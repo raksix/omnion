@@ -34,6 +34,8 @@ _Last updated: 2026-09-25_
   one per platform feature layer; mobile app intentionally not captured.
 - AI Hub design: [`docs/06-AI-HUB.md`](06-AI-HUB.md) — providers/registry/router, agent runtime,
   tool + permission + approval + audit chain, RAG, cost manager, data guard.
+- IAM design: [`docs/07-IAM.md`](07-IAM.md) — custom roles, RBAC + ABAC, policy engine, scopes,
+  permission simulator, service accounts.
 
 ## Hard rules (owner directives)
 
@@ -62,6 +64,7 @@ _Last updated: 2026-09-25_
 | 2026-09-25 | Fixed the versioning & release strategy: SemVer at every layer (core/modules/plugins/themes/content revisions); Git flow (main/develop/feature/release) → tag → GitHub Release → Docker images; CMS content revision history with compare/restore + block-level diff; draft/published + scheduled publishing; reversible DB migrations (backup → migrate → health check); plugin manifests with compatibility ranges + dependency resolver; system update manager with rollback (non-destructive/expand-contract migrations only); audit history; config versioning; feature flags (env/org/site scoped); same-artifact environment promotion; repo gains `versioning/` + `release/` directories and a `VERSION` file. | Captured as [`docs/05-VERSIONING.md`](05-VERSIONING.md); 04 tree extended; pointer added. |
 | 2026-09-25 | Shared the full platform feature pool (25 layers) and asked for each item to be captured as a **separate request** — mobile app excluded. Guiding principle: one platform, keep the Core thin (features live under `modules/`). | Captured as [`docs/requests/`](requests/) — REQ-001…REQ-024 with an index (`README.md`). |
 | 2026-09-25 | Shared the deep AI Hub design: user-extensible AI providers (incl. OpenAI-compatible custom), provider abstraction, model registry + model router, AI agents that operate the Omnion API through tools with separate RBAC permissions, approval flow for dangerous actions, action previews, AI memory + RAG knowledge base, agents marketplace, multi-agent orchestrator, cost manager per org/site, AI audit logs, privacy/data guard (PII masking), local-AI (Ollama/vLLM) support, and the AI Hub admin screen. Core security principle: `AI Agent → Tool → Permission → Approval → Audit`. | Captured as [`docs/06-AI-HUB.md`](06-AI-HUB.md); linked from REQ-001. |
+| 2026-09-25 | Shared the deep IAM design (enterprise RBAC/ABAC): fully custom roles; granular permissions; Discord-style role hierarchy with priority values; role inheritance; explicit allow/deny precedence; scopes (global/org/site/department/module/resource); organization → site → team model; groups; multi-role users with effective permissions; resource-level permissions; ABAC policies + visual Policy Builder; special Owner role (audited); the same role system for AI agents; service accounts/API keys; temporary roles; approval-based permissions; permission simulator; role audit history; permission-safety invariants. Crate split: `identity/`, `permissions/`, `policy-engine/`, `authorization/`, `audit/`. | Captured as [`docs/07-IAM.md`](07-IAM.md); linked from REQ-006; 04 crates list extended. |
 
 ## Open questions (to resolve while gathering context)
 
