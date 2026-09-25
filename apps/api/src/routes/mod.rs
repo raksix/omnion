@@ -7,15 +7,20 @@
 //! (`crate::guards::require`); `GET /api/v1/me` and sign-in/out stay open to any signed-in
 //! account, and `GET /api/v1/iam/effective-permissions` resolves the caller's own set without a
 //! permission because it answers "what may I do here".
+//!
+//! The tenancy surface (`/organizations`, `/sites`) is guarded by the `organizations.*`,
+//! `sites.*` and `domains.manage` permissions and additionally scoped in the handlers
+//! (`crate::scope`): organization accounts only ever see and change their own organization.
 
 pub mod auth;
 pub mod health;
 pub mod iam;
 pub mod me;
 pub mod readyz;
+pub mod tenancy;
 
 use axum::Router;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 
 use crate::guards;
 use crate::state::AppState;
@@ -29,6 +34,43 @@ pub fn router(state: AppState) -> Router {
     let bindings = get(iam::list_bindings)
         .layer(guards::require(&state, "iam.bindings.read"))
         .merge(post(iam::create_binding).layer(guards::require(&state, "iam.bindings.manage")));
+
+    // Tenancy: reading needs a read permission, every mutation its own key.
+    let organizations = get(tenancy::list_organizations)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            post(tenancy::create_organization)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization = get(tenancy::get_organization)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            patch(tenancy::update_organization)
+                .layer(guards::require(&state, "organizations.manage")),
+        )
+        .merge(
+            delete(tenancy::delete_organization)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let sites = get(tenancy::list_sites)
+        .layer(guards::require(&state, "sites.read"))
+        .merge(post(tenancy::create_site).layer(guards::require(&state, "sites.create")));
+
+    let site = get(tenancy::get_site)
+        .layer(guards::require(&state, "sites.read"))
+        .merge(patch(tenancy::update_site).layer(guards::require(&state, "sites.update")))
+        .merge(delete(tenancy::delete_site).layer(guards::require(&state, "sites.delete")));
+
+    let domains = get(tenancy::list_domains)
+        .layer(guards::require(&state, "sites.read"))
+        .merge(post(tenancy::add_domain).layer(guards::require(&state, "domains.manage")));
+
+    let domain = delete(tenancy::remove_domain).layer(guards::require(&state, "domains.manage"));
+
+    let domain_primary =
+        post(tenancy::set_primary_domain).layer(guards::require(&state, "domains.manage"));
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
@@ -51,7 +93,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/iam/audit",
             get(iam::list_audit).layer(guards::require(&state, "audit.read")),
-        );
+        )
+        .route("/organizations", organizations)
+        .route("/organizations/{id}", organization)
+        .route("/sites", sites)
+        .route("/sites/{id}", site)
+        .route("/sites/{id}/domains", domains)
+        .route("/sites/{id}/domains/{domain_id}", domain)
+        .route("/sites/{id}/domains/{domain_id}/primary", domain_primary);
 
     Router::new()
         .route("/healthz", get(health::healthz))

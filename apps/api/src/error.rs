@@ -107,6 +107,45 @@ impl From<IdentityError> for ApiError {
                 "dependency_unavailable",
                 "database is unavailable",
             ),
+            IdentityError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            // Tenancy: a missing row is a 404, a taken slug/key/host a 409, and everything the
+            // store cannot accept (shape, status, host) is a bad request.
+            IdentityError::OrganizationNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "organization_not_found",
+                "no such organization",
+            ),
+            IdentityError::OrganizationSlugTaken => Self::new(
+                StatusCode::CONFLICT,
+                "organization_slug_taken",
+                "an organization with this slug already exists",
+            ),
+            IdentityError::SiteNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "site_not_found", "no such site")
+            }
+            IdentityError::SiteKeyTaken => Self::new(
+                StatusCode::CONFLICT,
+                "site_key_taken",
+                "a site with this key already exists in the organization",
+            ),
+            IdentityError::DomainTaken => Self::new(
+                StatusCode::CONFLICT,
+                "domain_taken",
+                "this host already addresses a site",
+            ),
+            IdentityError::DomainNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "domain_not_found",
+                "no such domain on this site",
+            ),
+            // Shape problems the store refuses (slug, key, status, host) are the caller's.
+            IdentityError::InvalidOrganization(message)
+            | IdentityError::InvalidSite(message)
+            | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
             other => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -240,5 +279,33 @@ mod tests {
         assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(internal.code(), "internal_error");
         assert_eq!(internal.message, "email address is already registered");
+    }
+
+    #[test]
+    fn tenancy_errors_map_onto_the_tenancy_statuses() {
+        assert_eq!(
+            ApiError::from(IdentityError::OrganizationNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::from(IdentityError::OrganizationSlugTaken).code(),
+            "organization_slug_taken"
+        );
+        assert_eq!(
+            ApiError::from(IdentityError::SiteKeyTaken).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::from(IdentityError::DomainTaken).code(),
+            "domain_taken"
+        );
+        assert_eq!(
+            ApiError::from(IdentityError::DomainNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let invalid = ApiError::from(IdentityError::InvalidHost("nope".to_owned()));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code(), "invalid_request");
     }
 }
