@@ -222,6 +222,28 @@ pub async fn find_site_by_key(
         .map_err(Into::into)
 }
 
+/// Resolve a site key platform-wide — the hint a public renderer sends when the request does
+/// not carry a domain that addresses a site.
+///
+/// Keys are unique inside an organization, not across the installation, so this answers `Some`
+/// only when exactly one site carries the key; `None` covers both "no such key" and "the key is
+/// ambiguous", and the caller answers `404` for either.
+pub async fn find_site_by_global_key(pool: &PgPool, key: &str) -> Result<Option<Site>> {
+    let key = validate_key(key)?;
+    let sql = format!(
+        "select {SITE_COLUMNS} from sites where key = $1 order by created_at asc, id asc limit 2"
+    );
+    let sites = sqlx::query_as::<_, Site>(&sql)
+        .bind(&key)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(match sites.as_slice() {
+        [site] => Some(site.clone()),
+        _ => None,
+    })
+}
+
 /// Every site of one organization, oldest first.
 pub async fn list_sites_for_organization(
     pool: &PgPool,
