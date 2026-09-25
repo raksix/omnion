@@ -8,9 +8,12 @@ _Last updated: 2026-09-25_
 
 ## Phase
 
-- **Context gathering. No implementation — yet.** The owner paused building on 2026-09-25
-  ("we are not building the project now; we'll gather context"). Do not scaffold
-  stack choices, features or code until the owner asks to start.
+- **Build phase started (2026-09-25).** The owner asked for a Lokma-style build loop and to
+  start implementing the platform — "write the code first, deploy later" (dev target:
+  `omnion.fermag.com.tr`).
+- Execution: the `omnion-build` Hermes cron loop works [`docs/BUILD-BACKLOG.md`](BUILD-BACKLOG.md)
+  — ONE phase-task per run — with cross-tick memory in [`docs/BUILD-LOG.md`](BUILD-LOG.md);
+  the loop is the single writer for code in this repo.
 
 ## What Omnion is
 
@@ -33,7 +36,7 @@ _Last updated: 2026-09-25_
 - Versioning & release management: [`docs/05-VERSIONING.md`](05-VERSIONING.md) — SemVer per
   layer, Git flow + releases, content revisions with diff/restore, reversible migrations,
   plugin/theme compatibility, feature flags, environment promotion.
-- Feature request pool: [`docs/requests/`](requests/) — individual requests (REQ-001…REQ-049),
+- Feature request pool: [`docs/requests/`](requests/) — individual requests (REQ-001…REQ-050),
   one per platform feature layer; mobile app intentionally not captured.
 - AI Hub design: [`docs/06-AI-HUB.md`](06-AI-HUB.md) — providers/registry/router, agent runtime,
   tool + permission + approval + audit chain, RAG, cost manager, data guard.
@@ -79,7 +82,8 @@ _Last updated: 2026-09-25_
 ## Open questions (to resolve while gathering context)
 
 - Open-source license choice (positioning is open-source; license not selected yet).
-- Build order: which core pieces and modules get built first once implementation starts.
+- Build order: defined in [`docs/BUILD-BACKLOG.md`](BUILD-BACKLOG.md) — P00→P14 foundation
+  first, then the REQ queue (owner steers priority).
 - Scope of the first deliverable (panel only vs. panel + a theme/frontend).
 - Naming/branding details beyond "Omnion".
 - SaaS productization timing (the multi-tenant model already exists from day one).
