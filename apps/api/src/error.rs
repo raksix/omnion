@@ -4,6 +4,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use omnion_audit::AuditError;
+use omnion_content::ContentError;
 use omnion_core::CoreError;
 use omnion_identity::IdentityError;
 use omnion_permissions::PermissionsError;
@@ -172,6 +173,45 @@ impl From<AuditError> for ApiError {
     }
 }
 
+impl From<ContentError> for ApiError {
+    fn from(error: ContentError) -> Self {
+        match error {
+            ContentError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            ContentError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            // Content: a missing page or revision is a 404, a taken slug or a publish with
+            // nothing to publish a 409, and everything the store cannot accept (shape, size,
+            // unknown status) a bad request.
+            ContentError::PageNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "page_not_found", "no such page")
+            }
+            ContentError::RevisionNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "revision_not_found",
+                "no such revision on this page",
+            ),
+            ContentError::SlugTaken => Self::new(
+                StatusCode::CONFLICT,
+                "slug_taken",
+                "this site already has a page with this slug",
+            ),
+            ContentError::NoDraftRevision => Self::new(
+                StatusCode::CONFLICT,
+                "no_draft_revision",
+                "this page has no draft revision to publish",
+            ),
+            other => Self::bad_request("invalid_request", other.to_string()),
+        }
+    }
+}
+
 impl From<PermissionsError> for ApiError {
     fn from(error: PermissionsError) -> Self {
         match error {
@@ -279,6 +319,30 @@ mod tests {
         assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(internal.code(), "internal_error");
         assert_eq!(internal.message, "email address is already registered");
+    }
+
+    #[test]
+    fn content_errors_map_onto_the_content_statuses() {
+        assert_eq!(
+            ApiError::from(ContentError::PageNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::from(ContentError::RevisionNotFound).code(),
+            "revision_not_found"
+        );
+        assert_eq!(
+            ApiError::from(ContentError::SlugTaken).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::from(ContentError::NoDraftRevision).code(),
+            "no_draft_revision"
+        );
+
+        let invalid = ApiError::from(ContentError::InvalidSlug("Nope!".to_owned()));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code(), "invalid_request");
     }
 
     #[test]

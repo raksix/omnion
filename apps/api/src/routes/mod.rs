@@ -11,8 +11,12 @@
 //! The tenancy surface (`/organizations`, `/sites`) is guarded by the `organizations.*`,
 //! `sites.*` and `domains.manage` permissions and additionally scoped in the handlers
 //! (`crate::scope`): organization accounts only ever see and change their own organization.
+//!
+//! The content surface (`/pages`) is guarded by the `content.pages.*` permissions; its
+//! handlers apply the same scope rule through the site a page belongs to.
 
 pub mod auth;
+pub mod content;
 pub mod health;
 pub mod iam;
 pub mod me;
@@ -72,6 +76,35 @@ pub fn router(state: AppState) -> Router {
     let domain_primary =
         post(tenancy::set_primary_domain).layer(guards::require(&state, "domains.manage"));
 
+    // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
+    // history needs the read key; every mutation carries its own.
+    let pages = get(content::list_pages)
+        .layer(guards::require(&state, "content.pages.read"))
+        .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
+
+    let page = get(content::get_page)
+        .layer(guards::require(&state, "content.pages.read"))
+        .merge(patch(content::update_page).layer(guards::require(&state, "content.pages.update")))
+        .merge(delete(content::delete_page).layer(guards::require(&state, "content.pages.delete")));
+
+    let page_publish =
+        post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));
+
+    let page_restore =
+        post(content::restore_revision).layer(guards::require(&state, "content.pages.restore"));
+
+    let page_revisions =
+        get(content::list_revisions).layer(guards::require(&state, "content.pages.read"));
+
+    let page_revision =
+        get(content::get_revision).layer(guards::require(&state, "content.pages.read"));
+
+    let page_translations =
+        get(content::list_translations).layer(guards::require(&state, "content.pages.read"));
+
+    let page_translation =
+        put(content::set_translations).layer(guards::require(&state, "content.pages.update"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -100,7 +133,21 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{id}", site)
         .route("/sites/{id}/domains", domains)
         .route("/sites/{id}/domains/{domain_id}", domain)
-        .route("/sites/{id}/domains/{domain_id}/primary", domain_primary);
+        .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
+        .route("/pages", pages)
+        .route("/pages/{id}", page)
+        .route("/pages/{id}/publish", page_publish)
+        .route("/pages/{id}/restore", page_restore)
+        .route("/pages/{id}/revisions", page_revisions)
+        .route("/pages/{id}/revisions/{revision_id}", page_revision)
+        .route(
+            "/pages/{id}/revisions/{revision_id}/translations",
+            page_translations,
+        )
+        .route(
+            "/pages/{id}/revisions/{revision_id}/translations/{language}",
+            page_translation,
+        );
 
     Router::new()
         .route("/healthz", get(health::healthz))
