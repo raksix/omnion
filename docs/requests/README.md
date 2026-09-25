@@ -2,7 +2,7 @@
 
 > The platform feature pool, captured as **individual requests** from the owner's brief
 > (2026-09-25; extended the same day with the platform periphery + headline features —
-> REQ-025…REQ-049). One request per feature layer; each gets implemented (or re-scoped)
+> REQ-025…REQ-050). One request per feature layer; each gets implemented (or re-scoped)
 > later — they are capture, not commitment yet.
 >
 > Status convention: `pending` → `in-progress` → `done (<commit>)`.
@@ -106,6 +106,7 @@ marketplace — all connected by the **Omnion Core**.
 | REQ-047 | [AI Admin](REQ-047-ai-admin.md) *(headline)* | AI Hub × audit/logs | pending |
 | REQ-048 | [App Marketplace](REQ-048-app-marketplace.md) *(headline)* | `apps/marketplace` | pending |
 | REQ-049 | [Omnion Studio](REQ-049-omnion-studio.md) *(headline)* | new `apps/studio` | pending |
+| REQ-050 | [First-run Onboarding / Setup Wizard](REQ-050-first-run-onboarding.md) | platform (`apps/admin` + CLI) | pending |
 
 > Note: a **mobile app** was mentioned in the brief but intentionally **not captured yet**
 > (excluded by the owner for now).
