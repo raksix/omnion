@@ -20,7 +20,7 @@ Commerce features to move closer to the Odoo-side of the market:
 - Subscriptions
 - Digital products
 
-Explicitly **not embedded in the Core** — built as a module:
+**Not embedded in the Core** — built as a module:
 
 ```text
 modules/
