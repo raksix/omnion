@@ -185,6 +185,7 @@ jobs:
             kill "$API_PID" 2>/dev/null || true
             exit 1
           fi
+          echo "public surface: title=\"$public_title\" via-key · \"$host_title\" via-domain · unpublished=$draft_code"
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
