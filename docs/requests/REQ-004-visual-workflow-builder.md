@@ -18,3 +18,8 @@ Email      CRM
 ```
 
 Plugins can extend it with new node types.
+
+## Notes
+
+- Builder UX prior art + engine research: [`docs/09-N8N-TEARDOWN.md`](../09-N8N-TEARDOWN.md)
+  (§8: test webhooks / "listen for test event", waiting/resume, HITL signed callbacks).

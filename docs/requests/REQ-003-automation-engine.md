@@ -30,3 +30,9 @@ Call webhook
 ```
 
 Users build these visually in the UI with the workflow builder (REQ-004).
+
+## Notes
+
+- Engine research: [`docs/09-N8N-TEARDOWN.md`](../09-N8N-TEARDOWN.md) — deep source-level
+  teardown of the n8n engine v2.41 (durable steps, queues, waits, HITL approvals) with
+  adopt/avoid lessons.
