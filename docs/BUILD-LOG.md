@@ -133,5 +133,10 @@
   platform role 403 `system_role`; `/api/v1/iam/audit` lists `iam.binding.granted`,
   `iam.role.permissions_updated` and `iam.role.created` with actor, target and metadata, and the same
   rows are in `audit_log`.
+- CI: the smoke step now also walks the gated surface (roles + own effective set, anonymous 401 for
+  roles/audit). Run `36197985861` → **success**: `Rust — fmt · clippy · test` ✅ (1m06s; the smoke log
+  shows `permission catalogue and base roles ready permissions=32`, the six base roles with the
+  documented priorities and allow counts 32/32/21/9/8/2, the administrator's global Owner binding and
+  the resolved effective set) · `Infra — compose config` ✅.
 - Next: **P04 — Tenancy v0** (organizations, sites, domains + CRUD API, scope enforcement,
   cross-tenant denial tests).
