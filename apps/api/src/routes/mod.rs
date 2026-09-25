@@ -14,12 +14,17 @@
 //!
 //! The content surface (`/pages`) is guarded by the `content.pages.*` permissions; its
 //! handlers apply the same scope rule through the site a page belongs to.
+//!
+//! The public surface (`/public`) is the one unauthenticated read route of the API: it serves
+//! published content to the public site renderer (`apps/web`) and resolves the addressed site
+//! from the request — see `crate::routes::public` for the resolution order.
 
 pub mod auth;
 pub mod content;
 pub mod health;
 pub mod iam;
 pub mod me;
+pub mod public;
 pub mod readyz;
 pub mod tenancy;
 
@@ -105,6 +110,10 @@ pub fn router(state: AppState) -> Router {
     let page_translation =
         put(content::set_translations).layer(guards::require(&state, "content.pages.update"));
 
+    // Public: the unauthenticated read surface of the site renderer. It serves published
+    // content only, so it carries no permission guard — and no mutation can be reached here.
+    let public_pages = get(public::get_published_page);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -147,7 +156,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/pages/{id}/revisions/{revision_id}/translations/{language}",
             page_translation,
-        );
+        )
+        .route("/public/pages/{slug}", public_pages);
 
     Router::new()
         .route("/healthz", get(health::healthz))
