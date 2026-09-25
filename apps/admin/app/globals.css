@@ -1,0 +1,37 @@
+/**
+ * Omnion admin — global stylesheet.
+ *
+ * Tailwind CSS v4 with explicit sources: this repository is a monorepo that also carries a
+ * Rust `target/` tree, so automatic content detection stays off and the app's own directories
+ * are declared one by one.
+ */
+@import "tailwindcss" source(none);
+
+@source "../app";
+@source "../components";
+@source "../features";
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+
+  /* Light, warm palette: cream canvas, ink text, terracotta accent. */
+  --color-canvas: #faf9f5;
+  --color-surface: #ffffff;
+  --color-ink: #262624;
+  --color-muted: #6b6560;
+  --color-line: #e8e4dc;
+  --color-accent: #c96442;
+  --color-accent-strong: #b0563a;
+  --color-accent-soft: #f7e9e2;
+  --color-positive: #3f7d5c;
+  --color-positive-soft: #e7f2ec;
+  --color-caution: #96661c;
+  --color-caution-soft: #f8efdd;
+  --color-quiet-soft: #eeeae2;
+}
+
+::selection {
+  background-color: var(--color-accent-soft);
+}
