@@ -88,6 +88,20 @@ jobs:
             kill "$API_PID" 2>/dev/null || true
             exit 1
           fi
+          # IAM: the bootstrapped administrator is the Owner, so the gated surface answers …
+          curl -fsS -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/iam/roles
+          echo
+          curl -fsS -b /tmp/omnion-cookies.txt 'http://127.0.0.1:8080/api/v1/iam/effective-permissions' | head -c 300
+          echo
+          # … while the same routes stay closed without a session.
+          for route in /api/v1/iam/roles /api/v1/iam/audit; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$route")
+            if [ "$code" != "401" ]; then
+              echo "anonymous $route must be rejected with 401, got $code" >&2
+              kill "$API_PID" 2>/dev/null || true
+              exit 1
+            fi
+          done
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
