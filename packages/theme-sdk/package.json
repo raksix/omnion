@@ -1,0 +1,19 @@
+{
+  "name": "@omnion/theme-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The Omnion theme contract — what a theme is and what the renderer hands it.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}
