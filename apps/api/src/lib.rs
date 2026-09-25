@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
+pub mod client_ip;
+pub mod cookies;
+pub mod dto;
 pub mod error;
 pub mod routes;
 pub mod state;

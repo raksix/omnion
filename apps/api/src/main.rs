@@ -1,14 +1,17 @@
 //! Omnion API binary entrypoint.
 //!
 //! Boot order (docs/02-ARCHITECTURE.md, "Reliability"): typed config → telemetry →
-//! database + migrations → Redis → HTTP server with graceful shutdown.
+//! database + migrations → first-administrator bootstrap → Redis → HTTP server with
+//! graceful shutdown.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_core::config::Config;
-use omnion_core::{BuildInfo, CoreError, Db, RedisClient, telemetry};
+use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
+use omnion_identity::users::{self, BootstrapOutcome};
 use tokio::net::TcpListener;
 
 /// Service identifier used in logs and health payloads.
@@ -25,7 +28,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), CoreError> {
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
     let telemetry = telemetry::init(&config.log)?;
     let build = BuildInfo::new(SERVICE, env!("CARGO_PKG_VERSION"));
@@ -41,6 +44,8 @@ async fn run() -> Result<(), CoreError> {
     db.migrate().await?;
     tracing::info!("database ready and migrations applied");
 
+    bootstrap_admin(&config, &db).await?;
+
     let redis = RedisClient::new(&config.redis.url)?;
     if let Err(err) = redis.ping().await {
         // Redis is not needed to serve traffic: the process boots and `/readyz` keeps
@@ -53,12 +58,47 @@ async fn run() -> Result<(), CoreError> {
     tracing::info!(%address, "listening");
 
     let app = routes::router(AppState::new(build, config, db, redis));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("shutdown complete");
     telemetry.shutdown();
+    Ok(())
+}
+
+/// Seed the first administrator on a fresh database.
+///
+/// Driven by `OMNION_ADMIN_EMAIL` / `OMNION_ADMIN_PASSWORD` (docs/07-IAM.md): the account is
+/// created only when the `users` table is still empty, and the password is hashed here at
+/// boot — never stored or logged in plain text.
+async fn bootstrap_admin(config: &Config, db: &Db) -> Result<(), omnion_identity::IdentityError> {
+    match &config.admin {
+        Some(admin) => {
+            match users::bootstrap_first_admin(db.pool(), &admin.email, &admin.password).await? {
+                BootstrapOutcome::Created { user_id, email } => {
+                    tracing::info!(%user_id, %email, "first administrator account created");
+                }
+                BootstrapOutcome::SkippedExistingUsers => {
+                    tracing::info!(
+                        email = %admin.email,
+                        "administrator bootstrap skipped: accounts already exist"
+                    );
+                }
+            }
+        }
+        None => {
+            if !users::has_any(db.pool()).await? {
+                tracing::warn!(
+                    "no accounts exist yet — set OMNION_ADMIN_EMAIL and OMNION_ADMIN_PASSWORD \
+                     to seed the first administrator"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

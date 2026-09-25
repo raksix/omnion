@@ -4,6 +4,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use omnion_core::CoreError;
+use omnion_identity::IdentityError;
 use serde::Serialize;
 
 /// Error response shape used across `/api/v1`:
@@ -16,6 +17,34 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// Build an error with an explicit status, code and message.
+    #[must_use]
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// `400` — the request body or its parameters are unusable.
+    #[must_use]
+    pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
+    }
+
+    /// `401` — the caller is not signed in, or the session is gone.
+    #[must_use]
+    pub fn unauthorized(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, code, message)
+    }
+
+    /// `403` — the caller is signed in but the action is not allowed.
+    #[must_use]
+    pub fn forbidden(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, code, message)
+    }
+
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an
@@ -58,11 +87,31 @@ impl From<CoreError> for ApiError {
     }
 }
 
+impl From<IdentityError> for ApiError {
+    fn from(error: IdentityError) -> Self {
+        match error {
+            // A pool that cannot hand out a connection is a retryable infrastructure
+            // failure; everything else is an internal error the operator has to look at.
+            IdentityError::Database(
+                sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_),
+            ) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            other => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                other.to_string(),
+            ),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
 }
-
 #[derive(Serialize)]
 struct ErrorDetail {
     code: &'static str,
@@ -100,5 +149,33 @@ mod tests {
         let error = ApiError::from(CoreError::Telemetry("boom".to_owned()));
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.code(), "internal_error");
+    }
+
+    #[test]
+    fn helpers_pick_the_right_status() {
+        assert_eq!(
+            ApiError::bad_request("invalid_request", "no").status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::unauthorized("unauthenticated", "no").status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ApiError::forbidden("account_disabled", "no").status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn exhausted_pool_maps_to_503_but_other_identity_errors_to_500() {
+        let unavailable = ApiError::from(IdentityError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.code(), "dependency_unavailable");
+
+        let internal = ApiError::from(IdentityError::EmailTaken);
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(internal.code(), "internal_error");
+        assert_eq!(internal.message, "email address is already registered");
     }
 }
