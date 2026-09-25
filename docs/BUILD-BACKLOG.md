@@ -25,10 +25,10 @@
 
 ## P01 — Core foundations
 
-- [ ] Typed env config module + `tracing` subscriber (OpenTelemetry-ready hooks) + shared error type.
-- [ ] sqlx + Postgres pool + migration runner; `database/migrations/0001_initial.sql` (organizations, users, sessions, audit_log minimal per docs/07).
-- [ ] `GET /readyz` → DB + Redis pings.
-- [ ] **Verify:** `docker compose up -d` + API against it; migrations applied; readyz shows both ok. Commit + push + log.
+- [x] Typed env config module + `tracing` subscriber (OpenTelemetry-ready hooks) + shared error type.
+- [x] sqlx + Postgres pool + migration runner; `database/migrations/0001_initial.sql` (organizations, users, sessions, audit_log minimal per docs/07).
+- [x] `GET /readyz` → DB + Redis pings.
+- [x] **Verify:** `docker compose up -d` + API against it; migrations applied; readyz shows both ok. Commit + push + log.
 
 ## P02 — Identity v0 (docs/07 subset)
 

@@ -27,3 +27,34 @@
 - CI on GitHub: workflow run `36193827205` → **success** (jobs: `Rust — fmt · clippy · test` ✅ · `Infra — compose config` ✅).
 - Repo note: this clone's `origin` moved to the SSH URL — the stored OAuth token has no `workflow` scope, so over HTTPS GitHub rejects any commit touching `.github/workflows/`.
 - Next: **P01 — Core foundations** (typed env config + tracing subscriber + shared error type, sqlx/Postgres pool + `database/migrations/0001_initial.sql`, `GET /readyz` with DB + Redis pings).
+
+## 2026-09-25 — P01 · Core foundations
+
+- `crates/core` gained the shared infrastructure layer: typed `config` (OMNION_* keys, `PORT` fallback,
+  validation for environment/port/pool size/URL schemes, pretty-vs-JSON log defaults), `telemetry`
+  (tracing subscriber with the OpenTelemetry layer hook plus a shutdown handle), `error`
+  (`ConfigError` + `CoreError`), `db` (SQLx pool + embedded migration runner) and `redis_client`
+  (lazily connected handle that reconnects without a restart).
+- `database/migrations/0001_initial.sql`: organizations, users (case-insensitive unique email),
+  sessions (hashed tokens only) and an append-only `audit_log` whose `actor_type` also covers the
+  AI Hub audit chain.
+- `apps/api` boots config → telemetry → database + migrations → redis → HTTP, with SIGTERM/Ctrl-C
+  graceful shutdown. `GET /readyz` pings both dependencies — `200` only when everything answers,
+  `503` with detail in development — and `ApiError` maps core errors onto the HTTP surface (`503`
+  for an unavailable dependency, `500` otherwise).
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D warnings`
+  clean · `cargo test --workspace` → **27 passed** (20 core unit · 3 api unit · 1 healthz ·
+  3 readyz integration against the live compose stack) · live run: `GET /healthz` → `200
+  {"ok":true,…}` and `GET /readyz` → `200 {"checks":{"database":{"status":"ok"},"redis":{"status":"ok"}}}` ·
+  `_sqlx_migrations` shows version 1 "initial" with `success = t`, and `\dt` lists
+  organizations · users · sessions · audit_log · failure path: with Redis stopped, `/readyz` → `503
+  redis unavailable (broken pipe)` while `/healthz` stayed `200`, and it returned to `200` without
+  restarting the API once Redis was back.
+- Dev stack: `docker compose -f infra/compose/docker-compose.dev.yml up -d` now really starts all four
+  containers (postgres 5433 · redis 6380 · minio 9000/9001 · mailpit 1025/8025). Upstream MinIO images
+  are no longer published on Docker Hub (`pull access denied`), so `infra/compose/minio.yml` pulls the
+  community mirror `pgsty/minio` — the same server binary.
+- CI: the Rust job now provisions PostgreSQL + Redis service containers (so the readiness integration
+  tests run for real) and adds a smoke step that boots the API and curls `/healthz` + `/readyz`.
+- Next: **P02 — Identity v0** (users + argon2, sessions, login/logout, first-admin bootstrap,
+  integration tests).
