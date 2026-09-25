@@ -46,3 +46,6 @@ Billing:
 
 - Builds on the identity/authorization vision in docs/01-VISION.md §2 and
   docs/02-ARCHITECTURE.md (Enterprise side).
+- Full design: [`docs/07-IAM.md`](../07-IAM.md) — custom roles, granular permissions,
+  hierarchy + inheritance, allow/deny precedence, scopes, ABAC, policy builder, permission
+  simulator, service accounts, temporary roles.

@@ -19,7 +19,9 @@ omnion/
 │   ├── core/                   # Omnion core
 │   ├── auth/                   # Authentication
 │   ├── identity/               # Users / Organizations
-│   ├── permissions/            # RBAC / policies
+│   ├── permissions/            # RBAC / roles
+│   ├── policy-engine/          # ABAC / policy engine
+│   ├── authorization/          # authorization decisions
 │   ├── sites/                  # Multi-site
 │   ├── content/                # CMS
 │   ├── media/                  # Media management
