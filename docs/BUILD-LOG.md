@@ -94,5 +94,7 @@
   row with `$argon2id$v=19$…`, one session row with a hash that is not the token, `revoked = t`,
   `seen = t`.
 - CI: the smoke step now seeds the admin and walks login → me → anonymous 401 → logout.
+- CI run `36196441876` → **success**: `Rust — fmt · clippy · test` ✅ (1m11s — the identity suite ran
+  against the service containers) · `Infra — compose config` ✅ (4s).
 - Next: **P03 — IAM v0** (roles, permissions, role bindings, `require(permission)` guard, audit
   writes, role seeds from docs/07 §3).
