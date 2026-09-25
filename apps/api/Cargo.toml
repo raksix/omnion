@@ -1,0 +1,18 @@
+[package]
+name = "omnion-api"
+description = "Omnion HTTP API (Axum). Thin HTTP layer over the crates in crates/."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+omnion-core = { path = "../../crates/core" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
