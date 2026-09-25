@@ -36,6 +36,8 @@ _Last updated: 2026-09-25_
   tool + permission + approval + audit chain, RAG, cost manager, data guard.
 - IAM design: [`docs/07-IAM.md`](07-IAM.md) — custom roles, RBAC + ABAC, policy engine, scopes,
   permission simulator, service accounts.
+- Business suite design: [`docs/08-BUSINESS-SUITE.md`](08-BUSINESS-SUITE.md) — Odoo-style
+  modules on one Core; three layers (Core / Platform / Business Suite).
 
 ## Hard rules (owner directives)
 
@@ -65,6 +67,7 @@ _Last updated: 2026-09-25_
 | 2026-09-25 | Shared the full platform feature pool (25 layers) and asked for each item to be captured as a **separate request** — mobile app excluded. Guiding principle: one platform, keep the Core thin (features live under `modules/`). | Captured as [`docs/requests/`](requests/) — REQ-001…REQ-024 with an index (`README.md`). |
 | 2026-09-25 | Shared the deep AI Hub design: user-extensible AI providers (incl. OpenAI-compatible custom), provider abstraction, model registry + model router, AI agents that operate the Omnion API through tools with separate RBAC permissions, approval flow for dangerous actions, action previews, AI memory + RAG knowledge base, agents marketplace, multi-agent orchestrator, cost manager per org/site, AI audit logs, privacy/data guard (PII masking), local-AI (Ollama/vLLM) support, and the AI Hub admin screen. Core security principle: `AI Agent → Tool → Permission → Approval → Audit`. | Captured as [`docs/06-AI-HUB.md`](06-AI-HUB.md); linked from REQ-001. |
 | 2026-09-25 | Shared the deep IAM design (enterprise RBAC/ABAC): fully custom roles; granular permissions; Discord-style role hierarchy with priority values; role inheritance; explicit allow/deny precedence; scopes (global/org/site/department/module/resource); organization → site → team model; groups; multi-role users with effective permissions; resource-level permissions; ABAC policies + visual Policy Builder; special Owner role (audited); the same role system for AI agents; service accounts/API keys; temporary roles; approval-based permissions; permission simulator; role audit history; permission-safety invariants. Crate split: `identity/`, `permissions/`, `policy-engine/`, `authorization/`, `audit/`. | Captured as [`docs/07-IAM.md`](07-IAM.md); linked from REQ-006; 04 crates list extended. |
+| 2026-09-25 | Shared the business-suite design: Odoo-style module ecosystem (CMS/website/blog/ecommerce, CRM, sales, purchases, inventory, accounting + localizations, invoicing, subscriptions, projects/tasks/timesheets, helpdesk, appointments, HR/recruitment/leaves/expenses, marketing, documents, knowledge, approvals, manufacturing) all on one Core; ledger-style inventory; e-invoice localizations for Türkiye; AI operating across modules; shared infrastructure (identity/permissions/workflow/notifications/files/audit/search/events/AI). Three-layer model: Core → Platform → Business Suite. | Captured as [`docs/08-BUSINESS-SUITE.md`](08-BUSINESS-SUITE.md); linked from REQ-008/REQ-009. |
 
 ## Open questions (to resolve while gathering context)
 
