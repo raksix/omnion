@@ -4,10 +4,24 @@
 //! `docs/04-MONOREPO.md`). Business features do **not** live here: they are built as
 //! toggleable modules on top of the core, so the core stays thin and stable.
 //!
-//! P00 keeps this crate deliberately small — build metadata only. P01 adds the typed
-//! configuration, telemetry and shared error primitives on top of it.
+//! P01 adds the shared infrastructure primitives on top of the P00 build metadata:
+//! typed configuration ([`config`]), structured logging ([`telemetry`]), the PostgreSQL
+//! pool and migration runner ([`db`]), the Redis handle ([`redis_client`]) and the shared
+//! error types ([`error`]).
 
 #![forbid(unsafe_code)]
+
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod redis_client;
+pub mod telemetry;
+
+pub use config::Config;
+pub use db::Db;
+pub use error::{ConfigError, CoreError, Result};
+pub use redis_client::RedisClient;
+pub use telemetry::Telemetry;
 
 /// Crate name of the Omnion core, as declared in `Cargo.toml`.
 pub const CORE_NAME: &str = env!("CARGO_PKG_NAME");
