@@ -39,10 +39,10 @@
 
 ## P03 — IAM v0 (docs/07)
 
-- [ ] Tables: roles, permissions, role_bindings (scope columns: organization/site), role inheritance flag.
-- [ ] Guard middleware `require(permission)` + audit write on privileged actions.
-- [ ] Seed base roles from docs/07 §3 (Owner 1000 → Member 100) + permission catalogue for existing endpoints.
-- [ ] **Verify:** permission-gated endpoint tests (allowed vs denied vs explicit-deny). Commit + push + log.
+- [x] Tables: roles, permissions, role_bindings (scope columns: organization/site), role inheritance flag.
+- [x] Guard middleware `require(permission)` + audit write on privileged actions.
+- [x] Seed base roles from docs/07 §3 (Owner 1000 → Member 100) + permission catalogue for existing endpoints.
+- [x] **Verify:** permission-gated endpoint tests (allowed vs denied vs explicit-deny). Commit + push + log.
 
 ## P04 — Tenancy v0
 

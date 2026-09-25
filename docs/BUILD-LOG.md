@@ -98,3 +98,40 @@
   against the service containers) · `Infra — compose config` ✅ (4s).
 - Next: **P03 — IAM v0** (roles, permissions, role bindings, `require(permission)` guard, audit
   writes, role seeds from docs/07 §3).
+
+## 2026-09-25 — P03 · IAM v0
+
+- New crate `crates/permissions` (docs/07-IAM.md): the permission catalogue (32 keys across
+  content/media/users/plugins/deployment/iam/audit), fully custom roles with priority, an inheritance
+  link and flag, explicit allow/deny entries and scoped role bindings (global / organization / site,
+  `expires_at` for temporary roles). `evaluate::RoleGraph` is a pure, deterministic resolver for the
+  documented precedence — explicit deny > explicit allow > inherited allow > default deny — and it
+  reports the provenance of every verdict (the seed of the permission simulator, §18). `crates/audit`
+  is the append-only trail writer (§13, §19) reused by later AI-agent actions.
+- Migration `0002_iam.sql`: `permissions`, `roles` (platform vs organization roles, key unique per
+  scope), `role_permissions` (allow/deny, one row per key) and `role_bindings` (scope shape enforced by
+  a check constraint, live combinations unique, `site_id` gains its foreign key with P04).
+- `apps/api`: `require(permission)` guard (`src/guards.rs`) wraps routes, resolves the session once and
+  hands it to the handler through the request extensions; privileged actions write audit rows in the
+  same request. New `/api/v1/iam` surface: permissions, roles (GET/POST), role permissions (PUT),
+  bindings (GET/POST), effective-permissions (own set without a permission, others need
+  `iam.roles.read`) and audit (GET, `audit.read`). Boot seeds the catalogue and the six base roles
+  (§3) and keeps the "at least one Owner" invariant (§20), auditing the fallback binding as a platform
+  action.
+- Fixed: adding a migration did not rebuild `omnion-core`, so the embedded migrator kept the old set
+  and `0002` silently never applied (`relation "permissions" does not exist`). `crates/core/build.rs`
+  now emits `cargo:rerun-if-changed=../../database/migrations`.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D warnings`
+  clean · `cargo test --workspace` → **95 passed** (permissions 20 unit incl. deny/inheritance/cycle
+  cases · audit 2 · api unit 17 · identity 18 · iam integration 4 against the compose stack).
+- Live run on `:18081` against the compose stack: boot log `permission catalogue and base roles ready
+  permissions=32`; `/healthz` 200 and `/readyz` both checks ok; anonymous `/api/v1/me` 401 and
+  `/api/v1/iam/roles` 401; a signed-in session without a role gets `403 permission_denied` naming
+  `iam.roles.read`; after the platform Owner binding `GET /iam/roles` → 200 with the ladder (`owner
+  p1000 allow=32`, `administrator p900 allow=32`, `manager p700 allow=21`, `moderator p500 allow=9`);
+  `POST /iam/roles` 201, `PUT /iam/roles/{id}/permissions` 200, `POST /iam/bindings` 201, editing a
+  platform role 403 `system_role`; `/api/v1/iam/audit` lists `iam.binding.granted`,
+  `iam.role.permissions_updated` and `iam.role.created` with actor, target and metadata, and the same
+  rows are in `audit_log`.
+- Next: **P04 — Tenancy v0** (organizations, sites, domains + CRUD API, scope enforcement,
+  cross-tenant denial tests).
