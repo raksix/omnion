@@ -1,0 +1,9 @@
+[package]
+name = "omnion-core"
+description = "Omnion core: shared infrastructure primitives for every Omnion application."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
