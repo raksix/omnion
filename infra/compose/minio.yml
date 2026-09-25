@@ -1,8 +1,12 @@
 # MinIO — S3-compatible object storage for media and other uploaded files.
 # Console: http://localhost:${OMNION_MINIO_CONSOLE_PORT:-9001}
+#
+# Image note: upstream MinIO stopped publishing to Docker Hub, so the development stack
+# pulls the community-maintained mirror of the same server binary. Production deployments
+# point at their own S3-compatible endpoint instead (docs/02-ARCHITECTURE.md).
 services:
   minio:
-    image: minio/minio:latest
+    image: pgsty/minio:latest
     container_name: omnion-minio
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
