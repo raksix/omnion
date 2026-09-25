@@ -71,6 +71,17 @@ omnion/
 │   ├── seeds/
 │   └── fixtures/
 │
+├── versioning/
+│   ├── manifests/
+│   ├── compatibility/
+│   ├── migrations/
+│   └── changelog/
+│
+├── release/
+│   ├── scripts/
+│   ├── changelog/
+│   └── artifacts/
+│
 ├── infra/
 │   ├── docker/
 │   ├── compose/
@@ -111,6 +122,7 @@ omnion/
 ├── docker-compose.yml
 ├── docker-compose.dev.yml
 ├── Dockerfile
+├── VERSION
 ├── Cargo.toml
 ├── Cargo.lock
 ├── package.json
