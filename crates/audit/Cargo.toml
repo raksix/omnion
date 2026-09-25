@@ -1,0 +1,14 @@
+[package]
+name = "omnion-audit"
+description = "Omnion audit trail: append-only records of privileged actions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sqlx.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+time.workspace = true
