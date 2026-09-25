@@ -30,6 +30,33 @@ pub enum IdentityError {
     /// A blocking hashing task could not be joined.
     #[error("hashing task failed: {0}")]
     Task(String),
+    /// The organization slug is already taken.
+    #[error("organization slug is already taken")]
+    OrganizationSlugTaken,
+    /// No organization carries this identifier.
+    #[error("no such organization")]
+    OrganizationNotFound,
+    /// An organization field is not usable (slug shape, blank name, unknown status).
+    #[error("invalid organization: {0}")]
+    InvalidOrganization(String),
+    /// The site key is already taken inside the organization.
+    #[error("site key is already taken in this organization")]
+    SiteKeyTaken,
+    /// No site carries this identifier.
+    #[error("no such site")]
+    SiteNotFound,
+    /// A site field is not usable (key shape, blank name, unknown status).
+    #[error("invalid site: {0}")]
+    InvalidSite(String),
+    /// The domain host is already bound to a site.
+    #[error("this host is already bound to a site")]
+    DomainTaken,
+    /// The site does not carry this domain.
+    #[error("no such domain on this site")]
+    DomainNotFound,
+    /// A domain host is not usable (shape or case).
+    #[error("invalid host: {0}")]
+    InvalidHost(String),
 }
 
 /// Result alias used across the identity crate.

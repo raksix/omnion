@@ -12,16 +12,27 @@
 
 pub mod authentication;
 pub mod error;
+pub mod organizations;
 pub mod password;
 pub mod sessions;
+pub mod sites;
 pub mod users;
 
 pub use authentication::{AuthOutcome, authenticate};
 pub use error::{IdentityError, Result};
+pub use organizations::{
+    NewOrganization, Organization, OrganizationChanges, create_organization, delete_organization,
+    find_organization, find_organization_by_slug, list_organizations, update_organization,
+};
 pub use password::{MIN_PASSWORD_LENGTH, hash_password, verify_password};
 pub use sessions::{
     AuthenticatedSession, SESSION_TTL_DAYS, SESSION_TTL_SECONDS, Session, create_session,
     hash_token, resolve_session, revoke_session, touch_session,
+};
+pub use sites::{
+    NewSite, Site, SiteChanges, SiteDomain, add_domain, count_for_organization, create_site,
+    delete_site, find_site, find_site_by_host, find_site_by_key, list_domains, list_sites,
+    list_sites_for_organization, remove_domain, set_primary_domain, update_site,
 };
 pub use users::{
     BootstrapOutcome, NewUser, User, bootstrap_first_admin, count_users, create_user, find_by_id,
