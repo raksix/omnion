@@ -14,10 +14,15 @@ _Last updated: 2026-09-25_
 
 ## What Omnion is
 
+- Positioning (owner, 2026-09-25): **"Omnion is an open-source enterprise application platform
+  with a powerful CMS at its core."**
 - Omnion is a **CMS (content management system) panel**.
-- Public framing: everywhere and always, the project is described only as a CMS panel.
+- Public framing: professional product language only — the project is presented as the
+  platform/CMS described above, nothing outside that framing.
 - Target architecture & feature vision: [`docs/01-VISION.md`](01-VISION.md) — corporate,
   multi-tenant, headless-capable platform/CMS.
+- Technical architecture & stack direction: [`docs/02-ARCHITECTURE.md`](02-ARCHITECTURE.md) —
+  modular monolith (Rust/Axum), Docker → Kubernetes deployment path, WASM plugin runtime.
 
 ## Hard rules (owner directives)
 
@@ -40,17 +45,19 @@ _Last updated: 2026-09-25_
 | 2026-09-25 | Omnion is a general-audience CMS panel; the public repo must never carry language outside that framing; clean up any wording that violates it and re-push. | README wording, commit history and repository description cleaned; history rewritten; the previous repo was privatized as `raksix/omnion-legacy`; a fresh public repo was published and pushed. Rule 1 recorded. |
 | 2026-09-25 | "We are not building the project now — we'll gather context; just save my directives into docs." | This file created; build paused. |
 | 2026-09-25 | Shared the target architecture vision: corporate, multi-tenant, headless-capable CMS — Odoo-style module system, LDAP/AD/SAML/OAuth2/OIDC + MFA, theme system + theme API, i18n + Translation Center + Translation Memory, Content Type Builder, workflow + audit log, RBAC permissions, multi-site vs multi-tenant split, API-first (REST/GraphQL/Webhooks/Events), event system. | Captured as [`docs/01-VISION.md`](01-VISION.md); pointer added above. |
+| 2026-09-25 | Fixed the technical direction: modular monolith (no microservices on day one), preferred stack Rust + Axum + Tokio + SQLx + PostgreSQL + Redis + S3/MinIO + Next.js/React/TS + Docker/Kubernetes + OpenTelemetry + WASM plugin runtime; Docker Compose → Helm chart deployment path; versioned API (`/api/v1`) + OpenAPI SDK generation; positioning as an open-source enterprise application platform with a powerful CMS at its core. | Captured as [`docs/02-ARCHITECTURE.md`](02-ARCHITECTURE.md); positioning + pointers + open questions updated. |
 
 ## Open questions (to resolve while gathering context)
 
-- Tech stack, hosting and deployment (Docker) — to be chosen before implementation.
+- Open-source license choice (positioning is open-source; license not selected yet).
 - Build order: which core pieces and modules get built first once implementation starts.
 - Scope of the first deliverable (panel only vs. panel + a theme/frontend).
 - Naming/branding details beyond "Omnion".
 - SaaS productization timing (the multi-tenant model already exists from day one).
-- Full technical blueprint (stack + folder structure + DB schema + multi-tenant model +
-  plugin API + theme API + LDAP architecture + translation system + Docker deployment) —
-  the proposed next-step deliverable once the context phase ends.
+- Full technical blueprint details (folder layout, DB schema, multi-tenant model, plugin API,
+  theme API, LDAP architecture, translation system, Docker/K8s manifests) — stack direction is
+  set ([`docs/02-ARCHITECTURE.md`](02-ARCHITECTURE.md)); the detailed blueprint is the
+  next-step deliverable.
 
 ## How to work with this file
 
