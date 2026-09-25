@@ -106,6 +106,18 @@ deployment.deploy
 deployment.rollback
 ```
 
+Tenancy (P04):
+
+```text
+organizations.read
+organizations.manage
+sites.read
+sites.create
+sites.update
+sites.delete
+domains.manage
+```
+
 ## 3. Discord-style role hierarchy
 
 ```text

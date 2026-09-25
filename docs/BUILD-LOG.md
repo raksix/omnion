@@ -140,3 +140,56 @@
   the resolved effective set) · `Infra — compose config` ✅.
 - Next: **P04 — Tenancy v0** (organizations, sites, domains + CRUD API, scope enforcement,
   cross-tenant denial tests).
+
+## 2026-09-25 — P04 · Tenancy v0
+
+- Migration `0003_tenancy.sql` (docs/01-VISION.md §10, docs/07-IAM.md §7): `sites` (one property
+  of one organization, `key` unique per organization) and `site_domains` (host unique
+  platform-wide, at most one primary per site through a partial unique index). The site-scoped
+  role binding finally gets its foreign key; the narrow pre-constraint cleanup retires bindings
+  that pointed at no site, so the constraint applies on an existing database.
+- `crates/identity` grows the tenancy store: `organizations` (create/read/list/update/delete with
+  slug, name and status validation) and `sites` (site and domain CRUD, host validation, automatic
+  first-primary plus promotion on removal, `find_site_by_host` — the routing primitive P07 builds
+  on). `IdentityError` learns the tenancy variants; `apps/api/src/error.rs` maps them
+  (404 not-found, 409 taken, 400 shape).
+- `crates/permissions`: new `tenancy` category — `organizations.read|manage`,
+  `sites.read|create|update|delete`, `domains.manage`; the Manager ladder gains site management
+  and Moderator/Editor `sites.read`; `bindings::validate` now refuses a site scope that names an
+  unknown site or one of another organization.
+- `apps/api`: `/api/v1/organizations` (GET/POST/GET id/PATCH/DELETE) and `/api/v1/sites`
+  (GET/POST/GET id/PATCH/DELETE) plus `/{id}/domains`, `/{id}/domains/{domain_id}` and
+  `/{id}/domains/{domain_id}/primary`, all behind the new guards. The shared `scope.rs` helpers
+  carry the tenancy rule — an account with a primary organization stays inside it, opening and
+  deleting a tenant is platform-only — and `routes/iam.rs` now uses them instead of its own
+  copies. Deleting a tenant requires it to be empty (`409 organization_not_empty`).
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D warnings`
+  clean · `cargo test --workspace` → **119 passed** (identity 27 · permissions 22 · core 23 · api
+  unit 26 · auth 6 · health 1 · iam 4 · readyz 3 · tenancy 5 integration against the compose
+  stack, incl. cross-tenant denial and restore-free domain promotion).
+- Live run on `:18082` against the compose stack (Owner session, P03 pattern): `/healthz` and
+  `/readyz` both ok; anonymous `/api/v1/sites` and `/api/v1/organizations` 401; tenant 201,
+  duplicate slug 409 `organization_slug_taken`; site 201, duplicate key 409 `site_key_taken`; first
+  host primary, second non-primary, promotion 200, list primary-first; platform patch 200; domain
+  removed 204 with the remaining host promoted; site 204; tenant 204 and `GET` 404; `site.created`,
+  `site.domain.added`, `site.domain.primary_changed`, `site.updated`, `site.domain.removed`,
+  `site.deleted`, `organization.created`, `organization.updated` and `organization.deleted` rows
+  in `audit_log` with actor, target and metadata.
+- Cross-tenant, live: an organization account (its own role with the tenancy keys, bound at
+  organization scope) sees exactly its own organization and site and may create inside them, while
+  every read of the other tenant — organization, site, domains, `?organization_id=` filter — and
+  every write (`POST /sites` with the other organization, `POST /sites/{other}/domains`, PATCH,
+  DELETE) answers **403 cross_organization**; the same calls on its own site answer 200/201. An
+  account without a role gets **403 permission_denied** on the way to the handler; opening a
+  tenant, and deleting its own, answer **403 platform_only** while renaming it is 200; a
+  site-scoped binding that names another tenant's site is refused with `invalid_request`
+  (“the site belongs to another organization”). The dev database was left clean
+  (organizations 0 · sites 0 · domains 0 · 6 base roles · 1 owner binding).
+- Noted for operators: base roles keep the permission set they were created with, so an
+  installation that upgrades keeps the new tenancy keys on the Owner only — a tenant grants them
+  to a role of its own (proven live); the seed's Owner sync is what keeps the platform owner
+  complete.
+- CI: the smoke step now also opens a tenant, a site and a domain and re-checks the anonymous 401s;
+  the block was rehearsed locally against the built binary before pushing.
+- Next: **P05 — Content v0** (pages + revisions, draft/published, publish/restore, slug rules,
+  translations skeleton).

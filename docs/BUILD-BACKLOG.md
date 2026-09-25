@@ -46,8 +46,8 @@
 
 ## P04 — Tenancy v0
 
-- [ ] organizations, sites, domains tables + CRUD API; scope enforcement (user sees only their org/site scope).
-- [ ] **Verify:** tests incl. cross-tenant denial. Commit + push + log.
+- [x] organizations, sites, domains tables + CRUD API; scope enforcement (user sees only their org/site scope).
+- [x] **Verify:** tests incl. cross-tenant denial. Commit + push + log.
 
 ## P05 — Content v0 (docs/05 §4 + docs/01 §5)
 
