@@ -15,13 +15,13 @@
 
 ## P00 — Toolchain + repo skeleton
 
-- [ ] Install Rust toolchain (rustup, minimal profile) → `cargo --version`. `cc`/`gcc` 13 + `ld` already present.
-- [ ] Root `Cargo.toml` workspace (`resolver = "2"`, members: `apps/api`, `crates/*`) + `rust-toolchain.toml` (stable).
-- [ ] `apps/api`: axum app, `GET /healthz` → `{"ok":true}`, `PORT` env (default 8080).
-- [ ] `crates/core`: `omnion-core` lib crate (documented empty base for later phases).
-- [ ] `infra/compose/docker-compose.dev.yml` + `postgres.yml` + `redis.yml` + `minio.yml` + `mailpit.yml` (per docs/04 + docs/02).
-- [ ] `.gitignore` additions (`target/`, `.env`), `.github/workflows/ci.yml` skeleton (fmt + clippy + test).
-- [ ] **Verify:** `cargo check` green; `curl localhost:8080/healthz` → 200; `docker compose config` valid. Commit + push + log.
+- [x] Install Rust toolchain (rustup, minimal profile) → `cargo --version`. `cc`/`gcc` 13 + `ld` already present.
+- [x] Root `Cargo.toml` workspace (`resolver = "2"`, members: `apps/api`, `crates/*`) + `rust-toolchain.toml` (stable).
+- [x] `apps/api`: axum app, `GET /healthz` → `{"ok":true}`, `PORT` env (default 8080).
+- [x] `crates/core`: `omnion-core` lib crate (documented empty base for later phases).
+- [x] `infra/compose/docker-compose.dev.yml` + `postgres.yml` + `redis.yml` + `minio.yml` + `mailpit.yml` (per docs/04 + docs/02).
+- [x] `.gitignore` additions (`target/`, `.env`), `.github/workflows/ci.yml` skeleton (fmt + clippy + test).
+- [x] **Verify:** `cargo check` green; `curl localhost:8080/healthz` → 200; `docker compose config` valid. Commit + push + log.
 
 ## P01 — Core foundations
 
