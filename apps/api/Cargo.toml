@@ -11,8 +11,10 @@ axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 omnion-core = { path = "../../crates/core" }
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+sqlx.workspace = true
