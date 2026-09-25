@@ -12,4 +12,5 @@ pub mod dto;
 pub mod error;
 pub mod guards;
 pub mod routes;
+pub mod scope;
 pub mod state;

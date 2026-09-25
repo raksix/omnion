@@ -29,6 +29,7 @@ use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::guards::scope_of;
+use crate::scope::{ensure_same_organization, resolve_organization};
 use crate::state::AppState;
 
 /// Hierarchy position a role gets when the request does not pick one: between the Editor (300)
@@ -718,40 +719,6 @@ pub async fn list_audit(
 async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
     omnion_audit::record(state.db().pool(), entry).await?;
     Ok(())
-}
-
-/// The organization an action applies to: the caller's own unless a platform account picks one.
-fn resolve_organization(
-    current: &CurrentSession,
-    requested: Option<Uuid>,
-) -> Result<Uuid, ApiError> {
-    match (current.user.organization_id, requested) {
-        (Some(own), Some(target)) if own != target => Err(cross_organization()),
-        (Some(own), _) => Ok(own),
-        (None, Some(target)) => Ok(target),
-        (None, None) => Err(ApiError::bad_request(
-            "organization_required",
-            "organization_id is required for an account without a primary organization",
-        )),
-    }
-}
-
-/// Refuse work on an organization the caller does not belong to.
-fn ensure_same_organization(
-    current: &CurrentSession,
-    organization_id: Option<Uuid>,
-) -> Result<(), ApiError> {
-    match (current.user.organization_id, organization_id) {
-        (Some(own), Some(target)) if own != target => Err(cross_organization()),
-        _ => Ok(()),
-    }
-}
-
-fn cross_organization() -> ApiError {
-    ApiError::forbidden(
-        "cross_organization",
-        "this account may only work inside its own organization",
-    )
 }
 
 /// Build a scope from a binding request.
