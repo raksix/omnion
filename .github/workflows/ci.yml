@@ -102,6 +102,28 @@ jobs:
               exit 1
             fi
           done
+          # Tenancy: the Owner opens a tenant, a site inside it and a domain on that site.
+          curl -fsS -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/organizations
+          echo
+          org_id=$(curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d '{"name":"Smoke Organization","slug":"smoke-organization"}' \
+            http://127.0.0.1:8080/api/v1/organizations | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          site_id=$(curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d "{\"organization_id\":\"$org_id\",\"key\":\"main\",\"name\":\"Main Site\"}" \
+            http://127.0.0.1:8080/api/v1/sites | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d '{"host":"smoke.omnion.test"}' \
+            "http://127.0.0.1:8080/api/v1/sites/$site_id/domains"
+          echo
+          # … and the same tenancy routes stay closed without a session.
+          for route in /api/v1/organizations /api/v1/sites; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$route")
+            if [ "$code" != "401" ]; then
+              echo "anonymous $route must be rejected with 401, got $code" >&2
+              kill "$API_PID" 2>/dev/null || true
+              exit 1
+            fi
+          done
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
