@@ -16,6 +16,9 @@ _Last updated: 2026-09-25_
 
 - Positioning (owner, 2026-09-25): **"Omnion is an open-source enterprise application platform
   with a powerful CMS at its core."**
+- Owner's synthesis (2026-09-25): WordPress's CMS side + Odoo's business side + n8n's
+  automation side + an AI agent platform + a low-code app builder + enterprise IAM + a
+  marketplace — all connected by the **Omnion Core**.
 - Omnion is a **CMS (content management system) panel**.
 - Public framing: professional product language only — the project is presented as the
   platform/CMS described above, nothing outside that framing.
@@ -30,7 +33,7 @@ _Last updated: 2026-09-25_
 - Versioning & release management: [`docs/05-VERSIONING.md`](05-VERSIONING.md) — SemVer per
   layer, Git flow + releases, content revisions with diff/restore, reversible migrations,
   plugin/theme compatibility, feature flags, environment promotion.
-- Feature request pool: [`docs/requests/`](requests/) — 24 individual requests (REQ-001…REQ-024),
+- Feature request pool: [`docs/requests/`](requests/) — individual requests (REQ-001…REQ-049),
   one per platform feature layer; mobile app intentionally not captured.
 - AI Hub design: [`docs/06-AI-HUB.md`](06-AI-HUB.md) — providers/registry/router, agent runtime,
   tool + permission + approval + audit chain, RAG, cost manager, data guard.
@@ -71,6 +74,7 @@ _Last updated: 2026-09-25_
 | 2026-09-25 | Shared the deep IAM design (enterprise RBAC/ABAC): fully custom roles; granular permissions; Discord-style role hierarchy with priority values; role inheritance; explicit allow/deny precedence; scopes (global/org/site/department/module/resource); organization → site → team model; groups; multi-role users with effective permissions; resource-level permissions; ABAC policies + visual Policy Builder; special Owner role (audited); the same role system for AI agents; service accounts/API keys; temporary roles; approval-based permissions; permission simulator; role audit history; permission-safety invariants. Crate split: `identity/`, `permissions/`, `policy-engine/`, `authorization/`, `audit/`. | Captured as [`docs/07-IAM.md`](07-IAM.md); linked from REQ-006; 04 crates list extended. |
 | 2026-09-25 | Shared the business-suite design: Odoo-style module ecosystem (CMS/website/blog/ecommerce, CRM, sales, purchases, inventory, accounting + localizations, invoicing, subscriptions, projects/tasks/timesheets, helpdesk, appointments, HR/recruitment/leaves/expenses, marketing, documents, knowledge, approvals, manufacturing) all on one Core; ledger-style inventory; e-invoice localizations for Türkiye; AI operating across modules; shared infrastructure (identity/permissions/workflow/notifications/files/audit/search/events/AI). Three-layer model: Core → Platform → Business Suite. | Captured as [`docs/08-BUSINESS-SUITE.md`](08-BUSINESS-SUITE.md); linked from REQ-008/REQ-009. |
 | 2026-09-25 | Asked for an in-depth examination of **n8n's codebase** as the reference for the Automation Engine / Workflow Builder / AI agent runtime. | Performed a real sparse checkout of n8n **v2.41.0** and produced a source-level teardown: [`docs/09-N8N-TEARDOWN.md`](09-N8N-TEARDOWN.md) — engines v1/v2, item model, expression sandboxing, task runners, queue/scaling, webhooks + HITL, DB model, AI stack; 20 adopt/avoid lessons. Linked from REQ-003/REQ-004. |
+| 2026-09-25 | Shared the platform periphery + headline features (no-code App Builder, Dynamic Data Model, Dashboard Builder, BI/Reporting, PDF documents, E-signature, Import/Export Center, Universal Command Center, Internal Developer Platform, Sandboxes, Multi-region, Air-gapped mode, Secrets Manager, Compliance Center, Advanced Audit, API Gateway, Real-time platform, per-module AI Copilots, White-label, Package Installer; headline: AI App Builder, AI Workflow Builder, AI Admin, App Marketplace, Omnion Studio). Asked: add these too. | Captured as [`docs/requests/`](requests/) — REQ-025…REQ-049; index + final synthesis updated. |
 
 ## Open questions (to resolve while gathering context)
 
