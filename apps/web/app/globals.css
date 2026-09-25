@@ -1,0 +1,32 @@
+/**
+ * Omnion public web — the renderer's own stylesheet.
+ *
+ * Deliberately tiny: presentation belongs to the active theme, whose stylesheet `layout.tsx`
+ * loads after this file. Only the reset that every page needs lives here.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+img,
+svg,
+video {
+  max-width: 100%;
+  height: auto;
+}

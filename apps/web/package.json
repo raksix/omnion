@@ -1,0 +1,26 @@
+{
+  "name": "@omnion/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Omnion public site renderer — Next.js on top of the theme engine.",
+  "scripts": {
+    "dev": "next dev --port 3200",
+    "build": "next build",
+    "start": "next start --port 3200",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@omnion/theme-minimal": "workspace:*",
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*",
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "typescript": "5.9.3"
+  }
+}
