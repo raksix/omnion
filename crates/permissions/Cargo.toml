@@ -1,0 +1,13 @@
+[package]
+name = "omnion-permissions"
+description = "Omnion permissions: permission catalogue, custom roles and scoped role bindings."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+time.workspace = true
