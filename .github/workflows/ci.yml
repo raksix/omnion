@@ -17,6 +17,31 @@ jobs:
   rust:
     name: Rust — fmt · clippy · test
     runs-on: ubuntu-latest
+    # The dev dependencies of the stack under test (infra/compose/*.yml) — the tests skip
+    # themselves when nothing is listening, so the job stays green without them.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: omnion
+          POSTGRES_PASSWORD: omnion
+          POSTGRES_DB: omnion
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U omnion -d omnion"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,6 +54,23 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Smoke test (healthz + readyz)
+        run: |
+          cargo build -p omnion-api
+          ./target/debug/omnion-api &
+          API_PID=$!
+          healthy=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz; then healthy=1; break; fi
+            sleep 1
+          done
+          if [ "$healthy" != "1" ]; then
+            echo "API did not become healthy" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:8080/readyz
+          kill "$API_PID"
 
   infra:
     name: Infra — compose config
