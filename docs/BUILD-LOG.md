@@ -191,5 +191,9 @@
   complete.
 - CI: the smoke step now also opens a tenant, a site and a domain and re-checks the anonymous 401s;
   the block was rehearsed locally against the built binary before pushing.
+- CI run `36199468683` → **success**: `Rust — fmt · clippy · test` ✅ (119 tests, including the five
+  tenancy integration tests; the smoke log shows tenant `smoke-organization`, site `main` and domain
+  `smoke.omnion.test` with `"is_primary":true` created against the CI service containers) ·
+  `Infra — compose config` ✅.
 - Next: **P05 — Content v0** (pages + revisions, draft/published, publish/restore, slug rules,
   translations skeleton).
