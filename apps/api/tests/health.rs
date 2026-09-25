@@ -1,13 +1,18 @@
 //! Integration test: the router really answers `/healthz`.
+//!
+//! Liveness must not depend on any dependency being up, so this test uses the default state
+//! (lazy, unconnected handles).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use omnion_api::routes;
+use omnion_api::state::AppState;
 use tower::ServiceExt;
 
 #[tokio::test]
 async fn healthz_reports_ok() {
-    let response = omnion_api::routes::router()
+    let response = routes::router(AppState::default())
         .oneshot(
             Request::builder()
                 .uri("/healthz")
