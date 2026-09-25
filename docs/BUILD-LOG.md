@@ -275,3 +275,47 @@
   password on `/api/v1/auth/login`). Screenshot: `/tmp/omnion_p06_pages.png`.
 - Next: **P07 — Public web v0** (`apps/web` server-side renderer for published pages + the
   `themes/minimal` stub, `GET /:slug` renders).
+
+## 2026-09-25 — P07 · Public web v0
+
+- The platform now *serves* a site, not just manages one. `crates/identity` gained
+  `find_site_by_global_key` (a key resolves platform-wide only when exactly one site carries it —
+  keys are unique per organization), and `apps/api` gained the **public surface**
+  `GET /api/v1/public/pages/{slug}`: unauthenticated, published revisions only, and no internal
+  identifiers in the payload (site key + name · page slug/type/updated_at · revision
+  number/title/body/summary/published_at).
+- Site resolution is part of the request, documented in `apps/api/src/routes/public.rs`: `?site=`
+  (a host when it contains a dot, otherwise a key) → `X-Forwarded-Host`/`Host` with the port
+  dropped → the installation's only site when there is exactly one. An address that matches
+  nothing answers `404` — and it answers the *same* `404` for "unknown" and "not published", so
+  the public surface never discloses a draft. An address that is not a slug shape is a `404` too,
+  never a `400`: the panel's validation rules stay in the panel.
+- New JavaScript side: `packages/types` (the public content shapes — types-only), `packages/theme-sdk`
+  (the theme contract: `SiteTheme`, `PageLayoutProps`, `ThemeManifest`, `defineTheme`),
+  `themes/minimal` (manifest + `PageLayout` + stylesheet; warm cream/ink/terracotta palette with a
+  light/dark pair), and `apps/web` — Next.js 16 renderer where `app/[[...slug]]/page.tsx` serves the
+  site's `home` page at `/` and any published page at `/{slug}` (`force-dynamic`, so a publish is
+  visible without a rebuild), `lib/api.ts` reads the API server-side and forwards the visitor's host
+  as the site hint unless it is a loopback address, `lib/theme.ts` is the theme registry, and
+  `lib/metadata.ts` emits title/description plus canonical and Open Graph URLs when
+  `OMNION_SITE_URL` is set. `pnpm-workspace.yaml` now includes `themes/*`.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D warnings`
+  clean · `cargo test --workspace` → **145 passed** (api unit 33 incl. the new hint/host helpers ·
+  public integration 2 · the rest unchanged) · `pnpm --filter @omnion/web run typecheck` clean ·
+  `pnpm --filter @omnion/web run build` green (`ƒ /[[...slug]]` server-rendered on demand) · root
+  `pnpm build` → turbo `2 successful, 2 total`.
+- Live walk on a fresh database (`omnion_p07_live`, dropped afterwards; API on `:18090`, renderer on
+  `:3200`): the draft answers `404` on the public surface; after publishing, the public read answers
+  `200` through `?site=main`, through `Host: p07.omnion.test` and with no hint at all (single-site
+  fallback); `GET /home` returns 7509 bytes of HTML containing the title, the body paragraph,
+  `Powered by Omnion` and `data-theme="minimal"`; `GET /` serves the home page; `GET /` with
+  `Host: p07.omnion.test` renders through the renderer's host forwarding; `/missing` and the
+  draft-only `/soon` answer the not-found view; a revision published while the renderer kept running
+  appeared in the HTML without a restart; the theme's stylesheet came back with its `--mn-accent`
+  token.
+- CI: the smoke step now also reads the published page through the public surface (by key and by the
+  site's own domain), and it creates a page that is never published to assert the public `404`. The
+  block was rehearsed locally against the built binary first (`SMOKE BLOCK REHEARSAL OK:
+  public_title=Welcome to Omnion host_title=Welcome to Omnion draft=404`).
+- Next: **P08 — Media v0** (`crates/storage` S3/MinIO abstraction, upload endpoint, media table and
+  the public serve path).

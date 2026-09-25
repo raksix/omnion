@@ -63,8 +63,9 @@
 
 ## P07 — Public web v0
 
-- [ ] `apps/web`: minimal server-side renderer for published pages; theme engine stub with `themes/minimal` (docs/03); `GET /:slug` renders.
-- [ ] **Verify:** curl a published page → HTML contains title + body. Commit + push + log.
+- [x] `apps/web`: minimal server-side renderer for published pages; theme engine stub with `themes/minimal` (docs/03); `GET /:slug` renders.
+      Public surface `GET /api/v1/public/pages/{slug}` (published revisions only; site resolved from `?site=` → `Host` → the only site), `packages/types` + `packages/theme-sdk` (theme contract) + `themes/minimal` (manifest, layout, stylesheet).
+- [x] **Verify:** curl a published page → HTML contains title + body. Commit + push + log.
 
 ## P08 — Media v0
 
