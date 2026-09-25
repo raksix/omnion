@@ -1,9 +1,12 @@
 //! Session-backed authentication extractor.
 //!
 //! Handlers ask for a [`CurrentSession`] and Axum resolves the cookie for them; a request
-//! without a valid session is rejected with `401` before the handler body runs.
+//! without a valid session is rejected with `401` before the handler body runs. Route guards
+//! (`crate::guards`) resolve the session first and hand it over through the request
+//! extensions, so a guarded handler needs no extra lookup.
 
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::request::Parts;
 use omnion_identity::sessions::{self, AuthenticatedSession};
 
@@ -22,14 +25,14 @@ pub struct CurrentSession {
     pub token: String,
 }
 
-impl FromRequestParts<AppState> for CurrentSession {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let Some(token) = cookies::session_token(&parts.headers) else {
+impl CurrentSession {
+    /// Resolve the session cookie of a request.
+    ///
+    /// `401 unauthenticated` when no cookie is present, `401 invalid_session` when the token is
+    /// unknown, expired or revoked — the two cases are distinguishable on purpose, so a client
+    /// can tell "sign in" from "your session ended".
+    pub async fn resolve(state: &AppState, headers: &HeaderMap) -> Result<Self, ApiError> {
+        let Some(token) = cookies::session_token(headers) else {
             return Err(ApiError::unauthorized(
                 "unauthenticated",
                 "sign in to continue",
@@ -51,5 +54,21 @@ impl FromRequestParts<AppState> for CurrentSession {
             session: resolved.session,
             token,
         })
+    }
+}
+
+impl FromRequestParts<AppState> for CurrentSession {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // A guard already resolved this request's session; reuse it instead of querying again.
+        if let Some(resolved) = parts.extensions.get::<Self>() {
+            return Ok(resolved.clone());
+        }
+
+        Self::resolve(state, &parts.headers).await
     }
 }

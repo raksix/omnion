@@ -30,6 +30,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 thiserror = "2"
 
+# HTTP middleware plumbing: route guards wrap handlers in the API layer.
+tower = { version = "0.5", features = ["util"] }
+
 # Identity primitives (crates/identity): typed ids and timestamps shared with SQLx, Argon2
 # password hashing, session-token generation and hashing.
 uuid = { version = "1", features = ["v4", "serde"] }

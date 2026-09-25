@@ -3,9 +3,19 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use omnion_audit::AuditError;
 use omnion_core::CoreError;
 use omnion_identity::IdentityError;
+use omnion_permissions::PermissionsError;
 use serde::Serialize;
+
+/// `true` when a database error means the dependency itself is unavailable (retryable).
+fn dependency_unavailable(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)
+    )
+}
 
 /// Error response shape used across `/api/v1`:
 /// `{"error":{"code":"internal_error","message":"…"}}`.
@@ -92,9 +102,7 @@ impl From<IdentityError> for ApiError {
         match error {
             // A pool that cannot hand out a connection is a retryable infrastructure
             // failure; everything else is an internal error the operator has to look at.
-            IdentityError::Database(
-                sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_),
-            ) => Self::new(
+            IdentityError::Database(err) if dependency_unavailable(&err) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "dependency_unavailable",
                 "database is unavailable",
@@ -104,6 +112,61 @@ impl From<IdentityError> for ApiError {
                 "internal_error",
                 other.to_string(),
             ),
+        }
+    }
+}
+
+impl From<AuditError> for ApiError {
+    fn from(error: AuditError) -> Self {
+        match error {
+            AuditError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            other => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                other.to_string(),
+            ),
+        }
+    }
+}
+
+impl From<PermissionsError> for ApiError {
+    fn from(error: PermissionsError) -> Self {
+        match error {
+            PermissionsError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            PermissionsError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            PermissionsError::RoleNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "role_not_found", "no such role")
+            }
+            PermissionsError::RoleKeyTaken => Self::new(
+                StatusCode::CONFLICT,
+                "role_key_taken",
+                "a role with this key already exists",
+            ),
+            PermissionsError::AlreadyBound => Self::new(
+                StatusCode::CONFLICT,
+                "already_bound",
+                "the role is already assigned at this scope",
+            ),
+            PermissionsError::SystemRole => Self {
+                status: StatusCode::FORBIDDEN,
+                code: "system_role",
+                message: "platform roles are managed by the platform".to_owned(),
+            },
+            // Everything else is a bad request: the caller handed in something the store
+            // cannot accept (key shape, priority range, unknown permission, bad scope).
+            other => Self::bad_request("invalid_request", other.to_string()),
         }
     }
 }

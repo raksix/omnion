@@ -45,6 +45,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("database ready and migrations applied");
 
     bootstrap_admin(&config, &db).await?;
+    seed_iam(&db).await?;
 
     let redis = RedisClient::new(&config.redis.url)?;
     if let Err(err) = redis.ping().await {
@@ -99,6 +100,35 @@ async fn bootstrap_admin(config: &Config, db: &Db) -> Result<(), omnion_identity
             }
         }
     }
+    Ok(())
+}
+
+/// Bring the IAM tables in line with the code and guarantee the Owner invariant.
+///
+/// Afterwards the permission catalogue and the six base roles exist, and when no live Owner
+/// binding is left the earliest active account receives one — an installation that bootstrapped
+/// before roles existed would otherwise be locked out of its own IAM surface
+/// (docs/07-IAM.md §20). The binding is a platform action, so it is audited as one.
+async fn seed_iam(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let report = omnion_permissions::seed::ensure(db.pool()).await?;
+    tracing::info!(
+        permissions = report.permissions,
+        roles_created = report.roles_created,
+        owner_synced = report.owner_synced,
+        "permission catalogue and base roles ready"
+    );
+
+    if let Some(user_id) = report.owner_bound {
+        omnion_audit::record(
+            db.pool(),
+            omnion_audit::NewAuditEntry::system("iam.bootstrap.owner_bound")
+                .target("user", user_id.to_string())
+                .metadata(serde_json::json!({ "role": "owner", "scope": "global" })),
+        )
+        .await?;
+        tracing::info!(%user_id, "owner role assigned to the earliest active account");
+    }
+
     Ok(())
 }
 

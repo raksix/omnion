@@ -9,15 +9,17 @@ publish = false
 [dependencies]
 axum.workspace = true
 tokio.workspace = true
+tower.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+omnion-audit = { path = "../../crates/audit" }
 omnion-core = { path = "../../crates/core" }
 omnion-identity = { path = "../../crates/identity" }
+omnion-permissions = { path = "../../crates/permissions" }
 
 [dev-dependencies]
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
