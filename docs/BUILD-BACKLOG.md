@@ -51,9 +51,9 @@
 
 ## P05 — Content v0 (docs/05 §4 + docs/01 §5)
 
-- [ ] pages + revisions (immutable rows, `revision_no`), draft/published states, publish/restore endpoints, slug rules.
-- [ ] translations table skeleton (content → translations[lang] model, NOT `title_tr` columns).
-- [ ] **Verify:** tests incl. restore-to-previous-revision. Commit + push + log.
+- [x] pages + revisions (immutable rows, `revision_no`), draft/published states, publish/restore endpoints, slug rules.
+- [x] translations table skeleton (content → translations[lang] model, NOT `title_tr` columns).
+- [x] **Verify:** tests incl. restore-to-previous-revision. Commit + push + log.
 
 ## P06 — Admin app v0
 

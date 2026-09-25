@@ -197,3 +197,43 @@
   `Infra — compose config` ✅.
 - Next: **P05 — Content v0** (pages + revisions, draft/published, publish/restore, slug rules,
   translations skeleton).
+
+## 2026-09-25 — P05 · Content v0
+
+- New crate `crates/content` (docs/05-VERSIONING.md §4–§7, docs/01-VISION.md §5, §7): `pages`
+  (slug unique per site, `page_type`, lifecycle `draft`/`published`/`archived`, a pointer at the
+  revision visitors see), `page_revisions` (append-only history with `revision_no`,
+  title/body/summary and `restored_from_id`) and `translations` (one value of one field of one
+  resource in one language — the content → translations[lang] model, no `title_tr` columns
+  anywhere).
+- The store keeps the documented rules: revision 1 is written with the page; editing content
+  appends `n + 1` and archives the draft it supersedes; publishing freezes the draft, retires
+  the revision it replaced and refuses with `no_draft_revision` when nothing is pending;
+  restoring copies an older revision forward as a new draft (recording where it came from), so
+  history is never rewritten; deleting a page takes its revisions and translation rows with it.
+  Migration `0004_content.sql`; partial unique indexes hold "at most one draft, one published"
+  in the database itself.
+- API surface: `GET|POST /api/v1/pages`, `GET|PATCH|DELETE /api/v1/pages/{id}`,
+  `POST /{id}/publish`, `POST /{id}/restore`, `GET /{id}/revisions[/{revision_id}]` and
+  `GET|PUT /{id}/revisions/{revision_id}/translations[/{language}]`, all behind the
+  `content.pages.*` guards plus the tenancy scope rule (a foreign page answers `403
+  cross_organization`); every state change writes an audit row (`page.created`, `page.updated`,
+  `page.published`, `page.revision.restored`, `page.translation.updated`, `page.deleted`).
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `cargo test --workspace` → **140 passed** (content crate 12 unit · api
+  content routes 3 unit · 5 content integration against the compose stack). Live run on `:18083`
+  against a fresh database (dropped afterwards): page `home` created as v1 draft; publish →
+  `published_rev=1`; edit → v2 draft while v1 stayed live; publish → v2; re-publish →
+  `no_draft_revision`; restore v1 → v3 draft with `restored_from=<v1>`; publish → v3 live;
+  history `v3 published / v2 archived / v1 archived` with v1's row unchanged;
+  `PUT .../translations/tr` → `tr/title = Merhaba`, `tr/body = Gövde`; anonymous `/api/v1/pages`
+  → `401 unauthenticated`; `_sqlx_migrations` shows version 4 `content`; `audit_log` carries the
+  seven `page.*` actions with revision numbers.
+- CI: the smoke step now walks the content surface (create → publish → edit → publish → restore
+  → translation) and re-checks the anonymous 401. Run `36200626747` → **success** (Rust job
+  1m31s; the smoke log shows the page created as a draft, revised to "Welcome to Omnion", and
+  the restore row `revision_no: 3, state: draft, restored_from_id: …`) · `Infra — compose
+  config` ✅.
+- Next: **P06 — Admin app v0** (`apps/admin` Next.js + TS + Tailwind with the API-wired login,
+  app shell, pages list and site switcher; root `package.json` + `pnpm-workspace.yaml` +
+  `turbo.json` skeleton).
