@@ -23,6 +23,8 @@ _Last updated: 2026-09-25_
   multi-tenant, headless-capable platform/CMS.
 - Technical architecture & stack direction: [`docs/02-ARCHITECTURE.md`](02-ARCHITECTURE.md) —
   modular monolith (Rust/Axum), Docker → Kubernetes deployment path, WASM plugin runtime.
+- Frontend & theme system: [`docs/03-FRONTEND.md`](03-FRONTEND.md) — Next.js/React/TS admin
+  panel + public theme engine, 10 default themes, block editor, Theme Builder, theme SDK.
 
 ## Hard rules (owner directives)
 
@@ -46,6 +48,7 @@ _Last updated: 2026-09-25_
 | 2026-09-25 | "We are not building the project now — we'll gather context; just save my directives into docs." | This file created; build paused. |
 | 2026-09-25 | Shared the target architecture vision: corporate, multi-tenant, headless-capable CMS — Odoo-style module system, LDAP/AD/SAML/OAuth2/OIDC + MFA, theme system + theme API, i18n + Translation Center + Translation Memory, Content Type Builder, workflow + audit log, RBAC permissions, multi-site vs multi-tenant split, API-first (REST/GraphQL/Webhooks/Events), event system. | Captured as [`docs/01-VISION.md`](01-VISION.md); pointer added above. |
 | 2026-09-25 | Fixed the technical direction: modular monolith (no microservices on day one), preferred stack Rust + Axum + Tokio + SQLx + PostgreSQL + Redis + S3/MinIO + Next.js/React/TS + Docker/Kubernetes + OpenTelemetry + WASM plugin runtime; Docker Compose → Helm chart deployment path; versioned API (`/api/v1`) + OpenAPI SDK generation; positioning as an open-source enterprise application platform with a powerful CMS at its core. | Captured as [`docs/02-ARCHITECTURE.md`](02-ARCHITECTURE.md); positioning + pointers + open questions updated. |
+| 2026-09-25 | Fixed the frontend direction: Next.js + React + TypeScript for both the admin panel and public sites (separate apps); WordPress-style theme system with 10 high-quality default themes, visual Theme Builder, Gutenberg-style block editor, strict theme/content separation, `omnion create-theme` SDK + theme API, shared `@omnion/ui` kit (theme-overridable), and a future Omnion Marketplace. | Captured as [`docs/03-FRONTEND.md`](03-FRONTEND.md); pointer added. |
 
 ## Open questions (to resolve while gathering context)
 
@@ -58,6 +61,8 @@ _Last updated: 2026-09-25_
   theme API, LDAP architecture, translation system, Docker/K8s manifests) — stack direction is
   set ([`docs/02-ARCHITECTURE.md`](02-ARCHITECTURE.md)); the detailed blueprint is the
   next-step deliverable.
+- Omnion Marketplace scope/timing (third-party theme & plugin distribution) — after the core
+  platform is stable.
 
 ## How to work with this file
 
