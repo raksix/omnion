@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-minimal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Omnion's Minimal theme — one quiet, typographic column for public sites.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/minimal.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

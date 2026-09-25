@@ -1,0 +1,170 @@
+/**
+ * Minimal — the stylesheet of Omnion's Minimal theme.
+ *
+ * A theme owns its presentation completely: canvas, type scale, spacing and the light/dark
+ * pair all live here, and the renderer's own stylesheet is loaded before this one so the theme
+ * always has the last word. Warm palette on purpose (cream, ink, terracotta) to match the
+ * platform's design language.
+ */
+
+:root {
+  --mn-canvas: #faf9f5;
+  --mn-surface: #ffffff;
+  --mn-ink: #262624;
+  --mn-muted: #6b6560;
+  --mn-line: #e8e4dc;
+  --mn-accent: #c96442;
+  --mn-accent-soft: #f7e9e2;
+
+  --mn-font-body:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  --mn-font-title: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+
+  --mn-measure: 42rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mn-canvas: #211f1d;
+    --mn-surface: #26241f;
+    --mn-ink: #edeae4;
+    --mn-muted: #a8a29a;
+    --mn-line: #3a3631;
+    --mn-accent: #d97b57;
+    --mn-accent-soft: #3a2a23;
+  }
+}
+
+html {
+  background-color: var(--mn-canvas);
+  color-scheme: light dark;
+}
+
+body {
+  background-color: var(--mn-canvas);
+  color: var(--mn-ink);
+  font-family: var(--mn-font-body);
+  font-size: 17px;
+  line-height: 1.7;
+}
+
+::selection {
+  background-color: var(--mn-accent-soft);
+}
+
+a {
+  color: var(--mn-accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--mn-accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.mn-shell {
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 1.5rem;
+}
+
+.mn-header,
+.mn-footer {
+  display: flex;
+  width: 100%;
+  max-width: var(--mn-measure);
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.5rem 0;
+  font-size: 0.875rem;
+  color: var(--mn-muted);
+}
+
+.mn-header {
+  border-bottom: 1px solid var(--mn-line);
+}
+
+.mn-footer {
+  margin-top: 4rem;
+  border-top: 1px solid var(--mn-line);
+  padding-bottom: 2.5rem;
+}
+
+.mn-brand {
+  color: var(--mn-ink);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.mn-brand:hover {
+  color: var(--mn-accent);
+}
+
+.mn-kind {
+  border: 1px solid var(--mn-line);
+  border-radius: 999px;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mn-main {
+  width: 100%;
+  max-width: var(--mn-measure);
+  flex: 1;
+}
+
+.mn-article {
+  padding-top: 3.5rem;
+}
+
+.mn-title {
+  margin: 0;
+  font-family: var(--mn-font-title);
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+
+.mn-summary {
+  margin: 1rem 0 0;
+  font-size: 1.125rem;
+  color: var(--mn-muted);
+}
+
+.mn-meta {
+  margin: 1.25rem 0 0;
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+  color: var(--mn-muted);
+}
+
+.mn-body {
+  margin-top: 2.5rem;
+}
+
+.mn-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.mn-body p:last-child {
+  margin-bottom: 0;
+}
+
+/* The not-found view reuses the same shell, with the article as its only column. */
+.mn-article .mn-summary a {
+  color: var(--mn-accent);
+}
