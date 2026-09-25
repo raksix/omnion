@@ -56,5 +56,9 @@
   community mirror `pgsty/minio` — the same server binary.
 - CI: the Rust job now provisions PostgreSQL + Redis service containers (so the readiness integration
   tests run for real) and adds a smoke step that boots the API and curls `/healthz` + `/readyz`.
+- CI run `36195108450` → **success** (Rust job `1m51s`, Infra job `5s`): the readyz suite passed 3/3
+  against the service containers and the smoke step logged `listening address=0.0.0.0:8080`,
+  `{"ok":true,…}` for `/healthz`, `{"checks":{"database":{"status":"ok"},"redis":{"status":"ok"}}}` for
+  `/readyz`, then `shutdown signal received` after SIGTERM.
 - Next: **P02 — Identity v0** (users + argon2, sessions, login/logout, first-admin bootstrap,
   integration tests).
