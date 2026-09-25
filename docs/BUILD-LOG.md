@@ -62,3 +62,37 @@
   `/readyz`, then `shutdown signal received` after SIGTERM.
 - Next: **P02 — Identity v0** (users + argon2, sessions, login/logout, first-admin bootstrap,
   integration tests).
+
+## 2026-09-25 — P02 · Identity v0
+
+- New crate `crates/identity` (docs/07-IAM.md subset): `users` (create/find by email or id,
+  lowercase-normalized addresses, case-insensitive uniqueness), `password` (Argon2id hashing on the
+  blocking pool, minimum length policy, `dummy_verify` so unknown addresses burn the same work as
+  wrong passwords), `sessions` (256-bit hex tokens; only the SHA-256 hash is stored; 30-day TTL;
+  resolve/touch/revoke) and `authentication` (`authenticate` returns Authenticated /
+  InvalidCredentials / AccountDisabled — account status is only disclosed after the password
+  verified).
+- `crates/core` config gains `OMNION_ADMIN_EMAIL` + `OMNION_ADMIN_PASSWORD` (both-or-neither
+  validation, password redacted from `Debug`); `apps/api` boot now seeds the first administrator on
+  an empty database (`bootstrap_first_admin`, idempotent and race-safe) and logs why it skipped
+  otherwise.
+- API surface: `POST /api/v1/auth/login` (session cookie `omnion_session`, HttpOnly + SameSite=Lax,
+  `Secure` outside development, Max-Age 30 days) · `GET /api/v1/me` — backed by a `CurrentSession`
+  extractor (401 `unauthenticated` / `invalid_session`) · `POST /api/v1/auth/logout` (204, revokes and
+  clears). Identity errors map onto the HTTP surface through `ApiError` (exhausted pool → 503).
+  `ClientAddress` extractor captures the peer IP for `sessions.ip_address` without requiring
+  connect-info (axum has no optional `ConnectInfo`), and the server is served with
+  `into_make_service_with_connect_info`.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D warnings`
+  clean · `cargo test --workspace` → **65 passed** (identity 18 · core 23 · api unit 14 · health 1 ·
+  readyz 3 · auth integration 6 — including bootstrap on a throwaway database and revoke-after-logout)
+  · live run on `:18080` against the compose stack: boot log `first administrator account created`,
+  `/healthz` 200, `/readyz` 200 both checks ok, login 200 + `set-cookie: omnion_session=…; Path=/;
+  HttpOnly; SameSite=Lax; Max-Age=2592000` with a 64-char token, `/me` 200 with the account JSON,
+  `/me` without cookie 401 `unauthenticated`, logout 204 + `Max-Age=0`, replayed revoked token 401
+  `invalid_session`, wrong password 401 `invalid_credentials`; database check: `admin@omnion.test`
+  row with `$argon2id$v=19$…`, one session row with a hash that is not the token, `revoked = t`,
+  `seen = t`.
+- CI: the smoke step now seeds the admin and walks login → me → anonymous 401 → logout.
+- Next: **P03 — IAM v0** (roles, permissions, role bindings, `require(permission)` guard, audit
+  writes, role seeds from docs/07 §3).

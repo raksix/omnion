@@ -32,10 +32,10 @@
 
 ## P02 — Identity v0 (docs/07 subset)
 
-- [ ] Users (+ argon2 hashing), sessions, `POST /api/v1/auth/login`, `GET /api/v1/me`, `POST /api/v1/auth/logout`.
-- [ ] First-admin bootstrap on empty DB (env `OMNION_ADMIN_EMAIL` / `OMNION_ADMIN_PASSWORD`, hashed at boot).
-- [ ] Integration tests against compose DB.
-- [ ] **Verify:** curl login → cookie → me flow; tests green. Commit + push + log.
+- [x] Users (+ argon2 hashing), sessions, `POST /api/v1/auth/login`, `GET /api/v1/me`, `POST /api/v1/auth/logout`.
+- [x] First-admin bootstrap on empty DB (env `OMNION_ADMIN_EMAIL` / `OMNION_ADMIN_PASSWORD`, hashed at boot).
+- [x] Integration tests against compose DB.
+- [x] **Verify:** curl login → cookie → me flow; tests green. Commit + push + log.
 
 ## P03 — IAM v0 (docs/07)
 
