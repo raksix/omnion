@@ -117,6 +117,29 @@ impl LogConfig {
     }
 }
 
+/// First-administrator bootstrap (docs/07-IAM.md).
+///
+/// Both values must come from the environment together. The API creates the account only
+/// when the `users` table is still empty, so this is a one-shot seed for a fresh install —
+/// the password is hashed at boot and never stored or logged in plain text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminBootstrap {
+    /// Email address of the first administrator (`OMNION_ADMIN_EMAIL`).
+    pub email: String,
+    /// Plaintext password (`OMNION_ADMIN_PASSWORD`), hashed before it reaches the database.
+    pub password: String,
+}
+
+impl std::fmt::Debug for AdminBootstrap {
+    /// Never renders the password — configuration is logged at boot.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminBootstrap")
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// HTTP listener configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpConfig {
@@ -196,6 +219,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// Redis.
     pub redis: RedisConfig,
+    /// Optional first-administrator bootstrap.
+    pub admin: Option<AdminBootstrap>,
     /// Logging.
     pub log: LogConfig,
 }
@@ -253,6 +278,23 @@ impl Config {
             url: read("OMNION_REDIS_URL").unwrap_or_else(|| DEFAULT_REDIS_URL.to_owned()),
         };
 
+        let admin = match (read("OMNION_ADMIN_EMAIL"), read("OMNION_ADMIN_PASSWORD")) {
+            (Some(email), Some(password)) => Some(AdminBootstrap { email, password }),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(ConfigError::invalid(
+                    "OMNION_ADMIN_PASSWORD",
+                    "set it together with OMNION_ADMIN_EMAIL (both or neither)",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::invalid(
+                    "OMNION_ADMIN_EMAIL",
+                    "set it together with OMNION_ADMIN_PASSWORD (both or neither)",
+                ));
+            }
+        };
+
         let format = match read("OMNION_LOG_FORMAT") {
             Some(raw) => LogFormat::parse(&raw)?,
             None if env.is_development() => LogFormat::Pretty,
@@ -268,6 +310,7 @@ impl Config {
             http: HttpConfig { host, port },
             database,
             redis,
+            admin,
             log,
         };
         config.validate()?;
@@ -299,6 +342,7 @@ impl Default for Config {
             redis: RedisConfig {
                 url: DEFAULT_REDIS_URL.to_owned(),
             },
+            admin: None,
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
     }
@@ -390,5 +434,42 @@ mod tests {
         let error = config_from(&[("OMNION_DB_MAX_CONNECTIONS", "0")])
             .expect_err("pool size must be positive");
         assert_eq!(error.key, "OMNION_DB_MAX_CONNECTIONS");
+    }
+
+    #[test]
+    fn admin_bootstrap_needs_both_values() {
+        let error = config_from(&[("OMNION_ADMIN_EMAIL", "admin@example.com")])
+            .expect_err("an email without a password must be rejected");
+        assert_eq!(error.key, "OMNION_ADMIN_PASSWORD");
+
+        let error = config_from(&[("OMNION_ADMIN_PASSWORD", "change-me-please-123")])
+            .expect_err("a password without an email must be rejected");
+        assert_eq!(error.key, "OMNION_ADMIN_EMAIL");
+    }
+
+    #[test]
+    fn admin_bootstrap_loads_and_redacts_the_password() {
+        let config = config_from(&[
+            ("OMNION_ADMIN_EMAIL", "admin@example.com"),
+            ("OMNION_ADMIN_PASSWORD", "change-me-please-123"),
+        ])
+        .expect("both values together are valid");
+
+        let admin = config.admin.expect("bootstrap must be configured");
+        assert_eq!(admin.email, "admin@example.com");
+        assert_eq!(admin.password, "change-me-please-123");
+
+        let rendered = format!("{admin:?}");
+        assert!(
+            !rendered.contains("change-me-please-123"),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn admin_bootstrap_is_absent_by_default() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.admin.is_none());
     }
 }
