@@ -1,0 +1,20 @@
+# Mailpit — local SMTP sink and web inbox for development mail.
+# Web inbox: http://localhost:${OMNION_MAILPIT_UI_PORT:-8025}
+services:
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: omnion-mailpit
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    ports:
+      - "${OMNION_SMTP_PORT:-1025}:1025"
+      - "${OMNION_MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:8025/livez || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 20

@@ -1,0 +1,20 @@
+# Omnion — development stack.
+#
+#   docker compose -f infra/compose/docker-compose.dev.yml up -d
+#
+# Brings up everything the API and the Next.js apps need locally (docs/02-ARCHITECTURE.md):
+# PostgreSQL, Redis, MinIO (S3-compatible object storage) and Mailpit (local SMTP sink).
+#
+# Host ports are overridable through OMNION_* variables with non-default fallbacks, so the
+# stack also runs on machines that already use the standard ports:
+#   OMNION_POSTGRES_PORT (default 5433) · OMNION_REDIS_PORT (default 6380)
+#   OMNION_MINIO_PORT (default 9000) · OMNION_MINIO_CONSOLE_PORT (default 9001)
+#   OMNION_SMTP_PORT (default 1025) · OMNION_MAILPIT_UI_PORT (default 8025)
+
+name: omnion
+
+include:
+  - postgres.yml
+  - redis.yml
+  - minio.yml
+  - mailpit.yml

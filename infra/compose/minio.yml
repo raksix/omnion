@@ -1,0 +1,19 @@
+# MinIO — S3-compatible object storage for media and other uploaded files.
+# Console: http://localhost:${OMNION_MINIO_CONSOLE_PORT:-9001}
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: omnion-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${OMNION_S3_ACCESS_KEY:-omnion}
+      MINIO_ROOT_PASSWORD: ${OMNION_S3_SECRET_KEY:-omnion-dev-secret}
+    ports:
+      - "${OMNION_MINIO_PORT:-9000}:9000"
+      - "${OMNION_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+volumes:
+  minio-data:
