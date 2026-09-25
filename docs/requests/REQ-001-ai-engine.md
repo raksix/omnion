@@ -30,6 +30,8 @@ Give the platform a dedicated **Omnion AI Engine**:
 ## Notes
 
 - Lives under `modules/` — the Core stays thin.
+- Full design: [`docs/06-AI-HUB.md`](../06-AI-HUB.md) — providers, model registry, model
+  router, agents, tools, permissions, approvals, RAG, cost manager, data guard.
 - Reuses the provider-abstraction pattern planned for translation (docs/01-VISION.md, §5).
 - Natural-language admin operations build on the command palette (REQ-002) and the
   automation engine (REQ-003).
