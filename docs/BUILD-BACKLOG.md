@@ -57,9 +57,9 @@
 
 ## P06 — Admin app v0
 
-- [ ] `apps/admin`: Next.js + TS + Tailwind; login page (API-wired), app shell, pages list, site switcher (read-only ok).
-- [ ] Root `package.json` + `pnpm-workspace.yaml` + `turbo.json` skeleton (docs/04).
-- [ ] **Verify:** production build green; dev server serves; login works against local API. Commit + push + log.
+- [x] `apps/admin`: Next.js + TS + Tailwind; login page (API-wired), app shell, pages list, site switcher (read-only ok).
+- [x] Root `package.json` + `pnpm-workspace.yaml` + `turbo.json` skeleton (docs/04).
+- [x] **Verify:** production build green; dev server serves; login works against local API. Commit + push + log.
 
 ## P07 — Public web v0
 

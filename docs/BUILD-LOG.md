@@ -237,3 +237,41 @@
 - Next: **P06 — Admin app v0** (`apps/admin` Next.js + TS + Tailwind with the API-wired login,
   app shell, pages list and site switcher; root `package.json` + `pnpm-workspace.yaml` +
   `turbo.json` skeleton).
+
+## 2026-09-25 — P06 · Admin app v0
+
+- The JavaScript/TypeScript side of the monorepo is alive: root `package.json` +
+  `pnpm-workspace.yaml` (`apps/*`, `packages/*`) + `turbo.json` (`build`/`dev`/`typecheck`), so
+  `pnpm build` at the root builds every app through turbo (verified: `1 successful, 1 total`).
+- New app `apps/admin/` (Next.js 16 + React 19 + TypeScript 5.9 + Tailwind v4, docs/03-FRONTEND.md):
+  the app shell (sidebar sections, sticky header with the current screen, mobile drawer), an
+  API-wired sign-in screen, an overview screen with live workspace totals and the account card,
+  the pages list of the selected site (state filter, live/draft revision per row, reload, empty
+  and error states) and the sites list.
+- Same-origin API access: `next.config.ts` forwards `/api/*` to `OMNION_API_URL` (default
+  `http://127.0.0.1:8080`), so the API's HttpOnly session cookie stays first-party and no CORS
+  rule is needed; a deployment only has to route `/api/*` at the edge.
+- Session handling is server-first. `proxy.ts` (Next.js 16's renamed `middleware.ts`) turns
+  visitors without a session cookie away from panel routes with a `307` to `/login`, the root
+  layout resolves the account through `GET /api/v1/me` with the request's own cookie, and the
+  client provider starts from that answer — the browser never probes the session itself, which
+  keeps the console clean and shows no flash of protected UI.
+- Tailwind v4 with `source(none)` + explicit `@source` roots: the repository also carries a Rust
+  `target/` tree, so automatic content detection stays off and the app declares its own folders.
+- Proof: `pnpm install` (2 workspace projects) · `pnpm --filter @omnion/admin run typecheck`
+  clean · `pnpm --filter @omnion/admin run build` green (7 routes; `ƒ Proxy (Middleware)`) ·
+  root `pnpm build` → turbo `1 successful, 1 total` · the compiled stylesheet carries the
+  utilities the screens use (`bg-canvas`, `text-muted`, `border-line`, `sm:grid-cols-3`,
+  `hover:bg-canvas`, …). Live walk on `:3100` against a fresh database (`omnion_p06_live`,
+  dropped afterwards) with the API on `:8080`: seeded one tenant → one site → two pages (one
+  published with a newer draft, one draft-only) through the API, then drove the panel in a real
+  browser (Playwright): anonymous `/` → **307** to `/login`; a wrong password shows the API's
+  own refusal (`email or password is incorrect`); the bootstrap account signs in and lands on
+  the overview with totals `1 site / 2 pages / 1 published`; the switcher lists the site; the
+  pages list shows `/home · live v1 · draft v2` and `/about · not published · draft v1`; the
+  state filter narrows the list to the published page; the sites list marks the selected site;
+  sign-out clears the cookie and a guarded route answers with `/login`. **17/17 checks passed,
+  0 console errors** (the only rejected request in the whole walk is the deliberate wrong
+  password on `/api/v1/auth/login`). Screenshot: `/tmp/omnion_p06_pages.png`.
+- Next: **P07 — Public web v0** (`apps/web` server-side renderer for published pages + the
+  `themes/minimal` stub, `GET /:slug` renders).
