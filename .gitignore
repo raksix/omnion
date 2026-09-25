@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Builds
+dist/
+build/
+.next/
+out/
+
+# Env / secrets
+.env
+.env.*
+*.local
+!.env.example
+
+# Logs & caches
+*.log
+logs/
+.cache/
+.DS_Store
