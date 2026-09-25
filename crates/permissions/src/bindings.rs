@@ -172,7 +172,8 @@ pub async fn count_live_for_role(pool: &PgPool, role_id: Uuid) -> Result<i64> {
 }
 
 /// Validate a binding before it is written: the role must exist and may only be used inside
-/// its own organization, and the account must exist.
+/// its own organization, the account must exist, and a site scope must name a site that exists
+/// and belongs to the scope's organization.
 pub async fn validate(pool: &PgPool, new: &NewBinding) -> Result<()> {
     let role = roles::find_role(pool, new.role_id)
         .await?
@@ -184,6 +185,32 @@ pub async fn validate(pool: &PgPool, new: &NewBinding) -> Result<()> {
         return Err(PermissionsError::InvalidBinding(
             "the role belongs to another organization".to_owned(),
         ));
+    }
+
+    if let Scope::Site {
+        organization_id,
+        site_id,
+    } = new.scope
+    {
+        let site_organization: Option<Uuid> =
+            sqlx::query_scalar("select organization_id from sites where id = $1")
+                .bind(site_id)
+                .fetch_optional(pool)
+                .await?;
+        match site_organization {
+            None => {
+                return Err(PermissionsError::InvalidBinding("unknown site".to_owned()));
+            }
+            Some(site_organization)
+                if organization_id
+                    .is_some_and(|organization_id| organization_id != site_organization) =>
+            {
+                return Err(PermissionsError::InvalidBinding(
+                    "the site belongs to another organization".to_owned(),
+                ));
+            }
+            Some(_) => {}
+        }
     }
 
     let account_exists: bool =
