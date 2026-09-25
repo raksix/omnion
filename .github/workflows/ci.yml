@@ -158,6 +158,33 @@ jobs:
             kill "$API_PID" 2>/dev/null || true
             exit 1
           fi
+          # Public surface: the site renderer reads published content without any session, the
+          # site resolves by key and by its own domain, and drafts stay private.
+          public_title=$(curl -fsS "http://127.0.0.1:8080/api/v1/public/pages/home?site=main" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"]["title"])')
+          if [ "$public_title" != "Welcome to Omnion" ]; then
+            echo "the public read must serve the published revision, got $public_title" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          host_title=$(curl -fsS -H 'Host: smoke.omnion.test' \
+            http://127.0.0.1:8080/api/v1/public/pages/home \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"]["title"])')
+          if [ "$host_title" != "Welcome to Omnion" ]; then
+            echo "the site's own domain must resolve the request, got $host_title" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d "{\"site_id\":\"$site_id\",\"slug\":\"unpublished\",\"title\":\"Not yet\"}" \
+            http://127.0.0.1:8080/api/v1/pages >/dev/null
+          draft_code=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:8080/api/v1/public/pages/unpublished)
+          if [ "$draft_code" != "404" ]; then
+            echo "an unpublished page must answer 404 on the public surface, got $draft_code" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
