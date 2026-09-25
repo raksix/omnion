@@ -124,6 +124,40 @@ jobs:
               exit 1
             fi
           done
+          # Content: the Owner drafts a page, publishes it, revises it and restores the first
+          # revision — the history survives and nothing is rewritten.
+          page_id=$(curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d "{\"site_id\":\"$site_id\",\"slug\":\"home\",\"title\":\"Welcome\"}" \
+            http://127.0.0.1:8080/api/v1/pages | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          first_revision=$(curl -fsS -b /tmp/omnion-cookies.txt \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id/revisions" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revisions"][0]["id"])')
+          curl -fsS -b /tmp/omnion-cookies.txt -X POST \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id/publish" | head -c 220
+          echo
+          curl -fsS -b /tmp/omnion-cookies.txt -X PATCH -H 'content-type: application/json' \
+            -d '{"title":"Welcome to Omnion"}' \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id" | head -c 220
+          echo
+          curl -fsS -b /tmp/omnion-cookies.txt -X POST \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id/publish" >/dev/null
+          curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d "{\"revision_id\":\"$first_revision\"}" \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id/restore" | head -c 220
+          echo
+          curl -fsS -b /tmp/omnion-cookies.txt \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id/revisions" | head -c 400
+          echo
+          curl -fsS -b /tmp/omnion-cookies.txt -X PUT -H 'content-type: application/json' \
+            -d '{"title":"Merhaba"}' \
+            "http://127.0.0.1:8080/api/v1/pages/$page_id/revisions/$first_revision/translations/tr" | head -c 220
+          echo
+          # … and the content routes stay closed without a session.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080/api/v1/pages?site_id=$site_id")
+          if [ "$code" != "401" ]; then
+            echo "anonymous /api/v1/pages must be rejected with 401, got $code" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
