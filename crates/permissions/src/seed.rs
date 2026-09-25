@@ -90,6 +90,11 @@ const BASE_ROLES: &[BaseRole] = &[
             "deployment.read",
             "deployment.preview",
             "audit.read",
+            "organizations.read",
+            "sites.read",
+            "sites.create",
+            "sites.update",
+            "domains.manage",
         ]),
     },
     BaseRole {
@@ -107,6 +112,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.update",
             "users.read",
             "audit.read",
+            "sites.read",
         ]),
     },
     BaseRole {
@@ -123,6 +129,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.read",
             "media.upload",
             "media.update",
+            "sites.read",
         ]),
     },
     BaseRole {
@@ -360,6 +367,37 @@ mod tests {
         assert!(
             owner.permissions.keys().contains(&"iam.roles.manage"),
             "the owner role must be able to manage roles"
+        );
+    }
+
+    #[test]
+    fn the_tenancy_keys_reach_the_operational_roles() {
+        // P04: the site switcher and site settings need `sites.read`; the manager ladder edits
+        // sites and their domains; the member role stays content-and-media read-only.
+        let keys_of = |key: &str| {
+            BASE_ROLES
+                .iter()
+                .find(|base| base.key == key)
+                .expect("base role exists")
+                .permissions
+                .keys()
+        };
+
+        for role in ["manager", "moderator", "editor"] {
+            assert!(keys_of(role).contains(&"sites.read"), "{role} reads sites");
+        }
+        for key in [
+            "organizations.read",
+            "sites.read",
+            "sites.create",
+            "sites.update",
+            "domains.manage",
+        ] {
+            assert!(keys_of("manager").contains(&key), "manager holds {key}");
+        }
+        assert!(
+            !keys_of("member").contains(&"sites.read"),
+            "members stay on content and media"
         );
     }
 

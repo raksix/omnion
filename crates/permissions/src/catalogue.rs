@@ -6,7 +6,7 @@
 //! outside the catalogue is a bug, and the store rejects it.
 //!
 //! Categories group the keys for the admin UI (`content`, `media`, `users`, `plugins`,
-//! `deployment`, `iam`, `audit`).
+//! `deployment`, `iam`, `audit`, `tenancy`).
 
 /// A single permission the platform understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +189,44 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "audit",
         description: "Read the audit trail",
     },
+    // Tenancy (docs/01-VISION.md §10, docs/07-IAM.md §7): organizations, their sites and the
+    // domains that address them. `organizations.manage` covers opening and editing tenants;
+    // the platform surface stays with the Owner/Administrator ladder.
+    PermissionDef {
+        key: "organizations.read",
+        category: "tenancy",
+        description: "Read organizations",
+    },
+    PermissionDef {
+        key: "organizations.manage",
+        category: "tenancy",
+        description: "Create and edit organizations",
+    },
+    PermissionDef {
+        key: "sites.read",
+        category: "tenancy",
+        description: "Read sites and their domains",
+    },
+    PermissionDef {
+        key: "sites.create",
+        category: "tenancy",
+        description: "Create sites",
+    },
+    PermissionDef {
+        key: "sites.update",
+        category: "tenancy",
+        description: "Edit sites",
+    },
+    PermissionDef {
+        key: "sites.delete",
+        category: "tenancy",
+        description: "Delete sites",
+    },
+    PermissionDef {
+        key: "domains.manage",
+        category: "tenancy",
+        description: "Add, remove and promote site domains",
+    },
 ];
 
 /// Look a permission up by key.
@@ -261,8 +299,40 @@ mod tests {
             "deployment",
             "iam",
             "audit",
+            "tenancy",
         ] {
             assert!(categories.contains(expected), "missing category {expected}");
+        }
+    }
+
+    #[test]
+    fn the_tenancy_family_is_catalogued() {
+        // docs/01-VISION.md §10 (multi-site vs multi-tenant) and docs/07-IAM.md §7: sites and
+        // the domains that address them are first-class, so the keys that guard them are too.
+        for key in [
+            "organizations.read",
+            "organizations.manage",
+            "sites.read",
+            "sites.create",
+            "sites.update",
+            "sites.delete",
+            "domains.manage",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+        }
+
+        for key in [
+            "organizations.manage",
+            "sites.create",
+            "sites.update",
+            "sites.delete",
+            "domains.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("tenancy"),
+                "{key} belongs to the tenancy category"
+            );
         }
     }
 
