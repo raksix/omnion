@@ -24,3 +24,8 @@ Priority: Critical
 Response SLA: 30 min
 Resolution SLA: 4 hours
 ```
+
+## Notes
+
+- Part of the broader business suite — [`docs/08-BUSINESS-SUITE.md`](../08-BUSINESS-SUITE.md)
+  (which defines tiered SLAs: Critical 1h / High 4h / Normal 24h).

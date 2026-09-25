@@ -31,3 +31,9 @@ modules/
 ├── subscriptions/
 └── support/
 ```
+
+## Notes
+
+- Part of the broader business suite — [`docs/08-BUSINESS-SUITE.md`](../08-BUSINESS-SUITE.md)
+  (CRM, Sales, Inventory, Accounting, HR, Projects, Helpdesk, Marketing, Documents, Knowledge,
+  Approvals).

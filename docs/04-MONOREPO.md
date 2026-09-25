@@ -51,7 +51,8 @@ omnion/
 │   ├── ecommerce/
 │   ├── crm/
 │   ├── hr/
-│   └── documentation/
+│   ├── documentation/
+│   └── ...                     # full ecosystem: docs/08-BUSINESS-SUITE.md
 │
 ├── themes/
 │   ├── corporate/
