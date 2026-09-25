@@ -2,7 +2,7 @@
 
 Project workspace for **Omnion** — anchored at `/mnt/apopic/omnion`.
 
-> Status: fresh scaffold (2026-09-25). Purpose, stack and roadmap to be defined.
+> Status: scaffold (2026-09-25). Purpose: **CMS (content management system) panel**. Stack and roadmap to be defined.
 
 ## Structure
 
@@ -15,7 +15,7 @@ Project workspace for **Omnion** — anchored at `/mnt/apopic/omnion`.
 
 - Documentation, code comments and commit messages in English (chat stays Turkish).
 - Commits: small, atomic, imperative subject lines; push immediately.
-- Private repo by default.
+- **Public repo** — never commit secrets, credentials or large media files (GitHub ToS); media belongs on the app's own storage/CDN.
 
 ## Housekeeping
 
