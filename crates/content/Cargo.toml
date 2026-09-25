@@ -1,0 +1,13 @@
+[package]
+name = "omnion-content"
+description = "Omnion content: pages, their revision history and translation rows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+time.workspace = true

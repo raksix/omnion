@@ -964,6 +964,7 @@ dependencies = [
  "axum",
  "http-body-util",
  "omnion-audit",
+ "omnion-content",
  "omnion-core",
  "omnion-identity",
  "omnion-permissions",
@@ -982,6 +983,16 @@ name = "omnion-audit"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sqlx",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-content"
+version = "0.1.0"
+dependencies = [
  "sqlx",
  "thiserror",
  "time",
