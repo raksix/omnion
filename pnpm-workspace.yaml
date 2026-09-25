@@ -1,0 +1,7 @@
+# Omnion monorepo — pnpm workspace (docs/04-MONOREPO.md).
+#
+# The Rust side is a Cargo workspace at the repository root; the JavaScript/TypeScript side
+# is this pnpm workspace. `apps/api` has no package.json, so pnpm simply skips it.
+packages:
+  - "apps/*"
+  - "packages/*"
