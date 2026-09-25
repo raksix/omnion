@@ -54,7 +54,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Smoke test (healthz + readyz)
+      - name: Smoke test (healthz, readyz, identity flow)
+        env:
+          # Seeds the first administrator on the freshly migrated CI database.
+          OMNION_ADMIN_EMAIL: admin@example.com
+          OMNION_ADMIN_PASSWORD: smoke-test-admin-password
         run: |
           cargo build -p omnion-api
           ./target/debug/omnion-api &
@@ -70,6 +74,21 @@ jobs:
             exit 1
           fi
           curl -fsS http://127.0.0.1:8080/readyz
+          echo
+          # Identity: the bootstrapped account signs in, reads /me and signs out again.
+          curl -fsS -c /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d '{"email":"admin@example.com","password":"smoke-test-admin-password"}' \
+            http://127.0.0.1:8080/api/v1/auth/login
+          echo
+          curl -fsS -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/me
+          echo
+          anonymous=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/me)
+          if [ "$anonymous" != "401" ]; then
+            echo "anonymous /me must be rejected with 401, got $anonymous" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
   infra:
