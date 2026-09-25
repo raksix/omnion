@@ -317,5 +317,9 @@
   site's own domain), and it creates a page that is never published to assert the public `404`. The
   block was rehearsed locally against the built binary first (`SMOKE BLOCK REHEARSAL OK:
   public_title=Welcome to Omnion host_title=Welcome to Omnion draft=404`).
+- CI run `36202889332` → **success**: `Rust — fmt · clippy · test` ✅ (the public integration suite
+  ran in CI — `Running tests/public.rs` → `2 passed` — and the smoke log prints the public evidence:
+  `public surface: title="Welcome to Omnion" via-key · "Welcome to Omnion" via-domain ·
+  unpublished=404`) · `Infra — compose config` ✅.
 - Next: **P08 — Media v0** (`crates/storage` S3/MinIO abstraction, upload endpoint, media table and
   the public serve path).
