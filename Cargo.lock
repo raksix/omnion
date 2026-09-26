@@ -1133,6 +1133,7 @@ dependencies = [
  "omnion-events",
  "omnion-identity",
  "omnion-media",
+ "omnion-module-analytics",
  "omnion-onboarding",
  "omnion-permissions",
  "omnion-search",
@@ -1254,6 +1255,22 @@ dependencies = [
  "sqlx",
  "thiserror",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-analytics"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
  "uuid",
 ]
 

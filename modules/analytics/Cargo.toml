@@ -1,0 +1,19 @@
+[package]
+name = "omnion-module-analytics"
+description = "Omnion analytics: the collection endpoint, the rollup engine and the privacy rules behind them (docs/requests/REQ-007)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
