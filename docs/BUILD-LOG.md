@@ -1208,3 +1208,51 @@
   realtime (`/analytics/realtime` + its SSE counters). Slice 4 then closes the privacy operations
   (retention purge with its audit row, visitor erasure, the "what we store" table and the
   `/analytics/settings` screen).
+
+## REQ-007 slice 3 — goals, funnels and realtime (2026-09-26)
+
+- **Goals are the platform's definition of a conversion, and the recorder is ordered and
+  deduplicated.** `modules/analytics/src/goals.rs` validates a goal (a name, one to five steps, and
+  a match that means something per kind), stores the funnel in one transaction, and mirrors the
+  last step in the goal's own row. `record_facts` only ever moves a visitor to the *earliest missing*
+  step, so a later step cannot be reached before an earlier one — and one beacon can carry a visitor
+  several steps because a batch can hold several facts. Every write is an `on conflict do nothing`
+  on the unique `(goal, visitor, step)` key, and only the hits that were actually written are
+  reported, which is what lets the API emit `analytics.goal_reached` exactly once per conversion.
+- **A funnel counts a step as *reached* by the visitor whose furthest position inside the range is
+  that step or beyond.** That is what keeps counts monotonically non-increasing when a visitor's
+  earlier step happened before the window; counting hits at position *p* would let step two exceed
+  step one. A goal shortened after the fact folds a furthest position beyond the funnel into the
+  last step instead of dropping it.
+- **Realtime reads raw rows and nothing else.** `modules/analytics/src/realtime.rs` answers the last
+  five and thirty minutes (visitors, pageviews, events, goal hits, current pages, event feed), the
+  API hands it over as a snapshot and as server-sent snapshots every five seconds, and a per-site
+  cap of eight live streams is enforced by a guard that travels inside the stream so a dropped
+  connection frees its slot. The first pass of this slice failed here: `analytics_events.value` is
+  `numeric`, the feed decoded it as a float, and every realtime request answered 500 — the cast
+  (`value::float8`) and a test that gives an event a value closed it (the assertion failed before
+  the fix, passes after).
+- **Two screens, one section.** `/analytics/goals` (list with conversions, rates, last hit, switch,
+  edit, delete; an editor with an ordered step list, per-step validation and a live funnel with
+  drop-offs) and `/analytics/realtime` (two windows, current pages, event feed; the pill turns to
+  `Paused` and the stream closes while the tab is hidden). Reading is `analytics.read`, writing is
+  `analytics.goals.manage`; a `PATCH` merges so a switch never rewrites the match it did not show.
+- **The QA harness learned one thing about itself.** Every screen drops its in-flight fetches when
+  the URL state changes and the realtime stream ends with the tab, so a browser-cancelled request
+  (`net::ERR_ABORTED`) is now *counted* (`abortedRequests`) instead of reported as a high finding —
+  24 of the first pass's 159 high findings were exactly that, and none of them was a defect.
+- **Proof:** `cargo test --workspace --no-fail-fast` → **556 passed, 0 failed** (the new walks: a
+  three-step funnel recording 3·2·1 with drop-offs and a deduplicated re-send, and realtime counting
+  a beacon with an event value) · `cargo clippy --workspace --all-targets -- -D warnings` → clean ·
+  `pnpm typecheck && pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 404 clicks, 406 screenshots,
+  **0 high findings**, **0 vision issues** (`qa-artifacts/20260926-231356`). The walkthrough creates
+  a two-step goal through the editor (and is refused when a step has no match), completes it with a
+  real beacon, reads the funnel back (`1` · `1`, conversions `1`), measures the beacon-to-counter
+  latency at **18 ms**, and reads the live realtime screen (pill `live`, five-minute counter `1`,
+  two current pages, four feed events).
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium findings,
+  unchanged), and `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
+- Next: **REQ-007 slice 4** — retention purge with its audit row, visitor erasure, the exclusions
+  and sampling half of the settings screen, the "what we store" table, `/analytics/settings`, and
+  the `analytics.traffic_spike` / `analytics.retention_purged` / `analytics.erasure_completed`
+  events.

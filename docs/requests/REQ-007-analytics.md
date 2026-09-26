@@ -1,6 +1,6 @@
 # REQ-007 — Analytics
 
-> **Status:** in-progress (slices 1–2 shipped) · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
+> **Status:** in-progress (slices 1–3 shipped) · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -152,7 +152,14 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
   migrate` against an empty database applied all fourteen migrations (`1…15`, 0011 was never used)
   and left the eleven `analytics_*` tables behind; populated proof: the walk suites apply the same
   migrations to the development database on every run.
-- [ ] A beacon to `/public/analytics/collect` appears in realtime within 5 seconds and in the overview after the rollup tick.
+- [x] A beacon to `/public/analytics/collect` appears in realtime within 5 seconds and in the overview after the rollup tick.
+  The realtime half is proven twice: `…::realtime_reads_the_last_half_hour_and_respects_the_scope`
+  posts one beacon and reads the counters, the current pages and the feed back from
+  `/analytics/realtime`, and the walkthrough measures the same thing over HTTP — a beacon posted
+  after the goal exists is visible in the counters **18 ms** later (`realtimeLatencyMs`), and the
+  screen itself renders the live pill (`data-rt-state="live"`), the five-minute counter (`1`), the
+  pages table (`2` rows) and the feed (`4` events). The overview half has been proven since slice 2
+  (`analytics_runner` rebuilds the buckets on its timer and the overview reads them).
 - [x] Cookieless mode sets no cookie and writes no `localStorage` entry: `apps/web/public/analytics.js`
   touches no storage API and the collector writes nothing to the browser (the visitor identifier is
   computed server-side).
@@ -173,8 +180,18 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
   the same ordering, and an export whose three lines (header + two rows) hold the filtered paths
   and not the table — with the row count in `x-export-rows`, and `analytics.export` refusing the
   reader who may only read.
-- [ ] A three-step goal reports monotonically non-increasing funnel counts with per-step drop-offs.
-- [ ] Goal hits are deduplicated per visitor per step — re-sending the same beacon does not double-count.
+- [x] A three-step goal reports monotonically non-increasing funnel counts with per-step drop-offs.
+  `…::goals_record_ordered_deduplicated_hits_and_report_their_funnel` seeds four visitors (one
+  completes all three steps in a single beacon, one stops after the second, one never enters, one
+  skips the middle step) and reads the funnel back as **3 · 2 · 1** with drop-offs `0 · 1 · 1`,
+  conversions `1`, rate `0.25` — and asserts the sequence is monotone, because a funnel that grows
+  is not a funnel. The same walk proves the next line too.
+- [x] Goal hits are deduplicated per visitor per step — re-sending the same beacon does not double-count.
+  The same walk: a completed beacon is posted twice, the second answer carries
+  `reached_goals: []` and the hit count stays at six — the unique `(goal, visitor, step)` key and
+  the `on conflict do nothing` write are what make a funnel a count of visitors rather than of
+  requests. A switched-off goal records no hits at all, and deleting a goal takes its steps and
+  hits with it (both asserted in the same walk).
 - [x] Excluded paths and IPs produce no rows; changing the lists affects new hits only.
 - [ ] Retention purge deletes rows older than the cutoff for one site, writes `analytics_purges` with the removed count, and never touches another site.
 - [ ] `DELETE /analytics/visitors/{hash}` removes every visit, pageview, event and goal hit for that visitor and emits `analytics.erasure_completed`.
@@ -182,11 +199,14 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
   (a full budget of beacons is served in-process before the 429; the limiter is per instance, see
   the slice log).
 - [ ] Permission guards answer 401/403/200 as documented and an organization cannot read another organization’s sites; all ten screens have empty, loading and error states with zero high findings and a clean mobile pass.
-  (The guards and the organization isolation are now proven for the settings, snippet and all
-  seven report endpoints — a member without `analytics.read` gets 403, another organization's
-  reader gets 403, the platform Owner reads across, and an unknown sort key or day answers
-  `400 invalid_report_query`. Goals, realtime and the privacy half of the settings screen land
-  with slices 3–4, so the ten-screen half of this line stays open.)
+  (The guards and the organization isolation are proven for the settings, snippet, all seven
+  report endpoints, the goal CRUD, the funnel and both realtime routes: a member without
+  `analytics.read` gets 403 on the goal list and the realtime snapshot, a reader without
+  `analytics.goals.manage` gets 403 on create, another organization's reader gets 403, the
+  platform Owner reads across, and a missing goal is a `404 goal_not_found` while an unknown
+  sort key or day is a `400 invalid_report_query`. The write half of the settings screen, the
+  retention purge and the visitor erasure land with slice 4, so the ten-screen half of this
+  line stays open.)
 
 ### QA plan
 
@@ -316,3 +336,88 @@ Deviations and choices, for the reviewer:
 - Countries and screens are the only audience dimensions read outside the rollups; everything the
   rollups carry (pageviews by path, visitors by device/browser/OS/country/language/referrer) has
   the same numbers in both paths, which the integration walks check on a seeded fixture.
+
+### Slice 3 — shipped (goals, funnels, realtime)
+
+- **`modules/analytics/src/goals.rs`** — the conversion side of the engine: validation (a name of
+  1–120 characters, one to five steps, and a match that means something per kind: a pageview needs
+  a path, an event its name, a download a file or a path, a form its name or a path), CRUD with the
+  steps written in one transaction, and the funnel arithmetic. A goal mirrors its **last** step in
+  its own row (`kind` + `match`), so a list query and a single-step goal stay the same shape.
+- **The recorder is ordered and deduplicated.** `record_facts` walks the earliest *missing* step
+  only: a fact that matches step three while step two is unrecorded records nothing, and one beacon
+  can carry a visitor over several steps because it holds several facts. Every write is an
+  `on conflict (goal_id, visitor_hash, step_position) do nothing`, and the answer reports only the
+  hits that were actually written — which is why a re-sent beacon answers `[]` and why the platform
+  event can be emitted exactly once. `record_conversion` is the hook REQ-064 (forms) and REQ-008
+  (orders) will call with the visitor hash they already computed.
+- **A funnel counts a step as *reached*** by the visitor whose furthest position inside the range is
+  that step or beyond. That is what keeps the counts monotonically non-increasing when a visitor's
+  earlier step happened before the window began; the alternative (counting hits at position *p*)
+  would let step two exceed step one. A furthest position beyond the funnel (a goal shortened after
+  the fact) counts at the last step instead of being dropped.
+- **`modules/analytics/src/realtime.rs`** — the last five and thirty minutes read straight from the
+  raw rows: visitors, pageviews, events and goal hits, the current pages, and the event feed. No
+  rollup stands between a beacon and the counter, which is what makes the screen *realtime*; the
+  event's `value` is cast to `float8` in SQL, because `numeric` is not a float and a feed that fails
+  on the first value only fails in production (it did, in the first QA pass of this slice).
+- **API** — `GET`/`POST /analytics/goals`, `GET`/`PATCH`/`DELETE /analytics/goals/{id}`,
+  `GET /analytics/goals/{id}/funnel`, `GET /analytics/realtime` and
+  `GET /analytics/realtime/stream`. Reading is `analytics.read`; writing is
+  `analytics.goals.manage`. A `PATCH` merges: the switch changes the switch, `kind`/`match` change
+  the last step, and `steps` replaces the funnel — a screen never re-sends what it did not show.
+- **The stream** is server-sent snapshots every five seconds with a keep-alive ping, capped at eight
+  live streams per site through a guard moved into the stream itself: when the browser drops the
+  connection the slot is free, and a reader over the cap gets a `429` while the screen keeps its
+  last snapshot. `EventSource` reconnects on its own, and one stream lives at most half an hour.
+- **`analytics.goal_reached`** reaches the platform bus the moment the last step is recorded, with
+  the goal, the step, the opaque daily visitor handle, the path and the value — never an address and
+  never a form field. A bus that cannot record the fact warns instead of failing the beacon: the
+  visit is already stored, and a marketing automation that misses one conversion must not also lose
+  the traffic behind it.
+- **The two screens** (`apps/admin/features/analytics`): `/analytics/goals` — the list (kind, match,
+  conversions, rate vs visitors, last hit, switch, edit, delete) with an editor that holds an
+  ordered step list (add, remove, reorder), validates each step before sending, and shows the
+  selected goal's funnel with its per-step drop-offs; `/analytics/realtime` — the two windows, the
+  current pages and the feed, kept fresh over the stream, and the pill says `Paused` while the tab
+  is hidden (the stream is closed, not left polling). Both screens join the section's navigation,
+  and below `lg` the tables become cards like every other report.
+- **The walkthrough** (`scripts/qa/walkthrough.cjs`) grew the pass: it opens the editor, tries to
+  save a step without a match (refused on screen), describes a two-step funnel, creates it, posts a
+  beacon that completes it *after* the goal exists, reloads, reads the funnel back (`2` steps, `1`
+  · `1`, conversions `1`) and measures the beacon-to-counter latency over HTTP (18 ms), then walks
+  `/analytics/realtime` and reads the live pill, the five-minute counter, the pages table and the
+  feed. A request the browser itself cancelled (`net::ERR_ABORTED`) is counted, not reported: every
+  screen drops in-flight fetches when the URL state changes, and the realtime stream ends when the
+  tab goes away.
+
+Deliberate choices and deviations, for the reviewer:
+
+- A funnel is a **same-day** funnel under cookieless counting: the visitor hash rotates at
+  midnight, so a returning visitor is a new visitor tomorrow here as everywhere else in this
+  module. Cookie mode (the site-level switch) is what extends it across days. The REQ's own note
+  under Risks is the reason the screen says nothing about "unique users across the funnel" — it
+  says *visitors*.
+- The funnel's step counts are **reached** counts, and the drop-off is the difference to the step
+  before; the first step's drop-off is always zero because nothing precedes it. The screen shows
+  `—` for a rate whose range met nobody, never `0%`.
+- `PATCH` with `steps` replaces the funnel wholesale (positions are renumbered from 1), because a
+  partial step list would leave the positions ambiguous; the goal row's mirror is rewritten from
+  the new last step in the same transaction.
+- The realtime stream cap is per instance, like the beacon limiter: the shared counter arrives with
+  the Redis-backed limiter. The cap is a guardrail against a wall of forgotten tabs, not a limit on
+  readers.
+
+Proof (this tick): `cargo test --workspace --no-fail-fast` → **556 passed, 0 failed** (analytics:
+33 module units — 11 of them the goal and funnel arithmetic — plus 11 integration walks, two of
+them new) · `cargo clippy --workspace --all-targets -- -D warnings` → clean · `pnpm typecheck &&
+pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 404 clicks, 406 screenshots, **0 high findings**, 0
+vision issues (`qa-artifacts/20260926-231356`; the 5 medium findings are the public renderer's own
+icon 404s, carried forward unchanged). The depth pass reads the section end to end: the goal editor,
+a refused empty match, a two-step funnel created through the screen, its funnel read back, the
+live realtime pill and counters, and a beacon-to-counter latency of **18 ms**.
+
+Next: **slice 4** — the privacy operations (retention purge with its audit row, visitor erasure,
+exclusions and sampling in the screen, the "what we store" table and the `/analytics/settings`
+screen) and the events they emit (`analytics.traffic_spike`, `analytics.retention_purged`,
+`analytics.erasure_completed`).
