@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { FileText, Globe, Images, LayoutDashboard, LogOut, Menu, X } from "lucide-react";
+import { FileText, Globe, Images, LayoutDashboard, LogOut, Menu, Sparkles, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -18,6 +18,7 @@ const NAV = [
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images },
   { href: "/sites", label: "Sites", icon: Globe },
+  { href: "/ai", label: "AI Hub", icon: Sparkles },
 ] as const;
 
 function initials(value: string): string {

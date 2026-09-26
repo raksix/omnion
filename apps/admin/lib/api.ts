@@ -242,3 +242,251 @@ export function deleteMedia(mediaId: string): Promise<null> {
 export function mediaRawUrl(mediaId: string): string {
   return `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
 }
+
+// ---------------------------------------------------------------------------------------------
+// AI Hub (docs/06-AI-HUB.md, P11)
+// ---------------------------------------------------------------------------------------------
+
+/** One connected AI provider. The key itself is never part of this shape. */
+export type AiProvider = {
+  id: string;
+  name: string;
+  protocol: string;
+  base_url: string;
+  has_api_key: boolean;
+  enabled: boolean;
+  is_default: boolean;
+  model_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** One model of the registry, with the provider it belongs to. */
+export type AiModel = {
+  id: string;
+  provider_id: string;
+  provider_name: string;
+  model_key: string;
+  display_name: string;
+  context_window: number | null;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_streaming: boolean;
+  supports_embeddings: boolean;
+  enabled: boolean;
+  is_default: boolean;
+  model_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+/** A model to register on a provider. */
+export type AiModelInput = {
+  key: string;
+  display_name?: string;
+  context_window?: number;
+  supports_tools?: boolean;
+  supports_vision?: boolean;
+  supports_streaming?: boolean;
+  supports_embeddings?: boolean;
+};
+
+/** One message of a chat request. */
+export type ChatMessageInput = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
+/** What a finished chat stream reported. */
+export type ChatDone = {
+  finish_reason: string | null;
+  chars: number;
+  usage: {
+    prompt_tokens: number | null;
+    completion_tokens: number | null;
+    total_tokens: number | null;
+  } | null;
+};
+
+/** The providers this installation connected. */
+export async function fetchAiProviders(): Promise<AiProvider[]> {
+  const body = await request<{ providers: AiProvider[] }>("/api/v1/ai/providers");
+  return body.providers;
+}
+
+/** The model registry, across every provider. */
+export async function fetchAiModels(): Promise<AiModel[]> {
+  const body = await request<{ models: AiModel[] }>("/api/v1/ai/models");
+  return body.models;
+}
+
+/** Connect a provider, optionally with the models it serves. */
+export function connectAiProvider(input: {
+  name: string;
+  baseUrl: string;
+  apiKey?: string;
+  enabled?: boolean;
+  isDefault?: boolean;
+  models?: AiModelInput[];
+}): Promise<AiProvider> {
+  return request<AiProvider>("/api/v1/ai/providers", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      base_url: input.baseUrl,
+      api_key: input.apiKey && input.apiKey.trim() ? input.apiKey.trim() : null,
+      enabled: input.enabled ?? true,
+      is_default: input.isDefault ?? false,
+      models: input.models ?? [],
+    }),
+  });
+}
+
+/** Change a provider. `apiKey: null` forgets the stored key, `undefined` keeps it. */
+export function updateAiProvider(
+  providerId: string,
+  changes: {
+    name?: string;
+    baseUrl?: string;
+    apiKey?: string | null;
+    enabled?: boolean;
+    isDefault?: boolean;
+  },
+): Promise<AiProvider> {
+  const body: Record<string, unknown> = {};
+  if (changes.name !== undefined) body.name = changes.name;
+  if (changes.baseUrl !== undefined) body.base_url = changes.baseUrl;
+  if (changes.apiKey !== undefined) body.api_key = changes.apiKey;
+  if (changes.enabled !== undefined) body.enabled = changes.enabled;
+  if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
+  return request<AiProvider>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Remove a provider and every model it serves. */
+export function removeAiProvider(providerId: string): Promise<null> {
+  return request<null>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Replace the set of models one provider serves. */
+export async function replaceAiProviderModels(
+  providerId: string,
+  models: AiModelInput[],
+): Promise<AiModel[]> {
+  const body = await request<{ models: AiModel[] }>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/models`,
+    { method: "PUT", body: JSON.stringify({ models }) },
+  );
+  return body.models;
+}
+
+/** Ask a provider which models it serves. */
+export function discoverAiProviderModels(
+  providerId: string,
+): Promise<{ provider_id: string; provider_name: string; models: string[] }> {
+  return request(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** Switch a model on or off, or make it the installation's default. */
+export function updateAiModel(
+  modelId: string,
+  changes: { enabled?: boolean; isDefault?: boolean },
+): Promise<AiModel> {
+  const body: Record<string, unknown> = {};
+  if (changes.enabled !== undefined) body.enabled = changes.enabled;
+  if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
+  return request<AiModel>(`/api/v1/ai/models/${encodeURIComponent(modelId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Run a chat and stream the answer back.
+ *
+ * The API answers as `text/event-stream`: `start` (which provider and model the router chose),
+ * `delta` frames with the answer as it arrives, then `done` — or `error` with a stable code. A
+ * provider that refuses after the stream opened arrives as that `error` frame, which this helper
+ * raises as an `ApiError` so the caller handles one shape either way.
+ */
+export async function streamChat(
+  input: { model?: string; messages: ChatMessageInput[] },
+  handlers: {
+    onStart?: (info: { provider: string; model: string; protocol: string }) => void;
+    onDelta?: (content: string) => void;
+    onDone?: (done: ChatDone) => void;
+  } = {},
+): Promise<void> {
+  const response = await fetch("/api/v1/ai/chat", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({
+      model: input.model && input.model.trim() ? input.model.trim() : null,
+      messages: input.messages,
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) {
+          event = line.slice(7).trim();
+        } else if (line.startsWith("data: ")) {
+          data += line.slice(6);
+        }
+      }
+      if (!data) {
+        continue;
+      }
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "start") {
+        handlers.onStart?.(payload as { provider: string; model: string; protocol: string });
+      } else if (event === "delta") {
+        handlers.onDelta?.(String(payload.content ?? ""));
+      } else if (event === "done") {
+        handlers.onDone?.(payload as unknown as ChatDone);
+      } else if (event === "error") {
+        throw new ApiError(
+          502,
+          String(payload.code ?? "provider_error"),
+          String(payload.message ?? "The AI provider failed."),
+        );
+      }
+    }
+  }
+}
