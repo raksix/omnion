@@ -1,3 +1,5 @@
+# REQ-064 — CMS Depth Pack
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** platform (core + admin + web)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 

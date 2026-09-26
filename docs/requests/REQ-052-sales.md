@@ -1,3 +1,5 @@
+# REQ-052 — Sales & Quotes
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/sales`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 

@@ -1,3 +1,5 @@
+# REQ-060 — Marketing
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/marketing`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 

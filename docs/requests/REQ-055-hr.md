@@ -1,3 +1,5 @@
+# REQ-055 — HR
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/hr`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 

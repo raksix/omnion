@@ -1,3 +1,5 @@
+# REQ-057 — Calendar & Appointments
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/calendar`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 

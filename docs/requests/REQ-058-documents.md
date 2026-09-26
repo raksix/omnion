@@ -1,3 +1,5 @@
+# REQ-058 — Documents & Knowledge
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/documents`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 

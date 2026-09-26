@@ -157,3 +157,93 @@ extended instead ("no untested screen" rule).
 - ✅ QA loop built; in its first four hours it found 5 defects (2 high), fixed and proved 4.
 - ⏳ With this plan: the request queue grew to 64 work items, each being expanded into a detailed
   implementation spec; the build loop starts at Wave 1 (panel depth).
+
+## 9. Inventory closure (2026-09-26)
+
+A line-by-line pass over docs/00–09 produced 1,320 named capabilities; every one that had no
+request of its own now has one (REQ-065…REQ-134, seventy new requests). They slot into the
+existing waves as follows.
+
+### Wave 1b — panel depth extras
+
+- REQ-067 Role Management UI
+- REQ-068 Permission Catalogue & Effective Permissions
+- REQ-074 Permission Simulator
+- REQ-075 Appearance & Themes Screen
+- REQ-076 Theme Builder UI
+- REQ-077 Revision History UI
+- REQ-078 System Updates Center
+- REQ-079 AI Command Center
+- REQ-080 Admin Activity Timeline
+- REQ-081 Frontend Packages & UI Kit
+- REQ-083 Theme Sections & Slots
+- REQ-085 Design Quality Bar
+- REQ-113 Per-Site Configuration
+- REQ-119 Notification Channels & Templates
+- REQ-120 Multi-Site Operations
+- REQ-123 Feature Flags
+
+### Wave 2b — content & CMS extras
+
+- REQ-109 Content Type Builder
+- REQ-110 Editorial Workflow
+- REQ-111 Diff Engine
+- REQ-112 Configuration Versioning
+- REQ-114 Translation Engine & Memory
+- REQ-115 SEO Intelligence
+- REQ-116 Blog Module
+- REQ-082 Ten Default Themes
+- REQ-084 Theme SDK & Packaging
+
+### Wave 3b — automation & AI extras
+
+- REQ-086 Workflow Editor Canvas
+- REQ-087 Node Library & Credentials
+- REQ-088 Core Node Families
+- REQ-089 Triggers
+- REQ-090 Wait/Resume & Human-in-the-Loop
+- REQ-091 Execution Engine Hardening
+- REQ-092 Expressions & Variables
+- REQ-093 Execution History & Debugging
+- REQ-094 Workflow Templates Gallery
+- REQ-095 Workflow Versioning & Sharing
+- REQ-096 Queue Mode & Scaling
+- REQ-097 AI Provider Runtime
+- REQ-098 Model Registry & Router
+- REQ-099 Agent Runtime
+- REQ-100 AI Tool System
+- REQ-101 AI Approvals & Action Preview
+- REQ-102 AI Memory & Knowledge
+- REQ-103 Module Copilots
+- REQ-104 AI Cost Manager & Logs
+- REQ-105 AI Data Guard
+- REQ-106 Local & Air-gapped AI
+- REQ-107 Agent Evals & Telemetry
+- REQ-108 MCP Server & Computer Use
+
+### Wave 4b — business extras
+
+- REQ-117 Forms → CRM Lead Pipeline
+- REQ-118 Storefront & Checkout
+- REQ-133 Projects (shared automation)
+
+### Wave 5b — platform & enterprise extras
+
+- REQ-065 Identity Providers & SSO
+- REQ-066 MFA, Passkeys & Device Trust
+- REQ-069 Policy Engine (ABAC)
+- REQ-070 Scopes & Resource Permissions
+- REQ-071 Groups & Teams
+- REQ-072 Service Accounts & API Keys
+- REQ-073 Temporary & Approval-Based Access
+- REQ-121 Plugin System & WASM Runtime
+- REQ-122 Package Install Pipeline
+- REQ-125 Secrets & Credential Management
+- REQ-126 Observability Stack
+- REQ-127 Reliability Primitives
+- REQ-128 Deployment Tooling
+- REQ-129 Migration Safety
+- REQ-130 GraphQL & SDK Generation
+- REQ-131 CLI & Generators
+- REQ-132 Control-Plane / Data-Plane Split
+- REQ-134 Licensing & Editions

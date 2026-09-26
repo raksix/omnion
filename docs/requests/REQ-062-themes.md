@@ -1,3 +1,5 @@
+# REQ-062 — Themes & Theme Builder
+
 > **Status:** pending · **Captured:** 2026-09-26 · **Layer:** platform (`themes/*` + admin)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
