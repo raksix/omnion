@@ -1,6 +1,6 @@
 # REQ-032 — Universal Command Center
 
-> **Status:** in-progress — slice 2 shipped (federated per-group search + typed URL handoff) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
+> **Status:** in-progress — slices 1–3 shipped (action commands + audit; slice 4 left) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -118,12 +118,14 @@ Webhook relevance: none directly. Audit: every action command writes a `command.
 
 ### Acceptance criteria
 
-Slice 1 shipped the boxes ticked below and slice 2 the next four; the rest carry the slice that
-owns them. Evidence: the QA passes of `qa-artifacts/20260926-171549` and
-`qa-artifacts/20260926-180233` (**77 clicks, 98 screenshots, 0 high findings, 0 vision issues**),
-`scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs` (**22/22**),
-`scripts/qa/probe-palette-federated.cjs` (**32/32**) and the API suites
-`apps/api/tests/command_center.rs` (**9 walks**) + `apps/api/tests/search.rs` (**+2 walks**: the
+Slice 1 shipped the boxes ticked below and slice 2 the next four; slice 3 ticked the two above
+(confirmation + job feedback, and the audit criterion) and the rest carry the slice that owns
+them. Evidence: the QA passes of `qa-artifacts/20260926-171549`, `qa-artifacts/20260926-180233`
+and `qa-artifacts/20260926-184340` (**105 clicks, 115 screenshots, 0 high findings, 0 vision
+issues**), `scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs`
+(**22/22**), `scripts/qa/probe-palette-federated.cjs` (**32/32**),
+`scripts/qa/probe-command-actions.cjs` (**31/31**) and the API suites
+`apps/api/tests/command_center.rs` (**14 walks**) + `apps/api/tests/search.rs` (**+2 walks**: the
 count outside a reader's scope, and `history=false`).
 
 - [x] `Ctrl+K` (and `Cmd+K`) opens the palette on every admin route, including over an open modal, without losing unsaved form state. — the palette is mounted once in the app shell, so it is on every route; the pass opened it over the results screen's shortcuts dialog (palette `z 50` over dialog `z 40`, and the dialog stayed open while the palette's scrim closed the palette) and over a half-typed "New page" form, whose title text survived the round trip.
@@ -134,13 +136,13 @@ count outside a reader's scope, and `history=false`).
 - [x] `>` shows commands only, `@` people only, `#` sites only, and the mode chip in the input row reflects the active prefix. — `>` renders exactly the registry's rows (8 for an owner, chip "Commands"); `#qa` answers with the Sites provider only (no Pages/Media rows) and the chip reads "Sites"; `@` moves the chip to "People". Slice 2 made the narrowing a property of the *requests*: `>` asks the registry and nothing else (probe: 0 sections), `#`/`:`/`@` ask exactly one provider each, and `@` still promises no screen the panel does not have.
 - [x] Running "Open analytics" navigates without a full reload and closes the palette. — the same walk with "Open pages": client-side navigation to `/pages`, `paletteClosed: true`.
 - [x] "Create customer" opens the create form with the palette closed and the first field focused. — the same walk with "Create a page" (`/pages?new=1`): palette closed, form open, the title field carrying the focus.
-- [ ] "Run backup" asks for confirmation before queueing a job, then shows the standard job feedback. — slice 3 (no mutating command ships yet).
+- [x] "Run backup" asks for confirmation before queueing a job, then shows the standard job feedback. — **slice 3, with the stand-in this platform actually has**: no backup service exists yet, so the job action is the index rebuild (`act.reindex-search`) — it asks first (the palette's confirmation card; the API refuses an unconfirmed run with `confirmation_required` before anything executes, and the audit trail is *unchanged* while the question is open), then the owning service answers in its own shape and the palette prints that answer verbatim: "Rebuilt 7 providers · 18 documents · 95 ms" with a link to `/settings/search`, where the same pass is read back as the provider's last run. Proven by `probe-command-actions.cjs` (31/31: the question, Escape withdrawing it, the run, the entry) and the walkthrough's `action-confirm`/`action-run` steps (`ranNothingYet: true`, `newEntries: 1`).
 - [ ] The AI card for "Open Mehmet's last 10 tickets" shows the parsed intent before running. — slice 4.
 - [ ] A low-confidence phrase never auto-executes. — slice 4.
 - [x] A failing result type shows a per-group error with retry while other groups still render. — slice 2's probe fails one type's request with a real `503 dependency_unavailable`: that section shows "Media could not be searched." with a **Try again** button (the failure's code and status in its tooltip) while the Pages section keeps its rows, and the retry refills the failed group once the store answers again.
 - [x] Recents persist across sessions and are per user, not per organization. — the walkthrough sees the command it ran after a reload; `recents_are_per_user_and_never_per_organization` proves one account's history is invisible to another in the same organization, and that a clear is personal.
 - [x] Clearing recents empties the group immediately and after a reload. — `probe-command-center.cjs`: 0 rows immediately, 0 rows and `items: []` after a reload.
-- [ ] Every executed action command appears in the audit log with actor, command and target. — slice 3 (navigation commands write nothing; the `command.run` entry lands with the first mutating command).
+- [x] Every executed action command appears in the audit log with actor, command and target. — every run that starts writes exactly one `command.run` entry (`target_type: command`, `target_id` = the registry id, `metadata.outcome` + the owning service's aggregate result, `ip_address`; the actor is the caller's account), and the run is counted in `command_usage_daily` — one row per run, two runs two rows, proven at the API (`command_center.rs`: the entry names command and outcome, the usage count goes 1 → 2) and in the browser (`probe-command-actions.cjs`: "exactly one audit entry per executed command", actor + target read back through `GET /api/v1/iam/audit`). A refused run (unconfirmed, navigation, unknown id, or a caller missing the command's own key) writes nothing: a check asserts the trail is unchanged after all three refusals. Navigation commands still write no entry — the request's own rule holds.
 - [x] `/search` reproduces the same results from its URL alone, with filter chips and type filters applied. — slice 2: a section's "see all" lands on `/search?q=<words>&type=<provider>` (the screen's own filter parameter, so the chip is already applied) and the screen's count equals the API's own count for that query — the same number after a reload. REQ-002's depth pass proved the rest of the screen's URL state (facets, chips, sort, page).
 - [x] Keyboard-only operation reaches every group and row; `Tab`/`Shift+Tab` cycle groups and `Cmd+Enter` opens in a new tab. — arrows and `Enter` (both probes), `Ctrl+Enter` in a new tab and `Tab` between groups (probe-command-center) are proven; slice 2's probe adds `Shift+Tab` (forward `pages → media`, back `media → pages`) and the narrowing sweep of every mode.
 - [ ] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844. — the sheet fills 390×844 and its rows (commands included) are 44px; the AI card arrives with slice 4.
@@ -290,6 +292,80 @@ committed search is kept; and as the Member account the `>` list loses "Create a
 sites" while the shared `?q=…&type=sites` link renders **0 rows** and "1 result is outside your
 permissions." with the site's name nowhere in the answer. The typing budget, measured keystroke →
 row over 20 samples: **p50 197 ms · p95 220 ms · max 237 ms** (the criterion is 300 ms p95).
+
+#### Slice 3 — action commands + audit (2026-09-26) — shipped
+
+What landed:
+
+- **A command has a kind now.** The registry carries `CommandKind::Action` and a `confirm` flag, and
+  `runnable()` answers only for actions — so the API's refusal (`not_runnable`) cannot drift from
+  what the projection says. Two actions ship with the services that exist today: the index rebuild
+  (`search.manage`, asks first) and clearing the account's own palette history (no key beyond being
+  signed in, asks first because it cannot be undone).
+- **`POST /api/v1/commands/{id}/run` is the only way an action runs.** It carries no route-level
+  guard on purpose — every command has its own key — so the handler re-checks the command's own
+  permission, refuses a navigation command by name, refuses an unknown id as a 404, and refuses an
+  unconfirmed run with `confirmation_required` **before anything executes**. The confirmation is a
+  rule of the platform, not a decoration of one dialog: a programmatic caller that skips the card
+  still has to say yes.
+- **The act is the owning service's code, not a copy.** `search::perform_reindex` (audit row and
+  `search.reindexed` event included) now serves both the settings screen's button and the palette's
+  command; one `clear_recents` serves the palette's own Clear control and the `act.clear-recents`
+  command. The two entry points cannot drift.
+- **One entry and one count per executed command.** `command.run` names actor, command (as the
+  target), outcome and the owning service's aggregate result — never a row of content — and
+  `command_usage_daily` counts the run (upserted by user/command/day, no query text). A run that
+  starts is counted whatever its outcome; a run that never started (refused) is neither audited nor
+  counted.
+- **The palette asks, then prints the service's own answer.** An action row carries an Action badge
+  and says it asks first; activating it opens the confirmation card above the list (`↵` run, `esc`
+  withdraw — and `esc` does not close the palette while the question is open), and the result card
+  shows the run endpoint's own message with a link to the screen that reads the record back.
+  Recents of an action command run it again instead of navigating.
+
+Deviations, recorded as they were decided:
+
+- The request's four named examples ("Create customer", "Create workflow", "Run backup", "Switch
+  site") arrive with their owning services — CRM (REQ-051), the workflows screen (REQ-003), a
+  backup service, and a palette parameter model for "switch to site X" — none of which exist yet.
+  What this slice ships is the machinery plus the two actions whose services are here, and the
+  pattern for the rest is now one registry entry + one match arm + one audit expectation. In the
+  acceptance criterion, the index rebuild is the stand-in for "Run backup": it is the platform's own
+  long-running job, it asks first, and its feedback is the standard one (the provider's last run on
+  `/settings/search`).
+- No new migration: slice 3 writes the tables `0014_command_center.sql` already declared —
+  `command_usage_daily` was created there "written by slice 3", and now is.
+- The QA plan's step 10 says "check `/audit`"; the panel has no audit *screen* yet (REQ-039/REQ-012's
+  ground), so the entry is read through `GET /api/v1/iam/audit` — the same rows the screen will read.
+- `command.run` files the caller's organization when they have one and `null` at the platform level,
+  exactly as `audit_log` files those accounts; the palette's history was already per user.
+- The run endpoint answers the owning feature's shape inside `result` and one derived line in
+  `message`. The panel prints that line; it composes no outcome of its own.
+
+Found, not caused by this slice:
+
+- The search suite asserted that one `indexer::drain(_, 100)` applies its own event. On a bus that
+  now carries action-command reindexes too — every reindex leaves one `search.reindexed` per
+  provider behind, and those are skipped rather than applied — a single batch can be spent on
+  history the suite does not own, and the assertion failed for a reason it cannot control. The
+  suite ticks the way the runner does now (bounded batches until one applies something), fixed in
+  this tick.
+
+Proof: `cargo test --workspace` → **463 passed, 0 failed** (8 new: 3 registry walks — only an action
+is runnable and each action carries its own confirmation rule; every action matches its own words;
+the projection never hands a member an action it may not run — plus 5 command-centre walks: a run
+executes the owning service and leaves one `command.run` entry and one usage count per run; an
+unconfirmed run leaves nothing; a screen command and an unknown id are refused by name; the endpoint
+re-checks the command's own permission; every registered action has a service behind it) · `cargo
+clippy --workspace --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 ·
+`bash scripts/qa/run.sh` → 105 clicks, 115 screenshots, **0 high findings**, **0 vision issues**
+(`qa-artifacts/20260926-184340`; the 5 medium findings are the public renderer's own icon 404s,
+carried forward) · `scripts/qa/probe-command-actions.cjs` → **31/31** (the question, nothing run
+while it is open, Escape withdrawing it, the run's own line, exactly one audit entry per executed
+command with actor + target, the three refusals, the history really cleared, and the card at
+390×844 with 44px answers) · `probe-command-center.cjs` **26/26**, `probe-palette.cjs` **22/22**,
+`probe-palette-federated.cjs` **32/32** re-run clean (no regressions) · the walkthrough's own steps
+record `ranNothingYet: true` and `newEntries: 1` for the run.
 
 ### Risks / notes
 

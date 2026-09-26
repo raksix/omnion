@@ -1011,7 +1011,54 @@
   it with an explicit reindex; the gap is worth a REQ-002 follow-up rather than a quiet fix here.
 - Carried forward, not caused by this slice: the public renderer still answers `404` for its own
   icon requests (5 medium findings, unchanged).
-- Next: REQ-032 stays in progress — **slice 3** next (action commands + audit: mutating commands
-  through the owning services, confirmation for destructive ones, `command.run` entries and
-  `command_usage_daily`), then slice 4 (natural-language resolution + the intent card); wave 1 then
-  moves to REQ-007 (analytics + the real dashboard).
+- Next: REQ-032 stayed in progress — **slice 3** was the next tick's work.
+
+## 2026-09-26 — REQ-032 · slice 3 · the palette acts, and says so
+
+- **A command has a kind.** The registry grew `CommandKind::Action` and a `confirm` flag, and
+  `runnable()` answers only for actions — so the API's `not_runnable` refusal cannot drift from what
+  the projection says. Two actions ship with the services that exist today: rebuilding the whole
+  search index (`search.manage`, asks first) and clearing the account's own palette history (asks
+  first; no key beyond being signed in). The four examples in the request — "Create customer",
+  "Create workflow", "Run backup", "Switch site" — arrive with their owning services (CRM, the
+  workflows screen, a backup service, a palette parameter model), none of which exist yet; the
+  pattern for each is now one registry entry + one match arm + one audit expectation.
+- **The act is the owning service's code, not a copy.** `search::perform_reindex` (its audit row and
+  `search.reindexed` event included) now serves both the settings screen's button and the palette's
+  command, and one `clear_recents` serves the palette's Clear control and the `act.clear-recents`
+  command — two entry points, one behaviour, no drift possible.
+- **The confirmation is a platform rule.** `POST /commands/{id}/run` carries no route-level guard
+  on purpose: every command has its own key, so the handler re-checks it, refuses a navigation
+  command by name, refuses an unknown id as a 404, and refuses an unconfirmed run with
+  `confirmation_required` **before anything executes** — a programmatic caller that skips the card
+  still has to say yes. The audit trail is provably unchanged while the palette's question is open
+  (the probe reads it before, during and after).
+- **One entry and one count per executed command.** `command.run` names actor, command (as the
+  target), outcome and the owning service's aggregate result — never a row of content — and
+  `command_usage_daily` counts the run (upserted by user/command/day, no query text). A refused run
+  writes nothing at all; the probe asserts the trail is unchanged after all three refusals.
+- **The palette never invents the outcome.** The result card prints the run endpoint's own message
+  ("Rebuilt 7 providers · 18 documents · 95 ms") and links to the screen that reads the record back
+  (`/settings/search`, which shows the same pass as the provider's last run). Recents of an action
+  command run it again instead of navigating.
+- **A defect found and fixed in this tick, not caused by this slice:** the search suite asserted
+  that one `indexer::drain(_, 100)` applies its own event; with action-command reindexes on the same
+  shared bus (every reindex leaves one `search.reindexed` per provider, and those are skipped rather
+  than applied) a single batch can be spent on history the suite does not own. The suite now ticks
+  the way the runner does — bounded batches until one applies something.
+- **Proof:** `cargo test --workspace` → **463 passed, 0 failed** (8 new walks: 3 registry + 5
+  command-centre) · `cargo clippy --workspace --all-targets -- -D warnings` → clean · `pnpm
+  typecheck && pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 105 clicks, 115 screenshots, **0 high
+  findings**, **0 vision issues** (`qa-artifacts/20260926-184340`; 5 medium = the public renderer's
+  own icon 404s, carried forward) · `scripts/qa/probe-command-actions.cjs` → **31/31** ·
+  `probe-command-center.cjs` **26/26** · `probe-palette.cjs` **22/22** ·
+  `probe-palette-federated.cjs` **32/32** · the walkthrough's own steps record
+  `ranNothingYet: true` (nothing ran while the question was open) and `newEntries: 1` with
+  `target: act.reindex-search`, `outcome: ok`.
+- Carried forward, not caused by this slice: the public renderer still answers `404` for its own
+  icon requests (5 medium findings, unchanged). Slice 2's finding stands: creating a draft page emits
+  no event, so a fresh draft reaches the index only on a publish or a reindex.
+- Next: REQ-032 stays in progress — **slice 4** (natural-language resolution: `POST
+  /command-center/resolve` on ai-hub, the intent preview card, confidence threshold with "Did you
+  mean", `Edit as search`, timeout fallback); wave 1 then moves to REQ-007 (analytics + the real
+  dashboard).
