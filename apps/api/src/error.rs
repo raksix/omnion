@@ -11,6 +11,7 @@ use omnion_core::CoreError;
 use omnion_events::EventsError;
 use omnion_identity::IdentityError;
 use omnion_media::MediaError;
+use omnion_module_analytics::AnalyticsError;
 use omnion_onboarding::OnboardingError;
 use omnion_permissions::PermissionsError;
 use omnion_search::SearchError;
@@ -140,6 +141,39 @@ impl From<EventsError> for ApiError {
             EventsError::Client(message) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
             }
+        }
+    }
+}
+
+impl From<AnalyticsError> for ApiError {
+    /// Analytics (docs/requests/REQ-007): a beacon the collector cannot use and settings the
+    /// platform refuses are `400`s that name the field, a site without settings is a `404`, and
+    /// the store itself keeps the platform's dependency/internal split.
+    fn from(error: AnalyticsError) -> Self {
+        match error {
+            AnalyticsError::InvalidPayload(message) => Self::bad_request("invalid_beacon", message),
+            AnalyticsError::EmptyBeacon => Self::bad_request(
+                "empty_beacon",
+                "the beacon carries neither a pageview nor an event",
+            ),
+            AnalyticsError::InvalidSettings(message) => {
+                Self::bad_request("invalid_analytics_settings", message)
+            }
+            AnalyticsError::SettingsNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "analytics_settings_not_found",
+                "this site has no analytics settings",
+            ),
+            AnalyticsError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            AnalyticsError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
         }
     }
 }

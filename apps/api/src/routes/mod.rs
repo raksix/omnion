@@ -60,8 +60,17 @@
 //! the providers whose own read permissions the caller carries, and rebuilding the index is the
 //! separate `search.manage`. The indexer that keeps the documents fresh from the event bus is
 //! `crate::search_runner`. See `crate::routes::search`.
+//!
+//! The analytics surface (`/analytics/*`, docs/requests/REQ-007) is the platform's own
+//! measurement engine: the panel side (`/analytics/settings`, `/analytics/snippet`) is read
+//! with `analytics.read` and written with `analytics.settings.manage` in the caller's own
+//! organization, while the collection endpoint (`POST /api/v1/public/analytics/collect`) is
+//! public by nature — a rendered site's tracking script posts to it — and protected by a body
+//! cap, a per-site rate limit and a collector that decides before it writes. The worker that
+//! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
+pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod commands;
@@ -332,6 +341,24 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "search.read"));
     let command_run = post(commands::run);
 
+    // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
+    // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
+    // resolve the site through the caller's own organization. The collection endpoint is the
+    // public half — a site's own script posts beacons to it — so it carries no guard; the body
+    // cap below is the one limit the router itself enforces.
+    let analytics_settings_read =
+        get(analytics::get_settings).layer(guards::require(&state, "analytics.read"));
+    let analytics_settings_write =
+        put(analytics::put_settings).layer(guards::require(&state, "analytics.settings.manage"));
+    let analytics_snippet =
+        get(analytics::snippet).layer(guards::require(&state, "analytics.read"));
+
+    let analytics_collect = Router::new()
+        .route("/public/analytics/collect", post(analytics::collect))
+        .layer(DefaultBodyLimit::max(
+            omnion_module_analytics::collect::MAX_BODY_BYTES,
+        ));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -351,6 +378,12 @@ pub fn router(state: AppState) -> Router {
         .route("/command-center/context", command_context)
         .route("/command-center/resolve", command_resolve)
         .route("/command-center/recent", command_recent)
+        .route(
+            "/analytics/settings",
+            analytics_settings_read.merge(analytics_settings_write),
+        )
+        .route("/analytics/snippet", analytics_snippet)
+        .merge(analytics_collect)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),

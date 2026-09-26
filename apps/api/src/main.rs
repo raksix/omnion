@@ -9,7 +9,9 @@ use std::process::ExitCode;
 
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_api::{automation_runner, event_runner, search_runner, workflow_runner};
+use omnion_api::{
+    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+};
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
 use omnion_identity::users::{self, BootstrapOutcome};
@@ -111,6 +113,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _indexer = search_runner::spawn(state.clone());
     } else {
         tracing::info!("the search indexer is disabled (OMNION_SEARCH_RUNNER=false)");
+    }
+
+    // The analytics rollup worker rebuilds the recent hourly and daily buckets in this process
+    // (REQ-007): each tick recomputes from the raw rows, which is idempotent, so a tick that
+    // cannot reach the database is logged and the next one writes the same buckets.
+    if state.config().analytics.runner_enabled {
+        let _rollups = analytics_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
     }
 
     let app = routes::router(state);

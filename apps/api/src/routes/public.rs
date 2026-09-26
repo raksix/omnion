@@ -176,7 +176,10 @@ fn page_not_found(slug: &str) -> ApiError {
 }
 
 /// Resolve the site a request addresses, following the documented order.
-async fn resolve_site(
+///
+/// Shared with the analytics collector (`crate::routes::analytics`): a beacon is addressed the
+/// same way a rendered page is, so a site's script never needs a second addressing rule.
+pub(crate) async fn resolve_site(
     pool: &PgPool,
     hint: Option<&str>,
     headers: &HeaderMap,

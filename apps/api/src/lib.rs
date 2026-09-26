@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analytics_runner;
 pub mod auth;
 pub mod automation_runner;
 pub mod client_ip;
