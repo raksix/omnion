@@ -293,6 +293,29 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "search",
         description: "Rebuild and configure the search index",
     },
+    // Analytics (docs/requests/REQ-007). Reading the numbers is one power; changing what a site
+    // collects — and therefore what it promises its visitors — is a stronger one; exporting raw
+    // rows is a third, because a report a site's operator can hand out is still the site's data.
+    PermissionDef {
+        key: "analytics.read",
+        category: "analytics",
+        description: "Read analytics reports, settings and the tracking snippet",
+    },
+    PermissionDef {
+        key: "analytics.export",
+        category: "analytics",
+        description: "Export analytics reports",
+    },
+    PermissionDef {
+        key: "analytics.goals.manage",
+        category: "analytics",
+        description: "Create and edit conversion goals",
+    },
+    PermissionDef {
+        key: "analytics.settings.manage",
+        category: "analytics",
+        description: "Change tracking, privacy and retention settings",
+    },
 ];
 
 /// Look a permission up by key.
@@ -369,6 +392,7 @@ mod tests {
             "audit",
             "tenancy",
             "search",
+            "analytics",
         ] {
             assert!(categories.contains(expected), "missing category {expected}");
         }
@@ -464,6 +488,24 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("ai"),
                 "{key} belongs to the ai category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_analytics_family_is_catalogued() {
+        // REQ-007: seeing what a site measures, deciding what it may measure, exporting the
+        // numbers and owning its conversion goals are four separate powers.
+        for key in [
+            "analytics.read",
+            "analytics.export",
+            "analytics.goals.manage",
+            "analytics.settings.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("analytics"),
+                "{key} belongs to the analytics category"
             );
         }
     }

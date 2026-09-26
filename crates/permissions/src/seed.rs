@@ -104,6 +104,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "events.read",
             "search.read",
             "search.manage",
+            "analytics.read",
+            "analytics.export",
+            "analytics.goals.manage",
+            "analytics.settings.manage",
         ]),
     },
     BaseRole {
@@ -126,6 +130,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "audit.read",
             "sites.read",
             "search.read",
+            "analytics.read",
         ]),
     },
     BaseRole {
@@ -146,6 +151,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "workflows.read",
             "sites.read",
             "search.read",
+            "analytics.read",
         ]),
     },
     BaseRole {
