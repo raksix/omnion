@@ -64,6 +64,7 @@
 pub mod ai;
 pub mod auth;
 pub mod automation;
+pub mod commands;
 pub mod content;
 pub mod health;
 pub mod iam;
@@ -313,6 +314,18 @@ pub fn router(state: AppState) -> Router {
     // own beyond being signed in.
     let search_recent = get(search::recent).merge(delete(search::clear_recent));
 
+    // Command centre (docs/requests/REQ-032): the palette's own surface — the commands the
+    // caller may run (projected through their effective permissions), the suggestions for the
+    // screen they are on, and their own recents. Reading and writing recents is `search.read`,
+    // the box every signed-in account holds; a command's own key is checked when it is recorded.
+    // See `crate::routes::commands`.
+    let commands_route = get(commands::list_commands).layer(guards::require(&state, "search.read"));
+    let command_context = get(commands::context).layer(guards::require(&state, "search.read"));
+    let command_recent = get(commands::recent)
+        .merge(post(commands::record))
+        .merge(delete(commands::clear))
+        .layer(guards::require(&state, "search.read"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -327,6 +340,9 @@ pub fn router(state: AppState) -> Router {
             search_settings_read.merge(search_settings_write),
         )
         .route("/search/recent", search_recent)
+        .route("/commands", commands_route)
+        .route("/command-center/context", command_context)
+        .route("/command-center/recent", command_recent)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
