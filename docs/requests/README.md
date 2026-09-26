@@ -107,6 +107,25 @@ marketplace — all connected by the **Omnion Core**.
 | REQ-048 | [App Marketplace](REQ-048-app-marketplace.md) *(headline)* | `apps/marketplace` | pending |
 | REQ-049 | [Omnion Studio](REQ-049-omnion-studio.md) *(headline)* | new `apps/studio` | pending |
 | REQ-050 | [First-run Onboarding / Setup Wizard](REQ-050-first-run-onboarding.md) | platform (`apps/admin` + CLI) | pending |
+| REQ-051 | [CRM](REQ-051-crm.md) | module (`modules/crm`) | pending |
+| REQ-052 | [Sales & Quotes](REQ-052-sales.md) | module (`modules/sales`) | pending |
+| REQ-053 | [Inventory & Warehouse](REQ-053-inventory.md) | module (`modules/inventory`) | pending |
+| REQ-054 | [Accounting](REQ-054-accounting.md) | module (`modules/accounting`) | pending |
+| REQ-055 | [HR](REQ-055-hr.md) | module (`modules/hr`) | pending |
+| REQ-056 | [Projects & Tasks](REQ-056-projects.md) | module (`modules/projects`) | pending |
+| REQ-057 | [Calendar & Appointments](REQ-057-calendar.md) | module (`modules/calendar`) | pending |
+| REQ-058 | [Documents & Knowledge](REQ-058-documents.md) | module (`modules/documents`) | pending |
+| REQ-059 | [Approvals](REQ-059-approvals.md) | module (`modules/approvals`) | pending |
+| REQ-060 | [Marketing](REQ-060-marketing.md) | module (`modules/marketing`) | pending |
+| REQ-061 | [Manufacturing](REQ-061-manufacturing.md) | module (`modules/manufacturing`) | pending |
+| REQ-062 | [Themes & Theme Builder](REQ-062-themes.md) | platform (`themes/*` + admin) | pending |
+| REQ-063 | [Block System & Page Builder](REQ-063-page-builder.md) | platform (`apps/admin` + `crates/content`) | pending |
+| REQ-064 | [CMS Depth Pack](REQ-064-cms-depth.md) | platform (core + admin + web) | pending |
+
+> **Execution:** [`docs/BUILD-PLAN-v2.md`](../BUILD-PLAN-v2.md) groups these 64 requests into
+> waves (1 = panel depth, 2 = CMS depth, 3 = automation & AI, 4 = business modules,
+> 5 = platform & enterprise, 6 = deployment). The `omnion-build` loop works the queue in wave
+> order, one slice per tick, with the browser QA pass as the acceptance gate.
 
 > Note: a **mobile app** was mentioned in the brief but intentionally **not captured yet**
 > (excluded by the owner for now).
