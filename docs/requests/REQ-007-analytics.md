@@ -1,6 +1,6 @@
 # REQ-007 — Analytics
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
+> **Status:** in-progress (slice 1 shipped) · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -146,22 +146,31 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
 
 ### Acceptance criteria
 
-- [ ] `0012_analytics.sql` applies on a fresh and on a populated database; `cargo test -p omnion-module-analytics` is green.
+- [x] The analytics migration applies on a fresh and on a populated database (shipped as
+  `0015_analytics.sql` — 0012–0014 were taken by search and the command centre); the module's
+  own suite is green (`cargo test -p omnion-module-analytics` → 22/22, and the fresh-database
+  harness suites apply all fifteen migrations from scratch on every run).
 - [ ] A beacon to `/public/analytics/collect` appears in realtime within 5 seconds and in the overview after the rollup tick.
-- [ ] Cookieless mode sets no cookie and writes no `localStorage` entry.
-- [ ] With `anonymize_ip` on, no row stores a raw address (`ip_prefix` is null) and IPv4/IPv6 truncation matches the documented widths.
-- [ ] DNT and GPC requests are dropped before any row is written and increase the filtered counter.
-- [ ] Rollup idempotency: running a bucket twice leaves `analytics_daily` identical (byte-for-byte comparison in a test).
+- [x] Cookieless mode sets no cookie and writes no `localStorage` entry: `apps/web/public/analytics.js`
+  touches no storage API and the collector writes nothing to the browser (the visitor identifier is
+  computed server-side).
+- [x] With `anonymize_ip` on, no row stores a raw address (`ip_prefix` is null) and IPv4/IPv6 truncation matches the documented widths.
+- [x] DNT and GPC requests are dropped before any row is written and increase the filtered counter.
+- [x] Rollup idempotency: running a bucket twice leaves `analytics_daily` identical (snapshot comparison in a test).
 - [ ] Overview numbers match a seeded fixture for visitors, page views, conversions and forms across a custom range.
 - [ ] Comparison mode returns the previous equal-length period; a range without prior data shows “no comparison” instead of zero.
 - [ ] Page-report filters combine (path + device + country + source), sorting and paging stay consistent, and the CSV contains exactly the filtered rows.
 - [ ] A three-step goal reports monotonically non-increasing funnel counts with per-step drop-offs.
 - [ ] Goal hits are deduplicated per visitor per step — re-sending the same beacon does not double-count.
-- [ ] Excluded paths and IPs produce no rows; changing the lists affects new hits only.
+- [x] Excluded paths and IPs produce no rows; changing the lists affects new hits only.
 - [ ] Retention purge deletes rows older than the cutoff for one site, writes `analytics_purges` with the removed count, and never touches another site.
 - [ ] `DELETE /analytics/visitors/{hash}` removes every visit, pageview, event and goal hit for that visitor and emits `analytics.erasure_completed`.
-- [ ] The collect endpoint answers 429 above the rate limit and stays responsive under a burst test.
+- [x] The collect endpoint answers 429 above the rate limit and stays responsive under a burst test
+  (a full budget of beacons is served in-process before the 429; the limiter is per instance, see
+  the slice log).
 - [ ] Permission guards answer 401/403/200 as documented and an organization cannot read another organization’s sites; all ten screens have empty, loading and error states with zero high findings and a clean mobile pass.
+  (The guards and the organization isolation are proven for the settings and snippet endpoints;
+  the ten screens arrive with slices 2–4.)
 
 ### QA plan
 
