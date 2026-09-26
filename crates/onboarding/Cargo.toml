@@ -1,0 +1,18 @@
+[package]
+name = "omnion-onboarding"
+description = "Omnion onboarding: the first-run flow — owner account, organization, first site, theme and checklist."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+omnion-audit = { path = "../audit" }
+omnion-content = { path = "../content" }
+omnion-identity = { path = "../identity" }
+omnion-permissions = { path = "../permissions" }
