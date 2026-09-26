@@ -7,10 +7,14 @@
  * (with the key write-only — the panel shows whether one is stored, never its value), the model
  * registry those providers fill, and a chat to try the whole chain — router, provider, stream —
  * before anything else on the platform builds on it.
+ *
+ * The chat's prompt can arrive prefilled from the palette's `Ask AI` row (`?q=…`), which is how a
+ * search that found nothing becomes a question.
  */
 import { useCallback, useEffect, useState } from "react";
 
 import { Download, Plus, Power, Send, Star, Trash2 } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -45,6 +49,7 @@ function Flag({ label, on }: { label: string; on: boolean }) {
 
 /** The AI Hub screen. */
 export function AiView() {
+  const searchParams = useSearchParams();
   const [providers, setProviders] = useState<AiProvider[] | null>(null);
   const [models, setModels] = useState<AiModel[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +71,9 @@ export function AiView() {
 
   // The chat.
   const [chatModel, setChatModel] = useState("");
-  const [prompt, setPrompt] = useState("");
+  // A prompt handed over by the palette's `Ask AI` row arrives in the URL; the reader still
+  // presses Send themselves — nothing is asked on their behalf.
+  const [prompt, setPrompt] = useState(() => searchParams.get("q") ?? "");
   const [answer, setAnswer] = useState("");
   const [chatRoute, setChatRoute] = useState<string | null>(null);
   const [chatUsage, setChatUsage] = useState<string | null>(null);

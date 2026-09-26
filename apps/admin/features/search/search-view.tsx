@@ -756,6 +756,13 @@ export function SearchView() {
             {result.total === 0 ? (
               <div className="rounded-xl border border-line bg-surface px-6 py-10 text-center">
                 <p className="text-[13.5px] font-medium">Nothing matched “{result.query}”</p>
+                {result.hidden_total > 0 ? (
+                  <p data-search-hidden className="mx-auto mt-1 max-w-md text-[12.5px] text-muted">
+                    {result.hidden_total === 1
+                      ? "1 result is outside your permissions."
+                      : `${result.hidden_total} results are outside your permissions.`}
+                  </p>
+                ) : null}
                 <ul className="mx-auto mt-2 flex max-w-md flex-col gap-1 text-left text-[12.5px] text-muted">
                   <li>Check the spelling of the words you searched for.</li>
                   <li>Try fewer or shorter words — one unusual word ranks best.</li>
