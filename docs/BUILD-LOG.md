@@ -1062,3 +1062,37 @@
   /command-center/resolve` on ai-hub, the intent preview card, confidence threshold with "Did you
   mean", `Edit as search`, timeout fallback); wave 1 then moves to REQ-007 (analytics + the real
   dashboard).
+
+## 2026-09-26 — REQ-032 · slice 4 · the palette reads what is typed into it
+
+- **A phrase becomes a structure, checked against the platform's own tables.** `crates/search/src/intent.rs`
+  reads one phrase into the vocabulary the platform really has — the domain maps through the provider
+  registry, a command is only ever a registry entry whose own words the phrase covered, filters are the
+  ones the index supports, and confidence is *computed* from what was recognised, so the same words
+  always read the same way. An unmapped domain stays a search and says so; a command the caller cannot
+  run is dropped and the words search instead. 13 walks, no database.
+- **The model is asked first and checked afterwards.** `POST /api/v1/command-center/resolve` (guard
+  `search.read`) answers the intent, a preview line, `runnable`, the destinations, the alternatives and
+  where the reading came from — and executes nothing. A connected model gets a six-second bound and a
+  closed vocabulary; its answer is *normalised* (unknown command, unknown provider, out-of-range sort or
+  count dropped, not trusted) and an unusable one leaves the grammar's reading standing with
+  `degraded: true`. Only model readings are audited (`command.resolve`: the interpreted intent, never a
+  row of content). The endpoint answers `search_route` (the editable search) beside `route` (where a
+  runnable reading lands), because a reading the caller may not run still has an editable shape.
+- **The card is a proposal beside the results, not a gate in front of them.** It sits above the list
+  like the confirmation card and is deliberately not an arrow-key row (every row the arrows reach must
+  be a screen); its controls are real buttons, ≥44px on touch. `Run` shows only for a runnable reading,
+  and a reading of an action command opens the platform's *own* confirmation card, so a command that
+  asks first asks here too. `Edit as search` always exists, the request aborts when a newer keystroke
+  overtakes it, and a failing reader offers a retry. Low confidence ("zzqqxx", 55%) carries no Run at
+  all — only alternatives.
+- Proof: `cargo test --workspace` → **490 passed, 0 failed** (27 new) · `cargo clippy --workspace
+  --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 · `bash scripts/qa/run.sh`
+  → 97 clicks, 117 screenshots, **0 high findings**, **0 vision issues** (`qa-artifacts/20260926-194131`;
+  the walkthrough's new steps record `parsedIntent: true · offersRun: false · ranNothingYet: true` and
+  `Edit as search` landing on `/search?q=tickets+Mehmet&sort=newest`) · `scripts/qa/probe-command-resolve.cjs`
+  → **47/47** (including a connected model that never answers degrading in **6.4 s** with its audit entry,
+  and the card at 390×844) · the four older palette probes re-run clean.
+- Next: **wave 1 moves to REQ-007** (analytics + the real dashboard). REQ-032 is closed; carried
+  forward, not caused by this slice: the public renderer's own icon 404s (5 medium findings), and
+  `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).

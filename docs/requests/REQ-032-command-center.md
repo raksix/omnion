@@ -1,6 +1,6 @@
 # REQ-032 — Universal Command Center
 
-> **Status:** in-progress — slices 1–3 shipped (action commands + audit; slice 4 left) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
+> **Status:** done (cc83afb…843a403) — all four slices shipped; the reading closed it · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -119,14 +119,17 @@ Webhook relevance: none directly. Audit: every action command writes a `command.
 ### Acceptance criteria
 
 Slice 1 shipped the boxes ticked below and slice 2 the next four; slice 3 ticked the two above
-(confirmation + job feedback, and the audit criterion) and the rest carry the slice that owns
-them. Evidence: the QA passes of `qa-artifacts/20260926-171549`, `qa-artifacts/20260926-180233`
-and `qa-artifacts/20260926-184340` (**105 clicks, 115 screenshots, 0 high findings, 0 vision
-issues**), `scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs`
-(**22/22**), `scripts/qa/probe-palette-federated.cjs` (**32/32**),
-`scripts/qa/probe-command-actions.cjs` (**31/31**) and the API suites
-`apps/api/tests/command_center.rs` (**14 walks**) + `apps/api/tests/search.rs` (**+2 walks**: the
-count outside a reader's scope, and `history=false`).
+(confirmation + job feedback, and the audit criterion); slice 4 ticked the last three — the AI
+card, the low-confidence rule and the phone. Evidence: the QA passes of
+`qa-artifacts/20260926-171549`, `qa-artifacts/20260926-180233`, `qa-artifacts/20260926-184340` and
+`qa-artifacts/20260926-194131` (**0 high findings, 0 vision issues**; the last one 97 clicks, 117
+screenshots and the new `resolve-read` / `resolve-edit-as-search` steps),
+`scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs` (**22/22**),
+`scripts/qa/probe-palette-federated.cjs` (**32/32**),
+`scripts/qa/probe-command-actions.cjs` (**31/31**), `scripts/qa/probe-command-resolve.cjs`
+(**47/47**) and the API suites `apps/api/tests/command_center.rs` (**18 walks**, 4 of them the
+resolver) + `apps/api/tests/search.rs` (**+2 walks**: the count outside a reader's scope, and
+`history=false`).
 
 - [x] `Ctrl+K` (and `Cmd+K`) opens the palette on every admin route, including over an open modal, without losing unsaved form state. — the palette is mounted once in the app shell, so it is on every route; the pass opened it over the results screen's shortcuts dialog (palette `z 50` over dialog `z 40`, and the dialog stayed open while the palette's scrim closed the palette) and over a half-typed "New page" form, whose title text survived the round trip.
 - [x] `Esc` closes the palette and returns focus to the element that had focus before opening. — measured with the create form's title field as the captured element (`focusReturned: true`).
@@ -137,15 +140,15 @@ count outside a reader's scope, and `history=false`).
 - [x] Running "Open analytics" navigates without a full reload and closes the palette. — the same walk with "Open pages": client-side navigation to `/pages`, `paletteClosed: true`.
 - [x] "Create customer" opens the create form with the palette closed and the first field focused. — the same walk with "Create a page" (`/pages?new=1`): palette closed, form open, the title field carrying the focus.
 - [x] "Run backup" asks for confirmation before queueing a job, then shows the standard job feedback. — **slice 3, with the stand-in this platform actually has**: no backup service exists yet, so the job action is the index rebuild (`act.reindex-search`) — it asks first (the palette's confirmation card; the API refuses an unconfirmed run with `confirmation_required` before anything executes, and the audit trail is *unchanged* while the question is open), then the owning service answers in its own shape and the palette prints that answer verbatim: "Rebuilt 7 providers · 18 documents · 95 ms" with a link to `/settings/search`, where the same pass is read back as the provider's last run. Proven by `probe-command-actions.cjs` (31/31: the question, Escape withdrawing it, the run, the entry) and the walkthrough's `action-confirm`/`action-run` steps (`ranNothingYet: true`, `newEntries: 1`).
-- [ ] The AI card for "Open Mehmet's last 10 tickets" shows the parsed intent before running. — slice 4.
-- [ ] A low-confidence phrase never auto-executes. — slice 4.
+- [x] The AI card for "Open Mehmet's last 10 tickets" shows the parsed intent before running. — the phrase reads as **"Tickets · assignee: Mehmet · last 10 · newest first"** at 85% confidence, and the audit trail is read *before and after* the reading to prove nothing ran (`probe-command-resolve.cjs`: `reading a phrase runs nothing — 1 → 1 command.run entries`; the walkthrough records `ranNothingYet: true` for its own `resolve-read` step). No tickets screen exists yet, so the card says so in plain words and offers `Edit as search`, which lands on `/search?q=tickets+Mehmet&sort=newest` with the order the phrase asked for — a reading is a proposal, not a promise.
+- [x] A low-confidence phrase never auto-executes. — "zzqqxx" reads as *unclear* (55%, below the run threshold), so the card carries **no Run at all** — only `Edit as search` and the "Did you mean" alternatives — and the audit trail is unchanged after it (`probe-command-resolve.cjs`: `a low-confidence phrase offers no Run at all`, `and still runs nothing`). The rule is the server's: `runnable` is computed behind the API (confidence ≥ 0.6 **and** a destination the caller may really open), so no panel build can talk itself into a run. The same threshold holds for a reading the caller lacks the key for: an editor asking "open sites" receives no `nav.sites` anywhere in the body and no Run.
 - [x] A failing result type shows a per-group error with retry while other groups still render. — slice 2's probe fails one type's request with a real `503 dependency_unavailable`: that section shows "Media could not be searched." with a **Try again** button (the failure's code and status in its tooltip) while the Pages section keeps its rows, and the retry refills the failed group once the store answers again.
 - [x] Recents persist across sessions and are per user, not per organization. — the walkthrough sees the command it ran after a reload; `recents_are_per_user_and_never_per_organization` proves one account's history is invisible to another in the same organization, and that a clear is personal.
 - [x] Clearing recents empties the group immediately and after a reload. — `probe-command-center.cjs`: 0 rows immediately, 0 rows and `items: []` after a reload.
 - [x] Every executed action command appears in the audit log with actor, command and target. — every run that starts writes exactly one `command.run` entry (`target_type: command`, `target_id` = the registry id, `metadata.outcome` + the owning service's aggregate result, `ip_address`; the actor is the caller's account), and the run is counted in `command_usage_daily` — one row per run, two runs two rows, proven at the API (`command_center.rs`: the entry names command and outcome, the usage count goes 1 → 2) and in the browser (`probe-command-actions.cjs`: "exactly one audit entry per executed command", actor + target read back through `GET /api/v1/iam/audit`). A refused run (unconfirmed, navigation, unknown id, or a caller missing the command's own key) writes nothing: a check asserts the trail is unchanged after all three refusals. Navigation commands still write no entry — the request's own rule holds.
 - [x] `/search` reproduces the same results from its URL alone, with filter chips and type filters applied. — slice 2: a section's "see all" lands on `/search?q=<words>&type=<provider>` (the screen's own filter parameter, so the chip is already applied) and the screen's count equals the API's own count for that query — the same number after a reload. REQ-002's depth pass proved the rest of the screen's URL state (facets, chips, sort, page).
 - [x] Keyboard-only operation reaches every group and row; `Tab`/`Shift+Tab` cycle groups and `Cmd+Enter` opens in a new tab. — arrows and `Enter` (both probes), `Ctrl+Enter` in a new tab and `Tab` between groups (probe-command-center) are proven; slice 2's probe adds `Shift+Tab` (forward `pages → media`, back `media → pages`) and the narrowing sweep of every mode.
-- [ ] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844. — the sheet fills 390×844 and its rows (commands included) are 44px; the AI card arrives with slice 4.
+- [x] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844. — the sheet fills 390×844 and its rows (commands included) are 44px; slice 4 measured the card itself at 390×844: **374px wide** inside a 390px viewport (it spans the sheet rather than floating), its `Run` / `Edit as search` controls **44px** tall, and the "Did you mean" alternatives the same (`probe-command-resolve.cjs`: `it spans the sheet rather than floating in a corner`, `its controls are 44px on a phone`).
 
 ### QA plan
 
@@ -366,6 +369,86 @@ command with actor + target, the three refusals, the history really cleared, and
 390×844 with 44px answers) · `probe-command-center.cjs` **26/26**, `probe-palette.cjs` **22/22**,
 `probe-palette-federated.cjs` **32/32** re-run clean (no regressions) · the walkthrough's own steps
 record `ranNothingYet: true` and `newEntries: 1` for the run.
+
+#### Slice 4 — natural-language resolution (2026-09-26) — shipped
+
+What landed:
+
+- **A phrase becomes a structure, checked against the platform's own tables.**
+  `crates/search/src/intent.rs` reads one phrase into the vocabulary the platform really has: the
+  domain word maps through the provider registry (and nothing else does), a command is only ever a
+  registry entry whose own words the phrase covered, filters are the ones the index supports (an
+  order, a count, an assignee), and confidence is *computed* — every recognised part raises it — so
+  the same words always read the same way. A domain the index does not answer for stays a search
+  and says so; a command the caller cannot run is dropped and the words search instead.
+- **The reading is the API's, and it executes nothing.** `POST /api/v1/command-center/resolve`
+  (guard `search.read`) answers one phrase with the intent, a preview line in plain words
+  ("Tickets · assignee: Mehmet · last 10 · newest first"), `runnable`, the destinations, the
+  alternatives and where the reading came from — and writes nothing but an audit entry: **no run,
+  no usage, no navigation**. `runnable` is computed behind the API (confidence at or above 0.6
+  *and* a screen the caller may really open), so the panel cannot talk itself into a run.
+- **The model is asked first, and normalised afterwards.** When the installation has a model
+  connected, the resolver asks it — bounded at **six seconds**, with a closed vocabulary in the
+  prompt (the providers this caller may read, the commands they may run) — and then checks the
+  answer: an unknown command id, a provider the index does not answer for, a sort order outside
+  the three, a count past the cap are *dropped*, not trusted. No model, a slow model or an
+  unusable answer leaves the grammar's own reading standing, flagged as such: `source`, `degraded`
+  and a plain-word note travel with the answer, so a local reading is never dressed up as a
+  model's. Model readings are audited (`command.resolve`: the interpreted intent, status, the
+  words — never a row of content); the grammar's are reproducible from the words themselves, so
+  they are not.
+- **The card is a proposal beside the results, not a gate in front of them.** It sits above the
+  list like the confirmation card does, and it is deliberately not an arrow-key row: its controls
+  are real buttons (≥44px on touch), because every row the arrow keys reach must be a screen.
+  `Run` appears only for a runnable reading — and for a reading of an action command it opens the
+  platform's *own* confirmation card, so a command that asks first asks here too. `Edit as search`
+  always exists: the API answers `search_route` (the words, the domain and the order, runnable or
+  not) beside `route` (where Run lands), so collapsing the two can never lose the filters the
+  phrase carried. The request is aborted the moment a newer keystroke overtakes it, and a failing
+  reader gets a retry rather than a dead end.
+
+Deviations, recorded as they were decided:
+
+- The request's "Tickets" example has no module yet (a helpdesk is REQ-009's ground), so the
+  reading of that exact phrase is honest rather than theatrical: the interpretation prints in full,
+  a Run is *not* offered, and the card says why. A runnable reading is demonstrated with the
+  domains that exist ("show me the newest pages" → `/search?q=pages&type=pages&sort=newest`).
+- "Degrades to plain search when slow" is implemented as the grammar's own reading standing in
+  (with `degraded: true` and a note), not as the card disappearing: the results beside it were
+  never blocked in the first place, and a reading the operator can correct is worth more than an
+  empty space.
+- The arrow-key list does not carry the card's controls (§ above). The confirmation card of slice 3
+  set that precedent, and the alternative — listbox options that are buttons — costs the list its
+  own promise.
+- The resolve fires on a **250 ms** typing pause for phrases of four characters or more, in the
+  open mode only; a prefixed box (`>`, `@`, `#`, `:`, `?`) already says what the reader wants and
+  asks nobody.
+
+Found, not caused by this slice:
+
+- A provider left behind by a probe that crashed mid-way makes every reading in the installation
+  time out, and the *symptom* is a palette that feels slow rather than a missing provider. The
+  probe now clears its own name first, and the six-second bound is the thing that keeps the failure
+  survivable either way.
+
+Proof: `cargo test --workspace` → **490 passed, 0 failed** (27 new: 13 grammar walks in
+`omnion-search::intent` — the request's own phrase, a command, an order, gibberish, the count cap,
+the permission-degraded command — 10 resolver walks in `omnion-api::intent_resolver` covering the
+normalisation of a model's answer, and 4 new walks in `apps/api/tests/command_center.rs`: the
+interpretation and its verbs, the screens a caller may open, the unreadable phrase, the endpoint's
+own refusals) · `cargo
+clippy --workspace --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 ·
+`bash scripts/qa/run.sh` → 97 clicks, 117 screenshots, **0 high findings**, **0 vision issues**
+(`qa-artifacts/20260926-194131`; the 5 medium findings are the public renderer's own icon 404s,
+carried forward) with the walkthrough's new `resolve-read` step recording
+`parsedIntent: true · offersRun: false · ranNothingYet: true` and `resolve-edit-as-search` landing
+on `/search?q=tickets+Mehmet&sort=newest` · `scripts/qa/probe-command-resolve.cjs` → **47/47**
+(the reading, nothing run, the alternatives, `Edit as search`, a runnable Run, a command reading, an
+action reading that still asks first, the unreadable phrase, a slow reader that does not block
+typing, a failing reader with a retry, a connected model that never answers degrading in **6.4 s**
+with its audit entry, and the card at 390×844) · `probe-command-center.cjs` **26/26**,
+`probe-palette.cjs` **22/22**, `probe-palette-federated.cjs` **32/32**,
+`probe-command-actions.cjs` **31/31** re-run clean (no regressions).
 
 ### Risks / notes
 
