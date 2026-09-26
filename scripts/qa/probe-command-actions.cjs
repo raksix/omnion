@@ -104,12 +104,17 @@ async function main() {
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
+  // Console errors are collected with their URL: this probe asks the run endpoint for three
+  // refusals on purpose (unconfirmed, navigation, unknown id), and the browser logs each 4xx as a
+  // console error. Counting them would make the probe fail on its own questions.
   const consoleErrors = [];
   const serverErrors = [];
   page.on("console", (msg) => {
     if (msg.type() === "error") {
-      const where = msg.location?.().url ?? "";
-      consoleErrors.push(`${msg.text().slice(0, 120)}${where ? ` @ ${where}` : ""}`.slice(0, 200));
+      consoleErrors.push({
+        text: msg.text().slice(0, 120),
+        url: msg.location?.().url ?? "",
+      });
     }
   });
   page.on("response", (response) => {
@@ -287,10 +292,16 @@ async function main() {
     serverErrors.length === 0,
     serverErrors.slice(0, 3).join(" | "),
   );
+  const unexpectedErrors = consoleErrors.filter(
+    (entry) => !/\/api\/v1\/commands\/[^/]+\/run$/.test(entry.url),
+  );
   check(
-    "no console errors on the desktop pass",
-    consoleErrors.length === 0,
-    consoleErrors.slice(0, 2).join(" | "),
+    "no console errors on the desktop pass, apart from the refusals this probe asks for",
+    unexpectedErrors.length === 0,
+    unexpectedErrors
+      .slice(0, 2)
+      .map((entry) => `${entry.text} @ ${entry.url}`)
+      .join(" | "),
   );
 
   // ---------------------------------------------------------------- mobile: the card is usable
