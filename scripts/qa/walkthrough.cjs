@@ -59,6 +59,23 @@ const CREDS = {
  */
 const SAMPLE_SLUG = "qa-sample";
 
+/**
+ * The one file the pass uploads, as base64: a small landscape, so the library's thumbnail looks
+ * like a picture rather than a placeholder. It has to decode into a real PNG — an earlier,
+ * one-character-short string produced a file the browser could not render at all.
+ */
+const SAMPLE_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAKAAAAB4CAIAAAD6wG44AAADwUlEQVR42u3cyVJTQRTG8bTF3iqRhcPSYuPaRxABtRTW+A5uHLAUEC1xeAxdi1VqHPA1cCO6UFAkJBDwAVxYYNAkd+hzerr/bwlUp/v8cs69N1CYj+vbNZJuDlECgAnAJNQMGGpABxOACSOaeAGuIcyIJoxoQgcTgAnAhGsw4TGJEU0Y0SSOEU18pHVrste3jjx4LvhC5tPGNuUOhFaD2awA7CrNfLSdGbRmBjhQWilms9IAWFl3etJ+kcGFksY8JkWga7OO+dxow6CUzekJ2QWPLizSwcnqllsT4MRjvjCiFdJQaN/9DBUZ1HRw8h28SQdLt+/NCe2XGHqYt4n5ZUOcfcmI9pUN/fYt9CoAJx6AEw/X4MQvw3Rw6h3MH92l3cKMaEY04S6ahNvoX5t8VCmcHzfUP+s49miRDiYA+24vB+vzmJTuDfSfn/3W4hqsku/XVa7Exx8XGw+MaK7BxEmrKa1pVhnRmlmTG9QnSr1jzGprBwZl48sSui8Y0YGmtI3ICmZtiw52lNVrhVv55BPbNwfAgTLb0wIcKLMULcCVCL/wTzzcRQNM4h7RzGg6mABMuIsmdDBJGfji3BU8xGPWt3dCo3059xQYMeCfbZ/AF2Z7du2ruzDHDNyHFua4gXPSwiwDvOEQ+Pys1W3Ua5hDBrbUhTlcYClajMsANzSBx2cVH23rMOcC3lEBHp9x9KlFfR7mDOBdadop98eozz/DUh3YCy3MGcCbEsBjvmk78yYq5rGZKdUN2wIHRRsX8z+lU9pweeBgaQNn7l838Q2bZnHg0RhoO/M2DOacdZPdrWnuFgAevRMZ7YHC3fPGXKJuUrvNCxw1rUdmy7rZ79a0cgCfS0V3P++UmWUrZrPbDOD0aLWZlSpWeqs9gdOm1TB2ULESu+0CXBFaKWb35Sq0W7PVATxSPdrOvC/I7LdcOXdrtn7t1mq1kduVpj1QuPvZhQunXJm7NWeuXgI1f+EC7IT+xgD3y9Je7c4GP+GWejB7A27Xlw+Pn+Y9pM3sGrhdX/7/i0jrMbsA7oraNUhL5cOesSJwflek9ZjlgW1cYRbPQGioXZdF2g+wkmvy0i6fIMqMaGeuKU3vXkXTPkhe4BBQo5MuVDSlg2QAB+sasrRl0WQP0h04ItdApDUqJnKQv8BRo3qRdlYxm4OY4eFTaT8nyDL7bYMSZ0kf2F46wNmW/ywVAi5anSiuWZlnqSJwn+rEeyPSS7rSwFV41wKcuDTAiYf/NgswAZgATAAmABOACcAAE4AJwARgAjCxym/ay4DNqO3IxAAAAABJRU5ErkJggg==";
+
+/** Write the sample file next to the pass's other artifacts; answers its path. */
+function ensureSamplePng() {
+  const file = path.join(OUT, "upload-sample.png");
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
+  }
+  return file;
+}
+
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const clickLines = [];
@@ -529,6 +546,16 @@ async function interact(page, pageName, report) {
       await page.goto(`${URL_ADMIN}${pagePath}`, { waitUntil: "domcontentloaded" }).catch(() => {});
       await page.waitForTimeout(450);
     }
+    // The search palette is global chrome: whatever opened it in the previous round (the search
+    // box being filled, for one) is closed here, so a click is never swallowed by the overlay.
+    const paletteOpen = await page
+      .evaluate(() => Boolean(document.querySelector("[data-search-palette]")))
+      .catch(() => false);
+    if (paletteOpen) {
+      await page.locator("[data-palette-input]").first().focus().catch(() => {});
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(150);
+    }
     const items = await inventory();
     if (round === 0) log(`interact: ${pageName} → ${items.length} elements`);
     meta = items.find((it) => !clickedKeys.has(it.key)) || null;
@@ -603,10 +630,7 @@ async function interact(page, pageName, report) {
       continue;
     }
     if (meta.tag === "input" && meta.type === "file") {
-      const file = path.join(OUT, "upload-sample.png");
-      if (!fs.existsSync(file)) {
-        fs.writeFileSync(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAEAAAABAAQMAAACQp+OdAAAAA1BMVEX/AAAAz0kAAAAHUlEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=", "base64"));
-      }
+      const file = ensureSamplePng();
       const ok = await page
         .locator(`[data-qa-idx="${i}"]`)
         .setInputFiles(file)
@@ -690,6 +714,142 @@ async function interact(page, pageName, report) {
   }
 }
 
+// ---------------------------------------------------------------- media upload
+
+/**
+ * Put one file in the library.
+ *
+ * The media screen's upload control is a hidden file input behind a button, and the click-through
+ * only reaches visible controls — so this is the one place the pass sets a file on an input
+ * directly, which is exactly what the browser does when a person picks a file. Without it the
+ * library stays empty, and an empty library means the search index has no media to answer with.
+ */
+async function uploadMediaSample(page) {
+  const file = ensureSamplePng();
+
+  const input = page.locator('input[type="file"]').first();
+  if ((await input.count()) === 0) {
+    return { uploaded: false, note: "no file input on this screen" };
+  }
+  await input.setInputFiles(file).catch(() => {});
+  await page.waitForTimeout(1600);
+  return {
+    uploaded: true,
+    file: path.basename(file),
+    listed: await page.locator("text=upload-sample.png").count(),
+  };
+}
+
+// ---------------------------------------------------------------- palette (REQ-002)
+
+/**
+ * The ⌘K palette: opened from the keyboard, searched, walked with the arrow keys, used to open a
+ * real screen, then reopened to check that the query was remembered. The pass covers the whole
+ * loop — open, search, sections, keyboard, navigation, recents, close — rather than the opening
+ * animation alone.
+ */
+async function runPalette(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "palette", action: "palette", ...step });
+  };
+
+  // The palette's Media section needs something in the library: the media pass uploads a file and
+  // then removes it again (both are real controls and both are covered), so one file is put back
+  // before the search.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  report.paletteUpload = await uploadMediaSample(page);
+  log(`palette upload: ${JSON.stringify(report.paletteUpload)}`);
+  await page.waitForTimeout(2500);
+
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  await page.keyboard.press("Control+K");
+  await page.waitForSelector("[data-search-palette]", { timeout: 6000 }).catch(() => {});
+  const opened = (await page.locator("[data-search-palette]").count()) > 0;
+  const focusedInput = await page.evaluate(
+    () => document.activeElement === document.querySelector("[data-palette-input]"),
+  );
+  note({ step: "open", opened, focusedInput });
+  await shot(page, "palette-open", { full: false });
+
+  const input = page.locator("[data-palette-input]").first();
+  await input.fill("sample").catch(() => {});
+  await page.waitForTimeout(1100);
+  const rows = await page.locator("[data-search-palette] [role=option]").count();
+  const sections = await page
+    .locator("[data-search-palette] [role=listbox] > div")
+    .count()
+    .catch(() => 0);
+  const text = await page
+    .locator('[data-search-palette] [role="listbox"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "search",
+    query: "sample",
+    rows,
+    sections,
+    text: text.replace(/\s+/g, " ").slice(0, 280),
+  });
+  await shot(page, "palette-results", { full: false });
+
+  // The arrow keys move the highlight: the row the input points at changes without the mouse.
+  const active = () =>
+    page.evaluate(
+      () =>
+        document.querySelector("[data-palette-input]")?.getAttribute("aria-activedescendant") ?? null,
+    );
+  const first = await active();
+  await input.press("ArrowDown").catch(() => {});
+  await page.waitForTimeout(220);
+  const second = await active();
+  note({ step: "arrow", from: first, to: second, moved: Boolean(second) && second !== first });
+
+  // Enter opens the highlighted row on the screen that owns it.
+  const before = page.url();
+  await input.press("Enter").catch(() => {});
+  await page.waitForTimeout(1200);
+  const after = page.url();
+  note({
+    step: "open-row",
+    before,
+    after,
+    navigated: after !== before,
+    leftOverview: new URL(after).pathname !== "/",
+  });
+  await shot(page, "palette-opened-row", { full: false });
+
+  // Reopening shows the query under "Recent searches" — the history is real, not a stub.
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.keyboard.press("Control+K");
+  await page.waitForTimeout(900);
+  const recents = await page
+    .locator("[data-search-palette]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "recents",
+    hasRecentSection: /Recent searches/i.test(recents),
+    hasQuery: /\bsample\b/i.test(recents),
+    hasViewedSection: /Recently viewed/i.test(recents),
+  });
+  await shot(page, "palette-recents", { full: false });
+
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(400);
+  note({ step: "close", closed: (await page.locator("[data-search-palette]").count()) === 0 });
+  await shot(page, "palette-closed", { full: false });
+
+  report.palette = steps;
+}
+
 // ---------------------------------------------------------------- run
 
 async function main() {
@@ -732,16 +892,26 @@ async function main() {
     { path: "/media", name: "media" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
+    // The results screen is a route like any other: it is walked, clicked and measured.
+    { path: "/search?q=qa", name: "search" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
     await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await page.waitForTimeout(900);
+    if (route.name === "media") {
+      report.mediaUpload = await uploadMediaSample(page);
+      log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
+      await page.waitForTimeout(600);
+    }
     const diag = await diagnostics(page);
     await shot(page, `page-${route.name}`);
     await interact(page, route.name, report);
     report.pages.push({ ...route, diagnostics: diag });
   }
+
+  // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
+  await runPalette(page, report);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -754,17 +924,63 @@ async function main() {
     report.reLogin = reLogin;
   }
 
-  // Mobile pass.
+  // Mobile pass. The context is new, so it carries no session — without the sign-in below every
+  // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
   const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
   const mpage = await mobile.newPage();
   attach(mpage, "mobile");
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }]) {
+  report.mobileLogin = await ensureSignedIn(mpage, report);
+  if (!report.mobileLogin) {
+    log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
+  }
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
     await shot(mpage, `mobile-${route.name}`);
     report.mobile.push({ ...route, diagnostics: diag });
   }
+
+  // The palette on a phone: a full-screen sheet with 44px rows and a reachable close control.
+  // Overlay shots are viewport-only: a full-page screenshot of a fixed sheet shows the page
+  // below the fold as well, which reads as an overlay that fails to cover the screen.
+  await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await mpage.waitForTimeout(1200);
+  let mobileOpened = false;
+  for (let attempt = 0; attempt < 3 && !mobileOpened; attempt += 1) {
+    // A development server hydrates on its own schedule; a tap that lands before that is a tap
+    // into a static page, so the pass is patient instead of assuming.
+    await mpage.locator("[data-search-box]").first().click({ timeout: 4000 }).catch(() => {});
+    await mpage.waitForTimeout(700);
+    mobileOpened = (await mpage.locator("[data-search-palette]").count()) > 0;
+  }
+  await mpage.locator("[data-palette-input]").first().fill("sample").catch(() => {});
+  await mpage.waitForTimeout(1000);
+  await shot(mpage, "mobile-palette", { full: false });
+  const mobileSheet = await mpage
+    .evaluate(() => {
+      const dialog = document.querySelector("[data-search-palette] [role=dialog]");
+      if (!dialog) return null;
+      const rect = dialog.getBoundingClientRect();
+      const rows = [...document.querySelectorAll("[data-search-palette]  [role=option]")].map(
+        (row) => Math.round(row.getBoundingClientRect().height),
+      );
+      return {
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        viewport: { w: innerWidth, h: innerHeight },
+        rowHeights: rows.slice(0, 6),
+        minRow: rows.length ? Math.min(...rows) : 0,
+        closeButtons: document.querySelectorAll('[data-search-palette] button[aria-label="Close search"]').length,
+      };
+    })
+    .catch(() => null);
+  report.mobilePalette = {
+    opened: mobileOpened,
+    sheet: mobileSheet,
+    rows: await mpage.locator("[data-search-palette] [role=option]").count().catch(() => 0),
+  };
+  log(`mobile palette: ${JSON.stringify(report.mobilePalette)}`);
   await mobile.close();
 
   // Public renderer — reached through the site's own host so the renderer resolves the site.
