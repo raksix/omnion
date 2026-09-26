@@ -40,3 +40,30 @@
 - Probe lesson: the walkthrough treats a repeated descriptor as already-clicked, so a form must
   never put a close/icon-only control *before* its fields — the first unseen key would close the
   form before it is filled. The editor keeps its actions after the fields for that reason.
+
+## 2026-09-26 · pass `20260926-112300` — ISSUE-002 fixed (blank page at an unpublished address)
+
+- Counters: 49 clicks · 8 field fills · 49 screenshots · 10 programmatic findings
+  (high 0 · medium 10 · low 0) · vision review 14 shots → 5 issues (high 0 · medium 3 · low 2).
+  Vision `high` went 2 → 0 and the blank-page report disappeared.
+- Fixed **ISSUE-002** (high): the renderer painted nothing at an unpublished address. The dev
+  server blocks cross-origin dev resources for `qa.omnion.test`, and the blocked HMR socket is
+  also React's debug-channel transport — so the client-side recovery of a failed server render
+  (`__next_error__` → `createRoot()`) waited for that channel forever. `apps/web/next.config.ts`
+  now declares the QA host in `allowedDevOrigins` (development only); the not-found view renders
+  and the socket connects.
+- Harness: the public pass now verifies the renderer's real job — it opens the published page
+  (`/qa-sample`, created by the panel pass in the same tick) on the site's own host and requires
+  `200` + heading, and it records the root's visible text with a new `high` `web-blank` finding
+  when a `404` answer shows no page. Negative control: the guard fires on the previous pass's
+  summary (`web.text` empty) and stays silent on this one.
+- Proof: `summary.json → web` — root text “Nothing published here … Back to the home page”;
+  `published` = `200`, title “QA Sample Page · QA Site”, heading “QA Sample Page”, body text
+  present, no overflow/broken images; vision review 0 issues for `web-home`, `web-first-link`
+  and `web-published`.
+- Still open: ISSUE-003 (badge contrast, 3.9), ISSUE-004 (dev indicator over “Sign out” — vision
+  still sees it as medium on `page-sites`/`click-ai-*`), and the ISSUE-002 follow-up: publish a
+  `home` page in the fixture so the root is real content instead of the expected `404`.
+- Lesson: a Next.js dev-only failure mode can look exactly like an app defect — the giveaway is
+  the `__next_error__` document plus a `<script>` payload holding the very content that never
+  reached the screen. Measure `document.body.innerText`, not the response body.
