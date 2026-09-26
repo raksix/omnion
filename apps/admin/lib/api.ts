@@ -215,6 +215,49 @@ export async function fetchPages(siteId: string, status?: string): Promise<Page[
   return body.pages;
 }
 
+/** Create a page together with its first, draft revision. */
+export function createPage(input: {
+  siteId: string;
+  slug: string;
+  title: string;
+  body?: string;
+  summary?: string;
+}): Promise<Page> {
+  return request<Page>("/api/v1/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      site_id: input.siteId,
+      slug: input.slug,
+      title: input.title,
+      body: input.body ?? null,
+      summary: input.summary ?? null,
+    }),
+  });
+}
+
+/** Edit a page: a content change appends the next draft revision, a slug rename does not. */
+export function updatePage(
+  pageId: string,
+  changes: { slug?: string; title?: string; body?: string; summary?: string },
+): Promise<Page> {
+  const body: Record<string, unknown> = {};
+  if (changes.slug !== undefined) body.slug = changes.slug;
+  if (changes.title !== undefined) body.title = changes.title;
+  if (changes.body !== undefined) body.body = changes.body;
+  if (changes.summary !== undefined) body.summary = changes.summary;
+  return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Publish the page's working draft — the revision visitors then see. */
+export function publishPage(pageId: string): Promise<Page> {
+  return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}/publish`, {
+    method: "POST",
+  });
+}
+
 /** The media library of one site, newest first. */
 export async function fetchMedia(siteId: string): Promise<Media[]> {
   const body = await request<{ media: Media[] }>(
