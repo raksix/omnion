@@ -70,6 +70,12 @@ pub struct SearchParams {
     pub after: Option<String>,
     /// `true` asks for the facet rail's counts next to the hits.
     pub facets: Option<String>,
+    /// `false` keeps the search out of the caller's own history (`search_recent`).
+    ///
+    /// The palette types into this endpoint once per group per keystroke; recording every one of
+    /// those would drown the history the results screen keeps. A search that is *committed* — a
+    /// hit opened, a filter applied on the results screen — records itself the ordinary way.
+    pub history: Option<String>,
 }
 
 /// Query string of `GET /api/v1/search/export`: the search parameters plus an optional selection.
@@ -222,6 +228,12 @@ pub struct SearchResponse {
     pub per_page: i64,
     /// Which provider contributed how many (ordered by count).
     pub counts: Vec<CountBody>,
+    /// How many documents the query matches outside the caller's own read scope.
+    ///
+    /// Answered (as a count, never as titles) when the caller's own answer is empty: it is how
+    /// "nothing matched" and "nothing you may read matched" are told apart. `0` when the caller
+    /// covers every enabled provider.
+    pub hidden_total: i64,
     /// The facet rail's counts; only answered when `facets=true` was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets: Option<Vec<FacetGroupBody>>,
@@ -424,14 +436,25 @@ pub async fn search(
     let started = std::time::Instant::now();
     let HitPage { hits, total } = query::search(state.db().pool(), &request).await?;
     // The history is a convenience, never the answer: a failed write is logged and the search
-    // still answers.
-    if let Err(error) = record_recent(state.db().pool(), current.user.id, request.query.raw()).await
-    {
-        tracing::warn!(
-            code = error.code(),
-            "the search history could not be written"
-        );
+    // still answers. A caller that says `history=false` — the palette, which asks once per group
+    // per keystroke — is taken at its word.
+    if wants_history(&params) {
+        if let Err(error) = record_recent(state.db().pool(), current.user.id, request.query.raw()).await
+        {
+            tracing::warn!(
+                code = error.code(),
+                "the search history could not be written"
+            );
+        }
     }
+    // An empty answer is the one moment the caller needs to know whether the index was empty or
+    // their own read scope was: a count, never a title. A non-empty answer is not asked, so the
+    // ordinary search pays nothing for this.
+    let hidden_total = if total == 0 {
+        query::hidden_count(state.db().pool(), &request).await?
+    } else {
+        0
+    };
     let counts = query::counts(state.db().pool(), &request).await?;
     let facets = if wants_facets {
         Some(
@@ -469,6 +492,7 @@ pub async fn search(
         page: request.page,
         per_page: request.per_page,
         counts,
+        hidden_total,
         facets,
         took_ms: started.elapsed().as_millis() as u64,
     }))
@@ -864,6 +888,24 @@ fn parse_sort(raw: Option<&str>) -> Result<Sort, ApiError> {
     }
 }
 
+/// Whether this search should join the caller's own history.
+///
+/// Recording is the default — a search typed on the results screen is a search worth keeping —
+/// and only an explicit `false` (or `0`/`no`) turns it off. An unknown value is treated as the
+/// default rather than refused: the history is a convenience, and a mistyped flag must not cost
+/// the caller their results.
+fn wants_history(params: &SearchParams) -> bool {
+    !matches!(
+        params
+            .history
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some("false" | "0" | "no")
+    )
+}
+
 /// Turn the query string into the filter set the engine narrows with.
 ///
 /// Everything is validated here: an unparsable date or a malformed owner is a `400` naming the
@@ -1025,7 +1067,23 @@ mod tests {
             before: None,
             after: None,
             facets: None,
+            history: None,
         }
+    }
+
+    #[test]
+    fn a_search_joins_the_history_unless_it_says_otherwise() {
+        assert!(wants_history(&params("release")));
+        let mut muted = params("release");
+        muted.history = Some(" false ".to_owned());
+        assert!(!wants_history(&muted));
+        muted.history = Some("0".to_owned());
+        assert!(!wants_history(&muted));
+        muted.history = Some("NO".to_owned());
+        assert!(!wants_history(&muted));
+        // An unknown value is the default, not a refusal: the history never costs results.
+        muted.history = Some("maybe".to_owned());
+        assert!(wants_history(&muted));
     }
 
     #[test]

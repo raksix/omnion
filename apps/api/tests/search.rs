@@ -1142,6 +1142,137 @@ async fn the_callers_search_history_is_kept_and_clearable() {
 }
 
 #[tokio::test]
+async fn an_empty_answer_says_what_lies_outside_the_readers_scope() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    fixture.reindex().await;
+
+    // Both sites carry the fixture's marker, and neither is in the editor's scope: their keys
+    // read content and media, so the sites provider answers around them rather than to them.
+    const SITE_A_TITLE: &str = "Search Site A";
+    let probe = format!("/api/v1/search?q={}", fixture.marker);
+
+    let editor = fixture.editor_token().await;
+    let answer = call(
+        &fixture.state,
+        request(Method::GET, &probe, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "body: {}", answer.body);
+    assert_eq!(answer.body["total"], json!(0), "body: {}", answer.body);
+    assert_eq!(
+        answer.body["hidden_total"],
+        json!(1),
+        "one site matches the marker and it is outside the editor's scope: {}",
+        answer.body
+    );
+    // The count is the whole answer: no title of the hidden site appears anywhere in the body.
+    let text = answer.body.to_string();
+    assert!(
+        !text.contains(SITE_A_TITLE),
+        "the hidden title leaked into the answer: {text}"
+    );
+    assert!(
+        !text.contains("Search Site B"),
+        "the hidden title leaked into the answer: {text}"
+    );
+
+    // The platform owner covers every provider: the same query is answered in full, and nothing
+    // counts as hidden — the reader who may see everything is never told about a wall.
+    let owner = fixture.platform_token().await;
+    let answer = call(
+        &fixture.state,
+        request(Method::GET, &probe, Some(&owner), None),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "body: {}", answer.body);
+    assert!(
+        answer.body["total"].as_i64().unwrap_or(0) >= 1,
+        "the owner must be answered: {}",
+        answer.body
+    );
+    assert_eq!(answer.body["hidden_total"], json!(0), "body: {}", answer.body);
+    assert!(
+        answer.body.to_string().contains(SITE_A_TITLE),
+        "the owner must see the site: {}",
+        answer.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_search_can_stay_out_of_the_callers_history() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "palette-notes",
+        "Palette notes",
+    )
+    .await;
+    fixture.reindex().await;
+
+    let editor = fixture.editor_token().await;
+
+    // The palette asks once per group per keystroke, and those calls say `history=false`: the
+    // account's history stays a record of the searches someone committed to.
+    for _ in 0..3 {
+        let answer = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                "/api/v1/search?q=palette%20notes&history=false&types=pages",
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "body: {}", answer.body);
+        assert!(
+            answer.body["total"].as_i64().unwrap_or(0) >= 1,
+            "body: {}",
+            answer.body
+        );
+    }
+
+    let history = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/recent", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(
+        history.body["queries"],
+        json!([]),
+        "typing must not fill the history: {}",
+        history.body
+    );
+
+    // A search the account saw through — the results screen's own call — is kept as before.
+    let answered = search(&fixture.state, &editor, "palette").await;
+    assert!(
+        answered["total"].as_i64().unwrap_or(0) >= 1,
+        "body: {answered}"
+    );
+    let history = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/recent", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(
+        history.body["queries"],
+        json!(["palette"]),
+        "a committed search is kept: {}",
+        history.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn search_refuses_what_it_cannot_answer() {
     let Some(fixture) = Fixture::new().await else {
         return;

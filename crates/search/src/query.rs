@@ -580,8 +580,22 @@ fn push_conditions(
     request: &SearchRequest,
     omit: Option<FilterKind>,
 ) {
+    push_conditions_with(builder, request, &request.providers, omit);
+}
+
+/// The same conditions, with the provider scope replaced.
+///
+/// Every reader of the index scopes by the providers the caller's own keys cover. The count of
+/// what lies *outside* that scope ([`hidden_count`]) is the one caller that needs the same
+/// filters over a different provider list, so the scope is a parameter rather than a field read.
+fn push_conditions_with(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    request: &SearchRequest,
+    providers: &[&'static str],
+    omit: Option<FilterKind>,
+) {
     builder.push("d.provider = any(");
-    builder.push_bind(request.providers.clone());
+    builder.push_bind(providers.to_vec());
     builder.push("::text[])");
 
     builder.push(" and (");
@@ -1046,6 +1060,42 @@ pub async fn counts(pool: &PgPool, request: &SearchRequest) -> Result<Vec<Provid
     builder.push(" group by d.provider order by count desc, d.provider asc");
     let rows: Vec<ProviderCount> = builder.build_query_as().fetch_all(pool).await?;
     Ok(rows)
+}
+
+/// How many documents a query matches outside the caller's own read scope.
+///
+/// The answer to "was the search really empty, or is the result hidden from me?" — a count and
+/// nothing else: no titles, no ids and no per-provider split, because naming what lies outside a
+/// reader's scope would hand them the index anyway. The caller's own filters (the `type:` values
+/// included) still narrow it, so the number matches the search the reader actually made. A caller
+/// who covers every enabled provider is answered `0` without a query being run — nothing is
+/// hidden from them by definition.
+pub async fn hidden_count(pool: &PgPool, request: &SearchRequest) -> Result<i64> {
+    let hidden = unreadable_providers(pool, &request.providers).await?;
+    if hidden.is_empty() {
+        return Ok(0);
+    }
+    let mut builder: QueryBuilder<'_, Postgres> =
+        QueryBuilder::new("select count(*) from search_documents d where ");
+    push_conditions_with(&mut builder, request, &hidden, None);
+    let total: i64 = builder.build_query_scalar().fetch_one(pool).await?;
+    Ok(total)
+}
+
+/// The registered providers the installation has enabled that the caller's own read set does not
+/// cover — the scope a search answers around rather than in.
+async fn unreadable_providers(
+    pool: &PgPool,
+    readable: &[&'static str],
+) -> Result<Vec<&'static str>> {
+    let enabled = enabled_providers(pool).await?;
+    Ok(providers::PROVIDERS
+        .iter()
+        .filter(|spec| {
+            enabled.iter().any(|key| key == spec.key) && !readable.contains(&spec.key)
+        })
+        .map(|spec| spec.key)
+        .collect())
 }
 
 /// Title-prefix suggestions for the palette's first paint.
