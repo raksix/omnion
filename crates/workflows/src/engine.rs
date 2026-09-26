@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::actions;
 use crate::definition::{MAX_ATTEMPTS, wait_seconds_from};
 use crate::error::{Result, WorkflowError};
+use crate::handler::{ActionContext, ActionHandler, NoActionHandler};
 use crate::model::{ExecutionStatus, StepKind, TriggerKind, Workflow, WorkflowExecution};
 use crate::store::{self, ClaimedStep};
 
@@ -105,7 +106,19 @@ struct StepOutcome {
 }
 
 /// Run one tick: due schedules, then due steps.
+///
+/// The process installs no host action handler here: a definition that names a host action
+/// fails its step with that reason. Use [`tick_with`] when the process can run them.
 pub async fn tick(pool: &PgPool, config: &RunnerConfig) -> Result<TickReport> {
+    tick_with(pool, config, &NoActionHandler).await
+}
+
+/// Run one tick with the process's host action handler.
+pub async fn tick_with(
+    pool: &PgPool,
+    config: &RunnerConfig,
+    handler: &dyn ActionHandler,
+) -> Result<TickReport> {
     let mut report = TickReport::default();
 
     for workflow in store::claim_due_schedules(pool, config.scheduler_batch).await? {
@@ -133,7 +146,7 @@ pub async fn tick(pool: &PgPool, config: &RunnerConfig) -> Result<TickReport> {
         };
         report.steps_run += 1;
 
-        let outcome = advance_step(pool, config, &claimed).await?;
+        let outcome = advance_step(pool, config, handler, &claimed).await?;
         if outcome.waited {
             report.waits_parked += 1;
         }
@@ -290,31 +303,60 @@ pub async fn start_run(
     triggered_by: Option<Uuid>,
 ) -> Result<WorkflowExecution> {
     let definitions = workflow.definitions()?;
-    let (execution, _steps) =
-        store::create_execution(pool, workflow, trigger, triggered_by, &definitions).await?;
+    start_run_with(pool, workflow, trigger, triggered_by, &definitions).await
+}
 
-    let entry = match triggered_by {
-        Some(user_id) => {
-            omnion_audit::NewAuditEntry::by_user(user_id, "workflow.execution.started")
-        }
-        None => omnion_audit::NewAuditEntry::system("workflow.execution.started"),
-    }
-    .organization(workflow.organization_id)
-    .target("workflow_execution", execution.id.to_string())
-    .metadata(json!({
-        "workflow_id": workflow.id,
-        "trigger": trigger.as_str(),
-        "steps": definitions.len(),
-    }));
+/// Start a run of one workflow from steps the caller already holds, and audit it.
+///
+/// An event trigger uses this: the automation layer resolves the definition's bindings against
+/// the event's payload first, so the run's steps carry the values of *that* event (a retry of a
+/// step then repeats exactly what the first attempt did).
+pub async fn start_run_with(
+    pool: &PgPool,
+    workflow: &Workflow,
+    trigger: TriggerKind,
+    triggered_by: Option<Uuid>,
+    steps: &[crate::definition::StepDefinition],
+) -> Result<WorkflowExecution> {
+    let (execution, _steps) =
+        store::create_execution(pool, workflow, trigger, triggered_by, steps).await?;
+
+    record_start(pool, workflow, &execution, trigger, steps.len()).await?;
+    Ok(execution)
+}
+
+/// Write the audit row of a run that has just been created.
+///
+/// Public because a run can be materialised inside a caller's own transaction (the automation
+/// layer starts a run in the same transaction that advances its event cursor). The audit is the
+/// second write after that commit — a run whose audit row is missing is a gap in the trail, not
+/// a run that did not happen.
+pub async fn record_start(
+    pool: &PgPool,
+    workflow: &Workflow,
+    execution: &WorkflowExecution,
+    trigger: TriggerKind,
+    steps: usize,
+) -> Result<()> {
+    let entry = omnion_audit::NewAuditEntry::system("workflow.execution.started")
+        .organization(workflow.organization_id)
+        .target("workflow_execution", execution.id.to_string())
+        .metadata(json!({
+            "workflow_id": workflow.id,
+            "trigger": trigger.as_str(),
+            "steps": steps,
+            "triggered_by": execution.triggered_by,
+        }));
 
     omnion_audit::record(pool, entry).await?;
-    Ok(execution)
+    Ok(())
 }
 
 /// Advance one claimed step by one attempt.
 async fn advance_step(
     pool: &PgPool,
     config: &RunnerConfig,
+    handler: &dyn ActionHandler,
     claimed: &ClaimedStep,
 ) -> Result<StepOutcome> {
     let kind = StepKind::parse(&claimed.kind).ok_or_else(|| {
@@ -362,7 +404,29 @@ async fn advance_step(
         }
         StepKind::Task => {
             let action = claimed.action.clone().unwrap_or_default();
-            match actions::run(&action, &claimed.params, claimed.attempts) {
+            let outcome = if actions::is_host_action(&action) {
+                // The action touches the world: the process's handler runs it. The context is
+                // the run's own rows, so an action that writes (a comment) lands on the right
+                // tenant without the definition carrying it.
+                let execution = store::find_execution(pool, claimed.execution_id).await?;
+                let context = ActionContext {
+                    pool,
+                    organization_id: execution
+                        .as_ref()
+                        .map(|row| row.organization_id)
+                        .unwrap_or_default(),
+                    site_id: claim_site(pool, claimed.execution_id).await?,
+                    execution_id: claimed.execution_id,
+                    step_id: claimed.id,
+                    step_no: claimed.step_no,
+                    attempt: claimed.attempts,
+                };
+                handler.execute(&action, &claimed.params, &context).await
+            } else {
+                actions::run(&action, &claimed.params, claimed.attempts)
+            };
+
+            match outcome {
                 Ok(output) => {
                     store::complete_step(pool, claimed.id, &output).await?;
                     Ok(StepOutcome {
@@ -407,6 +471,19 @@ async fn advance_step(
             }
         }
     }
+}
+
+/// The site of the workflow behind an execution, for the action context.
+async fn claim_site(pool: &PgPool, execution_id: Uuid) -> Result<Option<Uuid>> {
+    let site: Option<Option<Uuid>> = sqlx::query_scalar(
+        "select w.site_id from workflow_executions e \
+         join workflows w on w.id = e.workflow_id where e.id = $1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(site.flatten())
 }
 
 /// Close a run when the step that just finished was its last one.

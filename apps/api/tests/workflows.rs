@@ -1428,6 +1428,8 @@ fn the_definition_rules_are_the_engine_rules() {
         enabled: true,
         trigger: TriggerKind::Manual,
         schedule: None,
+        trigger_event: None,
+        conditions: json!([]),
         next_run_at: None,
         steps: definition.steps_json().expect("steps serialise"),
     };

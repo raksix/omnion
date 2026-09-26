@@ -25,8 +25,8 @@ fn workflow_columns() -> &'static str {
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
     let sql = format!(
         "insert into workflows (organization_id, site_id, name, description, enabled, \
-         trigger_kind, schedule, next_run_at, steps, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning {}",
+         trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {}",
         workflow_columns()
     );
 
@@ -38,6 +38,8 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.enabled)
         .bind(new.trigger.as_str())
         .bind(new.schedule)
+        .bind(new.trigger_event)
+        .bind(new.conditions)
         .bind(new.next_run_at)
         .bind(new.steps)
         .bind(new.created_by)
@@ -86,12 +88,16 @@ pub struct WorkflowUpdate {
     pub description: String,
     /// New site scope.
     pub site_id: Option<Uuid>,
-    /// Whether the schedule stays armed.
+    /// Whether the schedule/event trigger stays armed.
     pub enabled: bool,
     /// New trigger kind.
     pub trigger: TriggerKind,
     /// New cron expression (schedules only).
     pub schedule: Option<String>,
+    /// New event name (event triggers only).
+    pub trigger_event: Option<String>,
+    /// New conditions (event triggers only).
+    pub conditions: serde_json::Value,
     /// New next due time (schedules only).
     pub next_run_at: Option<OffsetDateTime>,
     /// New step definitions as stored JSON.
@@ -106,7 +112,8 @@ pub async fn update_workflow(
 ) -> Result<Option<Workflow>> {
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
-         trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, updated_at = now() \
+         trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
+         conditions = $11, updated_at = now() \
          where id = $1 returning {}",
         workflow_columns()
     );
@@ -121,6 +128,8 @@ pub async fn update_workflow(
         .bind(update.schedule)
         .bind(update.next_run_at)
         .bind(update.steps)
+        .bind(update.trigger_event)
+        .bind(update.conditions)
         .fetch_optional(pool)
         .await?;
 
@@ -207,7 +216,24 @@ pub async fn create_execution(
     steps: &[StepDefinition],
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     let mut transaction = pool.begin().await?;
+    let created =
+        create_execution_in(&mut transaction, workflow, trigger, triggered_by, steps).await?;
+    transaction.commit().await?;
+    Ok(created)
+}
 
+/// The same write, inside a transaction the caller owns.
+///
+/// The automation layer needs it: a match starts a run and advances the event cursor in ONE
+/// transaction, so a crash can never leave a cursor that skipped an event whose run never
+/// existed (and a replay can never start the same run twice).
+pub async fn create_execution_in(
+    connection: &mut sqlx::PgConnection,
+    workflow: &Workflow,
+    trigger: TriggerKind,
+    triggered_by: Option<Uuid>,
+    steps: &[StepDefinition],
+) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
          triggered_by) values ($1, $2, 'running', $3, $4) returning {}",
@@ -219,7 +245,7 @@ pub async fn create_execution(
         .bind(workflow.organization_id)
         .bind(trigger.as_str())
         .bind(triggered_by)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut *connection)
         .await?;
 
     let step_sql = format!(
@@ -239,13 +265,85 @@ pub async fn create_execution(
             .bind(step.action.as_deref())
             .bind(step.params.clone())
             .bind(step.max_attempts)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut *connection)
             .await?;
         rows.push(row);
     }
 
-    transaction.commit().await?;
     Ok((execution, rows))
+}
+
+/// The armed, event-triggered workflows of one tenant that listen for one event.
+///
+/// A rule with no site applies to the whole organization; a rule bound to a site only fires for
+/// that site's events. An event without an organization matches nothing — the same rule the bus
+/// applies to webhook fan-out: an event that belongs to nobody cannot reach a tenant.
+///
+/// Takes any executor, because the matcher reads this inside the transaction that also creates
+/// the runs and advances its cursor.
+pub async fn list_event_rules<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    organization_id: Uuid,
+    site_id: Option<Uuid>,
+    event_name: &str,
+) -> Result<Vec<Workflow>> {
+    let sql = format!(
+        "select {} from workflows \
+         where trigger_kind = 'event' and enabled and trigger_event = $1 \
+           and organization_id = $2 \
+           and (site_id is null or site_id = $3) \
+         order by created_at asc, id",
+        workflow_columns()
+    );
+
+    let workflows: Vec<Workflow> = sqlx::query_as(&sql)
+        .bind(event_name)
+        .bind(organization_id)
+        .bind(site_id)
+        .fetch_all(executor)
+        .await?;
+
+    Ok(workflows)
+}
+
+/// The event-triggered workflows of a scope, for the automations surface.
+pub async fn list_event_workflows(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+) -> Result<Vec<Workflow>> {
+    let sql = format!(
+        "select {} from workflows \
+         where trigger_kind = 'event' \
+           and ($1::uuid is null or organization_id = $1) \
+           and ($2::uuid is null or site_id = $2) \
+         order by created_at desc, id",
+        workflow_columns()
+    );
+
+    let workflows: Vec<Workflow> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(site_id)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(workflows)
+}
+
+/// Record that a rule fired: one more run, and when.
+///
+/// Called by the matcher inside its own transaction, so the counter moves exactly with the run
+/// it counts.
+pub async fn note_match(connection: &mut sqlx::PgConnection, workflow_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "update workflows set last_triggered_at = now(), trigger_count = trigger_count + 1 \
+         where id = $1",
+    )
+    .bind(workflow_id)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(())
 }
 
 /// Load one run.

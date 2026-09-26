@@ -68,6 +68,15 @@ pub struct WorkflowBody {
     pub trigger: &'static str,
     /// Cron expression of a schedule.
     pub schedule: Option<String>,
+    /// Event name of an event trigger.
+    pub trigger_event: Option<String>,
+    /// Conditions an event trigger's payload must satisfy.
+    pub conditions: serde_json::Value,
+    /// When the trigger last started a run.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_triggered_at: Option<OffsetDateTime>,
+    /// How many runs the trigger has started.
+    pub trigger_count: i32,
     /// Next due time of a schedule.
     #[serde(with = "time::serde::rfc3339::option")]
     pub next_run_at: Option<OffsetDateTime>,
@@ -97,6 +106,10 @@ impl WorkflowBody {
             enabled: workflow.enabled,
             trigger: workflow.trigger().as_str(),
             schedule: workflow.schedule.clone(),
+            trigger_event: workflow.trigger_event.clone(),
+            conditions: workflow.conditions.clone(),
+            last_triggered_at: workflow.last_triggered_at,
+            trigger_count: workflow.trigger_count,
             next_run_at: workflow.next_run_at,
             steps: workflow.steps.clone(),
             step_count,
@@ -340,6 +353,8 @@ pub async fn create_workflow(
             enabled: input.enabled,
             trigger: definition.trigger.kind,
             schedule: definition.trigger.cron.clone(),
+            trigger_event: definition.trigger.event.clone(),
+            conditions: definition.conditions_json()?,
             next_run_at,
             steps: definition.steps_json()?,
             created_by: Some(current.user.id),
@@ -414,6 +429,8 @@ pub async fn update_workflow(
             enabled: input.enabled,
             trigger: definition.trigger.kind,
             schedule: definition.trigger.cron.clone(),
+            trigger_event: definition.trigger.event.clone(),
+            conditions: definition.conditions_json()?,
             next_run_at,
             steps: definition.steps_json()?,
         },
@@ -652,10 +669,14 @@ mod tests {
             enabled: true,
             trigger_kind: "schedule".to_owned(),
             schedule: Some("0 3 * * *".to_owned()),
+            trigger_event: None,
+            conditions: serde_json::json!([]),
             next_run_at: Some(OffsetDateTime::UNIX_EPOCH),
             steps: serde_json::json!([
                 { "name": "prepare", "kind": "task", "action": "noop", "params": {}, "max_attempts": 1 }
             ]),
+            last_triggered_at: None,
+            trigger_count: 0,
             created_by: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,

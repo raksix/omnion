@@ -16,6 +16,15 @@ use crate::model::{StepKind, TriggerKind};
 /// Most steps one definition may carry.
 pub const MAX_STEPS: usize = 50;
 
+/// Most conditions an event trigger may carry.
+pub const MAX_CONDITIONS: usize = 10;
+
+/// Longest event name an event trigger listens for.
+pub const MAX_EVENT_NAME: usize = 96;
+
+/// Longest single segment of an event name.
+pub const MAX_EVENT_SEGMENT: usize = 32;
+
 /// Most attempts a task step may be given (docs/09-N8N-TEARDOWN.md §13 lesson 4: the n8n cap).
 pub const MAX_ATTEMPTS: i32 = 5;
 
@@ -29,11 +38,16 @@ pub const MAX_STEP_NAME: usize = 80;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trigger {
-    /// `manual` or `schedule`.
+    /// `manual`, `schedule` or `event`.
     pub kind: TriggerKind,
-    /// Cron expression, required for a schedule and refused for a manual trigger.
+    /// Cron expression, required for a schedule and refused for the other kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
+    /// Event name (e.g. `page.published`), required for an event trigger and refused for the
+    /// other kinds. The bus is the authority on which names exist — see
+    /// `omnion_events::validation::validate_event_name`; the engine checks the shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
 }
 
 impl Trigger {
@@ -43,6 +57,7 @@ impl Trigger {
         Self {
             kind: TriggerKind::Manual,
             cron: None,
+            event: None,
         }
     }
 
@@ -52,6 +67,17 @@ impl Trigger {
         Self {
             kind: TriggerKind::Schedule,
             cron: Some(cron.into()),
+            event: None,
+        }
+    }
+
+    /// An event trigger: the workflow runs when the platform records this event.
+    #[must_use]
+    pub fn event(name: impl Into<String>) -> Self {
+        Self {
+            kind: TriggerKind::Event,
+            cron: None,
+            event: Some(name.into()),
         }
     }
 
@@ -68,9 +94,21 @@ impl Trigger {
                         "a manual trigger carries no cron expression",
                     ));
                 }
+                if self.event.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_trigger",
+                        "a manual trigger carries no event name",
+                    ));
+                }
                 Ok(None)
             }
             TriggerKind::Schedule => {
+                if self.event.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_trigger",
+                        "a schedule carries no event name",
+                    ));
+                }
                 let raw = self.cron.as_deref().unwrap_or("").trim();
                 if raw.is_empty() {
                     return Err(WorkflowError::invalid(
@@ -81,7 +119,56 @@ impl Trigger {
                 let schedule = CronSchedule::parse(raw)?;
                 Ok(Some(schedule.next_after(now)?))
             }
+            TriggerKind::Event => {
+                if self.cron.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_trigger",
+                        "an event trigger carries no cron expression",
+                    ));
+                }
+                self.event_name()?;
+                Ok(None)
+            }
         }
+    }
+
+    /// The event name of an event trigger, shape-checked.
+    pub fn event_name(&self) -> Result<&str> {
+        let raw = self.event.as_deref().unwrap_or("").trim();
+        if raw.is_empty() {
+            return Err(WorkflowError::invalid(
+                "invalid_trigger",
+                "an event trigger needs the event name it listens for",
+            ));
+        }
+        if raw.len() > MAX_EVENT_NAME {
+            return Err(WorkflowError::invalid(
+                "invalid_trigger",
+                format!("an event name is at most {MAX_EVENT_NAME} characters"),
+            ));
+        }
+
+        // Lower-case, dotted, at least a domain and an action: the same shape the bus stores.
+        // Whether the name is one the platform actually emits is the bus's answer, asked by the
+        // API layer; here the engine only refuses something no event could ever carry.
+        let segments: Vec<&str> = raw.split('.').collect();
+        let well_formed = segments.len() >= 2
+            && segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && segment.len() <= MAX_EVENT_SEGMENT
+                    && segment.starts_with(|first: char| first.is_ascii_lowercase())
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            });
+        if !well_formed {
+            return Err(WorkflowError::invalid(
+                "invalid_trigger",
+                format!("{raw:?} is not a lower-case dotted event name, e.g. page.published"),
+            ));
+        }
+
+        Ok(raw)
     }
 }
 
@@ -244,12 +331,16 @@ impl StepDefinition {
     }
 }
 
-/// A whole definition: the trigger and the ordered steps.
+/// A whole definition: the trigger, the conditions it must satisfy and the ordered steps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowDefinition {
     /// How the workflow starts.
     pub trigger: Trigger,
+    /// Conditions an event trigger's payload must satisfy, in order. Empty for the other
+    /// triggers — a manual run and a schedule have no payload to evaluate them against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Value>,
     /// Steps, in the order they run.
     pub steps: Vec<StepDefinition>,
 }
@@ -257,9 +348,20 @@ pub struct WorkflowDefinition {
 impl WorkflowDefinition {
     /// Build a definition and check it.
     pub fn new(trigger: Trigger, steps: Vec<StepDefinition>) -> Result<Self> {
-        let definition = Self { trigger, steps };
+        let definition = Self {
+            trigger,
+            conditions: Vec::new(),
+            steps,
+        };
         definition.validate()?;
         Ok(definition)
+    }
+
+    /// Attach the conditions of an event trigger.
+    #[must_use]
+    pub fn with_conditions(mut self, conditions: Vec<Value>) -> Self {
+        self.conditions = conditions;
+        self
     }
 
     /// Check the definition against the engine's rules.
@@ -290,7 +392,41 @@ impl WorkflowDefinition {
             seen.push(name);
         }
 
+        self.validate_conditions()?;
         self.trigger.validate(time::OffsetDateTime::now_utc())?;
+        Ok(())
+    }
+
+    /// Conditions belong to an event trigger, and every condition is an object.
+    ///
+    /// What a condition *means* — which field, which operator — is the automation layer's rule
+    /// (`omnion-automation`), which validates the same list before it is stored; the engine
+    /// holds the shape, because it is what writes them into `workflows.conditions`.
+    fn validate_conditions(&self) -> Result<()> {
+        if self.conditions.len() > MAX_CONDITIONS {
+            return Err(WorkflowError::invalid(
+                "invalid_conditions",
+                format!("a trigger carries at most {MAX_CONDITIONS} conditions"),
+            ));
+        }
+        if self.conditions.is_empty() {
+            return Ok(());
+        }
+        if self.trigger.kind != TriggerKind::Event {
+            return Err(WorkflowError::invalid(
+                "invalid_conditions",
+                "conditions belong to an event trigger; a manual run and a schedule have no \
+                 payload to evaluate them against",
+            ));
+        }
+        for condition in &self.conditions {
+            if !condition.is_object() {
+                return Err(WorkflowError::invalid(
+                    "invalid_conditions",
+                    "every condition is a JSON object",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -300,6 +436,16 @@ impl WorkflowDefinition {
             WorkflowError::invalid(
                 "invalid_steps",
                 format!("the steps cannot be stored: {err}"),
+            )
+        })
+    }
+
+    /// The stored JSON shape of the conditions.
+    pub fn conditions_json(&self) -> Result<Value> {
+        serde_json::to_value(&self.conditions).map_err(|err| {
+            WorkflowError::invalid(
+                "invalid_conditions",
+                format!("the conditions cannot be stored: {err}"),
             )
         })
     }
@@ -431,6 +577,7 @@ mod tests {
         let trigger = Trigger {
             kind: TriggerKind::Manual,
             cron: Some("0 0 * * *".to_owned()),
+            event: None,
         };
         let error = WorkflowDefinition::new(
             trigger,
@@ -471,5 +618,119 @@ mod tests {
             { "name": "prepare", "kind": "task", "action": "noop", "runFor": 3 }
         ]);
         assert!(serde_json::from_value::<Vec<StepDefinition>>(raw).is_err());
+    }
+
+    #[test]
+    fn an_event_trigger_carries_the_event_it_listens_for() {
+        let definition = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task(
+                "announce",
+                "echo",
+                serde_json::json!({ "value": "published" }),
+            )],
+        )
+        .expect("an event trigger is valid");
+        assert_eq!(definition.trigger.kind, TriggerKind::Event);
+        assert_eq!(
+            definition.trigger.event_name().expect("the name reads"),
+            "page.published"
+        );
+
+        // A cron expression belongs to a schedule, not to an event.
+        let mut trigger = Trigger::event("page.published");
+        trigger.cron = Some("0 0 * * *".to_owned());
+        let error = WorkflowDefinition::new(
+            trigger,
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect_err("an event trigger carries no cron");
+        assert_eq!(error.code(), "invalid_trigger");
+
+        // An event name the bus could never record is refused with the engine's own message.
+        for bad in [
+            "PagePublished",
+            "page",
+            "page.published!",
+            "1page.published",
+            "",
+        ] {
+            let error = WorkflowDefinition::new(
+                Trigger::event(bad),
+                vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+            )
+            .expect_err("a malformed event name is refused");
+            assert_eq!(error.code(), "invalid_trigger", "{bad}");
+        }
+
+        let too_long = format!("page.{}", "a".repeat(MAX_EVENT_SEGMENT + 1));
+        assert!(
+            WorkflowDefinition::new(
+                Trigger::event(too_long),
+                vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn conditions_belong_to_an_event_trigger() {
+        let condition =
+            serde_json::json!({ "field": "status", "operator": "equals", "value": "published" });
+
+        let definition = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect("the trigger is valid")
+        .with_conditions(vec![condition.clone()]);
+        definition
+            .validate()
+            .expect("a condition on an event trigger is valid");
+        assert_eq!(
+            definition.conditions_json().expect("conditions store")[0]["field"],
+            "status"
+        );
+
+        // The same condition on a manual workflow has nothing to evaluate it against.
+        let manual = WorkflowDefinition::new(
+            Trigger::manual(),
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect("the trigger is valid")
+        .with_conditions(vec![condition.clone()]);
+        assert_eq!(
+            manual
+                .validate()
+                .expect_err("conditions need an event")
+                .code(),
+            "invalid_conditions"
+        );
+
+        // The list is bounded and every entry is an object.
+        let many = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect("the trigger is valid")
+        .with_conditions(vec![condition; MAX_CONDITIONS + 1]);
+        assert_eq!(
+            many.validate().expect_err("the cap holds").code(),
+            "invalid_conditions"
+        );
+
+        let not_an_object = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect("the trigger is valid")
+        .with_conditions(vec![serde_json::json!("status")]);
+        assert_eq!(
+            not_an_object
+                .validate()
+                .expect_err("a condition is an object")
+                .code(),
+            "invalid_conditions"
+        );
     }
 }

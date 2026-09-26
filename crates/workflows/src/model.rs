@@ -17,6 +17,8 @@ pub enum TriggerKind {
     Manual,
     /// The engine's scheduler reached the workflow's next due time.
     Schedule,
+    /// The platform recorded the event this workflow listens for (see [`crate::definition`]).
+    Event,
 }
 
 impl TriggerKind {
@@ -26,6 +28,7 @@ impl TriggerKind {
         match self {
             Self::Manual => "manual",
             Self::Schedule => "schedule",
+            Self::Event => "event",
         }
     }
 
@@ -35,8 +38,15 @@ impl TriggerKind {
         match raw {
             "manual" => Some(Self::Manual),
             "schedule" => Some(Self::Schedule),
+            "event" => Some(Self::Event),
             _ => None,
         }
+    }
+
+    /// `true` when the trigger is driven by the platform rather than by a person.
+    #[must_use]
+    pub const fn is_automatic(self) -> bool {
+        matches!(self, Self::Schedule | Self::Event)
     }
 }
 
@@ -186,10 +196,18 @@ pub struct Workflow {
     pub trigger_kind: String,
     /// Cron expression when the trigger is a schedule.
     pub schedule: Option<String>,
+    /// Event name when the trigger is an event.
+    pub trigger_event: Option<String>,
+    /// Conditions an event trigger's payload must satisfy, as stored JSON array.
+    pub conditions: serde_json::Value,
     /// Next time the scheduler should start this workflow.
     pub next_run_at: Option<OffsetDateTime>,
     /// Ordered step definitions, as stored JSON.
     pub steps: serde_json::Value,
+    /// When the trigger last started a run of this workflow (schedules and events).
+    pub last_triggered_at: Option<OffsetDateTime>,
+    /// How many runs the trigger has started.
+    pub trigger_count: i32,
     /// Account that created the workflow.
     pub created_by: Option<Uuid>,
     /// Creation time.
@@ -218,7 +236,8 @@ impl Workflow {
 
 /// Columns of `workflows`, in the order [`Workflow`] expects.
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
-     trigger_kind, schedule, next_run_at, steps, created_by, created_at, updated_at";
+     trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, last_triggered_at, \
+     trigger_count, created_by, created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]
@@ -231,12 +250,16 @@ pub struct NewWorkflow {
     pub name: String,
     /// Free-form description.
     pub description: String,
-    /// Whether the schedule is armed.
+    /// Whether the schedule/event trigger is armed.
     pub enabled: bool,
     /// Trigger kind.
     pub trigger: TriggerKind,
     /// Cron expression when scheduled.
     pub schedule: Option<String>,
+    /// Event name when the trigger is an event.
+    pub trigger_event: Option<String>,
+    /// Conditions of an event trigger, as stored JSON array.
+    pub conditions: serde_json::Value,
     /// First due time when scheduled.
     pub next_run_at: Option<OffsetDateTime>,
     /// Step definitions as stored JSON.
@@ -345,10 +368,17 @@ mod tests {
 
     #[test]
     fn the_trigger_kinds_round_trip() {
-        for kind in [TriggerKind::Manual, TriggerKind::Schedule] {
+        for kind in [
+            TriggerKind::Manual,
+            TriggerKind::Schedule,
+            TriggerKind::Event,
+        ] {
             assert_eq!(TriggerKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(TriggerKind::parse("cron"), None);
+        assert!(TriggerKind::Event.is_automatic());
+        assert!(TriggerKind::Schedule.is_automatic());
+        assert!(!TriggerKind::Manual.is_automatic());
     }
 
     #[test]

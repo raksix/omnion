@@ -23,12 +23,14 @@ pub mod cron;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod handler;
 pub mod model;
 pub mod store;
 
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
 pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};
+pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
 pub use model::{
     ExecutionStatus, NewWorkflow, StepKind, StepStatus, TriggerKind, Workflow, WorkflowExecution,
     WorkflowStep,
