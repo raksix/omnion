@@ -8,12 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod comments;
 pub mod error;
 pub mod model;
 pub mod pages;
 pub mod translations;
 pub mod validation;
 
+pub use comments::{
+    COMMENT_COLUMNS, CommentSource, MAX_COMMENT_BODY, NewRevisionComment, RevisionComment,
+};
 pub use error::{ContentError, Result};
 pub use model::{
     DEFAULT_PAGE_TYPE, NewPage, NewRevisionTranslation, Page, PageChanges, PageRevision,

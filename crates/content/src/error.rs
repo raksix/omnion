@@ -18,6 +18,9 @@ pub enum ContentError {
     /// A body is not usable (too large).
     #[error("invalid body: {0}")]
     InvalidBody(String),
+    /// A comment is not usable (blank, too long, or an author that does not match its source).
+    #[error("invalid comment: {0}")]
+    InvalidComment(String),
     /// A summary is not usable (too long).
     #[error("invalid summary: {0}")]
     InvalidSummary(String),
@@ -52,6 +55,30 @@ pub enum ContentError {
 
 /// Result alias used across the content crate.
 pub type Result<T, E = ContentError> = std::result::Result<T, E>;
+
+impl ContentError {
+    /// Stable machine-readable code, for tests and for callers that branch on the failure.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "content_store_error",
+            Self::InvalidSlug(_) => "invalid_slug",
+            Self::InvalidTitle(_) => "invalid_title",
+            Self::InvalidBody(_) => "invalid_body",
+            Self::InvalidComment(_) => "invalid_comment",
+            Self::InvalidSummary(_) => "invalid_summary",
+            Self::InvalidPageType(_) => "invalid_page_type",
+            Self::InvalidStatus(_) => "invalid_status",
+            Self::InvalidLanguage(_) => "invalid_language",
+            Self::InvalidField(_) => "invalid_field",
+            Self::InvalidValue(_) => "invalid_value",
+            Self::PageNotFound => "page_not_found",
+            Self::RevisionNotFound => "revision_not_found",
+            Self::SlugTaken => "slug_taken",
+            Self::NoDraftRevision => "no_draft_revision",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
