@@ -1186,5 +1186,645 @@ async fn search_refuses_what_it_cannot_answer() {
     assert_eq!(bad_sort.status, StatusCode::BAD_REQUEST);
     assert_eq!(bad_sort.body["error"]["code"], "unknown_sort");
 
+    let bad_filter = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/search?q=release&updated=century",
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(bad_filter.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_filter.body["error"]["code"], "unknown_updated_range");
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3 — the results depth: facets, the export, the weights
+// ---------------------------------------------------------------------------------------------
+
+/// Result of one call whose body is not JSON (the CSV export).
+struct RawResponse {
+    status: StatusCode,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+}
+
+/// Drive the router and keep the body as text, with the headers the export promises.
+async fn call_raw(state: &AppState, request: Request<Body>) -> RawResponse {
+    let response = routes::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router must answer");
+    let status = response.status();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body must read")
+        .to_bytes();
+    RawResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+/// One facet group of an answer, by key.
+fn facet<'a>(body: &'a Value, key: &str) -> &'a Value {
+    body["facets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("facets must be an array in {body}"))
+        .iter()
+        .find(|group| group["key"] == key)
+        .unwrap_or_else(|| panic!("facet {key} must be answered in {body}"))
+}
+
+/// A facet value's count, by value.
+fn facet_count(body: &Value, key: &str, value: &str) -> Option<i64> {
+    facet(body, key)["values"]
+        .as_array()
+        .expect("facet values must be an array")
+        .iter()
+        .find(|row| row["value"] == value)
+        .and_then(|row| row["count"].as_i64())
+}
+
+#[tokio::test]
+async fn facets_count_what_the_filters_leave() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "facet-one",
+        &format!("Facet {} one", fixture.marker),
+    )
+    .await;
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "facet-two",
+        &format!("Facet {} two", fixture.marker),
+    )
+    .await;
+    // An owner: both pages belong to the fixture's editor, so the rail has a name to offer.
+    let editor_id: Uuid = sqlx::query_scalar("select id from users where email = $1")
+        .bind(&fixture.editor_email)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the editor must exist");
+    sqlx::query("update pages set created_by = $1 where site_id = $2")
+        .bind(editor_id)
+        .bind(fixture.site_a)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the pages must gain an owner");
+    fixture.reindex().await;
+
+    let answer = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search?q={}&facets=true", fixture.marker),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "body: {}", answer.body);
+    let body = answer.body;
+
+    // Six groups, each one the rail renders.
+    for key in ["type", "site", "owner", "language", "status", "updated"] {
+        assert!(
+            !facet(&body, key)["values"]
+                .as_array()
+                .expect("values")
+                .is_empty(),
+            "facet {key} must carry values: {body}"
+        );
+    }
+
+    // The type facet reads as the registry writes it, not as the database stores it.
+    let pages_value = facet(&body, "type")["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .find(|row| row["value"] == "pages")
+        .expect("the pages value must be there")
+        .clone();
+    assert_eq!(pages_value["label"], "Pages");
+    assert!(
+        pages_value["count"].as_i64().unwrap_or(0) >= 2,
+        "two pages carry the marker: {pages_value}"
+    );
+    assert!(facet_count(&body, "site", &fixture.site_a.to_string()).unwrap_or(0) >= 2);
+    assert!(facet_count(&body, "language", "en").unwrap_or(0) >= 2);
+    assert!(facet_count(&body, "status", "draft").unwrap_or(0) >= 2);
+    assert!(facet_count(&body, "updated", "today").unwrap_or(0) >= 2);
+    // The owner facet carries the account that owns the pages, by name.
+    assert_eq!(
+        facet(&body, "owner")["values"]
+            .as_array()
+            .expect("values")
+            .iter()
+            .find(|row| row["value"] == editor_id.to_string())
+            .map(|row| row["label"].clone()),
+        Some(Value::String("Release Editor".to_owned())),
+        "owner facet: {}",
+        facet(&body, "owner")
+    );
+
+    // A facet's own filter is left out of its own counts: under `types=media` the type facet still
+    // says what the pages would answer, because that is the number the click would produce.
+    let filtered = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/search?q={}&types=media&facets=true",
+                fixture.marker
+            ),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::OK, "body: {}", filtered.body);
+    assert_eq!(
+        filtered.body["total"].as_i64(),
+        Some(0),
+        "the marker names no media: {}",
+        filtered.body
+    );
+    assert!(
+        facet_count(&filtered.body, "type", "pages").unwrap_or(0) >= 2,
+        "the type facet must still answer for pages: {}",
+        filtered.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_export_answers_one_row_per_hit_and_honours_a_selection() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "export-one",
+        &format!("Export {} one", fixture.marker),
+    )
+    .await;
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "export-two",
+        &format!("Export {} two", fixture.marker),
+    )
+    .await;
+    fixture.reindex().await;
+
+    let answer = search(&fixture.state, &owner, &fixture.marker).await;
+    let total = answer["total"].as_i64().expect("total");
+
+    let exported = call_raw(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search/export?q={}", fixture.marker),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(exported.status, StatusCode::OK, "body: {}", exported.body);
+    assert!(
+        exported
+            .headers
+            .get("content-type")
+            .is_some_and(|value| value.contains("text/csv"))
+    );
+    assert_eq!(
+        exported.headers.get("x-export-rows").map(String::as_str),
+        Some(total.to_string().as_str()),
+        "the count header must match the result set"
+    );
+    let rows: Vec<&str> = exported
+        .body
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        rows.len() as i64,
+        total,
+        "one row per hit; file:\n{}",
+        exported.body
+    );
+    assert!(
+        exported
+            .body
+            .starts_with("title,type,provider,owner,updated,tags,url,subtitle"),
+        "header: {}",
+        exported.body.lines().next().unwrap_or_default()
+    );
+
+    // A selection exports exactly the rows the caller picked.
+    let page_hit = answer["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .find(|hit| hit["provider"] == "pages")
+        .expect("the fixture's pages must answer");
+    let key = format!(
+        "{}:{}:{}",
+        page_hit["provider"].as_str().unwrap_or_default(),
+        page_hit["entity_type"].as_str().unwrap_or_default(),
+        page_hit["entity_id"].as_str().unwrap_or_default()
+    );
+    let selected = call_raw(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/search/export?q={}&selected={}",
+                fixture.marker,
+                urlencoding(&key)
+            ),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(selected.status, StatusCode::OK, "body: {}", selected.body);
+    let selected_rows: Vec<&str> = selected
+        .body
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        selected_rows.len(),
+        1,
+        "a one-row selection exports one row: {}",
+        selected.body
+    );
+    assert!(
+        selected.body.contains(&fixture.marker),
+        "the exported row names the fixture: {}",
+        selected.body
+    );
+
+    // A malformed selection is named, not exported as if it were empty.
+    let broken = call_raw(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/search/export?q={}&selected=pages:page",
+                fixture.marker
+            ),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(broken.status, StatusCode::BAD_REQUEST);
+
+    fixture.cleanup().await;
+}
+
+/// Percent-encode the characters a CSV row key may carry in a URL.
+fn urlencoding(value: &str) -> String {
+    value.replace(':', "%3A")
+}
+
+#[tokio::test]
+async fn ranking_weights_change_the_order_of_a_fixture_result_set() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+    let term = format!("wt{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let titled = format!("Alpha {term}");
+
+    // Two documents carry the term in two different sections of the index: a page whose title
+    // names it, and the site whose *name* names it (the site name reaches a page's subtitle, so
+    // the fixture's second page answers through the subtitle section). One query, two weights:
+    // the order is the settings' answer.
+    create_page(&fixture.db, fixture.site_a, "weights-title", &titled).await;
+    create_page(
+        &fixture.db,
+        fixture.site_b,
+        "weights-subtitle",
+        "Weights subtitle page",
+    )
+    .await;
+    sqlx::query("update sites set name = $1 where id = $2")
+        .bind(format!("Beta {term} Site"))
+        .bind(fixture.site_b)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the second site must be renamed");
+    fixture.reindex().await;
+
+    let default_order = hit_titles(&search(&fixture.state, &owner, &term).await);
+    assert_eq!(
+        default_order.first().map(String::as_str),
+        Some(titled.as_str()),
+        "with the defaults the title match leads: {default_order:?}"
+    );
+
+    // Title 1 · tags 10 · subtitle 10 · body 1 — allowed by the form's own rules (title ≥ body)
+    // and it puts a subtitle match above the lighter title match.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&owner),
+            Some(json!({
+                "weights": { "title": 1, "tags": 10, "subtitle": 10, "body": 1 },
+                "enabled_providers": [
+                    "pages", "media", "users", "sites", "logs", "translations", "settings"
+                ],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "save: {}", saved.body);
+
+    let flipped_order = hit_titles(&search(&fixture.state, &owner, &term).await);
+
+    // Put the defaults back before asserting: a failed expectation must not leave the
+    // installation tuned.
+    let restored = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&owner),
+            Some(json!({
+                "weights": { "title": 6, "tags": 4, "subtitle": 3, "body": 1 },
+                "enabled_providers": [
+                    "pages", "media", "users", "sites", "logs", "translations", "settings"
+                ],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored.status,
+        StatusCode::OK,
+        "restore: {}",
+        restored.body
+    );
+
+    assert_eq!(
+        flipped_order.first().map(String::as_str),
+        Some("Weights subtitle page"),
+        "the heavier subtitle leads: {flipped_order:?}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_settings_screen_reads_writes_and_refuses_what_it_promises() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+    let editor = fixture.editor_token().await;
+
+    // Reading is `search.read`; the answer carries the defaults, so "restore defaults" is the
+    // server's own number rather than a constant copied into the panel.
+    let read = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/settings", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "body: {}", read.body);
+    assert_eq!(read.body["defaults"]["title"], 6);
+    assert_eq!(read.body["weights"]["title"], 6);
+    assert_eq!(
+        read.body["available_providers"].as_array().map(Vec::len),
+        Some(omnion_search::PROVIDERS.len())
+    );
+
+    // Writing is `search.manage`, which the editor does not hold.
+    let denied = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&editor),
+            Some(json!({
+                "weights": { "title": 6, "tags": 4, "subtitle": 3, "body": 1 },
+                "enabled_providers": ["pages"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+
+    // A body heavier than the title is refused with its own code.
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&owner),
+            Some(json!({
+                "weights": { "title": 2, "tags": 4, "subtitle": 3, "body": 9 },
+                "enabled_providers": ["pages"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.body["error"]["code"], "title_below_body");
+
+    // Switching every provider off would leave a search box that answers nothing.
+    let empty = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&owner),
+            Some(json!({
+                "weights": { "title": 6, "tags": 4, "subtitle": 3, "body": 1 },
+                "enabled_providers": [],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(empty.body["error"]["code"], "no_providers");
+
+    // A disabled provider stops answering, and switching it back on brings it back.
+    let off = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&owner),
+            Some(json!({
+                "weights": { "title": 6, "tags": 4, "subtitle": 3, "body": 1 },
+                "enabled_providers": ["media"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(off.status, StatusCode::OK, "off: {}", off.body);
+
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "settings-off",
+        &format!("Settings {} off", fixture.marker),
+    )
+    .await;
+    fixture.reindex().await;
+    let hidden = search(&fixture.state, &owner, &fixture.marker).await;
+    assert_eq!(
+        provider_hits(&hidden, "pages"),
+        0,
+        "pages are switched off: {hidden}"
+    );
+
+    let back_on = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/search/settings",
+            Some(&owner),
+            Some(json!({
+                "weights": { "title": 6, "tags": 4, "subtitle": 3, "body": 1 },
+                "enabled_providers": [
+                    "pages", "media", "users", "sites", "logs", "translations", "settings"
+                ],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(back_on.status, StatusCode::OK, "on: {}", back_on.body);
+    let visible = search(&fixture.state, &owner, &fixture.marker).await;
+    assert!(
+        provider_hits(&visible, "pages") >= 1,
+        "pages answer again: {visible}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn activity_and_settings_join_the_index_with_their_own_screens() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    // A page, its audit entry (the publish route writes one) and the settings row every
+    // organization carries.
+    let page_id = create_page(
+        &fixture.db,
+        fixture.site_a,
+        "activity-one",
+        &format!("Activity {} page", fixture.marker),
+    )
+    .await;
+    sqlx::query(
+        "insert into audit_log (organization_id, actor_user_id, action, target_type, target_id) \
+         values ($1, null, 'page.updated', 'page', $2)",
+    )
+    .bind(fixture.organizations[0])
+    .bind(page_id.to_string())
+    .execute(fixture.db.pool())
+    .await
+    .expect("the audit entry must be written");
+
+    fixture.reindex().await;
+
+    let activity = search(&fixture.state, &owner, "page.updated").await;
+    assert!(
+        provider_hits(&activity, "logs") >= 1,
+        "the audit entry must be findable: {activity}"
+    );
+    let log_hit = activity["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .find(|hit| hit["provider"] == "logs")
+        .expect("a log hit");
+    assert_eq!(log_hit["provider"], "logs");
+    assert!(
+        log_hit["url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("/pages?site="),
+        "the entry opens the page it touched: {log_hit}"
+    );
+
+    // The settings provider answers one row per organization, opening the screen that owns it.
+    let settings = search(&fixture.state, &owner, "ranking+weights").await;
+    assert!(
+        provider_hits(&settings, "settings") >= 1,
+        "the settings row must be findable: {settings}"
+    );
+    let settings_hit = settings["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .find(|hit| hit["provider"] == "settings")
+        .expect("a settings hit");
+    assert_eq!(settings_hit["url"], "/settings/search");
+
+    // The status screen knows the pass that just ran.
+    let status = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/status", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(status.status, StatusCode::OK, "body: {}", status.body);
+    let lines = status.body["providers"].as_array().expect("providers");
+    let pages_line = lines
+        .iter()
+        .find(|line| line["provider"] == "pages")
+        .expect("the pages line");
+    assert!(
+        matches!(
+            pages_line["state"].as_str(),
+            Some("ready") | Some("stale") | Some("indexing")
+        ),
+        "state: {pages_line}"
+    );
+    assert!(
+        pages_line["last_run"]["finished_at"].as_str().is_some(),
+        "the pass is recorded: {pages_line}"
+    );
+
     fixture.cleanup().await;
 }
