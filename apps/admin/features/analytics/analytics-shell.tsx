@@ -322,8 +322,8 @@ export function AnalyticsShell({
     <AnalyticsContext.Provider value={value}>
       <div className="flex flex-col gap-4">
         <nav aria-label="Analytics screens" className="flex flex-wrap items-center gap-1.5">
-          <span className="mr-1 flex items-center gap-1.5 text-[12px] text-muted">
-            <BarChart3 className="size-4" aria-hidden />
+          <span className="mr-1 flex items-center gap-1.5 rounded-lg bg-quiet-soft px-2 py-1 text-[12px] font-medium text-ink">
+            <BarChart3 className="size-3.5 shrink-0" aria-hidden />
             Analytics
           </span>
           {ANALYTICS_NAV.map((entry) => {

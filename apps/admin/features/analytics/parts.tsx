@@ -556,68 +556,10 @@ export function DataTable<Row>({
   footer?: ReactNode;
 }) {
   const sortable = columns.filter((column) => column.sortable && onSort);
-  return (
-    <>
-      <div className="lg:hidden">
-        {sortable.length > 0 ? (
-          <label className="flex items-center gap-2 px-3 pt-3 text-[11px] tracking-wide text-muted uppercase">
-            Sort
-            <select
-              value={sort ?? sortable[0].key}
-              data-analytics-sort-select
-              onChange={(event) => onSort?.(event.target.value)}
-              className="rounded-lg border border-line bg-canvas px-2 py-1 text-[12px] text-ink"
-            >
-              {sortable.map((column) => (
-                <option key={column.key} value={column.key}>
-                  {column.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        ) : null}
-        <ul data-analytics-cards className="flex flex-col gap-2 p-3">
-          {rows.map((row) => (
-            <li key={rowKey(row)}>
-              <div
-                role={onRowClick ? "button" : undefined}
-                tabIndex={onRowClick ? 0 : undefined}
-                onClick={onRowClick ? () => onRowClick(row) : undefined}
-                onKeyDown={
-                  onRowClick
-                    ? (event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          onRowClick(row);
-                        }
-                      }
-                    : undefined
-                }
-                className={`flex flex-col gap-1.5 rounded-lg border border-line p-3 ${
-                  onRowClick ? "cursor-pointer transition hover:bg-canvas" : ""
-                }`}
-              >
-                {columns.map((column) => (
-                  <div key={column.key} className="flex items-baseline justify-between gap-3">
-                    <span className="shrink-0 text-[11px] tracking-wide text-muted uppercase">
-                      {column.label}
-                    </span>
-                    <span
-                      className={`min-w-0 text-right break-words ${
-                        column.numeric ? "font-mono" : ""
-                      }`}
-                    >
-                      {column.render(row)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </li>
-          ))}
-        </ul>
-      </div>
+  const wide = useWideScreen();
 
-      <div className="hidden min-w-0 overflow-x-auto lg:block">
+  return wide ? (
+    <div className="min-w-0 overflow-x-auto">
       <table data-analytics-table className="w-full min-w-[720px] border-collapse text-[12.5px]">
         <thead>
           <tr className="border-b border-line text-left text-[11.5px] tracking-wide text-muted uppercase">
@@ -683,9 +625,86 @@ export function DataTable<Row>({
         </tbody>
         {footer ? <tfoot>{footer}</tfoot> : null}
       </table>
-      </div>
-    </>
+    </div>
+  ) : (
+    <div>
+      {sortable.length > 0 ? (
+        <label className="flex items-center gap-2 px-3 pt-3 text-[11px] tracking-wide text-muted uppercase">
+          Sort
+          <select
+            value={sort ?? sortable[0].key}
+            data-analytics-sort-select
+            onChange={(event) => onSort?.(event.target.value)}
+            className="rounded-lg border border-line bg-canvas px-2 py-1 text-[12px] text-ink"
+          >
+            {sortable.map((column) => (
+              <option key={column.key} value={column.key}>
+                {column.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
+      <ul data-analytics-cards className="flex flex-col gap-2 p-3">
+        {rows.map((row) => (
+          <li key={rowKey(row)}>
+            <div
+              role={onRowClick ? "button" : undefined}
+              tabIndex={onRowClick ? 0 : undefined}
+              onClick={onRowClick ? () => onRowClick(row) : undefined}
+              onKeyDown={
+                onRowClick
+                  ? (event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onRowClick(row);
+                      }
+                    }
+                  : undefined
+              }
+              className={`flex flex-col gap-1.5 rounded-lg border border-line p-3 ${
+                onRowClick ? "cursor-pointer transition hover:bg-canvas" : ""
+              }`}
+            >
+              {columns.map((column) => (
+                <div key={column.key} className="flex items-baseline justify-between gap-3">
+                  <span className="shrink-0 text-[11px] tracking-wide text-muted uppercase">
+                    {column.label}
+                  </span>
+                  <span
+                    className={`min-w-0 text-right break-words ${
+                      column.numeric ? "font-mono" : ""
+                    }`}
+                  >
+                    {column.render(row)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
+}
+
+/**
+ * `true` on a wide screen.
+ *
+ * One layout in the DOM at a time: a report row is rendered once, so a hook like
+ * `data-analytics-page-link` names exactly one element — a hidden copy of every row would make a
+ * click-through harness guess which of the two it found, and a screen reader announce both.
+ */
+function useWideScreen(): boolean {
+  const [wide, setWide] = useState(true);
+  useEffect(() => {
+    const query = window.matchMedia("(min-width: 1024px)");
+    const update = () => setWide(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return wide;
 }
 
 /** Paging controls of a report table. */
