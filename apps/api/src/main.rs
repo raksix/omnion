@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use omnion_api::routes;
 use omnion_api::state::AppState;
+use omnion_api::workflow_runner;
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
 use omnion_identity::users::{self, BootstrapOutcome};
@@ -72,7 +73,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "listening");
 
-    let app = routes::router(AppState::new(build, config, db, redis, storage));
+    let state = AppState::new(build, config, db, redis, storage);
+
+    // The workflow engine ticks in this process (docs/BUILD-BACKLOG.md P09). It is opened,
+    // not awaited: every tick is a query against the durable store, so a tick that cannot
+    // reach the database logs a warning and the next one picks the work up again.
+    if state.config().workflows.runner_enabled {
+        let _runner = workflow_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the workflow runner is disabled (OMNION_WORKFLOW_RUNNER=false)");
+    }
+
+    let app = routes::router(state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
