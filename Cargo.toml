@@ -41,3 +41,10 @@ argon2 = "0.5"
 rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
+
+# Object storage (crates/storage): the S3/MinIO client signs its own requests (SigV4) over a
+# plain HTTP client, so the media library needs no vendor SDK.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+hmac = "0.12"
+percent-encoding = "2"
+bytes = "1"
