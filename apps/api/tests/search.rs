@@ -832,7 +832,10 @@ async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
     );
 
     let (applied, _) = tick(&fixture.db).await;
-    assert!(applied >= 1, "the tick must apply the event, applied {applied}");
+    assert!(
+        applied >= 1,
+        "the tick must apply the event, applied {applied}"
+    );
 
     let query = format!("kaizen%20{}", fixture.marker);
     let body = search(&fixture.state, &owner, &query).await;
@@ -889,7 +892,10 @@ async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
         .to_owned();
 
     let (applied, _) = tick(&fixture.db).await;
-    assert!(applied >= 1, "the tick must apply the event, applied {applied}");
+    assert!(
+        applied >= 1,
+        "the tick must apply the event, applied {applied}"
+    );
 
     let query = format!("zephyr%20{}", fixture.marker);
     let body = search(&fixture.state, &owner, &query).await;
@@ -929,7 +935,10 @@ async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
     );
 
     let (applied, _) = tick(&fixture.db).await;
-    assert!(applied >= 1, "the tick must apply the event, applied {applied}");
+    assert!(
+        applied >= 1,
+        "the tick must apply the event, applied {applied}"
+    );
 
     let body = search(&fixture.state, &owner, &query).await;
     assert_eq!(
@@ -1206,7 +1215,12 @@ async fn an_empty_answer_says_what_lies_outside_the_readers_scope() {
         "the owner must be answered: {}",
         answer.body
     );
-    assert_eq!(answer.body["hidden_total"], json!(0), "body: {}", answer.body);
+    assert_eq!(
+        answer.body["hidden_total"],
+        json!(0),
+        "body: {}",
+        answer.body
+    );
     assert!(
         answer.body.to_string().contains(SITE_A_TITLE),
         "the owner must see the site: {}",

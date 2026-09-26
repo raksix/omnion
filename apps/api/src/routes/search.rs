@@ -439,7 +439,8 @@ pub async fn search(
     // still answers. A caller that says `history=false` — the palette, which asks once per group
     // per keystroke — is taken at its word.
     if wants_history(&params) {
-        if let Err(error) = record_recent(state.db().pool(), current.user.id, request.query.raw()).await
+        if let Err(error) =
+            record_recent(state.db().pool(), current.user.id, request.query.raw()).await
         {
             tracing::warn!(
                 code = error.code(),

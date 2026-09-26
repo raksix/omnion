@@ -1091,9 +1091,7 @@ async fn unreadable_providers(
     let enabled = enabled_providers(pool).await?;
     Ok(providers::PROVIDERS
         .iter()
-        .filter(|spec| {
-            enabled.iter().any(|key| key == spec.key) && !readable.contains(&spec.key)
-        })
+        .filter(|spec| enabled.iter().any(|key| key == spec.key) && !readable.contains(&spec.key))
         .map(|spec| spec.key)
         .collect())
 }
