@@ -285,6 +285,76 @@ jobs:
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
+      # The AI Hub walk (docs/BUILD-BACKLOG.md P11): an OpenAI-compatible provider is mocked on
+      # the machine itself (infra/mocks/openai-compatible.mjs), connected through the API, and a
+      # chat is streamed through it — the round trip the phase asks for, against a mock instead
+      # of a vendor that would need a key.
+      - name: AI Hub walk (mock provider)
+        env:
+          OMNION_ADMIN_EMAIL: admin@example.com
+          OMNION_ADMIN_PASSWORD: smoke-test-admin-password
+        run: |
+          set -euo pipefail
+          node infra/mocks/openai-compatible.mjs 8123 > /tmp/omnion-mock.log 2>&1 &
+          MOCK_PID=$!
+          OMNION_PORT=8081 ./target/debug/omnion-api > /tmp/omnion-ai-api.log 2>&1 &
+          API_PID=$!
+          trap 'kill "$MOCK_PID" "$API_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8081/readyz >/dev/null 2>&1 \
+              && curl -fsS http://127.0.0.1:8123/v1/models >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS -c /tmp/omnion-ai-cookies.txt -H 'content-type: application/json' \
+            -d '{"email":"admin@example.com","password":"smoke-test-admin-password"}' \
+            http://127.0.0.1:8081/api/v1/auth/login >/dev/null
+          # Connect the mock as a provider with two models; the key stays write-only.
+          provider_id=$(curl -fsS -b /tmp/omnion-ai-cookies.txt -H 'content-type: application/json' \
+            -d '{"name":"CI Mock","base_url":"http://127.0.0.1:8123/v1","api_key":"sk-ci-mock","models":["mock-small","mock-large"]}' \
+            http://127.0.0.1:8081/api/v1/ai/providers \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          if curl -fsS -b /tmp/omnion-ai-cookies.txt http://127.0.0.1:8081/api/v1/ai/providers | grep -q 'sk-ci-mock'; then
+            echo "the stored provider key must never come back through the API" >&2
+            exit 1
+          fi
+          curl -fsS -b /tmp/omnion-ai-cookies.txt http://127.0.0.1:8081/api/v1/ai/models \
+            | python3 -c 'import json,sys; rows=json.load(sys.stdin)["models"]; print("ai registry:", len(rows), "model(s), default=" + [m["model_key"] for m in rows if m["is_default"]][0])'
+          # The chat streams: a start frame, the deltas, then the done frame with the usage.
+          curl -fsS -N -b /tmp/omnion-ai-cookies.txt -H 'content-type: application/json' \
+            -d '{"model":"mock-large","messages":[{"role":"user","content":"hello"}]}' \
+            http://127.0.0.1:8081/api/v1/ai/chat > /tmp/omnion-ai-stream.txt
+          python3 - <<'PY'
+          raw = open("/tmp/omnion-ai-stream.txt").read()
+          parts = [
+              line.split('"content":"', 1)[1].split('"', 1)[0]
+              for line in raw.split("\n")
+              if line.startswith("data: ") and '"content":"' in line
+          ]
+          answer = "".join(parts)
+          assert answer == "Hello from the mock (mock-large).", answer
+          assert "event: start" in raw and "event: done" in raw, raw
+          assert '"total_tokens":12' in raw, raw
+          print("ai chat stream: deltas=" + str(len(parts)) + ' reassembled="' + answer + '"')
+          PY
+          # A model the provider refuses arrives as an error frame the caller can branch on.
+          curl -fsS -b /tmp/omnion-ai-cookies.txt -X PUT -H 'content-type: application/json' \
+            -d '{"models":["mock-small","broken-model"]}' \
+            "http://127.0.0.1:8081/api/v1/ai/providers/$provider_id/models" >/dev/null
+          curl -fsS -N -b /tmp/omnion-ai-cookies.txt -H 'content-type: application/json' \
+            -d '{"model":"broken-model","messages":[{"role":"user","content":"hello"}]}' \
+            http://127.0.0.1:8081/api/v1/ai/chat | grep -q '"code":"provider_error"'
+          # … and the AI surface stays closed to anonymous callers.
+          ai_code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/api/v1/ai/providers)
+          if [ "$ai_code" != "401" ]; then
+            echo "anonymous /api/v1/ai/providers must be rejected with 401, got $ai_code" >&2
+            exit 1
+          fi
+          curl -fsS -b /tmp/omnion-ai-cookies.txt http://127.0.0.1:8081/api/v1/iam/audit \
+            | python3 -c 'import json,sys; rows=[r["action"] for r in json.load(sys.stdin)["entries"] if r["action"].startswith("ai.")]; print("ai audit rows:", len(rows), sorted(set(rows)))'
+          echo "ai hub: provider=$provider_id · registry=ok · chat=streamed · refusal=reported · anonymous=401"
+
       # The first-run walk (docs/BUILD-BACKLOG.md P10): a database that has never been migrated
       # is set up by the `omnion` CLI — no SQL, no environment bootstrap — and the API then
       # serves it: the wizard is closed, the owner signs in, the site exists with its theme.
