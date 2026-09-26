@@ -1151,3 +1151,60 @@
 - Next: REQ-007 stays in progress — **slice 2** (overview + the six report screens over these
   rollups, the shared date-range toolbar, filters, drawers and CSV export, plus the walkthrough
   gaining the ten `/analytics` routes with a synthetic beacon batch).
+
+## 2026-09-26 — REQ-007 · slice 2 · the numbers come back out
+
+- **The read side is one module, and it is honest about where a number comes from.** `reports.rs`
+  answers the overview, the page report, sources, audience, events, downloads and forms. A range
+  inside the site's retention window is read from the **raw rows** — that is where *distinct
+  visitors across a period* is a real number rather than a sum of per-day counts — and a range
+  that reaches past retention falls back to the daily rollups, marking the answer `exact: false`
+  so the screen can say so. Series buckets are addressed by an offset from the range start rather
+  than by a truncated timestamp: `date_trunc` follows the connection's time zone, and a report
+  that shifts by an hour depending on who asks is worse than no report.
+- **A report's SQL and its binds cannot drift.** `Narrowing` writes only the clauses a report
+  actually applies and numbers each placeholder from how many values are already bound. The first
+  draft had the failure modes this prevents: a no-op placeholder for a filter the sources report
+  cannot use, and a `limit` that was bound three times out of four (the QA of the module's own
+  tests caught the first as a red assertion, the second as a 500).
+- **Where a filter cannot apply is a fact about the data.** A visit has no path of its own — its
+  pageviews do — so the path filter on a visit-scoped report narrows through an `exists` over that
+  visit's pageviews; a page report narrows the path on the pageview itself. The screens and the
+  export share one query, so the CSV holds exactly the rows the table showed, and the row count
+  rides in `x-export-rows` because a silently truncated file lies.
+- **The collector now stores the country an edge reported.** Cloudflare's `CF-IPCountry` and its
+  two siblings are read on the beacon; the platform still never geolocates an address itself, and
+  the edges' own "unknown" placeholders (`XX`, `T1`) are refused — a country that is not a country
+  would show up in the audience report as a place.
+- **Seven screens, one toolbar.** The report screens live behind a shared shell whose state is the
+  URL (range presets, two pickers, comparison, granularity, export, refresh with a last-updated
+  caption, and the spec's keyboard: `d`, `c`, `r`, `e`, `g`+`o|p|s|a`). The overview's empty state
+  hands over the tracking snippet instead of an empty chart; a comparison against a period with no
+  traffic says "no comparison" rather than drawing a delta against zero; below `lg` every table
+  becomes a card list (one layout in the DOM, chosen by a media query, so a hook names exactly one
+  element).
+- **Three defects the QA pass found, and the fix for each.** (1) The date pickers let a range end
+  before it starts, so every screen asked the API for a range it must refuse — 28 of the pass's 29
+  errors; moving one end now drags the other. (2) The country filter sent whatever was typed and
+  let the API be the first line of defence; the field validates as a two-letter code, marks itself
+  `aria-invalid` and says so under the input. (3) A click-through harness looked up an element on a
+  page that was already being replaced by a client-side navigation; the pass now settles after each
+  click and records the click error itself, and the wizard's step loop waits for its own step to
+  move instead of submitting twice.
+- **Proof:** `cargo test --workspace --no-fail-fast` → **541 passed, 0 failed** (the analytics
+  module's 36 units + the suite's 9 integration walks, three of them new: the seeded overview and
+  its comparison, the filtered/sorted/paged page report with its CSV, and the dimension reports
+  with an empty site answering zeroes) · `cargo clippy` clean · `pnpm typecheck && pnpm build` →
+  2/2 · `bash scripts/qa/run.sh` → 328 clicks, 331 screenshots, **0 high findings**, **0 vision
+  issues** (`qa-artifacts/20260926-220408`). The depth pass reads the analytics section end to end:
+  a synthetic batch of four visitors (two devices, three countries, one download, one form with its
+  start, one custom event with a value) spread over thirty days, the 7-day range with the
+  comparison on, a page drawer, a real CSV download (`omnion-analytics-pages-2026-09-20..2026-09-26.csv`,
+  2 rows) and the empty state of a filter that cannot match.
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium findings,
+  unchanged), and `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
+- Next: **REQ-007 slice 3** — goal CRUD with steps, hit recording from pageviews/events/downloads
+  and the server-side conversions, the funnel endpoint and screen (`/analytics/goals`), and
+  realtime (`/analytics/realtime` + its SSE counters). Slice 4 then closes the privacy operations
+  (retention purge with its audit row, visitor erasure, the "what we store" table and the
+  `/analytics/settings` screen).

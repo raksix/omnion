@@ -1,6 +1,6 @@
 # REQ-007 — Analytics
 
-> **Status:** in-progress (slice 1 shipped) · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
+> **Status:** in-progress (slices 1–2 shipped) · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -159,9 +159,20 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
 - [x] With `anonymize_ip` on, no row stores a raw address (`ip_prefix` is null) and IPv4/IPv6 truncation matches the documented widths.
 - [x] DNT and GPC requests are dropped before any row is written and increase the filtered counter.
 - [x] Rollup idempotency: running a bucket twice leaves `analytics_daily` identical (snapshot comparison in a test).
-- [ ] Overview numbers match a seeded fixture for visitors, page views, conversions and forms across a custom range.
-- [ ] Comparison mode returns the previous equal-length period; a range without prior data shows “no comparison” instead of zero.
-- [ ] Page-report filters combine (path + device + country + source), sorting and paging stay consistent, and the CSV contains exactly the filtered rows.
+- [x] Overview numbers match a seeded fixture for visitors, page views, conversions and forms across a custom range.
+  Proven by `apps/api/tests/analytics.rs::the_overview_matches_the_seeded_fixture_and_compares_with_the_period_before`:
+  four visitors over six pageviews, one goal conversion, one form, one download — and the visitor
+  who came back on a second day is still one visitor (4, not 5).
+- [x] Comparison mode returns the previous equal-length period; a range without prior data shows “no comparison” instead of zero.
+  The same walk: `previous_has_data = false` and `previous = 0` while nothing precedes the window,
+  then one seeded visitor a period earlier makes the delta real and rides beside the matching
+  bucket; the screen renders `data-analytics-no-comparison` for the empty case.
+- [x] Page-report filters combine (path + device + country + source), sorting and paging stay consistent, and the CSV contains exactly the filtered rows.
+  `…::the_page_report_filters_sorts_pages_and_exports_exactly_its_rows`: three paths, six
+  pageviews, the combined filter leaving two rows, `per_page=1&page=2` landing on the second row of
+  the same ordering, and an export whose three lines (header + two rows) hold the filtered paths
+  and not the table — with the row count in `x-export-rows`, and `analytics.export` refusing the
+  reader who may only read.
 - [ ] A three-step goal reports monotonically non-increasing funnel counts with per-step drop-offs.
 - [ ] Goal hits are deduplicated per visitor per step — re-sending the same beacon does not double-count.
 - [x] Excluded paths and IPs produce no rows; changing the lists affects new hits only.
@@ -171,8 +182,11 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
   (a full budget of beacons is served in-process before the 429; the limiter is per instance, see
   the slice log).
 - [ ] Permission guards answer 401/403/200 as documented and an organization cannot read another organization’s sites; all ten screens have empty, loading and error states with zero high findings and a clean mobile pass.
-  (The guards and the organization isolation are proven for the settings and snippet endpoints;
-  the ten screens arrive with slices 2–4.)
+  (The guards and the organization isolation are now proven for the settings, snippet and all
+  seven report endpoints — a member without `analytics.read` gets 403, another organization's
+  reader gets 403, the platform Owner reads across, and an unknown sort key or day answers
+  `400 invalid_report_query`. Goals, realtime and the privacy half of the settings screen land
+  with slices 3–4, so the ten-screen half of this line stays open.)
 
 ### QA plan
 
@@ -249,3 +263,56 @@ this slice, so the walkthrough inventory is unchanged — slice 2 adds the ten `
 
 Next: **slice 2** — the overview and the six report screens over these rollups, with the shared
 date-range toolbar, filters, drawers and CSV export.
+
+### Slice 2 — shipped (overview + the six report screens)
+
+- **`modules/analytics/src/reports.rs`** — the read side in one place: the range (inclusive UTC
+  days, at most 366 of them), the five filters, a `Narrowing` builder that writes only the clauses
+  a report actually applies (so a filter that cannot narrow a report never appears as a no-op in
+  its SQL), the overview, the page report (sorted by a whitelist, paged), the sources report with
+  its group-by modes, the audience panels and countries, events and their property breakdown,
+  downloads by file and by page, forms with completion and abandonment, and the CSV renderer.
+  Fourteen unit tests cover the arithmetic that cannot be wrong in production: range maths, bucket
+  lists, filter validation, the sort whitelist, ratios without a denominator, CSV quoting.
+- **Series buckets are addressed by an offset from the range start**, not by a truncated
+  timestamp: `date_trunc` follows the connection's time zone, and a report that shifts by an hour
+  depending on who asks is worse than no report.
+- **`apps/api`** — `GET /analytics/{overview,pages,pages/series,sources,audience,events,
+  events/{name},downloads,forms}` behind `analytics.read`, and `GET /analytics/export` behind
+  `analytics.export`, all resolving the site through the caller's own organization. The export
+  answers the same rows the screen shows (same filters, same sort) with the row count in
+  `x-export-rows`, because a silently truncated file lies.
+- **The seven screens** (`apps/admin/features/analytics`): one toolbar (Today / Yesterday / 7 days
+  / 30 days / 12 months / custom pickers, comparison switch, granularity select enabled only where
+  the range allows hours, export, refresh with a last-updated caption), all of it held in the URL,
+  plus the spec's keyboard (`d`, `c`, `r`, `e`, `g` then `o|p|s|a`). The overview's empty state
+  hands over the tracking snippet rather than an empty chart; a range older than retention says
+  its numbers come from the daily rollups; a comparison with no traffic behind it says
+  "no comparison" instead of drawing a delta against zero.
+- **The collector now stores the country an edge reported** (`CF-IPCountry`, `X-Vercel-IP-Country`,
+  `X-Country-Code`): the audience report's countries column was always going to be `(unknown)`
+  without it, and Omnion still never geolocates an address itself. The edges' own placeholders
+  (`XX`, `T1`) are refused — a country that is not a country is not a place.
+- **The walkthrough grew the section** (`scripts/qa/walkthrough.cjs`): it posts a synthetic batch
+  to the public collect endpoint (four visitors: two device types, three countries, one download,
+  one form submit with its start, one custom event with a value), spreads a third of those rows
+  over the last thirty days through the disposable QA database so the series has a shape, then
+  walks and clicks all seven screens, switches to 7 days, turns the comparison on, opens a page
+  drawer and downloads a real CSV.
+
+Deviations and choices, for the reviewer:
+
+- `GET /analytics/pages/series` takes `?path=` rather than the spec's `/pages/{path}/series`: a URL
+  path is not a path, and `/pages/%2Fpricing/series` would make every router on the way a
+  participant in the encoding question.
+- The overview reads the **raw rows** while the range is inside the site's retention window — that
+  is where "distinct visitors across a period" is a real number — and reads the **daily rollups**
+  past it, answering `exact: false` so the screen can say so. The rollup path sums per-day
+  distinct counts, which counts a returning visitor once per day; that is a property of the
+  rollup, not of the visitor, and the screen names it.
+- The events report's property breakdown is `jsonb_each_text` over the property object: values are
+  rendered as text, which is what a breakdown needs, and nothing there is a form field value by
+  design (REQ-064 owns forms' own field data).
+- Countries and screens are the only audience dimensions read outside the rollups; everything the
+  rollups carry (pageviews by path, visitors by device/browser/OS/country/language/referrer) has
+  the same numbers in both paths, which the integration walks check on a seeded fixture.
