@@ -23,10 +23,12 @@ use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::header::{SET_COOKIE, USER_AGENT};
 use axum::response::{IntoResponse, Response};
+use omnion_events::{NewEvent, bus};
 use omnion_identity::sessions::{self, SESSION_TTL_SECONDS};
 use omnion_onboarding::themes::{BUNDLED_THEMES, BundledTheme};
 use omnion_onboarding::{self as onboarding, state as onboarding_state};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
@@ -281,6 +283,15 @@ pub async fn create_owner(
         .map(str::to_owned);
     let ip_address = client.as_text();
 
+    // The first account is worth finding too (REQ-002): the index reads the user row from here.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("user.created")
+            .actor(user.id)
+            .payload(json!({ "user_id": user.id, "email": user.email })),
+    )
+    .await?;
+
     let (session, token) = sessions::create_session(
         state.db().pool(),
         user.id,
@@ -343,7 +354,7 @@ pub async fn create_site(
         return Err(ApiError::bad_request("invalid_request", "name is required"));
     }
 
-    onboarding::create_site(
+    let (site, _domain) = onboarding::create_site(
         state.db().pool(),
         current.user.id,
         onboarding::FirstSite {
@@ -351,6 +362,22 @@ pub async fn create_site(
             key: body.key,
             domain: body.domain,
         },
+    )
+    .await?;
+
+    // The site exists from here on, so it is part of what a search can find.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("site.created")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "site_id": site.id,
+                "key": site.key,
+                "name": site.name,
+                "theme": site.theme,
+            })),
     )
     .await?;
 

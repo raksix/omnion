@@ -26,6 +26,7 @@ use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use omnion_audit::NewAuditEntry;
+use omnion_events::{NewEvent, bus};
 use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_media::{
@@ -184,6 +185,23 @@ pub async fn upload_media(
         }
     };
 
+    // The bus carries the fact that the library changed; the search index (REQ-002) is one of its
+    // subscribers, so an upload is findable a moment later without a manual reindex.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("media.created")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "media_id": media.id,
+                "site_id": site.id,
+                "filename": media.filename,
+                "content_type": media.content_type,
+            })),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "media.uploaded")
@@ -239,6 +257,18 @@ pub async fn delete_media(
     if !omnion_media::delete_media(state.db().pool(), media.id).await? {
         return Err(media_not_found());
     }
+
+    // The row is gone; the index has to hear about it or the library would keep answering with a
+    // file nobody can open.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("media.deleted")
+            .organization(site.organization_id)
+            .site(media.site_id)
+            .actor(current.user.id)
+            .payload(json!({ "media_id": media.id, "site_id": media.site_id })),
+    )
+    .await?;
 
     record(
         &state,

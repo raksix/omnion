@@ -12,6 +12,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
+use omnion_events::{NewEvent, bus};
 use omnion_identity::organizations::{self, NewOrganization, Organization, OrganizationChanges};
 use omnion_identity::sites::{self, NewSite, Site, SiteChanges, SiteDomain};
 use serde::{Deserialize, Serialize};
@@ -438,6 +439,22 @@ pub async fn create_site(
     )
     .await?;
 
+    // A new site is a new thing to find (REQ-002): the bus carries it, the index follows.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("site.created")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "site_id": site.id,
+                "key": site.key,
+                "name": site.name,
+                "theme": site.theme,
+            })),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "site.created")
@@ -471,6 +488,23 @@ pub async fn update_site(
 ) -> Result<Json<SiteBody>, ApiError> {
     let site = site_in_scope(&state, &current, site_id).await?;
     let updated = sites::update_site(state.db().pool(), site.id, &body.changes()).await?;
+
+    // A rename or a theme change is worth finding again: the index re-reads the site row.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("site.updated")
+            .organization(updated.organization_id)
+            .site(updated.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "site_id": updated.id,
+                "key": updated.key,
+                "name": updated.name,
+                "status": updated.status,
+                "theme": updated.theme,
+            })),
+    )
+    .await?;
 
     record(
         &state,
