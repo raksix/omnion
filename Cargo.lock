@@ -1129,6 +1129,7 @@ dependencies = [
  "omnion-audit",
  "omnion-content",
  "omnion-core",
+ "omnion-events",
  "omnion-identity",
  "omnion-media",
  "omnion-onboarding",
@@ -1190,6 +1191,25 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omnion-events"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
