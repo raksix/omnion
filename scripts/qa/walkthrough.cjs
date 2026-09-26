@@ -971,6 +971,92 @@ async function runCommandCenter(page, report) {
   });
   await shot(page, "command-center-recents", { full: false });
 
+  // An action command asks before it runs (REQ-032, slice 3): the question is a card above the
+  // list, the yes runs it through its owning service, and the answer the service gives is what
+  // the palette prints. The audit trail is read back through the API — one entry per executed
+  // command, naming actor, command and target.
+  const auditRuns = () =>
+    page
+      .evaluate(() =>
+        fetch("/api/v1/iam/audit?limit=50", { credentials: "same-origin" })
+          .then((response) => (response.ok ? response.json() : { entries: [] }))
+          .catch(() => ({ entries: [] })),
+      )
+      .then((body) =>
+        (Array.isArray(body?.entries) ? body.entries : []).filter(
+          (entry) => entry.action === "command.run",
+        ),
+      )
+      .catch(() => []);
+
+  const auditBefore = await auditRuns();
+  await input()
+    .fill("> rebuild")
+    .catch(() => {});
+  await page.waitForTimeout(1100);
+  const actionBadges = await page.locator('[data-palette-command-kind="action"]').count();
+  const actionText = (await page
+    .locator("[data-search-palette]")
+    .first()
+    .innerText()
+    .catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  await input()
+    .press("Enter")
+    .catch(() => {});
+  await page.waitForTimeout(800);
+  const confirmShown = (await page.locator("[data-palette-confirm]").count()) === 1;
+  const confirmText = confirmShown
+    ? (await page.locator("[data-palette-confirm]").first().innerText())
+        .replace(/\s+/g, " ")
+        .trim()
+    : "";
+  const auditAsked = await auditRuns();
+  note({
+    step: "action-confirm",
+    actionBadges,
+    offersAction: /rebuild the search index/i.test(actionText),
+    confirmShown,
+    asksFirst: /asks first/i.test(actionText),
+    ranNothingYet: auditAsked.length === auditBefore.length,
+    question: confirmText.slice(0, 120),
+  });
+  await shot(page, "command-center-action-confirm", { full: false });
+
+  // The yes: run it and read what the owning service answered.
+  await page
+    .locator("[data-palette-confirm-run]")
+    .first()
+    .click({ timeout: 4000 })
+    .catch(() => {});
+  await page.waitForTimeout(3800);
+  const doneShown = (await page.locator('[data-palette-run-result="done"]').count()) === 1;
+  const doneText = doneShown
+    ? (await page.locator('[data-palette-run-result="done"]').first().innerText())
+        .replace(/\s+/g, " ")
+        .trim()
+    : "";
+  const auditAfter = await auditRuns();
+  const newestRun = auditAfter[0] ?? null;
+  note({
+    step: "action-run",
+    doneShown,
+    answer: doneText.slice(0, 140),
+    newEntries: auditAfter.length - auditBefore.length,
+    target: newestRun?.target_id ?? null,
+    actor: newestRun?.actor_user_id ?? null,
+    outcome: newestRun?.metadata?.outcome ?? null,
+    detailsLink: (await page.locator("[data-palette-run-details]").count()) === 1,
+  });
+  await shot(page, "command-center-action-run", { full: false });
+  await page
+    .locator("[data-palette-run-dismiss]")
+    .first()
+    .click({ timeout: 3000 })
+    .catch(() => {});
+  await page.waitForTimeout(300);
+
   // `?` alone is the shortcut sheet; `#` and `@` move the chip to their own modes.
   await input()
     .fill("?")
