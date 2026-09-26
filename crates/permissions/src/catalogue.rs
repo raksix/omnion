@@ -280,6 +280,19 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "events",
         description: "Read the platform's event feed",
     },
+    // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
+    // account holds it, and the results are still narrowed by organization and by each
+    // provider's own read permission; `search.manage` is index maintenance, not searching.
+    PermissionDef {
+        key: "search.read",
+        category: "search",
+        description: "Search the platform's indexed content",
+    },
+    PermissionDef {
+        key: "search.manage",
+        category: "search",
+        description: "Rebuild and configure the search index",
+    },
 ];
 
 /// Look a permission up by key.
@@ -355,6 +368,7 @@ mod tests {
             "iam",
             "audit",
             "tenancy",
+            "search",
         ] {
             assert!(categories.contains(expected), "missing category {expected}");
         }

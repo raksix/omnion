@@ -102,6 +102,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "domains.manage",
             "webhooks.read",
             "events.read",
+            "search.read",
+            "search.manage",
         ]),
     },
     BaseRole {
@@ -123,6 +125,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "users.read",
             "audit.read",
             "sites.read",
+            "search.read",
         ]),
     },
     BaseRole {
@@ -142,6 +145,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "ai.chat",
             "workflows.read",
             "sites.read",
+            "search.read",
         ]),
     },
     BaseRole {
@@ -149,7 +153,7 @@ const BASE_ROLES: &[BaseRole] = &[
         name: "Member",
         priority: 100,
         description: "Reads content and media.",
-        permissions: BasePermissions::List(&["content.pages.read", "media.read"]),
+        permissions: BasePermissions::List(&["content.pages.read", "media.read", "search.read"]),
     },
 ];
 
@@ -471,9 +475,17 @@ mod tests {
             .find(|base| base.key == "member")
             .expect("member exists");
         let keys = member.permissions.keys();
-        assert_eq!(keys, vec!["content.pages.read", "media.read"]);
+        assert_eq!(
+            keys,
+            vec!["content.pages.read", "media.read", "search.read"],
+            "the member reads content, media and the search box"
+        );
         assert!(!keys.contains(&"iam.roles.manage"));
         assert!(!keys.contains(&"users.delete"));
+        assert!(
+            !keys.contains(&"search.manage"),
+            "running the index is not a member's power"
+        );
 
         let editor = BASE_ROLES
             .iter()
