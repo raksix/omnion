@@ -529,6 +529,9 @@ pub struct ResolveResponse {
     pub runnable: bool,
     /// Where a runnable reading lands, when it opens a screen.
     pub route: Option<String>,
+    /// Where `Edit as search` goes: the same words, the same filters, runnable or not. A reading
+    /// the caller may not run still has an editable shape, and the operator can fix it by hand.
+    pub search_route: Option<String>,
     /// Confidence of the reading.
     pub confidence: f32,
     /// What was understood.
@@ -542,6 +545,11 @@ pub struct ResolveResponse {
 impl From<crate::intent_resolver::Resolution> for ResolveResponse {
     fn from(resolution: crate::intent_resolver::Resolution) -> Self {
         let intent = resolution.intent;
+        let search_route = if intent.entity.is_some() || !intent.query.trim().is_empty() {
+            Some(intent.search_url())
+        } else {
+            None
+        };
         Self {
             query: intent.query.clone(),
             source: resolution.source,
@@ -550,6 +558,7 @@ impl From<crate::intent_resolver::Resolution> for ResolveResponse {
             preview_text: intent.preview(),
             runnable: resolution.runnable,
             route: resolution.route,
+            search_route,
             confidence: intent.confidence,
             intent: IntentBody {
                 kind: intent.kind.as_str(),

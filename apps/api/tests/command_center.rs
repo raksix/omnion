@@ -1423,9 +1423,14 @@ async fn an_interpretation_says_what_it_understood_and_runs_nothing() {
         "Tickets · assignee: Mehmet · last 10 · newest first"
     );
 
-    // No panel screen reads a tickets list yet, so the reading says so instead of promising one.
+    // No panel screen reads a tickets list yet, so the reading says so instead of promising one —
+    // but the words and the order it read still travel as an editable search.
     assert_eq!(response.body["runnable"], false);
     assert_eq!(response.body["route"], Value::Null);
+    assert_eq!(
+        response.body["search_route"],
+        "/search?q=tickets+Mehmet&sort=newest"
+    );
     assert!(
         response.body["note"]
             .as_str()
@@ -1472,6 +1477,7 @@ async fn an_interpretation_points_at_screens_the_caller_may_open() {
         pages.body["route"], "/search?q=pages&type=pages&sort=newest",
         "a runnable search lands on the results screen with its own filters"
     );
+    assert_eq!(pages.body["search_route"], pages.body["route"]);
 
     // …and the command that opens that screen is offered as itself.
     let media = resolve_phrase(&fixture.state, &editor, "open media").await;
