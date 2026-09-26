@@ -372,6 +372,27 @@ pub fn router(state: AppState) -> Router {
     let analytics_export =
         get(analytics::export).layer(guards::require(&state, "analytics.export"));
 
+    // Goals and realtime (docs/requests/REQ-007, slice 3): reading a goal, its funnel and the
+    // realtime snapshot is `analytics.read`, while creating, changing or deleting a goal is the
+    // separate `analytics.goals.manage` — an editor who may read the numbers should not be able
+    // to silence a conversion by accident.
+    let analytics_goals_read = Router::new()
+        .route("/analytics/goals", get(analytics::goals_index))
+        .route("/analytics/goals/{id}", get(analytics::goal_get))
+        .route("/analytics/goals/{id}/funnel", get(analytics::goal_funnel))
+        .route("/analytics/realtime", get(analytics::realtime))
+        .route(
+            "/analytics/realtime/stream",
+            get(analytics::realtime_stream),
+        )
+        .route_layer(guards::require(&state, "analytics.read"));
+
+    let analytics_goals_write = Router::new()
+        .route("/analytics/goals", post(analytics::goal_create))
+        .route("/analytics/goals/{id}", patch(analytics::goal_patch))
+        .route("/analytics/goals/{id}", delete(analytics::goal_delete))
+        .route_layer(guards::require(&state, "analytics.goals.manage"));
+
     let analytics_collect = Router::new()
         .route("/public/analytics/collect", post(analytics::collect))
         .layer(DefaultBodyLimit::max(
@@ -404,6 +425,8 @@ pub fn router(state: AppState) -> Router {
         .route("/analytics/snippet", analytics_snippet)
         .merge(analytics_reports)
         .route("/analytics/export", analytics_export)
+        .merge(analytics_goals_read)
+        .merge(analytics_goals_write)
         .merge(analytics_collect)
         .route(
             "/iam/permissions",

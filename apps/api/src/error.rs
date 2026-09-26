@@ -167,6 +167,17 @@ impl From<AnalyticsError> for ApiError {
                 "analytics_settings_not_found",
                 "this site has no analytics settings",
             ),
+            AnalyticsError::InvalidGoal(message) => Self::bad_request("invalid_goal", message),
+            AnalyticsError::GoalNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "goal_not_found",
+                "this site has no such goal",
+            ),
+            AnalyticsError::GoalNameTaken => Self::new(
+                StatusCode::CONFLICT,
+                "goal_name_taken",
+                "another goal of this site carries this name",
+            ),
             AnalyticsError::Database(err) if dependency_unavailable(&err) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "dependency_unavailable",

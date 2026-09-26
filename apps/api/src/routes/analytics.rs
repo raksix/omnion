@@ -14,6 +14,7 @@
 //!   can never read or change another tenant's promises.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,13 +24,19 @@ use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::IntervalStream;
 use uuid::Uuid;
 
+use omnion_events::{NewEvent, bus};
 use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_module_analytics::collect::{self, Beacon, RequestMeta};
+use omnion_module_analytics::goals::{self, Goal, GoalChanges, GoalPatch};
+use omnion_module_analytics::realtime::{self, RealtimeSnapshot};
 use omnion_module_analytics::reports::{self, DateRange, Filters, Granularity, Report};
 use omnion_module_analytics::settings as store;
 use omnion_module_analytics::{Settings, SettingsChanges};
@@ -108,6 +115,37 @@ pub async fn collect(
     };
 
     let report = collect::ingest(pool, site.id, &settings, &meta, &beacon).await?;
+
+    // A finished goal is a fact the rest of the platform acts on (REQ-007 §Events): the bus
+    // records it and queues the deliveries its subscribers asked for. Only a hit this beacon
+    // actually wrote is announced — a re-sent beacon changed nothing and says nothing. A bus that
+    // cannot record the fact is a warning, not a failed beacon: the visit is already stored, and
+    // a marketing automation that misses one conversion must not also lose the traffic behind it.
+    for reached in report.reached_goals.iter().filter(|hit| hit.is_final) {
+        let emission = bus::emit(
+            pool,
+            NewEvent::new("analytics.goal_reached")
+                .organization(site.organization_id)
+                .site(site.id)
+                .payload(serde_json::json!({
+                    "goal_id": reached.goal_id,
+                    "goal": reached.goal,
+                    "step_position": reached.step_position,
+                    "visitor": reached.visitor,
+                    "path": reached.path,
+                    "value": reached.value,
+                })),
+        )
+        .await;
+        if let Err(error) = emission {
+            tracing::warn!(
+                site_id = %site.id,
+                goal_id = %reached.goal_id,
+                error = %error,
+                "the goal event could not be recorded"
+            );
+        }
+    }
 
     Ok((StatusCode::ACCEPTED, Json(report)))
 }
@@ -475,13 +513,8 @@ pub async fn event_detail(
     current: CurrentSession,
 ) -> Result<Json<reports::EventDetail>, ApiError> {
     let request = ReportRequest::resolve(&state, &current, &query).await?;
-    let report = reports::event_detail(
-        state.db().pool(),
-        request.site.id,
-        &name,
-        request.range,
-    )
-    .await?;
+    let report =
+        reports::event_detail(state.db().pool(), request.site.id, &name, request.range).await?;
 
     Ok(Json(report))
 }
@@ -559,8 +592,7 @@ pub async fn export(
                     rows.len().to_string(),
                 ),
             ];
-            let mut response =
-                axum::response::Response::new(axum::body::Body::from(report.csv()));
+            let mut response = axum::response::Response::new(axum::body::Body::from(report.csv()));
             for (name, value) in headers {
                 if let Ok(value) = value.parse() {
                     response.headers_mut().insert(name, value);
@@ -800,10 +832,270 @@ impl BeaconLimiter {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Goals (panel)
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/analytics/goals` — every goal of a site with how it did in the range.
+#[derive(Debug, Serialize)]
+pub struct GoalsResponse {
+    /// First day the numbers cover.
+    pub from: Date,
+    /// Last day the numbers cover.
+    pub to: Date,
+    /// The goals, ordered by name.
+    pub goals: Vec<goals::GoalSummary>,
+}
+
+/// `GET /api/v1/analytics/goals` — the goal list with conversions, rates and last hit.
+pub async fn goals_index(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<GoalsResponse>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let goals = goals::list(state.db().pool(), request.site.id, request.range).await?;
+
+    Ok(Json(GoalsResponse {
+        from: request.range.from,
+        to: request.range.to,
+        goals,
+    }))
+}
+
+/// `POST /api/v1/analytics/goals` — create a goal, optionally a funnel of steps.
+pub async fn goal_create(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+    Json(changes): Json<GoalChanges>,
+) -> Result<(StatusCode, Json<Goal>), ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let goal = goals::create(
+        state.db().pool(),
+        request.site.id,
+        Some(current.user.id),
+        &changes,
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(goal)))
+}
+
+/// `GET /api/v1/analytics/goals/{id}` — one goal with its steps, as the editor reads it.
+pub async fn goal_get(
+    State(state): State<AppState>,
+    axum::extract::Path(goal_id): axum::extract::Path<Uuid>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<Goal>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let goal = goals::get(state.db().pool(), request.site.id, goal_id).await?;
+
+    Ok(Json(goal))
+}
+
+/// `PATCH /api/v1/analytics/goals/{id}` — update what the body carries, keep the rest.
+///
+/// The switch, the name and the funnel are all partial updates of one resource: a screen that
+/// turns a goal off must not have to re-send the match it never showed, and a screen that edits
+/// the last step must not have to re-send the first.
+pub async fn goal_patch(
+    State(state): State<AppState>,
+    axum::extract::Path(goal_id): axum::extract::Path<Uuid>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+    Json(changes): Json<GoalPatch>,
+) -> Result<Json<Goal>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let goal = goals::patch(state.db().pool(), request.site.id, goal_id, &changes).await?;
+
+    Ok(Json(goal))
+}
+
+/// `DELETE /api/v1/analytics/goals/{id}` — remove a goal; its steps and hits go with it.
+pub async fn goal_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(goal_id): axum::extract::Path<Uuid>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<StatusCode, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    goals::delete(state.db().pool(), request.site.id, goal_id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/analytics/goals/{id}/funnel` — one goal's steps for the range.
+pub async fn goal_funnel(
+    State(state): State<AppState>,
+    axum::extract::Path(goal_id): axum::extract::Path<Uuid>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<goals::Funnel>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let funnel = goals::funnel(state.db().pool(), request.site.id, goal_id, request.range).await?;
+
+    Ok(Json(funnel))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Realtime (panel)
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/analytics/realtime` — the snapshot of the last half hour.
+pub async fn realtime(
+    State(state): State<AppState>,
+    Query(query): Query<SiteQuery>,
+    current: CurrentSession,
+) -> Result<Json<RealtimeSnapshot>, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let snapshot =
+        realtime::snapshot(state.db().pool(), site.id, OffsetDateTime::now_utc()).await?;
+
+    Ok(Json(snapshot))
+}
+
+/// How many realtime streams one site may hold open at once.
+///
+/// Realtime is polling under the hood, so each stream is a query every few seconds: the cap is
+/// what keeps a wall of forgotten tabs from becoming the site's own load test. A reader who is
+/// over the cap gets a `429` and the screen keeps its last snapshot on screen.
+const MAX_REALTIME_STREAMS: usize = 8;
+
+/// How often a stream answers with a fresh snapshot.
+const REALTIME_TICK: Duration = Duration::from_secs(5);
+
+/// How many snapshots one stream may carry before it ends (half an hour at [`REALTIME_TICK`]).
+///
+/// `EventSource` reconnects on its own, which is the point: the next connection re-checks the
+/// reader's session and the site's scope, and a closed tab stops costing anything.
+const REALTIME_STREAM_TICKS: usize = 360;
+
+/// `GET /api/v1/analytics/realtime/stream` — server-sent snapshots of the last half hour.
+pub async fn realtime_stream(
+    State(state): State<AppState>,
+    Query(query): Query<SiteQuery>,
+    current: CurrentSession,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let guard = RealtimeStreams::acquire(site.id)?;
+    let pool = state.db().pool().clone();
+    let site_id = site.id;
+
+    let stream = IntervalStream::new(tokio::time::interval(REALTIME_TICK))
+        .take(REALTIME_STREAM_TICKS)
+        .then(move |_| {
+            let pool = pool.clone();
+            // The guard travels with the stream: when the browser drops it, the slot is free.
+            let _slot = &guard;
+            async move {
+                match realtime::snapshot(&pool, site_id, OffsetDateTime::now_utc()).await {
+                    Ok(snapshot) => Ok(SseEvent::default().event("snapshot").data(
+                        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_owned()),
+                    )),
+                    Err(error) => Ok(SseEvent::default().event("error").data(error.to_string())),
+                }
+            }
+        });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// The per-site count of live realtime streams.
+#[derive(Debug, Default)]
+struct RealtimeStreams {
+    counts: Mutex<HashMap<Uuid, usize>>,
+}
+
+impl RealtimeStreams {
+    /// One process-wide counter; the streams are answered by every API instance, so this is a
+    /// per-instance guardrail exactly like the beacon limiter, and the shared counter arrives
+    /// with the Redis-backed limiter.
+    fn counts() -> &'static RealtimeStreams {
+        static COUNTS: OnceLock<RealtimeStreams> = OnceLock::new();
+        COUNTS.get_or_init(RealtimeStreams::default)
+    }
+
+    /// Take one slot of a site, or refuse when the site already holds too many.
+    fn acquire(site_id: Uuid) -> Result<RealtimeStreamGuard, ApiError> {
+        let counts = Self::counts();
+        let mut live = counts
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let entry = live.entry(site_id).or_insert(0);
+        if *entry >= MAX_REALTIME_STREAMS {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_streams",
+                format!("a site may hold {MAX_REALTIME_STREAMS} realtime streams at once"),
+            ));
+        }
+        *entry += 1;
+
+        Ok(RealtimeStreamGuard { site_id })
+    }
+
+    /// Give one slot back.
+    fn release(site_id: Uuid) {
+        let counts = Self::counts();
+        let mut live = counts
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(entry) = live.get_mut(&site_id) {
+            *entry = entry.saturating_sub(1);
+            if *entry == 0 {
+                live.remove(&site_id);
+            }
+        }
+    }
+}
+
+/// One held stream slot, released when the stream is dropped.
+#[derive(Debug)]
+struct RealtimeStreamGuard {
+    site_id: Uuid,
+}
+
+impl Drop for RealtimeStreamGuard {
+    fn drop(&mut self) {
+        RealtimeStreams::release(self.site_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn the_realtime_stream_cap_is_per_site_and_frees_its_slots() {
+        let site = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_REALTIME_STREAMS {
+            held.push(RealtimeStreams::acquire(site).expect("a slot inside the cap"));
+        }
+        let refused = RealtimeStreams::acquire(site).unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Another site has its own budget.
+        let other_guard = RealtimeStreams::acquire(other).expect("another site has its own slots");
+
+        // Dropping one stream frees exactly one slot.
+        held.pop();
+        let again = RealtimeStreams::acquire(site).expect("the freed slot is available");
+        drop(again);
+        drop(other_guard);
+        for guard in held {
+            drop(guard);
+        }
+    }
 
     #[test]
     fn the_forwarded_address_wins_and_the_socket_is_the_fallback() {
