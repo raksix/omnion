@@ -593,7 +593,12 @@
   the provider, streams a chat, asserts the reassembled answer, the `provider_error` frame and the
   anonymous `401`, and prints the `ai.*` audit rows. Its script was dry-run locally against the
   live stack first (`exit 0`, `ai chat stream: deltas=5 reassembled="Hello from the mock
-  (mock-large)."`).
+  (mock-large)."`). Run `36210119981` → **success**: `Rust — fmt · clippy · test` ✅ (the walk
+  printed `ai registry: 2 model(s), default=mock-large`, `ai chat stream: deltas=5
+  reassembled="Hello from the mock (mock-large)."`, `ai audit rows: 4 [… ai.chat.completed ·
+  ai.chat.failed · ai.provider.connected · ai.provider.models_replaced]` and `ai hub:
+  provider=… · registry=ok · chat=streamed · refusal=reported · anonymous=401`) ·
+  `Infra — compose config` ✅.
 - Next: **P12 — Events + Webhooks v0** (event bus table + delivery worker + HMAC signatures, first
   fan-out `page.published`).
 
