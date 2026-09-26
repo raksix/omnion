@@ -889,7 +889,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
           type="button"
           data-palette-confirm-run
           onClick={() => void runAction(pendingRun)}
-          className="rounded-md border border-accent-strong/30 bg-accent-soft px-3 py-1.5 text-[12px] font-medium text-accent-strong transition hover:bg-surface"
+          className="min-h-11 rounded-md border border-accent-strong/30 bg-accent-soft px-3 py-1.5 text-[12px] font-medium text-accent-strong transition hover:bg-surface lg:min-h-0"
         >
           Run
         </button>
@@ -897,7 +897,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
           type="button"
           data-palette-confirm-cancel
           onClick={() => setPendingRun(null)}
-          className="rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] text-muted transition hover:bg-quiet-soft hover:text-ink"
+          className="min-h-11 rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] text-muted transition hover:bg-quiet-soft hover:text-ink lg:min-h-0"
         >
           Cancel
         </button>
