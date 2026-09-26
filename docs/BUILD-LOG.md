@@ -1011,4 +1011,7 @@
   it with an explicit reindex; the gap is worth a REQ-002 follow-up rather than a quiet fix here.
 - Carried forward, not caused by this slice: the public renderer still answers `404` for its own
   icon requests (5 medium findings, unchanged).
-- Next: wave 1 continues with **REQ-007** (analytics + the real dashboard), then REQ-006 (IAM).
+- Next: REQ-032 stays in progress — **slice 3** next (action commands + audit: mutating commands
+  through the owning services, confirmation for destructive ones, `command.run` entries and
+  `command_usage_daily`), then slice 4 (natural-language resolution + the intent card); wave 1 then
+  moves to REQ-007 (analytics + the real dashboard).
