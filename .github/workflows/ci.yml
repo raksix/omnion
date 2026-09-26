@@ -48,6 +48,25 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The media suite writes into the same object store the development stack ships. Service
+      # containers cannot pass a command, so MinIO is started here the way `infra/compose`
+      # starts it; the suite skips itself when no store is listening.
+      - name: Start the object store (media library)
+        run: |
+          docker run -d --name omnion-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=omnion -e MINIO_ROOT_PASSWORD=omnion-dev-secret \
+            pgsty/minio:latest server /data
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "the object store did not become healthy" >&2
+            docker logs omnion-minio || true
+            exit 1
+          fi
+          echo "object store: $(curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/minio/health/live)"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -186,6 +205,46 @@ jobs:
             exit 1
           fi
           echo "public surface: title=\"$public_title\" via-key · \"$host_title\" via-domain · unpublished=$draft_code"
+          # Media: the Owner uploads a file into the site's library, reads it back through both
+          # read paths, lists it, and removes it again — the round trip the media surface exists
+          # for (docs/BUILD-BACKLOG.md P08).
+          printf 'omnion media smoke\n' > /tmp/omnion-media.txt
+          media_id=$(curl -fsS -b /tmp/omnion-cookies.txt \
+            -F 'file=@/tmp/omnion-media.txt;type=text/plain' \
+            "http://127.0.0.1:8080/api/v1/media?site_id=$site_id" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          library=$(curl -fsS -b /tmp/omnion-cookies.txt \
+            "http://127.0.0.1:8080/api/v1/media?site_id=$site_id" \
+            | python3 -c 'import json,sys; rows=json.load(sys.stdin)["media"]; first=rows[0]; print(len(rows), "file(s), first=" + first["filename"], first["size_bytes"], "B", first["content_type"])')
+          curl -fsS -b /tmp/omnion-cookies.txt -o /tmp/omnion-media-raw.bin \
+            "http://127.0.0.1:8080/api/v1/media/$media_id/raw"
+          cmp /tmp/omnion-media.txt /tmp/omnion-media-raw.bin
+          curl -fsS -o /tmp/omnion-media-public.bin \
+            "http://127.0.0.1:8080/api/v1/public/media/$media_id"
+          cmp /tmp/omnion-media.txt /tmp/omnion-media-public.bin
+          media_type=$(curl -s -o /dev/null -w '%{content_type}' \
+            "http://127.0.0.1:8080/api/v1/public/media/$media_id")
+          if [ "$media_type" != "text/plain" ]; then
+            echo "the served media must keep its content type, got $media_type" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          media_code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080/api/v1/media?site_id=$site_id")
+          if [ "$media_code" != "401" ]; then
+            echo "anonymous /api/v1/media must be rejected with 401, got $media_code" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          curl -fsS -o /dev/null -X DELETE -b /tmp/omnion-cookies.txt \
+            "http://127.0.0.1:8080/api/v1/media/$media_id"
+          removed=$(curl -s -o /dev/null -w '%{http_code}' -b /tmp/omnion-cookies.txt \
+            "http://127.0.0.1:8080/api/v1/media/$media_id/raw")
+          if [ "$removed" != "404" ]; then
+            echo "a removed file must answer 404 on the panel read path, got $removed" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "media surface: library=$library · round-trip=ok · public=ok · removed=$removed"
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
