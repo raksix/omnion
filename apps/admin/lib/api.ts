@@ -1014,3 +1014,323 @@ export async function streamChat(
     }
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Analytics (docs/requests/REQ-007): the reports behind the /analytics screens
+// ---------------------------------------------------------------------------------------------
+
+/** One report parameter, as the screens write it into the URL. */
+export type AnalyticsQuery = Record<string, string | number | boolean | undefined | null>;
+
+/** One point of a series. */
+export type AnalyticsSeriesPoint = {
+  bucket: string;
+  label: string;
+  visitors: number;
+  pageviews: number;
+  previous_visitors?: number;
+  previous_pageviews?: number;
+};
+
+/** One headline number and, when comparing, the same number one period earlier. */
+export type AnalyticsMetric = { value: number; previous: number | null };
+
+/** One ranked value of a dimension. */
+export type AnalyticsDimensionRow = {
+  value: string;
+  visitors: number | null;
+  views: number | null;
+};
+
+/** The overview report. */
+export type AnalyticsOverview = {
+  range: { from: string; to: string };
+  previous_range: { from: string; to: string };
+  compare: boolean;
+  exact: boolean;
+  previous_has_data: boolean;
+  granularity: "hour" | "day";
+  kpis: {
+    visitors: AnalyticsMetric;
+    pageviews: AnalyticsMetric;
+    conversions: AnalyticsMetric;
+    forms: AnalyticsMetric;
+    downloads: AnalyticsMetric;
+  };
+  series: AnalyticsSeriesPoint[];
+  top_pages: AnalyticsDimensionRow[];
+  top_sources: AnalyticsDimensionRow[];
+  devices: AnalyticsDimensionRow[];
+};
+
+/** The filters a report echoes back. */
+export type AnalyticsFilterEcho = {
+  path?: string;
+  title?: string;
+  device?: string;
+  country?: string;
+  source?: string;
+};
+
+/** One row of the page report. */
+export type AnalyticsPageRow = {
+  path: string;
+  title: string | null;
+  views: number;
+  visitors: number;
+  views_per_visitor: number | null;
+  avg_time_ms: number | null;
+  bounce_rate: number | null;
+  entrances: number;
+  exits: number;
+};
+
+/** The page report. */
+export type AnalyticsPagesReport = {
+  range: { from: string; to: string };
+  filters: AnalyticsFilterEcho;
+  sort: string;
+  direction: "asc" | "desc";
+  page: number;
+  per_page: number;
+  total: number;
+  rows: AnalyticsPageRow[];
+};
+
+/** One row of the sources report. */
+export type AnalyticsSourceRow = {
+  source: string;
+  medium: string | null;
+  campaign: string | null;
+  term: string | null;
+  content: string | null;
+  visits: number;
+  visitors: number;
+  conversions: number;
+  conversion_rate: number | null;
+};
+
+/** The sources report. */
+export type AnalyticsSourcesReport = {
+  range: { from: string; to: string };
+  group: string;
+  rows: AnalyticsSourceRow[];
+};
+
+/** One bar panel of the audience report. */
+export type AnalyticsDimensionPanel = {
+  kind: string;
+  title: string;
+  rows: AnalyticsDimensionRow[];
+};
+
+/** One country of the audience report. */
+export type AnalyticsCountryRow = {
+  code: string;
+  visitors: number;
+  views: number;
+  share: number;
+};
+
+/** The audience report. */
+export type AnalyticsAudienceReport = {
+  range: { from: string; to: string };
+  panels: AnalyticsDimensionPanel[];
+  countries: AnalyticsCountryRow[];
+  visitors: number;
+};
+
+/** One row of the events report. */
+export type AnalyticsEventRow = {
+  name: string;
+  count: number;
+  visitors: number;
+  value_sum: number | null;
+  last_seen: string | null;
+};
+
+/** The events report. */
+export type AnalyticsEventsReport = {
+  range: { from: string; to: string };
+  rows: AnalyticsEventRow[];
+};
+
+/** One event, in detail. */
+export type AnalyticsEventDetail = {
+  range: { from: string; to: string };
+  name: string;
+  count: number;
+  visitors: number;
+  value_sum: number | null;
+  last_seen: string | null;
+  series: { bucket: string; label: string; count: number }[];
+  properties: { key: string; value: string; count: number }[];
+};
+
+/** One row of the downloads report. */
+export type AnalyticsDownloadRow = {
+  value: string;
+  downloads: number;
+  visitors: number;
+};
+
+/** The downloads report. */
+export type AnalyticsDownloadsReport = {
+  range: { from: string; to: string };
+  total: number;
+  files: AnalyticsDownloadRow[];
+  pages: AnalyticsDownloadRow[];
+};
+
+/** One row of the forms report. */
+export type AnalyticsFormRow = {
+  form: string;
+  submissions: number;
+  visitors: number;
+  value_sum: number | null;
+  starts: number;
+  completion_rate: number | null;
+  abandonment: number | null;
+  last_seen: string | null;
+};
+
+/** The forms report. */
+export type AnalyticsFormsReport = {
+  range: { from: string; to: string };
+  rows: AnalyticsFormRow[];
+};
+
+/** Build a report URL: only the parameters the caller actually set are written. */
+function analyticsUrl(path: string, query: AnalyticsQuery): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    params.set(key, String(value));
+  }
+  const search = params.toString();
+
+  return search ? `${path}?${search}` : path;
+}
+
+/** `GET /api/v1/analytics/overview`. */
+export function fetchAnalyticsOverview(
+  query: AnalyticsQuery,
+): Promise<AnalyticsOverview> {
+  return request<AnalyticsOverview>(analyticsUrl("/api/v1/analytics/overview", query));
+}
+
+/** `GET /api/v1/analytics/pages`. */
+export function fetchAnalyticsPages(query: AnalyticsQuery): Promise<AnalyticsPagesReport> {
+  return request<AnalyticsPagesReport>(analyticsUrl("/api/v1/analytics/pages", query));
+}
+
+/** `GET /api/v1/analytics/pages/series` — one page's own series. */
+export function fetchAnalyticsPageSeries(
+  query: AnalyticsQuery,
+): Promise<AnalyticsSeriesPoint[]> {
+  return request<AnalyticsSeriesPoint[]>(
+    analyticsUrl("/api/v1/analytics/pages/series", query),
+  );
+}
+
+/** `GET /api/v1/analytics/sources`. */
+export function fetchAnalyticsSources(query: AnalyticsQuery): Promise<AnalyticsSourcesReport> {
+  return request<AnalyticsSourcesReport>(analyticsUrl("/api/v1/analytics/sources", query));
+}
+
+/** `GET /api/v1/analytics/audience`. */
+export function fetchAnalyticsAudience(
+  query: AnalyticsQuery,
+): Promise<AnalyticsAudienceReport> {
+  return request<AnalyticsAudienceReport>(analyticsUrl("/api/v1/analytics/audience", query));
+}
+
+/** `GET /api/v1/analytics/events`. */
+export function fetchAnalyticsEvents(query: AnalyticsQuery): Promise<AnalyticsEventsReport> {
+  return request<AnalyticsEventsReport>(analyticsUrl("/api/v1/analytics/events", query));
+}
+
+/** `GET /api/v1/analytics/events/{name}`. */
+export function fetchAnalyticsEvent(
+  name: string,
+  query: AnalyticsQuery,
+): Promise<AnalyticsEventDetail> {
+  return request<AnalyticsEventDetail>(
+    analyticsUrl(`/api/v1/analytics/events/${encodeURIComponent(name)}`, query),
+  );
+}
+
+/** `GET /api/v1/analytics/downloads`. */
+export function fetchAnalyticsDownloads(
+  query: AnalyticsQuery,
+): Promise<AnalyticsDownloadsReport> {
+  return request<AnalyticsDownloadsReport>(
+    analyticsUrl("/api/v1/analytics/downloads", query),
+  );
+}
+
+/** `GET /api/v1/analytics/forms`. */
+export function fetchAnalyticsForms(query: AnalyticsQuery): Promise<AnalyticsFormsReport> {
+  return request<AnalyticsFormsReport>(analyticsUrl("/api/v1/analytics/forms", query));
+}
+
+/**
+ * `GET /api/v1/analytics/export` — the report the screen is showing, as a file.
+ *
+ * The browser gets the bytes and the row count the API put in a header, so the screen can say
+ * what it just downloaded instead of guessing.
+ */
+export async function downloadAnalyticsExport(
+  query: AnalyticsQuery,
+): Promise<{ rows: number; blob: Blob; filename: string }> {
+  let response: Response;
+  try {
+    response = await fetch(analyticsUrl("/api/v1/analytics/export", query), {
+      credentials: "same-origin",
+      headers: { accept: "text/csv" },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  const rows = Number(response.headers.get("x-export-rows") ?? "0");
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+
+  return {
+    rows,
+    blob: await response.blob(),
+    filename: match?.[1] ?? "omnion-analytics.csv",
+  };
+}
+
+/** `GET /api/v1/analytics/snippet` — what a site pastes into its pages. */
+export type AnalyticsSnippet = {
+  site: { key: string; name: string };
+  script_url: string;
+  collect_url: string;
+  snippet: string;
+};
+
+/** The snippet of one site, with its script and collect addresses resolved. */
+export function fetchAnalyticsSnippet(siteId: string): Promise<AnalyticsSnippet> {
+  return request<AnalyticsSnippet>(
+    `/api/v1/analytics/snippet?site_id=${encodeURIComponent(siteId)}`,
+  );
+}

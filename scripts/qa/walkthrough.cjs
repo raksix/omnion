@@ -25,6 +25,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 const { chromium } = require("playwright-core");
 
 // ---------------------------------------------------------------- args / env
@@ -41,6 +42,14 @@ const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
 const STEP_MS = Number(arg("step-ms", "380"));
+/**
+ * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
+ * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
+ * rows over the last thirty days, so the report screens have a multi-day shape to draw. It is the
+ * same `docker exec psql` the reset step uses, against `omnion_qa` and nothing else.
+ */
+const QA_PG_CONTAINER = arg("db-container", process.env.QA_PG_CONTAINER || "omnion-postgres");
+const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
 
 const CREDS = {
   name: "QA Owner",
@@ -1379,6 +1388,211 @@ async function runSearchDepth(page, report) {
   report.searchDepth = steps;
 }
 
+// ---------------------------------------------------------------- analytics (REQ-007, slice 2)
+
+/** Run one statement against the disposable QA database. */
+function qaSql(statement) {
+  return execFileSync(
+    "docker",
+    ["exec", QA_PG_CONTAINER, "psql", "-U", "omnion", "-d", QA_DB, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", statement],
+    { encoding: "utf8", timeout: 30000 },
+  ).trim();
+}
+
+/** Post one beacon to the public collection endpoint of the QA site. */
+async function postBeacon(body, { userAgent, forwardedFor, country }) {
+  const headers = { "content-type": "application/json", "user-agent": userAgent };
+  if (forwardedFor) headers["x-forwarded-for"] = forwardedFor;
+  if (country) headers["cf-ipcountry"] = country;
+  const response = await fetch(
+    `${URL_ADMIN}/api/v1/public/analytics/collect?site=${CREDS.siteKey}`,
+    { method: "POST", headers, body: JSON.stringify(body) },
+  );
+  return { status: response.status, body: await response.json().catch(() => null) };
+}
+
+/**
+ * The synthetic batch the analytics screens are read against: fixed test paths, one download, one
+ * form submit, one custom event, two device types and three countries — then a slice of it spread
+ * over the last thirty days so the series has a shape beyond today.
+ */
+async function seedAnalytics(report) {
+  const desktop =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  const phone =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+  const linux =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+  const batch = [
+    {
+      meta: { userAgent: desktop, forwardedFor: "203.0.113.11", country: "TR" },
+      payload: {
+        pageview: {
+          path: "/qa/landing",
+          title: "QA landing",
+          referrer: "https://www.google.com/search?q=omnion",
+          duration_ms: 2400,
+          scroll_depth: 62,
+          screen: { width: 1440, height: 900 },
+          language: "tr-TR",
+        },
+        events: [
+          { name: "download", properties: { file: "/qa/files/guide.pdf" } },
+          { name: "signup", value: 49.5, properties: { plan: "pro" } },
+        ],
+        utm: { source: "newsletter", medium: "email", campaign: "launch" },
+      },
+    },
+    {
+      meta: { userAgent: phone, forwardedFor: "198.51.100.22", country: "DE" },
+      payload: {
+        pageview: {
+          path: "/qa/pricing",
+          title: "QA pricing",
+          duration_ms: 1500,
+          scroll_depth: 40,
+          screen: { width: 390, height: 844 },
+          language: "de-DE",
+        },
+        events: [{ name: "form_submit", value: 120, properties: { form: "contact" } }],
+        utm: { source: "newsletter", medium: "email", campaign: "launch" },
+      },
+    },
+    {
+      meta: { userAgent: linux, forwardedFor: "192.0.2.33", country: "FR" },
+      payload: {
+        pageview: {
+          path: "/qa/docs",
+          title: "QA docs",
+          duration_ms: 900,
+          scroll_depth: 88,
+          screen: { width: 1920, height: 1080 },
+          language: "fr-FR",
+        },
+        events: [{ name: "cta_click", properties: { slot: "hero" } }],
+      },
+    },
+    {
+      meta: { userAgent: phone, forwardedFor: "198.51.100.44", country: "TR" },
+      payload: {
+        pageview: {
+          path: "/qa/landing",
+          title: "QA landing",
+          duration_ms: 700,
+          scroll_depth: 25,
+          screen: { width: 390, height: 844 },
+          language: "tr-TR",
+        },
+        events: [
+          { name: "form_start", properties: { form: "contact" } },
+          { name: "form_submit", value: 80, properties: { form: "contact" } },
+        ],
+      },
+    },
+  ];
+
+  const answers = [];
+  for (const entry of batch) {
+    answers.push(await postBeacon(entry.payload, entry.meta));
+  }
+  const accepted = answers.filter((answer) => answer.status === 202).length;
+
+  // The history fixture: a third of the batch stays today, a third lands inside the last week and
+  // a third inside the last month, so 7-day and 30-day ranges both have a shape to draw.
+  let spread = "skipped";
+  try {
+    const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+    const shift = (table, column) => `
+      update ${table} set ${column} = ${column} - (
+        case when id % 3 = 1 then (1 + (id % 6)) else (7 + (id % 23)) end || ' days'
+      )::interval
+      where site_id = '${site}' and id % 3 <> 0;`;
+    for (const statement of [
+      shift("analytics_pageviews", "occurred_at"),
+      shift("analytics_visits", "started_at"),
+      shift("analytics_events", "occurred_at"),
+    ]) {
+      qaSql(statement);
+    }
+    spread = "applied";
+  } catch (err) {
+    spread = `skipped: ${String(err).slice(0, 120)}`;
+  }
+
+  return { accepted, posted: batch.length, spread, first: answers[0] };
+}
+
+/** The analytics pass: the range, the comparison, a page drawer and a real export. */
+async function runAnalyticsDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/analytics`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const kpi = () =>
+    page
+      .locator("[data-analytics-kpi=visitors] [data-analytics-kpi-value]")
+      .first()
+      .innerText()
+      .catch(() => "0");
+
+  // The batch is already in the raw rows; the screen reads them on its own request.
+  let visitors = (await kpi()).trim();
+  for (let attempt = 0; attempt < 12 && visitors === "0"; attempt += 1) {
+    await page.locator("[data-analytics-refresh]").click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+    visitors = (await kpi()).trim();
+  }
+  steps.visitors = visitors;
+  steps.empty = (await page.locator("[data-analytics-overview-empty]").count()) > 0;
+
+  await page.locator("[data-analytics-preset=7d]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const compareBox = page.locator("[data-analytics-compare]").first();
+  if (!(await compareBox.isChecked().catch(() => false))) {
+    await compareBox.check({ timeout: 4000 }).catch(() => {});
+  }
+  await page.waitForTimeout(1200);
+  await shot(page, "page-analytics-overview");
+  steps.comparison =
+    (await page.locator("[data-analytics-no-comparison]").count()) > 0 ? "no-comparison" : "compared";
+  steps.range = (await page.locator("[data-analytics-toolbar]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  steps.series = await page.locator("[data-analytics-axis-label]").count();
+
+  // The page report, its drawer and its export.
+  await page.goto(`${URL_ADMIN}/analytics/pages`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.pageRows = await page.locator("[data-analytics-row]").count();
+  const link = page.locator("[data-analytics-page-link]").first();
+  if ((await link.count()) > 0) {
+    await link.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.drawer = (await page.locator("[data-analytics-drawer]").count()) > 0;
+    await shot(page, "analytics-page-drawer");
+    await page.locator("[data-analytics-drawer-close]").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  } else {
+    steps.drawer = false;
+  }
+
+  const waiting = page.waitForEvent("download", { timeout: 20000 }).catch(() => null);
+  await page.locator("[data-analytics-export]").click({ timeout: 4000 }).catch(() => {});
+  const download = await waiting;
+  steps.export = download
+    ? { filename: download.suggestedFilename(), failure: download.failure() || null }
+    : "no-download";
+  steps.exportNote = (
+    await page.locator("[data-analytics-export-note]").innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  report.analytics = { ...(report.analytics || {}), ...steps };
+  return steps;
+}
+
 // ---------------------------------------------------------------- run
 
 async function main() {
@@ -1415,6 +1629,11 @@ async function main() {
   }
   await shot(page, "11-overview-after-login");
 
+  // The analytics batch goes in before the routes are walked: the report screens read it, and the
+  // history fixture gives their series more than one bucket to draw.
+  report.analytics = await seedAnalytics(report);
+  log(`analytics seed: ${JSON.stringify(report.analytics)}`);
+
   const routes = [
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
@@ -1425,6 +1644,15 @@ async function main() {
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
     { path: "/settings/search", name: "search-settings" },
+    // The analytics reports (REQ-007, slice 2): every screen of the section is walked, clicked and
+    // measured, and the depth pass below reads the range, the comparison, a drawer and an export.
+    { path: "/analytics", name: "analytics" },
+    { path: "/analytics/pages", name: "analytics-pages" },
+    { path: "/analytics/sources", name: "analytics-sources" },
+    { path: "/analytics/audience", name: "analytics-audience" },
+    { path: "/analytics/events", name: "analytics-events" },
+    { path: "/analytics/downloads", name: "analytics-downloads" },
+    { path: "/analytics/forms", name: "analytics-forms" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -1450,6 +1678,11 @@ async function main() {
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
   await runSearchDepth(page, report);
 
+  // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
+  // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
+  // settings screen with slice 4 — this pass visits what exists today.
+  report.analyticsDepth = await runAnalyticsDepth(page, report);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -1470,7 +1703,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
