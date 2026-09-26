@@ -1127,6 +1127,7 @@ dependencies = [
  "http-body-util",
  "omnion-ai-hub",
  "omnion-audit",
+ "omnion-automation",
  "omnion-content",
  "omnion-core",
  "omnion-events",
@@ -1155,6 +1156,24 @@ dependencies = [
  "sqlx",
  "thiserror",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-automation"
+version = "0.1.0"
+dependencies = [
+ "omnion-audit",
+ "omnion-content",
+ "omnion-events",
+ "omnion-workflows",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1288,6 +1307,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "time",
+ "tokio",
  "tracing",
  "uuid",
 ]
