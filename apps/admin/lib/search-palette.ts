@@ -13,6 +13,13 @@ export const PALETTE_PROVIDERS = {
   pages: { label: "Pages", route: "/pages" },
   media: { label: "Media", route: "/media" },
   sites: { label: "Sites", route: "/sites" },
+  // Activity, translations and settings arrived with their providers (slice 3). A row of theirs
+  // carries its own destination — an audit entry opens the page it touched, a translation opens
+  // its page's editor, the settings row opens the screen that owns it — so the section opens
+  // real screens even though none of the three has a list screen of its own.
+  logs: { label: "Activity", route: "/search" },
+  translations: { label: "Translations", route: "/pages" },
+  settings: { label: "Settings", route: "/settings/search" },
 } as const;
 
 /** One of the provider keys the palette knows. */

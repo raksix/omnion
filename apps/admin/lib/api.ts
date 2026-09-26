@@ -304,6 +304,8 @@ export type SearchHit = {
   subtitle: string;
   /** Panel route a click opens. */
   url: string;
+  /** Display name of the account the entity belongs to, when it has one. */
+  owner: string | null;
   /** Tags stored with the document (`draft`, `published`, …). */
   tags: string[];
   /** When the entity last changed, RFC 3339. */
@@ -318,6 +320,41 @@ export type SearchCount = {
   title: string;
   route: string;
   count: number;
+};
+
+/** One value of the facet rail. */
+export type SearchFacetValue = {
+  value: string;
+  label: string;
+  count: number;
+};
+
+/** One group of the facet rail. */
+export type SearchFacetGroup = {
+  key: string;
+  title: string;
+  values: SearchFacetValue[];
+  more: number;
+};
+
+/** The filters the results screen applies through the URL. */
+export type SearchFilterInput = {
+  /** Comma-separated provider keys. */
+  type?: string;
+  /** A site id, key or domain host. */
+  site?: string;
+  /** `me` or an account id. */
+  owner?: string;
+  /** A language code. */
+  language?: string;
+  /** One status tag. */
+  status?: string;
+  /** `today`, `week`, `month`, `older` or `never`. */
+  updated?: string;
+  /** Exclusive upper bound (`YYYY-MM-DD`). */
+  before?: string;
+  /** Inclusive lower bound (`YYYY-MM-DD`). */
+  after?: string;
 };
 
 /** The whole answer of one search. */
@@ -342,6 +379,8 @@ export type SearchResult = {
   per_page: number;
   /** Which provider contributed how many, ordered by count. */
   counts: SearchCount[];
+  /** The facet rail's counts; present when `facets=true` was asked for. */
+  facets?: SearchFacetGroup[];
   /** How long the search took, in milliseconds. */
   took_ms: number;
 };
@@ -356,23 +395,167 @@ export type SearchSuggestion = {
   provider: string;
 };
 
-/**
- * Search every provider the account's own read permissions cover.
- *
- * The scoped syntax travels inside `q` (`type:page site:acme is:draft`), exactly as the box
- * accepts it — the results screen passes what the account typed instead of re-encoding it.
- */
-export function searchAll(input: {
+/** The search parameters a request or an export URL carries. */
+type SearchQueryInput = {
   q: string;
   page?: number;
   per_page?: number;
   sort?: SearchSort;
-}): Promise<SearchResult> {
+  /** Ask the answer for the facet rail's counts. */
+  facets?: boolean;
+  /** The filters the rail applies. */
+  filters?: SearchFilterInput;
+};
+
+/** Build the query string of a search or export call. */
+function searchParams(input: SearchQueryInput): URLSearchParams {
   const params = new URLSearchParams({ q: input.q });
   if (input.page) params.set("page", String(input.page));
   if (input.per_page) params.set("per_page", String(input.per_page));
   if (input.sort) params.set("sort", input.sort);
-  return request<SearchResult>(`/api/v1/search?${params.toString()}`);
+  if (input.facets) params.set("facets", "true");
+  const filters = input.filters ?? {};
+  if (filters.type) params.set("types", filters.type);
+  if (filters.site) params.set("site_id", filters.site);
+  if (filters.owner) params.set("owner", filters.owner);
+  if (filters.language) params.set("language", filters.language);
+  if (filters.status) params.set("status", filters.status);
+  if (filters.updated) params.set("updated", filters.updated);
+  if (filters.before) params.set("before", filters.before);
+  if (filters.after) params.set("after", filters.after);
+  return params;
+}
+
+/**
+ * Search every provider the account's own read permissions cover.
+ *
+ * The scoped syntax travels inside `q` (`type:page site:acme is:draft`), exactly as the box
+ * accepts it — the results screen passes what the account typed instead of re-encoding it. The
+ * rail's own filters travel as their own parameters, so a result set stays a URL.
+ */
+export function searchAll(input: SearchQueryInput): Promise<SearchResult> {
+  return request<SearchResult>(`/api/v1/search?${searchParams(input).toString()}`);
+}
+
+/** One provider's line on the search settings screen. */
+export type SearchProviderStatus = {
+  provider: string;
+  title: string;
+  documents: number;
+  last_indexed_at: string | null;
+  /** `indexing`, `failed`, `stale`, `ready` or `empty`. */
+  state: string;
+  last_run: {
+    indexed: number | null;
+    pruned: number | null;
+    duration_ms: number | null;
+    started_at: string;
+    finished_at: string | null;
+    error: string | null;
+  } | null;
+};
+
+/** The index's per-provider health. */
+export function fetchSearchStatus(): Promise<{
+  providers: SearchProviderStatus[];
+  documents: number;
+}> {
+  return request<{ providers: SearchProviderStatus[]; documents: number }>(
+    "/api/v1/search/status",
+  );
+}
+
+/** Rebuild one provider's index, or every one of them. */
+export function reindexSearch(provider?: string): Promise<{
+  providers: { provider: string; indexed: number; pruned: number; duration_ms: number }[];
+}> {
+  return request(`/api/v1/search/reindex`, {
+    method: "POST",
+    body: JSON.stringify(provider ? { provider } : {}),
+  });
+}
+
+/** The ranking weights, as the settings form writes them. */
+export type SearchWeights = {
+  title: number;
+  tags: number;
+  subtitle: number;
+  body: number;
+};
+
+/** The installation's search settings. */
+export type SearchSettings = {
+  weights: SearchWeights;
+  /** The weights an installation starts with — the server's own answer to "restore defaults". */
+  defaults: SearchWeights;
+  enabled_providers: string[];
+  available_providers: string[];
+  updated_at: string | null;
+};
+
+/** Read the search settings. */
+export function fetchSearchSettings(): Promise<SearchSettings> {
+  return request<SearchSettings>("/api/v1/search/settings");
+}
+
+/** Save the search settings (needs `search.manage`). */
+export function saveSearchSettings(input: {
+  weights: SearchWeights;
+  enabled_providers: string[];
+}): Promise<SearchSettings> {
+  return request<SearchSettings>("/api/v1/search/settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Download the current result set (or a selection of it) as CSV.
+ *
+ * The file comes from the API with the same filters the screen shows, so its rows and the
+ * table's rows are the same answer; `rows` is the count the server reported in its own header.
+ */
+export async function downloadSearchExport(input: {
+  q: string;
+  filters?: SearchFilterInput;
+  selected?: string[];
+}): Promise<{ rows: number; truncated: boolean; blob: Blob; filename: string }> {
+  const params = searchParams(input);
+  if (input.selected && input.selected.length > 0) {
+    params.set("selected", input.selected.join(","));
+  }
+  let response: Response;
+  try {
+    response = await fetch(`/api/v1/search/export?${params.toString()}`, {
+      credentials: "same-origin",
+      headers: { accept: "text/csv" },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  const rows = Number(response.headers.get("x-export-rows") ?? "0");
+  const truncated = response.headers.get("x-export-truncated") === "true";
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  return {
+    rows,
+    truncated,
+    blob: await response.blob(),
+    filename: match?.[1] ?? "omnion-search.csv",
+  };
 }
 
 /** Title-only prefix suggestions, at most eight. */
