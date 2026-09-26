@@ -9,6 +9,12 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   /**
+   * The floating Next.js badge is a framework artifact, not part of the product: it sits in the
+   * bottom-left corner of every development page. Development only — a production build renders
+   * no indicator either way.
+   */
+  devIndicators: false,
+  /**
    * The QA harness reaches the renderer through the site's own host (`qa.omnion.test`, mapped to
    * 127.0.0.1 by the browser) instead of `localhost`. Next.js blocks cross-origin dev resources
    * by default, and the blocked HMR socket also blocks the React debug channel — which leaves the
