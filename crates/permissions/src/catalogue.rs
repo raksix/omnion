@@ -84,6 +84,23 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "media",
         description: "Manage folders and storage settings",
     },
+    // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
+    // the steps a run left behind.
+    PermissionDef {
+        key: "workflows.read",
+        category: "workflows",
+        description: "Read workflows and their run history",
+    },
+    PermissionDef {
+        key: "workflows.manage",
+        category: "workflows",
+        description: "Create, edit and remove workflows",
+    },
+    PermissionDef {
+        key: "workflows.run",
+        category: "workflows",
+        description: "Start and cancel workflow runs",
+    },
     // Users.
     PermissionDef {
         key: "users.read",
@@ -294,6 +311,7 @@ mod tests {
         for expected in [
             "content",
             "media",
+            "workflows",
             "users",
             "plugins",
             "deployment",
@@ -369,6 +387,19 @@ mod tests {
             "deployment.rollback",
         ] {
             assert!(is_known(family), "{family} must be in the catalogue");
+        }
+    }
+
+    #[test]
+    fn the_workflow_family_is_catalogued() {
+        // P09: the automation surface is guarded by three keys — read, manage and run — so a
+        // role can be trusted to trigger a workflow without letting it rewrite definitions.
+        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("workflows"),
+                "{key} belongs to the workflows category"
+            );
         }
     }
 

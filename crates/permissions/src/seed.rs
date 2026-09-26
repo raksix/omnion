@@ -81,6 +81,9 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.update",
             "media.delete",
             "media.manage",
+            "workflows.read",
+            "workflows.manage",
+            "workflows.run",
             "users.read",
             "users.update",
             "iam.permissions.read",
@@ -110,6 +113,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.restore",
             "media.read",
             "media.update",
+            "workflows.read",
+            "workflows.run",
             "users.read",
             "audit.read",
             "sites.read",
@@ -129,6 +134,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.read",
             "media.upload",
             "media.update",
+            "workflows.read",
             "sites.read",
         ]),
     },
@@ -399,6 +405,29 @@ mod tests {
             !keys_of("member").contains(&"sites.read"),
             "members stay on content and media"
         );
+    }
+
+    #[test]
+    fn the_workflow_keys_reach_the_operational_roles() {
+        // P09: workflows are written and started by the manager ladder; a moderator may start
+        // one without editing definitions; an editor reads them; a member sees none.
+        let keys_of = |key: &str| {
+            BASE_ROLES
+                .iter()
+                .find(|base| base.key == key)
+                .expect("base role exists")
+                .permissions
+                .keys()
+        };
+
+        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
+            assert!(keys_of("manager").contains(&key), "manager holds {key}");
+        }
+        assert!(keys_of("moderator").contains(&"workflows.run"));
+        assert!(!keys_of("moderator").contains(&"workflows.manage"));
+        assert!(keys_of("editor").contains(&"workflows.read"));
+        assert!(!keys_of("editor").contains(&"workflows.run"));
+        assert!(!keys_of("member").contains(&"workflows.read"));
     }
 
     #[test]
