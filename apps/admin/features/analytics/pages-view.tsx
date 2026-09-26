@@ -39,6 +39,19 @@ const FILTERS = [
   { key: "source", label: "Source", placeholder: "newsletter" },
 ] as const;
 
+/** `true` when the text is a country code the API will accept. */
+function validCountry(value: string): boolean {
+  return /^[A-Za-z]{2}$/.test(value.trim());
+}
+
+/** `true` when the text is a filter this screen (and the API) can carry. */
+function invalidReason(key: string, value: string): string | null {
+  if (key === "country" && value !== "" && !validCountry(value)) {
+    return "A country is a two-letter code (for example TR).";
+  }
+  return null;
+}
+
 /** The device choices the API accepts. */
 const DEVICES = ["desktop", "mobile", "tablet", "other"];
 
@@ -73,8 +86,9 @@ function PageSeries({ path }: { path: string }) {
 
 /** The page report. */
 export function AnalyticsPagesView() {
-  const { params, patch } = useAnalytics();
+  const { params, patch, from, to } = useAnalytics();
   const [open, setOpen] = useState<AnalyticsPageRow | null>(null);
+  const [invalid, setInvalid] = useState<Record<string, string>>({});
   const sort = params.get("sort") ?? "views";
   const direction = (params.get("dir") === "asc" ? "asc" : "desc") as "asc" | "desc";
   const page = Math.max(1, Number(params.get("page") ?? "1") || 1);
@@ -179,32 +193,61 @@ export function AnalyticsPagesView() {
     <div className="flex flex-col gap-4" data-analytics-pages>
       <Panel title="Filters" bodyClassName="px-4 py-3" testId="filters">
         <div className="flex flex-wrap items-end gap-3">
-          {FILTERS.map((filter) => (
-            <label
-              key={filter.key}
-              className="flex min-w-[150px] flex-col gap-1 text-[11px] tracking-wide text-muted uppercase"
-            >
-              {filter.label}
-              <input
-                type="text"
-                defaultValue={params.get(filter.key) ?? ""}
-                placeholder={filter.placeholder}
-                data-analytics-filter={filter.key}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    patch({ [filter.key]: event.currentTarget.value.trim() || null });
-                  }
-                }}
-                onBlur={(event) => {
-                  const value = event.currentTarget.value.trim();
-                  if ((params.get(filter.key) ?? "") !== value) {
-                    patch({ [filter.key]: value || null });
-                  }
-                }}
-                className="rounded-lg border border-line bg-canvas px-2 py-1.5 text-[12.5px] text-ink"
-              />
-            </label>
-          ))}
+          {FILTERS.map((filter) => {
+            const message = invalid[filter.key];
+            const commit = (raw: string) => {
+              const value = raw.trim();
+              const reason = invalidReason(filter.key, value);
+              setInvalid((current) => {
+                const next = { ...current };
+                if (reason) {
+                  next[filter.key] = reason;
+                } else {
+                  delete next[filter.key];
+                }
+                return next;
+              });
+              if (reason || (params.get(filter.key) ?? "") === value) {
+                return;
+              }
+              patch({
+                [filter.key]:
+                  filter.key === "country" ? value.toUpperCase() || null : value || null,
+              });
+            };
+            return (
+              <label
+                key={filter.key}
+                className="flex min-w-[150px] flex-col gap-1 text-[11px] tracking-wide text-muted uppercase"
+              >
+                {filter.label}
+                <input
+                  type="text"
+                  defaultValue={params.get(filter.key) ?? ""}
+                  placeholder={filter.placeholder}
+                  data-analytics-filter={filter.key}
+                  aria-invalid={message ? true : undefined}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      commit(event.currentTarget.value);
+                    }
+                  }}
+                  onBlur={(event) => commit(event.currentTarget.value)}
+                  className={`rounded-lg border bg-canvas px-2 py-1.5 text-[12.5px] text-ink ${
+                    message ? "border-accent" : "border-line"
+                  }`}
+                />
+                {message ? (
+                  <span
+                    data-analytics-filter-error={filter.key}
+                    className="text-[11px] normal-case text-accent-strong"
+                  >
+                    {message}
+                  </span>
+                ) : null}
+              </label>
+            );
+          })}
           <label className="flex flex-col gap-1 text-[11px] tracking-wide text-muted uppercase">
             Device
             <select
@@ -296,7 +339,11 @@ export function AnalyticsPagesView() {
               <span className="font-mono">visitors {formatCount(open.visitors)}</span>
               <span className="font-mono">avg {formatDuration(open.avg_time_ms)}</span>
               <Link
-                href={`/analytics/pages?${new URLSearchParams({ path: open.path }).toString()}`}
+                href={`/analytics/pages?${new URLSearchParams({
+                  from,
+                  to,
+                  path: open.path,
+                }).toString()}`}
                 className="ml-auto text-accent-strong hover:underline"
               >
                 Filter the table by this page

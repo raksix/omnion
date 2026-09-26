@@ -384,7 +384,12 @@ export function AnalyticsShell({
               type="date"
               value={from}
               data-analytics-from
-              onChange={(event) => patch({ from: event.target.value })}
+              onChange={(event) => {
+                // Moving the start past the end drags the end with it: a range that ends before
+                // it starts is not a range, and the report should never have to refuse one.
+                const value = event.target.value;
+                patch(value > to ? { from: value, to: value } : { from: value });
+              }}
               className="rounded-lg border border-line bg-canvas px-2 py-1.5 font-mono text-[12px] text-ink"
             />
           </label>
@@ -394,7 +399,10 @@ export function AnalyticsShell({
               type="date"
               value={to}
               data-analytics-to
-              onChange={(event) => patch({ to: event.target.value })}
+              onChange={(event) => {
+                const value = event.target.value;
+                patch(value < from ? { from: value, to: value } : { to: value });
+              }}
               className="rounded-lg border border-line bg-canvas px-2 py-1.5 font-mono text-[12px] text-ink"
             />
           </label>

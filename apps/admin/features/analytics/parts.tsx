@@ -8,7 +8,7 @@
  * every empty state, a retry beside every error, and numbers formatted in one place. Nothing
  * here knows what a report *is*; it renders what a report answered.
  */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import {
   AlertCircle,
@@ -309,7 +309,6 @@ export function SeriesChart({
   emptyLabel?: string;
 }) {
   const [active, setActive] = useState<number | null>(null);
-  const frame = useRef<HTMLDivElement | null>(null);
   const manageable = points.length > 0;
 
   const max = useMemo(() => {
@@ -357,7 +356,7 @@ export function SeriesChart({
   };
 
   return (
-    <div className="flex flex-col gap-2 px-4 py-3" ref={frame}>
+    <div className="flex flex-col gap-2 px-4 py-3">
       <div className="flex flex-wrap items-center gap-3 text-[11.5px] text-muted">
         <span className="flex items-center gap-1.5">
           <span aria-hidden className="inline-block size-2 rounded-full" style={{ background: VISITORS_COLOUR }} />
@@ -532,7 +531,11 @@ export type Column<Row> = {
   render: (row: Row) => ReactNode;
 };
 
-/** The report table: sortable headers, horizontal scroll on a phone, rows that open a drawer. */
+/**
+ * The report table: sortable headers on a wide screen, cards below `lg` — the spec's own mobile
+ * rule, and a phone reads a card list better than a table that scrolls sideways off the screen.
+ * Both layouts render the same rows through the same columns, so they cannot disagree.
+ */
 export function DataTable<Row>({
   columns,
   rows,
@@ -552,8 +555,69 @@ export function DataTable<Row>({
   rowKey: (row: Row) => string;
   footer?: ReactNode;
 }) {
+  const sortable = columns.filter((column) => column.sortable && onSort);
   return (
-    <div className="min-w-0 overflow-x-auto">
+    <>
+      <div className="lg:hidden">
+        {sortable.length > 0 ? (
+          <label className="flex items-center gap-2 px-3 pt-3 text-[11px] tracking-wide text-muted uppercase">
+            Sort
+            <select
+              value={sort ?? sortable[0].key}
+              data-analytics-sort-select
+              onChange={(event) => onSort?.(event.target.value)}
+              className="rounded-lg border border-line bg-canvas px-2 py-1 text-[12px] text-ink"
+            >
+              {sortable.map((column) => (
+                <option key={column.key} value={column.key}>
+                  {column.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        <ul data-analytics-cards className="flex flex-col gap-2 p-3">
+          {rows.map((row) => (
+            <li key={rowKey(row)}>
+              <div
+                role={onRowClick ? "button" : undefined}
+                tabIndex={onRowClick ? 0 : undefined}
+                onClick={onRowClick ? () => onRowClick(row) : undefined}
+                onKeyDown={
+                  onRowClick
+                    ? (event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          onRowClick(row);
+                        }
+                      }
+                    : undefined
+                }
+                className={`flex flex-col gap-1.5 rounded-lg border border-line p-3 ${
+                  onRowClick ? "cursor-pointer transition hover:bg-canvas" : ""
+                }`}
+              >
+                {columns.map((column) => (
+                  <div key={column.key} className="flex items-baseline justify-between gap-3">
+                    <span className="shrink-0 text-[11px] tracking-wide text-muted uppercase">
+                      {column.label}
+                    </span>
+                    <span
+                      className={`min-w-0 text-right break-words ${
+                        column.numeric ? "font-mono" : ""
+                      }`}
+                    >
+                      {column.render(row)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div className="hidden min-w-0 overflow-x-auto lg:block">
       <table data-analytics-table className="w-full min-w-[720px] border-collapse text-[12.5px]">
         <thead>
           <tr className="border-b border-line text-left text-[11.5px] tracking-wide text-muted uppercase">
@@ -619,7 +683,8 @@ export function DataTable<Row>({
         </tbody>
         {footer ? <tfoot>{footer}</tfoot> : null}
       </table>
-    </div>
+      </div>
+    </>
   );
 }
 
