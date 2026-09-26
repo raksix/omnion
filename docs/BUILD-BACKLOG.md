@@ -125,8 +125,21 @@
 
 ## P13 — Automation v0 (REQ-003 lite)
 
-- [ ] Trigger → condition → action on top of P09; first actions: send email (mailpit in dev), create content revision comment.
-- [ ] **Verify:** automation runs E2E on a page.published trigger. Commit + push + log.
+- [x] Trigger → condition → action on top of P09; first actions: send email (mailpit in dev), create content revision comment.
+      `crates/automation` (a rule IS a workflow with `trigger_kind = 'event'`; the closed 9-operator
+      condition set; `{{ }}` bindings; the one-transaction drain whose cursor row is the lock),
+      `send_email` (SMTP written out in `mail.rs`; `OMNION_MAIL_*`) + `comment_revision`
+      (`crates/content/src/comments.rs`), `database/migrations/0010_automation.sql` (cursor + runs +
+      the P09 `'event'` constraint work), `/api/v1/automations` CRUD + `/automations/catalogue`,
+      `apps/api/src/automation_runner.rs` (`OMNION_AUTOMATION_*`).
+- [x] **Verify:** automation runs E2E on a page.published trigger. Commit + push + log.
+      `apps/api/tests/automation.rs` — 5 walks on a throwaway DB with a real in-process SMTP sink:
+      the full page.published → conditions → send_email + comment_revision run end to end (the sink
+      reads the composed subject/recipient/body; the revision comment is readable; the audit rows are
+      there), a false condition and an unheard event start nothing, an unfillable binding refuses the
+      run, a switched-off mail server fails the step with that reason, and the surface is
+      permission-gated + tenant-scoped. Full suite: `cargo test --workspace --lib` 328 passed ·
+      `cargo test -p omnion-api --tests` 58 + 56. fmt + clippy clean.
 
 ## P14 — Polish + CI v0
 

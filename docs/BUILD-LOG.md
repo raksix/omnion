@@ -715,3 +715,53 @@
   operator cannot tell why nothing arrived.
 - The last mile is the delivery id: `X-Omnion-Delivery` is the row's own id, which is what makes
   the receiver's log and the panel's delivery list talk about the same attempt.
+
+## 2026-09-26 — P13 · Automation v0 (REQ-003 lite)
+
+- New crate `crates/automation` (`omnion-automation`) — trigger → condition → action on top of the
+  P09 engine, with the docs/09-N8N-TEARDOWN §13 lessons applied: an automation rule **is** a
+  workflow whose `trigger_kind = 'event'` (storage reflects what it is — no parallel rule table),
+  the comparison set is closed and small (9 operators: `equals`, `not_equals`, `contains`,
+  `not_contains`, `starts_with`, `ends_with`, `in`, `exists`, `not_exists` — no expression
+  language), and no dynamic code ever runs in the core process. `model.rs` the rule + run shapes;
+  `condition.rs` the evaluator (every condition must hold; a field the payload does not answer is
+  false, and the skip audit says why); `binding.rs` the `{{ }}` bindings an action may fill from
+  the payload — a binding the event cannot fill **refuses to start** the run (no half-filled
+  steps); `matcher.rs` the drain — **one tick = one transaction**: read the events above the
+  cursor, evaluate the armed rules of their tenants, start one durable run per match, advance the
+  cursor; `for update skip locked` makes the cursor row itself the concurrency lock, so
+  exactly-once holds across instances.
+- Cursor: seeded to the end of the bus **once at boot** (`matcher::seed_cursor`, called by
+  `automation_runner` before its first tick) — a fresh installation watches forward; on an empty
+  bus that seed lands on `0`, which is precisely why the drain reads everything above it. The
+  lazy-seed branch inside the drain was removed: the E2E walk caught it swallowing the first real
+  event (it re-read `0` as "never seeded" and stepped the cursor past the event the rule was
+  waiting for).
+- Actions: `send_email` — the SMTP wire protocol written out in `mail.rs` (`EHLO` → optional
+  `AUTH PLAIN` → `MAIL FROM` → one `RCPT TO` per recipient → `DATA` → `QUIT`; multi-line replies
+  read in full; dot-stuffed bodies), master switch `OMNION_MAIL_ENABLED`, and a switched-off
+  server fails the step **with that reason** — and `comment_revision` — a comment on the revision
+  the event names (`crates/content/src/comments.rs`). Synthetic actions (`noop`, `echo`, `fail`,
+  `transient`) stay pure in-engine; they are what the suite drives the engine with.
+- `database/migrations/0010_automation.sql`: the cursor row + the run table + the P09 constraint
+  work the E2E walk exposed — `workflows_trigger_kind_valid` did not know `'event'` and
+  `workflows_schedule_shape` had no event branch, so an event rule fell through both checks; both
+  are dropped and re-added (three-branch shape), plus `trigger_event`/`conditions` columns and
+  `workflows_trigger_event_shape`.
+- API: `/api/v1/automations` (list/create/get/update/delete) + `/automations/catalogue` (the closed
+  vocabulary a rule may be written in), reusing `workflows.read`/`workflows.manage`; rules are
+  tenant resources and the surface is permission-gated. The matcher runs in the API process:
+  `OMNION_AUTOMATION_RUNNER` (default on), `OMNION_AUTOMATION_POLL_MS`, `OMNION_AUTOMATION_BATCH`.
+- Proof: `cargo fmt --all -- --check` → clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` → clean · `cargo test --workspace --lib` → **328 passed** · `cargo test -p omnion-api
+  --tests` → **58 + 56 integration (13 files, incl. the new `tests/automation.rs`)**.
+  `apps/api/tests/automation.rs` — 5 walks on a throwaway DB with a real in-process SMTP sink: the
+  full page.published → conditions → `send_email` + `comment_revision` run end to end —
+  `matcher: evaluated=1 matched=1 skipped=0 run=5029f197-…` · `engine: run="completed" step1={action:
+  send_email, subject: "Published: Release notes", to: editor@example.com} step2={action:
+  comment_revision, comment_id: 6d5b166d-…}` · `sink: to=editor@example.com subject="Published:
+  Release notes" bytes=314 commands=5` — plus: a false condition and an unheard event start nothing,
+  a binding the event cannot fill refuses the run, a switched-off mail server fails the step with
+  that reason (`step_error="the email could not be sent: sending email is switched off
+  (OMNION_MAIL_ENABLED=false)"`), and the surface stays permission-gated + tenant-scoped.
+- Next: **P14 — Polish + CI v0** (make the CI workflow run for real + README quickstart).
