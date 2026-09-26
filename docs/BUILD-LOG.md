@@ -374,7 +374,13 @@
   at `next start` answers `500` (`ECONNREFUSED 127.0.0.1:8080`).
 - CI: a `Start the object store (media library)` step brings MinIO up the way `infra/compose` does
   (service containers cannot pass a command) and the smoke step now walks the media round trip —
-  upload → list → `cmp` both read paths → anonymous `401` → delete → `404`.
+  upload → list → `cmp` both read paths → anonymous `401` → delete → `404`. Run `36204518708` →
+  **success**: `Rust — fmt · clippy · test` ✅ (the media integration suite ran in CI —
+  `a_file_round_trips_from_upload_to_fetch ... ok`, `the_media_surface_is_permission_gated ... ok`,
+  `an_upload_into_another_tenant_is_refused ... ok`, `test result: ok. 6 passed` — and the smoke log
+  prints the media evidence: `media surface: library=1 file(s), first=omnion-media.txt 19 B
+  text/plain · round-trip=ok · public=ok · removed=404`, after the new step printed
+  `object store: 200`) · `Infra — compose config` ✅.
 - Next: **P09 — Workflow engine v0** (`crates/workflows`: durable step store, background runner,
   step retries with backoff, wait-sweeper, manual + schedule triggers).
 
