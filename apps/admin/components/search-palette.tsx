@@ -8,13 +8,22 @@
  * * nothing yet — the commands this account may run, the ones worth suggesting on the screen it
  *   is on, and its own recent searches and commands;
  * * a few characters — commands that match, then the index's answer grouped by provider;
- * * a leading `>` — commands only; `@` people, `#` sites, `:` settings narrow the search to that
- *   one kind; `?` alone opens the shortcut sheet.
+ * * a leading `>` — commands only, no index call at all; `@` people, `#` sites, `:` settings
+ *   narrow the search to that one kind; `?` alone opens the shortcut sheet.
  *
  * Everything the palette shows is real: the commands come from `GET /api/v1/commands` (already
  * filtered to the caller's permissions), the rows from `GET /api/v1/search`, and the history from
  * the account's own record. A provider whose screen does not exist contributes no section, so no
  * row is a click into nothing.
+ *
+ * **Federated answers (slice 2).** The palette asks each provider its own question, in parallel,
+ * with `history=false` (typing is not a search worth remembering — committing to a result is,
+ * and that is recorded separately). Each group therefore has its own life: it shows a skeleton
+ * while its request is in flight, its rows when it answers, and its own retryable error — with
+ * the failure's code in a tooltip — when its request fails. One slow or failing provider never
+ * blanks the others, which is what "result groups stream independently" means. A whole-index
+ * count rides along so the "see all results" row and the "outside your permissions" line are the
+ * API's own numbers rather than a sum of whatever happened to arrive.
  *
  * Keyboard rules the component owns:
  *
@@ -37,8 +46,8 @@ import {
   Globe,
   History,
   Images,
-  LayoutDashboard,
   Loader2,
+  LayoutDashboard,
   Search,
   SlidersHorizontal,
   Sparkles,
@@ -74,11 +83,20 @@ import {
 } from "@/lib/command-center";
 import {
   MIN_QUERY,
-  buildSections,
+  PALETTE_PROVIDER_ORDER,
+  askAiUrl,
+  groupFromAnswer,
+  groupFromError,
+  groupsAllFailed,
+  groupsTotal,
+  paletteProvider,
+  pendingGroups,
   resultsUrl,
   sectionUrl,
   siteFromUrl,
   splitHighlight,
+  withGroup,
+  type PaletteGroup,
 } from "@/lib/search-palette";
 import {
   forgetHiddenRecents,
@@ -90,11 +108,15 @@ import {
 import { useSites } from "@/lib/sites";
 
 /** How long a keystroke waits before it becomes a request. */
-const DEBOUNCE_MS = 120;
+const DEBOUNCE_MS = 100;
 /** How many recent rows the palette lists. */
 const RECENT_LIMIT = 8;
-/** Hits per search request: enough for five rows of every provider that answers. */
-const PER_PAGE = 50;
+/** Hits asked of one provider: enough for five rows plus the "see all" verdict. */
+const PER_GROUP = 6;
+/** How many providers are asked at once; the rest follow in waves. */
+const GROUP_CONCURRENCY = 3;
+/** The whole-index count asks for one row; it is the totals that matter. */
+const AGGREGATE_PER_PAGE = 1;
 /** Commands listed while the box is empty. */
 const COMMAND_LIMIT = 8;
 /** Commands listed above the results while searching. */
@@ -118,6 +140,21 @@ const COMMAND_ICONS: Record<string, LucideIcon> = {
   sparkles: Sparkles,
 };
 
+/** The failure of one request, in the pieces a group row shows. */
+type GroupFailure = { code: string; status: number; message: string };
+
+/** Read one caught failure as a group failure. */
+function asGroupFailure(cause: unknown): GroupFailure {
+  if (cause instanceof ApiError) {
+    return { code: cause.code, status: cause.status, message: cause.message };
+  }
+  return {
+    code: "network_error",
+    status: 0,
+    message: "The Omnion API could not be reached.",
+  };
+}
+
 /** One row the keyboard can land on. */
 type PaletteItem = {
   id: string;
@@ -127,12 +164,15 @@ type PaletteItem = {
     | "suggestion"
     | "see-all"
     | "everywhere"
+    | "ask-ai"
     | "recent-query"
     | "recent-command"
     | "view";
   /** Section the row belongs to; `-1` for the rows that sit under every section. */
   section: number;
   label: string;
+  /** Supporting line the action rows carry. */
+  hint?: string;
   /** Where activating the row goes. */
   url?: string;
   /** The query a recent row re-runs. */
@@ -157,6 +197,7 @@ function Option({
   onActivate,
   onHover,
   icon,
+  action,
   children,
   trailing,
 }: {
@@ -165,6 +206,8 @@ function Option({
   onActivate: () => void;
   onHover: () => void;
   icon: ReactNode;
+  /** `data-palette-action` value, when the row is one of the palette's own actions. */
+  action?: string;
   children: ReactNode;
   trailing?: ReactNode;
 }) {
@@ -173,6 +216,7 @@ function Option({
       id={id}
       role="option"
       aria-selected={active}
+      data-palette-action={action}
       onClick={onActivate}
       onMouseMove={onHover}
       className={`flex min-h-11 cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 transition lg:min-h-10 ${
@@ -195,10 +239,13 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   const { selectSite } = useSites();
   const [mounted, setMounted] = useState(false);
   const [query, setQuery] = useState(initialQuery);
-  const [result, setResult] = useState<SearchResult | null>(null);
+  /** One entry per provider this search asks; each one loads, answers and fails on its own. */
+  const [groups, setGroups] = useState<PaletteGroup[]>([]);
+  /** The whole-index answer: its totals, its hints and the count outside the caller's scope. */
+  const [answer, setAnswer] = useState<SearchResult | null>(null);
+  /** The words the API matched on, for the row highlighting (any group answers with them). */
+  const [terms, setTerms] = useState<string[]>([]);
   const [suggestions, setSuggestions] = useState<SearchSuggestion[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [commands, setCommands] = useState<CommandInfo[] | null>(null);
   const [contextCommands, setContextCommands] = useState<CommandInfo[]>([]);
   const [commandsError, setCommandsError] = useState(false);
@@ -218,6 +265,19 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   const reading = readMode(query);
   const mode = reading.mode;
   const term = reading.term;
+
+  const minimum = mode === "all" ? MIN_QUERY : 1;
+  const hunting = modeSearches(mode) && mode !== "commands" && term.length >= minimum;
+
+  // Which providers this search asks: the one a narrowed mode names, or the whole index. A mode
+  // with nothing to search (`>` commands, `?` help) asks nobody.
+  const targets = useMemo<string[]>(() => {
+    if (!modeSearches(mode) || mode === "commands") {
+      return [];
+    }
+    const narrowed = modeTypes(mode);
+    return narrowed ? [narrowed] : [...PALETTE_PROVIDER_ORDER];
+  }, [mode]);
 
   useEffect(() => {
     setMounted(true);
@@ -271,56 +331,115 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     }
   }, [mounted]);
 
-  // The search itself: a short debounce, then the index and the suggestions together. A narrowed
-  // mode (`#sites`) searches from the first character; the open mode waits for two.
+  // One provider's question, answered into its own group. Both the first pass and a group's own
+  // retry come through here, so a retry can never overwrite a newer keystroke's answers.
+  const ask = useCallback(
+    (provider: string, text: string, token: number) =>
+      searchAll({
+        q: text,
+        per_page: PER_GROUP,
+        history: false,
+        filters: { type: provider },
+      })
+        .then((group) => {
+          if (tokenRef.current !== token) {
+            return;
+          }
+          setGroups((current) => withGroup(current, groupFromAnswer(provider, group)));
+          setTerms((current) => (current.length > 0 ? current : group.terms));
+        })
+        .catch((cause: unknown) => {
+          if (tokenRef.current !== token) {
+            return;
+          }
+          setGroups((current) => withGroup(current, groupFromError(provider, asGroupFailure(cause))));
+        }),
+    [],
+  );
+
+  // The search itself: a short debounce, then every provider's own question in parallel. A
+  // narrowed mode searches from the first character; the open mode waits for two.
   useEffect(() => {
-    const minimum = mode === "all" ? MIN_QUERY : 1;
-    if (!modeSearches(mode) || term.length < minimum) {
+    if (!hunting) {
       tokenRef.current += 1;
-      setResult(null);
+      setGroups([]);
+      setAnswer(null);
+      setTerms([]);
       setSuggestions(null);
-      setError(null);
-      setLoading(false);
       return;
     }
 
     const token = tokenRef.current + 1;
     tokenRef.current = token;
-    setLoading(true);
+    setGroups(pendingGroups(targets));
+    setAnswer(null);
+    setTerms([]);
 
-    const types = modeTypes(mode);
+    const text = term;
     const timer = setTimeout(() => {
-      Promise.allSettled([
-        searchAll({ q: term, per_page: PER_PAGE, filters: types ? { type: types } : undefined }),
-        suggestTitles(term),
-      ]).then(([searchOutcome, suggestOutcome]) => {
-        if (tokenRef.current !== token) {
-          return;
+      // The groups are asked in small waves. A burst of nine parallel requests queues against the
+      // browser's own connection budget and starves everything else the page is fetching (a
+      // Next.js navigation's prefetches included), so three go out at a time and the rest follow
+      // as they answer — the sections still stream; the pipe is not hogged.
+      const waves: string[][] = [];
+      for (let index = 0; index < targets.length; index += GROUP_CONCURRENCY) {
+        waves.push(targets.slice(index, index + GROUP_CONCURRENCY));
+      }
+      void (async () => {
+        for (const wave of waves) {
+          await Promise.all(wave.map((provider) => ask(provider, text, token)));
+          if (tokenRef.current !== token) {
+            return;
+          }
         }
-        if (searchOutcome.status === "fulfilled") {
-          setResult(searchOutcome.value);
-          setError(null);
-        } else {
-          const cause = searchOutcome.reason;
-          setResult(null);
-          setError(cause instanceof ApiError ? cause.message : "The search could not be completed.");
+        // The whole-index count rides behind the first wave: the "see all results" total and the
+        // number of results outside this account's permissions. It is a nicety, so it is asked
+        // last and its failure costs the palette nothing — the sections stand alone.
+        if (targets.length > 1) {
+          searchAll({ q: text, per_page: AGGREGATE_PER_PAGE, history: false })
+            .then((result) => {
+              if (tokenRef.current === token) {
+                setAnswer(result);
+                setTerms((current) => (current.length > 0 ? current : result.terms));
+              }
+            })
+            .catch(() => undefined);
         }
-        setSuggestions(suggestOutcome.status === "fulfilled" ? suggestOutcome.value : []);
-        setLoading(false);
-      });
+      })();
+
+      suggestTitles(text)
+        .then((rows) => {
+          if (tokenRef.current === token) {
+            setSuggestions(rows);
+          }
+        })
+        .catch(() => {
+          if (tokenRef.current === token) {
+            setSuggestions([]);
+          }
+        });
     }, DEBOUNCE_MS);
 
     return () => clearTimeout(timer);
-  }, [term, mode, attempt]);
+  }, [term, hunting, targets, attempt, ask]);
 
-  const sections = useMemo(() => buildSections(result), [result]);
+  /** Retry one provider: only its own group goes back to loading. */
+  const retryGroup = useCallback(
+    (provider: string) => {
+      const token = tokenRef.current;
+      setGroups((current) => withGroup(current, pendingGroups([provider])[0]));
+      ask(provider, term, token);
+    },
+    [ask, term],
+  );
 
-  const browsing = term.length === 0;
-  const minimum = mode === "all" ? MIN_QUERY : 1;
-  const searching = modeSearches(mode) && term.length >= minimum;
+  const allFailed = hunting && groupsAllFailed(groups);
+  const noAnswerYet = groups.every((group) => group.status !== "ready");
+  const showSuggestions = hunting && noAnswerYet && (suggestions?.length ?? 0) > 0;
+  const firstPaint = hunting && noAnswerYet && !showSuggestions;
 
-  // The commands the box offers right now: the suggestions for this screen first while it is
-  // empty, the matches once something is typed.
+  // The commands the box offers right now: everything this account may run (suggestions for this
+  // screen first) while the box is empty, the matches once something is typed.
   const commandSuggestions = useMemo(() => {
     if (!commands || !modeSearches(mode)) {
       return [];
@@ -328,7 +447,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     if (mode === "people" || mode === "sites" || mode === "settings") {
       return [];
     }
-    if (browsing) {
+    if (term.length === 0) {
       const seen = new Set<string>();
       const merged: CommandInfo[] = [];
       for (const command of [...(contextCommands ?? []), ...commands]) {
@@ -343,8 +462,9 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
       }
       return merged;
     }
-    return matchCommands(commands, term, mode === "commands" ? COMMAND_LIMIT + 4 : COMMAND_INLINE);
-  }, [commands, contextCommands, browsing, term, mode]);
+    // A `>` search is a search for a command: it gets the longer list.
+    return matchCommands(commands, term, mode === "commands" ? COMMAND_LIMIT : COMMAND_INLINE);
+  }, [commands, contextCommands, term, mode]);
 
   // The store keeps every run of a query; the palette shows each one once, minus the ones this
   // browser asked to forget.
@@ -355,14 +475,22 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
       .slice(0, RECENT_LIMIT);
   }, [recents, hidden]);
 
-  const showSuggestions = searching && result === null && (suggestions?.length ?? 0) > 0;
+  const hiddenTotal = answer?.hidden_total ?? 0;
+  const resultTotal = answer?.total ?? groupsTotal(groups);
+  const nothingMatched =
+    hunting &&
+    !allFailed &&
+    groups.length > 0 &&
+    groups.every((group) => group.status === "ready" && group.rows.length === 0) &&
+    commandSuggestions.length === 0 &&
+    !showSuggestions;
 
   const items = useMemo<PaletteItem[]>(() => {
     const list: PaletteItem[] = [];
     let section = 0;
 
-    const commandItems = (commands: CommandInfo[]) => {
-      commands.forEach((command, index) => {
+    const commandItems = (rows: CommandInfo[]) => {
+      rows.forEach((command, index) => {
         list.push({
           id: `command-${index}`,
           kind: "command",
@@ -372,7 +500,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
           commandId: command.id,
         });
       });
-      if (commands.length > 0) {
+      if (rows.length > 0) {
         section += 1;
       }
     };
@@ -381,22 +509,31 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
       return list;
     }
 
-    if (searching) {
+    if (mode === "commands") {
       commandItems(commandSuggestions);
-      sections.forEach((group, index) => {
+      return list;
+    }
+
+    if (hunting) {
+      commandItems(commandSuggestions);
+      groups.forEach((group) => {
+        // A provider the panel has no screen for contributes no rows: no dead ends.
+        if (!paletteProvider(group.provider)) {
+          return;
+        }
         group.rows.forEach((hit, row) => {
           list.push({
-            id: `hit-${index}-${row}`,
+            id: `hit-${group.provider}-${row}`,
             kind: "hit",
             section,
             label: hit.title || hit.url,
             url: hit.url,
-            resultCount: result?.total ?? null,
+            resultCount: resultTotal,
           });
         });
-        if (group.truncated) {
+        if (group.status === "ready" && group.truncated) {
           list.push({
-            id: `see-all-${index}`,
+            id: `see-all-${group.provider}`,
             kind: "see-all",
             section,
             label: `See all ${group.total} ${group.label}`,
@@ -425,14 +562,27 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         kind: "everywhere",
         section: -1,
         label: `See all results for “${term}”`,
+        hint: "opens the results screen",
         url: resultsUrl(term),
-        resultCount: result?.total ?? null,
+        resultCount: resultTotal,
       });
+      // The no-results state offers the way out as well: the results screen itself, and the AI
+      // Hub with the words already in its prompt.
+      if (nothingMatched) {
+        list.push({
+          id: "ask-ai",
+          kind: "ask-ai",
+          section: -1,
+          label: `Ask AI about “${term}”`,
+          hint: "opens the AI Hub with this prompt",
+          url: askAiUrl(term),
+        });
+      }
       return list;
     }
 
-    // Nothing typed yet (or a mode that searches nothing yet): the commands this account may run
-    // on this screen, then its own history.
+    // Nothing typed yet (or a mode that searches nothing): the commands this account may run on
+    // this screen, then its own history.
     commandItems(commandSuggestions);
     visibleRecents.forEach((row, index) => {
       if (row.kind === "query") {
@@ -470,13 +620,14 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     return list;
   }, [
     mode,
-    searching,
+    hunting,
     commandSuggestions,
-    sections,
+    groups,
     showSuggestions,
     suggestions,
     term,
-    result,
+    resultTotal,
+    nothingMatched,
     visibleRecents,
     views,
   ]);
@@ -628,8 +779,10 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     clearCommandRecents().catch(() => undefined);
   };
 
-  const highlight = (title: string, terms: string[]) =>
-    splitHighlight(title, terms).map((part, index) =>
+  const rowIndex = (id: string) => itemIndex.get(id) ?? -1;
+
+  const highlight = (title: string, needles: string[]) =>
+    splitHighlight(title, needles).map((part, index) =>
       part.match ? (
         <mark key={index} className="rounded bg-accent-soft px-0.5 text-accent-strong">
           {part.text}
@@ -638,8 +791,6 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         <span key={index}>{part.text}</span>
       ),
     );
-
-  const rowIndex = (id: string) => itemIndex.get(id) ?? -1;
 
   const commandRow = (command: CommandInfo, index: number) => {
     const id = `command-${index}`;
@@ -693,12 +844,108 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         ) : null
       }
     >
-      <span className="truncate text-[13px] text-ink">{highlight(hit.title, result?.terms ?? [])}</span>
+      <span className="truncate text-[13px] text-ink">{highlight(hit.title, terms)}</span>
       {hit.subtitle ? (
         <span className="truncate text-[11.5px] text-muted">{hit.subtitle}</span>
       ) : null}
     </Option>
   );
+
+  /** The palette's own action row (the "see all results" and "Ask AI" rows). */
+  const actionRow = (id: string) => {
+    const item = items[rowIndex(id)];
+    if (!item) {
+      return null;
+    }
+    const Icon = item.kind === "ask-ai" ? Sparkles : Search;
+    return (
+      <Option
+        key={id}
+        id={id}
+        action={item.kind}
+        active={rowIndex(id) === activeIndex}
+        onActivate={() => activate(item, false)}
+        onHover={() => setActiveIndex(rowIndex(id))}
+        icon={<Icon className="size-3.5" />}
+        trailing={
+          item.hint ? (
+            <span className="shrink-0 text-[11px] text-muted">{item.hint}</span>
+          ) : null
+        }
+      >
+        <span className="truncate text-[13px] text-ink">{item.label}</span>
+      </Option>
+    );
+  };
+
+  /** One provider's section: its own skeleton, its own rows, or its own retryable error. */
+  const renderGroup = (group: PaletteGroup) => {
+    // A provider the panel has no screen for renders nothing — no rows, no error, no dead end.
+    if (!paletteProvider(group.provider)) {
+      return null;
+    }
+    if (group.status === "ready" && group.rows.length === 0) {
+      return null;
+    }
+    return (
+      <div
+        key={group.provider}
+        data-palette-section={group.provider}
+        data-palette-section-state={group.status}
+        className="mb-2"
+      >
+        <SectionHeader
+          label={group.label}
+          count={group.status === "ready" ? group.total : null}
+        />
+        {group.status === "pending" ? (
+          <div data-palette-skeleton={group.provider} className="px-1">
+            {[0, 1].map((row) => (
+              <div key={row} className="mb-1.5 h-9 animate-pulse rounded-lg bg-quiet-soft" />
+            ))}
+          </div>
+        ) : null}
+        {group.status === "error" && group.error ? (
+          <div
+            data-palette-group-error={group.provider}
+            className="mx-1 rounded-lg border border-line bg-canvas px-2 py-2 text-[12px] text-muted"
+          >
+            <span>{group.label} could not be searched. </span>
+            <button
+              type="button"
+              data-palette-group-retry={group.provider}
+              title={`${group.error.code} · status ${group.error.status}`}
+              onClick={() => retryGroup(group.provider)}
+              className="font-medium text-accent-strong underline"
+            >
+              Try again
+            </button>
+          </div>
+        ) : null}
+        {group.status === "ready" ? (
+          <>
+            {group.rows.map((hit, row) => hitRow(hit, `hit-${group.provider}-${row}`, group.label))}
+            {group.truncated ? (
+              <SeeAllRow
+                key={`see-all-${group.provider}`}
+                id={`see-all-${group.provider}`}
+                provider={group.provider}
+                label={`See all ${group.total} ${group.label}`}
+                active={rowIndex(`see-all-${group.provider}`) === activeIndex}
+                onActivate={() => {
+                  const item = items[rowIndex(`see-all-${group.provider}`)];
+                  if (item) {
+                    activate(item, false);
+                  }
+                }}
+                onHover={() => setActiveIndex(rowIndex(`see-all-${group.provider}`))}
+              />
+            ) : null}
+          </>
+        ) : null}
+      </div>
+    );
+  };
 
   const helpPanel = (
     <div data-palette-help className="px-3 py-3">
@@ -733,16 +980,84 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     </div>
   );
 
+  const commandsErrorNote = (
+    <div className="mb-2 rounded-lg border border-line bg-canvas px-2 py-2 text-[12px] text-muted">
+      <span>The command list could not be loaded. </span>
+      <button
+        type="button"
+        data-palette-commands-retry
+        onClick={() => setRegistryAttempt((value) => value + 1)}
+        className="font-medium text-accent-strong underline"
+      >
+        Try again
+      </button>
+    </div>
+  );
+
+  const suggestionsBlock = showSuggestions ? (
+    <div className="mb-2">
+      <SectionHeader label="Suggestions" count={(suggestions ?? []).length} />
+      {(suggestions ?? []).slice(0, 5).map((suggestion, index) => {
+        const id = `suggestion-${index}`;
+        const Icon = PROVIDER_ICONS[suggestion.provider] ?? Search;
+        return (
+          <Option
+            key={id}
+            id={id}
+            active={rowIndex(id) === activeIndex}
+            onActivate={() => {
+              const item = items[rowIndex(id)];
+              if (item) {
+                activate(item, false);
+              }
+            }}
+            onHover={() => setActiveIndex(rowIndex(id))}
+            icon={<Icon className="size-3.5" />}
+          >
+            <span className="truncate text-[13px] text-ink">{suggestion.title}</span>
+          </Option>
+        );
+      })}
+    </div>
+  ) : null;
+
   const body = () => {
     if (mode === "help") {
       return helpPanel;
     }
 
-    if (searching && error) {
+    // `>` is the commands mode: the registry answers alone, the index is never asked.
+    if (mode === "commands") {
+      return (
+        <>
+          {commandsError ? commandsErrorNote : null}
+          {commandSuggestions.length === 0 && !commandsError ? (
+            <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
+              <p className="text-[13px] font-medium">No command matches “{term}”</p>
+              <p className="max-w-sm text-[12px] text-muted">
+                Commands come from the features your account may open. Try fewer words, or clear
+                the prefix to search the content instead.
+              </p>
+            </div>
+          ) : (
+            <div className="mb-2">
+              <SectionHeader label="Commands" count={commandSuggestions.length} />
+              {commandSuggestions.map(commandRow)}
+            </div>
+          )}
+        </>
+      );
+    }
+
+    // Every provider failed: the one state that blanks the answer, with one retry for all of it.
+    if (hunting && allFailed) {
       return (
         <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
           <p className="text-[13px] font-medium">Search is unavailable</p>
-          <p className="max-w-sm text-[12px] text-muted">{error}</p>
+          <p className="max-w-sm text-[12px] text-muted">
+            {groups.find((group) => group.error)?.error?.message ??
+              "The search could not be completed."}
+          </p>
           <button
             type="button"
             data-palette-retry
@@ -755,7 +1070,8 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
       );
     }
 
-    if (searching && loading && result === null && !showSuggestions) {
+    // The first paint: nothing has answered yet and the suggestions are the only rows that could.
+    if (firstPaint) {
       return (
         <div aria-live="polite" className="px-1 py-2">
           <span className="sr-only">Searching…</span>
@@ -766,39 +1082,39 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
       );
     }
 
-    if (mode === "commands" && commandSuggestions.length === 0) {
+    if (nothingMatched) {
       return (
-        <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
-          <p className="text-[13px] font-medium">No command matches “{term}”</p>
-          <p className="max-w-sm text-[12px] text-muted">
-            Commands come from the features your account may open. Try fewer words, or clear the
-            prefix to search the content instead.
-          </p>
-        </div>
-      );
-    }
-
-    if (searching && !modeTypes(mode) && result && result.total === 0 && commandSuggestions.length === 0) {
-      return (
-        <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
-          <p className="text-[13px] font-medium">Nothing matched “{result.query}”</p>
+        <div
+          data-palette-empty
+          className="flex flex-col items-center gap-2 px-4 py-6 text-center"
+        >
+          <p className="text-[13px] font-medium">Nothing matched “{term}”</p>
+          {hiddenTotal > 0 ? (
+            <p data-palette-hidden className="max-w-sm text-[12px] text-muted">
+              {hiddenTotal === 1
+                ? "1 result is outside your permissions."
+                : `${hiddenTotal} results are outside your permissions.`}
+            </p>
+          ) : null}
           <p className="max-w-sm text-[12px] text-muted">
             Try fewer words, check the spelling, or narrow the search with type:page, type:media or
             type:sites.
           </p>
-          {(result.hints ?? []).map((hint) => (
+          {(answer?.hints ?? []).map((hint) => (
             <p key={hint} className="max-w-sm text-[11.5px] text-muted">
               {hint}
             </p>
           ))}
+          <div className="mt-1 w-full">{actionRow("everywhere")}</div>
+          <div className="w-full">{actionRow("ask-ai")}</div>
         </div>
       );
     }
 
-    if (searching) {
+    if (hunting) {
       return (
         <>
-          {(result?.hints ?? []).map((hint) => (
+          {(answer?.hints ?? []).map((hint) => (
             <p key={hint} className="px-2 py-1 text-[11.5px] text-muted">
               {hint}
             </p>
@@ -811,73 +1127,19 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
             </div>
           ) : null}
 
-          {commandsError ? (
-            <div className="mb-2 rounded-lg border border-line bg-canvas px-2 py-2 text-[12px] text-muted">
-              <span>The command list could not be loaded. </span>
-              <button
-                type="button"
-                data-palette-commands-retry
-                onClick={() => setRegistryAttempt((value) => value + 1)}
-                className="font-medium text-accent-strong underline"
-              >
-                Try again
-              </button>
-            </div>
-          ) : null}
+          {commandsError ? commandsErrorNote : null}
 
-          {showSuggestions ? (
-            <div className="mb-2">
-              <SectionHeader label="Suggestions" count={(suggestions ?? []).length} />
-              {(suggestions ?? []).slice(0, 5).map((suggestion, index) => {
-                const id = `suggestion-${index}`;
-                const Icon = PROVIDER_ICONS[suggestion.provider] ?? Search;
-                return (
-                  <Option
-                    key={id}
-                    id={id}
-                    active={rowIndex(id) === activeIndex}
-                    onActivate={() => {
-                      const item = items[rowIndex(id)];
-                      if (item) {
-                        activate(item, false);
-                      }
-                    }}
-                    onHover={() => setActiveIndex(rowIndex(id))}
-                    icon={<Icon className="size-3.5" />}
-                  >
-                    <span className="truncate text-[13px] text-ink">{suggestion.title}</span>
-                  </Option>
-                );
-              })}
-            </div>
-          ) : null}
+          {suggestionsBlock}
 
-          {sections.map((group, index) => (
-            <div key={group.provider} className="mb-2">
-              <SectionHeader label={group.label} count={group.total} />
-              {group.rows.map((hit, row) => hitRow(hit, `hit-${index}-${row}`, group.label))}
-              {group.truncated ? (
-                <SeeAllRow
-                  id={`see-all-${index}`}
-                  label={`See all ${group.total} ${group.label}`}
-                  active={rowIndex(`see-all-${index}`) === activeIndex}
-                  onActivate={() => {
-                    const item = items[rowIndex(`see-all-${index}`)];
-                    if (item) {
-                      activate(item, false);
-                    }
-                  }}
-                  onHover={() => setActiveIndex(rowIndex(`see-all-${index}`))}
-                />
-              ) : null}
-            </div>
-          ))}
+          {groups.map(renderGroup)}
 
-          {mode && !modeTypes(mode) ? null : (
+          {actionRow("everywhere")}
+
+          {mode !== "all" ? (
             <p className="px-2 py-1 text-[11.5px] text-muted">
               Narrowed to {modeLabel(mode).toLowerCase()}.
             </p>
-          )}
+          ) : null}
         </>
       );
     }
@@ -889,26 +1151,14 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         {commandSuggestions.length > 0 ? (
           <div className="mb-2">
             <SectionHeader
-              label={browsing && mode === "all" ? "Suggested for this screen" : "Commands"}
+              label={mode === "all" ? "Suggested for this screen" : "Commands"}
               count={commandSuggestions.length}
             />
             {commandSuggestions.map((command, index) => commandRow(command, index))}
           </div>
         ) : null}
 
-        {commandsError ? (
-          <div className="mb-2 rounded-lg border border-line bg-canvas px-2 py-2 text-[12px] text-muted">
-            <span>The command list could not be loaded. </span>
-            <button
-              type="button"
-              data-palette-commands-retry
-              onClick={() => setRegistryAttempt((value) => value + 1)}
-              className="font-medium text-accent-strong underline"
-            >
-              Try again
-            </button>
-          </div>
-        ) : null}
+        {commandsError ? commandsErrorNote : null}
 
         {visibleRecents.length > 0 ? (
           <div className="mb-2">
@@ -1028,6 +1278,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
 
   const activeId = items[activeIndex]?.id;
   const chipLabel = mode === "all" ? null : modeLabel(mode);
+  const busy = hunting && !allFailed && groups.some((group) => group.status === "pending");
 
   return createPortal(
     <div className="fixed inset-0 z-50" data-search-palette>
@@ -1087,7 +1338,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
             spellCheck={false}
             className="min-w-0 flex-1 bg-transparent text-[14px] text-ink outline-none placeholder:text-muted"
           />
-          {loading ? (
+          {busy ? (
             <Loader2 className="size-4 shrink-0 animate-spin text-muted" aria-hidden />
           ) : null}
           <button
@@ -1182,14 +1433,21 @@ function SectionHeader({
   action,
 }: {
   label: string;
-  count: number;
+  /** The count, or `null` while the section's own answer is still in flight. */
+  count: number | null;
   action?: ReactNode;
 }) {
   return (
     <div className="flex items-center justify-between gap-2 px-2 py-1.5">
       <span className="text-[11px] font-medium tracking-wide text-muted uppercase">{label}</span>
       <span className="flex items-center gap-2">
-        <span className="text-[11px] text-muted">{count}</span>
+        {count === null ? (
+          <span className="text-[11px] text-muted" aria-hidden>
+            …
+          </span>
+        ) : (
+          <span className="text-[11px] text-muted">{count}</span>
+        )}
         {action}
       </span>
     </div>
@@ -1199,12 +1457,14 @@ function SectionHeader({
 /** A section's "see all" row, styled like an option. */
 function SeeAllRow({
   id,
+  provider,
   label,
   active,
   onActivate,
   onHover,
 }: {
   id: string;
+  provider: string;
   label: string;
   active: boolean;
   onActivate: () => void;
@@ -1213,6 +1473,7 @@ function SeeAllRow({
   return (
     <div
       id={id}
+      data-palette-see-all={provider}
       role="option"
       aria-selected={active}
       onClick={onActivate}

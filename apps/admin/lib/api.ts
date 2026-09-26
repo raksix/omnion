@@ -379,6 +379,13 @@ export type SearchResult = {
   per_page: number;
   /** Which provider contributed how many, ordered by count. */
   counts: SearchCount[];
+  /**
+   * How many documents the query matches outside this account's own read scope.
+   *
+   * A count and nothing else: it is how "nothing matched" and "nothing you may read matched"
+   * are told apart. `0` when the account covers every provider.
+   */
+  hidden_total: number;
   /** The facet rail's counts; present when `facets=true` was asked for. */
   facets?: SearchFacetGroup[];
   /** How long the search took, in milliseconds. */
@@ -405,6 +412,13 @@ type SearchQueryInput = {
   facets?: boolean;
   /** The filters the rail applies. */
   filters?: SearchFilterInput;
+  /**
+   * `false` keeps the call out of the account's own search history.
+   *
+   * The palette asks once per group per keystroke; only a search someone committed to — opened a
+   * hit, ran it on the results screen — belongs in `search_recent`.
+   */
+  history?: boolean;
 };
 
 /** Build the query string of a search or export call. */
@@ -414,6 +428,7 @@ function searchParams(input: SearchQueryInput): URLSearchParams {
   if (input.per_page) params.set("per_page", String(input.per_page));
   if (input.sort) params.set("sort", input.sort);
   if (input.facets) params.set("facets", "true");
+  if (input.history === false) params.set("history", "false");
   const filters = input.filters ?? {};
   if (filters.type) params.set("types", filters.type);
   if (filters.site) params.set("site_id", filters.site);
