@@ -79,7 +79,7 @@ cannot do something / the screen is broken, `medium` = visible defect or accessi
   remaining 5 are the web root's 404 console/request noise, the ISSUE-002 follow-up), and the
   vision review no longer sees the badge on any screenshot.
 
-## ISSUE-004 — Next.js dev indicator covers the sidebar's “Sign out” row · medium · open
+## ISSUE-004 — Next.js dev indicator covers the sidebar's “Sign out” row · medium · fixed
 
 - **Screen:** every admin/web screen while the stack runs under `next dev`
 - **Evidence:** `findings/vision.json` of `qa-artifacts/20260926-115544` — 7 of that pass's 8
@@ -88,9 +88,16 @@ cannot do something / the screen is broken, `medium` = visible defect or accessi
   `mobile-overview`, `mobile-pages` and `web-first-link` (a stray “N” floating in the corner).
   It was hidden behind the contrast noise on earlier passes; with the palette clean it is the
   only thing the vision review still reports on the admin screens.
-- **Fix direction:** `devIndicators: false` in `apps/admin/next.config.ts` and
-  `apps/web/next.config.ts` (development only — the badge is Next.js' own, it is not part of the
-  product, but it obscures a real control and lands in every QA screenshot).
+- **Root cause:** the floating `N` badge is Next.js' own development indicator. It is anchored to
+  the bottom-left corner of the viewport, which is exactly where the panel's sidebar footer sits,
+  so it lands on top of the “Sign out” row and travels into every screenshot.
+- **Fix:** `devIndicators: false` in `apps/admin/next.config.ts` and `apps/web/next.config.ts`
+  (development only — a production build renders no indicator, so nothing changes for a
+  deployment).
+- **Proof:** `qa-artifacts/20260926-122611` — the vision review reports **0 issues** across all 14
+  screenshots (was 9: 5 medium + 4 low, every one of them this badge) and `summary.json` carries
+  no mention of the badge; the walkthrough's own counters are unchanged (49 clicks · 8 fills ·
+  49 shots · 5 programmatic findings, all of them the web root's 404 noise tracked below).
 
 ## ISSUE-005 — A disabled filled button keeps white text on a faded fill · low · open
 

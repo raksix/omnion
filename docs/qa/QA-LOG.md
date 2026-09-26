@@ -91,3 +91,25 @@
 - Lesson: the walkthrough's contrast pass skips an element that has children, so a button whose
   label sits next to an icon is invisible to it — vision saw what the programmatic pass could
   not. Compare the two lists before calling a finding unreproducible.
+
+## 2026-09-26 · pass `20260926-122611` — ISSUE-004 fixed (framework dev indicator)
+
+- Counters: 49 clicks · 8 field fills · 49 screenshots · 5 programmatic findings
+  (high 0 · medium 5 · low 0) · vision review 14 shots → **0 issues** (was 9: 5 medium + 4 low).
+  The five programmatic findings are unchanged and are the web root's 404 console/request noise
+  (the ISSUE-002 follow-up), not app defects.
+- Fixed **ISSUE-004** (medium): the floating `N` badge Next.js draws in development is anchored to
+  the bottom-left of the viewport — exactly where the panel's sidebar footer sits — so it covered
+  the start of the “Sign out” label (“…ign out”) on every admin screenshot and floated in the
+  corner of the mobile and public captures. `devIndicators: false` in `apps/admin/next.config.ts`
+  and `apps/web/next.config.ts` (development only; a production build renders no indicator).
+- Proof: `20260926-122611` — every one of the 14 reviewed screenshots reports 0 issues and the
+  walkthrough counters are identical to the previous pass (49/8/49), so nothing else moved with
+  the change.
+- Still open: ISSUE-005 (low — a disabled `bg-accent` button fades to white-on-pale-terracotta),
+  and the ISSUE-002 follow-up (the fixture should publish a `home` page so the root stops
+  answering 404 and its five noise findings disappear).
+- Lesson: a framework's own dev overlay can hide a real control, and it is invisible to the
+  programmatic pass (it is not part of the DOM the diagnostics walk) while the vision review
+  reports it on every shot — a finding repeated across unrelated screens is usually an overlay,
+  not five layout bugs.
