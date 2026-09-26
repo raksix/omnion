@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use omnion_ai_hub::AiHubError;
 use omnion_audit::AuditError;
 use omnion_content::ContentError;
 use omnion_core::CoreError;
@@ -430,6 +431,79 @@ impl From<OnboardingError> for ApiError {
     }
 }
 
+impl From<AiHubError> for ApiError {
+    /// AI Hub (docs/06-AI-HUB.md): a provider the installation never connected — or a model the
+    /// registry does not carry — is a `404`; a taken provider name, a switched-off provider and
+    /// an installation without a default model are `409`s the operator resolves in the panel;
+    /// everything the platform refuses before it sends anything is a `400`; and a provider that
+    /// cannot be reached or refuses the request is a `502` — the gateway answering for its
+    /// upstream, which is exactly what happened.
+    fn from(error: AiHubError) -> Self {
+        match error {
+            AiHubError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            AiHubError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            AiHubError::ProviderNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                "no such AI provider",
+            ),
+            AiHubError::ModelNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                "no such AI model in the registry",
+            ),
+            AiHubError::ProviderNameTaken(name) => Self::new(
+                StatusCode::CONFLICT,
+                "provider_name_taken",
+                format!("an AI provider named \"{name}\" already exists"),
+            ),
+            AiHubError::NoDefaultModel => Self::new(
+                StatusCode::CONFLICT,
+                "no_default_model",
+                "connect an AI provider and choose a default model first",
+            ),
+            AiHubError::ProviderDisabled(name) => Self::new(
+                StatusCode::CONFLICT,
+                "provider_disabled",
+                format!("the AI provider \"{name}\" is switched off"),
+            ),
+            AiHubError::InvalidProvider(message) => Self::bad_request("invalid_provider", message),
+            AiHubError::InvalidModel(message) => Self::bad_request("invalid_model", message),
+            AiHubError::InvalidChatRequest(message) => {
+                Self::bad_request("invalid_chat_request", message)
+            }
+            AiHubError::Transport(message) => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "provider_unreachable",
+                format!("the AI provider could not be reached: {message}"),
+            ),
+            AiHubError::Upstream { status, message } => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "provider_error",
+                format!("the AI provider answered with status {status}: {message}"),
+            ),
+            AiHubError::Stream(message) => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "stream_failed",
+                format!("the AI provider's answer stream failed: {message}"),
+            ),
+            AiHubError::Malformed(message) => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "provider_malformed",
+                format!("the AI provider answered with an unusable body: {message}"),
+            ),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -593,6 +667,53 @@ mod tests {
             sqlx::Error::PoolClosed,
         )));
         assert_eq!(audit.code(), "dependency_unavailable");
+    }
+
+    #[test]
+    fn ai_hub_errors_map_onto_the_provider_statuses() {
+        assert_eq!(
+            ApiError::from(AiHubError::ProviderNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::from(AiHubError::ModelNotFound).code(),
+            "model_not_found"
+        );
+        assert_eq!(
+            ApiError::from(AiHubError::ProviderNameTaken("Local".to_owned())).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::from(AiHubError::ProviderDisabled("Local".to_owned())).code(),
+            "provider_disabled"
+        );
+        assert_eq!(
+            ApiError::from(AiHubError::NoDefaultModel).status(),
+            StatusCode::CONFLICT
+        );
+
+        let refused = ApiError::from(AiHubError::Upstream {
+            status: 429,
+            message: "slow down".to_owned(),
+        });
+        assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(refused.code(), "provider_error");
+        assert!(
+            refused.message.contains("429"),
+            "message: {}",
+            refused.message
+        );
+
+        let unreachable = ApiError::from(AiHubError::Transport("connection refused".to_owned()));
+        assert_eq!(unreachable.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(unreachable.code(), "provider_unreachable");
+
+        let invalid = ApiError::from(AiHubError::InvalidChatRequest("no messages".to_owned()));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code(), "invalid_chat_request");
+
+        let unavailable = ApiError::from(AiHubError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

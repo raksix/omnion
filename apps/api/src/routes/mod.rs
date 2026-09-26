@@ -33,7 +33,14 @@
 //! (REQ-050, P10): it carries no permission guard because there is nothing to check against
 //! until an account exists — the flow itself decides who may act (see
 //! `crate::routes::onboarding`).
+//!
+//! The AI Hub surface (`/ai`) is the platform's door to AI (docs/06-AI-HUB.md, P11): providers
+//! and the model registry are read with `ai.providers.read` and written with
+//! `ai.providers.manage`, and `POST /ai/chat` answers as `text/event-stream` behind the
+//! `ai.chat` key — using the platform's AI and connecting a provider are separate powers. See
+//! `crate::routes::ai`.
 
+pub mod ai;
 pub mod auth;
 pub mod content;
 pub mod health;
@@ -193,6 +200,29 @@ pub fn router(state: AppState) -> Router {
     let onboarding_ai = post(onboarding::decide_ai);
     let onboarding_complete = post(onboarding::complete);
 
+    // AI Hub (docs/06-AI-HUB.md): connecting a provider is `ai.providers.manage`, reading the
+    // registry `ai.providers.read`, and using the chat its own key — so a team can talk to the
+    // platform's AI without being able to point it at another endpoint.
+    let ai_providers = get(ai::list_providers)
+        .layer(guards::require(&state, "ai.providers.read"))
+        .merge(post(ai::create_provider).layer(guards::require(&state, "ai.providers.manage")));
+
+    let ai_provider = patch(ai::update_provider)
+        .layer(guards::require(&state, "ai.providers.manage"))
+        .merge(delete(ai::delete_provider).layer(guards::require(&state, "ai.providers.manage")));
+
+    let ai_provider_models =
+        put(ai::replace_provider_models).layer(guards::require(&state, "ai.providers.manage"));
+
+    let ai_provider_discover =
+        post(ai::discover_provider_models).layer(guards::require(&state, "ai.providers.manage"));
+
+    let ai_models = get(ai::list_models).layer(guards::require(&state, "ai.providers.read"));
+
+    let ai_model = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
+
+    let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -257,7 +287,14 @@ pub fn router(state: AppState) -> Router {
         .route("/onboarding/site", onboarding_site)
         .route("/onboarding/theme", onboarding_theme)
         .route("/onboarding/ai-provider", onboarding_ai)
-        .route("/onboarding/complete", onboarding_complete);
+        .route("/onboarding/complete", onboarding_complete)
+        .route("/ai/providers", ai_providers)
+        .route("/ai/providers/{id}", ai_provider)
+        .route("/ai/providers/{id}/models", ai_provider_models)
+        .route("/ai/providers/{id}/discover-models", ai_provider_discover)
+        .route("/ai/models", ai_models)
+        .route("/ai/models/{id}", ai_model)
+        .route("/ai/chat", ai_chat);
 
     Router::new()
         .route("/healthz", get(health::healthz))
