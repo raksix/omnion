@@ -68,3 +68,18 @@ export type Page = {
 export function pageTitle(page: Page): string {
   return page.draft?.title ?? page.published?.title ?? page.slug;
 }
+
+/** One file in a site's media library (`GET /api/v1/media`). */
+export type Media = {
+  id: string;
+  site_id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  checksum: string;
+  /** Panel read path of the bytes (`GET /api/v1/media/{id}/raw`). */
+  raw_path: string;
+  /** Public read path of the bytes (`GET /api/v1/public/media/{id}`). */
+  public_path: string;
+  created_at: string;
+};

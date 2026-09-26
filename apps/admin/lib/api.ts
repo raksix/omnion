@@ -4,7 +4,7 @@
  * The browser always calls the API on the admin panel's own origin: `next.config.ts` forwards
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
-import type { Organization, Page, Site, User } from "./types";
+import type { Media, Organization, Page, Site, User } from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
 export class ApiError extends Error {
@@ -53,7 +53,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       credentials: "same-origin",
       headers: {
         accept: "application/json",
-        ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+        // Only a JSON body gets the JSON content type: an upload sends `FormData`, and the
+        // browser has to set that content type itself — including its multipart boundary.
+        ...(typeof init.body === "string" ? { "content-type": "application/json" } : {}),
         ...init.headers,
       },
     });
@@ -116,4 +118,32 @@ export async function fetchPages(siteId: string, status?: string): Promise<Page[
   }
   const body = await request<{ pages: Page[] }>(`/api/v1/pages?${query.toString()}`);
   return body.pages;
+}
+
+/** The media library of one site, newest first. */
+export async function fetchMedia(siteId: string): Promise<Media[]> {
+  const body = await request<{ media: Media[] }>(
+    `/api/v1/media?site_id=${encodeURIComponent(siteId)}`,
+  );
+  return body.media;
+}
+
+/** Upload one file into a site's library. */
+export function uploadMedia(siteId: string, file: File): Promise<Media> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  return request<Media>(`/api/v1/media?site_id=${encodeURIComponent(siteId)}`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+/** Remove one file — its object and its row. */
+export function deleteMedia(mediaId: string): Promise<null> {
+  return request<null>(`/api/v1/media/${encodeURIComponent(mediaId)}`, { method: "DELETE" });
+}
+
+/** Browser URL of one file's bytes, read with the session cookie. */
+export function mediaRawUrl(mediaId: string): string {
+  return `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
 }

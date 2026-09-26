@@ -21,3 +21,22 @@ export function statusLabel(status: string): string {
   }
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
+
+/** Render a byte count the way the panel shows file sizes. */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "—";
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const units = ["KB", "MB", "GB", "TB"] as const;
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}

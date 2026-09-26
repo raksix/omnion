@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { FileText, Globe, LayoutDashboard, LogOut, Menu, X } from "lucide-react";
+import { FileText, Globe, Images, LayoutDashboard, LogOut, Menu, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -16,6 +16,7 @@ import { useSession } from "@/lib/session";
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
+  { href: "/media", label: "Media", icon: Images },
   { href: "/sites", label: "Sites", icon: Globe },
 ] as const;
 
