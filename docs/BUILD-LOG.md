@@ -920,3 +920,43 @@
   the step done, and the re-run reported 0 issues across all 14 screens.
 - Next: wave 1 continues with **REQ-032** (command centre: palette + quick actions + recents), then
   REQ-007 (analytics + real dashboard).
+
+## 2026-09-26 — REQ-032 · slice 1 · the palette becomes a command centre
+
+- **Commands are code, not configuration.** `crates/search/src/commands.rs` is the registry (8
+  entries today: the panel's screens plus "Create a page"), each naming the permission whose
+  holder may run it, the route it opens, keywords, aliases and the screens it is worth suggesting
+  on. `visible()` projects it through a caller's effective permissions and `suggest()` picks a
+  screen's suggestions — both pure, both unit-tested without a database.
+- **The API serves the projection.** `GET /api/v1/commands`, `GET /api/v1/command-center/context`
+  and `GET`/`POST`/`DELETE /api/v1/command-center/recent`, all behind `search.read`; migration
+  `0014_command_center.sql` adds `command_recents` (per user, trimmed to 50, upserted on repeat)
+  and `command_usage_daily`. The palette grew the command group, the `>` `@` `#` `:` `?` prefix
+  model with a mode chip, its own Recent list with a Clear control, and focus restoration on `Esc`;
+  `/pages?new=1` opens the create form with the cursor already in the title field.
+- **Proof:** `cargo fmt`/`clippy` clean · `cargo test --workspace` → **452 passed, 0 failed**
+  (9 new walks in `apps/api/tests/command_center.rs`: the projection leaves a member's answer
+  without the words "Create a page"/"Open pages", suggestions follow the screen and skip the one
+  already open, recents are personal and repeat-safe, the history trims at 50, refusals carry a
+  code, an out-of-reach command is dropped on read, every registry id stores) · `pnpm typecheck &&
+  pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 105 clicks, 113 screenshots, **0 high findings**,
+  **0 vision issues** (`qa-artifacts/20260926-171549`) · `scripts/qa/probe-command-center.cjs` →
+  **26/26** (a command lands on its screen and closes the palette, the run is in the account's own
+  history when read back through the API, clearing empties it immediately and after a reload, `#qa`
+  answers Sites-only, `Tab` walks the groups, no 5xx) · `scripts/qa/probe-palette.cjs` → **22/22**
+  (the REQ-002 palette regressions: arrows, `Ctrl+Enter` new tab, no-results, the phone sheet, and
+  the query remembered under the renamed Recent group).
+- **The pass caught two defects.** (1) The palette opens over the results screen's dialog and the
+  scrim closes it without touching the dialog (palette `z 50` over `z 40`), but the harness step
+  first clicked the scrim's *centre* — where the dialog sits — and read the interception as a
+  failure; it clicks the corner now. (2) A real one: the migration's id-format check rejected
+  hyphens, so recording `nav.create-page` answered `500` — invisible to the integration suite
+  (which only recorded `nav.pages`/`nav.media`) until the browser probe fired a real one.
+  `every_registered_command_can_be_remembered` now walks the whole registry through the endpoint.
+- The walkthrough also flagged the pages table pushing its Actions column 21px past a phone's edge,
+  so the page cell is now the flexible one (`w-full max-w-0`) — the vision review reports 0 issues.
+- Carried forward, not caused by this slice: the public renderer still answers `404` for its own
+  icon requests (5 medium findings, unchanged).
+- Next: wave 1 continues with **REQ-032 slice 2** (federated search in the palette: per-group
+  loading and errors, type filters, the URL-backed `/search`), then REQ-007 (analytics + real
+  dashboard).

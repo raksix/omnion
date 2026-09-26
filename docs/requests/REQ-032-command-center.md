@@ -1,6 +1,6 @@
 # REQ-032 — Universal Command Center
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
+> **Status:** in-progress — slice 1 shipped (registry + palette commands + history) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -118,24 +118,29 @@ Webhook relevance: none directly. Audit: every action command writes a `command.
 
 ### Acceptance criteria
 
-- [ ] `Ctrl+K` (and `Cmd+K`) opens the palette on every admin route, including over an open modal, without losing unsaved form state.
-- [ ] `Esc` closes the palette and returns focus to the element that had focus before opening.
-- [ ] Typing a partial page title returns that page under the entity groups within 300 ms p95 on the seeded dataset.
-- [ ] Command lists are filtered server-side: a role without `crm.customers.create` never receives "Create customer".
-- [ ] Search results are permission-filtered per type; requesting a shared `/search` URL as a lower-privilege user returns no title text for records they cannot read.
-- [ ] `>` shows commands only, `@` people only, `#` sites only, and the mode chip in the input row reflects the active prefix.
-- [ ] Running "Open analytics" navigates without a full reload and closes the palette.
-- [ ] "Create customer" opens the create form with the palette closed and the first field focused.
-- [ ] "Run backup" asks for confirmation before queueing a job, then shows the standard job feedback.
-- [ ] The AI card for "Open Mehmet's last 10 tickets" shows the parsed intent (entity, assignee, count, sort) before running, and `Run` lands on a ticket list matching that intent.
-- [ ] A low-confidence phrase never auto-executes: it renders as "Did you mean …" with the closest commands.
-- [ ] A failing result type shows a per-group error with retry while other groups still render.
-- [ ] Recents persist across sessions and are per user, not per organization.
-- [ ] Clearing recents empties the group immediately and after a reload.
-- [ ] Every executed action command appears in the audit log with actor, command and target.
-- [ ] `/search` reproduces the same results from its URL alone, with filter chips and type filters applied.
-- [ ] Keyboard-only operation reaches every group and row; `Tab`/`Shift+Tab` cycle groups and `Cmd+Enter` opens in a new tab.
-- [ ] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844.
+Slice 1 shipped the boxes ticked below; the rest carry the slice that owns them. Evidence: the QA
+pass of `qa-artifacts/20260926-171549` (**105 clicks, 113 screenshots, 0 high findings, 0 vision
+issues**), `scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs`
+(**22/22**) and `apps/api/tests/command_center.rs` (**9 walks**).
+
+- [x] `Ctrl+K` (and `Cmd+K`) opens the palette on every admin route, including over an open modal, without losing unsaved form state. — the palette is mounted once in the app shell, so it is on every route; the pass opened it over the results screen's shortcuts dialog (palette `z 50` over dialog `z 40`, and the dialog stayed open while the palette's scrim closed the palette) and over a half-typed "New page" form, whose title text survived the round trip.
+- [x] `Esc` closes the palette and returns focus to the element that had focus before opening. — measured with the create form's title field as the captured element (`focusReturned: true`).
+- [ ] Typing a partial page title returns that page under the entity groups within 300 ms p95 on the seeded dataset. — the answer arrives and opens a real screen (palette pass + probes); the p95 number is not measured yet — slice 2's timing pass.
+- [x] Command lists are filtered server-side: a role without the create key never receives its command. — `command_center.rs` asserts the *title text* is absent from a member's answer, not merely that an id is missing (`content.pages.create` stands in for the request's `crm.customers.create`: the same mechanism, with the key this wave actually ships).
+- [ ] Search results are permission-filtered per type; a shared `/search` URL read by a lower-privilege account returns no title text for records it cannot read. — the engine-level rule is REQ-002's (its suite proves it per provider); the browser walk as a second account is slice 2.
+- [x] `>` shows commands only, `@` people only, `#` sites only, and the mode chip in the input row reflects the active prefix. — `>` renders exactly the registry's rows (8 for an owner, chip "Commands"); `#qa` answers with the Sites provider only (no Pages/Media rows) and the chip reads "Sites"; `@` moves the chip to "People".
+- [x] Running "Open analytics" navigates without a full reload and closes the palette. — the same walk with "Open pages": client-side navigation to `/pages`, `paletteClosed: true`.
+- [x] "Create customer" opens the create form with the palette closed and the first field focused. — the same walk with "Create a page" (`/pages?new=1`): palette closed, form open, the title field carrying the focus.
+- [ ] "Run backup" asks for confirmation before queueing a job, then shows the standard job feedback. — slice 3 (no mutating command ships yet).
+- [ ] The AI card for "Open Mehmet's last 10 tickets" shows the parsed intent before running. — slice 4.
+- [ ] A low-confidence phrase never auto-executes. — slice 4.
+- [ ] A failing result type shows a per-group error with retry while other groups still render. — slice 2 (the palette keeps its retryable whole-answer error; per-group errors arrive with the federated pass).
+- [x] Recents persist across sessions and are per user, not per organization. — the walkthrough sees the command it ran after a reload; `recents_are_per_user_and_never_per_organization` proves one account's history is invisible to another in the same organization, and that a clear is personal.
+- [x] Clearing recents empties the group immediately and after a reload. — `probe-command-center.cjs`: 0 rows immediately, 0 rows and `items: []` after a reload.
+- [ ] Every executed action command appears in the audit log with actor, command and target. — slice 3 (navigation commands write nothing; the `command.run` entry lands with the first mutating command).
+- [ ] `/search` reproduces the same results from its URL alone, with filter chips and type filters applied. — REQ-002's depth pass proved the screen's URL state; the palette's own "See all" links carry the query and are slice 2's acceptance.
+- [ ] Keyboard-only operation reaches every group and row; `Tab`/`Shift+Tab` cycle groups and `Cmd+Enter` opens in a new tab. — arrows and `Enter` (both probes), `Ctrl+Enter` in a new tab and `Tab` between groups (probe-command-center) are proven; `Shift+Tab` and the sweep of the narrowing modes are slice 2's pass.
+- [ ] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844. — the sheet fills 390×844 and the rows (commands included) are 44px; the AI card arrives with slice 4.
 
 ### QA plan
 
@@ -164,6 +169,59 @@ Visual check: the palette reads as a clearly layered dialog over a scrim; match 
    Done: steps 3 and 10 pass and the audit log shows one entry per action.
 4. **Natural-language resolution.** `POST /command-center/resolve` on ai-hub, intent preview card, confidence threshold with "Did you mean", `Edit as search`, timeout fallback.
    Done: step 4 passes, a low-confidence phrase falls back instead of executing, and a slow model shows a resolving state without blocking typing.
+
+### Slice log
+
+#### Slice 1 — palette shell + registry + navigation (2026-09-26) — shipped
+
+What landed:
+
+- **The registry is code.** `crates/search/src/commands.rs` holds one entry per command the
+  platform offers today (8: the panel's screens plus "Create a page"), each with the permission
+  whose holder may run it, the route it lands on, keywords and aliases for matching, and the
+  routes it is worth suggesting on. `visible()` projects the registry through a caller's
+  effective permissions and `suggest()` picks the suggestions for a screen; both are pure and
+  unit-tested without a database.
+- **The API serves the projection, never the whole list.** `GET /api/v1/commands` (guard
+  `search.read`), `GET /api/v1/command-center/context?route=` (the suggestions for the screen the
+  caller is on), and `GET`/`POST`/`DELETE /api/v1/command-center/recent` (the caller's own
+  history: record, read, forget). Migration `0014_command_center.sql` adds `command_recents`
+  (per user, newest-first read, trimmed to 50, upserted on repeat) and `command_usage_daily`
+  (counts per account/command/day, no query text) — the usage table is written by slice 3.
+- **The palette is the command centre.** One group of commands (suggestions for the screen while
+  the box is empty, matches once something is typed), the `>` `@` `#` `:` `?` prefix model with a
+  mode chip in the input row, the account's own Recent list with a Clear control, and the
+  previously shipped entity sections. `Esc` now hands focus back to whatever had it before the
+  palette opened.
+- **A command that opens a form focuses it.** `/pages?new=1` opens the pages screen's create form
+  and puts the cursor in the title field (the same one-shot-parameter pattern the `focus` deep
+  link already used).
+
+Deviations, recorded as they were decided:
+
+- The migration is `0014_command_center.sql`: `0012`/`0013` were taken by REQ-002's index work.
+- `command_recents` dedupes on folded generated columns (`query_key`, `command_key`) instead of a
+  plain unique index on nullable columns — Postgres never collides NULLs, so `(user_id, kind,
+  query)` alone would have stacked a row per run.
+- `organization_id` on both tables is nullable: platform accounts belong to no organization, the
+  same way `audit_log` files them.
+- A search is remembered when the account **commits** to it (opening a hit, a section's "see all"
+  or the results screen), not on every keystroke pause; REQ-002's `search_recent` stays the
+  results screen's own history.
+- `@` narrows the search to the users provider; a user hit renders no palette section until
+  REQ-006 ships the accounts screen, so the mode answers honestly empty instead of linking
+  nowhere.
+- Navigation commands write no audit entry (the request's own rule); the `command.run` entries
+  arrive with the mutating commands in slice 3.
+
+Proof: `cargo test --workspace` → **452 passed, 0 failed** (9 of them the new command-centre
+walks) · `cargo clippy --workspace --all-targets -- -D warnings` → clean · `pnpm typecheck &&
+pnpm build` → 2/2 · `bash scripts/qa/run.sh` → the table above
+(`20260926-171549`) · `node scripts/qa/probe-command-center.cjs` → **26/26** ·
+`node scripts/qa/probe-palette.cjs` → **22/22**. A defect the probes caught before the commit:
+the column's id-format check rejected hyphenated ids (`nav.create-page`), so recording a perfectly
+ordinary command answered `500`; the check now allows hyphens and
+`every_registered_command_can_be_remembered` walks the whole registry through the endpoint.
 
 ### Risks / notes
 
