@@ -9,14 +9,16 @@
 /**
  * Site a piece of public content belongs to.
  *
- * The public surface answers with the site's handle and display name only: internal
- * identifiers stay inside the panel (docs/05-VERSIONING.md §6).
+ * The public surface answers with the site's handle, display name and the theme it renders
+ * with: internal identifiers stay inside the panel (docs/05-VERSIONING.md §6).
  */
 export interface PublicSite {
   /** Stable handle of the site inside its organization (`main`). */
   key: string;
   /** Display name of the site. */
   name: string;
+  /** Theme the renderer activates (`themes/<key>`); unknown keys fall back to the default. */
+  theme: string;
 }
 
 /** Public identity of a page. */

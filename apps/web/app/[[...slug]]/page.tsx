@@ -47,7 +47,7 @@ export default async function Page({ params }: RouteParams) {
     notFound();
   }
 
-  const theme = resolveTheme();
+  const theme = resolveTheme(content.site.theme);
   const PageLayout = theme.PageLayout;
 
   return <PageLayout content={content} />;
