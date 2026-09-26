@@ -823,3 +823,52 @@
 - Next: **REQ-002 slice 2 — the palette** (header search box, ⌘K overlay, sections by hit count,
   keyboard map, recently viewed, all states, mobile sheet), then slice 3 (`/search` results screen
   with facets/selection/export, `/settings/search`).
+
+## 2026-09-26 — REQ-002 · Global search (slice 2: the ⌘K palette and the results screen)
+
+- The panel has its one box. `⌘K`/`Ctrl+K` opens a palette from any screen, `/` focuses the header
+  box without opening anything, typing two characters hands over to the palette. Sections are one
+  per provider, ordered by how much each provider matched, five rows each plus "see all"; `↑`/`↓`
+  walk the whole list across section boundaries, `Tab` jumps sections, `Enter` opens the
+  highlighted row, `⌘Enter` opens it in a new tab, `Esc` closes. The empty query shows the
+  account's recent searches (removable one by one, clearable completely) and this browser's
+  recently viewed screens; a phone gets the same palette as a full-screen sheet with 44px rows.
+  `apps/admin/components/search-palette.tsx` + `global-search.tsx` carry it, `lib/search-palette.ts`
+  and `lib/search-memory.ts` the logic and the browser's own memory.
+- Hits open the thing they name. The indexer writes deep links now (`/pages?site=…&focus=…`,
+  `/media?site=…&focus=…`), the palette switches the panel's site before it navigates, the pages
+  screen opens the focused page's editor and the library marks the focused file's row. "See all
+  results" lands on `/search`, which ships as the honest half of the results screen (query, sort,
+  per-provider counts, rows with the match emphasised, pagination, all three states); facets,
+  selection, export and `/settings/search` stay in slice 3.
+- Slice 1 promised sections for pages, media, sites and accounts but only content emitted events —
+  the index carried plans for the others and no producers, so those sections would have stayed
+  empty forever. That half shipped too: `media.created`/`media.deleted`, `site.created`/
+  `site.updated` and `user.created` are emitted by the routes that change those rows.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `cargo test --workspace` → **422 passed, 0 failed (44 suites)**, including the
+  new `an_upload_and_a_new_site_reach_the_index_through_the_bus` (three real routes → one indexer
+  tick → indexed, then removed) · `pnpm typecheck && pnpm build` → 2/2 · `bash scripts/qa/run.sh`
+  → 58 clicks, 67 screenshots, **0 high findings** (`qa-artifacts/20260926-150923`); the pass's
+  palette phase reports open (`focusedInput: true`), two sections for "sample" (Media 1, Pages 1),
+  the highlight moving `hit-0-0 → hit-1-0`, the row opening `/pages?site=…&focus=…`, the recents
+  surviving a reload, and `close` ✓, while the phone sheet measures 390×844 with 44px rows ·
+  `scripts/qa/probe-palette.cjs` → **22/22 PASS** (keyboard map incl. `Ctrl+Enter` in a new tab,
+  the no-hits state, recents, the box click, `/`, both console-error checks).
+- The QA harness grew teeth and immediately used them. The mobile context is signed in now (every
+  "mobile" route had been photographing the sign-in screen — a gap, not a screen), the media
+  screen's hidden upload input is set directly (a click-through cannot reach a 0×0 control, so the
+  library — and everything indexed from it — stayed empty), and an open palette is closed before
+  the next round clicks. Real mobile screens then showed a pages table that overflowed a phone and
+  a corrupt 82-byte "PNG" fixture that rendered as a broken thumbnail; both fixed here (narrow
+  columns and action labels leave before the table does; the fixture is a real 160×120 PNG).
+  Overlay screenshots are viewport-only now — a full-page shot of a fixed sheet shows the page
+  below the fold and reads as an overlay that fails to cover the screen.
+- Carried forward, not caused by this slice: the public renderer answers `404` for its own icon
+  requests on every pass (5 medium findings, unchanged since `20260926-134405`), and the vision
+  review's one remaining low note guesses the contrast of `text-muted` at ~2.5:1 where the
+  harness's own measured check reports zero low-contrast nodes — the token stays as it is.
+- Next: **REQ-002 slice 3** — `/search` facets with counts, removable chips, Shift-range + `⌘A`
+  selection, Copy links, CSV export (`/search/export`), `/settings/search` (per-provider status,
+  ranking weights, reindex progress) and the settings/logs/translations providers; then wave 1
+  continues with REQ-032 (command centre).

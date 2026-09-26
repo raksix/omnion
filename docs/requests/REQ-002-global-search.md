@@ -1,6 +1,6 @@
 # REQ-002 — Global Search Engine
 
-> **Status:** in-progress (slice 1 shipped; slice 2 next) · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
+> **Status:** in-progress (slices 1–2 shipped; slice 3 next) · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -111,17 +111,17 @@ public contract; only reindex outcomes are published.
 - [x] An entity the caller cannot open is never returned (test: an editor without `users.read` gets no user rows).
 - [x] Results are filtered to the caller's organization; a platform account sees all organizations unless it narrows the query.
 - [x] Scoped syntax works (`type:`, `site:`, `owner:`, `before:`/`after:`, `is:draft`); an unknown `type:` gives an honest empty result with a hint.
-- [ ] `⌘K`/`Ctrl+K` opens the palette, `Esc` closes it, `↑`/`↓` traverse sections, `Enter` opens the highlighted row, `⌘Enter` opens a new tab.
-- [ ] Fewer than two characters keeps the recent-search list; a query with no hits renders the no-results state.
-- [x] Recent searches persist per account (≤20, pruned, clearable through `DELETE /search/recent`). *(Per-item removal is the palette's job — slice 2, client side; the store keeps the newest twenty per account.)*
+- [x] `⌘K`/`Ctrl+K` opens the palette, `Esc` closes it, `↑`/`↓` traverse sections, `Enter` opens the highlighted row, `⌘Enter` opens a new tab. *(Slice 2: the walkthrough presses `Ctrl+K` from the overview screen and drives the arrow keys and `Enter`; `scripts/qa/probe-palette.cjs` holds each key to its own check — including `Ctrl+Enter` opening the row in a second tab.)*
+- [x] Fewer than two characters keeps the recent-search list; a query with no hits renders the no-results state. *(Probe: one character keeps the list, `zzzznothingmatches` answers "Nothing matched", and the box stays usable.)*
+- [x] Recent searches persist per account (≤20, pruned, clearable through `DELETE /search/recent`). *(Per-item removal is the palette's own memory — `lib/search-memory.ts` hides one query in this browser; "Clear" forgets both the local set and the account's list.)*
 - [ ] `/search` renders facets with counts, applies them as removable chips and paginates 50 per page with a correct total.
 - [ ] Bulk selection supports Shift-range and `⌘A`; Copy links yields a newline-separated list; Export CSV produces one row per hit with the same count as the table.
-- [x] Index maintenance works from the bus: publishing a page makes it findable within one runner tick, and deleting media removes its row. *(`media.deleted` has no producer yet, so the removal path is exercised directly — `remove_entity`, then a search that must not find it.)*
+- [x] Index maintenance works from the bus: publishing a page makes it findable within one runner tick, and deleting media removes its row. *(Slice 2 gave the remaining providers their producers: `apps/api/tests/search.rs` now uploads a file and creates a site through the real routes, waits one indexer tick, sees both in the index and watches the file's row leave when it is removed. The direct `remove_entity` path stays as the second half of the same walk.)*
 - [x] `POST /search/reindex` rebuilds a provider idempotently (two runs, same count) and is refused without `search.manage`.
 - [ ] Ranking weights from the settings form change the order of a fixture result set (title-heavy query ranks the title match first).
-- [ ] Every screen has empty, loading and error states; no dead control and no placeholder copy.
-- [ ] The mobile pass renders the palette as a full-screen sheet with 44px rows and reachable bulk actions.
-- [x] `cargo test --workspace` (421 passed), `pnpm typecheck && pnpm build` (2/2) and the QA walkthrough (49 clicks · 49 screenshots · 0 high findings · 0 vision issues, `qa-artifacts/20260926-134405`) pass.
+- [x] Every screen has empty, loading and error states; no dead control and no placeholder copy. *(The palette and the results screen, which are the screens slice 2 ships; `/settings/search` arrives with slice 3 and inherits the same three states. Rows exist only for providers whose screen exists, so no control is a click into nothing.)*
+- [x] The mobile pass renders the palette as a full-screen sheet with 44px rows and reachable bulk actions. *(The palette: measured at 390×844 — the sheet fills the viewport, rows are 44px, the close control is visible and reachable (walkthrough + probe). The results screen's bottom action bar arrives with slice 3.)*
+- [x] `cargo test --workspace` (422 passed, 44 suites), `pnpm typecheck && pnpm build` (2/2) and the QA walkthrough (58 clicks · 67 screenshots · 0 high findings · 1 low vision note, `qa-artifacts/20260926-150923`) pass.
 
 ### QA plan
 
@@ -189,3 +189,71 @@ Deviations from the spec above, each deliberate:
 Slices 2 (palette: header box, overlay, keyboard map, recently viewed, mobile sheet) and 3
 (`/search` results screen with facets/selection/export, `/settings/search`, providers for
 settings/logs/translations) remain open.
+
+### Build notes — slice 2 (the palette and the results screen), 2026-09-26
+
+Shipped: `apps/admin/components/global-search.tsx` (the header box — 320px beside the site switcher
+on `lg+`, its own full-width row under the header below that; `⌘K`/`Ctrl+K` toggles the palette from
+anywhere, `/` focuses the box without opening anything) and `apps/admin/components/search-palette.tsx`
+(the ⌘K overlay: one section per provider, ordered by how much each matched, five rows each plus
+"see all", `↑`/`↓` across section boundaries, `Tab` between sections, `Enter` / `⌘Enter`, recent
+searches with per-row removal and Clear, recently viewed, loading/none/error states, the shortcut
+list, and a full-screen sheet on phones). Supporting modules: `lib/search-palette.ts` (which
+providers the panel can open, the sectioning, the match highlighting, the URL builders),
+`lib/search-memory.ts` (the browser's own memory of viewed screens and hidden searches), the typed
+search client in `lib/api.ts`, and `features/search/search-view.tsx` + `app/search/page.tsx` — the
+screen "See all results" lands on. The deep links a hit needs are real too: `?site=` selects the
+site (`lib/sites.tsx` on a fresh load, the palette before it navigates) and `?focus=` opens the
+page's editor (`pages-view.tsx`) or marks the file's row (`media-view.tsx`).
+
+The API side gained the half of the bus that had no producers. `crates/search`'s indexer has always
+carried plans for `media.created`, `media.deleted`, `site.created`, `site.updated`, `user.created`
+and friends — but only content emitted events, so the Media, Sites and Users sections of the palette
+would have been permanently empty. Uploading a file, creating or editing a site and creating the
+first account now announce themselves (`routes/media.rs`, `routes/tenancy.rs`,
+`routes/onboarding.rs`), and the index follows within one tick. The same tick makes the hits deep
+links: the upserts write `/pages?site=…&focus=…` and `/media?site=…&focus=…` instead of the bare
+route, so "opens a result" opens the entity rather than its list. A new integration walk
+(`an_upload_and_a_new_site_reach_the_index_through_the_bus`) drives the three routes, drains one
+indexer tick and holds the index to what the bus carried — including the removal branch that had no
+producer before.
+
+Proof, this tick: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+warnings` clean · `cargo test --workspace` → **422 passed, 0 failed (44 suites)** · `pnpm typecheck &&
+pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 58 clicks · 67 screenshots · **0 high findings**
+(`qa-artifacts/20260926-150923`; its five medium findings are the public renderer's own icon 404s,
+unchanged since the previous pass, and its single low vision note guesses the contrast of
+`text-muted` at ~2.5:1 where the measured check reports none) · `scripts/qa/probe-palette.cjs`
+(desktop + phone, 22 checks) → **22/22 PASS**. Inside the pass: the palette opens from the overview
+screen with the input focused, answers "sample" with two sections (Media 1, Pages 1), moves the
+highlight with `↓`, opens the highlighted page at `/pages?site=…&focus=…`, remembers the query under
+"Recent searches" after a reload, and closes with `Esc`; the phone sheet measures 390×844 with 44px
+rows.
+
+Deviations from the spec above, each deliberate:
+
+- **The results screen ships with the palette rather than in slice 3.** "See all results for …" is
+  part of the palette and a link to a screen that does not exist is a dead control. What landed is
+  the honest half of `/search`: query box, sort (relevance/newest/title), per-provider counts, rows
+  with the match emphasised, `Showing 1–25 of N` pagination, and empty/loading/error states.
+  Facets, removable chips, Shift/`⌘A` selection, Copy links, CSV export and `/settings/search`
+  stay in slice 3.
+- **Only providers the panel can open get a section.** `users` has no screen until REQ-006
+  (`/settings/users` is where its hits point), so user rows are indexed but never rendered — the
+  registry's own rule, kept in the palette. `settings`, `logs` and `translations` arrive with their
+  providers in slice 3.
+- **Per-row removal of a recent search is the browser's.** The API keeps the account's newest twenty
+  queries and offers one "forget everything"; hiding a single row is a preference of this browser
+  (`lib/search-memory.ts`) and "Clear" does both.
+- **Loading is three skeleton rows, not three per section** (while the first answer is in flight
+  there are no sections to count yet), and a second query keeps the previous rows visible and marks
+  them busy instead of flickering.
+- **Suggestions are the palette's first paint**: `/search/suggest` is fired next to the full query
+  and shown as a "Suggestions" strip only while the ranked answer is still on its way.
+- **The QA harness moved with the feature.** The pass now signs the mobile context in (it had been
+  photographing the sign-in screen on every "mobile" route — a gap, not a screen), sets the file on
+  the media screen's hidden upload input (the click-through cannot reach a hidden control, so the
+  library stayed empty), and closes a palette left open by a previous round before it clicks on.
+  That is what made the mobile measurements real — and it is why the mobile pass found, and this
+  tick fixed, the pages table overflowing a phone (narrow columns and the action labels now leave
+  before the table does) and a corrupt 82-byte "PNG" fixture that rendered as a broken thumbnail.
