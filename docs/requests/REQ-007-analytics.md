@@ -194,3 +194,56 @@ What the visual check should see: a drawn series with readable axis labels (noth
 - **High-cardinality dimensions** (paths, campaign names) can explode rollup rows — cap distinct values per dimension per day and fold the rest into `(other)`.
 - **Realtime streams** are polling under the hood: cap concurrent SSE connections per organization and close idle ones.
 - **Configured-but-silent conversions:** a goal with no hits for 30 days should show a hint, since the most likely cause is a mismatch with the emitting module’s event name.
+
+### Slice 1 — shipped (ingest, storage, settings)
+
+Delivered in one tick:
+
+- **`database/migrations/0015_analytics.sql`** — the tables of the data model plus `analytics_salts`
+  (the day's salt lives there and nowhere else; it is what rotates the visitor hash at midnight),
+  the schema checks, the indexes and one `analytics_settings` row per existing site.
+- **`modules/analytics`** (crate `omnion-module-analytics`, the first member of the `modules/` tree
+  docs/04-MONOREPO.md reserves for features) — `collect` (validation, bot filter, DNT/GPC,
+  exclusions, sampling, sessionisation, event storage), `rollup` (idempotent hourly/daily buckets
+  with the dimension cap), `settings` (read/validate/write + the snippet), `visitor` (daily-salted
+  hash, `/24`–`/48` truncation, exclusion rules) and `agent` (device/OS/browser/crawler reading).
+  22 unit tests, no database needed.
+- **API** — `POST /api/v1/public/analytics/collect` (public: 64 KB body cap, per-site-and-caller
+  budget, site resolved exactly as the public renderer resolves it), `GET`/`PUT
+  /api/v1/analytics/settings?site_id=` (`analytics.read` / `analytics.settings.manage`,
+  organization-scoped) and `GET /api/v1/analytics/snippet?site_id=`. The rollup worker
+  (`crate::analytics_runner`, `OMNION_ANALYTICS_*`) rebuilds the recent buckets on a timer.
+- **Permissions** — `analytics.read`, `analytics.export`, `analytics.goals.manage`,
+  `analytics.settings.manage` in the catalogue; Manager, Moderator and Editor base roles carry the
+  read key and the Manager the rest.
+- **The tracker** — `apps/web/public/analytics.js`: cookieless, no storage, sends the pageview,
+  queued custom events, downloads and outbound clicks; it stops before any request when the browser
+  reports `Do Not Track` or `Global Privacy Control`.
+
+Deliberate choices and deviations, for the reviewer:
+
+- The migration is **0015**, not 0012: the number is the next free slot at build time, and search
+  and the command centre took 0012–0014 while this request waited.
+- A day is the **UTC** day until REQ-113 adds per-site timezones; rollups and reports read the same
+  boundary, which is what the note under Risks asks for.
+- The collect endpoint's limiter is **per process** (a fixed window in memory), so a fleet of API
+  instances each allow the budget: it is a guardrail against a runaway script, not a billing meter.
+  Redis-backed counters are the follow-up when the edge deployment lands.
+- `X-Forwarded-For` is honoured (the platform's own edge sets it) for the daily hash, the exclusion
+  lists and the rate limit — never for authorization. A deployment that does not strip inbound
+  headers lets a caller choose their own bucket, which the deployment documentation must say.
+- The tracker measures engagement as a `page_engagement` **event** (path, duration, scroll depth),
+  not as a second pageview: a second pageview beacon for the same page would double-count the page
+  view, and a report that counts a page twice is worse than one without a duration.
+- "Realtime" is not built yet: a beacon is visible in the raw rows and in the rollups that slice 2's
+  overview will read.
+
+Proof (this tick): `cargo test --workspace --no-fail-fast` → **524 passed, 0 failed** (analytics:
+22 module units + 6 integration walks) · `cargo clippy --workspace --all-targets -- -D warnings` →
+clean · `pnpm typecheck && pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 105 clicks, 117
+screenshots, **0 high findings**, **0 vision issues** (`qa-artifacts/20260926-202816`; the 5 medium
+findings are the public renderer's own icon 404s, carried forward unchanged). No new screen ships in
+this slice, so the walkthrough inventory is unchanged — slice 2 adds the ten `/analytics` routes to it.
+
+Next: **slice 2** — the overview and the six report screens over these rollups, with the shared
+date-range toolbar, filters, drawers and CSV export.

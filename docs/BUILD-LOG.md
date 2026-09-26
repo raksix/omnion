@@ -1096,3 +1096,54 @@
 - Next: **wave 1 moves to REQ-007** (analytics + the real dashboard). REQ-032 is closed; carried
   forward, not caused by this slice: the public renderer's own icon 404s (5 medium findings), and
   `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
+
+## 2026-09-26 — REQ-007 · slice 1 · the platform starts counting
+
+- **One beacon becomes rows, and the decision comes first.** `POST /api/v1/public/analytics/collect`
+  is a public write path, so what protects it is what a public write path *can* be protected by:
+  a 64 KB body cap, a per-site-and-caller budget (429 named `rate_limited`, tested by spending the
+  whole budget), a site resolved exactly as the renderer resolves it (`?site=`, then the
+  forwarded host, then the installation's only site) — and a collector that decides **before** it
+  writes. Tracking switched off, `DNT: 1`, `Sec-GPC: 1`, a crawler user agent, an excluded path or
+  address and the site's own sample rate are all evaluated ahead of the first write, which is why a
+  dropped beacon leaves no trace at all: not a visit, not an event, not even the day's salt row.
+  What it does leave is a counter — the day's `filtered` bucket, the one metric the rollup is
+  forbidden to recompute (the bucket delete is narrowed with `metric = any(...)`).
+- **A hash instead of a person.** The visitor identifier is `sha256(site, day-salt, address, user
+  agent)`; the salt is 32 random bytes per UTC day in `analytics_salts` and nothing else is stored.
+  The tests read the row and find a 64-hex hash and `ip_prefix = null`. With `anonymize_ip` switched
+  off the row keeps the truncated network only — `203.0.113.0/24`, `2001:db8:1::/48` — the widths
+  the request documents, asserted in the walk and in the module's own unit tests.
+- **A bucket run is a delete and a rewrite, not an increment.** `rollup_day`/`rollup_hour` recompute
+  every metric/dimension pair from the raw rows inside one transaction, so running a bucket twice
+  writes the same numbers: the walk snapshots `analytics_daily` before and after the second run and
+  compares them row for row. High-cardinality dimensions are capped at fifty values per bucket with
+  the tail folded into `(other)`, sorted by count and then by value so two runs write the same order.
+- **The settings screen's validation is the API's validation.** One `validate()` in the module is
+  what both the endpoint and (from slice 2) the panel call; `retention_days = 3` answers
+  `invalid_analytics_settings` and the message *names the field*, `mode` is closed to the two
+  documented values, and excluded paths and addresses are checked line by line. Reading a site's
+  settings and snippet is `analytics.read`; changing them is `analytics.settings.manage`; both
+  resolve the site through the caller's own organization — a reader of the second organization gets
+  `cross_organization`, and the platform Owner is the caller who may reach across.
+- **`modules/` exists now.** REQ-007 called for `modules/analytics` while every previous feature
+  landed under `crates/`; docs/04-MONOREPO.md reserves `modules/` for features a customer can carry,
+  so the workspace gained `modules/*` and this is its first member (`omnion-module-analytics`).
+  The schema landed as **0015** — 0012–0014 went to search and the command centre while this request
+  waited, and the "next free slot at build time" rule in the request is what that means.
+- **Two deliberate reads of the same promise.** The tracker (`apps/web/public/analytics.js`) stops
+  before it makes a request when the browser reports DNT or GPC, and the collector enforces the same
+  rules again on the server: a client-side promise is not a promise. Engagement rides as a
+  `page_engagement` **event** rather than a second pageview beacon, because a second pageview for the
+  same page would double-count it.
+- **Proof:** `cargo test --workspace --no-fail-fast` → **524 passed, 0 failed** (analytics: 22 module
+  units + 6 integration walks; every other suite unchanged and green) · `cargo clippy --workspace
+  --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 · `bash
+  scripts/qa/run.sh` → 105 clicks, 117 screenshots, **0 high findings**, **0 vision issues**
+  (`qa-artifacts/20260926-202816`; the 5 medium findings are the public renderer's own icon 404s,
+  carried forward). This slice ships no screen, so the walkthrough inventory is unchanged.
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium), and
+  `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
+- Next: REQ-007 stays in progress — **slice 2** (overview + the six report screens over these
+  rollups, the shared date-range toolbar, filters, drawers and CSV export, plus the walkthrough
+  gaining the ten `/analytics` routes with a synthetic beacon batch).
