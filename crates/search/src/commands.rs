@@ -22,6 +22,21 @@
 pub enum CommandKind {
     /// Opens a screen. Running one writes nothing; `route` carries where it lands.
     Navigate,
+    /// Does something through its owning service when it is run from the palette
+    /// (`POST /api/v1/commands/{id}/run`). `route` names the screen that shows the record of the
+    /// act, or is empty when the act has no screen (the palette's own history).
+    Action,
+}
+
+impl CommandKind {
+    /// The kind as the API spells it (`navigate`, `action`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::Action => "action",
+        }
+    }
 }
 
 /// One command the palette can offer.
@@ -37,10 +52,17 @@ pub struct CommandSpec {
     pub hint: &'static str,
     /// Icon name the panel maps to its own icon set (`file-text`).
     pub icon: &'static str,
+    /// What running the command does: open a screen, or act through a service.
+    pub kind: CommandKind,
     /// Permission whose holder may run it; `None` for commands every signed-in account holds.
     pub permission: Option<&'static str>,
-    /// Where running it lands (`/pages`); may carry query parameters (`/pages?new=1`).
+    /// Where running it lands (`/pages`); may carry query parameters (`/pages?new=1`). An action
+    /// either names the screen that reads its record back, or carries `""` when it has none.
     pub route: &'static str,
+    /// `true` when the command asks the caller to confirm before it runs: it cannot be undone, or
+    /// it rewrites a whole dataset. The API refuses such a command unless the caller confirms, so
+    /// the question is a rule of the platform, not a decoration of one dialog.
+    pub confirm: bool,
     /// Extra words a query may match on.
     pub keywords: &'static [&'static str],
     /// Former or colloquial titles; kept so old references keep working.
@@ -53,7 +75,13 @@ impl CommandSpec {
     /// What running this command does.
     #[must_use]
     pub fn kind(&self) -> CommandKind {
-        CommandKind::Navigate
+        self.kind
+    }
+
+    /// `true` when the command acts through a service rather than opening a screen.
+    #[must_use]
+    pub fn is_action(&self) -> bool {
+        self.kind == CommandKind::Action
     }
 
     /// `true` when `needle` (already lower-cased and trimmed) appears in the title, the id, a
@@ -89,8 +117,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Panel",
         hint: "The panel's home: what the installation looks like right now",
         icon: "layout-dashboard",
+        kind: CommandKind::Navigate,
         permission: None,
         route: "/",
+        confirm: false,
         keywords: &["home", "dashboard", "start", "landing"],
         aliases: &["home", "dashboard"],
         contexts: &[],
@@ -101,8 +131,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Panel",
         hint: "The full results screen with filters, selection and export",
         icon: "search",
+        kind: CommandKind::Navigate,
         permission: Some("search.read"),
         route: "/search",
+        confirm: false,
         keywords: &["find", "results", "query", "everything"],
         aliases: &["find", "results"],
         contexts: &["/pages", "/media", "/sites", "/ai", "/settings/search"],
@@ -113,8 +145,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Panel",
         hint: "Providers, states, ranking weights and reindexing",
         icon: "sliders-horizontal",
+        kind: CommandKind::Navigate,
         permission: Some("search.manage"),
         route: "/settings/search",
+        confirm: false,
         keywords: &[
             "index",
             "reindex",
@@ -132,8 +166,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Content",
         hint: "The content of the selected site: drafts, revisions and publishing",
         icon: "file-text",
+        kind: CommandKind::Navigate,
         permission: Some("content.pages.read"),
         route: "/pages",
+        confirm: false,
         keywords: &["content", "articles", "posts", "documents"],
         aliases: &["pages", "content"],
         contexts: &["/media"],
@@ -144,8 +180,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Content",
         hint: "Opens the pages screen with the new-page form ready to type in",
         icon: "file-plus",
+        kind: CommandKind::Navigate,
         permission: Some("content.pages.create"),
         route: "/pages?new=1",
+        confirm: false,
         keywords: &["new page", "add page", "write", "article", "draft"],
         aliases: &["new page", "add page"],
         contexts: &["/pages", "/media"],
@@ -156,8 +194,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Content",
         hint: "The file library of the selected site",
         icon: "images",
+        kind: CommandKind::Navigate,
         permission: Some("media.read"),
         route: "/media",
+        confirm: false,
         keywords: &["files", "images", "uploads", "library", "assets"],
         aliases: &["files", "upload files"],
         contexts: &["/pages"],
@@ -168,8 +208,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Platform",
         hint: "The sites of the organization and the domains they answer on",
         icon: "globe",
+        kind: CommandKind::Navigate,
         permission: Some("sites.read"),
         route: "/sites",
+        confirm: false,
         keywords: &["domains", "website", "sites", "hosts"],
         aliases: &["domain", "website"],
         contexts: &[],
@@ -180,10 +222,43 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "Platform",
         hint: "Providers, the model registry and the chat playground",
         icon: "sparkles",
+        kind: CommandKind::Navigate,
         permission: Some("ai.providers.read"),
         route: "/ai",
+        confirm: false,
         keywords: &["models", "providers", "assistant", "chat", "ai"],
         aliases: &["ai", "models"],
+        contexts: &[],
+    },
+    CommandSpec {
+        id: "act.reindex-search",
+        title: "Rebuild the search index",
+        group: "Search",
+        hint: "Re-reads every provider's rows and rewrites the whole search index",
+        icon: "refresh-cw",
+        kind: CommandKind::Action,
+        permission: Some("search.manage"),
+        route: "/settings/search",
+        confirm: true,
+        keywords: &[
+            "reindex", "rebuild", "index", "refresh", "search", "backfill",
+        ],
+        aliases: &["reindex", "rebuild the index", "reindex search"],
+        contexts: &["/search"],
+    },
+    CommandSpec {
+        id: "act.clear-recents",
+        title: "Clear command history",
+        group: "Panel",
+        hint: "Forgets every search and command this account remembers in the palette",
+        icon: "eraser",
+        kind: CommandKind::Action,
+        permission: None,
+        // Nothing to open afterwards: the palette's own list is the surface that changes.
+        route: "",
+        confirm: true,
+        keywords: &["clear", "history", "forget", "recents", "palette", "reset"],
+        aliases: &["clear recents", "clear recent searches", "forget history"],
         contexts: &[],
     },
 ];
@@ -192,6 +267,17 @@ pub const COMMANDS: &[CommandSpec] = &[
 #[must_use]
 pub fn command(id: &str) -> Option<&'static CommandSpec> {
     COMMANDS.iter().find(|spec| spec.id == id)
+}
+
+/// One command by its id **when it is an action** — the only kind `POST
+/// /api/v1/commands/{id}/run` executes.
+///
+/// A navigation command is deliberately not runnable: it opens a screen, and a caller that wants
+/// that screen says so by opening it. Keeping the two apart here means the API's refusal
+/// (`not_runnable`) cannot drift from the registry's own answer.
+#[must_use]
+pub fn runnable(id: &str) -> Option<&'static CommandSpec> {
+    command(id).filter(|spec| spec.is_action())
 }
 
 /// Every command of the registry whose id appears in `ids`, in registry order.
@@ -278,11 +364,74 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), count, "command ids must be unique");
         assert!(
+            COMMANDS.iter().all(|spec| spec.id.split('.').count() == 2
+                && (spec.kind == CommandKind::Action || spec.route.starts_with('/'))),
+            "ids are `<area>.<action>`; a navigation command always lands on a route, an action \
+             names the screen that reads its record back or carries none"
+        );
+        assert!(
             COMMANDS
                 .iter()
-                .all(|spec| spec.id.split('.').count() == 2 && spec.route.starts_with('/')),
-            "ids are `<area>.<action>` and every command lands on a route"
+                .filter(|spec| spec.route.is_empty())
+                .all(|spec| spec.is_action()),
+            "only an action may carry no route: it never opens a screen"
         );
+    }
+
+    #[test]
+    fn only_an_action_can_be_run_and_an_action_says_whether_it_asks_first() {
+        // The two kinds are told apart by the registry itself, so the API's refusal
+        // (`not_runnable`) can never drift from what the projection says.
+        assert!(runnable("nav.pages").is_none());
+        assert!(runnable("nav.create-page").is_none());
+        assert_eq!(runnable("act.nope"), None);
+
+        let reindex = runnable("act.reindex-search").expect("the index rebuild is runnable");
+        assert_eq!(reindex.kind(), CommandKind::Action);
+        assert_eq!(reindex.permission, Some("search.manage"));
+        assert!(reindex.confirm, "a whole-index rebuild asks before it runs");
+        assert_eq!(reindex.route, "/settings/search");
+
+        let clear = runnable("act.clear-recents").expect("clearing the history is runnable");
+        assert!(
+            clear.permission.is_none(),
+            "the account's own history is every signed-in caller's to clear"
+        );
+        assert!(clear.confirm, "a clear cannot be undone, so it asks first");
+        assert_eq!(clear.route, "");
+
+        assert_eq!(CommandKind::Navigate.as_str(), "navigate");
+        assert_eq!(CommandKind::Action.as_str(), "action");
+    }
+
+    #[test]
+    fn every_action_command_matches_its_own_words() {
+        let reindex = command("act.reindex-search").expect("registered");
+        assert!(reindex.matches("reindex"));
+        assert!(reindex.matches("rebuild"));
+        assert!(reindex.matches("search"));
+        assert!(!reindex.matches("invoice"));
+
+        let clear = command("act.clear-recents").expect("registered");
+        assert!(clear.matches("clear"));
+        assert!(clear.matches("forget history"));
+        assert!(!clear.matches("reindex"));
+    }
+
+    #[test]
+    fn the_projection_never_hands_a_member_an_action_it_may_not_run() {
+        let member = visible(&allows(&["search.read"]));
+        assert!(
+            !member.iter().any(|spec| spec.id == "act.reindex-search"),
+            "search.manage is not part of a member's keys"
+        );
+        assert!(
+            member.iter().any(|spec| spec.id == "act.clear-recents"),
+            "clearing one's own history needs no key beyond being signed in"
+        );
+
+        let manager = visible(&allows(&["search.read", "search.manage"]));
+        assert!(manager.iter().any(|spec| spec.id == "act.reindex-search"));
     }
 
     #[test]
@@ -319,8 +468,8 @@ mod tests {
 
         assert_eq!(
             visible(&allows(&[])).len(),
-            1,
-            "only the panel home is unguarded"
+            2,
+            "only the panel home and clearing one's own palette history are unguarded"
         );
     }
 
