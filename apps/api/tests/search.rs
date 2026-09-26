@@ -55,6 +55,28 @@ struct TestResponse {
     body: Value,
 }
 
+/// One indexer tick, as the runner runs it: bounded batches until at least one event is applied.
+///
+/// The runner (`crate::search_runner`) loops `indexer::drain` until a batch comes back empty, and
+/// it has to: every reindex on this shared bus leaves one `search.reindexed` per provider behind
+/// and those events are skipped rather than applied, so a single `drain` call can be spent
+/// entirely on history this suite does not own. Returns how many events the tick applied.
+async fn tick(db: &Db) -> (u64, i64) {
+    let mut applied = 0_u64;
+    let mut cursor = 0_i64;
+    for _ in 0..20 {
+        let report = indexer::drain(db.pool(), 200)
+            .await
+            .expect("the drain must run");
+        applied += report.applied;
+        cursor = report.cursor;
+        if applied > 0 {
+            break;
+        }
+    }
+    (applied, cursor)
+}
+
 /// Drive the real router without a network socket.
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     let response = routes::router(state.clone())
@@ -731,10 +753,8 @@ async fn publishing_a_page_makes_it_findable_within_one_indexer_tick() {
     assert_eq!(published.status, StatusCode::OK, "body: {}", published.body);
 
     // One indexer tick: the published fact meets the index.
-    let report = indexer::drain(fixture.db.pool(), 100)
-        .await
-        .expect("the drain must run");
-    assert!(report.applied >= 1, "report: {report:?}");
+    let (applied, cursor) = tick(&fixture.db).await;
+    assert!(applied >= 1, "applied {applied}, cursor {cursor}");
 
     let body = search(&fixture.state, &editor, "launch").await;
     assert_eq!(body["total"], 1, "the published page is findable: {body}");
@@ -759,7 +779,7 @@ async fn publishing_a_page_makes_it_findable_within_one_indexer_tick() {
     let second = indexer::drain(fixture.db.pool(), 100)
         .await
         .expect("the second drain must run");
-    assert!(second.cursor >= report.cursor, "report: {second:?}");
+    assert!(second.cursor >= cursor, "report: {second:?}");
     let body = search(&fixture.state, &editor, "launch").await;
     assert_eq!(body["total"], 1, "still exactly one document: {body}");
 
@@ -811,10 +831,8 @@ async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
         created_site.body
     );
 
-    let tick = indexer::drain(fixture.db.pool(), 200)
-        .await
-        .expect("the drain must run");
-    assert!(tick.applied >= 1, "report: {tick:?}");
+    let (applied, _) = tick(&fixture.db).await;
+    assert!(applied >= 1, "the tick must apply the event, applied {applied}");
 
     let query = format!("kaizen%20{}", fixture.marker);
     let body = search(&fixture.state, &owner, &query).await;
@@ -870,10 +888,8 @@ async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
         .expect("the upload answers with the row")
         .to_owned();
 
-    let tick = indexer::drain(fixture.db.pool(), 200)
-        .await
-        .expect("the second drain must run");
-    assert!(tick.applied >= 1, "report: {tick:?}");
+    let (applied, _) = tick(&fixture.db).await;
+    assert!(applied >= 1, "the tick must apply the event, applied {applied}");
 
     let query = format!("zephyr%20{}", fixture.marker);
     let body = search(&fixture.state, &owner, &query).await;
@@ -912,10 +928,8 @@ async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
         removed.body
     );
 
-    let tick = indexer::drain(fixture.db.pool(), 200)
-        .await
-        .expect("the third drain must run");
-    assert!(tick.applied >= 1, "report: {tick:?}");
+    let (applied, _) = tick(&fixture.db).await;
+    assert!(applied >= 1, "the tick must apply the event, applied {applied}");
 
     let body = search(&fixture.state, &owner, &query).await;
     assert_eq!(
