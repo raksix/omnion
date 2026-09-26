@@ -22,6 +22,14 @@
  * first — the card above the list, `↵` to run and `esc` to take it back — and the answer the
  * owning service gives is what the result card prints: the palette never invents an outcome.
  *
+ * **The resolution card (slice 4).** A phrase of a few words is sent to be *read*
+ * (`POST /command-center/resolve`) after a short pause, and what comes back is shown as a proposal
+ * above the results: the interpretation in plain words, how sure the platform is, and the two ways
+ * to act — `Run` when the reading points somewhere the caller may really open, and `Edit as search`
+ * always. A reading that is not runnable offers alternatives instead of a run, and nothing on this
+ * card executes by itself: the operator decides. The request is aborted when a newer keystroke
+ * overtakes it, and the results keep streaming while the card is still resolving.
+ *
  * **Federated answers (slice 2).** The palette asks each provider its own question, in parallel,
  * with `history=false` (typing is not a search worth remembering — committing to a result is,
  * and that is recorded separately). Each group therefore has its own life: it shows a skeleton
@@ -73,15 +81,28 @@ import {
   fetchCommandRecents,
   fetchCommands,
   recordCommandRecent,
+  resolveCommandQuery,
   runCommand,
   searchAll,
   suggestTitles,
   type CommandInfo,
   type CommandRecent,
+  type Resolution,
   type SearchHit,
   type SearchResult,
   type SearchSuggestion,
 } from "@/lib/api";
+import {
+  RESOLVE_DEBOUNCE_MS,
+  canRun,
+  cardTitle,
+  confidenceLabel,
+  confidenceLevel,
+  editAsSearchUrl,
+  shouldResolve,
+  sourceLabel,
+  type ResolveState,
+} from "@/lib/command-resolve";
 import {
   matchCommands,
   modeLabel,
@@ -282,6 +303,10 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   const [runState, setRunState] = useState<RunState>({ status: "idle" });
   const [attempt, setAttempt] = useState(0);
   const [registryAttempt, setRegistryAttempt] = useState(0);
+  /** What the platform read in the typed words, and where that reading is up to. */
+  const [resolution, setResolution] = useState<Resolution | null>(null);
+  const [resolveState, setResolveState] = useState<ResolveState>("idle");
+  const [resolveAttempt, setResolveAttempt] = useState(0);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   // Every request carries the number of the keystroke it belongs to; an answer whose number is
@@ -448,6 +473,45 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
 
     return () => clearTimeout(timer);
   }, [term, hunting, targets, attempt, ask]);
+
+  // The reading: a phrase of a few words is sent to the platform after a short pause, and the
+  // request is aborted the moment a newer keystroke makes it stale — a slow model can never
+  // replace a fresh answer. The results keep streaming while this is in flight: the card is a
+  // proposal beside them, not a gate in front of them.
+  useEffect(() => {
+    if (!shouldResolve(mode, term)) {
+      setResolution(null);
+      setResolveState("idle");
+      return;
+    }
+
+    const controller = new AbortController();
+    setResolution(null);
+    setResolveState("resolving");
+    const phrase = term;
+    const timer = setTimeout(() => {
+      resolveCommandQuery(phrase, controller.signal)
+        .then((answer) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setResolution(answer);
+          setResolveState("ready");
+        })
+        .catch(() => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setResolution(null);
+          setResolveState("failed");
+        });
+    }, RESOLVE_DEBOUNCE_MS);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [term, mode, resolveAttempt]);
 
   /** Retry one provider: only its own group goes back to loading. */
   const retryGroup = useCallback(
@@ -736,6 +800,62 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     }
   }, []);
 
+  /**
+   * Act on a reading: run the command it names (through the same confirmation the manual path
+   * uses), or open the screen it points at. A reading with nowhere to go has no Run at all, so
+   * this can never be reached for one.
+   */
+  const runResolution = useCallback(() => {
+    if (!resolution) {
+      return;
+    }
+    const commandId = resolution.intent.command_id;
+    if (resolution.intent.kind === "command" && commandId) {
+      const command = commandById.get(commandId);
+      if (!command) {
+        return;
+      }
+      rememberCommand(command.id);
+      if (command.kind === "action") {
+        // The same machinery a manual action goes through: a command that asks first asks here too.
+        if (command.confirm) {
+          setPendingRun(command);
+        } else {
+          void runAction(command);
+        }
+        return;
+      }
+      go(command.route, false);
+      return;
+    }
+    if (resolution.route) {
+      rememberQuery(term, null);
+      go(resolution.route, false);
+    }
+  }, [commandById, go, rememberCommand, rememberQuery, resolution, runAction, term]);
+
+  /**
+   * "Edit as search": hand the words to the results screen, where the reader can fix the filters by
+   * hand. Always available, whatever the reading was — it is the one destination that cannot be
+   * wrong.
+   */
+  const editAsSearch = useCallback(() => {
+    if (!resolution) {
+      return;
+    }
+    rememberQuery(term, null);
+    go(editAsSearchUrl(resolution, term), false);
+  }, [go, rememberQuery, resolution, term]);
+
+  /** An alternative is a screen: activating it opens it, and never runs anything. */
+  const openAlternative = useCallback(
+    (route: string) => {
+      rememberQuery(term, null);
+      go(route, false);
+    },
+    [go, rememberQuery, term],
+  );
+
   const activate = useCallback(
     (item: PaletteItem, newTab: boolean) => {
       if (item.kind === "recent-query" && item.query) {
@@ -956,6 +1076,144 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
               aria-label="Dismiss the run result"
               data-palette-run-dismiss
               onClick={() => setRunState({ status: "idle" })}
+              className="shrink-0 rounded-md p-1 text-muted transition hover:bg-quiet-soft hover:text-ink"
+            >
+              <X className="size-3.5" aria-hidden />
+            </button>
+          ) : null}
+        </div>
+      </div>
+    );
+
+  /**
+   * The resolution card: what the platform read in the words, as a proposal beside the results.
+   *
+   * It is deliberately not a result row (the arrow keys walk rows that open screens); its controls
+   * are real buttons, ≥44px on touch, and the only key that reaches them is the one the reader
+   * presses on them. `Run` appears only when the server said the reading is runnable, so a
+   * low-confidence phrase can never execute anything — it offers alternatives instead.
+   */
+  const aiCard =
+    resolveState === "idle" ? null : (
+      <div
+        data-palette-ai={resolution?.intent.kind ?? "pending"}
+        data-palette-ai-state={resolveState}
+        className="mx-0.5 mb-2 rounded-lg border border-accent-strong/25 bg-accent-soft/40 px-3 py-2.5"
+      >
+        <div className="flex items-start gap-2">
+          {resolveState === "resolving" ? (
+            <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-muted" aria-hidden />
+          ) : resolveState === "failed" ? (
+            <TriangleAlert className="mt-0.5 size-4 shrink-0 text-caution" aria-hidden />
+          ) : (
+            <Sparkles className="mt-0.5 size-4 shrink-0 text-accent-strong" aria-hidden />
+          )}
+          <div className="min-w-0 flex-1">
+            {resolveState === "resolving" ? (
+              <p className="text-[13px] font-medium text-ink">Reading “{term}”…</p>
+            ) : resolveState === "failed" ? (
+              <>
+                <p className="text-[13px] font-medium text-ink">
+                  These words could not be read
+                </p>
+                <p className="mt-0.5 text-[12px] text-muted">
+                  The search below still works.
+                </p>
+                <button
+                  type="button"
+                  data-palette-ai-retry
+                  onClick={() => setResolveAttempt((value) => value + 1)}
+                  className="mt-1.5 min-h-11 rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] font-medium text-ink transition hover:bg-quiet-soft lg:min-h-0"
+                >
+                  Try again
+                </button>
+              </>
+            ) : resolution ? (
+              <>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[13px] font-medium text-ink">{cardTitle(resolution)}</p>
+                  <span
+                    data-palette-ai-confidence={confidenceLevel(resolution.confidence)}
+                    className={`shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px] ${
+                      confidenceLevel(resolution.confidence) === "high"
+                        ? "border-positive/30 bg-positive/10 text-positive"
+                        : confidenceLevel(resolution.confidence) === "medium"
+                          ? "border-caution/30 bg-caution-soft text-caution"
+                          : "border-line bg-canvas text-muted"
+                    }`}
+                  >
+                    {confidenceLabel(resolution.confidence)} sure
+                  </span>
+                </div>
+                <p
+                  data-palette-ai-preview
+                  className="mt-0.5 text-[12.5px] break-words text-ink"
+                >
+                  {resolution.preview_text}
+                </p>
+                <p data-palette-ai-source className="mt-0.5 text-[11.5px] text-muted">
+                  {sourceLabel(resolution)}
+                </p>
+                {resolution.note ? (
+                  <p
+                    data-palette-ai-note
+                    className="mt-1 text-[11.5px] break-words text-muted"
+                  >
+                    {resolution.note}
+                  </p>
+                ) : null}
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  {canRun(resolution) ? (
+                    <button
+                      type="button"
+                      data-palette-ai-run
+                      onClick={runResolution}
+                      className="min-h-11 rounded-md border border-accent-strong/30 bg-accent-soft px-3 py-1.5 text-[12px] font-medium text-accent-strong transition hover:bg-surface lg:min-h-0"
+                    >
+                      Run
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    data-palette-ai-edit
+                    onClick={editAsSearch}
+                    className="min-h-11 rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] font-medium text-ink transition hover:bg-quiet-soft lg:min-h-0"
+                  >
+                    Edit as search
+                  </button>
+                </div>
+                {!resolution.runnable && resolution.alternatives.length > 0 ? (
+                  <div data-palette-ai-suggest className="mt-2.5">
+                    <p className="text-[11px] font-medium tracking-wide text-muted uppercase">
+                      Did you mean
+                    </p>
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      {resolution.alternatives.map((alternative) => (
+                        <button
+                          key={alternative.route}
+                          type="button"
+                          data-palette-ai-alternative={alternative.route}
+                          onClick={() => openAlternative(alternative.route)}
+                          className="min-h-11 max-w-full truncate rounded-md border border-line bg-surface px-2.5 py-1.5 text-[12px] text-ink transition hover:bg-quiet-soft lg:min-h-0"
+                        >
+                          {alternative.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+          {resolveState !== "resolving" ? (
+            <button
+              type="button"
+              aria-label="Dismiss the interpretation"
+              data-palette-ai-dismiss
+              onClick={() => {
+                setResolution(null);
+                setResolveState("idle");
+              }}
               className="shrink-0 rounded-md p-1 text-muted transition hover:bg-quiet-soft hover:text-ink"
             >
               <X className="size-3.5" aria-hidden />
@@ -1571,6 +1829,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         >
           {confirmCard}
           {runCard}
+          {aiCard}
           {body()}
         </div>
 

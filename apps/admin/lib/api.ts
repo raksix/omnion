@@ -692,6 +692,82 @@ export function runCommand(commandId: string, confirm = true): Promise<CommandRu
 }
 
 // ---------------------------------------------------------------------------------------------
+// Natural-language resolution (REQ-032, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** One filter an interpretation carried, in the words the card prints. */
+export type IntentFilter = {
+  key: string;
+  label: string;
+  value: string;
+};
+
+/** What the resolver understood, in the platform's own vocabulary. */
+export type ResolvedIntent = {
+  /** `search`, `command` or `unclear`. */
+  kind: "search" | "command" | "unclear";
+  /** The domain word the reader used, if any. */
+  entity: string | null;
+  /** The provider the domain maps to, when the index answers for it. */
+  provider: string | null;
+  /** The registry id a command interpretation named. */
+  command_id: string | null;
+  /** The words a search would carry. */
+  query: string;
+  filters: IntentFilter[];
+  sort: "newest" | "oldest" | "title" | null;
+  limit: number | null;
+  confidence: number;
+};
+
+/** One thing the words could have meant instead — always a screen, never an action. */
+export type ResolveAlternative = {
+  label: string;
+  kind: "search" | "command";
+  route: string;
+  provider: string | null;
+  command_id: string | null;
+  confidence: number;
+};
+
+/**
+ * One interpretation of a typed phrase.
+ *
+ * `runnable` is the server's own answer to "may this be run", permission rules included; `route`
+ * is where a runnable reading lands. `source` and `degraded` say where the reading came from, so
+ * the card never dresses a local reading up as a model's.
+ */
+export type Resolution = {
+  query: string;
+  source: "local" | "model";
+  degraded: boolean;
+  note: string | null;
+  preview_text: string;
+  runnable: boolean;
+  route: string | null;
+  /** Where `Edit as search` goes — the words and filters, runnable or not. */
+  search_route: string | null;
+  confidence: number;
+  intent: ResolvedIntent;
+  alternatives: ResolveAlternative[];
+  model: string | null;
+};
+
+/**
+ * Ask the platform what one phrase means.
+ *
+ * Nothing executes here: the answer is an interpretation plus the ways to act on it. `signal`
+ * aborts a request a newer keystroke has overtaken, so a slow reading never replaces a fresh one.
+ */
+export function resolveCommandQuery(q: string, signal?: AbortSignal): Promise<Resolution> {
+  return request<Resolution>("/api/v1/command-center/resolve", {
+    method: "POST",
+    body: JSON.stringify({ q }),
+    ...(signal ? { signal } : {}),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
 // AI Hub (docs/06-AI-HUB.md, P11)
 // ---------------------------------------------------------------------------------------------
 
