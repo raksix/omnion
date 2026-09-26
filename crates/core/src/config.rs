@@ -46,6 +46,24 @@ pub const DEFAULT_WORKFLOW_RETRY_BASE_MS: u64 = 5_000;
 /// Default ceiling of the retry backoff in milliseconds (`OMNION_WORKFLOW_RETRY_MAX_MS`).
 pub const DEFAULT_WORKFLOW_RETRY_MAX_MS: u64 = 300_000;
 
+/// Default delay between two webhook-delivery ticks (`OMNION_EVENTS_POLL_MS`).
+pub const DEFAULT_EVENTS_POLL_MS: u64 = 5_000;
+
+/// Default number of deliveries one tick may claim (`OMNION_EVENTS_BATCH`).
+pub const DEFAULT_EVENTS_BATCH: usize = 20;
+
+/// Default claim lease in seconds (`OMNION_EVENTS_LEASE_SECONDS`).
+pub const DEFAULT_EVENTS_LEASE_SECONDS: u64 = 120;
+
+/// Default per-delivery request timeout in milliseconds (`OMNION_EVENTS_REQUEST_TIMEOUT_MS`).
+pub const DEFAULT_EVENTS_REQUEST_TIMEOUT_MS: u64 = 10_000;
+
+/// Default first retry backoff in milliseconds (`OMNION_EVENTS_RETRY_BASE_MS`).
+pub const DEFAULT_EVENTS_RETRY_BASE_MS: u64 = 15_000;
+
+/// Default ceiling of the retry backoff in milliseconds (`OMNION_EVENTS_RETRY_MAX_MS`).
+pub const DEFAULT_EVENTS_RETRY_MAX_MS: u64 = 900_000;
+
 /// Deployment environment the process runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -263,6 +281,44 @@ impl Default for WorkflowConfig {
     }
 }
 
+/// Event bus and webhook delivery knobs (`OMNION_EVENTS_*`, phase P12).
+///
+/// The background runner of `apps/api` reads these: it drains the delivery queue every
+/// `poll_ms` and gives each receiver `request_timeout_ms` to answer. An installation that
+/// delivers from somewhere else turns the runner off with `OMNION_EVENTS_RUNNER=false` — the
+/// queue is durable, so another worker picks the work up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsConfig {
+    /// Whether this process drains the webhook delivery queue (`OMNION_EVENTS_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two delivery ticks (`OMNION_EVENTS_POLL_MS`).
+    pub poll_ms: u64,
+    /// Deliveries one tick may claim (`OMNION_EVENTS_BATCH`).
+    pub batch: usize,
+    /// How long a claim is exclusive, in seconds (`OMNION_EVENTS_LEASE_SECONDS`).
+    pub lease_seconds: u64,
+    /// How long one delivery may take, in milliseconds (`OMNION_EVENTS_REQUEST_TIMEOUT_MS`).
+    pub request_timeout_ms: u64,
+    /// First retry backoff (`OMNION_EVENTS_RETRY_BASE_MS`).
+    pub retry_base_ms: u64,
+    /// Ceiling of the retry backoff (`OMNION_EVENTS_RETRY_MAX_MS`).
+    pub retry_max_ms: u64,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_EVENTS_POLL_MS,
+            batch: DEFAULT_EVENTS_BATCH,
+            lease_seconds: DEFAULT_EVENTS_LEASE_SECONDS,
+            request_timeout_ms: DEFAULT_EVENTS_REQUEST_TIMEOUT_MS,
+            retry_base_ms: DEFAULT_EVENTS_RETRY_BASE_MS,
+            retry_max_ms: DEFAULT_EVENTS_RETRY_MAX_MS,
+        }
+    }
+}
+
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -278,6 +334,8 @@ pub struct Config {
     pub admin: Option<AdminBootstrap>,
     /// Workflow engine knobs (P09).
     pub workflows: WorkflowConfig,
+    /// Event bus and webhook delivery knobs (P12).
+    pub events: EventsConfig,
     /// Logging.
     pub log: LogConfig,
 }
@@ -388,6 +446,32 @@ impl Config {
             )?,
         };
 
+        let events = EventsConfig {
+            runner_enabled: read_flag(&read, "OMNION_EVENTS_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_EVENTS_POLL_MS", DEFAULT_EVENTS_POLL_MS)?,
+            batch: read_count(&read, "OMNION_EVENTS_BATCH", DEFAULT_EVENTS_BATCH)?,
+            lease_seconds: read_positive(
+                &read,
+                "OMNION_EVENTS_LEASE_SECONDS",
+                DEFAULT_EVENTS_LEASE_SECONDS,
+            )?,
+            request_timeout_ms: read_positive(
+                &read,
+                "OMNION_EVENTS_REQUEST_TIMEOUT_MS",
+                DEFAULT_EVENTS_REQUEST_TIMEOUT_MS,
+            )?,
+            retry_base_ms: read_positive(
+                &read,
+                "OMNION_EVENTS_RETRY_BASE_MS",
+                DEFAULT_EVENTS_RETRY_BASE_MS,
+            )?,
+            retry_max_ms: read_positive(
+                &read,
+                "OMNION_EVENTS_RETRY_MAX_MS",
+                DEFAULT_EVENTS_RETRY_MAX_MS,
+            )?,
+        };
+
         let config = Self {
             env,
             http: HttpConfig { host, port },
@@ -395,6 +479,7 @@ impl Config {
             redis,
             admin,
             workflows,
+            events,
             log,
         };
         config.validate()?;
@@ -428,6 +513,7 @@ impl Default for Config {
             },
             admin: None,
             workflows: WorkflowConfig::default(),
+            events: EventsConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
     }
@@ -659,5 +745,57 @@ mod tests {
         let error = config_from(&[("OMNION_WORKFLOW_RUNNER", "maybe")])
             .expect_err("an unknown boolean is refused");
         assert_eq!(error.key, "OMNION_WORKFLOW_RUNNER");
+    }
+
+    #[test]
+    fn the_event_delivery_runner_has_development_defaults() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.events.runner_enabled);
+        assert_eq!(config.events.poll_ms, DEFAULT_EVENTS_POLL_MS);
+        assert_eq!(config.events.batch, DEFAULT_EVENTS_BATCH);
+        assert_eq!(config.events.lease_seconds, DEFAULT_EVENTS_LEASE_SECONDS);
+        assert_eq!(
+            config.events.request_timeout_ms,
+            DEFAULT_EVENTS_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(config.events.retry_base_ms, DEFAULT_EVENTS_RETRY_BASE_MS);
+        assert_eq!(config.events.retry_max_ms, DEFAULT_EVENTS_RETRY_MAX_MS);
+    }
+
+    #[test]
+    fn the_event_delivery_runner_is_configurable() {
+        let config = config_from(&[
+            ("OMNION_EVENTS_RUNNER", "false"),
+            ("OMNION_EVENTS_POLL_MS", "250"),
+            ("OMNION_EVENTS_BATCH", "4"),
+            ("OMNION_EVENTS_LEASE_SECONDS", "30"),
+            ("OMNION_EVENTS_REQUEST_TIMEOUT_MS", "1000"),
+            ("OMNION_EVENTS_RETRY_BASE_MS", "100"),
+            ("OMNION_EVENTS_RETRY_MAX_MS", "900"),
+        ])
+        .expect("the event settings are valid");
+
+        assert!(!config.events.runner_enabled);
+        assert_eq!(config.events.poll_ms, 250);
+        assert_eq!(config.events.batch, 4);
+        assert_eq!(config.events.lease_seconds, 30);
+        assert_eq!(config.events.request_timeout_ms, 1_000);
+        assert_eq!(config.events.retry_base_ms, 100);
+        assert_eq!(config.events.retry_max_ms, 900);
+    }
+
+    #[test]
+    fn broken_event_settings_fail_at_boot() {
+        let error =
+            config_from(&[("OMNION_EVENTS_POLL_MS", "0")]).expect_err("a zero poll is refused");
+        assert_eq!(error.key, "OMNION_EVENTS_POLL_MS");
+
+        let error = config_from(&[("OMNION_EVENTS_BATCH", "many")])
+            .expect_err("a non-numeric batch is refused");
+        assert_eq!(error.key, "OMNION_EVENTS_BATCH");
+
+        let error = config_from(&[("OMNION_EVENTS_RUNNER", "maybe")])
+            .expect_err("an unknown boolean is refused");
+        assert_eq!(error.key, "OMNION_EVENTS_RUNNER");
     }
 }
