@@ -89,8 +89,21 @@
 
 ## P11 — AI Hub v0 (docs/06)
 
-- [ ] Provider abstraction + providers/models tables; chat endpoint (streaming); provider config in admin.
-- [ ] **Verify:** chat round-trip against a configured OpenAI-compatible provider (CI: mock). Commit + push + log.
+- [x] Provider abstraction + providers/models tables; chat endpoint (streaming); provider config in admin.
+      `crates/ai-hub` (stored shapes with validation, the OpenAI-compatible wire client with an SSE
+      decoder, and the router that resolves `provider/model` → bare key → default model),
+      `database/migrations/0008_ai_hub.sql` (two partial unique indexes: one default provider, one
+      default model), the `/api/v1/ai` surface (providers — the key write-only —, the model registry,
+      discovery against the provider itself, `PATCH /ai/models/{id}` and `POST /ai/chat` answering as
+      `text/event-stream`), the `/ai` screen in `apps/admin` (providers, models, Try-it chat) and
+      `infra/mocks/openai-compatible.mjs` for the mock round trip.
+- [x] **Verify:** chat round-trip against a configured OpenAI-compatible provider (CI: mock). Commit + push + log.
+      `apps/api/tests/ai_hub.rs` — 2 walks against the compose stack with an in-process mock provider
+      (connect → registry → streamed chat → refusal → default repair → audit → removal, plus the
+      permission gate). Live walk on `:18096` against the Node mock: `start` + 5 deltas + `done`
+      (`total_tokens=12`) reassembling to the mock's answer, a refused model as an `error` frame with
+      `provider_error`, anonymous `401`, 7 `ai.*` audit rows. Browser walk 10/10 with 0 console errors.
+      The CI `AI Hub walk (mock provider)` step runs the same flow (dry-run locally: exit 0).
 
 ## P12 — Events + Webhooks v0
 

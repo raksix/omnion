@@ -534,3 +534,87 @@
 - Two walks that share a table-wide repair pass cannot run at once: `engine::sweep` is
   deliberately global, so the workflow suite now holds a walk lock — determinism is worth the
   extra ~17 s of serial runtime, and a flake that fails 4 of 5 runs is a bug, not weather.
+
+## 2026-09-26 — P11 · AI Hub v0 (docs/06)
+
+- New crate `crates/ai-hub` (`omnion-ai-hub`) — the platform's single door to AI. `model.rs` holds
+  the stored shapes and their validation (a provider is a name, a protocol, a base URL and a
+  write-only key; a model is a wire key plus the capability metadata of docs/06 §3); `store.rs`
+  keeps the two data rules the rest of the platform leans on — at most one default provider, and a
+  default model that is always an enabled one (a switch-off, a removal, a replaced model list or a
+  deleted provider repairs the default, or leaves the installation without one — never with a
+  model that cannot answer); `client.rs` is the OpenAI-compatible wire client (`chat`,
+  `stream_chat` with an SSE decoder built against frames rather than chunks, and
+  `list_remote_models`); `router.rs` resolves a request to one `(provider, model)` pair — an
+  explicit `provider/model`, a bare key searched across the enabled providers (default provider
+  first, and a model key may itself carry a slash), or the installation's default model.
+- `database/migrations/0008_ai_hub.sql`: `ai_providers` + `ai_models`, with the partial unique
+  indexes that make the two rules the database's own (one default provider, one default model),
+  case-insensitive provider names, a base-URL shape check and a cascade from a provider to its
+  models.
+- Permissions: `ai.providers.read`, `ai.providers.manage` and `ai.chat` (category `ai`) —
+  connecting an endpoint and using the platform's AI are separate powers. Manager reads the
+  registry and chats (managing providers stays with Owner/Administrator), moderator and editor
+  chat, member holds none of them.
+- API (`/api/v1/ai`): providers list/create/patch/delete (the key goes in and never comes back —
+  only `has_api_key` does), the model registry (`GET /ai/models`, `PUT /ai/providers/{id}/models`
+  replaces a provider's set, `PATCH /ai/models/{id}` switches or defaults one), discovery against
+  the provider itself (`POST /ai/providers/{id}/discover-models`) and `POST /ai/chat`, which
+  answers as `text/event-stream`: `start` (the pair the router chose) → `delta` frames → `done`
+  with the finish reason and the token usage, or `error` with a stable code. Every exchange is
+  audited (`ai.chat.completed` / `ai.chat.failed`) with provider, model and usage.
+- `apps/admin`: the `/ai` screen (sidebar entry; provider list with enable / make-default /
+  models / remove; a connect form with the key write-only; a model editor with "Discover from
+  provider"; the registry with capability flags and default/enable switches; and a Try-it chat
+  that streams an answer through the whole chain). `lib/api.ts` gained the typed client, including
+  a browser-side `streamChat` that parses the SSE frames.
+- `infra/mocks/openai-compatible.mjs`: a dependency-free OpenAI-compatible mock (models list, JSON
+  and streamed chat, and a model it refuses with `500`) so the round trip is reproducible locally
+  and in CI without a vendor key.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `cargo test --workspace` → **303 passed, 0 failed** (ai-hub 26 unit
+  tests; `apps/api/tests/ai_hub.rs` is new) · `pnpm --filter @omnion/admin build` green with the
+  `ƒ /ai` route and `pnpm --filter @omnion/admin typecheck` clean.
+- Live walk (fresh database `omnion_p11_live`, API `:18096`, mock on `:8123`): sign-in; connect
+  `Local Mock` (`http://127.0.0.1:8123/v1/` — the trailing slash normalized away, key stored,
+  `model_count 2`, no key anywhere in the responses); the registry lists both models with
+  `Local Mock/mock-large` as the default; discovery returns the provider's own list; a chat
+  addressed as `Local Mock/mock-large` streams `start` + 5 deltas + `done`
+  (`chars=33 · total_tokens=12`) and reassembles to `Hello from the mock (mock-large).`; the same
+  without a model named (the router takes the default); a model the provider refuses arrives as
+  `event: error {"code":"provider_error", … 500 …}`; an anonymous chat is `401`; the audit trail
+  holds 7 `ai.*` rows across five actions.
+- Browser walk (admin panel `:3100` against the API, Chromium): **10/10** checks — sign-in, the
+  sidebar entry, the provider row, the model rows with the default marked, a chat streaming
+  through the UI (`Hello from the mock (mock-large).` · route `Local Mock · mock-large ·
+  openai_compatible` · usage `33 characters · 12 tokens · stop`), a model becoming the default
+  from its row, and 0 console errors.
+- CI: a new `AI Hub walk (mock provider)` step starts the mock and a second API instance, connects
+  the provider, streams a chat, asserts the reassembled answer, the `provider_error` frame and the
+  anonymous `401`, and prints the `ai.*` audit rows. Its script was dry-run locally against the
+  live stack first (`exit 0`, `ai chat stream: deltas=5 reassembled="Hello from the mock
+  (mock-large)."`).
+- Next: **P12 — Events + Webhooks v0** (event bus table + delivery worker + HMAC signatures, first
+  fan-out `page.published`).
+
+### Lessons
+
+- A provider key is a one-way shape: the API's provider body has no field for it (`has_api_key` is
+  derived), so "the key never comes back" is a grep over the responses rather than an audit of
+  every handler — design the response type so a leak would need a new field.
+- Two invariants belong to the schema, not to validation code: "one default provider" and "the
+  default model is always enabled" are partial unique indexes plus one `repair_default_model` pass
+  that every write path calls. The database refuses the impossible state; the store reforms it
+  after each change.
+- Streaming has two failure surfaces and both need an answer: everything decidable before the
+  first byte stays an HTTP status (routing, permission, request shape), everything after it
+  travels as an `error` frame inside the stream. A client that handles only one of them shows a
+  half-answer, or a spinner that never stops.
+- The SSE decoder is where a provider's personality is: it must survive a JSON object split
+  mid-frame, CRLF frames, keep-alive comments, a missing trailing blank line, a usage frame after
+  the finish reason, and a refusal smuggled inside a `200` stream. Write it against frames, never
+  against "one chunk = one event" — and prove it with frame-level unit tests.
+- Two mocks, two jobs: the in-process axum mock keeps the Rust suite hermetic; the zero-dependency
+  Node mock makes the same round trip reachable from CI and from a laptop. The CI step's script
+  was dry-run locally before it was committed — and the dry run found that 8081 on this box is the
+  Pterodactyl Wings daemon, not a free port (`ss -tlpn` before trusting a port).
