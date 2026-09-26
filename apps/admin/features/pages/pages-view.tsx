@@ -62,6 +62,8 @@ export function PagesView() {
   const [publishing, setPublishing] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** The title field of the editor — the command centre's "Create a page" focuses it. */
+  const titleRef = useRef<HTMLInputElement | null>(null);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
@@ -93,11 +95,11 @@ export function PagesView() {
     };
   }, [selectedSite, filter, reloadToken]);
 
-  const openCreate = () => {
+  const openCreate = useCallback(() => {
     setActionError(null);
     setNotice(null);
     setEditor({ id: null, title: "", slug: "", body: "" });
-  };
+  }, []);
 
   const openEdit = useCallback((page: Page) => {
     setActionError(null);
@@ -125,6 +127,29 @@ export function PagesView() {
     appliedFocus.current = focusParam;
     openEdit(target);
   }, [focusParam, pages, openEdit]);
+
+  // `/pages?new=1` — the "Create a page" command (REQ-032) opens the same form the button does,
+  // applied once like `focus`, so dismissing it does not bring it back on the next render.
+  const newParam = searchParams.get("new");
+  const appliedNew = useRef<string | null>(null);
+  useEffect(() => {
+    if (!newParam || appliedNew.current === newParam) {
+      return;
+    }
+    appliedNew.current = newParam;
+    openCreate();
+  }, [newParam, openCreate]);
+
+  // The new-page form takes the focus the moment it is on screen: the command centre lands on it
+  // from `/pages?new=1`, and a form that opens without the cursor in its first field makes the
+  // command feel half-done. The effect runs after the form is committed, which is why the focus
+  // belongs here rather than in `openCreate` (where the field does not exist yet).
+  const creating = editor !== null && editor.id === null;
+  useEffect(() => {
+    if (creating) {
+      titleRef.current?.focus();
+    }
+  }, [creating]);
 
   /** Save the editor: a new page, or the next draft revision of the one being edited. */
   const save = async () => {
@@ -248,6 +273,7 @@ export function PagesView() {
                 <input
                   id="page-title"
                   name="title"
+                  ref={titleRef}
                   value={editor.title}
                   onChange={(event) =>
                     setEditor((current) =>
