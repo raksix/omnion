@@ -1595,7 +1595,9 @@ async function runAnalyticsDepth(page, report) {
   await page.goto(`${URL_ADMIN}/analytics/pages`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1500);
   steps.pageRows = await page.locator("[data-analytics-row]").count();
-  const link = page.locator("[data-analytics-page-link]").first();
+  // `:visible` on purpose: a click-through harness clicks what a person could click, and a screen
+  // is allowed to keep an unshown copy of a control in the DOM.
+  const link = page.locator("[data-analytics-page-link]:visible").first();
   if ((await link.count()) > 0) {
     await link.click({ timeout: 4000 }).catch(() => {});
     await page.waitForTimeout(1400);
