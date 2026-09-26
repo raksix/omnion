@@ -850,6 +850,183 @@ async function runPalette(page, report) {
   report.palette = steps;
 }
 
+// ---------------------------------------------------------------- search depth
+
+/** The result count the results screen shows ("42 results for “qa”"), as a number. */
+async function searchTotal(page) {
+  return page
+    .evaluate(() => {
+      const node = document.querySelector("[data-search-total]");
+      return node ? Number((node.textContent || "").replace(/[^0-9]/g, "")) : null;
+    })
+    .catch(() => null);
+}
+
+/**
+ * The depth pass of the results screen and the search settings (REQ-002, slice 3).
+ *
+ * Every step is a number, not an impression: the facet's own count before and after a click, the
+ * chips the filters leave, how many rows a Shift-range selected, how many links the clipboard
+ * holds, how many rows the exported file carries — and, on the settings screen, what the pass
+ * report says and what the weights form does with a value the API refuses.
+ */
+async function runSearchDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "search-depth", action: "search", ...step });
+  };
+
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+    origin: URL_ADMIN,
+  }).catch(() => {});
+
+  await page.goto(`${URL_ADMIN}/search?q=qa`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-facet-rail]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const groups = await page.locator("[data-facet]").count();
+  const countBefore = await searchTotal(page);
+  const firstValue = page.locator('[data-facet="type"] [data-facet-value]').first();
+  const firstLabel = (await firstValue.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+  note({ step: "facets", groups, firstValue: firstLabel, countBefore });
+  await shot(page, "search-facets");
+
+  await firstValue.click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const appliedChips = await page.locator("[data-chip]").count();
+  const countAfter = await searchTotal(page);
+  note({
+    step: "apply-facet",
+    chips: appliedChips,
+    countBefore,
+    countAfter,
+    narrowed: countAfter !== null && countBefore !== null && countAfter <= countBefore,
+  });
+  await shot(page, "search-facet-applied");
+
+  await page.locator("[data-chip] button").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  note({ step: "remove-chip", chips: await page.locator("[data-chip]").count() });
+
+  // `s` cycles the sort order without touching the mouse.
+  await page.locator("[data-search-query]").first().click().catch(() => {});
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("s").catch(() => {});
+  await page.waitForTimeout(900);
+  const sortValue = await page.locator("[data-search-sort]").inputValue().catch(() => null);
+  note({ step: "sort-key", sortValue });
+
+  // A Shift-range selection: two clicks with Shift select the rows between them.
+  const boxes = page.locator("[data-search-row] [data-row-checkbox]");
+  const rowCount = await boxes.count();
+  if (rowCount >= 3) {
+    await boxes.nth(0).click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(200);
+    await boxes.nth(2).click({ modifiers: ["Shift"], timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  } else {
+    for (let i = 0; i < rowCount; i += 1) {
+      await boxes.nth(i).click({ timeout: 4000 }).catch(() => {});
+    }
+    await page.waitForTimeout(400);
+  }
+  const bulkText = await page.locator("[data-search-bulk]").innerText().catch(() => "");
+  const selectedCount = Number((/(\d+)\s+selected/.exec(bulkText) || [])[1] || 0);
+  note({ step: "shift-range", rows: rowCount, selected: selectedCount });
+  await shot(page, "search-selection");
+
+  // Copy links: the clipboard holds one link per selected row.
+  await page.locator("[data-bulk-copy]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const clipboard = await page
+    .evaluate(() => navigator.clipboard.readText().catch(() => ""))
+    .catch(() => "");
+  const links = clipboard.split("\n").map((line) => line.trim()).filter(Boolean);
+  note({ step: "copy-links", links: links.length, sample: links[0] || null, matches: links.length === selectedCount });
+
+  // Export the selection: the file carries exactly the rows the screen showed as checked.
+  let csvRows = null;
+  let csvHeader = null;
+  const download = await Promise.all([
+    page.waitForEvent("download", { timeout: 10000 }).catch(() => null),
+    page.locator("[data-bulk-export]").click({ timeout: 4000 }).catch(() => {}),
+  ]).then(([event]) => event);
+  if (download) {
+    const target = path.join(OUT, "search-export.csv");
+    await download.saveAs(target).catch(() => {});
+    if (fs.existsSync(target)) {
+      const lines = fs.readFileSync(target, "utf8").split("\n").filter((line) => line.trim());
+      csvHeader = lines[0] || null;
+      csvRows = Math.max(lines.length - 1, 0);
+    }
+  }
+  note({ step: "export-selection", csvRows, csvHeader, matches: csvRows === selectedCount });
+  await shot(page, "search-exported");
+
+  // The shortcut list, and Escape leaving it.
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("?").catch(() => {});
+  await page.waitForTimeout(400);
+  const shortcuts = await page.locator("[data-search-shortcuts-dialog]").count();
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(300);
+  note({ step: "shortcuts", opened: shortcuts > 0, closed: (await page.locator("[data-search-shortcuts-dialog]").count()) === 0 });
+
+  // The settings screen: a pass per provider, its numbers, and the weights form.
+  await page.goto(`${URL_ADMIN}/settings/search`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-provider-row]:visible", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const providers = await page.locator("[data-provider-row]:visible").count();
+  const states = await page.locator("[data-provider-state]:visible").allInnerTexts().catch(() => []);
+  note({ step: "settings-open", providers, states });
+  await shot(page, "search-settings");
+
+  await page.locator('[data-reindex="pages"]:visible').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForSelector("[data-search-progress]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const progress = (await page.locator("[data-search-progress]").innerText().catch(() => "")).trim();
+  const lastPass = await page
+    .locator('[data-provider-row="pages"]:visible td')
+    .nth(4)
+    .innerText()
+    .catch(() => "");
+  note({ step: "reindex-provider", progress, lastPass: lastPass.replace(/\s+/g, " ").trim() });
+  await shot(page, "search-settings-reindex");
+
+  // A value the API refuses is shown as the API phrased it.
+  await page.locator('[data-weight="body"]').fill("9").catch(() => {});
+  await page.locator('[data-weight="title"]').fill("2").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.locator("[data-save-settings]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const refused = (await page.locator("text=Title must be at least Body").count()) > 0;
+  note({ step: "weights-validation", refused });
+
+  // Restore the defaults and save: the screen is left exactly as it was found. Every provider is
+  // switched back on first — the generic click-through walks these checkboxes too, and the
+  // installation the pass leaves behind should answer with everything it has.
+  const providerBoxes = page.locator("[data-enabled-provider]");
+  const providerCount = await providerBoxes.count();
+  for (let index = 0; index < providerCount; index += 1) {
+    const box = providerBoxes.nth(index);
+    if (!(await box.isChecked().catch(() => false))) {
+      await box.click({ timeout: 3000 }).catch(() => {});
+    }
+  }
+  await page.locator("[data-restore-defaults]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-save-settings]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const saved = (await page.locator("[data-search-progress]").innerText().catch(() => "")).trim();
+  const titleWeight = await page.locator('[data-weight="title"]').inputValue().catch(() => null);
+  note({ step: "weights-saved", saved, titleWeight });
+  await shot(page, "search-settings-saved");
+
+  report.searchDepth = steps;
+}
+
 // ---------------------------------------------------------------- run
 
 async function main() {
@@ -894,6 +1071,8 @@ async function main() {
     { path: "/ai", name: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
+    // The index's own screen (REQ-002, slice 3) — no untested screen.
+    { path: "/settings/search", name: "search-settings" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -912,6 +1091,9 @@ async function main() {
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
+
+  // The depth pass: facets, selection, copy, export and the index's own settings screen.
+  await runSearchDepth(page, report);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -933,7 +1115,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
