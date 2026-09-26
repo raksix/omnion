@@ -10,7 +10,11 @@
 //!
 //! When PostgreSQL is not reachable the suite skips itself with a printed reason, so
 //! `cargo test` stays usable on a machine without Docker.
+//!
+//! The walks run **one at a time** (see `walk_lock`): the engine's sweep pass works on the whole
+//! `workflows` table, so two walks in flight could settle each other's rows.
 
+use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
 use axum::body::Body;
@@ -31,11 +35,25 @@ use omnion_workflows::{
 };
 use serde_json::{Value, json};
 use time::Duration;
+use tokio::sync::{Mutex, MutexGuard};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
+
+/// The lock that keeps one walk in flight.
+///
+/// `engine::sweep` is deliberately table-wide (it is what repairs an installation whose runner
+/// stopped), and every walk of this suite calls it — so two walks running at once can settle
+/// each other's rows: the wait walk parks a step and the reclaim walk's sweep finishes it, the
+/// reclaim walk claims a step and the other walk's sweep takes it back. The walks assert on
+/// timing, so they hold this lock for their whole run instead of racing on the shared
+/// development database.
+fn walk_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Permission keys the workflow operator of this suite holds.
 const WORKFLOW_PERMISSIONS: [&str; 3] = ["workflows.read", "workflows.manage", "workflows.run"];
@@ -252,6 +270,8 @@ async fn drive_until_settled(
 /// Two organizations with one site each, a platform Owner, a workflow operator of the first
 /// organization and a plain member without any workflow permission.
 struct Fixture {
+    /// Holds the suite's walk lock for as long as the fixture lives.
+    _walk: MutexGuard<'static, ()>,
     state: AppState,
     db: Db,
     platform_email: String,
@@ -265,6 +285,8 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
+        // One walk at a time — see `walk_lock`.
+        let walk = walk_lock().lock().await;
         let (state, db) = live_state().await?;
         seed::ensure(db.pool())
             .await
@@ -327,6 +349,7 @@ impl Fixture {
         let (member_id, member_email) = create_account(&db, Some(organization_a)).await;
 
         Some(Self {
+            _walk: walk,
             state,
             db,
             platform_email,
