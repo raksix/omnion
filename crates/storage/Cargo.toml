@@ -1,0 +1,19 @@
+[package]
+name = "omnion-storage"
+description = "Omnion storage: the S3/MinIO object-storage abstraction behind the media library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+hex.workspace = true
+hmac.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
