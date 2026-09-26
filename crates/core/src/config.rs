@@ -28,6 +28,24 @@ pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 /// Default tracing filter (`OMNION_LOG`).
 pub const DEFAULT_LOG_FILTER: &str = "info";
 
+/// Default delay between two workflow-runner ticks (`OMNION_WORKFLOW_TICK_MS`).
+pub const DEFAULT_WORKFLOW_TICK_MS: u64 = 1_000;
+
+/// Default workflow wait-sweeper cadence (`OMNION_WORKFLOW_SWEEP_SECONDS`).
+pub const DEFAULT_WORKFLOW_SWEEP_SECONDS: u64 = 30;
+
+/// Default number of steps one tick may advance (`OMNION_WORKFLOW_BATCH`).
+pub const DEFAULT_WORKFLOW_BATCH: usize = 16;
+
+/// Default number of schedules one tick may start (`OMNION_WORKFLOW_SCHEDULER_BATCH`).
+pub const DEFAULT_WORKFLOW_SCHEDULER_BATCH: usize = 8;
+
+/// Default first retry backoff in milliseconds (`OMNION_WORKFLOW_RETRY_BASE_MS`).
+pub const DEFAULT_WORKFLOW_RETRY_BASE_MS: u64 = 5_000;
+
+/// Default ceiling of the retry backoff in milliseconds (`OMNION_WORKFLOW_RETRY_MAX_MS`).
+pub const DEFAULT_WORKFLOW_RETRY_MAX_MS: u64 = 300_000;
+
 /// Deployment environment the process runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -208,6 +226,43 @@ impl RedisConfig {
     }
 }
 
+/// Workflow engine knobs (`OMNION_WORKFLOW_*`, phase P09).
+///
+/// The background runner of `apps/api` reads these; an installation that does not want the
+/// engine ticking in-process turns it off with `OMNION_WORKFLOW_RUNNER=false` and runs the
+/// steps from wherever it prefers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowConfig {
+    /// Whether this process runs the engine (`OMNION_WORKFLOW_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two ticks (`OMNION_WORKFLOW_TICK_MS`).
+    pub tick_ms: u64,
+    /// Delay between two sweeps (`OMNION_WORKFLOW_SWEEP_SECONDS`).
+    pub sweep_seconds: u64,
+    /// Steps one tick may advance (`OMNION_WORKFLOW_BATCH`).
+    pub batch: usize,
+    /// Schedules one tick may start (`OMNION_WORKFLOW_SCHEDULER_BATCH`).
+    pub scheduler_batch: usize,
+    /// First retry backoff (`OMNION_WORKFLOW_RETRY_BASE_MS`).
+    pub retry_base_ms: u64,
+    /// Ceiling of the retry backoff (`OMNION_WORKFLOW_RETRY_MAX_MS`).
+    pub retry_max_ms: u64,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            tick_ms: DEFAULT_WORKFLOW_TICK_MS,
+            sweep_seconds: DEFAULT_WORKFLOW_SWEEP_SECONDS,
+            batch: DEFAULT_WORKFLOW_BATCH,
+            scheduler_batch: DEFAULT_WORKFLOW_SCHEDULER_BATCH,
+            retry_base_ms: DEFAULT_WORKFLOW_RETRY_BASE_MS,
+            retry_max_ms: DEFAULT_WORKFLOW_RETRY_MAX_MS,
+        }
+    }
+}
+
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -221,6 +276,8 @@ pub struct Config {
     pub redis: RedisConfig,
     /// Optional first-administrator bootstrap.
     pub admin: Option<AdminBootstrap>,
+    /// Workflow engine knobs (P09).
+    pub workflows: WorkflowConfig,
     /// Logging.
     pub log: LogConfig,
 }
@@ -305,12 +362,39 @@ impl Config {
             format,
         );
 
+        let workflows = WorkflowConfig {
+            runner_enabled: read_flag(&read, "OMNION_WORKFLOW_RUNNER", true)?,
+            tick_ms: read_positive(&read, "OMNION_WORKFLOW_TICK_MS", DEFAULT_WORKFLOW_TICK_MS)?,
+            sweep_seconds: read_positive(
+                &read,
+                "OMNION_WORKFLOW_SWEEP_SECONDS",
+                DEFAULT_WORKFLOW_SWEEP_SECONDS,
+            )?,
+            batch: read_count(&read, "OMNION_WORKFLOW_BATCH", DEFAULT_WORKFLOW_BATCH)?,
+            scheduler_batch: read_count(
+                &read,
+                "OMNION_WORKFLOW_SCHEDULER_BATCH",
+                DEFAULT_WORKFLOW_SCHEDULER_BATCH,
+            )?,
+            retry_base_ms: read_positive(
+                &read,
+                "OMNION_WORKFLOW_RETRY_BASE_MS",
+                DEFAULT_WORKFLOW_RETRY_BASE_MS,
+            )?,
+            retry_max_ms: read_positive(
+                &read,
+                "OMNION_WORKFLOW_RETRY_MAX_MS",
+                DEFAULT_WORKFLOW_RETRY_MAX_MS,
+            )?,
+        };
+
         let config = Self {
             env,
             http: HttpConfig { host, port },
             database,
             redis,
             admin,
+            workflows,
             log,
         };
         config.validate()?;
@@ -343,9 +427,59 @@ impl Default for Config {
                 url: DEFAULT_REDIS_URL.to_owned(),
             },
             admin: None,
+            workflows: WorkflowConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
     }
+}
+
+/// Read a boolean flag; anything else is a configuration error rather than a silent default.
+fn read_flag<F>(read: &F, key: &str, default: bool) -> Result<bool, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match read(key) {
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(ConfigError::invalid(
+                key,
+                format!("expected a boolean (true/false), got {other:?}"),
+            )),
+        },
+        None => Ok(default),
+    }
+}
+
+/// Read an optional positive integer.
+fn read_positive<F>(read: &F, key: &str, default: u64) -> Result<u64, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match read(key) {
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ConfigError::invalid(key, format!("expected a positive integer, got {raw:?}"))
+            }),
+        None => Ok(default),
+    }
+}
+
+/// Read an optional count (a positive integer that fits a `usize`).
+fn read_count<F>(read: &F, key: &str, default: usize) -> Result<usize, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = read_positive(read, key, default as u64)?;
+    usize::try_from(value).map_err(|_| {
+        ConfigError::invalid(
+            key,
+            format!("expected a count that fits this platform, got {value}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -471,5 +605,59 @@ mod tests {
     fn admin_bootstrap_is_absent_by_default() {
         let config = config_from(&[]).expect("defaults must load");
         assert!(config.admin.is_none());
+    }
+
+    #[test]
+    fn the_workflow_runner_has_development_defaults() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.workflows.runner_enabled);
+        assert_eq!(config.workflows.tick_ms, DEFAULT_WORKFLOW_TICK_MS);
+        assert_eq!(
+            config.workflows.sweep_seconds,
+            DEFAULT_WORKFLOW_SWEEP_SECONDS
+        );
+        assert_eq!(config.workflows.batch, DEFAULT_WORKFLOW_BATCH);
+        assert_eq!(
+            config.workflows.retry_base_ms,
+            DEFAULT_WORKFLOW_RETRY_BASE_MS
+        );
+        assert_eq!(config.workflows.retry_max_ms, DEFAULT_WORKFLOW_RETRY_MAX_MS);
+    }
+
+    #[test]
+    fn the_workflow_runner_is_configurable() {
+        let config = config_from(&[
+            ("OMNION_WORKFLOW_RUNNER", "false"),
+            ("OMNION_WORKFLOW_TICK_MS", "250"),
+            ("OMNION_WORKFLOW_SWEEP_SECONDS", "5"),
+            ("OMNION_WORKFLOW_BATCH", "4"),
+            ("OMNION_WORKFLOW_SCHEDULER_BATCH", "3"),
+            ("OMNION_WORKFLOW_RETRY_BASE_MS", "100"),
+            ("OMNION_WORKFLOW_RETRY_MAX_MS", "900"),
+        ])
+        .expect("the workflow settings are valid");
+
+        assert!(!config.workflows.runner_enabled);
+        assert_eq!(config.workflows.tick_ms, 250);
+        assert_eq!(config.workflows.sweep_seconds, 5);
+        assert_eq!(config.workflows.batch, 4);
+        assert_eq!(config.workflows.scheduler_batch, 3);
+        assert_eq!(config.workflows.retry_base_ms, 100);
+        assert_eq!(config.workflows.retry_max_ms, 900);
+    }
+
+    #[test]
+    fn broken_workflow_settings_fail_at_boot() {
+        let error =
+            config_from(&[("OMNION_WORKFLOW_TICK_MS", "0")]).expect_err("a zero tick is refused");
+        assert_eq!(error.key, "OMNION_WORKFLOW_TICK_MS");
+
+        let error = config_from(&[("OMNION_WORKFLOW_BATCH", "many")])
+            .expect_err("a non-numeric batch is refused");
+        assert_eq!(error.key, "OMNION_WORKFLOW_BATCH");
+
+        let error = config_from(&[("OMNION_WORKFLOW_RUNNER", "maybe")])
+            .expect_err("an unknown boolean is refused");
+        assert_eq!(error.key, "OMNION_WORKFLOW_RUNNER");
     }
 }
