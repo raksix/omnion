@@ -1,6 +1,6 @@
 # REQ-032 — Universal Command Center
 
-> **Status:** in-progress — slice 1 shipped (registry + palette commands + history) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
+> **Status:** in-progress — slice 2 shipped (federated per-group search + typed URL handoff) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core search
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -118,29 +118,32 @@ Webhook relevance: none directly. Audit: every action command writes a `command.
 
 ### Acceptance criteria
 
-Slice 1 shipped the boxes ticked below; the rest carry the slice that owns them. Evidence: the QA
-pass of `qa-artifacts/20260926-171549` (**105 clicks, 113 screenshots, 0 high findings, 0 vision
-issues**), `scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs`
-(**22/22**) and `apps/api/tests/command_center.rs` (**9 walks**).
+Slice 1 shipped the boxes ticked below and slice 2 the next four; the rest carry the slice that
+owns them. Evidence: the QA passes of `qa-artifacts/20260926-171549` and
+`qa-artifacts/20260926-180233` (**77 clicks, 98 screenshots, 0 high findings, 0 vision issues**),
+`scripts/qa/probe-command-center.cjs` (**26/26**), `scripts/qa/probe-palette.cjs` (**22/22**),
+`scripts/qa/probe-palette-federated.cjs` (**32/32**) and the API suites
+`apps/api/tests/command_center.rs` (**9 walks**) + `apps/api/tests/search.rs` (**+2 walks**: the
+count outside a reader's scope, and `history=false`).
 
 - [x] `Ctrl+K` (and `Cmd+K`) opens the palette on every admin route, including over an open modal, without losing unsaved form state. — the palette is mounted once in the app shell, so it is on every route; the pass opened it over the results screen's shortcuts dialog (palette `z 50` over dialog `z 40`, and the dialog stayed open while the palette's scrim closed the palette) and over a half-typed "New page" form, whose title text survived the round trip.
 - [x] `Esc` closes the palette and returns focus to the element that had focus before opening. — measured with the create form's title field as the captured element (`focusReturned: true`).
-- [ ] Typing a partial page title returns that page under the entity groups within 300 ms p95 on the seeded dataset. — the answer arrives and opens a real screen (palette pass + probes); the p95 number is not measured yet — slice 2's timing pass.
-- [x] Command lists are filtered server-side: a role without the create key never receives its command. — `command_center.rs` asserts the *title text* is absent from a member's answer, not merely that an id is missing (`content.pages.create` stands in for the request's `crm.customers.create`: the same mechanism, with the key this wave actually ships).
-- [ ] Search results are permission-filtered per type; a shared `/search` URL read by a lower-privilege account returns no title text for records it cannot read. — the engine-level rule is REQ-002's (its suite proves it per provider); the browser walk as a second account is slice 2.
-- [x] `>` shows commands only, `@` people only, `#` sites only, and the mode chip in the input row reflects the active prefix. — `>` renders exactly the registry's rows (8 for an owner, chip "Commands"); `#qa` answers with the Sites provider only (no Pages/Media rows) and the chip reads "Sites"; `@` moves the chip to "People".
+- [x] Typing a partial page title returns that page under the entity groups within 300 ms p95 on the seeded dataset. — `probe-palette-federated.cjs` measures keystroke → row over 20 samples of the seeded title ("qa", "qa s", … "qa sample page", "sampl", "sample", "page"): **p50 197 ms · p95 220 ms · max 237 ms** — and every sample was a fragment the engine really answers, with a non-matching query clearing the screen first so a leftover row could never pass for a fresh answer.
+- [x] Command lists are filtered server-side: a role without the create key never receives its command. — `command_center.rs` asserts the *title text* is absent from a member's answer, not merely that an id is missing (`content.pages.create` stands in for the request's `crm.customers.create`: the same mechanism, with the key this wave actually ships). The browser walk joined it in slice 2: as a Member the palette's `>` list holds "Open pages"/"Open media" and neither "Create a page" nor "Open sites".
+- [x] Search results are permission-filtered per type; a shared `/search` URL read by a lower-privilege account returns no title text for records it cannot read. — slice 2's walk: the Owner's `?q=<site>&type=sites` link holds the site, the Member's own answer is `total 0` with `hidden_total 1` and the site's name appears nowhere in the body (`an_empty_answer_says_what_lies_outside_the_readers_scope` proves the same at the API, titles included); the member's screen renders **0 rows** while the copy says "1 result is outside your permissions".
+- [x] `>` shows commands only, `@` people only, `#` sites only, and the mode chip in the input row reflects the active prefix. — `>` renders exactly the registry's rows (8 for an owner, chip "Commands"); `#qa` answers with the Sites provider only (no Pages/Media rows) and the chip reads "Sites"; `@` moves the chip to "People". Slice 2 made the narrowing a property of the *requests*: `>` asks the registry and nothing else (probe: 0 sections), `#`/`:`/`@` ask exactly one provider each, and `@` still promises no screen the panel does not have.
 - [x] Running "Open analytics" navigates without a full reload and closes the palette. — the same walk with "Open pages": client-side navigation to `/pages`, `paletteClosed: true`.
 - [x] "Create customer" opens the create form with the palette closed and the first field focused. — the same walk with "Create a page" (`/pages?new=1`): palette closed, form open, the title field carrying the focus.
 - [ ] "Run backup" asks for confirmation before queueing a job, then shows the standard job feedback. — slice 3 (no mutating command ships yet).
 - [ ] The AI card for "Open Mehmet's last 10 tickets" shows the parsed intent before running. — slice 4.
 - [ ] A low-confidence phrase never auto-executes. — slice 4.
-- [ ] A failing result type shows a per-group error with retry while other groups still render. — slice 2 (the palette keeps its retryable whole-answer error; per-group errors arrive with the federated pass).
+- [x] A failing result type shows a per-group error with retry while other groups still render. — slice 2's probe fails one type's request with a real `503 dependency_unavailable`: that section shows "Media could not be searched." with a **Try again** button (the failure's code and status in its tooltip) while the Pages section keeps its rows, and the retry refills the failed group once the store answers again.
 - [x] Recents persist across sessions and are per user, not per organization. — the walkthrough sees the command it ran after a reload; `recents_are_per_user_and_never_per_organization` proves one account's history is invisible to another in the same organization, and that a clear is personal.
 - [x] Clearing recents empties the group immediately and after a reload. — `probe-command-center.cjs`: 0 rows immediately, 0 rows and `items: []` after a reload.
 - [ ] Every executed action command appears in the audit log with actor, command and target. — slice 3 (navigation commands write nothing; the `command.run` entry lands with the first mutating command).
-- [ ] `/search` reproduces the same results from its URL alone, with filter chips and type filters applied. — REQ-002's depth pass proved the screen's URL state; the palette's own "See all" links carry the query and are slice 2's acceptance.
-- [ ] Keyboard-only operation reaches every group and row; `Tab`/`Shift+Tab` cycle groups and `Cmd+Enter` opens in a new tab. — arrows and `Enter` (both probes), `Ctrl+Enter` in a new tab and `Tab` between groups (probe-command-center) are proven; `Shift+Tab` and the sweep of the narrowing modes are slice 2's pass.
-- [ ] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844. — the sheet fills 390×844 and the rows (commands included) are 44px; the AI card arrives with slice 4.
+- [x] `/search` reproduces the same results from its URL alone, with filter chips and type filters applied. — slice 2: a section's "see all" lands on `/search?q=<words>&type=<provider>` (the screen's own filter parameter, so the chip is already applied) and the screen's count equals the API's own count for that query — the same number after a reload. REQ-002's depth pass proved the rest of the screen's URL state (facets, chips, sort, page).
+- [x] Keyboard-only operation reaches every group and row; `Tab`/`Shift+Tab` cycle groups and `Cmd+Enter` opens in a new tab. — arrows and `Enter` (both probes), `Ctrl+Enter` in a new tab and `Tab` between groups (probe-command-center) are proven; slice 2's probe adds `Shift+Tab` (forward `pages → media`, back `media → pages`) and the narrowing sweep of every mode.
+- [ ] Mobile: the top-bar search opens a full-screen sheet, all targets are ≥44px, and the AI card is usable at 390×844. — the sheet fills 390×844 and its rows (commands included) are 44px; the AI card arrives with slice 4.
 
 ### QA plan
 
@@ -222,6 +225,71 @@ pnpm build` → 2/2 · `bash scripts/qa/run.sh` → the table above
 the column's id-format check rejected hyphenated ids (`nav.create-page`), so recording a perfectly
 ordinary command answered `500`; the check now allows hyphens and
 `every_registered_command_can_be_remembered` walks the whole registry through the endpoint.
+
+#### Slice 2 — federated search in the palette (2026-09-26) — shipped
+
+What landed:
+
+- **Groups answer on their own.** The palette asks each provider its own question (`GET
+  /api/v1/search?q=…&types=pages`, once per section) instead of one answer it then slices: a
+  section has its own skeleton while its request is in flight, its rows when it answers, and its
+  own retryable error — the failure's code and status in the tooltip — when it fails. One slow or
+  failing provider never blanks the others, which is what "result groups stream independently"
+  means. A whole-index count rides behind the first wave for the "see all results" total and the
+  number outside the caller's scope. Sections keep the registry's order (a streaming list must not
+  reshuffle rows under the reader's eyes).
+- **Typing does not become history.** The federated calls say `history=false`; `search_recent`
+  stays the record of the searches someone committed to (a palette hit, a section's "see all", the
+  results screen). The palette's own recents are `command_recents`, written on commit.
+- **An empty answer says which empty it is.** `GET /api/v1/search` answers `hidden_total` — a count
+  and nothing else, computed when the caller's own answer is empty — over the enabled providers
+  their keys do not cover, so "nothing matched" and "nothing you may read matched" are told apart.
+  The results screen renders "N results are outside your permissions." above its advice; the
+  palette's no-results state carries the same line plus two ways out: **Search everything**
+  (`/search?q=…`) and **Ask AI** (`/ai?q=…`, the AI Hub opens with the words in its prompt).
+- **A "see all" is a link the screen understands.** `sectionUrl` now emits the results screen's own
+  `type=<provider>` parameter (not `type:` text inside `q`), so the link lands with its filter chip
+  already applied, its facet rail knowing which type is on, and its search box still showing the
+  words the reader typed.
+- **The narrowing modes narrow the requests.** `>` asks the registry and the index not at all
+  (zero sections, zero calls); `@`/`#`/`:` ask exactly one provider each; `@` still renders no
+  section — the accounts screen is REQ-006's — so the mode answers honestly empty rather than
+  linking nowhere.
+
+Deviations, recorded as they were decided:
+
+- The fan-out is capped at three providers in flight (`GROUP_CONCURRENCY`), the rest follow as the
+  first wave answers. Nine parallel calls queued against the browser's connection budget and
+  starved the page's own RSC prefetches — a defect the walkthrough recorded as two aborted
+  requests before the cap went in. The sections still stream; the pipe is no longer hogged.
+- The debounce went from 120 ms to 100 ms: the groups are small, the sections are asked in
+  parallel, and the slice's own budget is 300 ms p95 from keystroke to row.
+- Per-group errors carry the failure's **code and status** in their tooltip. The request's own id
+  is not in the spec's reach yet: the API has no request-id header — an observability concern that
+  belongs to the platform-wide work (REQ-014/REQ-039), not to one screen.
+- The palette's no-results state offers "Search everything" and "Ask AI" as real destinations; the
+  *resolved* intent card ("Tickets · assignee: Mehmet · last 10") is slice 4's, and nothing here
+  pretends to interpret language.
+- The empty answer's hidden count is aggregate-only on purpose: no title, no id, not even a
+  per-provider split travels with it.
+
+Proof: `cargo test --workspace` → **455 passed, 0 failed** (3 new: 2 walks in
+`apps/api/tests/search.rs` — the count outside a reader's scope (a member's answer counted it,
+carried no title, and the Owner's own answer reported `0` hidden) and `history=false` leaving
+`search_recent` untouched while a committed search is kept — plus the wire test for the flag) ·
+`cargo clippy --workspace --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` →
+2/2 ·
+`bash scripts/qa/run.sh` → 77 clicks, 98 screenshots, **0 high findings**, **0 vision issues**
+(`qa-artifacts/20260926-180233`) · `scripts/qa/probe-palette-federated.cjs` → **32/32**: a delayed
+provider's section shows its own skeleton while another already holds rows; a `503` on one type
+leaves that section retryable and the rest rendering; `>` emits no sections; `#`/`:`/`@` ask one
+provider each; `Tab`/`Shift+Tab` walk the sections; "see all" lands on `/search?q=…&type=pages`
+with the API's own count (the same after a reload, chip applied); "zzqqxx" offers the results
+screen and the AI Hub (whose prompt is prefilled); typing stays out of the history while a
+committed search is kept; and as the Member account the `>` list loses "Create a page" and "Open
+sites" while the shared `?q=…&type=sites` link renders **0 rows** and "1 result is outside your
+permissions." with the site's name nowhere in the answer. The typing budget, measured keystroke →
+row over 20 samples: **p50 197 ms · p95 220 ms · max 237 ms** (the criterion is 300 ms p95).
 
 ### Risks / notes
 

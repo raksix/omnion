@@ -960,3 +960,55 @@
 - Next: wave 1 continues with **REQ-032 slice 2** (federated search in the palette: per-group
   loading and errors, type filters, the URL-backed `/search`), then REQ-007 (analytics + real
   dashboard).
+
+## 2026-09-26 — REQ-032 · slice 2 · the palette answers in groups
+
+- **Each provider answers on its own.** The palette stopped slicing one answer: it asks every
+  provider its own question (`/api/v1/search?q=…&types=pages`) in waves of three, so a section has
+  its own skeleton while its request is in flight, its own rows when it answers, and its own
+  retryable error — the failure's code and status in the tooltip — when it fails. One slow or
+  failing type never blanks the rest. A whole-index count rides behind the first wave for the "see
+  all results" total; sections keep the registry's order instead of reshuffling under the reader's
+  eyes as answers land.
+- **Typing is not a search worth remembering.** The endpoint grew `history=false`; the palette's
+  federated calls say it, so `search_recent` stays the record of searches someone committed to
+  (a hit opened, a section's "see all", the results screen). The palette's own history is
+  `command_recents`, written on commit. Nine parallel calls per keystroke pause also became three
+  at a time **because the walkthrough proved it**: with nine in flight the page's own RSC
+  prefetches queued behind them and two navigations were recorded as `net::ERR_ABORTED` (high) —
+  the cap removed both, `GROUP_CONCURRENCY` in the palette.
+- **An empty answer now says which empty it is.** `hidden_total` (a count, never a title, computed
+  over the enabled providers the caller's keys do not cover, and only when their own answer is
+  empty) lets the results screen and the palette tell "nothing matched" from "nothing you may read
+  matched": "N results are outside your permissions." The palette's no-results state also offers
+  the way out as real rows — `/search?q=…` and `/ai?q=…` (the AI Hub opens with the words in its
+  prompt; nothing is asked on the reader's behalf).
+- **A "see all" is a link the screen understands.** `sectionUrl` emits the results screen's own
+  `type=<provider>` parameter, so the link lands with its chip applied, its rail already knowing
+  which type is on, and the search box still showing the words that were typed.
+- **The narrowing is a property of the requests now.** `>` asks the registry and never the index
+  (0 calls, 0 sections); `@`/`#`/`:` ask exactly one provider each. A regression of mine —
+  `>` + text listed the whole command list instead of the matches, so Enter landed on "Search
+  everything" — was caught by the *walkthrough*, not by the new probe: the end-to-end click pass
+  is the reason the palette's own commands still work.
+- **Proof:** `cargo test --workspace` → **455 passed, 0 failed** (3 new: the count outside a
+  reader's scope at the API — counted, titled nowhere, `0` for the reader who sees everything —
+  plus the `history=false` walk and its wire test) · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `pnpm typecheck && pnpm build` 2/2 · `bash scripts/qa/run.sh` → 77 clicks, 98
+  screenshots, **0 high findings**, **0 vision issues** (`qa-artifacts/20260926-180233`) ·
+  `scripts/qa/probe-palette-federated.cjs` → **32/32** (delayed provider → own skeleton while
+  another holds rows; 503 on one type → that section retryable, the rest rendering; `>`/`#`/`:`/`@`
+  ask what they say; `Tab`/`Shift+Tab` walk sections; "see all" → `/search?q=…&type=pages` with the
+  API's own count, same after a reload; "zzqqxx" → the results screen + a prefilled AI Hub;
+  history clean; as the Member: no "Create a page"/"Open sites", the shared sites link renders 0
+  rows and "1 result is outside your permissions." with no title in the answer) ·
+  `probe-command-center.cjs` **26/26** and `probe-palette.cjs` **22/22** re-run clean (no slice-1
+  regressions) · the typing budget, keystroke → row over 20 samples: **p50 197 ms · p95 220 ms ·
+  max 237 ms** (criterion: 300 ms p95).
+- **Found, not fixed (REQ-002's ground):** creating a draft page emits no event, so a fresh draft
+  reaches the index only on a publish or a reindex — the indexer's plan lists `page.created`
+  (`crates/search/src/indexer.rs`) but `POST /api/v1/pages` never emits it. The probe works around
+  it with an explicit reindex; the gap is worth a REQ-002 follow-up rather than a quiet fix here.
+- Carried forward, not caused by this slice: the public renderer still answers `404` for its own
+  icon requests (5 medium findings, unchanged).
+- Next: wave 1 continues with **REQ-007** (analytics + the real dashboard), then REQ-006 (IAM).
