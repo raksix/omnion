@@ -66,11 +66,7 @@ How workflows start.
 | POST | `/api/v1/public/hooks/{path}/test/{token}` | Test webhook ingress for a session | — |
 | POST | `/api/v1/events/{id}/replay` | Replay one event into armed subscriptions | `workflows.run` |
 
-Codes: `hook_unknown_path`, `hook_method_not_allowed`, `hook_auth_missing`, `hook_auth_invalid`,
-`hook_signature_invalid`, `hook_signature_expired`, `hook_ip_denied`, `hook_payload_too_large`,
-`hook_rate_limited`, `hook_workflow_not_armed`, `hook_pending_timeout`, `trigger_credential_unhealthy`,
-`trigger_path_conflict`, `poll_backoff_active`, `event_filter_failed`, `event_duplicate`,
-`schedule_expression_invalid`.
+Codes: `hook_unknown_path`, `hook_method_not_allowed`, `hook_auth_missing`, `hook_auth_invalid`, `hook_signature_invalid`, `hook_signature_expired`, `hook_ip_denied`, `hook_payload_too_large`, `hook_rate_limited`, `hook_workflow_not_armed`, `hook_pending_timeout`, `trigger_credential_unhealthy`, `trigger_path_conflict`, `poll_backoff_active`, `event_filter_failed`, `event_duplicate`, `schedule_expression_invalid`.
 
 ### Data model
 
@@ -168,6 +164,7 @@ degrades its trigger rather than failing silently).
 ### Acceptance criteria
 
 - [ ] Arming a webhook trigger makes the production URL accept the configured methods and start exactly one run per accepted call; a path collision is refused with `trigger_path_conflict` naming the holder.
+- [ ] Arming a trigger whose credential is unhealthy fails with `trigger_credential_unhealthy` before anything goes live.
 - [ ] Unknown path, disallowed method, missing or wrong secret, bad signature, expired signature, denied IP and oversized body each return their named code, log a call, and start no run.
 - [ ] `immediate` answers without waiting; `after_workflow` returns the mapped result; `custom` returns the configured status and body; a timeout answers with a pending status and a status URL without killing the run.
 - [ ] Test sessions accept calls on the test URL, stream them, allow pinning one as sample data, and expire leaving nothing routable.
