@@ -79,7 +79,7 @@ jobs:
           OMNION_ADMIN_EMAIL: admin@example.com
           OMNION_ADMIN_PASSWORD: smoke-test-admin-password
         run: |
-          cargo build -p omnion-api
+          cargo build -p omnion-api -p omnion-cli
           ./target/debug/omnion-api &
           API_PID=$!
           healthy=0
@@ -284,6 +284,60 @@ jobs:
           echo "workflow surface: $workflow_state · run=completed"
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
+
+      # The first-run walk (docs/BUILD-BACKLOG.md P10): a database that has never been migrated
+      # is set up by the `omnion` CLI — no SQL, no environment bootstrap — and the API then
+      # serves it: the wizard is closed, the owner signs in, the site exists with its theme.
+      - name: First-run walk (CLI setup on a fresh database)
+        env:
+          PGPASSWORD: omnion
+          OMNION_DATABASE_URL: postgres://omnion:omnion@127.0.0.1:5433/omnion_first_run
+        run: |
+          set -euo pipefail
+          if ! command -v createdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client
+          fi
+          createdb -h 127.0.0.1 -p 5433 -U omnion omnion_first_run
+          # `doctor` proves the environment before anything is created: an empty install is a
+          # healthy one.
+          ./target/debug/omnion doctor
+          ./target/debug/omnion migrate
+          ./target/debug/omnion setup --non-interactive \
+            --name 'CI Owner' --email owner@example.com --password 'ci-owner-password-123' \
+            --organization 'CI Organization' --site 'CI Site' --domain ci.omnion.test
+          ./target/debug/omnion doctor
+          # The same installation answers the wizard surface as done …
+          OMNION_PORT=8090 ./target/debug/omnion-api > /tmp/omnion-first-run-api.log 2>&1 &
+          API_PID=$!
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8090/readyz >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "the first-run API did not become ready" >&2
+            cat /tmp/omnion-first-run-api.log || true
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:8090/api/v1/onboarding \
+            | python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["completed"] and not s["needs_setup"], s; print("onboarding: completed · steps", s["steps"], "· themes", [t["key"] for t in s["themes"]])'
+          # … and the owner the CLI created signs in to a working panel.
+          curl -fsS -c /tmp/omnion-first-run-cookies.txt -H 'content-type: application/json' \
+            -d '{"email":"owner@example.com","password":"ci-owner-password-123"}' \
+            http://127.0.0.1:8090/api/v1/auth/login | head -c 200
+          echo
+          curl -fsS -b /tmp/omnion-first-run-cookies.txt http://127.0.0.1:8090/api/v1/sites \
+            | python3 -c 'import json,sys; sites=json.load(sys.stdin)["sites"]; assert len(sites)==1 and sites[0]["theme"]=="minimal", sites; print("site:", sites[0]["key"], "theme=" + sites[0]["theme"])'
+          workflow_code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/api/v1/onboarding/complete)
+          if [ "$workflow_code" != "401" ]; then
+            echo "the setup step must require a session, got $workflow_code" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          kill "$API_PID"
+          echo "first-run surface: CLI setup → completed · owner signs in · site serves theme"
 
   infra:
     name: Infra — compose config
