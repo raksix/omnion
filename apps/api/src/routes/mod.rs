@@ -28,6 +28,11 @@
 //! definitions are read with `workflows.read`, written with `workflows.manage`, started and
 //! cancelled with `workflows.run` — see `crate::routes::workflows`. The background runner that
 //! advances the runs lives in `crate::workflow_runner`.
+//!
+//! The onboarding surface (`/onboarding`) is the first-run flow of a fresh installation
+//! (REQ-050, P10): it carries no permission guard because there is nothing to check against
+//! until an account exists — the flow itself decides who may act (see
+//! `crate::routes::onboarding`).
 
 pub mod auth;
 pub mod content;
@@ -35,6 +40,7 @@ pub mod health;
 pub mod iam;
 pub mod me;
 pub mod media;
+pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod tenancy;
@@ -178,6 +184,15 @@ pub fn router(state: AppState) -> Router {
     let workflow_execution_cancel =
         post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
 
+    // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
+    // who may act, and it must be reachable before any account, role or binding exists.
+    let onboarding_owner = post(onboarding::create_owner);
+    let onboarding_organization = post(onboarding::create_organization);
+    let onboarding_site = post(onboarding::create_site);
+    let onboarding_theme = post(onboarding::choose_theme);
+    let onboarding_ai = post(onboarding::decide_ai);
+    let onboarding_complete = post(onboarding::complete);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -235,7 +250,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/workflow-executions/{id}/cancel",
             workflow_execution_cancel,
-        );
+        )
+        .route("/onboarding", get(onboarding::status))
+        .route("/onboarding/owner", onboarding_owner)
+        .route("/onboarding/organization", onboarding_organization)
+        .route("/onboarding/site", onboarding_site)
+        .route("/onboarding/theme", onboarding_theme)
+        .route("/onboarding/ai-provider", onboarding_ai)
+        .route("/onboarding/complete", onboarding_complete);
 
     Router::new()
         .route("/healthz", get(health::healthz))

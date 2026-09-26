@@ -8,6 +8,7 @@ use omnion_content::ContentError;
 use omnion_core::CoreError;
 use omnion_identity::IdentityError;
 use omnion_media::MediaError;
+use omnion_onboarding::OnboardingError;
 use omnion_permissions::PermissionsError;
 use omnion_storage::StorageError;
 use omnion_workflows::WorkflowError;
@@ -341,6 +342,90 @@ impl From<WorkflowError> for ApiError {
             ),
             WorkflowError::Audit(err) => err.into(),
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
+        }
+    }
+}
+
+impl From<OnboardingError> for ApiError {
+    /// Onboarding: the flow answers with its own vocabulary — an installation that is set up,
+    /// a caller that may not finish the first run, a step that is already done, a step that is
+    /// still open, a theme this installation does not bundle, or a provider request that has to
+    /// wait for the AI Hub.
+    fn from(error: OnboardingError) -> Self {
+        match error {
+            OnboardingError::AlreadyInstalled => Self::new(
+                StatusCode::CONFLICT,
+                "already_installed",
+                "this installation already has accounts — sign in instead",
+            ),
+            OnboardingError::NotOnboardingOwner => Self::forbidden(
+                "not_onboarding_owner",
+                "only the account that owns the first run may finish it",
+            ),
+            OnboardingError::AlreadyComplete => Self::new(
+                StatusCode::CONFLICT,
+                "onboarding_complete",
+                "the first-run setup is already complete",
+            ),
+            OnboardingError::StepAlreadyDone(step) => Self::new(
+                StatusCode::CONFLICT,
+                "step_already_done",
+                format!("the {step} step is already done"),
+            ),
+            OnboardingError::Incomplete { missing } => Self::new(
+                StatusCode::CONFLICT,
+                "setup_incomplete",
+                format!("the setup still needs: {missing}"),
+            ),
+            OnboardingError::SiteMissing => Self::new(
+                StatusCode::CONFLICT,
+                "site_missing",
+                "create the first site before choosing a theme",
+            ),
+            OnboardingError::UnknownTheme(theme) => Self::bad_request(
+                "unknown_theme",
+                format!("this installation does not bundle a theme called {theme:?}"),
+            ),
+            OnboardingError::AiHubPending => Self::new(
+                StatusCode::CONFLICT,
+                "ai_hub_pending",
+                "AI provider connections arrive with the AI Hub — skip this step for now",
+            ),
+            OnboardingError::Invalid(message) => Self::bad_request("invalid_request", message),
+            OnboardingError::StateMissing => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "the first-run record could not be read back",
+            ),
+            OnboardingError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            OnboardingError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            // Account shape problems are the caller's (the wizard validates, the server proves).
+            OnboardingError::Identity(IdentityError::InvalidEmail(message))
+            | OnboardingError::Identity(IdentityError::InvalidOrganization(message))
+            | OnboardingError::Identity(IdentityError::InvalidSite(message)) => {
+                Self::bad_request("invalid_request", message)
+            }
+            OnboardingError::Identity(IdentityError::WeakPassword { min }) => Self::bad_request(
+                "invalid_request",
+                format!("password must be at least {min} characters long"),
+            ),
+            OnboardingError::Identity(IdentityError::EmailTaken) => Self::new(
+                StatusCode::CONFLICT,
+                "email_taken",
+                "this email address already has an account",
+            ),
+            OnboardingError::Identity(err) => err.into(),
+            OnboardingError::Permissions(err) => err.into(),
+            OnboardingError::Content(err) => err.into(),
+            OnboardingError::Audit(err) => err.into(),
         }
     }
 }

@@ -81,6 +81,8 @@ pub struct SiteBody {
     pub name: String,
     /// `active` or `archived`.
     pub status: String,
+    /// Theme the renderer activates (`themes/<key>`).
+    pub theme: String,
     /// Creation timestamp, RFC 3339.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -97,6 +99,7 @@ impl From<&Site> for SiteBody {
             key: site.key.clone(),
             name: site.name.clone(),
             status: site.status.clone(),
+            theme: site.theme.clone(),
             created_at: site.created_at,
             updated_at: site.updated_at,
         }
@@ -191,6 +194,9 @@ pub struct CreateSiteRequest {
     pub key: String,
     /// Display name.
     pub name: String,
+    /// Theme to render with; the default theme when absent.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 /// `PATCH /api/v1/sites/{id}`.
@@ -202,6 +208,9 @@ pub struct UpdateSiteRequest {
     /// New status: `active` or `archived`.
     #[serde(default)]
     pub status: Option<String>,
+    /// New theme key (`themes/<key>`).
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl UpdateSiteRequest {
@@ -210,6 +219,7 @@ impl UpdateSiteRequest {
         SiteChanges {
             name: self.name,
             status: self.status,
+            theme: self.theme,
         }
     }
 }
@@ -423,6 +433,7 @@ pub async fn create_site(
             organization_id,
             key: body.key,
             name: body.name,
+            theme: body.theme,
         },
     )
     .await?;
@@ -469,6 +480,7 @@ pub async fn update_site(
                 "key": updated.key,
                 "name": updated.name,
                 "status": updated.status,
+                "theme": updated.theme,
             }))
             .ip_address(address.as_text())
             .organization(updated.organization_id),
@@ -665,9 +677,19 @@ mod tests {
         let site = UpdateSiteRequest {
             name: None,
             status: None,
+            theme: None,
         }
         .changes();
         assert!(site.is_empty(), "an empty patch changes nothing");
+
+        let site = UpdateSiteRequest {
+            name: None,
+            status: None,
+            theme: Some("minimal".to_owned()),
+        }
+        .changes();
+        assert!(!site.is_empty(), "a theme patch changes the site");
+        assert_eq!(site.theme.as_deref(), Some("minimal"));
     }
 
     #[test]

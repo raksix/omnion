@@ -39,6 +39,9 @@ pub struct PublicSiteBody {
     pub key: String,
     /// Display name.
     pub name: String,
+    /// Theme the renderer activates for this site; the renderer falls back to its default for a
+    /// key it does not know, so a visitor never sees a broken page.
+    pub theme: String,
 }
 
 /// Public identity of the page.
@@ -146,6 +149,7 @@ pub async fn get_published_page(
         site: PublicSiteBody {
             key: site.key,
             name: site.name,
+            theme: site.theme,
         },
         page: PublicPageBody {
             slug: page.slug,
