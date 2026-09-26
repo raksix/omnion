@@ -12,6 +12,9 @@
 //!   same bucket twice leaves the table byte-for-byte identical.
 //! * [`settings`] — the per-site configuration: tracking, privacy, retention, exclusions — with
 //!   the validation the settings screen renders as field errors.
+//! * [`goals`] — the conversions: a goal (optionally an ordered funnel of steps), the ordered and
+//!   deduplicated hit recording every beacon feeds, and the funnel arithmetic behind the
+//!   `/analytics/goals` screen.
 //! * [`visitor`], [`agent`] — the pieces the promises are made of: the daily-salted visitor hash,
 //!   address truncation, exclusion matching, and the user-agent reading bots and devices.
 //!
@@ -24,7 +27,9 @@
 pub mod agent;
 pub mod collect;
 pub mod error;
+pub mod goals;
 pub mod model;
+pub mod realtime;
 pub mod reports;
 pub mod rollup;
 pub mod settings;

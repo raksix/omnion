@@ -26,6 +26,15 @@ pub enum AnalyticsError {
     /// A settings update the platform refuses, with the field that caused it.
     #[error("invalid analytics settings: {0}")]
     InvalidSettings(String),
+    /// A goal description the platform refuses, with the field that caused it.
+    #[error("invalid goal: {0}")]
+    InvalidGoal(String),
+    /// The goal does not exist in this site.
+    #[error("this site has no such goal")]
+    GoalNotFound,
+    /// Another goal of the site already carries the name.
+    #[error("another goal of this site carries this name")]
+    GoalNameTaken,
     /// PostgreSQL refused or could not answer.
     #[error("analytics storage error: {0}")]
     Database(#[from] sqlx::Error),

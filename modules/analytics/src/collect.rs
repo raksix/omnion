@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::agent;
 use crate::error::{AnalyticsError, Result};
+use crate::goals::{self, Fact};
 use crate::model::Settings;
 use crate::visitor;
 
@@ -233,7 +234,6 @@ pub fn country_from_header(value: Option<&str>) -> Option<String> {
     Some(value)
 }
 
-
 /// Why a beacon was not stored, when it was not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
@@ -401,12 +401,17 @@ impl Dropped {
 }
 
 /// Result of one ingest call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct IngestReport {
     /// Rows written.
     pub stored: Stored,
     /// What was not stored, and why.
     pub dropped: Dropped,
+    /// Goal hits this beacon wrote (empty when a goal was already reached).
+    ///
+    /// The caller emits the platform event for a finished goal from here — the module records,
+    /// the API answers for it, and only a hit that was actually written is reported.
+    pub reached_goals: Vec<goals::ReachedGoal>,
 }
 
 /// Record one beacon, or count why it was not recorded.
@@ -433,6 +438,7 @@ pub async fn ingest(
         return Ok(IngestReport {
             stored: Stored::default(),
             dropped,
+            reached_goals: Vec::new(),
         });
     }
 
@@ -447,6 +453,7 @@ pub async fn ingest(
         return Ok(IngestReport {
             stored: Stored::default(),
             dropped,
+            reached_goals: Vec::new(),
         });
     }
 
@@ -473,7 +480,79 @@ pub async fn ingest(
         }
     }
 
-    Ok(IngestReport { stored, dropped })
+    // Goals are matched against what was stored, and only after it was stored: a conversion the
+    // reports cannot see would be a conversion that did not happen.
+    let facts = beacon_facts(beacon);
+    let reached_goals = if facts.is_empty() {
+        Vec::new()
+    } else {
+        goals::record_facts(pool, site_id, &visitor_hash, meta.now, &facts).await?
+    };
+
+    Ok(IngestReport {
+        stored,
+        dropped,
+        reached_goals,
+    })
+}
+
+/// The facts of a beacon, in the shape goals match against.
+///
+/// Only what the collector would store becomes a fact: an event past [`MAX_EVENTS_PER_BEACON`]
+/// or one with a name the collector refuses is dropped, and a goal must not convert on a
+/// submission no report will ever count. A `download` carries its file, a `form_submit` its
+/// form name, and every other event carries its own name.
+fn beacon_facts(beacon: &Beacon) -> Vec<Fact<'_>> {
+    let mut facts = Vec::new();
+    let path = beacon.path();
+
+    if let Some(pageview) = &beacon.pageview {
+        facts.push(Fact {
+            kind: "pageview",
+            path: Some(pageview.path.as_str()),
+            name: None,
+            file: None,
+            value: None,
+        });
+    }
+
+    for (index, event) in beacon.events.iter().enumerate() {
+        if index >= MAX_EVENTS_PER_BEACON || !valid_event_name(&event.name) {
+            continue;
+        }
+        let properties = event.properties.as_ref().filter(|value| value.is_object());
+        let property = |key: &str| {
+            properties
+                .and_then(|value| value.get(key))
+                .and_then(serde_json::Value::as_str)
+        };
+
+        match event.name.as_str() {
+            "download" => facts.push(Fact {
+                kind: "download",
+                path,
+                name: None,
+                file: property("file"),
+                value: event.value,
+            }),
+            "form_submit" => facts.push(Fact {
+                kind: "form_submit",
+                path,
+                name: property("form"),
+                file: None,
+                value: event.value,
+            }),
+            _ => facts.push(Fact {
+                kind: "event",
+                path,
+                name: Some(event.name.as_str()),
+                file: None,
+                value: event.value,
+            }),
+        }
+    }
+
+    facts
 }
 
 /// The visit a beacon belongs to: an open one, or a new one.
