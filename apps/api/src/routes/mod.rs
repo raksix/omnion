@@ -18,17 +18,24 @@
 //! The public surface (`/public`) is the one unauthenticated read route of the API: it serves
 //! published content to the public site renderer (`apps/web`) and resolves the addressed site
 //! from the request — see `crate::routes::public` for the resolution order.
+//!
+//! The media surface (`/media`) is the library a site's content points at: uploads are guarded
+//! by `media.upload`, reads by `media.read` and removals by `media.delete`, all scoped through
+//! the site the file belongs to. Its bytes are served twice — on the panel surface behind the
+//! session and on the public surface for the renderer — see `crate::routes::media`.
 
 pub mod auth;
 pub mod content;
 pub mod health;
 pub mod iam;
 pub mod me;
+pub mod media;
 pub mod public;
 pub mod readyz;
 pub mod tenancy;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put};
 
 use crate::guards;
@@ -110,9 +117,33 @@ pub fn router(state: AppState) -> Router {
     let page_translation =
         put(content::set_translations).layer(guards::require(&state, "content.pages.update"));
 
+    // Media: the library of a site (docs/01-VISION.md §5). Reading the library and removing a
+    // file each carry their own permission; the upload route also lifts the body limit to the
+    // library's own file limit, so a legitimate maximum-size file fits while a larger one is
+    // refused as it is read — hence its own router.
+    let media_upload = Router::new()
+        .route(
+            "/media",
+            post(media::upload_media).layer(guards::require(&state, "media.upload")),
+        )
+        .layer(DefaultBodyLimit::max(
+            omnion_media::MAX_UPLOAD_BYTES as usize + media::UPLOAD_BODY_SLACK,
+        ));
+
+    let media = get(media::list_media).layer(guards::require(&state, "media.read"));
+
+    let media_entry = get(media::get_media)
+        .layer(guards::require(&state, "media.read"))
+        .merge(delete(media::delete_media).layer(guards::require(&state, "media.delete")));
+
+    let media_raw = get(media::raw_media).layer(guards::require(&state, "media.read"));
+
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
     let public_pages = get(public::get_published_page);
+
+    // A published page points at its own assets, so the library's read side is public too.
+    let public_media = get(media::public_media);
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
@@ -157,7 +188,12 @@ pub fn router(state: AppState) -> Router {
             "/pages/{id}/revisions/{revision_id}/translations/{language}",
             page_translation,
         )
-        .route("/public/pages/{slug}", public_pages);
+        .route("/media", media)
+        .merge(media_upload)
+        .route("/media/{id}", media_entry)
+        .route("/media/{id}/raw", media_raw)
+        .route("/public/pages/{slug}", public_pages)
+        .route("/public/media/{id}", public_media);
 
     Router::new()
         .route("/healthz", get(health::healthz))

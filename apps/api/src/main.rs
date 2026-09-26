@@ -12,6 +12,7 @@ use omnion_api::state::AppState;
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
 use omnion_identity::users::{self, BootstrapOutcome};
+use omnion_storage::Storage;
 use tokio::net::TcpListener;
 
 /// Service identifier used in logs and health payloads.
@@ -54,11 +55,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(error = %err, "redis is not reachable yet");
     }
 
+    // The object store behind the media library (crates/storage). Like Redis it is opened, not
+    // required: a store that is down leaves media uploads answering `503` while the rest of the
+    // platform keeps working, and the next boot or upload brings it back.
+    let storage = Storage::from_env()?;
+    tracing::info!(store = %storage.describe(), "object store configured");
+    if let Err(err) = storage.ensure_ready().await {
+        tracing::warn!(
+            error = %err,
+            store = %storage.describe(),
+            "the object store is not ready yet"
+        );
+    }
+
     let address = config.http.bind_address()?;
     let listener = TcpListener::bind(address).await?;
     tracing::info!(%address, "listening");
 
-    let app = routes::router(AppState::new(build, config, db, redis));
+    let app = routes::router(AppState::new(build, config, db, redis, storage));
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

@@ -102,6 +102,15 @@ fn token_of(response: &TestResponse) -> String {
         .to_owned()
 }
 
+/// Object store of the test state.
+///
+/// These suites never touch the object store — that is the media suite's job — so the default
+/// development configuration is enough: it opens without contacting anything.
+fn test_storage() -> omnion_storage::Storage {
+    omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
+        .expect("the default storage configuration is valid")
+}
+
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
 async fn live_db(config: &Config) -> Option<Db> {
     match Db::connect(&config.database).await {
@@ -128,6 +137,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         config,
         db.clone(),
         redis,
+        test_storage(),
     );
     Some((state, db))
 }

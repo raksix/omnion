@@ -7,7 +7,9 @@ use omnion_audit::AuditError;
 use omnion_content::ContentError;
 use omnion_core::CoreError;
 use omnion_identity::IdentityError;
+use omnion_media::MediaError;
 use omnion_permissions::PermissionsError;
+use omnion_storage::StorageError;
 use serde::Serialize;
 
 /// `true` when a database error means the dependency itself is unavailable (retryable).
@@ -250,6 +252,76 @@ impl From<PermissionsError> for ApiError {
     }
 }
 
+impl From<MediaError> for ApiError {
+    fn from(error: MediaError) -> Self {
+        match error {
+            MediaError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            MediaError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            MediaError::NotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "media_not_found",
+                "no such media in this library",
+            ),
+            MediaError::SizeTooLarge { limit } => Self::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!("the file is larger than the {limit} byte limit"),
+            ),
+            MediaError::KeyTaken => Self::new(
+                StatusCode::CONFLICT,
+                "media_key_taken",
+                "this object key is already in the media library",
+            ),
+            // Everything else is the caller's: an empty upload, an unusable file name, an
+            // unusable content type or a key the store refuses.
+            other => Self::bad_request("invalid_request", other.to_string()),
+        }
+    }
+}
+
+impl From<StorageError> for ApiError {
+    /// The object store is a dependency like the database: a store that cannot answer is a
+    /// retryable `503`, a missing object is a `404`, and a store that refuses a well-formed
+    /// request is reported as `storage_error` so an operator sees the provider's own message.
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NotFound { .. } => Self::new(
+                StatusCode::NOT_FOUND,
+                "object_not_found",
+                "the stored object is missing from the object store",
+            ),
+            StorageError::Invalid(message) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_misconfigured",
+                message,
+            ),
+            StorageError::Unavailable(message) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+                format!("the object store is unreachable: {message}"),
+            ),
+            StorageError::Io(message) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+                format!("the storage directory could not be used: {message}"),
+            ),
+            StorageError::Provider { status, message } => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_error",
+                format!("the object store refused the request (status {status}): {message}"),
+            ),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -371,5 +443,62 @@ mod tests {
         let invalid = ApiError::from(IdentityError::InvalidHost("nope".to_owned()));
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         assert_eq!(invalid.code(), "invalid_request");
+    }
+
+    #[test]
+    fn media_errors_map_onto_the_library_statuses() {
+        assert_eq!(
+            ApiError::from(MediaError::NotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::from(MediaError::NotFound).code(),
+            "media_not_found"
+        );
+        assert_eq!(
+            ApiError::from(MediaError::SizeTooLarge { limit: 25 }).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            ApiError::from(MediaError::KeyTaken).status(),
+            StatusCode::CONFLICT
+        );
+
+        let empty = ApiError::from(MediaError::EmptyFile);
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(empty.code(), "invalid_request");
+
+        let unavailable = ApiError::from(MediaError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn storage_errors_map_onto_the_dependency_statuses() {
+        let missing = ApiError::from(StorageError::NotFound {
+            key: "sites/a/one.png".to_owned(),
+        });
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.code(), "object_not_found");
+
+        let unavailable =
+            ApiError::from(StorageError::Unavailable("connection refused".to_owned()));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.code(), "storage_unavailable");
+
+        let refused = ApiError::from(StorageError::Provider {
+            status: 403,
+            message: "AccessDenied".to_owned(),
+        });
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.code(), "storage_error");
+        assert!(
+            refused.message.contains("403"),
+            "message: {}",
+            refused.message
+        );
+
+        let misconfigured = ApiError::from(StorageError::Invalid("blank bucket".to_owned()));
+        assert_eq!(misconfigured.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(misconfigured.code(), "storage_misconfigured");
     }
 }
