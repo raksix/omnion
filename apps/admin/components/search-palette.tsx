@@ -16,6 +16,12 @@
  * the account's own record. A provider whose screen does not exist contributes no section, so no
  * row is a click into nothing.
  *
+ * **Action commands (slice 3).** A command whose `kind` is `action` does not open a screen: it
+ * runs through `POST /api/v1/commands/{id}/run`, which re-checks the command's own permission and
+ * executes it through the owning service. A command that carries `confirm` shows its question
+ * first — the card above the list, `↵` to run and `esc` to take it back — and the answer the
+ * owning service gives is what the result card prints: the palette never invents an outcome.
+ *
  * **Federated answers (slice 2).** The palette asks each provider its own question, in parallel,
  * with `history=false` (typing is not a search worth remembering — committing to a result is,
  * and that is recorded separately). Each group therefore has its own life: it shows a skeleton
@@ -39,8 +45,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from "react-dom";
 
 import {
+  CheckCircle,
   Clock,
   Command as CommandIcon,
+  Eraser,
   FilePlus,
   FileText,
   Globe,
@@ -48,9 +56,11 @@ import {
   Images,
   Loader2,
   LayoutDashboard,
+  RefreshCw,
   Search,
   SlidersHorizontal,
   Sparkles,
+  TriangleAlert,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -63,6 +73,7 @@ import {
   fetchCommandRecents,
   fetchCommands,
   recordCommandRecent,
+  runCommand,
   searchAll,
   suggestTitles,
   type CommandInfo,
@@ -138,7 +149,16 @@ const COMMAND_ICONS: Record<string, LucideIcon> = {
   images: Images,
   globe: Globe,
   sparkles: Sparkles,
+  "refresh-cw": RefreshCw,
+  eraser: Eraser,
 };
+
+/** What the palette knows about an action command that is running, or has just run. */
+type RunState =
+  | { status: "idle" }
+  | { status: "running"; command: CommandInfo }
+  | { status: "done"; command: CommandInfo; message: string }
+  | { status: "failed"; command: CommandInfo; message: string; code: string };
 
 /** The failure of one request, in the pieces a group row shows. */
 type GroupFailure = { code: string; status: number; message: string };
@@ -179,6 +199,8 @@ type PaletteItem = {
   query?: string;
   /** The registry id a command row runs. */
   commandId?: string;
+  /** What running the command does (`navigate` opens `url`; `action` runs through the API). */
+  commandKind?: "navigate" | "action";
   /** How many results the search answered with, for the history entry. */
   resultCount?: number | null;
 };
@@ -254,6 +276,10 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   const [views, setViews] = useState<RecentView[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  /** The action command whose confirmation card is showing; nothing runs until the caller says yes. */
+  const [pendingRun, setPendingRun] = useState<CommandInfo | null>(null);
+  /** The action command that is running, or the outcome of the last one. */
+  const [runState, setRunState] = useState<RunState>({ status: "idle" });
   const [attempt, setAttempt] = useState(0);
   const [registryAttempt, setRegistryAttempt] = useState(0);
 
@@ -466,6 +492,12 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     return matchCommands(commands, term, mode === "commands" ? COMMAND_LIMIT : COMMAND_INLINE);
   }, [commands, contextCommands, term, mode]);
 
+  /** The registry as a lookup, so a row knows what its command does today. */
+  const commandById = useMemo(
+    () => new Map((commands ?? []).map((command) => [command.id, command])),
+    [commands],
+  );
+
   // The store keeps every run of a query; the palette shows each one once, minus the ones this
   // browser asked to forget.
   const visibleRecents = useMemo(() => {
@@ -491,13 +523,16 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
 
     const commandItems = (rows: CommandInfo[]) => {
       rows.forEach((command, index) => {
+        const action = command.kind === "action";
         list.push({
           id: `command-${index}`,
           kind: "command",
           section,
           label: command.title,
-          url: command.route,
+          // An action runs; only a navigation command has somewhere to go.
+          url: action ? undefined : command.route,
           commandId: command.id,
+          commandKind: command.kind,
         });
       });
       if (rows.length > 0) {
@@ -602,6 +637,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
           label: row.label,
           url: row.route,
           commandId: row.commandId,
+          commandKind: commandById.get(row.commandId)?.kind,
         });
       }
     });
@@ -621,6 +657,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   }, [
     mode,
     hunting,
+    commandById,
     commandSuggestions,
     groups,
     showSuggestions,
@@ -676,6 +713,29 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     recordCommandRecent({ kind: "command", command_id: commandId }).catch(() => undefined);
   }, []);
 
+  /**
+   * Run one action command through the API, and show what the owning service answered.
+   *
+   * The palette never invents the outcome: the line it prints is the run endpoint's own message,
+   * and a failure keeps its code so the tooltip (and the reader) can tell what went wrong.
+   */
+  const runAction = useCallback(async (command: CommandInfo) => {
+    setPendingRun(null);
+    setRunState({ status: "running", command });
+    try {
+      const outcome = await runCommand(command.id, true);
+      setRunState({ status: "done", command, message: outcome.message });
+    } catch (cause) {
+      const failure = asGroupFailure(cause);
+      setRunState({
+        status: "failed",
+        command,
+        message: failure.message,
+        code: failure.code,
+      });
+    }
+  }, []);
+
   const activate = useCallback(
     (item: PaletteItem, newTab: boolean) => {
       if (item.kind === "recent-query" && item.query) {
@@ -683,10 +743,21 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         inputRef.current?.focus();
         return;
       }
-      if (item.kind === "command" && item.commandId) {
-        // An action command runs; a navigation command only opens a screen. Either way the run is
-        // remembered, and the owning screen does the writing.
-        rememberCommand(item.commandId);
+      if (item.kind === "command" || item.kind === "recent-command") {
+        // Either kind of command row is remembered (the owning screen does any writing); an
+        // action then runs, while a navigation command only opens its screen.
+        if (item.commandId) {
+          rememberCommand(item.commandId);
+        }
+        const command = item.commandId ? commandById.get(item.commandId) : undefined;
+        if (command?.kind === "action") {
+          if (command.confirm) {
+            setPendingRun(command);
+          } else {
+            void runAction(command);
+          }
+          return;
+        }
       }
       if (
         (item.kind === "hit" || item.kind === "see-all" || item.kind === "everywhere") &&
@@ -707,7 +778,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         );
       }
     },
-    [go, rememberCommand, rememberQuery, term],
+    [commandById, go, rememberCommand, rememberQuery, runAction, term],
   );
 
   const jumpSection = useCallback(
@@ -733,6 +804,21 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   );
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    // A confirmation is the top of the stack: Enter is the yes the card is asking for and Escape
+    // takes the question back, so neither reaches the rows or closes the palette.
+    if (pendingRun) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void runAction(pendingRun);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setPendingRun(null);
+        return;
+      }
+    }
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setActiveIndex((index) => Math.min(index + 1, Math.max(items.length - 1, 0)));
@@ -779,6 +865,106 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
     clearCommandRecents().catch(() => undefined);
   };
 
+  /**
+   * The question an action command asks before it runs: what would run, what it costs, and the
+   * two answers. Kept at the top of the list so it is impossible to miss and impossible to
+   * answer by accident with the arrow keys.
+   */
+  const confirmCard = pendingRun ? (
+    <div
+      data-palette-confirm={pendingRun.id}
+      className="mx-0.5 mb-2 rounded-lg border border-caution/40 bg-caution-soft px-3 py-2.5"
+    >
+      <div className="flex items-start gap-2">
+        <TriangleAlert className="mt-0.5 size-4 shrink-0 text-caution" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <p className="text-[13px] font-medium text-ink">Run “{pendingRun.title}”?</p>
+          <p className="mt-0.5 text-[12px] text-muted">
+            {pendingRun.hint}. This cannot be undone.
+          </p>
+        </div>
+      </div>
+      <div className="mt-2.5 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-palette-confirm-run
+          onClick={() => void runAction(pendingRun)}
+          className="rounded-md border border-accent-strong/30 bg-accent-soft px-3 py-1.5 text-[12px] font-medium text-accent-strong transition hover:bg-surface"
+        >
+          Run
+        </button>
+        <button
+          type="button"
+          data-palette-confirm-cancel
+          onClick={() => setPendingRun(null)}
+          className="rounded-md border border-line bg-surface px-3 py-1.5 text-[12px] text-muted transition hover:bg-quiet-soft hover:text-ink"
+        >
+          Cancel
+        </button>
+        <span className="text-[11px] text-muted">↵ run · esc cancel</span>
+      </div>
+    </div>
+  ) : null;
+
+  /** What the owning service answered — the run's own line, or its failure with the code kept. */
+  const runCard =
+    runState.status === "idle" ? null : (
+      <div
+        data-palette-run-result={runState.status}
+        className={`mx-0.5 mb-2 rounded-lg border px-3 py-2.5 ${
+          runState.status === "failed"
+            ? "border-caution/40 bg-caution-soft"
+            : "border-line bg-canvas/70"
+        }`}
+      >
+        <div className="flex items-start gap-2">
+          {runState.status === "running" ? (
+            <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-muted" aria-hidden />
+          ) : runState.status === "failed" ? (
+            <TriangleAlert className="mt-0.5 size-4 shrink-0 text-caution" aria-hidden />
+          ) : (
+            <CheckCircle className="mt-0.5 size-4 shrink-0 text-positive" aria-hidden />
+          )}
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-medium text-ink">
+              {runState.status === "running"
+                ? `Running “${runState.command.title}”…`
+                : runState.status === "failed"
+                  ? `“${runState.command.title}” did not run`
+                  : `“${runState.command.title}” is done`}
+            </p>
+            <p
+              className="mt-0.5 text-[12px] break-words text-muted"
+              title={runState.status === "failed" ? runState.code : undefined}
+            >
+              {runState.status === "running" ? "Waiting for the platform's answer." : runState.message}
+            </p>
+            {runState.status === "done" && runState.command.route ? (
+              <button
+                type="button"
+                data-palette-run-details
+                onClick={() => go(runState.command.route, false)}
+                className="mt-1 rounded-md text-[12px] font-medium text-accent-strong underline-offset-2 hover:underline"
+              >
+                View details
+              </button>
+            ) : null}
+          </div>
+          {runState.status !== "running" ? (
+            <button
+              type="button"
+              aria-label="Dismiss the run result"
+              data-palette-run-dismiss
+              onClick={() => setRunState({ status: "idle" })}
+              className="shrink-0 rounded-md p-1 text-muted transition hover:bg-quiet-soft hover:text-ink"
+            >
+              <X className="size-3.5" aria-hidden />
+            </button>
+          ) : null}
+        </div>
+      </div>
+    );
+
   const rowIndex = (id: string) => itemIndex.get(id) ?? -1;
 
   const highlight = (title: string, needles: string[]) =>
@@ -795,6 +981,7 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
   const commandRow = (command: CommandInfo, index: number) => {
     const id = `command-${index}`;
     const Icon = COMMAND_ICONS[command.icon] ?? CommandIcon;
+    const action = command.kind === "action";
     return (
       <Option
         key={id}
@@ -809,13 +996,22 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         onHover={() => setActiveIndex(rowIndex(id))}
         icon={<Icon className="size-3.5" />}
         trailing={
-          <span className="shrink-0 rounded-md border border-line bg-canvas px-1.5 py-0.5 text-[10.5px] text-muted">
-            Command
+          <span
+            data-palette-command-kind={command.kind}
+            className={`shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px] ${
+              action
+                ? "border-accent-strong/30 bg-accent-soft text-accent-strong"
+                : "border-line bg-canvas text-muted"
+            }`}
+          >
+            {action ? "Action" : "Command"}
           </span>
         }
       >
         <span className="truncate text-[13px] text-ink">{command.title}</span>
-        <span className="truncate text-[11.5px] text-muted">{command.hint}</span>
+        <span className="truncate text-[11.5px] text-muted">
+          {action ? `${command.hint}${command.confirm ? " · asks first" : ""}` : command.hint}
+        </span>
       </Option>
     );
   };
@@ -1184,14 +1380,23 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
                 ) : (
                   <CommandIcon className="size-3.5" />
                 );
+              const recentAction =
+                row.kind === "command" && commandById.get(row.commandId)?.kind === "action";
               const trailing =
                 row.kind === "query" ? (
                   row.resultCount !== null ? (
                     <span className="shrink-0 text-[11px] text-muted">{row.resultCount} results</span>
                   ) : null
                 ) : (
-                  <span className="shrink-0 rounded-md border border-line bg-canvas px-1.5 py-0.5 text-[10.5px] text-muted">
-                    Command
+                  <span
+                    data-palette-command-kind={recentAction ? "action" : "navigate"}
+                    className={`shrink-0 rounded-md border px-1.5 py-0.5 text-[10.5px] ${
+                      recentAction
+                        ? "border-accent-strong/30 bg-accent-soft text-accent-strong"
+                        : "border-line bg-canvas text-muted"
+                    }`}
+                  >
+                    {recentAction ? "Action" : "Command"}
                   </span>
                 );
               return (
@@ -1212,7 +1417,9 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
                     >
                       <span className="truncate text-[13px] text-ink">{row.label}</span>
                       {row.kind === "command" ? (
-                        <span className="truncate text-[11.5px] text-muted">{row.route}</span>
+                        <span className="truncate text-[11.5px] text-muted">
+                          {recentAction ? "runs again · asks first" : row.route}
+                        </span>
                       ) : null}
                     </Option>
                   </div>
@@ -1293,10 +1500,15 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
         aria-modal="true"
         aria-label="Search Omnion"
         // Escape closes from anywhere inside the palette — the input is not the only thing that
-        // can hold focus (a row, the "Clear" button, the shortcut list).
+        // can hold focus (a row, the "Clear" button, the shortcut list). A confirmation on the
+        // table takes the key first: its question is withdrawn before the palette itself closes.
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
+            if (pendingRun) {
+              setPendingRun(null);
+              return;
+            }
             onClose();
           }
         }}
@@ -1357,6 +1569,8 @@ export function SearchPalette({ initialQuery, onClose }: SearchPaletteProps) {
           aria-label="Search results"
           className="min-h-0 flex-1 overflow-y-auto px-1.5 py-2"
         >
+          {confirmCard}
+          {runCard}
           {body()}
         </div>
 

@@ -599,6 +599,10 @@ export function clearRecentSearches(): Promise<null> {
 /**
  * One command the palette may offer. The list arrives already projected through the caller's
  * effective permissions, so the panel never has to decide what an account may run.
+ *
+ * `kind` says what running it does: `navigate` opens `route`; `action` posts to the run endpoint
+ * and acts through its owning service, with `confirm` telling the palette to show the question
+ * first (the API refuses an unconfirmed run either way).
  */
 export type CommandInfo = {
   id: string;
@@ -606,6 +610,9 @@ export type CommandInfo = {
   group: string;
   hint: string;
   icon: string;
+  kind: "navigate" | "action";
+  confirm: boolean;
+  /** A navigation command's destination, or the screen that reads an action's record back. */
   route: string;
   keywords: string[];
   aliases: string[];
@@ -659,6 +666,29 @@ export function recordCommandRecent(
 /** Forget everything this account did in the palette. */
 export function clearCommandRecents(): Promise<null> {
   return request<null>("/api/v1/command-center/recent", { method: "DELETE" });
+}
+
+/** One action command's outcome: the owning service's own result plus the palette's own line. */
+export type CommandRunResult = {
+  command: string;
+  kind: "action";
+  outcome: "ok";
+  message: string;
+  result: unknown;
+};
+
+/**
+ * Run one action command through its owning service.
+ *
+ * `confirm` is the caller's yes: the API refuses a command that asks before it runs until the
+ * request carries it, so the confirmation the palette shows and the rule the API enforces are the
+ * same fact.
+ */
+export function runCommand(commandId: string, confirm = true): Promise<CommandRunResult> {
+  return request<CommandRunResult>(`/api/v1/commands/${encodeURIComponent(commandId)}/run`, {
+    method: "POST",
+    body: JSON.stringify({ confirm }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
