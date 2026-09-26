@@ -323,3 +323,58 @@
   unpublished=404`) · `Infra — compose config` ✅.
 - Next: **P08 — Media v0** (`crates/storage` S3/MinIO abstraction, upload endpoint, media table and
   the public serve path).
+
+## 2026-09-26 — P08 · Media v0
+
+- `crates/storage` (`omnion-storage`): the object-storage abstraction behind the media library —
+  a key validator (`keys.rs`, the shape that cannot leave a storage root), SigV4 signing of its own
+  S3 requests (`signing.rs`; unit-tested against the published example request — canonical request,
+  string-to-sign and signature), an S3/MinIO driver (`s3.rs`: path-style addressing, `NoSuchBucket`
+  → create the bucket and retry once, and a `probe` that tells a missing bucket from an unreachable
+  store) and a file-system driver for local runs (`fs.rs`). `Storage::from_config`/`from_env` pick
+  the driver from `StorageConfig` (`OMNION_STORAGE_DRIVER=s3|fs`, `OMNION_S3_*`, `OMNION_STORAGE_DIR`);
+  the secret key is never rendered.
+- `crates/media` (`omnion-media`): the row half — the `Media`/`NewMedia` model, the `media` table
+  queries and the rules the outside world meets: `sanitize_filename` (path dropped, symbols reduced,
+  extension kept), `normalize_content_type` (`type/subtype` only), `object_key` built from ids, and
+  `serve_plan` — the inline allow-list (images, video, audio, PDF, `text/plain`); everything else
+  leaves as `application/octet-stream` + `attachment` with `nosniff`, so an uploaded document can
+  never become markup or script on the platform's own origin.
+- `database/migrations/0005_media.sql`: one row per stored object (site, object key, file name,
+  content type, size, SHA-256 checksum, uploader) with a unique object key, `size > 0` and shaped
+  content-type/checksum constraints; sites cascade, so a removed tenant takes its library with it.
+- API (`/api/v1/media`): `POST` (multipart, `media.upload`; the route's own body limit is the
+  library's 25 MB plus framing slack; the row is written *after* the object is stored and the object
+  is dropped again when the row is refused), `GET` list and metadata (`media.read`),
+  `GET /{id}/raw` (`media.read`), `DELETE` (`media.delete` — object first, so a refused store never
+  leaves bytes nothing points at). Every handler applies the tenancy scope rule through the site and
+  writes an audit row (`media.uploaded`, `media.deleted`). The renderer's read path is
+  unauthenticated like the rest of the public surface: `GET /api/v1/public/media/{id}`. `AppState`
+  now carries the object store; boot logs `s3://omnion-media` and warns instead of failing when the
+  store is down.
+- `apps/admin`: the `/media` screen (new nav entry) — the library of the selected site with previews
+  for image types, type/size/uploaded columns, an upload button (multipart through the panel's own
+  origin) and per-row removal. `lib/api.ts` gained `fetchMedia`/`uploadMedia`/`deleteMedia`/
+  `mediaRawUrl` and now only sets `content-type: application/json` for string bodies, so `FormData`
+  keeps the browser's own multipart boundary; `lib/format.ts` gained `formatBytes`.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D warnings`
+  clean · `cargo test --workspace` → **190 passed** (storage 25 · media 12 · api unit 40 · the new
+  media integration suite **6** against the live compose stack) ✅ · root `pnpm build` for the admin
+  app green (`ƒ /media` in the route table) ✅.
+- Live walk (fresh database `omnion_p08_live`, API on `:18090`, admin on `:3100`, MinIO from
+  `infra/compose`): sign-in → tenant + site → upload `omnion-media.txt` (19 B, `text/plain`,
+  sha256 `11933807907f32bd…`) → the listing carries it with both read paths → `/raw` answers the very
+  bytes (`cmp` identical, `type=text/plain`) and `/public/media/{id}` the same bytes with no session
+  → anonymous `GET /api/v1/media` → `401` → `DELETE` → `204` → `/raw` afterwards → `404`; the object
+  shows up in the MinIO data directory and is gone once deleted. Admin: Playwright signs in, opens
+  `/media`, and the table lists `omnion-admin-fixture.txt` (`text/plain`, 27 B) — **the file is
+  listed in the panel** ✅ with 0 console errors.
+- Note for deployments: the admin's `/api/*` rewrite destination is baked at build time, so a panel
+  pointed at a non-default API origin has to be *built* with `OMNION_API_URL` set; setting it only
+  at `next start` answers `500` (`ECONNREFUSED 127.0.0.1:8080`).
+- CI: a `Start the object store (media library)` step brings MinIO up the way `infra/compose` does
+  (service containers cannot pass a command) and the smoke step now walks the media round trip —
+  upload → list → `cmp` both read paths → anonymous `401` → delete → `404`.
+- Next: **P09 — Workflow engine v0** (`crates/workflows`: durable step store, background runner,
+  step retries with backoff, wait-sweeper, manual + schedule triggers).
+

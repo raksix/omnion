@@ -69,8 +69,8 @@
 
 ## P08 — Media v0
 
-- [ ] `crates/storage` (S3/MinIO abstraction) + upload endpoint + media table + public serve path (dev: MinIO).
-- [ ] **Verify:** upload → fetch round-trip; file listed in admin. Commit + push + log.
+- [x] `crates/storage` (S3/MinIO abstraction) + upload endpoint + media table + public serve path (dev: MinIO).
+- [x] **Verify:** upload → fetch round-trip; file listed in admin. Commit + push + log.
 
 ## P09 — Workflow engine v0 (docs/09 lessons)
 
