@@ -21,6 +21,7 @@ omnion-audit = { path = "../../crates/audit" }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-content = { path = "../../crates/content" }
 omnion-core = { path = "../../crates/core" }
+omnion-events = { path = "../../crates/events" }
 omnion-identity = { path = "../../crates/identity" }
 omnion-media = { path = "../../crates/media" }
 omnion-onboarding = { path = "../../crates/onboarding" }

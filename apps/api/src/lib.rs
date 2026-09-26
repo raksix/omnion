@@ -10,6 +10,7 @@ pub mod client_ip;
 pub mod cookies;
 pub mod dto;
 pub mod error;
+pub mod event_runner;
 pub mod guards;
 pub mod routes;
 pub mod scope;

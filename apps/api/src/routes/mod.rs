@@ -39,6 +39,13 @@
 //! `ai.providers.manage`, and `POST /ai/chat` answers as `text/event-stream` behind the
 //! `ai.chat` key — using the platform's AI and connecting a provider are separate powers. See
 //! `crate::routes::ai`.
+//!
+//! The events and webhooks surface (`/webhooks`, `/events`) is the platform's own bus
+//! (docs/01-VISION.md §13, P12): endpoints are read with `webhooks.read` and written with
+//! `webhooks.manage`, the queue history of one endpoint rides the read key, and the event feed
+//! is read with `events.read`. Publishing a page records `page.published` and queues a signed
+//! delivery per subscribed endpoint; the worker that sends them lives in `crate::event_runner`.
+//! See `crate::routes::webhooks`.
 
 pub mod ai;
 pub mod auth;
@@ -51,6 +58,7 @@ pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod tenancy;
+pub mod webhooks;
 pub mod workflows;
 
 use axum::Router;
@@ -223,6 +231,27 @@ pub fn router(state: AppState) -> Router {
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
 
+    // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
+    // history is `webhooks.read`, connecting, changing, testing and removing them is
+    // `webhooks.manage`, and the platform's event feed is read with `events.read`. Every
+    // handler applies the tenancy scope rule through the endpoint's organization.
+    let webhooks = get(webhooks::list_webhooks)
+        .layer(guards::require(&state, "webhooks.read"))
+        .merge(post(webhooks::create_webhook).layer(guards::require(&state, "webhooks.manage")));
+
+    let webhook = get(webhooks::get_webhook)
+        .layer(guards::require(&state, "webhooks.read"))
+        .merge(patch(webhooks::update_webhook).layer(guards::require(&state, "webhooks.manage")))
+        .merge(delete(webhooks::delete_webhook).layer(guards::require(&state, "webhooks.manage")));
+
+    let webhook_deliveries =
+        get(webhooks::list_deliveries).layer(guards::require(&state, "webhooks.read"));
+
+    let webhook_test =
+        post(webhooks::test_webhook).layer(guards::require(&state, "webhooks.manage"));
+
+    let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -294,7 +323,12 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/providers/{id}/discover-models", ai_provider_discover)
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
-        .route("/ai/chat", ai_chat);
+        .route("/ai/chat", ai_chat)
+        .route("/webhooks", webhooks)
+        .route("/webhooks/{id}", webhook)
+        .route("/webhooks/{id}/deliveries", webhook_deliveries)
+        .route("/webhooks/{id}/test", webhook_test)
+        .route("/events", events);
 
     Router::new()
         .route("/healthz", get(health::healthz))

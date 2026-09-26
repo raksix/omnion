@@ -7,6 +7,7 @@ use omnion_ai_hub::AiHubError;
 use omnion_audit::AuditError;
 use omnion_content::ContentError;
 use omnion_core::CoreError;
+use omnion_events::EventsError;
 use omnion_identity::IdentityError;
 use omnion_media::MediaError;
 use omnion_onboarding::OnboardingError;
@@ -100,6 +101,44 @@ impl ApiError {
 impl From<CoreError> for ApiError {
     fn from(error: CoreError) -> Self {
         Self::from_core(error)
+    }
+}
+
+impl From<EventsError> for ApiError {
+    /// Events and webhooks (docs/01-VISION.md §13, P12): an endpoint that was never connected is
+    /// a `404`; a name already used inside the organization is a `409` the operator resolves in
+    /// the panel; a definition the platform refuses to store is a `400`; and the store itself is
+    /// the usual dependency/internal split.
+    fn from(error: EventsError) -> Self {
+        match error {
+            EventsError::Store(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            EventsError::Store(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            EventsError::EndpointNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "webhook_endpoint_not_found",
+                "no such webhook endpoint",
+            ),
+            EventsError::EndpointNameTaken(name) => Self::new(
+                StatusCode::CONFLICT,
+                "webhook_name_taken",
+                format!("a webhook endpoint named \"{name}\" already exists in this organization"),
+            ),
+            EventsError::InvalidEndpoint(message) => {
+                Self::bad_request("invalid_webhook_endpoint", message)
+            }
+            EventsError::InvalidEvent(message) => Self::bad_request("invalid_event", message),
+            EventsError::Client(message) => {
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+            }
+        }
     }
 }
 

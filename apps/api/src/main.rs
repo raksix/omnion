@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_api::workflow_runner;
+use omnion_api::{event_runner, workflow_runner};
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
 use omnion_identity::users::{self, BootstrapOutcome};
@@ -82,6 +82,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _runner = workflow_runner::spawn(state.clone());
     } else {
         tracing::info!("the workflow runner is disabled (OMNION_WORKFLOW_RUNNER=false)");
+    }
+
+    // The webhook delivery runner ticks in this process too (docs/BUILD-BACKLOG.md P12). Same
+    // shape as the workflow engine: the queue is durable, so a tick that cannot reach the
+    // database is logged and the next one picks the deliveries up.
+    if state.config().events.runner_enabled {
+        if event_runner::spawn(state.clone()).is_none() {
+            tracing::warn!("the webhook delivery runner is not running");
+        }
+    } else {
+        tracing::info!("the webhook delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
     }
 
     let app = routes::router(state);
