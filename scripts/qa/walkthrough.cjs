@@ -375,7 +375,20 @@ async function runWizard(page, report) {
     }
     const filled = await fillWizardStep(page);
     const clicked = await clickAction(page);
-    await page.waitForTimeout(1300);
+    // The step's own POST can still be in flight: wait for the step to move (or the screen to say
+    // the installation is ready) instead of clicking the same button into a second submission,
+    // which the platform refuses — correctly — as an out-of-order step.
+    for (let wait = 0; wait < 12; wait += 1) {
+      await page.waitForTimeout(350);
+      const state = await page
+        .evaluate(() => {
+          if (/Your installation is ready/i.test(document.body.innerText)) return "ready";
+          const el = document.querySelector('[data-setup-step][data-step-state="current"]');
+          return el ? el.getAttribute("data-setup-step") : "gone";
+        })
+        .catch(() => null);
+      if (state !== stepKey || wait >= 5) break;
+    }
     const now = page.url();
     report.steps.push({ index: i, stepKey, filled, clicked, url: now });
     await shot(page, `0${i + 1}-setup-${stepKey || i}`);
@@ -500,6 +513,22 @@ async function clickPrimaryIn(page, selector) {
     return text;
   }
   return null;
+}
+
+/**
+ * Give a click's own work the moment it needs: a client-side navigation (Next's router) can
+ * commit *after* the click returns, and the next element is then looked up on a page that is
+ * already going away — which reads as "click timed out" and blames the screen.
+ */
+async function settleAfterClick(page, minimum = STEP_MS) {
+  await page.waitForTimeout(minimum);
+  let previous = page.url();
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await page.waitForTimeout(150);
+    const current = page.url();
+    if (current === previous) break;
+    previous = current;
+  }
 }
 
 async function interact(page, pageName, report) {
@@ -658,7 +687,7 @@ async function interact(page, pageName, report) {
     } catch (err) {
       clickError = String(err.message || err).slice(0, 200);
     }
-    await page.waitForTimeout(STEP_MS);
+    await settleAfterClick(page);
     page.context().off("page", onPopup);
     for (const p of popups) await p.close().catch(() => {});
 
@@ -680,6 +709,7 @@ async function interact(page, pageName, report) {
       url_after: after.url,
       errors: consoleLog.slice(before.console).map((c) => `${c.type}: ${c.text.slice(0, 120)}`),
       net: netFailures.slice(before.net).map((n) => `${n.status || "fail"} ${n.url}`),
+      reason: clickError || undefined,
       ms: Date.now() - started,
     };
     record(entry);
@@ -1577,6 +1607,17 @@ async function runAnalyticsDepth(page, report) {
     steps.drawer = false;
   }
 
+  // Every report has an empty state, and it is exercised rather than assumed: a filter that
+  // cannot match leaves the screen with nothing, and the screen has to say so.
+  await page
+    .goto(`${URL_ADMIN}/analytics/pages?path=qa-nothing-matches-this`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.emptyState = (await page.locator('[data-analytics-state="analytics-empty"]').count()) > 0;
+  await shot(page, "analytics-pages-empty");
+  await page.goto(`${URL_ADMIN}/analytics/pages`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
   const waiting = page.waitForEvent("download", { timeout: 20000 }).catch(() => null);
   await page.locator("[data-analytics-export]").click({ timeout: 4000 }).catch(() => {});
   const download = await waiting;
@@ -1825,7 +1866,11 @@ async function main() {
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-request" : "request-failed", `${n.phase} ${n.status || "net"} ${n.url} ${n.error || ""}`);
   }
   for (const c of clicks.filter((c) => ["click-error", "console-error", "request-failed"].includes(c.outcome))) {
-    pushFindings("high", "click-error", `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${(c.errors || []).join(" | ").slice(0, 200)}`);
+    pushFindings(
+      "high",
+      "click-error",
+      `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${c.reason || ""} ${(c.errors || []).join(" | ")}`.slice(0, 240),
+    );
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
   if (report.web && !report.web.error) {
