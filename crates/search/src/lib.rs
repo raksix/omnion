@@ -22,10 +22,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod commands;
 pub mod error;
 pub mod indexer;
 pub mod providers;
 pub mod query;
+
+pub use commands::{COMMANDS, CommandKind, CommandSpec, command as command_spec, suggest, visible};
 
 pub use error::{Result, SearchError};
 pub use providers::{PROVIDERS, ProviderSpec, provider, provider_keys};
