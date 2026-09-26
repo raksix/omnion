@@ -64,6 +64,25 @@ pub const DEFAULT_EVENTS_RETRY_BASE_MS: u64 = 15_000;
 /// Default ceiling of the retry backoff in milliseconds (`OMNION_EVENTS_RETRY_MAX_MS`).
 pub const DEFAULT_EVENTS_RETRY_MAX_MS: u64 = 900_000;
 
+/// Default delay between two automation-matcher ticks (`OMNION_AUTOMATION_POLL_MS`).
+pub const DEFAULT_AUTOMATION_POLL_MS: u64 = 2_000;
+
+/// Default number of events one matcher tick evaluates (`OMNION_AUTOMATION_BATCH`).
+pub const DEFAULT_AUTOMATION_BATCH: usize = 100;
+
+/// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
+/// development stack, which is where `infra/compose/mailpit.yml` publishes it.
+pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
+
+/// Default SMTP port (`OMNION_SMTP_PORT`): Mailpit's plain SMTP port.
+pub const DEFAULT_SMTP_PORT: u16 = 1025;
+
+/// Default sender address of platform email (`OMNION_MAIL_FROM`).
+pub const DEFAULT_MAIL_FROM: &str = "omnion@localhost";
+
+/// Default per-message SMTP timeout in milliseconds (`OMNION_SMTP_TIMEOUT_MS`).
+pub const DEFAULT_SMTP_TIMEOUT_MS: u64 = 10_000;
+
 /// Deployment environment the process runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -319,6 +338,111 @@ impl Default for EventsConfig {
     }
 }
 
+/// Automation matcher knobs (`OMNION_AUTOMATION_*`, phase P13).
+///
+/// The background matcher of `apps/api` reads the event bus every `poll_ms` and evaluates up to
+/// `batch` recorded events per tick: which armed rules listen for their name, whether the
+/// payload satisfies their conditions, and — when it does — the run it starts. Turning the
+/// runner off (`OMNION_AUTOMATION_RUNNER=false`) leaves the events in the bus: the cursor is
+/// durable, so another worker (or the next boot) picks the work up where this process left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomationConfig {
+    /// Whether this process matches events (`OMNION_AUTOMATION_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two matcher ticks (`OMNION_AUTOMATION_POLL_MS`).
+    pub poll_ms: u64,
+    /// Events one tick may evaluate (`OMNION_AUTOMATION_BATCH`).
+    pub batch: usize,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_AUTOMATION_POLL_MS,
+            batch: DEFAULT_AUTOMATION_BATCH,
+        }
+    }
+}
+
+/// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
+///
+/// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
+/// production installation points the same settings at its own relay. The password is
+/// write-only like every other secret in the configuration: it is read from the environment and
+/// never rendered back (see the manual `Debug`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct MailConfig {
+    /// Whether the email action may send (`OMNION_MAIL_ENABLED`).
+    pub enabled: bool,
+    /// SMTP server host (`OMNION_SMTP_HOST`).
+    pub host: String,
+    /// SMTP server port (`OMNION_SMTP_PORT`).
+    pub port: u16,
+    /// Sender address of platform email (`OMNION_MAIL_FROM`).
+    pub from: String,
+    /// Username for `AUTH PLAIN`, when the server wants one (`OMNION_SMTP_USERNAME`).
+    pub username: Option<String>,
+    /// Password for `AUTH PLAIN`, when the server wants one (`OMNION_SMTP_PASSWORD`).
+    pub password: Option<String>,
+    /// How long one message may take (`OMNION_SMTP_TIMEOUT_MS`).
+    pub timeout_ms: u64,
+}
+
+impl MailConfig {
+    /// `true` when a username and a password are both configured.
+    #[must_use]
+    pub fn authenticates(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
+    }
+
+    /// `true` when the email action should send: switched on and given a server and a sender.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.enabled && !self.host.trim().is_empty() && !self.from.trim().is_empty()
+    }
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: DEFAULT_SMTP_HOST.to_owned(),
+            port: DEFAULT_SMTP_PORT,
+            from: DEFAULT_MAIL_FROM.to_owned(),
+            username: None,
+            password: None,
+            timeout_ms: DEFAULT_SMTP_TIMEOUT_MS,
+        }
+    }
+}
+
+/// Render the mail settings without the credentials.
+///
+/// A password in a log line is a leaked password: the Debug output names the host, the sender
+/// and whether credentials are configured, and never the secret itself.
+impl std::fmt::Debug for MailConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MailConfig")
+            .field("enabled", &self.enabled)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("from", &self.from)
+            .field("username", &self.username.as_deref().unwrap_or("<none>"))
+            .field(
+                "password",
+                &if self.password.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -336,6 +460,10 @@ pub struct Config {
     pub workflows: WorkflowConfig,
     /// Event bus and webhook delivery knobs (P12).
     pub events: EventsConfig,
+    /// Automation matcher knobs (P13).
+    pub automation: AutomationConfig,
+    /// Email settings of the `send_email` action (P13).
+    pub mail: MailConfig,
     /// Logging.
     pub log: LogConfig,
 }
@@ -472,6 +600,26 @@ impl Config {
             )?,
         };
 
+        let automation = AutomationConfig {
+            runner_enabled: read_flag(&read, "OMNION_AUTOMATION_RUNNER", true)?,
+            poll_ms: read_positive(
+                &read,
+                "OMNION_AUTOMATION_POLL_MS",
+                DEFAULT_AUTOMATION_POLL_MS,
+            )?,
+            batch: read_count(&read, "OMNION_AUTOMATION_BATCH", DEFAULT_AUTOMATION_BATCH)?,
+        };
+
+        let mail = MailConfig {
+            enabled: read_flag(&read, "OMNION_MAIL_ENABLED", true)?,
+            host: read("OMNION_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.to_owned()),
+            port: read_port(&read, "OMNION_SMTP_PORT", DEFAULT_SMTP_PORT)?,
+            from: read("OMNION_MAIL_FROM").unwrap_or_else(|| DEFAULT_MAIL_FROM.to_owned()),
+            username: read("OMNION_SMTP_USERNAME"),
+            password: read("OMNION_SMTP_PASSWORD"),
+            timeout_ms: read_positive(&read, "OMNION_SMTP_TIMEOUT_MS", DEFAULT_SMTP_TIMEOUT_MS)?,
+        };
+
         let config = Self {
             env,
             http: HttpConfig { host, port },
@@ -480,6 +628,8 @@ impl Config {
             admin,
             workflows,
             events,
+            automation,
+            mail,
             log,
         };
         config.validate()?;
@@ -514,6 +664,8 @@ impl Default for Config {
             admin: None,
             workflows: WorkflowConfig::default(),
             events: EventsConfig::default(),
+            automation: AutomationConfig::default(),
+            mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
     }
@@ -566,6 +718,16 @@ where
             format!("expected a count that fits this platform, got {value}"),
         )
     })
+}
+
+/// Read an optional TCP port.
+fn read_port<F>(read: &F, key: &str, default: u16) -> Result<u16, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = read_positive(read, key, u64::from(default))?;
+    u16::try_from(value)
+        .map_err(|_| ConfigError::invalid(key, format!("expected a port number, got {value}")))
 }
 
 #[cfg(test)]
@@ -797,5 +959,83 @@ mod tests {
         let error = config_from(&[("OMNION_EVENTS_RUNNER", "maybe")])
             .expect_err("an unknown boolean is refused");
         assert_eq!(error.key, "OMNION_EVENTS_RUNNER");
+    }
+
+    #[test]
+    fn the_automation_matcher_and_mail_have_development_defaults() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.automation.runner_enabled);
+        assert_eq!(config.automation.poll_ms, DEFAULT_AUTOMATION_POLL_MS);
+        assert_eq!(config.automation.batch, DEFAULT_AUTOMATION_BATCH);
+
+        // The defaults point at the compose stack's Mailpit, which is what makes the email
+        // action work out of the box in development.
+        assert!(config.mail.enabled);
+        assert_eq!(config.mail.host, DEFAULT_SMTP_HOST);
+        assert_eq!(config.mail.port, DEFAULT_SMTP_PORT);
+        assert_eq!(config.mail.from, DEFAULT_MAIL_FROM);
+        assert_eq!(config.mail.timeout_ms, DEFAULT_SMTP_TIMEOUT_MS);
+        assert!(!config.mail.authenticates(), "no credentials by default");
+        assert!(config.mail.is_usable());
+    }
+
+    #[test]
+    fn the_automation_matcher_and_mail_are_configurable() {
+        let config = config_from(&[
+            ("OMNION_AUTOMATION_RUNNER", "false"),
+            ("OMNION_AUTOMATION_POLL_MS", "250"),
+            ("OMNION_AUTOMATION_BATCH", "7"),
+            ("OMNION_MAIL_ENABLED", "false"),
+            ("OMNION_SMTP_HOST", "mailpit"),
+            ("OMNION_SMTP_PORT", "2525"),
+            ("OMNION_MAIL_FROM", "platform@example.com"),
+            ("OMNION_SMTP_USERNAME", "omnion"),
+            ("OMNION_SMTP_PASSWORD", "secret"),
+            ("OMNION_SMTP_TIMEOUT_MS", "1500"),
+        ])
+        .expect("the automation settings are valid");
+
+        assert!(!config.automation.runner_enabled);
+        assert_eq!(config.automation.poll_ms, 250);
+        assert_eq!(config.automation.batch, 7);
+        assert!(!config.mail.enabled);
+        assert_eq!(config.mail.host, "mailpit");
+        assert_eq!(config.mail.port, 2_525);
+        assert_eq!(config.mail.from, "platform@example.com");
+        assert_eq!(config.mail.username.as_deref(), Some("omnion"));
+        assert!(config.mail.authenticates());
+        assert_eq!(config.mail.timeout_ms, 1_500);
+        assert!(!config.mail.is_usable(), "switched off is not usable");
+    }
+
+    #[test]
+    fn a_mail_password_never_reaches_a_log_line() {
+        let config = config_from(&[
+            ("OMNION_SMTP_USERNAME", "omnion"),
+            ("OMNION_SMTP_PASSWORD", "hunter2"),
+        ])
+        .expect("the mail settings are valid");
+
+        let rendered = format!("{:?}", config.mail);
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        // The whole configuration renders safely too (it derives Debug through this field).
+        let whole = format!("{:?}", config);
+        assert!(!whole.contains("hunter2"), "{whole}");
+    }
+
+    #[test]
+    fn broken_automation_settings_fail_at_boot() {
+        let error =
+            config_from(&[("OMNION_AUTOMATION_POLL_MS", "0")]).expect_err("a zero poll is refused");
+        assert_eq!(error.key, "OMNION_AUTOMATION_POLL_MS");
+
+        let error = config_from(&[("OMNION_SMTP_PORT", "70000")])
+            .expect_err("a port outside the range is refused");
+        assert_eq!(error.key, "OMNION_SMTP_PORT");
+
+        let error = config_from(&[("OMNION_AUTOMATION_BATCH", "many")])
+            .expect_err("a non-numeric batch is refused");
+        assert_eq!(error.key, "OMNION_AUTOMATION_BATCH");
     }
 }
