@@ -70,6 +70,12 @@ pub const DEFAULT_AUTOMATION_POLL_MS: u64 = 2_000;
 /// Default number of events one matcher tick evaluates (`OMNION_AUTOMATION_BATCH`).
 pub const DEFAULT_AUTOMATION_BATCH: usize = 100;
 
+/// Default delay between two search-indexer ticks (`OMNION_SEARCH_POLL_MS`).
+pub const DEFAULT_SEARCH_POLL_MS: u64 = 2_000;
+
+/// Default number of events one search-indexer tick applies (`OMNION_SEARCH_BATCH`).
+pub const DEFAULT_SEARCH_BATCH: usize = 200;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -365,6 +371,28 @@ impl Default for AutomationConfig {
     }
 }
 
+/// Search indexer knobs (docs/requests/REQ-002): the background task that applies the event
+/// bus to the search index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchConfig {
+    /// Whether this process keeps the index fresh (`OMNION_SEARCH_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two indexer ticks (`OMNION_SEARCH_POLL_MS`).
+    pub poll_ms: u64,
+    /// Events one tick may apply (`OMNION_SEARCH_BATCH`).
+    pub batch: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_SEARCH_POLL_MS,
+            batch: DEFAULT_SEARCH_BATCH,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -462,6 +490,8 @@ pub struct Config {
     pub events: EventsConfig,
     /// Automation matcher knobs (P13).
     pub automation: AutomationConfig,
+    /// Search indexer knobs (REQ-002).
+    pub search: SearchConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -610,6 +640,12 @@ impl Config {
             batch: read_count(&read, "OMNION_AUTOMATION_BATCH", DEFAULT_AUTOMATION_BATCH)?,
         };
 
+        let search = SearchConfig {
+            runner_enabled: read_flag(&read, "OMNION_SEARCH_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_SEARCH_POLL_MS", DEFAULT_SEARCH_POLL_MS)?,
+            batch: read_count(&read, "OMNION_SEARCH_BATCH", DEFAULT_SEARCH_BATCH)?,
+        };
+
         let mail = MailConfig {
             enabled: read_flag(&read, "OMNION_MAIL_ENABLED", true)?,
             host: read("OMNION_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.to_owned()),
@@ -629,6 +665,7 @@ impl Config {
             workflows,
             events,
             automation,
+            search,
             mail,
             log,
         };
@@ -665,6 +702,7 @@ impl Default for Config {
             workflows: WorkflowConfig::default(),
             events: EventsConfig::default(),
             automation: AutomationConfig::default(),
+            search: SearchConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }

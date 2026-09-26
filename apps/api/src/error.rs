@@ -287,7 +287,8 @@ impl From<AutomationError> for ApiError {
 
 impl From<SearchError> for ApiError {
     /// Search reads the panel's own tables through the shared pool: a pool failure is the usual
-    /// retryable dependency split, anything else is an internal error the operator has to see.
+    /// retryable dependency split, an unknown provider is the caller's mistake, anything else is
+    /// an internal error the operator has to see.
     fn from(error: SearchError) -> Self {
         match error {
             SearchError::Store(err) if dependency_unavailable(&err) => Self::new(
@@ -299,6 +300,15 @@ impl From<SearchError> for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 err.to_string(),
+            ),
+            SearchError::UnknownProvider(key) => Self::bad_request(
+                "unknown_provider",
+                format!("no search provider named \"{key}\""),
+            ),
+            other => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                other.to_string(),
             ),
         }
     }

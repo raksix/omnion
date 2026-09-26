@@ -1,15 +1,16 @@
-//! Integration tests for the search surface: the one search box and its source registry
+//! Integration tests for the search surface: the index, the query language and the API
 //! (docs/requests/REQ-002).
 //!
 //! They run against the development stack
 //! (`docker compose -f infra/compose/docker-compose.dev.yml up -d`) — locally and in CI. When
 //! PostgreSQL is not reachable the suite skips itself with a printed reason.
 //!
-//! What the walks prove, in the words of the acceptance criteria: the answer is grouped per
-//! source; the result set is exactly what the caller's read permissions and their tenancy allow
-//! (a page of another organization is invisible, a source the caller cannot read is reported as
-//! skipped); every term must match; the source filter and the per-group limit are honoured; and
-//! a page renamed in its latest revision is still found by the title it carried before.
+//! What the walks prove, in the words of the acceptance criteria: a seeded installation answers
+//! a query across pages, media and users; an entity the caller cannot open is never returned
+//! (an editor without `users.read` gets no user rows); results are scoped to the caller's
+//! organization; the scoped syntax narrows honestly (an unknown `type:` is empty *and*
+//! explained); publishing a page makes it findable within one indexer tick; a reindex is
+//! idempotent and gated by `search.manage`; and the index's status and suggestions answer.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -21,6 +22,7 @@ use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_search::indexer;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -28,8 +30,23 @@ use uuid::Uuid;
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
-/// The read keys the search editor of this suite holds: content and media, but not sites.
-const EDITOR_PERMISSIONS: [&str; 2] = ["content.pages.read", "media.read"];
+/// Serialises this suite. The index has ONE cursor row and ONE event bus, so two of these walks
+/// in flight settle each other's events — the lesson the automation suite learned first. The
+/// guard is held for the whole walk.
+static SEARCH_WALK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What the content editor of this suite may do: read content and media, write and publish
+/// pages, and search — but **not** read accounts or sites.
+const EDITOR_PERMISSIONS: [&str; 5] = [
+    "search.read",
+    "content.pages.read",
+    "content.pages.create",
+    "content.pages.publish",
+    "media.read",
+];
+
+/// What the librarian adds on top: the account read key, which is what makes user rows appear.
+const LIBRARIAN_EXTRA: [&str; 1] = ["users.read"];
 
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
@@ -124,18 +141,24 @@ async fn live_state() -> Option<(AppState, Db)> {
     Some((state, db))
 }
 
-/// Two organizations with one site each, a platform Owner, an editor of the first organization
-/// that holds the content + media read keys, and a member without any.
+/// Two organizations with one site each, a platform Owner, a content editor of the first
+/// organization, a librarian (the editor plus `users.read`) and a member with nothing.
 ///
 /// Every row carries a `search-` prefix or a random address, and cleanup removes exactly the
 /// rows this fixture created — by id, never by pattern, so parallel suites cannot collide.
 struct Fixture {
+    /// Held for the whole walk; see [`SEARCH_WALK`].
+    _walk: tokio::sync::MutexGuard<'static, ()>,
     state: AppState,
     db: Db,
     platform_email: String,
+    /// Eight hex characters unique to this run, planted in the fixture's site names so a
+    /// search can address exactly this fixture's rows.
+    marker: String,
     site_a: Uuid,
     site_b: Uuid,
     editor_email: String,
+    librarian_email: String,
     member_email: String,
     accounts: Vec<Uuid>,
     organizations: Vec<Uuid>,
@@ -143,29 +166,31 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
+        let walk = SEARCH_WALK.lock().await;
         let (state, db) = live_state().await?;
         seed::ensure(db.pool())
             .await
             .expect("the IAM seed must run");
 
+        let marker = Uuid::new_v4().simple().to_string()[..8].to_owned();
         let org_a = create_organization_row(&db, "a", "Search Test A").await;
         let org_b = create_organization_row(&db, "b", "Search Test B").await;
-        let site_a = create_site_row(&db, org_a, "main", "Search Site A").await;
-        let site_b = create_site_row(&db, org_b, "main", "Search Site B").await;
+        let site_a = create_site_row(&db, org_a, "main", &format!("Search Site A {marker}")).await;
+        let site_b = create_site_row(&db, org_b, "main", &format!("Search Site B {marker}")).await;
 
-        let (platform_id, platform_email) = create_account(&db, None).await;
+        let (platform_id, platform_email) = create_account(&db, None, "Release Owner").await;
         seed::bind_owner(db.pool(), platform_id)
             .await
             .expect("the owner binding must be created");
 
-        let (editor_id, editor_email) = create_account(&db, Some(org_a)).await;
+        let (editor_id, editor_email) = create_account(&db, Some(org_a), "Release Editor").await;
         let role = role_store::create_role(
             db.pool(),
             NewRole {
                 organization_id: org_a,
                 key: format!("search-editor-{}", Uuid::new_v4().simple()),
                 name: "Search Editor".to_owned(),
-                description: "Reads the content and media of one organization".to_owned(),
+                description: "Reads content and media of one organization and searches".to_owned(),
                 priority: 400,
                 inherits_role_id: None,
             },
@@ -200,17 +225,60 @@ impl Fixture {
             .await
             .expect("the binding must be granted");
 
-        let (member_id, member_email) = create_account(&db, Some(org_a)).await;
+        // The librarian: everything the editor holds plus `users.read`.
+        let (librarian_id, librarian_email) =
+            create_account(&db, Some(org_a), "Release Librarian").await;
+        let librarian_role = role_store::create_role(
+            db.pool(),
+            NewRole {
+                organization_id: org_a,
+                key: format!("search-librarian-{}", Uuid::new_v4().simple()),
+                name: "Search Librarian".to_owned(),
+                description: "Searches, and may see the accounts of the organization".to_owned(),
+                priority: 420,
+                inherits_role_id: None,
+            },
+        )
+        .await
+        .expect("the librarian role must be created");
+        let entries: Vec<RolePermissionInput> = EDITOR_PERMISSIONS
+            .iter()
+            .chain(LIBRARIAN_EXTRA.iter())
+            .map(|key| RolePermissionInput {
+                key: (*key).to_owned(),
+                effect: Effect::Allow,
+            })
+            .collect();
+        role_store::set_role_permissions(db.pool(), librarian_role.id, &entries)
+            .await
+            .expect("the librarian permission set must be written");
+        let binding = NewBinding {
+            role_id: librarian_role.id,
+            user_id: librarian_id,
+            scope: Scope::Organization {
+                organization_id: org_a,
+            },
+            granted_by: Some(platform_id),
+            expires_at: None,
+        };
+        bindings::grant(db.pool(), binding)
+            .await
+            .expect("the librarian binding must be granted");
+
+        let (member_id, member_email) = create_account(&db, Some(org_a), "Release Member").await;
 
         Some(Self {
+            _walk: walk,
             state,
             db,
             platform_email,
+            marker,
             site_a,
             site_b,
             editor_email,
+            librarian_email,
             member_email,
-            accounts: vec![platform_id, editor_id, member_id],
+            accounts: vec![platform_id, editor_id, librarian_id, member_id],
             organizations: vec![org_a, org_b],
         })
     }
@@ -220,9 +288,14 @@ impl Fixture {
         login(&self.state, &self.platform_email).await
     }
 
-    /// The editor of the first organization, signed in.
+    /// The content editor of the first organization, signed in.
     async fn editor_token(&self) -> String {
         login(&self.state, &self.editor_email).await
+    }
+
+    /// The librarian (editor plus `users.read`), signed in.
+    async fn librarian_token(&self) -> String {
+        login(&self.state, &self.librarian_email).await
     }
 
     /// The plain member of the first organization, signed in.
@@ -230,8 +303,29 @@ impl Fixture {
         login(&self.state, &self.member_email).await
     }
 
+    /// Rebuild the whole index (as the platform Owner, who holds `search.manage`).
+    async fn reindex(&self) {
+        let owner = self.platform_token().await;
+        let response = call(
+            &self.state,
+            request(
+                Method::POST,
+                "/api/v1/search/reindex",
+                Some(&owner),
+                Some(json!({})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "reindex: {}",
+            response.body
+        );
+    }
+
     /// Remove exactly what this fixture created: the organizations cascade into sites, pages,
-    /// revisions and media rows.
+    /// revisions and media rows, and the search documents of those sites follow them.
     async fn cleanup(&self) {
         sqlx::query("delete from users where id = any($1)")
             .bind(&self.accounts)
@@ -271,14 +365,14 @@ async fn create_site_row(db: &Db, organization_id: Uuid, key: &str, name: &str) 
 }
 
 /// Create an account with a unique address so parallel runs cannot collide.
-async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
+async fn create_account(db: &Db, organization_id: Option<Uuid>, name: &str) -> (Uuid, String) {
     let email = format!("search-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
         db.pool(),
         NewUser {
             email: email.clone(),
             password: PASSWORD.to_owned(),
-            display_name: "Search Test".to_owned(),
+            display_name: name.to_owned(),
             organization_id,
         },
     )
@@ -288,13 +382,7 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
 }
 
 /// Insert a page with one draft revision and return the page id.
-async fn create_page(
-    db: &Db,
-    site_id: Uuid,
-    slug: &str,
-    title: &str,
-    summary: Option<&str>,
-) -> Uuid {
+async fn create_page(db: &Db, site_id: Uuid, slug: &str, title: &str) -> Uuid {
     let page_id: Uuid = sqlx::query_scalar(
         "insert into pages (site_id, slug, status) values ($1, $2, 'draft') returning id",
     )
@@ -305,37 +393,15 @@ async fn create_page(
     .expect("the test page must be created");
 
     sqlx::query(
-        "insert into page_revisions (page_id, revision_no, state, title, summary) \
-         values ($1, 1, 'draft', $2, $3)",
+        "insert into page_revisions (page_id, revision_no, state, title) values ($1, 1, 'draft', $2)",
     )
     .bind(page_id)
     .bind(title)
-    .bind(summary)
     .execute(db.pool())
     .await
     .expect("the draft revision must be written");
 
     page_id
-}
-
-/// Append one more revision (the working draft) to a page and return its id.
-async fn append_revision(db: &Db, page_id: Uuid, revision_no: i32, title: &str) {
-    sqlx::query(
-        "update page_revisions set state = 'archived' where page_id = $1 and state = 'draft'",
-    )
-    .bind(page_id)
-    .execute(db.pool())
-    .await
-    .expect("the previous draft must be retired");
-    sqlx::query(
-        "insert into page_revisions (page_id, revision_no, state, title) values ($1, $2, 'draft', $3)",
-    )
-    .bind(page_id)
-    .bind(revision_no)
-    .bind(title)
-    .execute(db.pool())
-    .await
-    .expect("the next draft revision must be written");
 }
 
 /// Insert a media row; the bytes never matter to search.
@@ -385,65 +451,13 @@ async fn login(state: &AppState, email: &str) -> String {
         .to_owned()
 }
 
-/// The titles of one group's hits, in the order the API answered them.
-fn group_titles(body: &Value, source: &str) -> Vec<String> {
-    let group = body["groups"]
-        .as_array()
-        .unwrap_or_else(|| panic!("groups must be an array in {body}"))
-        .iter()
-        .find(|group| group["source"] == source)
-        .unwrap_or_else(|| panic!("group {source} must exist in {body}"));
-    group["hits"]
-        .as_array()
-        .unwrap_or_else(|| panic!("hits must be an array in {group}"))
-        .iter()
-        .filter_map(|hit| hit["title"].as_str().map(str::to_owned))
-        .collect()
-}
-
-/// The ids of one group's hits.
-fn hit_ids(body: &Value, source: &str) -> Vec<String> {
-    let group = body["groups"]
-        .as_array()
-        .unwrap_or_else(|| panic!("groups must be an array in {body}"))
-        .iter()
-        .find(|group| group["source"] == source)
-        .unwrap_or_else(|| panic!("group {source} must exist in {body}"));
-    group["hits"]
-        .as_array()
-        .unwrap_or_else(|| panic!("hits must be an array in {group}"))
-        .iter()
-        .filter_map(|hit| hit["id"].as_str().map(str::to_owned))
-        .collect()
-}
-
-/// The `source` values of the groups the API answered, in order.
-fn group_keys(body: &Value) -> Vec<String> {
-    body["groups"]
-        .as_array()
-        .unwrap_or_else(|| panic!("groups must be an array in {body}"))
-        .iter()
-        .filter_map(|group| group["source"].as_str().map(str::to_owned))
-        .collect()
-}
-
-/// The `source` values of the sources the API skipped.
-fn skipped_keys(body: &Value) -> Vec<String> {
-    body["skipped"]
-        .as_array()
-        .unwrap_or_else(|| panic!("skipped must be an array in {body}"))
-        .iter()
-        .filter_map(|entry| entry["source"].as_str().map(str::to_owned))
-        .collect()
-}
-
-/// Search as `token` and return the parsed body, asserting `200`.
-async fn search(state: &AppState, token: &str, query: &str) -> Value {
+/// Search as `token` with a raw query string and assert `200`.
+async fn search(state: &AppState, token: &str, q: &str) -> Value {
     let response = call(
         state,
         request(
             Method::GET,
-            &format!("/api/v1/search?q={query}"),
+            &format!("/api/v1/search?q={q}"),
             Some(token),
             None,
         ),
@@ -458,171 +472,144 @@ async fn search(state: &AppState, token: &str, query: &str) -> Value {
     response.body
 }
 
+/// The provider keys the hits of an answer come from.
+fn hit_providers(body: &Value) -> Vec<String> {
+    body["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hits must be an array in {body}"))
+        .iter()
+        .filter_map(|hit| hit["provider"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// How many hits of one provider an answer carries.
+fn provider_hits(body: &Value, source: &str) -> usize {
+    body["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hits must be an array in {body}"))
+        .iter()
+        .filter(|hit| hit["provider"] == source)
+        .count()
+}
+
+/// The titles of an answer's hits.
+fn hit_titles(body: &Value) -> Vec<String> {
+    body["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hits must be an array in {body}"))
+        .iter()
+        .filter_map(|hit| hit["title"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[tokio::test]
-async fn search_groups_hits_by_source_and_scopes_them_to_the_caller() {
+async fn search_answers_across_providers_and_hides_what_the_caller_may_not_read() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
 
-    // Site A (the editor's organization): two matching pages, one matching file.
     create_page(
         &fixture.db,
         fixture.site_a,
         "release-notes",
         "Release notes",
-        Some("What changed this week"),
     )
     .await;
-    create_page(&fixture.db, fixture.site_a, "keynotes", "Keynotes", None).await;
     create_media(&fixture.db, fixture.site_a, "release-poster.png").await;
-    // Site B (another organization): the same words, invisible to the editor.
+
+    // The librarian holds `users.read`, so the accounts are in their result set.
+    fixture.reindex().await;
+
+    let librarian = fixture.librarian_token().await;
+    let body = search(&fixture.state, &librarian, "release").await;
+    assert_eq!(body["query"], "release");
+    let providers = hit_providers(&body);
+    for expected in ["pages", "media", "users"] {
+        assert!(
+            providers.contains(&expected.to_owned()),
+            "expected a {expected} hit in {body}"
+        );
+    }
+    assert!(
+        hit_titles(&body)
+            .iter()
+            .any(|title| title == "Release Editor"),
+        "the editor account is findable by name: {body}"
+    );
+
+    // The editor may not read accounts: the same query answers no user row at all.
+    let editor = fixture.editor_token().await;
+    let body = search(&fixture.state, &editor, "release").await;
+    let providers = hit_providers(&body);
+    assert!(providers.contains(&"pages".to_owned()), "body: {body}");
+    assert!(providers.contains(&"media".to_owned()), "body: {body}");
+    assert!(
+        !providers.contains(&"users".to_owned()),
+        "an editor without users.read must not see user rows: {body}"
+    );
+    assert!(
+        !providers.contains(&"sites".to_owned()),
+        "an editor without sites.read must not see site rows: {body}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_scopes_results_to_the_callers_organization() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // A token unique to this run keeps the assertion independent of what the other suites
+    // (running in parallel against the same database) put in the index.
+    let token = Uuid::new_v4().simple().to_string();
+    let mine = format!("Release notes {token}");
+    let theirs = format!("Release notes of another tenant {token}");
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        &format!("release-{token}"),
+        &mine,
+    )
+    .await;
     create_page(
         &fixture.db,
         fixture.site_b,
-        "release-notes-b",
-        "Release notes of another tenant",
-        None,
+        &format!("release-b-{token}"),
+        &theirs,
     )
     .await;
-    create_media(&fixture.db, fixture.site_b, "release-secret.png").await;
+    fixture.reindex().await;
 
+    // The editor of organization A sees exactly their own page.
     let editor = fixture.editor_token().await;
-    let body = search(&fixture.state, &editor, "release").await;
+    let body = search(&fixture.state, &editor, &token).await;
+    let titles = hit_titles(&body);
+    assert_eq!(titles, vec![mine.clone()], "body: {body}");
 
-    assert_eq!(body["query"], "release");
-    assert_eq!(body["terms"], json!(["release"]));
-    assert!(body["took_ms"].is_number(), "took_ms: {body}");
-
-    // Only the two readable sources answer; sites is skipped, not silently missing.
-    assert_eq!(group_keys(&body), vec!["pages", "media"]);
-    assert_eq!(skipped_keys(&body), vec!["sites"]);
-    assert_eq!(body["skipped"][0]["reason"], "permission");
-
-    // The other organization's rows are not in the result set.
-    let pages = group_titles(&body, "pages");
-    assert_eq!(pages, vec!["Release notes"]);
-    let media = group_titles(&body, "media");
-    assert_eq!(media, vec!["release-poster.png"]);
-
-    fixture.cleanup().await;
-}
-
-#[tokio::test]
-async fn search_ranks_a_prefix_above_a_word_inside_and_requires_every_term() {
-    let Some(fixture) = Fixture::new().await else {
-        return;
-    };
-
-    create_page(
-        &fixture.db,
-        fixture.site_a,
-        "release-notes",
-        "Release notes",
-        None,
-    )
-    .await;
-    create_page(&fixture.db, fixture.site_a, "keynotes", "Keynotes", None).await;
-    create_page(
-        &fixture.db,
-        fixture.site_a,
-        "weekly",
-        "Weekly update",
-        Some("Release notes for the week"),
-    )
-    .await;
-
-    let editor = fixture.editor_token().await;
-
-    // "notes" hits both titles; the word beginning of "Release notes" outranks the inside
-    // match of "Keynotes", and a title match outranks a match that only rides the summary.
-    let body = search(&fixture.state, &editor, "notes").await;
-    assert_eq!(
-        group_titles(&body, "pages"),
-        vec!["Release notes", "Keynotes", "Weekly update"]
-    );
-
-    // Every term must appear: "release invoice" matches nothing.
-    let body = search(&fixture.state, &editor, "release%20invoice").await;
-    assert!(group_titles(&body, "pages").is_empty());
-    assert!(group_titles(&body, "media").is_empty());
-    assert_eq!(
-        group_keys(&body),
-        vec!["pages", "media"],
-        "an empty group is still listed, never a placeholder row"
-    );
-
-    fixture.cleanup().await;
-}
-
-#[tokio::test]
-async fn search_finds_a_page_by_a_revision_that_was_renamed_away() {
-    let Some(fixture) = Fixture::new().await else {
-        return;
-    };
-
-    let page = create_page(
-        &fixture.db,
-        fixture.site_a,
-        "changelog",
-        "Release log",
-        None,
-    )
-    .await;
-    append_revision(&fixture.db, page, 2, "Changelog").await;
-
-    let editor = fixture.editor_token().await;
-    let body = search(&fixture.state, &editor, "release").await;
-
-    // The displayed title is the latest revision; the match rode the older one.
-    assert_eq!(group_titles(&body, "pages"), vec!["Changelog"]);
-
-    fixture.cleanup().await;
-}
-
-#[tokio::test]
-async fn search_answers_only_what_the_permissions_allow() {
-    let Some(fixture) = Fixture::new().await else {
-        return;
-    };
-
-    let page = create_page(
-        &fixture.db,
-        fixture.site_a,
-        "release-notes",
-        "Release notes",
-        None,
-    )
-    .await;
-
-    // The member of the same organization holds no read key at all.
-    let member = fixture.member_token().await;
-    let body = search(&fixture.state, &member, "release").await;
-    assert!(group_keys(&body).is_empty(), "no group is readable: {body}");
-    assert_eq!(skipped_keys(&body), vec!["pages", "media", "sites"]);
-
-    // The platform Owner reads across tenants, holds every key (nothing is skipped) and sees
-    // the page this fixture wrote.
+    // The platform Owner holds every key and reads across tenants; the site rows come too.
     let owner = fixture.platform_token().await;
-    let body = search(&fixture.state, &owner, "release").await;
-    assert!(group_keys(&body).contains(&"pages".to_owned()));
+    let body = search(&fixture.state, &owner, &token).await;
+    let titles = hit_titles(&body);
     assert!(
-        group_keys(&body).contains(&"sites".to_owned()),
-        "the owner holds sites.read: {body}"
+        titles.contains(&theirs),
+        "the owner reads across tenants: {body}"
     );
+    assert!(titles.contains(&mine), "body: {body}");
+
+    // The sites provider answers the owner too: its site rows carry the fixture's marker.
+    let body = search(&fixture.state, &owner, &fixture.marker).await;
     assert!(
-        skipped_keys(&body).is_empty(),
-        "the owner holds every read key: {body}"
-    );
-    assert!(
-        hit_ids(&body, "pages").contains(&page.to_string()),
-        "the owner sees the fixture's page: {body}"
+        hit_providers(&body).contains(&"sites".to_owned()),
+        "the owner reads sites as well: {body}"
     );
 
     fixture.cleanup().await;
 }
 
 #[tokio::test]
-async fn search_honours_the_source_filter_and_the_group_limit() {
+async fn search_speaks_the_scoped_syntax() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
@@ -632,7 +619,6 @@ async fn search_honours_the_source_filter_and_the_group_limit() {
         fixture.site_a,
         "release-notes",
         "Release notes",
-        None,
     )
     .await;
     create_page(
@@ -640,47 +626,340 @@ async fn search_honours_the_source_filter_and_the_group_limit() {
         fixture.site_a,
         "release-archive",
         "Release archive",
-        None,
     )
     .await;
     create_media(&fixture.db, fixture.site_a, "release-poster.png").await;
+    fixture.reindex().await;
 
     let editor = fixture.editor_token().await;
 
-    // A source filter narrows the answer to exactly those groups.
-    let response = call(
-        &fixture.state,
-        request(
-            Method::GET,
-            "/api/v1/search?q=release&sources=pages",
-            Some(&editor),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
-    assert_eq!(group_keys(&response.body), vec!["pages"]);
+    // type: narrows to one provider; the entity type spelling works too.
+    let body = search(&fixture.state, &editor, "release%20type:page").await;
+    assert!(
+        hit_providers(&body)
+            .iter()
+            .all(|provider| provider == "pages"),
+        "body: {body}"
+    );
+    assert!(body["total"].as_i64().unwrap_or(0) >= 2, "body: {body}");
+    let body = search(&fixture.state, &editor, "release%20type:media").await;
+    assert!(
+        hit_providers(&body)
+            .iter()
+            .all(|provider| provider == "media"),
+        "body: {body}"
+    );
 
-    // The limit caps each group.
-    let response = call(
-        &fixture.state,
-        request(
-            Method::GET,
-            "/api/v1/search?q=release&limit=1",
-            Some(&editor),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
-    assert_eq!(group_titles(&response.body, "pages").len(), 1);
-    assert_eq!(group_titles(&response.body, "media").len(), 1);
+    // is:draft matches the draft pages, owner:me the caller's own rows.
+    let body = search(&fixture.state, &editor, "type:page%20is:draft").await;
+    assert!(body["total"].as_i64().unwrap_or(0) >= 2, "body: {body}");
+
+    // site: narrows to the site's key.
+    let body = search(&fixture.state, &editor, "release%20site:main").await;
+    assert!(body["total"].as_i64().unwrap_or(0) >= 1, "body: {body}");
+
+    // An unknown type is an honest empty answer with a hint, never a silent match-all.
+    let body = search(&fixture.state, &editor, "release%20type:unicorn").await;
+    assert_eq!(body["total"], 0, "body: {body}");
+    assert!(
+        !body["hints"].as_array().expect("hints").is_empty(),
+        "an unknown type is explained: {body}"
+    );
+
+    // A date window narrows by the entity's own timestamp: the fixture's rows are brand new,
+    // so a window that ends yesterday is empty and one that starts yesterday is not.
+    let body = search(&fixture.state, &editor, "release%20after:2020-01-01").await;
+    assert!(body["total"].as_i64().unwrap_or(0) >= 1, "body: {body}");
+    let body = search(&fixture.state, &editor, "release%20before:2020-01-01").await;
+    assert_eq!(body["total"], 0, "body: {body}");
+
+    // A malformed date is explained too.
+    let body = search(&fixture.state, &editor, "release%20before:soon").await;
+    assert!(
+        !body["hints"].as_array().expect("hints").is_empty(),
+        "body: {body}"
+    );
 
     fixture.cleanup().await;
 }
 
 #[tokio::test]
-async fn search_refuses_a_missing_session_query_or_unknown_source() {
+async fn publishing_a_page_makes_it_findable_within_one_indexer_tick() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    fixture.reindex().await;
+
+    let editor = fixture.editor_token().await;
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/pages",
+            Some(&editor),
+            Some(json!({
+                "site_id": fixture.site_a,
+                "slug": "launch-notes",
+                "title": "Launch notes",
+                "body": "The launch is on Friday."
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
+    let page_id = created.body["id"].as_str().expect("page id").to_owned();
+
+    // Before publishing, the draft is not in the index under this title.
+    let body = search(&fixture.state, &editor, "launch").await;
+    assert_eq!(body["total"], 0, "a draft is not indexed yet: {body}");
+
+    let published = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/publish"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(published.status, StatusCode::OK, "body: {}", published.body);
+
+    // One indexer tick: the published fact meets the index.
+    let report = indexer::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the drain must run");
+    assert!(report.applied >= 1, "report: {report:?}");
+
+    let body = search(&fixture.state, &editor, "launch").await;
+    assert_eq!(body["total"], 1, "the published page is findable: {body}");
+    assert_eq!(hit_titles(&body), vec!["Launch notes".to_owned()]);
+
+    // owner:me answers the caller's own rows only: the editor created this page, the librarian
+    // did not.
+    let body = search(&fixture.state, &editor, "launch%20owner:me").await;
+    assert_eq!(body["total"], 1, "the editor owns the page: {body}");
+    let librarian = fixture.librarian_token().await;
+    let body = search(&fixture.state, &librarian, "launch%20owner:me").await;
+    assert_eq!(body["total"], 0, "the librarian owns no page: {body}");
+
+    // The cursor moved past the event: another tick neither duplicates the document nor loses
+    // it (other suites put their own events on the same bus, so idleness is not the measure).
+    let second = indexer::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the second drain must run");
+    assert!(second.cursor >= report.cursor, "report: {second:?}");
+    let body = search(&fixture.state, &editor, "launch").await;
+    assert_eq!(body["total"], 1, "still exactly one document: {body}");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn reindex_is_idempotent_and_gated_by_search_manage() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "release-notes",
+        "Release notes",
+    )
+    .await;
+
+    // The editor holds search.read but not search.manage.
+    let editor = fixture.editor_token().await;
+    let denied = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/search/reindex",
+            Some(&editor),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        denied.body
+    );
+    assert_eq!(denied.body["error"]["code"], "permission_denied");
+
+    // An unknown provider is the caller's mistake, named as such.
+    let owner = fixture.platform_token().await;
+    let unknown = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/search/reindex",
+            Some(&owner),
+            Some(json!({ "provider": "unicorns" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        unknown.body
+    );
+    assert_eq!(unknown.body["error"]["code"], "unknown_provider");
+
+    // Two runs, the same index: a second pass must neither duplicate nor drop the fixture's
+    // document (the installation-wide count is not the measure here — other suites run in
+    // parallel against the same database).
+    fixture.reindex().await;
+    let status = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/status", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(status.status, StatusCode::OK, "body: {}", status.body);
+    assert!(
+        status.body["documents"].as_i64().unwrap_or(0) >= 1,
+        "the index has documents: {}",
+        status.body
+    );
+
+    let first = search(&fixture.state, &editor, "release").await;
+    assert_eq!(first["total"], 1, "one document for the page: {first}");
+
+    fixture.reindex().await;
+    let second = search(&fixture.state, &editor, "release").await;
+    assert_eq!(
+        second["total"], 1,
+        "a second reindex must not duplicate the document: {second}"
+    );
+
+    // The removal branch: `media.deleted` has no producer yet, so the path is exercised
+    // directly — dropping a document and reindexing must not bring it back.
+    let file = create_media(&fixture.db, fixture.site_a, "release-poster.png").await;
+    fixture.reindex().await;
+    let body = search(&fixture.state, &editor, "release-poster").await;
+    assert_eq!(
+        provider_hits(&body, "media"),
+        1,
+        "the file is indexed: {body}"
+    );
+    indexer::remove_entity(fixture.db.pool(), "media", file)
+        .await
+        .expect("the document must be removed");
+    let body = search(&fixture.state, &editor, "release-poster").await;
+    assert_eq!(
+        provider_hits(&body, "media"),
+        0,
+        "the document is gone: {body}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn suggest_answers_with_the_palettes_first_paint() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "release-notes",
+        "Release notes",
+    )
+    .await;
+    fixture.reindex().await;
+
+    let editor = fixture.editor_token().await;
+    let response = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/search/suggest?q=rel",
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    let suggestions = response.body["suggestions"]
+        .as_array()
+        .expect("suggestions");
+    assert!(!suggestions.is_empty(), "body: {}", response.body);
+    assert!(suggestions.len() <= 8);
+    for suggestion in suggestions {
+        let title = suggestion["title"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(title.starts_with("rel"), "suggestion: {suggestion}");
+    }
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_callers_search_history_is_kept_and_clearable() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    create_page(
+        &fixture.db,
+        fixture.site_a,
+        "release-notes",
+        "Release notes",
+    )
+    .await;
+    fixture.reindex().await;
+
+    let editor = fixture.editor_token().await;
+    search(&fixture.state, &editor, "release").await;
+    search(&fixture.state, &editor, "release%20notes").await;
+
+    let response = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/recent", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    let queries: Vec<String> = response.body["queries"]
+        .as_array()
+        .expect("queries")
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        queries,
+        vec!["release notes".to_owned(), "release".to_owned()],
+        "newest first: {}",
+        response.body
+    );
+
+    let cleared = call(
+        &fixture.state,
+        request(Method::DELETE, "/api/v1/search/recent", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::NO_CONTENT);
+
+    let response = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search/recent", Some(&editor), None),
+    )
+    .await;
+    assert_eq!(response.body["queries"], json!([]));
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_refuses_what_it_cannot_answer() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
@@ -693,6 +972,16 @@ async fn search_refuses_a_missing_session_query_or_unknown_source() {
     .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 
+    // The member holds no keys at all — not even search.read.
+    let member = fixture.member_token().await;
+    let denied = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/search?q=release", Some(&member), None),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert_eq!(denied.body["error"]["code"], "permission_denied");
+
     let empty = call(
         &fixture.state,
         request(Method::GET, "/api/v1/search?q=", Some(&editor), None),
@@ -701,23 +990,18 @@ async fn search_refuses_a_missing_session_query_or_unknown_source() {
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(empty.body["error"]["code"], "query_required");
 
-    let unknown = call(
+    let bad_sort = call(
         &fixture.state,
         request(
             Method::GET,
-            "/api/v1/search?q=release&sources=pages,nope",
+            "/api/v1/search?q=release&sort=sideways",
             Some(&editor),
             None,
         ),
     )
     .await;
-    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
-    assert_eq!(unknown.body["error"]["code"], "unknown_source");
-    let message = unknown.body["error"]["message"]
-        .as_str()
-        .expect("the error names the sources");
-    assert!(message.contains("pages"), "message: {message}");
-    assert!(message.contains("nope"), "message: {message}");
+    assert_eq!(bad_sort.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_sort.body["error"]["code"], "unknown_sort");
 
     fixture.cleanup().await;
 }

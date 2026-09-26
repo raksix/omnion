@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_api::{automation_runner, event_runner, workflow_runner};
+use omnion_api::{automation_runner, event_runner, search_runner, workflow_runner};
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
 use omnion_identity::users::{self, BootstrapOutcome};
@@ -102,6 +102,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _matcher = automation_runner::spawn(state.clone());
     } else {
         tracing::info!("the automation matcher is disabled (OMNION_AUTOMATION_RUNNER=false)");
+    }
+
+    // The search indexer applies the bus to the search index in this process (REQ-002): each
+    // tick reads the events above its cursor and updates the documents they touch, so a page
+    // published here answers a search a moment later.
+    if state.config().search.runner_enabled {
+        let _indexer = search_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the search indexer is disabled (OMNION_SEARCH_RUNNER=false)");
     }
 
     let app = routes::router(state);

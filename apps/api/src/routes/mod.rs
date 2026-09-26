@@ -54,11 +54,12 @@
 //! rule is written in is closed and readable at `/automations/catalogue`; the actions that touch
 //! the world live in `omnion-automation` (see `crate::workflow_runner`, which installs them).
 //!
-//! The search surface (`/search`) is the platform's one search box (docs/requests/REQ-002): the
-//! handler asks the `omnion-search` registry, runs every source the caller's read permissions
-//! cover and answers the hits grouped per source. There is no `search.read` key on purpose —
-//! searching is not a new power, it is exactly the reading the caller already holds. See
-//! `crate::routes::search`.
+//! The search surface (`/search`, `/search/suggest`, `/search/status`, `/search/reindex`) is the
+//! platform's one search box over the `omnion-search` index (docs/requests/REQ-002): searching
+//! is `search.read` — the box every signed-in account holds — while the answer is narrowed to
+//! the providers whose own read permissions the caller carries, and rebuilding the index is the
+//! separate `search.manage`. The indexer that keeps the documents fresh from the event bus is
+//! `crate::search_runner`. See `crate::routes::search`.
 
 pub mod ai;
 pub mod auth;
@@ -293,13 +294,27 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "workflows.manage")),
         );
 
-    let search_route = get(search::search);
+    // Search (docs/requests/REQ-002): the one search box and its index. Searching is
+    // `search.read` — the box every signed-in account holds — and the handler narrows the
+    // answer to the providers the caller's own read permissions cover; rebuilding the index
+    // is the separate `search.manage`. See `crate::routes::search`.
+    let search_route = get(search::search).layer(guards::require(&state, "search.read"));
+    let search_suggest = get(search::suggest).layer(guards::require(&state, "search.read"));
+    let search_status = get(search::status).layer(guards::require(&state, "search.read"));
+    let search_reindex = post(search::reindex).layer(guards::require(&state, "search.manage"));
+    // The caller's own history: session-scoped by construction — it needs no permission of its
+    // own beyond being signed in.
+    let search_recent = get(search::recent).merge(delete(search::clear_recent));
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/me", get(me::me))
         .route("/search", search_route)
+        .route("/search/suggest", search_suggest)
+        .route("/search/status", search_status)
+        .route("/search/reindex", search_reindex)
+        .route("/search/recent", search_recent)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),

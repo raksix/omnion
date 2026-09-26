@@ -1,98 +1,124 @@
-//! `/api/v1/search` — the one search box (docs/requests/REQ-002).
+//! `/api/v1/search` — the platform's one search box (docs/requests/REQ-002).
 //!
-//! One request searches every source the caller may read and answers with the hits grouped per
-//! source, in the order the palette lists them. Two rules make the surface trustworthy:
+//! The engine (`omnion-search`) owns the index, the query language and the ranking; this module
+//! is the HTTP shape around it. Three promises it keeps:
 //!
-//! * **The result set is the caller's.** There is no `search.read` key, because searching is not
-//!   a new power: each group's permission (`content.pages.read`, `media.read`, `sites.read` …)
-//!   decides whether the caller sees it at all, resolved once through the IAM graph
-//!   (`effective_permissions`) and answered as `skipped` with the reason when it is not held.
-//!   The SQL of every source is tenant-scoped with the same rule the rest of the panel uses.
-//! * **Nothing is invented.** An empty group means "this source has no match", never a
-//!   placeholder row; a query with no terms is refused (`400 query_required`) instead of
-//!   returning something.
-//!
-//! The engine itself is `omnion-search` (`crate::routes` lists the surfaces); this module is
-//! the HTTP shape around it: parse `q`, validate `sources`, run the permitted sources and
-//! serialize.
+//! * **`search.read` is the box, not the content.** Every signed-in account may search; which
+//!   providers answer is decided per request from the caller's own permission set, so an editor
+//!   without `users.read` gets pages and media and simply no user rows — no error, no leak.
+//! * **The scope rides the query.** The caller's organization is a `WHERE` clause, never a
+//!   post-filter: page two of a result set can not contain something page one was not allowed
+//!   to count.
+//! * **Index operations are their own power.** Rebuilding an index is `search.manage`, and it
+//!   leaves an audit row plus a `search.reindexed` event, because it is a platform act.
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Query as QueryParams, State};
+use omnion_audit::NewAuditEntry;
+use omnion_events::{NewEvent, bus};
 use omnion_permissions::effective_permissions;
-use omnion_search::query::{DEFAULT_GROUP_LIMIT, MAX_GROUP_LIMIT, Query as SearchQuery};
-use omnion_search::{catalogue, sources};
+use omnion_search::indexer;
+use omnion_search::providers;
+use omnion_search::query::{
+    self, DEFAULT_PER_PAGE, HitPage, MAX_PER_PAGE, Query as SearchQuery, SearchRequest, Sort,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::auth::CurrentSession;
+use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::guards::scope_of;
 use crate::state::AppState;
 
+// ---------------------------------------------------------------------------------------------
+// Request shapes
+// ---------------------------------------------------------------------------------------------
+
 /// Query string of `GET /api/v1/search`.
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
-    /// The text to search for; required, at least one non-space character.
+    /// The query text, including the scoped syntax (`type:page site:acme is:draft`).
     pub q: Option<String>,
-    /// Hits per group; `1..=20`, default 5.
-    pub limit: Option<usize>,
-    /// Comma-separated source keys to restrict the search to; default: every readable source.
-    pub sources: Option<String>,
+    /// One-based page number; `1` when absent.
+    pub page: Option<i64>,
+    /// Hits per page; `1..=100`, default 25.
+    pub per_page: Option<i64>,
+    /// `relevance` (default), `newest` or `title`.
+    pub sort: Option<String>,
 }
+
+/// Query string of `GET /api/v1/search/suggest`.
+#[derive(Debug, Deserialize)]
+pub struct SuggestParams {
+    /// The prefix to suggest for.
+    pub q: Option<String>,
+}
+
+/// Body of `POST /api/v1/search/reindex`.
+#[derive(Debug, Deserialize)]
+pub struct ReindexBody {
+    /// One provider key, or nothing for every provider.
+    pub provider: Option<String>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Response shapes
+// ---------------------------------------------------------------------------------------------
 
 /// One hit as the API answers it.
 #[derive(Debug, Serialize)]
 pub struct HitBody {
-    /// Identifier inside the hit's own domain.
-    pub id: String,
-    /// Title the palette shows first.
+    /// Provider key (`pages`).
+    pub provider: String,
+    /// Document type (`page`).
+    pub entity_type: String,
+    /// Entity id inside its own domain.
+    pub entity_id: String,
+    /// Title.
     pub title: String,
-    /// Supporting line (site, slug, content type …).
-    pub subtitle: Option<String>,
+    /// Supporting line.
+    pub subtitle: String,
     /// Panel route a click opens.
     pub url: String,
-    /// Ranking score (only comparable inside one response).
-    pub score: f64,
-    /// When the record last changed, RFC 3339, when the source knows.
+    /// Tags stored with the document.
+    pub tags: Vec<String>,
+    /// When the entity last changed, RFC 3339.
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+    /// Rank inside this answer.
+    pub score: f32,
 }
 
-impl From<&omnion_search::Hit> for HitBody {
-    fn from(hit: &omnion_search::Hit) -> Self {
+impl From<query::Hit> for HitBody {
+    fn from(hit: query::Hit) -> Self {
         Self {
-            id: hit.id.clone(),
-            title: hit.title.clone(),
-            subtitle: hit.subtitle.clone(),
-            url: hit.url.clone(),
+            provider: hit.provider,
+            entity_type: hit.entity_type,
+            entity_id: hit.entity_id,
+            title: hit.title,
+            subtitle: hit.subtitle,
+            url: hit.url,
+            tags: hit.tags,
+            updated_at: hit.entity_updated_at,
             score: hit.score,
-            updated_at: hit.updated_at,
         }
     }
 }
 
-/// One group of hits — one source's answer.
+/// One provider's share of a result set (`pages: 3`) — the palette's section counts.
 #[derive(Debug, Serialize)]
-pub struct GroupBody {
-    /// Source key (`pages`).
-    pub source: &'static str,
-    /// Display title (`Pages`).
-    pub title: &'static str,
-    /// One line describing the source.
-    pub hint: &'static str,
-    /// Hits, best first; empty when this source has no match.
-    pub hits: Vec<HitBody>,
-}
-
-/// A source the caller may not read, named with the reason it is missing.
-#[derive(Debug, Serialize)]
-pub struct SkippedBody {
-    /// Source key.
-    pub source: &'static str,
+pub struct CountBody {
+    /// Provider key.
+    pub provider: String,
     /// Display title.
     pub title: &'static str,
-    /// Why the source is missing (`permission`).
-    pub reason: &'static str,
+    /// Panel route of the section.
+    pub route: &'static str,
+    /// Hits the provider contributes.
+    pub count: i64,
 }
 
 /// The whole answer of one search.
@@ -100,100 +126,371 @@ pub struct SkippedBody {
 pub struct SearchResponse {
     /// The query as it was understood (trimmed and capped).
     pub query: String,
-    /// The parsed terms.
+    /// The text terms.
     pub terms: Vec<String>,
-    /// One entry per searched source, in palette order.
-    pub groups: Vec<GroupBody>,
-    /// Sources left out because the caller lacks their read permission.
-    pub skipped: Vec<SkippedBody>,
-    /// How long the sources took, in milliseconds.
+    /// The `type:` filters.
+    pub types: Vec<String>,
+    /// The `is:` flags.
+    pub flags: Vec<String>,
+    /// Everything the parser refused, in caller-facing language.
+    pub hints: Vec<String>,
+    /// The hits of this page, best first.
+    pub hits: Vec<HitBody>,
+    /// Total hits the query matches.
+    pub total: i64,
+    /// One-based page number.
+    pub page: i64,
+    /// Hits per page.
+    pub per_page: i64,
+    /// Which provider contributed how many (ordered by count).
+    pub counts: Vec<CountBody>,
+    /// How long the search took, in milliseconds.
     pub took_ms: u64,
 }
 
-/// Search every readable source for `q`.
+/// One prefix suggestion.
+#[derive(Debug, Serialize)]
+pub struct SuggestionBody {
+    /// Title of the suggested document.
+    pub title: String,
+    /// Panel route it opens.
+    pub url: String,
+    /// Provider it belongs to.
+    pub provider: String,
+}
+
+/// Answer of `GET /api/v1/search/suggest`.
+#[derive(Debug, Serialize)]
+pub struct SuggestResponse {
+    /// The suggestions, at most eight.
+    pub suggestions: Vec<SuggestionBody>,
+}
+
+/// The caller's own recent searches.
+#[derive(Debug, Serialize)]
+pub struct RecentResponse {
+    /// The queries, newest first (at most twenty are kept).
+    pub queries: Vec<String>,
+}
+
+/// One provider's line on the status screen.
+#[derive(Debug, Serialize)]
+pub struct StatusBody {
+    /// Provider key.
+    pub provider: &'static str,
+    /// Display title.
+    pub title: &'static str,
+    /// Documents in the index.
+    pub documents: i64,
+    /// When its rows were last written, RFC 3339.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_indexed_at: Option<OffsetDateTime>,
+    /// `ready` when the provider has rows, `empty` when it has none yet.
+    pub state: &'static str,
+}
+
+/// Answer of `GET /api/v1/search/status`.
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    /// One line per registered provider.
+    pub providers: Vec<StatusBody>,
+    /// Documents across every provider.
+    pub documents: i64,
+}
+
+/// One provider's reindex result.
+#[derive(Debug, Serialize)]
+pub struct ReindexReportBody {
+    /// Provider key.
+    pub provider: &'static str,
+    /// Documents written.
+    pub indexed: u64,
+    /// Documents pruned.
+    pub pruned: u64,
+    /// Wall time in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Answer of `POST /api/v1/search/reindex`.
+#[derive(Debug, Serialize)]
+pub struct ReindexResponse {
+    /// One report per provider that was rebuilt.
+    pub providers: Vec<ReindexReportBody>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------------------------
+
+/// Search every provider the caller's read permissions cover.
 pub async fn search(
     State(state): State<AppState>,
     current: CurrentSession,
-    Query(params): Query<SearchParams>,
+    QueryParams(params): QueryParams<SearchParams>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    let query = SearchQuery::parse(params.q.as_deref().unwrap_or_default()).ok_or_else(|| {
+    let query = SearchQuery::parse(params.q.as_deref().unwrap_or_default()).map_err(|_| {
         ApiError::bad_request(
             "query_required",
             "the \"q\" query parameter must carry at least one non-space character",
         )
     })?;
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_GROUP_LIMIT)
-        .clamp(1, MAX_GROUP_LIMIT);
-    let requested = requested_sources(params.sources.as_deref())?;
+    let sort = parse_sort(params.sort.as_deref())?;
+    let providers = readable_providers(&state, &current).await?;
 
-    let pool = state.db().pool();
-    let permissions = effective_permissions(pool, current.user.id, scope_of(&current.user)).await?;
+    let request = SearchRequest {
+        query,
+        providers,
+        organization_id: current.user.organization_id,
+        user_id: current.user.id,
+        page: params.page.unwrap_or(1).max(1),
+        per_page: params
+            .per_page
+            .unwrap_or(DEFAULT_PER_PAGE)
+            .clamp(1, MAX_PER_PAGE),
+        sort,
+    };
 
     let started = std::time::Instant::now();
-    let mut groups = Vec::new();
-    let mut skipped = Vec::new();
-
-    for spec in catalogue::SEARCH_SOURCES {
-        if let Some(keys) = &requested
-            && !keys.iter().any(|key| key == spec.key)
-        {
-            continue;
-        }
-        if !permissions.allows(spec.permission) {
-            skipped.push(SkippedBody {
-                source: spec.key,
-                title: spec.title,
-                reason: "permission",
-            });
-            continue;
-        }
-        let hits = sources::run(spec, pool, current.user.organization_id, &query, limit).await?;
-        groups.push(GroupBody {
-            source: spec.key,
-            title: spec.title,
-            hint: spec.hint,
-            hits: hits.iter().map(HitBody::from).collect(),
-        });
+    let HitPage { hits, total } = query::search(state.db().pool(), &request).await?;
+    // The history is a convenience, never the answer: a failed write is logged and the search
+    // still answers.
+    if let Err(error) = record_recent(state.db().pool(), current.user.id, request.query.raw()).await
+    {
+        tracing::warn!(
+            code = error.code(),
+            "the search history could not be written"
+        );
     }
+    let counts = query::counts(state.db().pool(), &request).await?;
+
+    let counts = counts
+        .into_iter()
+        .filter_map(|row| {
+            let spec = providers::provider(&row.provider)?;
+            Some(CountBody {
+                provider: row.provider,
+                title: spec.title,
+                route: spec.route,
+                count: row.count,
+            })
+        })
+        .collect();
 
     Ok(Json(SearchResponse {
-        query: query.raw().to_owned(),
-        terms: query.terms().to_vec(),
-        groups,
-        skipped,
+        query: request.query.raw().to_owned(),
+        terms: request.query.terms().to_vec(),
+        types: request.query.types().to_vec(),
+        flags: request.query.flags().to_vec(),
+        hints: request.query.hints().to_vec(),
+        hits: hits.into_iter().map(HitBody::from).collect(),
+        total,
+        page: request.page,
+        per_page: request.per_page,
+        counts,
         took_ms: started.elapsed().as_millis() as u64,
     }))
 }
 
-/// Validate the `sources` parameter against the registry; `None` means "every source".
-fn requested_sources(raw: Option<&str>) -> Result<Option<Vec<String>>, ApiError> {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-
-    let mut keys = Vec::new();
-    for key in raw.split(',') {
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        if catalogue::source(key).is_none() {
-            return Err(ApiError::bad_request(
-                "unknown_source",
-                format!(
-                    "\"{key}\" is not a search source; known sources: {}",
-                    catalogue::source_keys().join(", ")
-                ),
-            ));
-        }
-        if !keys.iter().any(|known| known == key) {
-            keys.push(key.to_owned());
-        }
+/// Title-prefix suggestions for the palette's first paint.
+pub async fn suggest(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    QueryParams(params): QueryParams<SuggestParams>,
+) -> Result<Json<SuggestResponse>, ApiError> {
+    let prefix = params.q.as_deref().unwrap_or("").trim().to_owned();
+    if prefix.is_empty() {
+        return Ok(Json(SuggestResponse {
+            suggestions: Vec::new(),
+        }));
     }
 
-    Ok(if keys.is_empty() { None } else { Some(keys) })
+    let providers = readable_providers(&state, &current).await?;
+    let rows = query::suggest(
+        state.db().pool(),
+        current.user.organization_id,
+        &providers,
+        &prefix,
+    )
+    .await?;
+
+    Ok(Json(SuggestResponse {
+        suggestions: rows
+            .into_iter()
+            .map(|row| SuggestionBody {
+                title: row.title,
+                url: row.url,
+                provider: row.provider,
+            })
+            .collect(),
+    }))
+}
+
+/// The index's per-provider health.
+pub async fn status(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<StatusResponse>, ApiError> {
+    // Reading the index's shape is reading your own platform; the guard is `search.read`, and
+    // the counts themselves name no content.
+    let readable = readable_providers(&state, &current).await?;
+    let lines = query::status(state.db().pool()).await?;
+    let documents = lines.iter().map(|line| line.documents).sum();
+
+    Ok(Json(StatusResponse {
+        providers: lines
+            .into_iter()
+            .filter(|line| readable.contains(&line.provider))
+            .map(|line| StatusBody {
+                provider: line.provider,
+                title: line.title,
+                documents: line.documents,
+                last_indexed_at: line.last_indexed_at,
+                state: line.state,
+            })
+            .collect(),
+        documents,
+    }))
+}
+
+/// Rebuild one provider's index, or every provider's.
+pub async fn reindex(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<ReindexBody>,
+) -> Result<Json<ReindexResponse>, ApiError> {
+    let reports = match body.provider.as_deref().map(str::trim) {
+        None | Some("") => indexer::reindex_all(state.db().pool()).await?,
+        Some(key) => vec![indexer::reindex(state.db().pool(), key).await?],
+    };
+
+    for report in &reports {
+        // The audit trail is part of the operation, not an afterthought: it names who rebuilt
+        // what, and the event lets an installation watch its own search health.
+        omnion_audit::record(
+            state.db().pool(),
+            NewAuditEntry::by_user(current.user.id, "search.reindexed")
+                .target("search_provider", report.provider)
+                .metadata(json!({
+                    "indexed": report.indexed,
+                    "pruned": report.pruned,
+                    "duration_ms": report.duration_ms,
+                }))
+                .ip_address(address.as_text()),
+        )
+        .await?;
+
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new("search.reindexed")
+                .actor(current.user.id)
+                .payload(json!({
+                    "provider": report.provider,
+                    "documents": report.indexed,
+                    "pruned": report.pruned,
+                    "duration_ms": report.duration_ms,
+                })),
+        )
+        .await?;
+    }
+
+    Ok(Json(ReindexResponse {
+        providers: reports
+            .into_iter()
+            .map(|report| ReindexReportBody {
+                provider: report.provider,
+                indexed: report.indexed,
+                pruned: report.pruned,
+                duration_ms: report.duration_ms,
+            })
+            .collect(),
+    }))
+}
+
+/// The caller's own recent searches, newest first.
+pub async fn recent(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<RecentResponse>, ApiError> {
+    let queries: Vec<String> = sqlx::query_scalar(
+        "select query from search_recent where user_id = $1 \
+         order by created_at desc, id desc limit 20",
+    )
+    .bind(current.user.id)
+    .fetch_all(state.db().pool())
+    .await
+    .map_err(store)?;
+
+    Ok(Json(RecentResponse { queries }))
+}
+
+/// Forget the caller's recent searches.
+pub async fn clear_recent(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<axum::http::StatusCode, ApiError> {
+    sqlx::query("delete from search_recent where user_id = $1")
+        .bind(current.user.id)
+        .execute(state.db().pool())
+        .await
+        .map_err(store)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------------
+
+/// Keep the caller's newest 20 queries, newest first.
+async fn record_recent(pool: &sqlx::PgPool, user_id: Uuid, query: &str) -> Result<(), ApiError> {
+    sqlx::query("insert into search_recent (user_id, query) values ($1, $2)")
+        .bind(user_id)
+        .bind(query)
+        .execute(pool)
+        .await
+        .map_err(store)?;
+    sqlx::query(
+        "delete from search_recent where user_id = $1 and id not in ( \
+             select id from search_recent where user_id = $1 \
+             order by created_at desc, id desc limit 20) \
+           and query <> $2",
+    )
+    .bind(user_id)
+    .bind(query)
+    .execute(pool)
+    .await
+    .map_err(store)?;
+    Ok(())
+}
+
+/// The API shape of a raw store failure: the search crate's own `Store` variant carries it, so
+/// the status mapping (a pool that cannot hand out a connection is retryable) stays in one place.
+fn store(error: sqlx::Error) -> ApiError {
+    omnion_search::SearchError::Store(error).into()
+}
+
+/// Parse the `sort` parameter; an unknown value is refused rather than defaulted away.
+fn parse_sort(raw: Option<&str>) -> Result<Sort, ApiError> {
+    match raw {
+        None => Ok(Sort::Relevance),
+        Some(value) => Sort::parse(value).ok_or_else(|| {
+            ApiError::bad_request("unknown_sort", "sort is one of relevance, newest or title")
+        }),
+    }
+}
+
+/// The providers the caller's own read permissions cover, in registry order.
+async fn readable_providers(
+    state: &AppState,
+    current: &CurrentSession,
+) -> Result<Vec<&'static str>, ApiError> {
+    let permissions =
+        effective_permissions(state.db().pool(), current.user.id, scope_of(&current.user)).await?;
+    Ok(providers::PROVIDERS
+        .iter()
+        .filter(|spec| permissions.allows(spec.permission))
+        .map(|spec| spec.key)
+        .collect())
 }
 
 #[cfg(test)]
@@ -201,24 +498,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_filter_means_every_source() {
-        assert_eq!(requested_sources(None).expect("valid"), None);
-        assert_eq!(requested_sources(Some("   ")).expect("valid"), None);
-        assert_eq!(requested_sources(Some(",")).expect("valid"), None);
-    }
-
-    #[test]
-    fn a_filter_is_trimmed_and_deduplicated() {
-        let keys = requested_sources(Some(" pages , media,pages "))
-            .expect("valid")
-            .expect("some");
-        assert_eq!(keys, vec!["pages", "media"]);
-    }
-
-    #[test]
-    fn an_unknown_source_is_refused() {
-        let error = requested_sources(Some("pages,nope")).expect_err("refused");
-        assert_eq!(error.code(), "unknown_source");
-        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+    fn sort_defaults_and_refuses_unknown_values() {
+        assert_eq!(parse_sort(None).expect("default"), Sort::Relevance);
+        assert_eq!(parse_sort(Some("newest")).expect("newest"), Sort::Newest);
+        let error = parse_sort(Some("sideways")).expect_err("refused");
+        assert_eq!(error.code(), "unknown_sort");
     }
 }
