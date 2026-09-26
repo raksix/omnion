@@ -27,3 +27,6 @@ pnpm-debug.log*
 logs/
 .cache/
 .DS_Store
+
+# Object storage of the development driver (crates/storage, OMNION_STORAGE_DRIVER=fs)
+.omnion-media/
