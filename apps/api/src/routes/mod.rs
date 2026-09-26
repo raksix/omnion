@@ -53,6 +53,12 @@
 //! stepped run per match — the same engine P09's manual and scheduled runs use. The vocabulary a
 //! rule is written in is closed and readable at `/automations/catalogue`; the actions that touch
 //! the world live in `omnion-automation` (see `crate::workflow_runner`, which installs them).
+//!
+//! The search surface (`/search`) is the platform's one search box (docs/requests/REQ-002): the
+//! handler asks the `omnion-search` registry, runs every source the caller's read permissions
+//! cover and answers the hits grouped per source. There is no `search.read` key on purpose —
+//! searching is not a new power, it is exactly the reading the caller already holds. See
+//! `crate::routes::search`.
 
 pub mod ai;
 pub mod auth;
@@ -65,6 +71,7 @@ pub mod media;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod search;
 pub mod tenancy;
 pub mod webhooks;
 pub mod workflows;
@@ -286,10 +293,13 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "workflows.manage")),
         );
 
+    let search_route = get(search::search);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/me", get(me::me))
+        .route("/search", search_route)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),

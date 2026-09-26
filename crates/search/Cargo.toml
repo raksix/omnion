@@ -1,0 +1,13 @@
+[package]
+name = "omnion-search"
+description = "Omnion search: the source registry and the query engine behind the one search box."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+time.workspace = true

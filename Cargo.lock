@@ -1135,6 +1135,7 @@ dependencies = [
  "omnion-media",
  "omnion-onboarding",
  "omnion-permissions",
+ "omnion-search",
  "omnion-storage",
  "omnion-workflows",
  "serde",
@@ -1273,6 +1274,16 @@ dependencies = [
 
 [[package]]
 name = "omnion-permissions"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-search"
 version = "0.1.0"
 dependencies = [
  "sqlx",

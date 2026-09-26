@@ -13,6 +13,7 @@ use omnion_identity::IdentityError;
 use omnion_media::MediaError;
 use omnion_onboarding::OnboardingError;
 use omnion_permissions::PermissionsError;
+use omnion_search::SearchError;
 use omnion_storage::StorageError;
 use omnion_workflows::WorkflowError;
 use serde::Serialize;
@@ -280,6 +281,25 @@ impl From<AutomationError> for ApiError {
             // problem, and both carry the stable code the request should be answered with.
             AutomationError::Workflows(err) => Self::bad_request(err.code(), err.to_string()),
             AutomationError::Invalid { code, message } => Self::bad_request(code, message),
+        }
+    }
+}
+
+impl From<SearchError> for ApiError {
+    /// Search reads the panel's own tables through the shared pool: a pool failure is the usual
+    /// retryable dependency split, anything else is an internal error the operator has to see.
+    fn from(error: SearchError) -> Self {
+        match error {
+            SearchError::Store(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            SearchError::Store(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
         }
     }
 }
