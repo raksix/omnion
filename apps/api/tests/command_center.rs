@@ -30,6 +30,12 @@ use uuid::Uuid;
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
+/// Serialises this suite. Two facts make parallel walks unsafe here: an action command rebuilds
+/// the **whole** index (a global read of every organization's rows), and each fixture deletes its
+/// own organization when it is done — so one walk's reindex can insert a document naming an
+/// organization another walk has just removed. The guard is held for the whole walk.
+static COMMAND_WALK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// What the content editor of this suite may do: search, read and write pages, read media — and
 /// deliberately **not** manage the index, read sites or reach the AI hub.
 const EDITOR_PERMISSIONS: [&str; 4] = [
@@ -135,6 +141,8 @@ async fn live_state() -> Option<(AppState, Db)> {
 /// One organization, a platform Owner, a content editor and a plain member — the three points of
 /// view the projection has to answer for.
 struct Fixture {
+    /// Held for the whole walk; see [`COMMAND_WALK`].
+    _walk: tokio::sync::MutexGuard<'static, ()>,
     state: AppState,
     db: Db,
     platform_email: String,
@@ -146,6 +154,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
+        let walk = COMMAND_WALK.lock().await;
         let (state, db) = live_state().await?;
         seed::ensure(db.pool())
             .await
@@ -181,6 +190,7 @@ impl Fixture {
         .await;
 
         Some(Self {
+            _walk: walk,
             state,
             db,
             platform_email,
@@ -206,8 +216,15 @@ impl Fixture {
         login(&self.state, &self.member_email).await
     }
 
-    /// Remove exactly what this fixture created; recents cascade with the accounts.
+    /// Remove exactly what this fixture created; recents cascade with the accounts, and the
+    /// audit entries of these accounts are removed explicitly (the trail keeps its rows when an
+    /// account is deleted, so a suite must not leave its own behind).
     async fn cleanup(&self) {
+        sqlx::query("delete from audit_log where actor_user_id = any($1)")
+            .bind(&self.accounts)
+            .execute(self.db.pool())
+            .await
+            .expect("audit cleanup must run");
         sqlx::query("delete from users where id = any($1)")
             .bind(&self.accounts)
             .execute(self.db.pool())
@@ -393,7 +410,8 @@ async fn commands_are_projected_through_the_callers_permissions() {
         "unheld keys must never be projected, got {ids:?}"
     );
 
-    // The member holds `search.read` and nothing else: the box, and the panel's home.
+    // The member holds `search.read` and nothing else: the box, the panel's home — and clearing
+    // its own palette history, which needs no key beyond being signed in.
     let member = fixture.member_token().await;
     let response = call(
         &fixture.state,
@@ -403,8 +421,12 @@ async fn commands_are_projected_through_the_callers_permissions() {
     let ids = command_ids(&response.body);
     assert_eq!(
         ids,
-        vec!["nav.overview".to_owned(), "nav.search".to_owned()],
-        "a member without content keys sees exactly the two unguarded commands"
+        vec![
+            "nav.overview".to_owned(),
+            "nav.search".to_owned(),
+            "act.clear-recents".to_owned()
+        ],
+        "a member without content keys sees exactly the unguarded commands"
     );
 
     // The leak test is on the raw body: a title the caller may not have must not be present as
@@ -981,6 +1003,348 @@ async fn a_recent_whose_command_is_out_of_reach_is_not_shown() {
         ids.contains(&"nav.media"),
         "the commands still within reach stay, got {ids:?}"
     );
+
+    fixture.cleanup().await;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Action commands (slice 3): the run endpoint, its confirmation rule and its audit trail
+// ---------------------------------------------------------------------------------------------
+
+/// The account behind a session cookie, read from the API itself.
+async fn caller_id(state: &AppState, token: &str) -> Uuid {
+    let response = call(state, request(Method::GET, "/api/v1/me", Some(token), None)).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    response.body["user"]["id"]
+        .as_str()
+        .expect("the signed-in account carries its id")
+        .parse()
+        .expect("the id is a uuid")
+}
+
+/// Every `command.run` audit entry of one account, oldest first.
+async fn command_run_targets(db: &Db, user_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "select target_id from audit_log where actor_user_id = $1 and action = 'command.run' \
+         order by id asc",
+    )
+    .bind(user_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("the audit trail must be readable")
+    .into_iter()
+    .map(|target: Option<String>| target.unwrap_or_default())
+    .collect()
+}
+
+/// How many times one command has run today for one account.
+async fn usage_runs(db: &Db, user_id: Uuid, command_id: &str) -> i32 {
+    let runs: Option<i32> = sqlx::query_scalar(
+        "select runs from command_usage_daily \
+         where user_id = $1 and command_id = $2 and day = current_date",
+    )
+    .bind(user_id)
+    .bind(command_id)
+    .fetch_optional(db.pool())
+    .await
+    .expect("the usage table must be readable");
+    runs.unwrap_or(0)
+}
+
+/// Run one command with the given confirmation flag.
+async fn run_command(
+    state: &AppState,
+    token: &str,
+    command_id: &str,
+    confirm: bool,
+) -> TestResponse {
+    call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/commands/{command_id}/run"),
+            Some(token),
+            Some(json!({ "confirm": confirm })),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_action_command_runs_through_its_owning_service_and_is_audited() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+    let owner_id = caller_id(&fixture.state, &owner).await;
+
+    // The projection carries the kind and the confirmation rule: the palette learns both from the
+    // answer that lists the command, not from a second question.
+    let response = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/commands", Some(&owner), None),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    let reindex = response.body["commands"]
+        .as_array()
+        .expect("commands must be an array")
+        .iter()
+        .find(|row| row["id"] == "act.reindex-search")
+        .expect("the platform Owner is offered the index rebuild");
+    assert_eq!(reindex["kind"], "action");
+    assert_eq!(reindex["confirm"], true);
+    assert_eq!(reindex["route"], "/settings/search");
+
+    // The run executes the owning service and answers with its own shape.
+    let response = run_command(&fixture.state, &owner, "act.reindex-search", true).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    assert_eq!(response.body["outcome"], "ok");
+    assert_eq!(response.body["kind"], "action");
+    let message = response.body["message"]
+        .as_str()
+        .expect("the run carries a line for the palette");
+    assert!(
+        message.starts_with("Rebuilt"),
+        "the palette's line comes from the owning service, got {message:?}"
+    );
+    assert!(
+        response.body["result"].is_array(),
+        "the owning service's own shape rides along, got {}",
+        response.body["result"]
+    );
+
+    // Exactly one entry per executed command: one run, one `command.run` row, one usage count.
+    assert_eq!(
+        command_run_targets(&fixture.db, owner_id).await,
+        vec!["act.reindex-search".to_owned()]
+    );
+    assert_eq!(usage_runs(&fixture.db, owner_id, "act.reindex-search").await, 1);
+    assert_eq!(
+        usage_runs(&fixture.db, owner_id, "act.clear-recents").await,
+        0,
+        "a run counts for its own command only"
+    );
+
+    // A second run is a second entry and a second count — the trail is a log, not a flag.
+    let response = run_command(&fixture.state, &owner, "act.reindex-search", true).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    assert_eq!(
+        command_run_targets(&fixture.db, owner_id).await.len(),
+        2,
+        "two runs leave two rows"
+    );
+    assert_eq!(usage_runs(&fixture.db, owner_id, "act.reindex-search").await, 2);
+
+    // The audit entry names the actor, the command (as the target) and the outcome — and never a
+    // row of content.
+    let metadata: serde_json::Value = sqlx::query_scalar(
+        "select metadata from audit_log where actor_user_id = $1 and action = 'command.run' \
+         order by id desc limit 1",
+    )
+    .bind(owner_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the newest run entry must exist");
+    assert_eq!(metadata["outcome"], "ok");
+    assert!(
+        metadata["result"].is_array(),
+        "the aggregate the owning service returned is recorded, got {metadata}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_action_that_asks_first_never_runs_unconfirmed() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+    let owner_id = caller_id(&fixture.state, &owner).await;
+
+    // A missing flag and an explicit `false` are the same refusal: the command is not executed,
+    // so nothing is audited and nothing is counted.
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/commands/act.reindex-search/run",
+            Some(&owner),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(response.body["error"]["code"], "confirmation_required");
+
+    let response = run_command(&fixture.state, &owner, "act.reindex-search", false).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(response.body["error"]["code"], "confirmation_required");
+
+    assert!(
+        command_run_targets(&fixture.db, owner_id).await.is_empty(),
+        "an unconfirmed run leaves no audit row"
+    );
+    assert_eq!(usage_runs(&fixture.db, owner_id, "act.reindex-search").await, 0);
+
+    // The second action asks too — a clear cannot be put back either.
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/commands/act.clear-recents/run",
+            Some(&owner),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(response.body["error"]["code"], "confirmation_required");
+
+    // Confirmed, it runs and leaves exactly one entry.
+    let response = run_command(&fixture.state, &owner, "act.clear-recents", true).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    assert_eq!(response.body["command"], "act.clear-recents");
+    assert_eq!(
+        command_run_targets(&fixture.db, owner_id).await,
+        vec!["act.clear-recents".to_owned()]
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_command_that_opens_a_screen_is_not_a_job() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    // A navigation command is refused by name — it opens a screen, and the request's own rule is
+    // that navigation writes nothing.
+    for id in ["nav.pages", "nav.create-page"] {
+        let response = run_command(&fixture.state, &owner, id, true).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{id} must not be runnable, body: {}",
+            response.body
+        );
+        assert_eq!(response.body["error"]["code"], "not_runnable", "for {id}");
+    }
+
+    // An id nobody knows is a different refusal: it never existed.
+    let response = run_command(&fixture.state, &owner, "act.nope", true).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+    assert_eq!(response.body["error"]["code"], "unknown_command");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_run_endpoint_re_checks_the_commands_own_permission() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let member = fixture.member_token().await;
+    let member_id = caller_id(&fixture.state, &member).await;
+
+    // The editor writes content but does not manage the index: the endpoint refuses on its own,
+    // without trusting the projection the panel received.
+    let response = run_command(&fixture.state, &editor, "act.reindex-search", true).await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN, "body: {}", response.body);
+    assert_eq!(response.body["error"]["code"], "command_not_allowed");
+
+    let response = run_command(&fixture.state, &member, "act.reindex-search", true).await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert_eq!(response.body["error"]["code"], "command_not_allowed");
+    assert!(
+        command_run_targets(&fixture.db, member_id).await.is_empty(),
+        "a refused run is not an executed one"
+    );
+
+    // The member's own history, however, is theirs to clear — and clearing it really clears it.
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/command-center/recent",
+            Some(&member),
+            Some(json!({ "kind": "query", "query": "release notes" })),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+
+    let response = run_command(&fixture.state, &member, "act.clear-recents", true).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    assert_eq!(response.body["result"]["cleared"], 1);
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/command-center/recent",
+            Some(&member),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.body["items"].as_array().map(Vec::len),
+        Some(0),
+        "the history is really gone, got {}",
+        response.body
+    );
+    assert_eq!(
+        command_run_targets(&fixture.db, member_id).await,
+        vec!["act.clear-recents".to_owned()]
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn every_registered_action_command_has_a_service_behind_it() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    // "No dead buttons" as a test: walking the registry catches a command registered as an action
+    // before the service that runs it exists — the failure mode `action_not_implemented` names.
+    let actions: Vec<&str> = omnion_search::COMMANDS
+        .iter()
+        .filter(|spec| spec.is_action())
+        .map(|spec| spec.id)
+        .collect();
+    assert!(
+        !actions.is_empty(),
+        "the palette offers at least one command that acts"
+    );
+
+    for id in actions {
+        let response = run_command(&fixture.state, &owner, id, true).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{id} is registered as an action but did not run, body: {}",
+            response.body
+        );
+        assert_eq!(response.body["outcome"], "ok");
+    }
+
+    // Every action asks before it runs today; the flag is the registry's, not the panel's.
+    for spec in omnion_search::COMMANDS.iter().filter(|spec| spec.is_action()) {
+        assert!(
+            spec.confirm,
+            "{} changes data that cannot be put back, so it asks first",
+            spec.id
+        );
+    }
 
     fixture.cleanup().await;
 }
