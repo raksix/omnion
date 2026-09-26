@@ -163,7 +163,7 @@ export function MediaView() {
             type="button"
             disabled={!selectedSite || busy}
             onClick={() => fileInput.current?.click()}
-            className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:bg-quiet-soft disabled:text-muted"
           >
             <Upload className="size-3.5" aria-hidden />
             {busy ? "Working…" : "Upload file"}

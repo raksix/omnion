@@ -73,7 +73,7 @@ const inputClass =
   "w-full rounded-lg border border-line bg-surface px-3 py-2 text-[13px] text-ink outline-none transition placeholder:text-muted/70 focus:border-accent focus:ring-2 focus:ring-accent/15";
 
 const buttonClass =
-  "inline-flex items-center gap-2 rounded-lg bg-accent px-3.5 py-2.5 text-[13px] font-medium text-white transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-60";
+  "inline-flex items-center gap-2 rounded-lg bg-accent px-3.5 py-2.5 text-[13px] font-medium text-white transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:bg-quiet-soft disabled:text-muted";
 
 /** Index of the first open step; `STEPS.length` when everything is done. */
 function firstOpenStep(status: OnboardingStatus): number {

@@ -280,7 +280,7 @@ export function PagesView() {
               <button
                 type="submit"
                 disabled={saving}
-                className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-60"
+                className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
               >
                 {editor.id ? "Save draft" : "Create page"}
               </button>

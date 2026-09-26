@@ -287,7 +287,7 @@ export function AiView() {
               <button
                 type="submit"
                 disabled={busy}
-                className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-60"
+                className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
               >
                 Connect
               </button>
@@ -441,7 +441,7 @@ export function AiView() {
                             `${provider.name}: the model list is saved.`,
                           )
                         }
-                        className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-60"
+                        className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
                       >
                         Save models
                       </button>
@@ -610,7 +610,7 @@ export function AiView() {
               onClick={() => void send()}
               disabled={streaming || !prompt.trim() || enabledModels.length === 0}
               data-chat-send
-              className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-60"
+              className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
             >
               <Send className="size-3.5" aria-hidden />
               {streaming ? "Streaming…" : "Send"}
