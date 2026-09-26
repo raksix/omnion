@@ -458,6 +458,53 @@ jobs:
           kill "$API_PID"
           echo "first-run surface: CLI setup → completed · owner signs in · site serves theme"
 
+  web:
+    name: Web — install · typecheck · build · serve (admin + public renderer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The pnpm version comes from `packageManager` in the root package.json.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build (admin + public renderer)
+        run: pnpm build
+      # The panel really serves: the sign-in screen answers 200 and the request gate keeps an
+      # anonymous visitor on it (every other route redirects). The API is not needed for this —
+      # exactly the property a fresh clone has to show before anything is configured.
+      - name: Smoke test (admin panel serves the sign-in screen)
+        run: |
+          pnpm --filter @omnion/admin start > /tmp/omnion-admin.log 2>&1 &
+          ADMIN_PID=$!
+          serve=0
+          for _ in $(seq 1 30); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/login)" = "200" ]; then
+              serve=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$serve" != "1" ]; then
+            echo "the admin panel did not serve the sign-in screen" >&2
+            tail -20 /tmp/omnion-admin.log >&2
+            kill "$ADMIN_PID" 2>/dev/null || true
+            exit 1
+          fi
+          gated=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/pages)
+          if [ "$gated" != "307" ]; then
+            echo "an anonymous panel route must redirect to the sign-in screen with 307, got $gated" >&2
+            kill "$ADMIN_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "admin panel: /login=200 · anonymous /pages=$gated → /login"
+          kill "$ADMIN_PID"
+
   infra:
     name: Infra — compose config
     runs-on: ubuntu-latest
