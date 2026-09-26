@@ -18,6 +18,7 @@ use omnion_content::model::{
     NewPage, NewRevisionTranslation, Page, PageChanges, PageRevision, Translation,
 };
 use omnion_content::{pages, translations};
+use omnion_events::{NewEvent, bus};
 use omnion_identity::sites::{self, Site};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -424,6 +425,36 @@ pub async fn publish_page(
     let site = site_of(&state, page.site_id).await?;
 
     let (page, published) = pages::publish_page(state.db().pool(), page.id).await?;
+
+    // Fan-out (docs/BUILD-BACKLOG.md P12): the platform's own bus records the publication, and
+    // the bus queues one signed delivery per enabled endpoint of the organization subscribed to
+    // `page.published`, in the same transaction as the event row. The site renderer already
+    // serves the page either way — a bus that cannot record the fact reports the failure
+    // instead of hiding it.
+    let report = bus::emit(
+        state.db().pool(),
+        NewEvent::new("page.published")
+            .organization(site.organization_id)
+            .site(page.site_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "page_id": page.id,
+                "site_id": page.site_id,
+                "slug": page.slug,
+                "status": page.status,
+                "revision_id": published.id,
+                "revision_no": published.revision_no,
+                "title": published.title,
+            })),
+    )
+    .await?;
+
+    tracing::debug!(
+        event_id = report.event.id,
+        deliveries = report.deliveries,
+        slug = %page.slug,
+        "page.published recorded"
+    );
 
     record(
         &state,
