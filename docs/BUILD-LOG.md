@@ -505,7 +505,11 @@
      creates everything, the API serves it (login + the site with its theme), and a second
      `setup` is refused with exit 2 ✅
 - CI: the smoke job builds the CLI too and runs a first-run walk on a database that has never been
-  migrated (`omnion doctor`/`migrate`/`setup` → the API serves the result).
+  migrated (`omnion doctor` refuses the unmigrated schema, `migrate` applies it, `setup` creates
+  the installation, the API serves it). Run `36208527271` → **success** (the walk prints
+  `doctor reported the pending schema (exit 1, as expected)`, `Setup complete.` …
+  `onboarding: completed · steps {'owner': True, …} · themes ['minimal']`,
+  `site: ci-site theme=minimal`) · `Infra — compose config` ✅
 - Also fixed: the P09 workflow suite's walks are serialised behind a walk lock — its sweeps work
   on the whole `workflows` table, so two walks in flight could settle each other's rows (4 of 5
   runs failed before the lock, 5 of 5 pass after).
