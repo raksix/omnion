@@ -245,6 +245,43 @@ jobs:
             exit 1
           fi
           echo "media surface: library=$library · round-trip=ok · public=ok · removed=$removed"
+          # Workflows: the Owner defines a four-step workflow whose middle step fails once, runs
+          # it, and the runner inside the API retries the failure, parks on the wait step and
+          # finishes the run (docs/BUILD-BACKLOG.md P09).
+          workflow_steps='{"name":"Smoke workflow","organization_id":"'"$org_id"'","trigger":{"kind":"manual"},"steps":[{"name":"prepare","kind":"task","action":"noop"},{"name":"unstable","kind":"task","action":"transient","params":{"fail_times":1},"max_attempts":3},{"name":"pause","kind":"wait","params":{"seconds":1}},{"name":"finish","kind":"task","action":"echo","params":{"value":"done"}}]}'
+          workflow_id=$(curl -fsS -b /tmp/omnion-cookies.txt -H 'content-type: application/json' \
+            -d "$workflow_steps" http://127.0.0.1:8080/api/v1/workflows \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          execution_id=$(curl -fsS -b /tmp/omnion-cookies.txt -X POST \
+            "http://127.0.0.1:8080/api/v1/workflows/$workflow_id/run" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          workflow_state=""
+          for _ in $(seq 1 60); do
+            workflow_state=$(curl -fsS -b /tmp/omnion-cookies.txt \
+              "http://127.0.0.1:8080/api/v1/workflow-executions/$execution_id" \
+              | python3 -c 'import json,sys; e=json.load(sys.stdin); s=e["steps"]; print(e["status"], "attempts=" + str(s[1]["attempts"]), "wait=" + s[2]["status"])')
+            case "$workflow_state" in
+              completed*) break ;;
+            esac
+            sleep 1
+          done
+          case "$workflow_state" in
+            completed\ attempts=2*) ;;
+            *)
+              echo "the workflow did not settle: $workflow_state" >&2
+              kill "$API_PID" 2>/dev/null || true
+              exit 1
+              ;;
+          esac
+          curl -fsS -b /tmp/omnion-cookies.txt "http://127.0.0.1:8080/api/v1/iam/audit" \
+            | python3 -c 'import json,sys; rows=[r for r in json.load(sys.stdin)["entries"] if r["action"].startswith("workflow.execution.")]; print("workflow audit rows:", len(rows), sorted({r["action"] for r in rows}))'
+          workflow_code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/workflows)
+          if [ "$workflow_code" != "401" ]; then
+            echo "anonymous /api/v1/workflows must be rejected with 401, got $workflow_code" >&2
+            kill "$API_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "workflow surface: $workflow_state · run=completed"
           curl -fsS -o /dev/null -X POST -b /tmp/omnion-cookies.txt http://127.0.0.1:8080/api/v1/auth/logout
           kill "$API_PID"
 
