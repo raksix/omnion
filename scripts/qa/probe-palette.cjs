@@ -144,14 +144,21 @@ async function main() {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(400);
 
-  // Reopening shows the query under "Recent searches"; Escape closes from the input.
+  // Reopening shows the query under "Recent"; Escape closes from the input. The group sits below
+  // the command list, which is why this reads the rows themselves rather than the text slice.
   await page.goto(`${ADMIN}/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(800);
   await page.keyboard.press("Control+K");
   await page.waitForTimeout(900);
   state = await paletteState(page);
-  check("reopening shows the recent-search list", /Recent searches/i.test(state.text), state.text.slice(0, 120));
-  check("the query is remembered", /\bsample\b/i.test(state.text));
+  const recentRows = await page.locator('[data-search-palette] [id^="recent-"]').count();
+  const recentText = await page
+    .locator('[data-search-palette] [id^="recent-"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  check("reopening shows the account's recent list", recentRows > 0, `${recentRows} recent rows`);
+  check("the query is remembered", /sample/i.test(recentText), recentText.replace(/\s+/g, " ").slice(0, 80));
   await page.keyboard.press("Escape");
   await page.waitForTimeout(400);
   check("Escape closes the palette", !(await paletteState(page)).open);

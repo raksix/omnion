@@ -863,6 +863,213 @@ async function searchTotal(page) {
 }
 
 /**
+ * The command centre (REQ-032, slice 1): the palette's own command group, the prefix modes, a
+ * navigation command that really runs, and the account's history of what it ran.
+ *
+ * The numbers here are the acceptance criteria of the slice: how many commands the registry
+ * offers, what the mode chip says after a prefix, which URL the palette lands on, whether it
+ * closed behind the navigation, and whether the command it ran is still in the history after a
+ * reload.
+ */
+async function runCommandCenter(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "command-center", action: "palette", ...step });
+  };
+
+  const openPalette = async () => {
+    await page.keyboard.press("Control+K");
+    await page.waitForSelector("[data-search-palette]", { timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    return (await page.locator("[data-search-palette]").count()) > 0;
+  };
+  const input = () => page.locator("[data-palette-input]").first();
+
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  // `>` narrows the box to the commands this account may run.
+  const opened = await openPalette();
+  await input()
+    .fill(">")
+    .catch(() => {});
+  await page.waitForTimeout(1000);
+  const commandRows = await page.locator('[data-search-palette] [id^="command-"]').count();
+  const chip = (await page.locator("[data-palette-mode]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  const commandLabels = await page
+    .locator('[data-search-palette] [id^="command-"]')
+    .evaluateAll((rows) =>
+      rows.slice(0, 4).map((row) => (row.innerText || "").replace(/\s+/g, " ").trim()),
+    )
+    .catch(() => []);
+  note({
+    step: "commands-mode",
+    opened,
+    commandRows,
+    chip,
+    sample: commandLabels.join(" | "),
+  });
+  await shot(page, "command-center-commands", { full: false });
+
+  // A navigation command runs for real: the palette closes and the panel lands on the screen.
+  await input()
+    .fill("> open pages")
+    .catch(() => {});
+  await page.waitForTimeout(1000);
+  await input()
+    .press("Enter")
+    .catch(() => {});
+  await page.waitForTimeout(1600);
+  const landedUrl = page.url();
+  const paletteClosed = (await page.locator("[data-search-palette]").count()) === 0;
+  note({
+    step: "run-command",
+    command: "> open pages",
+    url: landedUrl,
+    paletteClosed,
+    landed: /\/pages/.test(landedUrl),
+  });
+  await shot(page, "command-center-after-command");
+
+  // What it ran is this account's history, and the history survives a reload.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await openPalette();
+  await page.waitForTimeout(1000);
+  const recentText = await page
+    .locator("[data-search-palette]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  const recentCommandRows = await page
+    .locator('[data-search-palette] [id^="recent-command-"]')
+    .count();
+  const recentsGroup = /recent/i.test(recentText);
+  const recentsHasCommand = /open pages/i.test(recentText);
+  note({
+    step: "recents",
+    recentCommandRows,
+    recentsGroup,
+    recentsHasCommand,
+  });
+  await shot(page, "command-center-recents", { full: false });
+
+  // `?` alone is the shortcut sheet; `#` and `@` move the chip to their own modes.
+  await input()
+    .fill("?")
+    .catch(() => {});
+  await page.waitForTimeout(500);
+  const helpPanel = await page.locator("[data-palette-help]").count();
+  note({ step: "help-mode", helpPanel });
+
+  await input()
+    .fill("#")
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  const sitesChip = (
+    await page.locator("[data-palette-mode]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "sites-mode", chip: sitesChip });
+
+  await input()
+    .fill("@")
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  const peopleChip = (
+    await page.locator("[data-palette-mode]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "people-mode", chip: peopleChip });
+  await shot(page, "command-center-modes", { full: false });
+
+  await input()
+    .fill("")
+    .catch(() => {});
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(500);
+
+  // The palette opens over an open dialog — and closes without taking the dialog with it.
+  await page.goto(`${URL_ADMIN}/search?q=qa`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1300);
+  await page
+    .locator("[data-search-shortcuts]")
+    .first()
+    .click({ timeout: 4000 })
+    .catch(() => {});
+  await page.waitForTimeout(500);
+  const dialogOpen = await page.locator("[data-search-shortcuts-dialog]").count();
+  const overDialog = await openPalette();
+  const stacking = await page
+    .evaluate(() => {
+      const palette = document.querySelector("[data-search-palette]");
+      const dialog = document.querySelector("[data-search-shortcuts-dialog]");
+      if (!palette || !dialog) {
+        return null;
+      }
+      const depth = (element) => Number(window.getComputedStyle(element).zIndex) || 0;
+      return { palette: depth(palette), dialog: depth(dialog) };
+    })
+    .catch(() => null);
+  note({ step: "palette-over-dialog", dialogOpen, paletteOpened: overDialog, stacking });
+  await shot(page, "command-center-over-dialog", { full: false });
+  // The scrim closes the palette and nothing else: the dialog underneath is another layer and
+  // stays open, which is what "over an open modal" means. The click lands in the corner of the
+  // scrim — its centre is where the dialog itself sits.
+  await page.mouse.click(5, 5).catch(() => {});
+  await page.waitForTimeout(500);
+  note({
+    step: "scrim-closes-palette",
+    paletteClosed: (await page.locator("[data-search-palette]").count()) === 0,
+    dialogStillOpen: (await page.locator("[data-search-shortcuts-dialog]").count()) > 0,
+  });
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(400);
+
+  // Unsaved work survives the palette: the box opens over a half-typed form, and Escape gives
+  // the field back its focus without touching what was typed in it.
+  await page.goto(`${URL_ADMIN}/pages`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1300);
+  await page
+    .locator("button:has-text('New page')")
+    .first()
+    .click({ timeout: 4000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+  await page
+    .locator("#page-title")
+    .first()
+    .fill("Unsaved draft QA")
+    .catch(() => {});
+  const openedOverForm = await openPalette();
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(600);
+  const titleValue = await page
+    .locator("#page-title")
+    .first()
+    .inputValue()
+    .catch(() => "");
+  const focusReturned = await page
+    .evaluate(() => document.activeElement?.id === "page-title")
+    .catch(() => false);
+  note({ step: "unsaved-form-survives", openedOverForm, titleValue, focusReturned });
+  await shot(page, "command-center-unsaved-form", { full: false });
+  await page
+    .locator("button:has-text('Cancel')")
+    .first()
+    .click({ timeout: 3000 })
+    .catch(() => {});
+
+  report.commandCenter = { steps };
+  log(`command centre: ${JSON.stringify(steps)}`);
+}
+
+/**
  * The depth pass of the results screen and the search settings (REQ-002, slice 3).
  *
  * Every step is a number, not an impression: the facet's own count before and after a click, the
@@ -1091,6 +1298,9 @@ async function main() {
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
+
+  // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
+  await runCommandCenter(page, report);
 
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
   await runSearchDepth(page, report);
