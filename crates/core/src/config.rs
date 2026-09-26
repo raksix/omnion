@@ -76,6 +76,12 @@ pub const DEFAULT_SEARCH_POLL_MS: u64 = 2_000;
 /// Default number of events one search-indexer tick applies (`OMNION_SEARCH_BATCH`).
 pub const DEFAULT_SEARCH_BATCH: usize = 200;
 
+/// Default delay between two analytics-rollup ticks (`OMNION_ANALYTICS_POLL_MS`).
+pub const DEFAULT_ANALYTICS_POLL_MS: u64 = 15_000;
+
+/// Default beacon budget of one site and caller per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
+pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -393,6 +399,32 @@ impl Default for SearchConfig {
     }
 }
 
+/// Analytics collection and rollup knobs (docs/requests/REQ-007).
+///
+/// The rollup worker of `apps/api` reads these: it rebuilds the recent hourly and daily buckets
+/// every `poll_ms` (a bucket run is idempotent, so a slow or duplicated tick changes nothing).
+/// `collect_per_minute` is the beacon budget of one site and caller per minute on the public
+/// collection endpoint — exceeding it answers `429` and is counted, never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticsConfig {
+    /// Whether this process rolls up analytics buckets (`OMNION_ANALYTICS_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two rollup ticks (`OMNION_ANALYTICS_POLL_MS`).
+    pub poll_ms: u64,
+    /// Beacons one site and caller may send per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
+    pub collect_per_minute: u64,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_ANALYTICS_POLL_MS,
+            collect_per_minute: DEFAULT_ANALYTICS_COLLECT_PER_MINUTE,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -492,6 +524,8 @@ pub struct Config {
     pub automation: AutomationConfig,
     /// Search indexer knobs (REQ-002).
     pub search: SearchConfig,
+    /// Analytics collection and rollup knobs (REQ-007).
+    pub analytics: AnalyticsConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -646,6 +680,16 @@ impl Config {
             batch: read_count(&read, "OMNION_SEARCH_BATCH", DEFAULT_SEARCH_BATCH)?,
         };
 
+        let analytics = AnalyticsConfig {
+            runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
+            collect_per_minute: read_positive(
+                &read,
+                "OMNION_ANALYTICS_COLLECT_PER_MINUTE",
+                DEFAULT_ANALYTICS_COLLECT_PER_MINUTE,
+            )?,
+        };
+
         let mail = MailConfig {
             enabled: read_flag(&read, "OMNION_MAIL_ENABLED", true)?,
             host: read("OMNION_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.to_owned()),
@@ -666,6 +710,7 @@ impl Config {
             events,
             automation,
             search,
+            analytics,
             mail,
             log,
         };
@@ -703,6 +748,7 @@ impl Default for Config {
             events: EventsConfig::default(),
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
+            analytics: AnalyticsConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
