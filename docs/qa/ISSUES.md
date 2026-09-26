@@ -99,18 +99,30 @@ cannot do something / the screen is broken, `medium` = visible defect or accessi
   no mention of the badge; the walkthrough's own counters are unchanged (49 clicks · 8 fills ·
   49 shots · 5 programmatic findings, all of them the web root's 404 noise tracked below).
 
-## ISSUE-005 — A disabled filled button keeps white text on a faded fill · low · open
+## ISSUE-005 — A disabled filled button keeps white text on a faded fill · low · fixed
 
-- **Screen:** `/ai` — the “Try it” card's Send button; every `bg-accent … disabled:opacity-60`
-  button follows the same rule
+- **Screen:** `/ai` — the “Try it” card's Send button; every `bg-accent … disabled:opacity-*`
+  control followed the same rule (7 buttons across 5 files)
 - **Evidence:** vision of `qa-artifacts/20260926-115544`, `page-ai`: “the Send button uses white
-  text on a pale terracotta background”. `opacity-60` fades the whole control, so the label ends
-  up white-on-light-terracotta (~1.5:1) and unreadable; the button is disabled in the QA fixture
-  because no provider is connected. The walkthrough's contrast pass cannot see it: its rule skips
-  an element that has children, and this button carries an icon *and* a label.
-- **Fix direction:** mute the disabled state instead of fading it — `disabled:bg-quiet-soft
-  disabled:text-muted` (4.79:1) in place of `disabled:opacity-60` on the `bg-accent` buttons.
-  Disabled controls are exempt from WCAG, so this is a UX nit rather than an AA failure.
+  text on a pale terracotta background”. The button is disabled in the QA fixture because no
+  provider is connected, and `opacity-60` faded the whole control. The walkthrough's contrast
+  pass cannot see it: its rule skips an element that has children, and this button carries an
+  icon *and* a label.
+- **Root cause:** the fade sat on the control as a whole, so the label was alpha-composited over
+  the page — white text stayed white while the terracotta fill washed out underneath it. Measured
+  on the live stack with `scripts/qa/probe-disabled-contrast.cjs`: fill `rgb(208,154,137)`, text
+  `rgb(255,255,255)` → **2.43:1**.
+- **Fix:** mute the disabled state instead of fading it —
+  `disabled:bg-quiet-soft disabled:text-muted` replaces `disabled:opacity-60` (`disabled:opacity-50`
+  in the media panel) on the filled accent buttons: `app/login/page.tsx`,
+  `features/setup/setup-view.tsx`, `features/media/media-view.tsx`, `features/pages/pages-view.tsx`
+  and `features/ai/ai-view.tsx` (×3). Nothing else about the controls changed.
+- **Proof:** the probe reports fill `rgb(238,234,226)` with text `rgb(107,101,96)` → **4.79:1**
+  (≥ 4.5), and with the pointer over the disabled control the fill stays `rgb(238,234,226)`: the
+  `disabled:` variant wins over `hover:bg-accent-strong` in the compiled sheet, so hovering a
+  disabled button no longer swaps in a dark fill. The pass after the change
+  (`qa-artifacts/20260926-125712`) is unchanged — 49 clicks · 8 fills · 49 shots, vision 0 issues —
+  and the only programmatic findings are the web root's 404 noise tracked above.
 
 ## Harness notes (fixed, not app defects)
 

@@ -113,3 +113,26 @@
   programmatic pass (it is not part of the DOM the diagnostics walk) while the vision review
   reports it on every shot — a finding repeated across unrelated screens is usually an overlay,
   not five layout bugs.
+
+## 2026-09-26 · pass `20260926-125712` — ISSUE-005 fixed (disabled filled controls)
+
+- Counters: 49 clicks · 8 field fills · 49 screenshots · 5 programmatic findings
+  (high 0 · medium 5 · low 0 — all of them the web root's 404 noise tracked by the ISSUE-002
+  follow-up) · vision review 14 shots → **0 issues**.
+- Fixed **ISSUE-005** (low): a filled accent button in its disabled state faded the *whole*
+  control (`disabled:opacity-60`; `disabled:opacity-50` in the media panel), so the label was
+  alpha-composited over the page as white-on-pale-terracotta. Seven buttons across five files now
+  mute instead of fade (`disabled:bg-quiet-soft disabled:text-muted`): login, the wizard, media,
+  pages and the three AI-hub buttons.
+- Proof: the vision review is nondeterministic about this one (it reported the button once and
+  then went quiet), so the fix is proven with a focused probe instead —
+  `scripts/qa/probe-disabled-contrast.cjs` measures the rendered pair on the live stack: fill
+  `rgb(208,154,137)` with white text (2.43:1) before → fill `rgb(238,234,226)` with
+  `rgb(107,101,96)` text (4.79:1) after, and the fill survives a hover (the `disabled:` variant
+  outranks `hover:bg-accent-strong` in the compiled sheet).
+- Still open: the ISSUE-002 follow-up (the fixture should publish a `home` page so the root stops
+  answering 404 and its five noise findings disappear). ISSUE-001 … ISSUE-005 are all fixed.
+- Lesson: when the vision model reports something once and then goes quiet, the silence is not a
+  fix — measure the rendered result instead. A small probe that composites an element's opacity
+  over its ancestor background turns a flaky visual hunch into a number, and its exit code becomes
+  a regression guard the next pass can lean on.

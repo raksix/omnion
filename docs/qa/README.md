@@ -38,6 +38,11 @@ One pass does:
 ## Conventions
 
 - `scripts/qa/*` is the only place walkthrough knowledge lives — never teach it to skip work.
+- Focused probes for a single defect live in `scripts/qa/probe-*.cjs`; they drive the same QA
+  stack, measure the rendered result directly and exit non-zero on failure (for example
+  `probe-disabled-contrast.cjs` composites a disabled control's opacity over its backdrop and
+  reports the WCAG ratio). Prefer a probe over a second vision review when the finding is
+  visual but measurable — it turns a flaky hunch into a number and stays as a regression guard.
 - Screenshots never enter git (see `.gitignore`); `docs/qa/*.md` do.
 - The environment knobs: `QA_API_PORT`, `QA_ADMIN_PORT`, `QA_WEB_PORT`, `QA_CHROME`,
   `QA_NODE_PATH`, `VISION_MCP_API_KEY` / `VISION_MCP_BASE_URL` / `VISION_MCP_MODEL`.
