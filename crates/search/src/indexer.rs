@@ -397,7 +397,8 @@ on conflict (provider, entity_type, entity_id) do update set \
 /// Upsert of the content provider: one document per page, titled by its latest revision.
 ///
 /// A page carries its status as a tag (`draft`, `published`, `archived`) so `is:draft` is a tag
-/// filter rather than a text match, and the ranking can weight it.
+/// filter rather than a text match, and the ranking can weight it. The `url` is the deep link a
+/// palette hit opens — the pages screen of the page's own site, with the page's editor open.
 const PAGES_UPSERT: &str = "\
 insert into search_documents \
     (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
@@ -405,7 +406,7 @@ insert into search_documents \
 select s.organization_id, p.site_id, 'pages', 'page', p.id::text, \
        rev.title, \
        concat_ws(' · ', s.name, '/' || p.slug, p.status), \
-       '/pages', \
+       '/pages?site=' || p.site_id::text || '&focus=' || p.id::text, \
        p.created_by, \
        array[p.status]::text[], \
        coalesce(rev.summary, ''), \
@@ -423,7 +424,8 @@ join lateral ( \
 where true {filter} \
 ";
 
-/// Upsert of the media provider: one document per file.
+/// Upsert of the media provider: one document per file. The `url` opens the file's own library
+/// with the row marked, so a hit lands on the file and not merely in the library.
 const MEDIA_UPSERT: &str = "\
 insert into search_documents \
     (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
@@ -431,7 +433,7 @@ insert into search_documents \
 select s.organization_id, m.site_id, 'media', 'media', m.id::text, \
        m.filename, \
        concat_ws(' · ', s.name, m.content_type), \
-       '/media', \
+       '/media?site=' || m.site_id::text || '&focus=' || m.id::text, \
        m.created_by, \
        array[m.content_type]::text[], \
        '', \
