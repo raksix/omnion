@@ -11,6 +11,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
+import { GlobalSearch } from "@/components/global-search";
 import { useSession } from "@/lib/session";
 
 const NAV = [
@@ -150,7 +151,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-30 border-b border-line bg-canvas/85 backdrop-blur">
-          <div className="flex items-center gap-3 px-4 py-3 sm:px-6">
+          <div className="flex flex-wrap items-center gap-3 px-4 py-3 sm:px-6">
             <button
               type="button"
               aria-label="Open navigation"
@@ -162,9 +163,14 @@ export function AppShell({ title, description, children }: AppShellProps) {
             <div className="min-w-0 flex-1">
               <h1 className="truncate text-[15px] font-semibold">{title}</h1>
               {description ? (
-                <p className="truncate text-[12px] text-muted">{description}</p>
+                // From `sm` up the shell says what the screen is; on a phone there is no room for
+                // it, and a sentence cut off mid-word reads as a defect rather than as a caption.
+                <p className="hidden truncate text-[12px] text-muted sm:block">{description}</p>
               ) : null}
             </div>
+            {/* The one search box: beside the site switcher on large screens, its own full-width
+                row under the header on small ones. */}
+            <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
             <SiteSwitcher />
           </div>
         </header>
