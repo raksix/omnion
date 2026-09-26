@@ -1,6 +1,6 @@
 # REQ-002 — Global Search Engine
 
-> **Status:** in-progress (slices 1–2 shipped; slice 3 next) · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
+> **Status:** done · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -114,14 +114,14 @@ public contract; only reindex outcomes are published.
 - [x] `⌘K`/`Ctrl+K` opens the palette, `Esc` closes it, `↑`/`↓` traverse sections, `Enter` opens the highlighted row, `⌘Enter` opens a new tab. *(Slice 2: the walkthrough presses `Ctrl+K` from the overview screen and drives the arrow keys and `Enter`; `scripts/qa/probe-palette.cjs` holds each key to its own check — including `Ctrl+Enter` opening the row in a second tab.)*
 - [x] Fewer than two characters keeps the recent-search list; a query with no hits renders the no-results state. *(Probe: one character keeps the list, `zzzznothingmatches` answers "Nothing matched", and the box stays usable.)*
 - [x] Recent searches persist per account (≤20, pruned, clearable through `DELETE /search/recent`). *(Per-item removal is the palette's own memory — `lib/search-memory.ts` hides one query in this browser; "Clear" forgets both the local set and the account's list.)*
-- [ ] `/search` renders facets with counts, applies them as removable chips and paginates 50 per page with a correct total.
-- [ ] Bulk selection supports Shift-range and `⌘A`; Copy links yields a newline-separated list; Export CSV produces one row per hit with the same count as the table.
+- [x] `/search` renders facets with counts, applies them as removable chips and paginates 50 per page with a correct total. *(Slice 3: six groups (Type, Site, Owner, Language, Status, Updated), each counted **without its own filter**; the walkthrough applies a type facet (13 → 9 hits, one chip), removes it (0 chips) and reads `Showing 1–50 of N` against the same total the API answered.)*
+- [x] Bulk selection supports Shift-range and `⌘A`; Copy links yields a newline-separated list; Export CSV produces one row per hit with the same count as the table. *(Walkthrough: a Shift-range selected 3 of 13 rows, Copy links put exactly 3 URLs on the clipboard, and the CSV of that selection carried 3 rows — the same count the bulk bar showed. `⌘A` selects the page; the selection is exported through `selected=`.)*
 - [x] Index maintenance works from the bus: publishing a page makes it findable within one runner tick, and deleting media removes its row. *(Slice 2 gave the remaining providers their producers: `apps/api/tests/search.rs` now uploads a file and creates a site through the real routes, waits one indexer tick, sees both in the index and watches the file's row leave when it is removed. The direct `remove_entity` path stays as the second half of the same walk.)*
 - [x] `POST /search/reindex` rebuilds a provider idempotently (two runs, same count) and is refused without `search.manage`.
-- [ ] Ranking weights from the settings form change the order of a fixture result set (title-heavy query ranks the title match first).
-- [x] Every screen has empty, loading and error states; no dead control and no placeholder copy. *(The palette and the results screen, which are the screens slice 2 ships; `/settings/search` arrives with slice 3 and inherits the same three states. Rows exist only for providers whose screen exists, so no control is a click into nothing.)*
-- [x] The mobile pass renders the palette as a full-screen sheet with 44px rows and reachable bulk actions. *(The palette: measured at 390×844 — the sheet fills the viewport, rows are 44px, the close control is visible and reachable (walkthrough + probe). The results screen's bottom action bar arrives with slice 3.)*
-- [x] `cargo test --workspace` (422 passed, 44 suites), `pnpm typecheck && pnpm build` (2/2) and the QA walkthrough (58 clicks · 67 screenshots · 0 high findings · 1 low vision note, `qa-artifacts/20260926-150923`) pass.
+- [x] Ranking weights from the settings form change the order of a fixture result set (title-heavy query ranks the title match first). *(`ranking_weights_change_the_order_of_a_fixture_result_set`: with the defaults the page whose title carries the term leads; after `PUT /search/settings` with title 1 · tags 10 · subtitle 10 · body 1 the site page that carries the term in its subtitle leads instead — the assertion runs after the defaults are restored, so a failure cannot leave the installation tuned.)*
+- [x] Every screen has empty, loading and error states; no dead control and no placeholder copy. *(The palette, the results screen and `/settings/search` — the index screen ships with slice 3 and carries the same three states plus per-provider states read from the pass records. Rows exist only for providers whose screen exists; Activity, Translations and Settings rows open the entity or screen they name, so no control is a click into nothing.)*
+- [x] The mobile pass renders the palette as a full-screen sheet with 44px rows and reachable bulk actions. *(The palette: 390×844, 44px rows, a visible close control. The results screen moves its filters into a sheet behind `Filters (n)` and keeps the selection bar sticky above the cards; `/settings/search` renders the providers as cards below `md` — the table's fixed columns do not fit a phone, and the first pass found exactly that.)*
+- [x] `cargo test --workspace` (436 passed, 0 failed), `pnpm typecheck && pnpm build` (2/2) and the QA walkthrough (105 clicks · 107 screenshots · **0 high findings** · **0 vision issues**, `qa-artifacts/20260926-160500`) pass.
 
 ### QA plan
 
@@ -257,3 +257,73 @@ Deviations from the spec above, each deliberate:
   That is what made the mobile measurements real — and it is why the mobile pass found, and this
   tick fixed, the pages table overflowing a phone (narrow columns and the action labels now leave
   before the table does) and a corrupt 82-byte "PNG" fixture that rendered as a broken thumbnail.
+
+
+### Build notes — slice 3 (results depth, the wider provider set, the index's own screen), 2026-09-26
+
+Shipped:
+
+- `database/migrations/0013_search_depth.sql` — `search_reindex_runs` (one row per pass: started,
+  finished, written, pruned, duration, error) and the wider default provider set (an installation
+  picks the three new keys up; a key an operator removed by hand is never re-added).
+- `crates/search` — three providers with their own upserts and prunes: **Activity** (`logs`: audit
+  entries and recorded events **whose target is an entity the panel can open**, so a row opens the
+  page, the file or the site it touched), **Translations** (`translations` joined to their page
+  revision, opening that page's editor) and **Settings** (one key/value row per organization — the
+  search weights — opening `/settings/search`). Facets: `query::facets` counts Type, Site, Owner,
+  Language, Status and Updated, each group **without its own filter**, so the number the rail shows
+  is the number its click produces; the hit statement now carries the owner's display name, and
+  `SearchFilters` merges the rail's parameters with the query language (union per kind). `status`
+  reads `ready` / `indexing` / `stale` / `failed` / `empty` from the pass records, and the settings
+  (weights + enabled providers) read, validate and write with the server owning the defaults.
+- `apps/api` — `/search` accepts `types`, `site_id`, `owner`, `language`, `status`, `updated`,
+  `before`, `after` and `facets=true`; `GET /search/export` answers CSV (the whole result set, or
+  `selected=`), with `X-Export-Rows` / `X-Export-Truncated`; `GET`/`PUT /search/settings` read and
+  write the ranking (`search.read` / `search.manage`). An unusable filter value is named — `400`
+  with the parameter's own code — never dropped.
+- `apps/admin` — `/search` grew the facet rail, chips, 50 rows a page, Shift/`⌘A` selection,
+  Copy links, CSV export, the keyboard map and (below `lg`) the filters in a sheet; `/settings/search`
+  is new: documents, last indexed, state and last pass per provider with a Reindex button, the
+  weights form (validated by the API's own rules), Restore defaults, and a progress line fed by the
+  passes. The palette renders the three new providers, and its sections open the targets their rows
+  name. The nav gained the index screen, so it is reachable from everywhere.
+- QA: the walkthrough visits `/settings/search` on desktop and phone and runs a scripted depth
+  phase — facet applied and removed, `s` sort, Shift-range, Copy links, one CSV export of the
+  selection, the shortcut dialog, a per-provider reindex (progress line + the pass's numbers) and
+  the weights form's refusal and save.
+
+Acceptance evidence, this tick: `cargo test --workspace` → **436 passed, 0 failed** (five new walks:
+facets under a filter, the export matching the result set and a selection, the ranking flip, the
+settings' refusals, and Activity/Settings reachable with their own screens) · `pnpm typecheck &&
+pnpm build` → 2/2 (the new route is in the build output) · `bash scripts/qa/run.sh` → 105 clicks ·
+107 screenshots · **0 high findings**, **0 vision issues** (`qa-artifacts/20260926-160500`); the
+depth phase's own numbers: 6 facet groups, a type facet narrowed 13 → 9 with one chip, removing it
+left 0, `s` moved the sort to `newest`, a Shift-range selected 3 of 13 rows, Copy links put 3 links
+on the clipboard, the exported CSV carried 3 rows, the settings screen reported 7 providers with
+their states, and a reindex answered "Indexed 1 document in 15 ms" with the row's last pass reading
+`1 written · 0 pruned · 15 ms`.
+
+Deviations from the spec above, each deliberate:
+
+- **The facets ride the search request** (`facets=true`) instead of a separate endpoint: same
+  parameters, same `WHERE` clause, one round trip for the screen that renders them — and the
+  palette's hot path (which never asks) does not pay for six extra counts.
+- **`/search/actions` is not built.** The palette's actions are the panel's own (the screens, a new
+  page), it renders them without a round trip, and no client calls that endpoint; shipping one with
+  no caller would be exactly the dead surface this project forbids.
+- **`logs` indexes what a click can open.** An audit entry about a role, an AI provider or an
+  organization has no screen yet (REQ-006/REQ-012/REQ-039 own those), so only entries and events
+  whose target resolves to a page, a file or a site are indexed — the rest join the provider the day
+  their screens exist. This is the same rule as the palette's "no section for a screen that is not
+  there", applied to rows.
+- **`settings` is the key/value the panel actually has**: the search weights, one row per
+  organization. A general settings store arrives with its own REQ and only adds a row to the same
+  statement.
+- **The export caps at 5 000 rows** and says so (`X-Export-Truncated`); the screen reports the count
+  it received, so a capped file cannot pass for the whole result set.
+- **The selection bar is sticky at every width** rather than a phone-only bottom bar (it does both
+  jobs), and below `lg` the filters move into a sheet behind `Filters (n)`.
+- **The vision pass's one low note was a misread**: it read the overview's `Connect a domain` row as
+  an unchecked circle labelled Done, while the DOM and the API agree the step is done
+  (`checklist[domain].done = true`, check icon rendered); the second pass reported 0 issues across
+  all 14 screens.

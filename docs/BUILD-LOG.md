@@ -872,3 +872,51 @@
   selection, Copy links, CSV export (`/search/export`), `/settings/search` (per-provider status,
   ranking weights, reindex progress) and the settings/logs/translations providers; then wave 1
   continues with REQ-032 (command centre).
+
+## 2026-09-26 — REQ-002 slice 3: results depth, the wider provider set, the index's own screen (done)
+
+- The results screen is now the depth the brief asked for. Facets: **Type, Site, Owner, Language,
+  Status and Updated**, each with counts and each counted **without its own filter** (so "Pages 12"
+  is the number clicking it would leave); applied filters become removable chips; 50 rows a page;
+  selection with Shift-range and `⌘A`; Copy links (newline-separated, absolute); CSV export
+  (`/search/export`) of the whole result set or of the selection, with the row count in a header;
+  the keyboard map (`s` sort, `f` facets, `x` a row, `⌘A` the page, `?` the list); and on phones
+  the filters move into a sheet behind `Filters (n)` while the selection bar stays sticky.
+- `/settings/search` is new — the index's own screen, reachable from the nav. One row (or card,
+  below `md`) per provider: documents, last indexed, **state** (`ready`, `indexing`, `stale`,
+  `failed`, `empty`) and the last pass's own numbers, with a Reindex button per provider and for the
+  whole index; the ranking weights form (whole numbers, title ≥ body) with the API's validation,
+  Restore defaults from the server's own defaults, and a progress line fed by the passes. The
+  states are read from `search_reindex_runs` (migration 0013): every pass records what it wrote, how
+  long it took and why it failed, so a state is never guessed from a document count.
+- Three providers joined the registry, each with a real destination: **Activity** (audit entries
+  and recorded events whose target is a page, a file or a site — a row opens the thing it touched),
+  **Translations** (a translated field opens its page's editor) and **Settings** (the search
+  weights row, one per organization, opening `/settings/search`). The palette renders all three; the
+  results screen can filter, select and export them like any other row.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `cargo test --workspace` → **436 passed, 0 failed** (five new walks in
+  `apps/api/tests/search.rs`: facets leave their own filter out of their own counts, the export
+  answers one row per hit and honours `selected=`, the weights flip a fixture's order, the settings
+  read/write/refusals, and Activity + Settings are findable with their own screens) · `pnpm
+  typecheck && pnpm build` → 2/2 (`/settings/search` in the route table) · `bash scripts/qa/run.sh`
+  → 105 clicks, 107 screenshots, **0 high findings**, **0 vision issues**
+  (`qa-artifacts/20260926-160500`). The pass's depth phase: 6 facet groups, a type facet narrowed
+  13 → 9 hits with one chip, removing it left 0 chips, `s` moved the sort to `newest`, a Shift-range
+  selected 3 of 13 rows, Copy links wrote exactly 3 URLs, the exported CSV carried 3 rows (same
+  count), the settings screen showed 7 providers with their states, a per-provider reindex answered
+  "Indexed 1 document in 15 ms." and its row read `1 written · 0 pruned · 15 ms`.
+- The QA harness keeps earning its keep. It caught a real defect in this slice — the settings table
+  is a six-column table and a phone reported 7 elements outside the viewport — so the provider rows
+  render as cards below `md`, the timestamps no longer wrap, and the disabled Save button stopped
+  fading its labelled text (white on pale peach). It also grew a depth phase of its own (facets →
+  chips → sort → selection → clipboard → CSV file → shortcuts → reindex → weights), which is what
+  makes each of those acceptance claims a number instead of an impression. Two layouts over one
+  dataset also taught the harness a selector lesson: `:visible` only, or a click lands on the copy
+  that a phone would show.
+- Carried forward, not caused by this slice: the public renderer still answers `404` for its own
+  icon requests (5 medium findings, unchanged), and the previous pass's single low vision note (the
+  overview's `Connect a domain` row) turned out to be a misread — the API and the DOM both report
+  the step done, and the re-run reported 0 issues across all 14 screens.
+- Next: wave 1 continues with **REQ-032** (command centre: palette + quick actions + recents), then
+  REQ-007 (analytics + real dashboard).
