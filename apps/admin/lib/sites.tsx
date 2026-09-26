@@ -52,6 +52,18 @@ function storeSiteId(siteId: string): void {
   }
 }
 
+/** The site a deep link asked for (`?site=<id>`), when the URL carries one. */
+function readLinkedSiteId(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return new URLSearchParams(window.location.search).get("site");
+  } catch {
+    return null;
+  }
+}
+
 /** Provide the sites and the current selection to the panel. */
 export function SitesProvider({ children }: { children: React.ReactNode }) {
   const { status: sessionStatus } = useSession();
@@ -82,8 +94,11 @@ export function SitesProvider({ children }: { children: React.ReactNode }) {
         setSites(list);
         setStatus("ready");
         setSelectedId((current) => {
-          const wanted = current ?? readStoredSiteId();
+          // A deep link (`/pages?site=<id>` — the palette's own hits) wins over the stored
+          // selection on the first resolution; a choice made in this session keeps winning.
+          const wanted = current ?? readLinkedSiteId() ?? readStoredSiteId();
           if (wanted && list.some((site) => site.id === wanted)) {
+            storeSiteId(wanted);
             return wanted;
           }
           return list.length > 0 ? list[0].id : null;

@@ -287,6 +287,114 @@ export function mediaRawUrl(mediaId: string): string {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Search (docs/requests/REQ-002)
+// ---------------------------------------------------------------------------------------------
+
+/** One hit of a search answer (`GET /api/v1/search`). */
+export type SearchHit = {
+  /** Provider key (`pages`). */
+  provider: string;
+  /** Document type (`page`). */
+  entity_type: string;
+  /** Entity id inside its own domain. */
+  entity_id: string;
+  /** Title. */
+  title: string;
+  /** Supporting line — for pages and media, the site and address of the hit. */
+  subtitle: string;
+  /** Panel route a click opens. */
+  url: string;
+  /** Tags stored with the document (`draft`, `published`, …). */
+  tags: string[];
+  /** When the entity last changed, RFC 3339. */
+  updated_at: string | null;
+  /** Rank inside this answer. */
+  score: number;
+};
+
+/** One provider's share of a result set — the palette's section counts. */
+export type SearchCount = {
+  provider: string;
+  title: string;
+  route: string;
+  count: number;
+};
+
+/** The whole answer of one search. */
+export type SearchResult = {
+  /** The query as the API understood it (trimmed and capped). */
+  query: string;
+  /** The text terms it parsed. */
+  terms: string[];
+  /** The `type:` filters it parsed. */
+  types: string[];
+  /** The `is:` flags it parsed. */
+  flags: string[];
+  /** Everything the parser refused, in caller-facing language. */
+  hints: string[];
+  /** This page's hits, best first. */
+  hits: SearchHit[];
+  /** Total hits the query matches. */
+  total: number;
+  /** One-based page number. */
+  page: number;
+  /** Hits per page. */
+  per_page: number;
+  /** Which provider contributed how many, ordered by count. */
+  counts: SearchCount[];
+  /** How long the search took, in milliseconds. */
+  took_ms: number;
+};
+
+/** Sort orders the search endpoint accepts. */
+export type SearchSort = "relevance" | "newest" | "title";
+
+/** One title-prefix suggestion (`GET /api/v1/search/suggest`). */
+export type SearchSuggestion = {
+  title: string;
+  url: string;
+  provider: string;
+};
+
+/**
+ * Search every provider the account's own read permissions cover.
+ *
+ * The scoped syntax travels inside `q` (`type:page site:acme is:draft`), exactly as the box
+ * accepts it — the results screen passes what the account typed instead of re-encoding it.
+ */
+export function searchAll(input: {
+  q: string;
+  page?: number;
+  per_page?: number;
+  sort?: SearchSort;
+}): Promise<SearchResult> {
+  const params = new URLSearchParams({ q: input.q });
+  if (input.page) params.set("page", String(input.page));
+  if (input.per_page) params.set("per_page", String(input.per_page));
+  if (input.sort) params.set("sort", input.sort);
+  return request<SearchResult>(`/api/v1/search?${params.toString()}`);
+}
+
+/** Title-only prefix suggestions, at most eight. */
+export async function suggestTitles(q: string): Promise<SearchSuggestion[]> {
+  const body = await request<{ suggestions: SearchSuggestion[] }>(
+    `/api/v1/search/suggest?q=${encodeURIComponent(q)}`,
+  );
+  return body.suggestions;
+}
+
+/** The account's own recent searches, newest first. */
+export async function fetchRecentSearches(): Promise<string[]> {
+  const body = await request<{ queries: string[] }>("/api/v1/search/recent");
+  return body.queries;
+}
+
+/** Forget every recent search of this account. */
+export function clearRecentSearches(): Promise<null> {
+  return request<null>("/api/v1/search/recent", { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------------------------
 // AI Hub (docs/06-AI-HUB.md, P11)
 // ---------------------------------------------------------------------------------------------
 
