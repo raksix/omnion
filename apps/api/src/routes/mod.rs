@@ -23,6 +23,11 @@
 //! by `media.upload`, reads by `media.read` and removals by `media.delete`, all scoped through
 //! the site the file belongs to. Its bytes are served twice — on the panel surface behind the
 //! session and on the public surface for the renderer — see `crate::routes::media`.
+//!
+//! The workflow surface (`/workflows`, `/workflow-executions`) is the automation engine of P09:
+//! definitions are read with `workflows.read`, written with `workflows.manage`, started and
+//! cancelled with `workflows.run` — see `crate::routes::workflows`. The background runner that
+//! advances the runs lives in `crate::workflow_runner`.
 
 pub mod auth;
 pub mod content;
@@ -33,6 +38,7 @@ pub mod media;
 pub mod public;
 pub mod readyz;
 pub mod tenancy;
+pub mod workflows;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -145,6 +151,33 @@ pub fn router(state: AppState) -> Router {
     // A published page points at its own assets, so the library's read side is public too.
     let public_media = get(media::public_media);
 
+    // Workflows: the definitions and their run history (docs/requests/REQ-003). Reading needs
+    // `workflows.read`, writing a definition `workflows.manage`, and starting or cancelling a
+    // run `workflows.run`; every handler applies the tenancy scope rule through the workflow's
+    // organization.
+    let workflows = get(workflows::list_workflows)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(post(workflows::create_workflow).layer(guards::require(&state, "workflows.manage")));
+
+    let workflow = get(workflows::get_workflow)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(put(workflows::update_workflow).layer(guards::require(&state, "workflows.manage")))
+        .merge(
+            delete(workflows::delete_workflow).layer(guards::require(&state, "workflows.manage")),
+        );
+
+    let workflow_run =
+        post(workflows::run_workflow).layer(guards::require(&state, "workflows.run"));
+
+    let workflow_executions =
+        get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
+
+    let workflow_execution =
+        get(workflows::get_execution).layer(guards::require(&state, "workflows.read"));
+
+    let workflow_execution_cancel =
+        post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -193,7 +226,16 @@ pub fn router(state: AppState) -> Router {
         .route("/media/{id}", media_entry)
         .route("/media/{id}/raw", media_raw)
         .route("/public/pages/{slug}", public_pages)
-        .route("/public/media/{id}", public_media);
+        .route("/public/media/{id}", public_media)
+        .route("/workflows", workflows)
+        .route("/workflows/{id}", workflow)
+        .route("/workflows/{id}/run", workflow_run)
+        .route("/workflows/{id}/executions", workflow_executions)
+        .route("/workflow-executions/{id}", workflow_execution)
+        .route(
+            "/workflow-executions/{id}/cancel",
+            workflow_execution_cancel,
+        );
 
     Router::new()
         .route("/healthz", get(health::healthz))

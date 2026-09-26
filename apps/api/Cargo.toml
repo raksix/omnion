@@ -23,6 +23,7 @@ omnion-identity = { path = "../../crates/identity" }
 omnion-media = { path = "../../crates/media" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-storage = { path = "../../crates/storage" }
+omnion-workflows = { path = "../../crates/workflows" }
 
 [dev-dependencies]
 http-body-util = "0.1"

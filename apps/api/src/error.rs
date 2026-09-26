@@ -10,6 +10,7 @@ use omnion_identity::IdentityError;
 use omnion_media::MediaError;
 use omnion_permissions::PermissionsError;
 use omnion_storage::StorageError;
+use omnion_workflows::WorkflowError;
 use serde::Serialize;
 
 /// `true` when a database error means the dependency itself is unavailable (retryable).
@@ -322,6 +323,28 @@ impl From<StorageError> for ApiError {
     }
 }
 
+impl From<WorkflowError> for ApiError {
+    /// Workflows: a definition the engine cannot accept is the caller's (its own stable code,
+    /// e.g. `invalid_cron`), a store failure is internal, and an audit failure rides on the
+    /// audit mapping.
+    fn from(error: WorkflowError) -> Self {
+        match error {
+            WorkflowError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            WorkflowError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            WorkflowError::Audit(err) => err.into(),
+            WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -470,6 +493,21 @@ mod tests {
 
         let unavailable = ApiError::from(MediaError::Database(sqlx::Error::PoolTimedOut));
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn workflow_errors_keep_their_own_codes() {
+        let invalid = ApiError::from(WorkflowError::invalid("invalid_cron", "broken schedule"));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code(), "invalid_cron");
+
+        let unavailable = ApiError::from(WorkflowError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let audit = ApiError::from(WorkflowError::Audit(AuditError::Database(
+            sqlx::Error::PoolClosed,
+        )));
+        assert_eq!(audit.code(), "dependency_unavailable");
     }
 
     #[test]
