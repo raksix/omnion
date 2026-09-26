@@ -762,14 +762,18 @@ pub async fn status(
 }
 
 /// Rebuild one provider's index, or every provider's.
-pub async fn reindex(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    address: ClientAddress,
-    Json(body): Json<ReindexBody>,
-) -> Result<Json<ReindexResponse>, ApiError> {
-    let reports = match body.provider.as_deref().map(str::trim) {
-        None | Some("") => indexer::reindex_all(state.db().pool()).await?,
+///
+/// The panel's own button and the palette's action command are the same operation reached two
+/// ways, so the work lives here and both callers share it — including the audit trail and the
+/// `search.reindexed` event, which belong to the act rather than to one entry point.
+pub(crate) async fn perform_reindex(
+    state: &AppState,
+    actor: Uuid,
+    ip_address: Option<String>,
+    provider: Option<&str>,
+) -> Result<Vec<ReindexReportBody>, ApiError> {
+    let reports = match provider {
+        None => indexer::reindex_all(state.db().pool()).await?,
         Some(key) => vec![indexer::reindex(state.db().pool(), key).await?],
     };
 
@@ -778,21 +782,21 @@ pub async fn reindex(
         // what, and the event lets an installation watch its own search health.
         omnion_audit::record(
             state.db().pool(),
-            NewAuditEntry::by_user(current.user.id, "search.reindexed")
+            NewAuditEntry::by_user(actor, "search.reindexed")
                 .target("search_provider", report.provider)
                 .metadata(json!({
                     "indexed": report.indexed,
                     "pruned": report.pruned,
                     "duration_ms": report.duration_ms,
                 }))
-                .ip_address(address.as_text()),
+                .ip_address(ip_address.clone()),
         )
         .await?;
 
         bus::emit(
             state.db().pool(),
             NewEvent::new("search.reindexed")
-                .actor(current.user.id)
+                .actor(actor)
                 .payload(json!({
                     "provider": report.provider,
                     "documents": report.indexed,
@@ -803,17 +807,33 @@ pub async fn reindex(
         .await?;
     }
 
-    Ok(Json(ReindexResponse {
-        providers: reports
-            .into_iter()
-            .map(|report| ReindexReportBody {
-                provider: report.provider,
-                indexed: report.indexed,
-                pruned: report.pruned,
-                duration_ms: report.duration_ms,
-            })
-            .collect(),
-    }))
+    Ok(reports
+        .into_iter()
+        .map(|report| ReindexReportBody {
+            provider: report.provider,
+            indexed: report.indexed,
+            pruned: report.pruned,
+            duration_ms: report.duration_ms,
+        })
+        .collect())
+}
+
+/// Rebuild one provider's index, or every provider's.
+pub async fn reindex(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<ReindexBody>,
+) -> Result<Json<ReindexResponse>, ApiError> {
+    let provider = body
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+
+    let reports = perform_reindex(&state, current.user.id, address.as_text(), provider).await?;
+
+    Ok(Json(ReindexResponse { providers: reports }))
 }
 
 /// The caller's own recent searches, newest first.

@@ -318,6 +318,10 @@ pub fn router(state: AppState) -> Router {
     // caller may run (projected through their effective permissions), the suggestions for the
     // screen they are on, and their own recents. Reading and writing recents is `search.read`,
     // the box every signed-in account holds; a command's own key is checked when it is recorded.
+    // `POST /commands/{id}/run` executes an action command through its owning service and carries
+    // no route-level guard on purpose: every command has its own key (`search.manage`,
+    // `content.pages.create`, …), so the handler re-checks the one the registry names — and it
+    // refuses a navigation command outright, because a command that opens a screen is not a job.
     // See `crate::routes::commands`.
     let commands_route = get(commands::list_commands).layer(guards::require(&state, "search.read"));
     let command_context = get(commands::context).layer(guards::require(&state, "search.read"));
@@ -325,6 +329,7 @@ pub fn router(state: AppState) -> Router {
         .merge(post(commands::record))
         .merge(delete(commands::clear))
         .layer(guards::require(&state, "search.read"));
+    let command_run = post(commands::run);
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
@@ -341,6 +346,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/search/recent", search_recent)
         .route("/commands", commands_route)
+        .route("/commands/{id}/run", command_run)
         .route("/command-center/context", command_context)
         .route("/command-center/recent", command_recent)
         .route(

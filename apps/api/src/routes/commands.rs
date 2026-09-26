@@ -1,9 +1,9 @@
 //! `/api/v1/commands` and `/api/v1/command-center/*` — the palette's own surface
-//! (docs/requests/REQ-032, slice 1).
+//! (docs/requests/REQ-032, slice 1; action commands and their audit, slice 3).
 //!
 //! The command palette is the panel's front door: one box that opens screens, offers the
 //! commands of the features the caller may actually run, and remembers what this account did
-//! last. This module is the HTTP shape around it. Three promises it keeps:
+//! last. This module is the HTTP shape around it. Four promises it keeps:
 //!
 //! * **The projection is permission-filtered server-side.** The registry (`omnion-search`'s
 //!   [`omnion_search::commands`]) is compiled in and projected through the caller's effective
@@ -14,18 +14,27 @@
 //! * **A recent that can no longer run is not shown.** A stored command is resolved against the
 //!   registry and the caller's permissions on read, so a role change cannot leave a dead row in
 //!   the palette.
+//! * **An action command runs through its owning service, and says so afterwards.** `POST
+//!   /commands/{id}/run` re-checks the command's own permission, refuses a command that asks
+//!   for confirmation unless the caller confirms, executes the act through the same code the
+//!   owning screen uses, and leaves one `command.run` audit entry (actor, command, target,
+//!   outcome) plus a count in `command_usage_daily`. The palette's feedback line is derived from
+//!   the owning service's own answer, never invented here.
 
 use axum::Json;
-use axum::extract::{Query as QueryParams, State};
+use axum::extract::{Path, Query as QueryParams, State};
 use axum::http::StatusCode;
+use omnion_audit::NewAuditEntry;
 use omnion_permissions::effective_permissions;
 use omnion_search::commands::{self, CommandSpec};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
+use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::guards::scope_of;
 use crate::state::AppState;
@@ -43,8 +52,10 @@ const RECENT_KEEP: i64 = 50;
 
 /// One command, as the panel receives it.
 ///
-/// The id is the stable handle; `route` is where a navigation command lands; `icon` is a name
-/// from the panel's own icon set, never markup.
+/// The id is the stable handle; `kind` says whether running it opens a screen (`navigate`) or
+/// acts through a service (`action`); `confirm` asks the panel to show the question first; `route`
+/// is where a navigation command lands, or the screen that reads an action's record back; `icon`
+/// is a name from the panel's own icon set, never markup.
 #[derive(Debug, Serialize)]
 pub struct CommandBody {
     pub id: &'static str,
@@ -52,6 +63,8 @@ pub struct CommandBody {
     pub group: &'static str,
     pub hint: &'static str,
     pub icon: &'static str,
+    pub kind: &'static str,
+    pub confirm: bool,
     pub route: &'static str,
     pub keywords: &'static [&'static str],
     pub aliases: &'static [&'static str],
@@ -66,6 +79,8 @@ impl From<&'static CommandSpec> for CommandBody {
             group: spec.group,
             hint: spec.hint,
             icon: spec.icon,
+            kind: spec.kind().as_str(),
+            confirm: spec.confirm,
             route: spec.route,
             keywords: spec.keywords,
             aliases: spec.aliases,
@@ -132,6 +147,39 @@ pub struct RecordBody {
     pub command_id: Option<String>,
     /// How many results the search answered with, when the palette knew.
     pub result_count: Option<i64>,
+}
+
+/// Body of `POST /api/v1/commands/{id}/run`.
+///
+/// `confirm` is the caller's own yes: a command that asks before it runs is refused with
+/// `confirmation_required` until the request carries it, so "did you mean it" is a rule of the
+/// API rather than a decoration of one dialog.
+#[derive(Debug, Deserialize)]
+pub struct RunBody {
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Answer of a successful run: the owning service's own result, plus the one line the palette
+/// shows above it.
+#[derive(Debug, Serialize)]
+pub struct RunResponse {
+    /// The registry id that ran.
+    pub command: &'static str,
+    /// Always `action`; a navigation command is refused.
+    pub kind: &'static str,
+    /// `ok` — failures answer as errors instead (with their own audit entry).
+    pub outcome: &'static str,
+    /// A human line derived from the owning service's answer.
+    pub message: String,
+    /// The owning feature's response shape, unchanged.
+    pub result: serde_json::Value,
+}
+
+/// One executed action: the palette's line and the owning service's own shape.
+struct ActionResult {
+    message: String,
+    result: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -316,17 +364,214 @@ pub async fn record(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Run one action command through its owning service.
+///
+/// The refusals are deliberate and each has its own code: an id nobody knows (`unknown_command`,
+/// 404), a navigation command (`not_runnable`, 400 — it opens a screen, and a caller that wants
+/// the screen says so by opening it), a command whose key the caller does not hold
+/// (`command_not_allowed`, 403 — re-checked here even though the projection already filters, so
+/// the endpoint is safe on its own), and a command that asks first without the caller's yes
+/// (`confirmation_required`, 400).
+///
+/// An execution that starts is audited and counted whatever its outcome: the `command.run` entry
+/// names actor, command and target, and `command_usage_daily` counts the run — a failed run is
+/// still a run somebody asked for.
+pub async fn run(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<String>,
+    Json(body): Json<RunBody>,
+) -> Result<Json<RunResponse>, ApiError> {
+    let id = id.trim();
+    let Some(spec) = commands::runnable(id) else {
+        // Two different refusals hide behind one lookup: an id nobody knows, and an id that is a
+        // screen rather than a job.
+        if commands::command(id).is_some() {
+            return Err(ApiError::bad_request(
+                "not_runnable",
+                format!("\"{id}\" opens a screen; it is not a command that runs"),
+            ));
+        }
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_command",
+            format!("\"{id}\" is not a command of this platform"),
+        ));
+    };
+
+    let permissions = caller_permissions(&state, &current).await?;
+    if !spec.permission.is_none_or(|key| permissions.allows(key)) {
+        return Err(ApiError::forbidden(
+            "command_not_allowed",
+            format!("\"{id}\" needs a permission the caller does not hold"),
+        ));
+    }
+    if spec.confirm && !body.confirm {
+        return Err(ApiError::bad_request(
+            "confirmation_required",
+            format!("\"{id}\" changes data that cannot be put back; confirm it to run it"),
+        ));
+    }
+
+    let ip = address.as_text();
+    let executed = execute(&state, &current, ip.clone(), spec).await;
+
+    // The trail comes first: an executed action is not reported as successful without one.
+    match &executed {
+        Ok(action) => {
+            record_run(&state, &current, ip, spec, "ok", action.result.clone()).await?;
+        }
+        Err(error) => {
+            record_run(
+                &state,
+                &current,
+                ip,
+                spec,
+                "failed",
+                json!({ "code": error.code() }),
+            )
+            .await?;
+        }
+    }
+    record_usage(&state, &current, spec.id).await?;
+
+    let action = executed?;
+    Ok(Json(RunResponse {
+        command: spec.id,
+        kind: spec.kind().as_str(),
+        outcome: "ok",
+        message: action.message,
+        result: action.result,
+    }))
+}
+
 /// Forget everything the caller did in the palette.
 pub async fn clear(
     State(state): State<AppState>,
     current: CurrentSession,
 ) -> Result<StatusCode, ApiError> {
-    sqlx::query("delete from command_recents where user_id = $1")
-        .bind(current.user.id)
-        .execute(state.db().pool())
+    clear_recents(state.db().pool(), current.user.id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The action runner
+// ---------------------------------------------------------------------------------------------
+
+/// Execute one action command through the code its owning screen also uses.
+///
+/// The mapping is deliberately explicit — a command registered as an action without a service
+/// behind it answers `action_not_implemented` rather than pretending to work, and the suite walks
+/// the registry to keep the two in step.
+async fn execute(
+    state: &AppState,
+    current: &CurrentSession,
+    ip_address: Option<String>,
+    spec: &'static CommandSpec,
+) -> Result<ActionResult, ApiError> {
+    match spec.id {
+        "act.reindex-search" => {
+            let reports =
+                crate::routes::search::perform_reindex(state, current.user.id, ip_address, None)
+                    .await?;
+
+            let indexed: u64 = reports.iter().map(|report| report.indexed).sum();
+            let pruned: u64 = reports.iter().map(|report| report.pruned).sum();
+            let duration_ms: u64 = reports.iter().map(|report| report.duration_ms).sum();
+            let mut message = if reports.len() == 1 {
+                format!(
+                    "Rebuilt \"{}\" · {} documents · {} ms",
+                    reports[0].provider, indexed, duration_ms
+                )
+            } else {
+                format!(
+                    "Rebuilt {} providers · {} documents · {} ms",
+                    reports.len(),
+                    indexed,
+                    duration_ms
+                )
+            };
+            if pruned > 0 {
+                message.push_str(&format!(" · {pruned} pruned"));
+            }
+
+            Ok(ActionResult {
+                message,
+                result: json!(reports),
+            })
+        }
+        "act.clear-recents" => {
+            let cleared = clear_recents(state.db().pool(), current.user.id).await?;
+            Ok(ActionResult {
+                message: if cleared == 1 {
+                    "Cleared the palette history — 1 entry forgotten.".to_owned()
+                } else {
+                    format!("Cleared the palette history — {cleared} entries forgotten.")
+                },
+                result: json!({ "cleared": cleared }),
+            })
+        }
+        other => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "action_not_implemented",
+            format!("the command \"{other}\" is registered as an action but no service runs it"),
+        )),
+    }
+}
+
+/// Write the `command.run` audit entry: actor, command (the target), outcome and the owning
+/// service's own aggregate result — never a row of content.
+async fn record_run(
+    state: &AppState,
+    current: &CurrentSession,
+    ip_address: Option<String>,
+    spec: &'static CommandSpec,
+    outcome: &'static str,
+    result: serde_json::Value,
+) -> Result<(), ApiError> {
+    omnion_audit::record(
+        state.db().pool(),
+        NewAuditEntry::by_user(current.user.id, "command.run")
+            .organization(organization_id(current))
+            .target("command", spec.id)
+            .metadata(json!({ "outcome": outcome, "result": result }))
+            .ip_address(ip_address),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Count the run for today: adoption is a number, and the table stores no query text.
+async fn record_usage(
+    state: &AppState,
+    current: &CurrentSession,
+    command_id: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "insert into command_usage_daily (user_id, organization_id, command_id, day, runs) \
+         values ($1, $2, $3, current_date, 1) \
+         on conflict (user_id, command_id, day) do update \
+         set runs = command_usage_daily.runs + 1",
+    )
+    .bind(current.user.id)
+    .bind(organization_id(current))
+    .bind(command_id)
+    .execute(state.db().pool())
+    .await
+    .map_err(store)?;
+    Ok(())
+}
+
+/// Forget every row the caller remembers; the owning service of both the palette's Clear control
+/// and the `act.clear-recents` command, so the two cannot drift.
+async fn clear_recents(pool: &sqlx::PgPool, user_id: Uuid) -> Result<u64, ApiError> {
+    let result = sqlx::query("delete from command_recents where user_id = $1")
+        .bind(user_id)
+        .execute(pool)
         .await
         .map_err(store)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(result.rows_affected())
 }
 
 // ---------------------------------------------------------------------------------------------
