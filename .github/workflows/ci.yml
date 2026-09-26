@@ -355,6 +355,50 @@ jobs:
             | python3 -c 'import json,sys; rows=[r["action"] for r in json.load(sys.stdin)["entries"] if r["action"].startswith("ai.")]; print("ai audit rows:", len(rows), sorted(set(rows)))'
           echo "ai hub: provider=$provider_id · registry=ok · chat=streamed · refusal=reported · anonymous=401"
 
+      # The events + webhooks walk (docs/BUILD-BACKLOG.md P12): a real receiver is started on
+      # the machine (infra/mocks/webhook-receiver.mjs — it verifies the HMAC signature the way a
+      # third-party receiver must), an endpoint is connected through the API, and publishing a
+      # page delivers `page.published` to it signed. The walk script is the same one a developer
+      # runs locally against a stack they started by hand.
+      - name: Webhooks walk (signed delivery)
+        env:
+          OMNION_ADMIN_EMAIL: admin@example.com
+          OMNION_ADMIN_PASSWORD: smoke-test-admin-password
+        run: |
+          set -euo pipefail
+          OMNION_WEBHOOK_SECRET=omnion-dev-webhook-secret \
+            node infra/mocks/webhook-receiver.mjs 8124 > /tmp/omnion-receiver.log 2>&1 &
+          RECEIVER_PID=$!
+          OMNION_PORT=8082 OMNION_EVENTS_POLL_MS=500 \
+            ./target/debug/omnion-api > /tmp/omnion-webhooks-api.log 2>&1 &
+          API_PID=$!
+          trap 'kill "$RECEIVER_PID" "$API_PID" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8082/readyz >/dev/null 2>&1 \
+              && curl -fsS http://127.0.0.1:8124/healthz >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "the webhooks walk stack did not become ready" >&2
+            tail -20 /tmp/omnion-webhooks-api.log >&2
+            exit 1
+          fi
+          OMNION_API=http://127.0.0.1:8082 \
+          OMNION_RECEIVER=http://127.0.0.1:8124 \
+          OMNION_WEBHOOK_SECRET=omnion-dev-webhook-secret \
+            bash infra/mocks/webhooks-walk.sh
+          # … and the surface stays closed to anonymous callers.
+          webhook_code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/api/v1/webhooks)
+          if [ "$webhook_code" != "401" ]; then
+            echo "anonymous /api/v1/webhooks must be rejected with 401, got $webhook_code" >&2
+            exit 1
+          fi
+          echo "events + webhooks: signed delivery verified · anonymous=$webhook_code"
+
       # The first-run walk (docs/BUILD-BACKLOG.md P10): a database that has never been migrated
       # is set up by the `omnion` CLI — no SQL, no environment bootstrap — and the API then
       # serves it: the wizard is closed, the owner signs in, the site exists with its theme.
