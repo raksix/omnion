@@ -1,28 +1,32 @@
-//! Omnion search — the engine behind the platform's one search box.
+//! Omnion search — the engine behind the platform's one search box (docs/requests/REQ-002).
 //!
-//! `docs/requests/REQ-002` asks for a single box that finds everything, with a `Ctrl/⌘ + K`
-//! command palette on top of it. The design keeps that honest in two pieces:
+//! The design is an **index**, not a scatter of per-table queries. Every searchable thing in
+//! the platform becomes one `search_documents` row, written by the provider that owns its
+//! domain, maintained from the event bus and rebuildable from scratch by a reindex pass. One
+//! row answers the palette, the results screen and (later) the public site's search, so the
+//! ranking, the scoping and the permission rules live in exactly one place.
 //!
-//! * [`catalogue`] — the **registry** of searchable sources: a stable key, the permission a
-//!   caller must hold, and the panel route a hit lives at. Sources are only registered once
-//!   their screen exists, so the palette never offers a result that goes nowhere.
-//! * [`query`] — the **query and ranking rule**, pure and unit-tested: parse, normalize, score
-//!   and order. Nothing in this module touches the database, so the ranking can be reasoned
-//!   about in isolation.
+//! * [`providers`] — the registry: one entry per searchable domain (pages, media, users, sites
+//!   today) naming its key, its document type and the permission a caller needs to see its
+//!   rows. A provider is registered once its domain exists; entities without a module yet
+//!   (posts, plugins, themes, orders) register from their own REQ when they ship.
+//! * [`query`] — the query language and the search itself: the scoped syntax (`type:`, `site:`,
+//!   `owner:`, `before:`/`after:`, `is:`), the PostgreSQL query that ranks with
+//!   `ts_rank_cd` over the generated vector plus a `pg_trgm` prefix/near-miss match, and the
+//!   scope + permission narrowing that happens **inside** the query (never after paging).
+//! * [`indexer`] — the write side: per-provider reindex over the source tables (upsert plus
+//!   prune, idempotent by construction) and the event-bus drain that keeps the index fresh.
 //!
-//! [`sources`] is the database side — one SQL statement per source, tenant-scoped with the same
-//! rule the rest of the panel uses, handing candidates to the shared ranker.
-//!
-//! The API surface that carries a query is `apps/api/src/routes/search.rs`; the palette that
-//! front-ends it is `apps/admin/components/command-palette.tsx`.
+//! The HTTP shape around it is `apps/api/src/routes/search.rs`; the palette and the results
+//! screen are the admin's business (`apps/admin`).
 
 #![forbid(unsafe_code)]
 
-pub mod catalogue;
 pub mod error;
+pub mod indexer;
+pub mod providers;
 pub mod query;
-pub mod sources;
 
-pub use catalogue::{SEARCH_SOURCES, SourceSpec, source, source_keys};
 pub use error::{Result, SearchError};
-pub use query::{Hit, Query};
+pub use providers::{PROVIDERS, ProviderSpec, provider, provider_keys};
+pub use query::{Hit, HitPage, Query, QueryError, SearchRequest, Sort};

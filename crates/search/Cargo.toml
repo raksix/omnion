@@ -1,13 +1,15 @@
 [package]
 name = "omnion-search"
-description = "Omnion search: the source registry and the query engine behind the one search box."
+description = "Omnion search: the document index, the providers behind it and the query engine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
 time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
