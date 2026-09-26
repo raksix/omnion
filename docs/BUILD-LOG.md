@@ -384,3 +384,75 @@
 - Next: **P09 — Workflow engine v0** (`crates/workflows`: durable step store, background runner,
   step retries with backoff, wait-sweeper, manual + schedule triggers).
 
+## 2026-09-26 — P09 · Workflow engine v0
+
+- `crates/workflows` (`omnion-workflows`): the durable step engine behind the automation surface
+  (docs/requests/REQ-003; design lessons from docs/09-N8N-TEARDOWN.md §13). A definition is a
+  trigger plus an ordered step list — `definition.rs` (manual or cron schedule, 1–50 uniquely
+  named steps, attempt cap five, waits 1 s–1 day), `cron.rs` (a five-field cron subset in UTC:
+  lists, ranges, steps, month/weekday names, the classic day-of-month/day-of-week union — no
+  dependency), `actions.rs` (the closed built-in action set `noop`, `echo`, `fail`, `transient`:
+  no dynamic code in the core process, lesson 14), `store.rs` (the durable step store: claim,
+  park, retry, settle, cancel, sweep — written so two instances racing over one row still hand
+  each step to exactly one runner) and `engine.rs` (the policy: what one tick does, what the
+  sweep repairs).
+- Durable by construction: starting a run materialises one `workflow_steps` row per step, with
+  `available_at` carrying both the retry backoff and the wait deadline. A wait parks the run (a
+  write, not a sleep) and is resumed by the runner's next claim or by the sweep; a failing step
+  is re-queued with an exponential backoff (5 s → 300 s by default) until its attempts run out;
+  a claim older than the lease (5 min) is reclaimed by the sweep with an honest outcome — the
+  next attempt for a task step, another park for a wait, and a clean failure when the lost
+  attempt was the last one, so every run still reaches a terminal state.
+- `database/migrations/0006_workflows.sql`: `workflows`, `workflow_executions`,
+  `workflow_steps` with the constraints the engine leans on (status vocabularies, trigger shape,
+  `attempts` never above the cap, one row per step position, cascade from the organization down).
+- API (`/api/v1/workflows`, `/api/v1/workflow-executions`): create / read / replace / remove a
+  definition, list its run history, read one run with every step, start a run and cancel one. The
+  three new keys (`workflows.read`, `workflows.manage`, `workflows.run`) are catalogued and reach
+  the operational roles (manager all three, moderator read+run, editor read). Definition changes
+  and cancellations are audited by the handlers; the engine audits the run lifecycle
+  (`workflow.execution.started|completed|failed|cancelled`).
+- `apps/api/src/workflow_runner.rs`: the background runner — one task inside the API process, on
+  by default — ticks the engine every `OMNION_WORKFLOW_TICK_MS` (default 1 s) and sweeps every
+  `OMNION_WORKFLOW_SWEEP_SECONDS` (default 30 s); batch, scheduler batch and the retry base/max
+  are configurable too (`OMNION_WORKFLOW_*`), and `OMNION_WORKFLOW_RUNNER=false` keeps a process
+  from running the engine at all.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `cargo test --workspace` → **250 passed, 0 failed** (workflows **36** unit
+  tests · the new integration suite `apps/api/tests/workflows.rs` **11** against the live compose
+  stack · every other suite unchanged) ✅
+- Live walk (fresh database `omnion_p09_live`, API on `:18091`, runner tick 200 ms / sweep 1 s /
+  retry base 400 ms): the Owner created a four-step workflow (noop → transient(`fail_times: 1`,
+  3 attempts) → wait(2 s) → echo) and started it. The runner re-queued the failing step
+  (`a failing step was re-queued … attempt=1 of=3 delay_ms=400`), parked the wait (`a wait step
+  parked the run … seconds=2`), resumed it and finished the run — the API then read
+  `completed step2.attempts=2 step3=succeeded step4=succeeded`. A second run parked on a 600 s
+  wait was cancelled (`cancelled`, steps `cancelled`+`succeeded`), the second cancel answered
+  `409 execution_not_running`. A `* * * * *` workflow fired by itself
+  (`a scheduled workflow started …`) exactly once with `trigger=schedule`. The audit trail held
+  9 rows (`started` ×3, `completed` ×2, `cancelled` ×1, `created` ×3) and both workflow routes
+  answered `401` without a session.
+- CI: the smoke step now walks a workflow as well — define the four-step run, start it, poll the
+  execution until it settles, assert `completed` with `attempts=2` on the retried step, print the
+  workflow audit rows, and prove `/api/v1/workflows` is closed to anonymous callers.
+- Next: **P10 — Onboarding v0 (REQ-050)** (first-run wizard + `omnion` CLI skeleton).
+
+### Lessons
+
+- A wait step must be resumable whichever mechanism wakes it: deciding "park or resume" from the
+  status the row had before the claim broke as soon as the sweeper re-queued a due wait — the
+  parked step parked itself again (caught by the attempts constraint as a `23514`). Deciding on
+  the claim count (`attempts > 1` ⇒ resume) makes the runner's claim and the sweep agree, and the
+  database constraint turned a silent double-park into a failing test.
+- An audit row is a second write: a probe that reads the state the moment it flips can land in
+  the millisecond before the audit arrives. Positive audit assertions must poll (state → audit is
+  the deliberate order); keep the negative ones reading immediately.
+- A claim is a LEASE, not a lock. A runner that stops mid-step leaves a `running` row whose
+  attempt is already counted, and nothing else would move it again: the run would stay open
+  forever and block its own later steps. The sweep reclaims claims older than the lease.
+- Test-fleet hygiene: a panicking test skips its cleanup, and the next run's engine ticks walk
+  into those rows (a leftover wait at its attempt cap failed an unrelated suite with a constraint
+  error). Sweep the suite's own prefix once per process (`OnceCell`) before fixtures appear, and
+  keep the test runner's lease longer than any test step so the reclaim path only fires in the
+  walk that asks for it.
+

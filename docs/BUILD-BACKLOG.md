@@ -74,9 +74,9 @@
 
 ## P09 — Workflow engine v0 (docs/09 lessons)
 
-- [ ] Durable step store (Postgres), background runner in `apps/api`, step retries (cap 5, backoff), wait-sweeper (batch, 30s), execution + step tables.
-- [ ] Triggers v0: manual + schedule; cancellation flag.
-- [ ] **Verify:** 3-step workflow with one transient failure → retried; a wait step resumes; audit rows written. Commit + push + log.
+- [x] Durable step store (Postgres), background runner in `apps/api`, step retries (cap 5, backoff), wait-sweeper (batch, 30s), execution + step tables. `crates/workflows` + `0006_workflows.sql` + `apps/api/src/workflow_runner.rs`; the sweeper also reclaims claims whose runner stopped (lease) and settles runs left open.
+- [x] Triggers v0: manual + schedule; cancellation flag. `POST /workflows/{id}/run` (manual), a five-field cron schedule in UTC armed at creation/update (`next_run_at`), `POST /workflow-executions/{id}/cancel` closing the run and its open steps.
+- [x] **Verify:** 3-step workflow with one transient failure → retried; a wait step resumes; audit rows written. Commit + push + log. Live walk on `:18091` (retry `attempt=1 of=3`, wait parked+resumed, `attempts=2`, audit `started`/`completed`/`cancelled`), integration suite `apps/api/tests/workflows.rs` 11/11, workspace 250 tests green, CI smoke extended.
 
 ## P10 — Onboarding v0 (REQ-050)
 
