@@ -6,9 +6,10 @@
  * working draft, publish it. Editing appends a revision and publishing freezes it, so the list
  * always says which revision is live and which one is still waiting.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Pencil, Plus, RefreshCw, Rocket } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -49,6 +50,7 @@ type Editor = { id: string | null; title: string; slug: string; body: string };
 /** The pages list with the create, edit and publish flow. */
 export function PagesView() {
   const { selectedSite, status: sitesStatus } = useSites();
+  const searchParams = useSearchParams();
   const [filter, setFilter] = useState("");
   const [pages, setPages] = useState<Page[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -97,7 +99,7 @@ export function PagesView() {
     setEditor({ id: null, title: "", slug: "", body: "" });
   };
 
-  const openEdit = (page: Page) => {
+  const openEdit = useCallback((page: Page) => {
     setActionError(null);
     setNotice(null);
     setEditor({
@@ -106,7 +108,23 @@ export function PagesView() {
       slug: page.slug,
       body: page.draft?.body ?? page.published?.body ?? "",
     });
-  };
+  }, []);
+
+  // `/pages?focus=<id>` — a search hit (or a shared link) opens that page's editor. The applied
+  // id is remembered, so closing the editor or reloading the list never reopens it.
+  const focusParam = searchParams.get("focus");
+  const appliedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusParam || !pages || appliedFocus.current === focusParam) {
+      return;
+    }
+    const target = pages.find((page) => page.id === focusParam);
+    if (!target) {
+      return;
+    }
+    appliedFocus.current = focusParam;
+    openEdit(target);
+  }, [focusParam, pages, openEdit]);
 
   /** Save the editor: a new page, or the next draft revision of the one being edited. */
   const save = async () => {
@@ -380,13 +398,15 @@ export function PagesView() {
                   <th scope="col" className="px-4 py-2.5">
                     Page
                   </th>
-                  <th scope="col" className="px-4 py-2.5">
+                  {/* The narrow columns leave the table on small screens: the page, its state and
+                      the actions are what a phone has room for. */}
+                  <th scope="col" className="hidden px-4 py-2.5 sm:table-cell">
                     Type
                   </th>
                   <th scope="col" className="px-4 py-2.5">
                     State
                   </th>
-                  <th scope="col" className="px-4 py-2.5">
+                  <th scope="col" className="hidden px-4 py-2.5 whitespace-nowrap md:table-cell">
                     Updated
                   </th>
                   <th scope="col" className="px-4 py-2.5">
@@ -405,13 +425,15 @@ export function PagesView() {
                         </span>
                       </span>
                     </td>
-                    <td className="px-4 py-3.5 text-muted">{page.page_type}</td>
+                    <td className="hidden px-4 py-3.5 text-muted sm:table-cell">{page.page_type}</td>
                     <td className="px-4 py-3.5">
                       <StatusBadge status={page.status} />
                     </td>
-                    <td className="px-4 py-3.5 text-muted">{formatTimestamp(page.updated_at)}</td>
+                    <td className="hidden px-4 py-3.5 whitespace-nowrap text-muted md:table-cell">
+                      {formatTimestamp(page.updated_at)}
+                    </td>
                     <td className="px-4 py-3.5">
-                      <span className="flex items-center gap-2">
+                      <span className="flex items-center gap-2 whitespace-nowrap">
                         <button
                           type="button"
                           onClick={() => openEdit(page)}
@@ -419,7 +441,9 @@ export function PagesView() {
                           className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas"
                         >
                           <Pencil className="size-3" aria-hidden />
-                          Edit
+                          {/* A phone has room for the icons, not the words: the labels stay from
+                              `sm` up, so the actions column never pushes the table past the card. */}
+                          <span className="hidden sm:inline">Edit</span>
                         </button>
                         <button
                           type="button"
@@ -429,7 +453,7 @@ export function PagesView() {
                           className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-50 disabled:hover:bg-transparent"
                         >
                           <Rocket className="size-3" aria-hidden />
-                          Publish
+                          <span className="hidden sm:inline">Publish</span>
                         </button>
                       </span>
                     </td>

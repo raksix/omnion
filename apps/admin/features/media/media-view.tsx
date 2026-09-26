@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { RefreshCw, Trash2, Upload } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -26,14 +27,27 @@ function isImage(contentType: string): boolean {
 /** The media library. */
 export function MediaView() {
   const { selectedSite, status: sitesStatus } = useSites();
+  const searchParams = useSearchParams();
   const [media, setMedia] = useState<Media[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
+
+  // `/media?focus=<id>` — a search hit names the file it came from, so the library brings that row
+  // into view and marks it instead of leaving the visitor to find it.
+  const focusParam = searchParams.get("focus");
+  useEffect(() => {
+    if (!focusParam || !media || !media.some((item) => item.id === focusParam)) {
+      return;
+    }
+    setFocusedId(focusParam);
+    document.getElementById(`media-${focusParam}`)?.scrollIntoView({ block: "center" });
+  }, [focusParam, media]);
 
   useEffect(() => {
     if (!selectedSite) {
@@ -227,7 +241,13 @@ export function MediaView() {
             </thead>
             <tbody>
               {media.map((item) => (
-                <tr key={item.id} className="border-t border-line transition hover:bg-canvas/60">
+                <tr
+                  key={item.id}
+                  id={`media-${item.id}`}
+                  className={`border-t border-line transition hover:bg-canvas/60 ${
+                    focusedId === item.id ? "bg-accent-soft/60" : ""
+                  }`}
+                >
                   <td className="px-4 py-3.5">
                     <span className="flex min-w-0 items-center gap-3">
                       {isImage(item.content_type) ? (
