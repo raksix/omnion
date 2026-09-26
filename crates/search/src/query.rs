@@ -223,6 +223,134 @@ pub fn known_types() -> Vec<&'static str> {
     names
 }
 
+/// The "Updated" facet of the results screen: ranges of `entity_updated_at`.
+///
+/// `Never` is its own value rather than part of `Older`: a document with no timestamp is a
+/// different fact from one that is old, and hiding it inside "Older" would make the counts lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatedRange {
+    /// Changed in the last day.
+    Today,
+    /// Changed in the last seven days.
+    Week,
+    /// Changed in the last thirty days.
+    Month,
+    /// Changed more than thirty days ago.
+    Older,
+    /// No timestamp was recorded for the entity.
+    Never,
+}
+
+impl UpdatedRange {
+    /// Parse the `updated` filter; `None` means "not one of ours".
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "today" => Some(Self::Today),
+            "week" => Some(Self::Week),
+            "month" => Some(Self::Month),
+            "older" => Some(Self::Older),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// The stable value the API and the URLs carry.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Older => "older",
+            Self::Never => "never",
+        }
+    }
+
+    /// The human label of the facet value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Today => "Today",
+            Self::Week => "This week",
+            Self::Month => "This month",
+            Self::Older => "Older than a month",
+            Self::Never => "Never updated",
+        }
+    }
+}
+
+/// Which filter a facet is counting, so its own filter can be left out of its counts.
+///
+/// A facet's counts answer "what would adding this value do?" — that question only has an answer
+/// when the facet's own filter is not applied to it. Every other filter stays, so the number the
+/// rail shows is the number the click produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterKind {
+    /// The `type:` / `types=` filter.
+    Types,
+    /// The `site:` / `site_id=` filter.
+    Site,
+    /// The `owner:` / `owner=` filter.
+    Owner,
+    /// The `language=` filter.
+    Language,
+    /// The `status=` / `is:` filter.
+    Status,
+    /// The `updated=` bucket filter.
+    Updated,
+}
+
+/// The filters the results screen applies through query parameters, next to the ones a person can
+/// type into the box.
+///
+/// Both sources land in the same `WHERE` clause and are OR-ed per kind (`type:page` plus
+/// `types=media` means "pages or media"), which is what lets the facet rail and the query language
+/// live side by side without one silently overriding the other.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    /// `types=` — provider keys or entity types, comma-separated in the URL.
+    pub types: Vec<String>,
+    /// `site_id=` — a site id, key or domain host.
+    pub site: Option<String>,
+    /// `owner=me` — the caller's own documents.
+    pub owner_me: bool,
+    /// `owner=<uuid>` — one account's documents.
+    pub owner_id: Option<Uuid>,
+    /// `language=` — an exact language code.
+    pub language: Option<String>,
+    /// `status=` — one tag (`draft`, `published`, `archived`, …).
+    pub status: Option<String>,
+    /// `updated=` — a range of the last change.
+    pub updated: Option<UpdatedRange>,
+    /// `before=YYYY-MM-DD` — exclusive upper bound on the last change.
+    pub before: Option<OffsetDateTime>,
+    /// `after=YYYY-MM-DD` — inclusive lower bound on the last change.
+    pub after: Option<OffsetDateTime>,
+}
+
+impl SearchFilters {
+    /// `true` when nothing is narrowed, so the request is exactly the query language's own.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+            && self.site.is_none()
+            && !self.owner_me
+            && self.owner_id.is_none()
+            && self.language.is_none()
+            && self.status.is_none()
+            && self.updated.is_none()
+            && self.before.is_none()
+            && self.after.is_none()
+    }
+}
+
+/// Parse a `YYYY-MM-DD` filter value; `None` when it is not a date.
+#[must_use]
+pub fn parse_filter_date(value: &str) -> Option<OffsetDateTime> {
+    parse_date(value)
+}
+
 /// How the hits are ordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
@@ -252,6 +380,8 @@ impl Sort {
 pub struct SearchRequest {
     /// The parsed query.
     pub query: Query,
+    /// Filters that arrived as query parameters (the facet rail's own source).
+    pub filters: SearchFilters,
     /// Provider keys the caller's read permissions cover.
     pub providers: Vec<&'static str>,
     /// Caller's organization; `None` means a platform-level account (sees everything).
@@ -281,6 +411,8 @@ pub struct Hit {
     pub subtitle: String,
     /// Panel route a click opens.
     pub url: String,
+    /// Display name of the account that owns the entity, when it has one.
+    pub owner: Option<String>,
     /// Tags stored with the document (page status, content type …).
     pub tags: Vec<String>,
     /// When the entity itself last changed.
@@ -318,8 +450,65 @@ pub struct ProviderStatus {
     pub documents: i64,
     /// When the provider's rows were last written.
     pub last_indexed_at: Option<OffsetDateTime>,
-    /// `ready` when the provider has rows, `empty` when it has none to show yet.
+    /// `indexing` · `failed` · `stale` · `ready` · `empty` — see [`provider_state`].
     pub state: &'static str,
+    /// The most recent reindex pass, when one ever ran.
+    pub last_run: Option<ReindexRun>,
+}
+
+/// One reindex pass as the status screen reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexRun {
+    /// Documents written by the pass.
+    pub indexed: Option<i64>,
+    /// Documents pruned by the pass.
+    pub pruned: Option<i64>,
+    /// Wall time of the pass, in milliseconds.
+    pub duration_ms: Option<i64>,
+    /// When it started.
+    pub started_at: OffsetDateTime,
+    /// When it finished; `None` while it is still running.
+    pub finished_at: Option<OffsetDateTime>,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+}
+
+/// How long a pass may run before it is no longer counted as "indexing" — a pass that died with
+/// the process must not leave a screen saying "indexing, started 3 days ago".
+pub const REINDEX_RUNNING_WINDOW_MINUTES: i64 = 5;
+
+/// How long a provider may go without a write before its state reads `stale`.
+pub const STALE_AFTER_HOURS: i64 = 24;
+
+/// Decide a provider's state from what the indexer actually did.
+///
+/// The order matters: a running pass beats everything (the screen polls exactly then), a failed
+/// pass beats a document count (the count is from the last good pass), and `empty` beats `stale`
+/// (nothing to be stale about).
+#[must_use]
+pub fn provider_state(
+    documents: i64,
+    last_indexed_at: Option<OffsetDateTime>,
+    last_run: Option<&ReindexRun>,
+    now: OffsetDateTime,
+) -> &'static str {
+    if let Some(run) = last_run {
+        if run.finished_at.is_none()
+            && run.started_at > now - time::Duration::minutes(REINDEX_RUNNING_WINDOW_MINUTES)
+        {
+            return "indexing";
+        }
+        if run.finished_at.is_some() && run.error.is_some() {
+            return "failed";
+        }
+    }
+    if documents == 0 {
+        return "empty";
+    }
+    match last_indexed_at {
+        Some(at) if at < now - time::Duration::hours(STALE_AFTER_HOURS) => "stale",
+        _ => "ready",
+    }
 }
 
 /// One prefix suggestion.
@@ -384,8 +573,13 @@ fn normalised(weights: [f64; 4]) -> [f32; 4] {
 /// Push the shared `WHERE` conditions of a query, binds included.
 ///
 /// Both the hit query and the per-provider counts call this in the same order, so their binds
-/// line up; it is the single place the scope and permission rules live.
-fn push_conditions(builder: &mut QueryBuilder<'_, Postgres>, request: &SearchRequest) {
+/// line up; it is the single place the scope and permission rules live. `omit` drops exactly one
+/// filter kind, which is how a facet's own counts are computed without the facet narrowing itself.
+fn push_conditions(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    request: &SearchRequest,
+    omit: Option<FilterKind>,
+) {
     builder.push("d.provider = any(");
     builder.push_bind(request.providers.clone());
     builder.push("::text[])");
@@ -397,6 +591,8 @@ fn push_conditions(builder: &mut QueryBuilder<'_, Postgres>, request: &SearchReq
     builder.push(")");
 
     let query = &request.query;
+    let filters = &request.filters;
+
     if query.has_terms() {
         builder.push(" and (d.document @@ websearch_to_tsquery('simple', ");
         builder.push_bind(query.fts_input());
@@ -407,49 +603,337 @@ fn push_conditions(builder: &mut QueryBuilder<'_, Postgres>, request: &SearchReq
         builder.push(")");
     }
 
-    if !query.types().is_empty() {
-        let types = query.types().to_vec();
-        builder.push(" and (d.provider = any(");
-        builder.push_bind(types.clone());
-        builder.push("::text[]) or d.entity_type = any(");
-        builder.push_bind(types);
-        builder.push("::text[]))");
+    if omit != Some(FilterKind::Types) {
+        let mut types: Vec<String> = query.types().to_vec();
+        for value in &filters.types {
+            let value = value.trim().to_lowercase();
+            if !value.is_empty() && !types.contains(&value) {
+                types.push(value);
+            }
+        }
+        if !types.is_empty() {
+            builder.push(" and (d.provider = any(");
+            builder.push_bind(types.clone());
+            builder.push("::text[]) or d.entity_type = any(");
+            builder.push_bind(types);
+            builder.push("::text[]))");
+        }
     }
 
-    if let Some(site) = &query.site {
-        builder.push(" and (d.site_id::text = ");
-        builder.push_bind(site.clone());
-        builder.push(" or d.site_id in (select s.id from sites s where s.key = ");
-        builder.push_bind(site.clone());
-        builder.push(
-            " or exists (select 1 from site_domains dom where dom.site_id = s.id and dom.host = ",
-        );
-        builder.push_bind(site.clone());
-        builder.push(")))");
+    if omit != Some(FilterKind::Site) {
+        // A site filter answers three spellings of the same thing: the site's id, its stable key
+        // and any of its domain hosts. The facet rail sends the id, a person may type the key.
+        let mut sites: Vec<String> = Vec::new();
+        if let Some(site) = query.site() {
+            sites.push(site.to_owned());
+        }
+        if let Some(site) = &filters.site {
+            let site = site.trim().to_lowercase();
+            if !site.is_empty() && !sites.contains(&site) {
+                sites.push(site);
+            }
+        }
+        if !sites.is_empty() {
+            builder.push(" and (d.site_id::text = any(");
+            builder.push_bind(sites.clone());
+            builder.push("::text[]) or d.site_id in (select s.id from sites s where s.key = any(");
+            builder.push_bind(sites.clone());
+            builder.push(
+                "::text[]) or exists (select 1 from site_domains dom where dom.site_id = s.id \
+                 and dom.host = any(",
+            );
+            builder.push_bind(sites);
+            builder.push("::text[]))))");
+        }
     }
 
-    if query.owner_me {
-        builder.push(" and d.owner_user_id = ");
-        builder.push_bind(request.user_id);
+    if omit != Some(FilterKind::Owner) {
+        let mut owners: Vec<Uuid> = Vec::new();
+        if query.owner_me {
+            owners.push(request.user_id);
+        }
+        if let Some(owner) = filters.owner_id {
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+        if !owners.is_empty() {
+            builder.push(" and d.owner_user_id = any(");
+            builder.push_bind(owners);
+            builder.push("::uuid[])");
+        }
     }
 
-    if let Some(after) = query.after {
+    if omit != Some(FilterKind::Language) {
+        if let Some(language) = &filters.language {
+            builder.push(" and d.language = ");
+            builder.push_bind(language.trim().to_lowercase());
+        }
+    }
+
+    if omit != Some(FilterKind::Status) {
+        let mut statuses: Vec<String> = query.flags().to_vec();
+        if let Some(status) = &filters.status {
+            let status = status.trim().to_lowercase();
+            if !status.is_empty() && !statuses.contains(&status) {
+                statuses.push(status);
+            }
+        }
+        if !statuses.is_empty() {
+            builder.push(" and d.tags && ");
+            builder.push_bind(statuses);
+            builder.push("::text[]");
+        }
+    }
+
+    if omit != Some(FilterKind::Updated) {
+        if let Some(range) = filters.updated {
+            match range {
+                UpdatedRange::Today => {
+                    builder.push(" and d.entity_updated_at >= now() - interval '1 day'");
+                }
+                UpdatedRange::Week => {
+                    builder.push(" and d.entity_updated_at >= now() - interval '7 days'");
+                }
+                UpdatedRange::Month => {
+                    builder.push(" and d.entity_updated_at >= now() - interval '30 days'");
+                }
+                UpdatedRange::Older => {
+                    builder.push(" and d.entity_updated_at < now() - interval '30 days'");
+                }
+                UpdatedRange::Never => {
+                    builder.push(" and d.entity_updated_at is null");
+                }
+            };
+        }
+    }
+
+    // The written dates and the parameters are both ranges and both apply: a query can carry
+    // `after:2026-01-01` while the rail carries a bucket.
+    let after = filters.after.or(query.after);
+    if let Some(after) = after {
         builder.push(" and (d.entity_updated_at is not null and d.entity_updated_at >= ");
         builder.push_bind(after);
         builder.push(")");
     }
 
-    if let Some(before) = query.before {
+    let before = filters.before.or(query.before);
+    if let Some(before) = before {
         builder.push(" and (d.entity_updated_at is not null and d.entity_updated_at < ");
         builder.push_bind(before);
         builder.push(")");
     }
+}
 
-    if !query.flags().is_empty() {
-        builder.push(" and d.tags && ");
-        builder.push_bind(query.flags().to_vec());
-        builder.push("::text[]");
+/// One value of the facet rail: what a click applies, what a person reads, how much it would leave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FacetValue {
+    /// The machine value (`pages`, a uuid, `draft`, `week`).
+    pub value: String,
+    /// The human label.
+    pub label: String,
+    /// Hits this value would leave under every other filter.
+    pub count: i64,
+}
+
+/// One group of the facet rail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FacetGroup {
+    /// Stable key (`type`, `site`, `owner`, `language`, `status`, `updated`).
+    pub key: &'static str,
+    /// Title the rail shows.
+    pub title: &'static str,
+    /// The values, strongest first.
+    pub values: Vec<FacetValue>,
+    /// How many further values exist beyond the ones listed.
+    pub more: i64,
+}
+
+/// How many values one facet group lists before `more` takes over.
+pub const FACET_LIMIT: usize = 12;
+
+/// One planned facet: the SQL of its value and label, the joins it needs and the filter it must
+/// leave out of its own counts.
+struct FacetPlan {
+    key: &'static str,
+    title: &'static str,
+    omit: FilterKind,
+    /// A condition that belongs to the facet itself (`d.site_id is not null`), pushed right after
+    /// `where` — a null value is not a facet value.
+    prelude: &'static str,
+    value: &'static str,
+    label: &'static str,
+    joins: &'static str,
+}
+
+/// The five column-backed facets. The sixth — `updated` — is a computed range and lives in
+/// [`updated_facet`], because its value is a bucket of time rather than a column.
+const FACET_PLANS: &[FacetPlan] = &[
+    FacetPlan {
+        key: "type",
+        title: "Type",
+        omit: FilterKind::Types,
+        prelude: "",
+        value: "d.provider",
+        label: "d.provider",
+        joins: "",
+    },
+    FacetPlan {
+        key: "site",
+        title: "Site",
+        omit: FilterKind::Site,
+        prelude: "d.site_id is not null and ",
+        value: "d.site_id::text",
+        label: "coalesce(s.name, d.site_id::text)",
+        joins: "left join sites s on s.id = d.site_id",
+    },
+    FacetPlan {
+        key: "owner",
+        title: "Owner",
+        omit: FilterKind::Owner,
+        prelude: "d.owner_user_id is not null and ",
+        value: "d.owner_user_id::text",
+        label: "coalesce(nullif(ou.display_name, ''), ou.email, d.owner_user_id::text)",
+        joins: "left join users ou on ou.id = d.owner_user_id",
+    },
+    FacetPlan {
+        key: "language",
+        title: "Language",
+        omit: FilterKind::Language,
+        prelude: "",
+        value: "d.language",
+        label: "d.language",
+        joins: "",
+    },
+    FacetPlan {
+        key: "status",
+        title: "Status",
+        omit: FilterKind::Status,
+        prelude: "array_length(d.tags, 1) >= 1 and ",
+        value: "facet_tag.tag",
+        label: "facet_tag.tag",
+        joins: "cross join lateral unnest(d.tags) as facet_tag(tag)",
+    },
+];
+
+/// Row shape of a facet value.
+#[derive(Debug, sqlx::FromRow)]
+struct FacetRow {
+    value: String,
+    label: String,
+    count: i64,
+}
+
+/// Every facet group of a request, each counted without its own filter.
+pub async fn facets(pool: &PgPool, request: &SearchRequest) -> Result<Vec<FacetGroup>> {
+    let mut groups: Vec<FacetGroup> = Vec::with_capacity(FACET_PLANS.len() + 1);
+    for plan in FACET_PLANS {
+        groups.push(facet_group(pool, request, plan).await?);
     }
+    groups.push(updated_facet(pool, request).await?);
+    Ok(groups)
+}
+
+/// Count one planned facet's values.
+async fn facet_group(
+    pool: &PgPool,
+    request: &SearchRequest,
+    plan: &FacetPlan,
+) -> Result<FacetGroup> {
+    let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+        "select {value} as value, {label} as label, count(*)::bigint as count \
+         from search_documents d {joins} where {prelude}",
+        value = plan.value,
+        label = plan.label,
+        joins = plan.joins,
+        prelude = plan.prelude,
+    ));
+    push_conditions(&mut builder, request, Some(plan.omit));
+    builder.push(format!(
+        " group by 1, 2 order by count desc, 1 asc limit {}",
+        FACET_LIMIT + 1
+    ));
+    let mut rows: Vec<FacetRow> = builder.build_query_as().fetch_all(pool).await?;
+
+    let truncated = rows.len() > FACET_LIMIT;
+    if truncated {
+        rows.truncate(FACET_LIMIT);
+    }
+    let mut more = 0;
+    if truncated {
+        // How many further values exist — counted, never guessed, so "12 of 31" is true.
+        let mut counter: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+            "select count(*) from (select 1 from search_documents d {joins} where {prelude}",
+            joins = plan.joins,
+            prelude = plan.prelude,
+        ));
+        push_conditions(&mut counter, request, Some(plan.omit));
+        counter.push(format!(
+            " group by {value}) distinct_values",
+            value = plan.value
+        ));
+        let total: i64 = counter.build_query_scalar().fetch_one(pool).await?;
+        more = (total - rows.len() as i64).max(0);
+    }
+
+    Ok(FacetGroup {
+        key: plan.key,
+        title: plan.title,
+        values: rows
+            .into_iter()
+            .map(|row| FacetValue {
+                // The type facet's value is a provider key; its label is the registry's title, so
+                // the rail reads "Pages", not "pages".
+                label: if plan.key == "type" {
+                    providers::provider(&row.value).map_or(row.label, |spec| spec.title.to_owned())
+                } else {
+                    row.label
+                },
+                value: row.value,
+                count: row.count,
+            })
+            .collect(),
+        more,
+    })
+}
+
+/// The "Updated" facet: how many hits fall in each range of the last change.
+async fn updated_facet(pool: &PgPool, request: &SearchRequest) -> Result<FacetGroup> {
+    let bucket = "case when d.entity_updated_at is null then 'never' \
+        when d.entity_updated_at >= now() - interval '1 day' then 'today' \
+        when d.entity_updated_at >= now() - interval '7 days' then 'week' \
+        when d.entity_updated_at >= now() - interval '30 days' then 'month' \
+        else 'older' end";
+    let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(format!(
+        "select {bucket} as value, {bucket} as label, count(*)::bigint as count \
+         from search_documents d where "
+    ));
+    push_conditions(&mut builder, request, Some(FilterKind::Updated));
+    builder.push(" group by 1, 2");
+    let mut rows: Vec<FacetRow> = builder.build_query_as().fetch_all(pool).await?;
+
+    const ORDER: [&str; 5] = ["today", "week", "month", "older", "never"];
+    rows.sort_by_key(|row| {
+        ORDER
+            .iter()
+            .position(|value| *value == row.value)
+            .unwrap_or(ORDER.len())
+    });
+
+    Ok(FacetGroup {
+        key: "updated",
+        title: "Updated",
+        values: rows
+            .into_iter()
+            .map(|row| FacetValue {
+                label: UpdatedRange::parse(&row.value)
+                    .map_or(row.label, |range| range.label().to_owned()),
+                value: row.value,
+                count: row.count,
+            })
+            .collect(),
+        more: 0,
+    })
 }
 
 /// Run a query and answer one page of hits plus the total.
@@ -460,8 +944,8 @@ pub async fn search(pool: &PgPool, request: &SearchRequest) -> Result<HitPage> {
     let offset = (page - 1) * per_page;
 
     let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
-        "select d.provider, d.entity_type, d.entity_id, d.title, d.subtitle, d.url, d.tags, \
-         d.entity_updated_at, ",
+        "select d.provider, d.entity_type, d.entity_id, d.title, d.subtitle, d.url, \
+         ou.display_name as owner, d.tags, d.entity_updated_at, ",
     );
     if request.query.has_terms() {
         builder.push("ts_rank_cd(");
@@ -474,8 +958,11 @@ pub async fn search(pool: &PgPool, request: &SearchRequest) -> Result<HitPage> {
     } else {
         builder.push("0.0::real");
     }
-    builder.push(" as score, count(*) over () as total from search_documents d where ");
-    push_conditions(&mut builder, request);
+    builder.push(
+        " as score, count(*) over () as total from search_documents d \
+         left join users ou on ou.id = d.owner_user_id where ",
+    );
+    push_conditions(&mut builder, request, None);
 
     builder.push(" order by ");
     match request.sort {
@@ -517,6 +1004,7 @@ struct HitWithTotal {
     title: String,
     subtitle: String,
     url: String,
+    owner: Option<String>,
     tags: Vec<String>,
     entity_updated_at: Option<OffsetDateTime>,
     score: f32,
@@ -532,6 +1020,7 @@ impl HitWithTotal {
             title: self.title,
             subtitle: self.subtitle,
             url: self.url,
+            owner: self.owner,
             tags: self.tags,
             entity_updated_at: self.entity_updated_at,
             score: self.score,
@@ -543,7 +1032,7 @@ impl HitWithTotal {
 async fn count(pool: &PgPool, request: &SearchRequest) -> Result<i64> {
     let mut builder: QueryBuilder<'_, Postgres> =
         QueryBuilder::new("select count(*) from search_documents d where ");
-    push_conditions(&mut builder, request);
+    push_conditions(&mut builder, request, None);
     let total: i64 = builder.build_query_scalar().fetch_one(pool).await?;
     Ok(total)
 }
@@ -553,7 +1042,7 @@ pub async fn counts(pool: &PgPool, request: &SearchRequest) -> Result<Vec<Provid
     let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
         "select d.provider as provider, count(*)::bigint as count from search_documents d where ",
     );
-    push_conditions(&mut builder, request);
+    push_conditions(&mut builder, request, None);
     builder.push(" group by d.provider order by count desc, d.provider asc");
     let rows: Vec<ProviderCount> = builder.build_query_as().fetch_all(pool).await?;
     Ok(rows)
@@ -597,19 +1086,243 @@ pub async fn status(pool: &PgPool) -> Result<Vec<ProviderStatus>> {
     .fetch_all(pool)
     .await?;
 
+    // The newest pass of each provider. A pass that never finished within the running window
+    // reads as indexing; one that failed keeps saying so until a later pass succeeds.
+    let runs: Vec<RunRow> = sqlx::query_as(
+        "select r.provider, r.indexed, r.pruned, r.duration_ms, r.started_at, r.finished_at, \
+         r.error from search_reindex_runs r \
+         where r.id = (select max(id) from search_reindex_runs where provider = r.provider)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let now = OffsetDateTime::now_utc();
     Ok(providers::PROVIDERS
         .iter()
         .map(|spec| {
             let row = rows.iter().find(|(key, _, _)| key == spec.key);
             let documents = row.map_or(0, |(_, count, _)| *count);
+            let last_indexed_at = row.and_then(|(_, _, at)| *at);
+            let last_run = runs
+                .iter()
+                .find(|run| run.provider == spec.key)
+                .map(RunRow::to_run);
             ProviderStatus {
                 provider: spec.key,
                 title: spec.title,
                 documents,
-                last_indexed_at: row.and_then(|(_, _, at)| *at),
-                state: if documents > 0 { "ready" } else { "empty" },
+                last_indexed_at,
+                state: provider_state(documents, last_indexed_at, last_run.as_ref(), now),
+                last_run,
             }
         })
+        .collect())
+}
+
+/// Row shape of the newest reindex pass of one provider.
+#[derive(Debug, sqlx::FromRow)]
+struct RunRow {
+    provider: String,
+    indexed: Option<i64>,
+    pruned: Option<i64>,
+    duration_ms: Option<i64>,
+    started_at: OffsetDateTime,
+    finished_at: Option<OffsetDateTime>,
+    error: Option<String>,
+}
+
+impl RunRow {
+    /// The pass as the status screen reads it.
+    fn to_run(&self) -> ReindexRun {
+        ReindexRun {
+            indexed: self.indexed,
+            pruned: self.pruned,
+            duration_ms: self.duration_ms,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            error: self.error.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings: the ranking weights and the enabled providers
+// ---------------------------------------------------------------------------------------------
+
+/// The four ranking weights, as a person writes them (`0..=10`, integers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Weights {
+    /// Weight of a title match.
+    pub title: i32,
+    /// Weight of a tag match.
+    pub tags: i32,
+    /// Weight of a subtitle match.
+    pub subtitle: i32,
+    /// Weight of a body match.
+    pub body: i32,
+}
+
+/// The weights an installation starts with.
+pub const DEFAULT_WEIGHTS: Weights = Weights {
+    title: 6,
+    tags: 4,
+    subtitle: 3,
+    body: 1,
+};
+
+/// The installation's search settings as the screen reads and writes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSettings {
+    /// Ranking weights.
+    pub weights: Weights,
+    /// Provider keys that answer a query.
+    pub enabled_providers: Vec<String>,
+    /// When the row was last written.
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+/// Why a settings write was refused — each variant is a sentence the screen can show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsError {
+    /// A weight outside `0..=10`.
+    OutOfRange(&'static str),
+    /// The body outweighs the title, which would rank a mention above a name.
+    TitleBelowBody,
+    /// A provider key no build knows.
+    UnknownProvider(String),
+    /// Every provider switched off — search would answer nothing.
+    NoProviders,
+}
+
+impl SettingsError {
+    /// The stable code the API answers with.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::OutOfRange(_) => "weight_out_of_range",
+            Self::TitleBelowBody => "title_below_body",
+            Self::UnknownProvider(_) => "unknown_provider",
+            Self::NoProviders => "no_providers",
+        }
+    }
+}
+
+impl std::fmt::Display for SettingsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange(name) => write!(
+                formatter,
+                "the {name} weight must be a whole number between 0 and 10"
+            ),
+            Self::TitleBelowBody => write!(
+                formatter,
+                "the title weight must be at least the body weight — a name outranks a mention"
+            ),
+            Self::UnknownProvider(key) => {
+                write!(formatter, "{key} is not a search provider this build knows")
+            }
+            Self::NoProviders => write!(
+                formatter,
+                "at least one provider must stay enabled, or search would answer nothing"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SettingsError {}
+
+/// Hold a settings value to the rules the form promises.
+pub fn validate_settings(settings: &SearchSettings) -> std::result::Result<(), SettingsError> {
+    let weights = settings.weights;
+    for (name, value) in [
+        ("title", weights.title),
+        ("tags", weights.tags),
+        ("subtitle", weights.subtitle),
+        ("body", weights.body),
+    ] {
+        if !(0..=10).contains(&value) {
+            return Err(SettingsError::OutOfRange(name));
+        }
+    }
+    if weights.title < weights.body {
+        return Err(SettingsError::TitleBelowBody);
+    }
+    if settings.enabled_providers.is_empty() {
+        return Err(SettingsError::NoProviders);
+    }
+    for key in &settings.enabled_providers {
+        if providers::provider(key).is_none() {
+            return Err(SettingsError::UnknownProvider(key.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Read the installation's settings; a missing row answers the defaults.
+pub async fn read_settings(pool: &PgPool) -> Result<SearchSettings> {
+    let row: Option<(serde_json::Value, Vec<String>, Option<OffsetDateTime>)> = sqlx::query_as(
+        "select weights, enabled_providers, updated_at from search_settings where id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((weights, enabled, updated_at)) = row else {
+        return Ok(SearchSettings {
+            weights: DEFAULT_WEIGHTS,
+            enabled_providers: providers::provider_keys()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            updated_at: None,
+        });
+    };
+
+    let read = |key: &str, fallback: i32| -> i32 {
+        weights
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .map_or(fallback, |value| value as i32)
+    };
+
+    Ok(SearchSettings {
+        weights: Weights {
+            title: read("title", DEFAULT_WEIGHTS.title),
+            tags: read("tags", DEFAULT_WEIGHTS.tags),
+            subtitle: read("subtitle", DEFAULT_WEIGHTS.subtitle),
+            body: read("body", DEFAULT_WEIGHTS.body),
+        },
+        enabled_providers: enabled,
+        updated_at,
+    })
+}
+
+/// Write the installation's settings and answer the stored row.
+pub async fn write_settings(pool: &PgPool, settings: &SearchSettings) -> Result<SearchSettings> {
+    let weights = serde_json::json!({
+        "title": settings.weights.title,
+        "tags": settings.weights.tags,
+        "subtitle": settings.weights.subtitle,
+        "body": settings.weights.body,
+    });
+    sqlx::query(
+        "insert into search_settings (id, weights, enabled_providers) values (1, $1, $2) \
+         on conflict (id) do update set weights = excluded.weights, \
+         enabled_providers = excluded.enabled_providers, updated_at = now()",
+    )
+    .bind(&weights)
+    .bind(settings.enabled_providers.clone())
+    .execute(pool)
+    .await?;
+    read_settings(pool).await
+}
+
+/// The provider keys a query may answer from: enabled by the settings **and** known to the build.
+pub async fn enabled_providers(pool: &PgPool) -> Result<Vec<String>> {
+    let settings = read_settings(pool).await?;
+    Ok(settings
+        .enabled_providers
+        .into_iter()
+        .filter(|key| providers::provider(key).is_some())
         .collect())
 }
 
@@ -752,5 +1465,121 @@ mod tests {
         assert_eq!(Sort::parse("newest"), Some(Sort::Newest));
         assert_eq!(Sort::parse("title"), Some(Sort::Title));
         assert_eq!(Sort::parse("sideways"), None);
+    }
+
+    #[test]
+    fn updated_ranges_parse_and_read_like_a_person_wrote_them() {
+        assert_eq!(UpdatedRange::parse("today"), Some(UpdatedRange::Today));
+        assert_eq!(UpdatedRange::parse(" WEEK "), Some(UpdatedRange::Week));
+        assert_eq!(UpdatedRange::parse("never"), Some(UpdatedRange::Never));
+        assert_eq!(UpdatedRange::parse("century"), None);
+        assert_eq!(UpdatedRange::Today.as_str(), "today");
+        assert_eq!(UpdatedRange::Older.label(), "Older than a month");
+    }
+
+    #[test]
+    fn a_providers_state_is_read_from_what_the_indexer_did() {
+        let now = OffsetDateTime::now_utc();
+
+        // A pass that is still running.
+        let running = ReindexRun {
+            indexed: None,
+            pruned: None,
+            duration_ms: None,
+            started_at: now - time::Duration::seconds(3),
+            finished_at: None,
+            error: None,
+        };
+        assert_eq!(
+            provider_state(4, Some(now), Some(&running), now),
+            "indexing"
+        );
+
+        // A pass that died with the process must not say "indexing" forever.
+        let abandoned = ReindexRun {
+            started_at: now - time::Duration::hours(2),
+            ..running.clone()
+        };
+        assert_eq!(provider_state(4, Some(now), Some(&abandoned), now), "ready");
+
+        // A failed pass beats a document count from the last good one.
+        let failed = ReindexRun {
+            finished_at: Some(now),
+            error: Some("connection closed".to_owned()),
+            ..running.clone()
+        };
+        assert_eq!(provider_state(4, Some(now), Some(&failed), now), "failed");
+
+        // Empty beats stale; stale beats ready.
+        assert_eq!(provider_state(0, None, None, now), "empty");
+        assert_eq!(
+            provider_state(4, Some(now - time::Duration::hours(26)), None, now),
+            "stale"
+        );
+        assert_eq!(
+            provider_state(4, Some(now - time::Duration::minutes(5)), None, now),
+            "ready"
+        );
+    }
+
+    /// A settings value with the production defaults, for the validation tests.
+    fn default_settings() -> SearchSettings {
+        SearchSettings {
+            weights: DEFAULT_WEIGHTS,
+            enabled_providers: providers::provider_keys()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn settings_validation_names_what_is_wrong() {
+        assert!(validate_settings(&default_settings()).is_ok());
+
+        let mut too_big = default_settings();
+        too_big.weights.body = 11;
+        assert_eq!(
+            validate_settings(&too_big).map_err(|error| error.code()),
+            Err("weight_out_of_range")
+        );
+
+        let mut body_heavy = default_settings();
+        body_heavy.weights.title = 2;
+        body_heavy.weights.body = 5;
+        assert_eq!(
+            validate_settings(&body_heavy).map_err(|error| error.code()),
+            Err("title_below_body")
+        );
+
+        let mut unknown = default_settings();
+        unknown.enabled_providers.push("unicorns".to_owned());
+        assert_eq!(
+            validate_settings(&unknown).map_err(|error| error.code()),
+            Err("unknown_provider")
+        );
+
+        let mut none = default_settings();
+        none.enabled_providers.clear();
+        assert_eq!(
+            validate_settings(&none).map_err(|error| error.code()),
+            Err("no_providers")
+        );
+    }
+
+    #[test]
+    fn every_facet_plan_names_its_own_filter_and_sql() {
+        for plan in FACET_PLANS {
+            assert!(!plan.key.is_empty() && !plan.title.is_empty());
+            assert!(!plan.value.is_empty() && !plan.label.is_empty());
+            assert!(
+                plan.value.starts_with("d.") || plan.value.starts_with("facet_tag."),
+                "{} must read a column of the document",
+                plan.key
+            );
+        }
+        let keys: Vec<&str> = FACET_PLANS.iter().map(|plan| plan.key).collect();
+        assert_eq!(keys, vec!["type", "site", "owner", "language", "status"]);
     }
 }

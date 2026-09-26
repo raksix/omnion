@@ -66,6 +66,35 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         hint: "The sites of your organization",
         route: "/sites",
     },
+    // The three providers of slice 3. Their documents carry the screen their target lives on
+    // (an audit entry opens the page it touched, a translation opens its page's editor), which is
+    // what keeps a row in the results set clickable; `/search` narrowed to the provider is the
+    // one honest home for activity, because a dedicated trail screen arrives with the audit work
+    // (REQ-012/REQ-039).
+    ProviderSpec {
+        key: "logs",
+        title: "Activity",
+        entity_type: "log",
+        permission: "audit.read",
+        hint: "Audit entries and recorded events, linked to the thing they touched",
+        route: "/search",
+    },
+    ProviderSpec {
+        key: "translations",
+        title: "Translations",
+        entity_type: "translation",
+        permission: "content.pages.read",
+        hint: "Translated fields of your pages, linked to the page they belong to",
+        route: "/pages",
+    },
+    ProviderSpec {
+        key: "settings",
+        title: "Settings",
+        entity_type: "setting",
+        permission: "search.read",
+        hint: "The key/value settings of your organization",
+        route: "/settings/search",
+    },
 ];
 
 /// Look one provider up by its key.

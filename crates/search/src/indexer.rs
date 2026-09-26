@@ -263,21 +263,66 @@ fn entity_id_of(payload: &Value, key: &str) -> Option<Uuid> {
 }
 
 /// Rebuild one provider's slice of the index.
+///
+/// Every pass leaves a row in `search_reindex_runs` — started when it begins, finished (or failed)
+/// when it ends. `/settings/search` reads its states from those rows instead of guessing from a
+/// document count, which is what makes "indexing" and "failed" honest.
 pub async fn reindex(pool: &PgPool, key: &str) -> Result<ReindexReport> {
     let spec =
         providers::provider(key).ok_or_else(|| SearchError::UnknownProvider(key.to_owned()))?;
     let started = Instant::now();
-    let mut transaction = pool.begin().await?;
-    let indexed = upsert(&mut transaction, spec, None).await?;
-    let pruned = prune(&mut transaction, spec).await?;
-    transaction.commit().await?;
+    let run_id: i64 =
+        sqlx::query_scalar("insert into search_reindex_runs (provider) values ($1) returning id")
+            .bind(spec.key)
+            .fetch_one(pool)
+            .await?;
 
-    Ok(ReindexReport {
-        provider: spec.key,
-        indexed,
-        pruned,
-        duration_ms: started.elapsed().as_millis() as u64,
-    })
+    let outcome = async {
+        let mut transaction = pool.begin().await?;
+        let indexed = upsert(&mut transaction, spec, None).await?;
+        let pruned = prune(&mut transaction, spec).await?;
+        transaction.commit().await?;
+        Ok::<(u64, u64), SearchError>((indexed, pruned))
+    }
+    .await;
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Ok((indexed, pruned)) => {
+            sqlx::query(
+                "update search_reindex_runs set finished_at = now(), indexed = $2, pruned = $3, \
+                 duration_ms = $4 where id = $1",
+            )
+            .bind(run_id)
+            .bind(indexed as i64)
+            .bind(pruned as i64)
+            .bind(duration_ms as i64)
+            .execute(pool)
+            .await?;
+            Ok(ReindexReport {
+                provider: spec.key,
+                indexed,
+                pruned,
+                duration_ms,
+            })
+        }
+        Err(error) => {
+            // The failure is part of the record: the screen shows it, and the next pass clears it.
+            if let Err(write) = sqlx::query(
+                "update search_reindex_runs set finished_at = now(), duration_ms = $2, error = $3 \
+                 where id = $1",
+            )
+            .bind(run_id)
+            .bind(duration_ms as i64)
+            .bind(error.to_string())
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(provider = spec.key, %write, "the failed reindex could not be recorded");
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Rebuild every provider, in registry order.
@@ -351,6 +396,38 @@ async fn prune(transaction: &mut Transaction<'_, Postgres>, spec: &ProviderSpec)
             "delete from search_documents d where d.provider = 'sites' \
              and not exists (select 1 from sites s where s.id::text = d.entity_id)"
         }
+        "logs" => {
+            // A row stays exactly while its source row still resolves to a target the panel can
+            // open — the same narrowing the upsert applies, or an entry whose page was deleted
+            // would keep answering with a link into nothing.
+            "delete from search_documents d where d.provider = 'logs' and not exists ( \
+                 select 1 from audit_log a \
+                 left join pages pg on a.target_type = 'page' and pg.id::text = a.target_id \
+                 left join media md on a.target_type = 'media' and md.id::text = a.target_id \
+                 left join sites st on a.target_type = 'site' and st.id::text = a.target_id \
+                 where d.entity_id = 'audit-' || a.id::text \
+                   and (pg.id is not null or md.id is not null or st.id is not null) \
+             ) and not exists ( \
+                 select 1 from events e \
+                 left join pages pg on pg.id::text = e.payload->>'page_id' \
+                 left join media md on md.id::text = e.payload->>'media_id' \
+                 left join sites st on st.id::text = e.payload->>'site_id' \
+                 where d.entity_id = 'event-' || e.id::text \
+                   and (pg.id is not null or md.id is not null or st.id is not null) \
+             )"
+        }
+        "translations" => {
+            "delete from search_documents d where d.provider = 'translations' and not exists ( \
+                 select 1 from translations t \
+                 join page_revisions r on r.id = t.resource_id and t.resource_type = 'page_revision' \
+                 join pages pg on pg.id = r.page_id \
+                 where d.entity_id = t.id::text and btrim(t.value) <> '' \
+             )"
+        }
+        "settings" => {
+            "delete from search_documents d where d.provider = 'settings' \
+             and not exists (select 1 from organizations o where d.entity_id = o.id::text)"
+        }
         other => {
             debug_assert!(false, "provider {other} has no prune");
             return Ok(0);
@@ -393,6 +470,128 @@ on conflict (provider, entity_type, entity_id) do update set \
     entity_updated_at = excluded.entity_updated_at, \
     document = excluded.document, \
     indexed_at = now()";
+
+/// Upsert of the activity provider: one document per audit entry or recorded event **that points
+/// at an entity the panel can open**.
+///
+/// The narrowing is deliberate. An audit entry about a role or an AI provider has no screen to
+/// land on yet, and the platform's own rule is that a row which cannot go anywhere is worse than
+/// a row that is not there; those entries join this provider the day their screen exists
+/// (REQ-012/REQ-039). The `url` is the target's deep link — an entry about a page opens the
+/// page's editor — and `body` carries the entry's metadata so a search can find "value" inside it.
+const LOGS_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select * from ( \
+    select a.organization_id, \
+           coalesce(pg.site_id, md.site_id, st.id), \
+           'logs', 'log', 'audit-' || a.id::text, \
+           a.action, \
+           concat_ws(' · ', coalesce(au.display_name, ''), a.target_type, \
+                     to_char(a.created_at, 'YYYY-MM-DD HH24:MI')), \
+           coalesce(case \
+               when pg.id is not null then '/pages?site=' || pg.site_id::text || '&focus=' || pg.id::text \
+               when md.id is not null then '/media?site=' || md.site_id::text || '&focus=' || md.id::text \
+               when st.id is not null then '/sites' \
+           end, '/'), \
+           a.actor_user_id, \
+           array[a.action]::text[], \
+           coalesce(a.metadata::text, ''), \
+           a.created_at, \
+           setweight(to_tsvector('simple', a.action), 'A') || \
+           setweight(to_tsvector('simple', coalesce(a.target_type, '')), 'B') || \
+           setweight(to_tsvector('simple', concat_ws(' ', coalesce(au.display_name, ''), \
+                                                     coalesce(a.target_type, ''), a.action)), 'C') || \
+           setweight(to_tsvector('simple', coalesce(a.metadata::text, '')), 'D') \
+    from audit_log a \
+    left join users au on au.id = a.actor_user_id \
+    left join pages pg on a.target_type = 'page' and pg.id::text = a.target_id \
+    left join media md on a.target_type = 'media' and md.id::text = a.target_id \
+    left join sites st on a.target_type = 'site' and st.id::text = a.target_id \
+    where (pg.id is not null or md.id is not null or st.id is not null) \
+    union all \
+    select e.organization_id, \
+           coalesce(pg.site_id, md.site_id, st.id), \
+           'logs', 'log', 'event-' || e.id::text, \
+           e.name, \
+           concat_ws(' · ', 'event', to_char(e.created_at, 'YYYY-MM-DD HH24:MI')), \
+           coalesce(case \
+               when pg.id is not null then '/pages?site=' || pg.site_id::text || '&focus=' || pg.id::text \
+               when md.id is not null then '/media?site=' || md.site_id::text || '&focus=' || md.id::text \
+               when st.id is not null then '/sites' \
+           end, '/'), \
+           e.actor_user_id, \
+           array[e.name]::text[], \
+           coalesce(e.payload::text, ''), \
+           e.created_at, \
+           setweight(to_tsvector('simple', e.name), 'A') || \
+           setweight(to_tsvector('simple', 'event'), 'B') || \
+           setweight(to_tsvector('simple', concat_ws(' ', 'event', e.name)), 'C') || \
+           setweight(to_tsvector('simple', coalesce(e.payload::text, '')), 'D') \
+    from events e \
+    left join pages pg on pg.id::text = e.payload->>'page_id' \
+    left join media md on md.id::text = e.payload->>'media_id' \
+    left join sites st on st.id::text = e.payload->>'site_id' \
+    where (pg.id is not null or md.id is not null or st.id is not null) \
+) rows \
+where true {filter} \
+";
+
+/// Upsert of the translation provider: one document per translated field, joined to the page it
+/// belongs to so a hit opens that page's editor. Blank values are skipped — a document whose
+/// title would be empty is refused by the table's own check.
+const TRANSLATIONS_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select t.organization_id, pg.site_id, 'translations', 'translation', t.id::text, \
+       left(t.value, 120), \
+       concat_ws(' · ', 'page /' || pg.slug, t.language, t.field), \
+       '/pages?site=' || pg.site_id::text || '&focus=' || pg.id::text, \
+       t.created_by, \
+       array[t.language]::text[], \
+       t.value, \
+       t.updated_at, \
+       setweight(to_tsvector('simple', left(t.value, 120)), 'A') || \
+       setweight(to_tsvector('simple', t.language), 'B') || \
+       setweight(to_tsvector('simple', concat_ws(' ', t.field, t.language)), 'C') || \
+       setweight(to_tsvector('simple', t.value), 'D') \
+from translations t \
+join page_revisions r on t.resource_type = 'page_revision' and r.id = t.resource_id \
+join pages pg on pg.id = r.page_id \
+where btrim(t.value) <> '' {filter} \
+";
+
+/// Upsert of the settings provider: one document per organization for the key/value settings the
+/// panel can actually change today — the search settings (ranking weights and enabled providers).
+/// The next settings centre adds its own row to this same statement, and each row opens the screen
+/// where the value lives.
+const SETTINGS_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select o.id, null, 'settings', 'setting', o.id::text, \
+       'Search ranking weights', \
+       concat_ws(' · ', \
+           'title ' || coalesce(ss.weights->>'title', '6'), \
+           'tags ' || coalesce(ss.weights->>'tags', '4'), \
+           'subtitle ' || coalesce(ss.weights->>'subtitle', '3'), \
+           'body ' || coalesce(ss.weights->>'body', '1'), \
+           array_length(ss.enabled_providers, 1) || ' providers'), \
+       '/settings/search', \
+       null, \
+       array['settings']::text[], \
+       coalesce(ss.weights::text, ''), \
+       ss.updated_at, \
+       setweight(to_tsvector('simple', 'search ranking weights'), 'A') || \
+       setweight(to_tsvector('simple', 'settings'), 'B') || \
+       setweight(to_tsvector('simple', 'search ranking weights settings providers'), 'C') || \
+       setweight(to_tsvector('simple', coalesce(ss.weights::text, '')), 'D') \
+from organizations o \
+left join search_settings ss on ss.id = 1 \
+where true {filter} \
+";
 
 /// Upsert of the content provider: one document per page, titled by its latest revision.
 ///
@@ -499,9 +698,17 @@ pub fn upsert_statement(provider_key: &str, entity_id: Option<Uuid>) -> Option<S
         "media" => (MEDIA_UPSERT, "m.id"),
         "users" => (USERS_UPSERT, "u.id"),
         "sites" => (SITES_UPSERT, "s.id"),
+        "translations" => (TRANSLATIONS_UPSERT, "t.id"),
+        "settings" => (SETTINGS_UPSERT, "o.id"),
+        // Activity rows are two sources behind one entity id (`audit-12` / `event-9`), and nothing
+        // addresses one of them by uuid: the only way in is a full pass, so a single-entity upsert
+        // writes nothing rather than guessing at a row. That also keeps `index_entity` harmless
+        // for this provider instead of panicking on a missing arm.
+        "logs" => (LOGS_UPSERT, ""),
         _ => return None,
     };
     let filter = match entity_id {
+        Some(_) if column.is_empty() => "and false".to_owned(),
         Some(id) => format!("and {column} = '{id}'::uuid"),
         None => String::new(),
     };

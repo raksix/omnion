@@ -29,4 +29,8 @@ pub mod query;
 
 pub use error::{Result, SearchError};
 pub use providers::{PROVIDERS, ProviderSpec, provider, provider_keys};
-pub use query::{Hit, HitPage, Query, QueryError, SearchRequest, Sort};
+pub use query::{
+    DEFAULT_WEIGHTS, FacetGroup, FacetValue, Hit, HitPage, Query, QueryError, ReindexRun,
+    SearchFilters, SearchRequest, SearchSettings, SettingsError, Sort, UpdatedRange, Weights,
+    enabled_providers, facets, provider_state, read_settings, validate_settings, write_settings,
+};
