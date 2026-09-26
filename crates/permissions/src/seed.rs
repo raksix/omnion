@@ -100,6 +100,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.create",
             "sites.update",
             "domains.manage",
+            "webhooks.read",
+            "events.read",
         ]),
     },
     BaseRole {

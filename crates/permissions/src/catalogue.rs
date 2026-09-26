@@ -6,7 +6,7 @@
 //! outside the catalogue is a bug, and the store rejects it.
 //!
 //! Categories group the keys for the admin UI (`content`, `media`, `users`, `plugins`,
-//! `deployment`, `iam`, `audit`, `tenancy`).
+//! `deployment`, `iam`, `audit`, `tenancy`, `webhooks`, `events`).
 
 /// A single permission the platform understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +261,24 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "domains.manage",
         category: "tenancy",
         description: "Add, remove and promote site domains",
+    },
+    // Events and webhooks (docs/01-VISION.md §13, phase P12). Reading the bus is one power;
+    // pointing the platform's events at an outside URL is a stronger one, because that URL
+    // receives the organization's data.
+    PermissionDef {
+        key: "webhooks.read",
+        category: "webhooks",
+        description: "Read webhook endpoints and their delivery history",
+    },
+    PermissionDef {
+        key: "webhooks.manage",
+        category: "webhooks",
+        description: "Connect, change, test and remove webhook endpoints",
+    },
+    PermissionDef {
+        key: "events.read",
+        category: "events",
+        description: "Read the platform's event feed",
     },
 ];
 
