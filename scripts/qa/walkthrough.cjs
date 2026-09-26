@@ -798,6 +798,20 @@ async function runPalette(page, report) {
   });
   await shot(page, "palette-results", { full: false });
 
+  // Each provider owns its own section and its own state (REQ-032 slice 2): the inventory records
+  // which sections answered and in which state, so a federated pass is visible in the report.
+  const groupStates = await page
+    .evaluate(() =>
+      [...document.querySelectorAll("[data-palette-section]")].map(
+        (node) =>
+          `${node.getAttribute("data-palette-section")}:${node.getAttribute(
+            "data-palette-section-state",
+          )}`,
+      ),
+    )
+    .catch(() => []);
+  note({ step: "groups", groups: groupStates.join(", ") });
+
   // The arrow keys move the highlight: the row the input points at changes without the mouse.
   const active = () =>
     page.evaluate(
