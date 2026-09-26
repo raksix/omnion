@@ -84,6 +84,24 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "media",
         description: "Manage folders and storage settings",
     },
+    // AI Hub (docs/06-AI-HUB.md §1, §7): connecting providers is an administrator-level power,
+    // while using the platform's AI chat is an everyday one — the AI Hub's own permission sets
+    // (§8) build on these keys in later phases.
+    PermissionDef {
+        key: "ai.providers.read",
+        category: "ai",
+        description: "Read AI providers and the model registry",
+    },
+    PermissionDef {
+        key: "ai.providers.manage",
+        category: "ai",
+        description: "Connect and configure AI providers",
+    },
+    PermissionDef {
+        key: "ai.chat",
+        category: "ai",
+        description: "Use the platform's AI chat",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {
@@ -311,6 +329,7 @@ mod tests {
         for expected in [
             "content",
             "media",
+            "ai",
             "workflows",
             "users",
             "plugins",
@@ -399,6 +418,20 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("workflows"),
                 "{key} belongs to the workflows category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ai_family_is_catalogued() {
+        // P11 (docs/06-AI-HUB.md §1): connecting a provider and using the chat are separate
+        // keys, so an operator can let a team talk to the platform's AI without letting them
+        // point it at another endpoint.
+        for key in ["ai.providers.read", "ai.providers.manage", "ai.chat"] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("ai"),
+                "{key} belongs to the ai category"
             );
         }
     }

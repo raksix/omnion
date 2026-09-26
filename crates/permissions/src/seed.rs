@@ -81,6 +81,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.update",
             "media.delete",
             "media.manage",
+            "ai.providers.read",
+            "ai.chat",
             "workflows.read",
             "workflows.manage",
             "workflows.run",
@@ -113,6 +115,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.restore",
             "media.read",
             "media.update",
+            "ai.chat",
             "workflows.read",
             "workflows.run",
             "users.read",
@@ -134,6 +137,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.read",
             "media.upload",
             "media.update",
+            "ai.chat",
             "workflows.read",
             "sites.read",
         ]),
@@ -428,6 +432,34 @@ mod tests {
         assert!(keys_of("editor").contains(&"workflows.read"));
         assert!(!keys_of("editor").contains(&"workflows.run"));
         assert!(!keys_of("member").contains(&"workflows.read"));
+    }
+
+    #[test]
+    fn the_ai_keys_reach_the_operational_roles() {
+        // P11: everyone who writes content can talk to the platform's AI; connecting providers
+        // stays with the administrator ladder (Owner/Administrator hold the whole catalogue) and
+        // the manager role, which runs the platform day to day.
+        let keys_of = |key: &str| {
+            BASE_ROLES
+                .iter()
+                .find(|base| base.key == key)
+                .expect("base role exists")
+                .permissions
+                .keys()
+        };
+
+        assert!(keys_of("manager").contains(&"ai.providers.read"));
+        assert!(keys_of("manager").contains(&"ai.chat"));
+        assert!(!keys_of("manager").contains(&"ai.providers.manage"));
+
+        for role in ["moderator", "editor"] {
+            assert!(keys_of(role).contains(&"ai.chat"), "{role} uses the chat");
+            assert!(
+                !keys_of(role).contains(&"ai.providers.read"),
+                "{role} does not read the provider settings"
+            );
+        }
+        assert!(!keys_of("member").contains(&"ai.chat"));
     }
 
     #[test]
