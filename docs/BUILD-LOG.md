@@ -434,7 +434,12 @@
   answered `401` without a session.
 - CI: the smoke step now walks a workflow as well — define the four-step run, start it, poll the
   execution until it settles, assert `completed` with `attempts=2` on the retried step, print the
-  workflow audit rows, and prove `/api/v1/workflows` is closed to anonymous callers.
+  workflow audit rows, and prove `/api/v1/workflows` is closed to anonymous callers. Run
+  `36206269819` → **success**: `Rust — fmt · clippy · test` ✅ (the workflow integration suite ran
+  in CI — the eleven walks passed against the compose stack — and the smoke log prints
+  `a failing step was re-queued … attempt=1 of=3 delay_ms=5000` for the retried step, then
+  `workflow surface: completed attempts=2 wait=succeeded · run=completed` with
+  `workflow audit rows: 19`) · `Infra — compose config` ✅.
 - Next: **P10 — Onboarding v0 (REQ-050)** (first-run wizard + `omnion` CLI skeleton).
 
 ### Lessons
