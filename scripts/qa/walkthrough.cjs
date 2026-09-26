@@ -1,0 +1,893 @@
+#!/usr/bin/env node
+/**
+ * Omnion QA — visual + interaction walkthrough.
+ *
+ * Runs against a freshly migrated QA database, drives the first-run wizard, then walks every
+ * admin screen: full-page screenshots, DOM diagnostics (overflow, contrast, broken images,
+ * unlabeled inputs, duplicate ids, off-screen elements) and a click-through of every visible
+ * interactive element (buttons, links, inputs, selects, textareas, summaries).
+ *
+ * Everything lands in `--out`:
+ *   shots/*.png        screenshots (page, interesting interactions, mobile)
+ *   clicks.jsonl       one JSON line per interaction (label, outcome, error deltas)
+ *   diagnostics.json   per-page DOM health report
+ *   summary.json       machine-readable roll-up (counts + findings)
+ *   report.md          human-readable report
+ *
+ * Usage:
+ *   NODE_PATH=/root/test-hermes/node_modules node scripts/qa/walkthrough.cjs \
+ *     --url http://127.0.0.1:3100 --web http://127.0.0.1:3200 --out qa-artifacts/<ts>
+ *
+ * The script never fails the process for visual findings — it always writes its artifacts and
+ * exits 0 unless the browser or the admin panel itself cannot be reached.
+ */
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const { chromium } = require("playwright-core");
+
+// ---------------------------------------------------------------- args / env
+
+function arg(name, fallback) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+}
+
+const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
+const URL_WEB = arg("web", "http://127.0.0.1:3200");
+const OUT = path.resolve(arg("out", `qa-artifacts/${Date.now()}`));
+const SHOTS = path.join(OUT, "shots");
+const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
+const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
+const STEP_MS = Number(arg("step-ms", "380"));
+
+const CREDS = {
+  name: "QA Owner",
+  email: "qa-owner@omnion.test",
+  password: "OmnionQa-Passw0rd-2026!",
+  org: "QA Organization",
+  orgSlug: "qa-org",
+  site: "QA Site",
+  siteKey: "main",
+  domain: "qa.omnion.test",
+};
+
+fs.mkdirSync(SHOTS, { recursive: true });
+
+const clickLines = [];
+function log(...a) {
+  console.log("[walk]", ...a);
+}
+function record(entry) {
+  clickLines.push(entry);
+  fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+}
+
+// ---------------------------------------------------------------- browser
+
+const consoleLog = [];
+const netFailures = [];
+const dialogs = [];
+const shots = [];
+
+async function shot(page, name, { full = true } = {}) {
+  const file = path.join(SHOTS, `${name}.png`);
+  try {
+    await page.screenshot({ path: file, fullPage: full, timeout: 15000 });
+    shots.push({ name, file, url: page.url(), bytes: fs.statSync(file).size });
+  } catch (err) {
+    log(`screenshot failed for ${name}: ${err.message}`);
+  }
+}
+
+function attach(page, phase) {
+  page.on("console", (msg) => {
+    if (msg.type() === "error" || msg.type() === "warning") {
+      consoleLog.push({ phase, type: msg.type(), text: msg.text().slice(0, 400), url: page.url() });
+    }
+  });
+  page.on("pageerror", (err) => {
+    consoleLog.push({ phase, type: "pageerror", text: String(err).slice(0, 400), url: page.url() });
+  });
+  page.on("requestfailed", (req) => {
+    netFailures.push({ phase, url: req.url().slice(0, 200), error: (req.failure() || {}).errorText });
+  });
+  page.on("response", (res) => {
+    if (res.status() >= 400) netFailures.push({ phase, url: res.url().slice(0, 200), status: res.status() });
+  });
+  page.on("dialog", async (d) => {
+    dialogs.push({ phase, type: d.type(), message: d.message().slice(0, 200) });
+    try {
+      if (d.type() === "prompt") await d.accept("qa");
+      else await d.accept();
+    } catch {
+      /* already handled */
+    }
+  });
+}
+
+// ---------------------------------------------------------------- DOM diagnostics
+
+async function diagnostics(page) {
+  return page.evaluate(() => {
+    const visible = (el) => {
+      const b = el.getBoundingClientRect();
+      if (b.width < 1 || b.height < 1) return false;
+      const s = getComputedStyle(el);
+      return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) > 0.05;
+    };
+    const label = (el) =>
+      (
+        el.getAttribute("aria-label") ||
+        el.innerText ||
+        el.getAttribute("placeholder") ||
+        el.getAttribute("title") ||
+        el.getAttribute("name") ||
+        ""
+      )
+        .trim()
+        .replace(/\s+/g, " ")
+        .slice(0, 70);
+
+    const r = {
+      url: location.href,
+      title: document.title,
+      viewport: { w: innerWidth, h: innerHeight },
+      scrollWidth: document.documentElement.scrollWidth,
+      horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 2,
+      brokenImages: [],
+      emptyInteractives: [],
+      unlabeledInputs: [],
+      duplicateIds: [],
+      lowContrast: [],
+      tinyTargets: [],
+      offscreen: [],
+      h1Count: document.querySelectorAll("h1").length,
+    };
+
+    document.querySelectorAll("img").forEach((img) => {
+      if (img.complete && img.naturalWidth === 0) r.brokenImages.push((img.currentSrc || img.src || "").slice(0, 160));
+    });
+
+    document.querySelectorAll("button, a[href], [role=button], input, select, textarea").forEach((el) => {
+      if (!visible(el)) return;
+      const name = label(el);
+      const tag = el.tagName;
+      if ((tag === "BUTTON" || el.getAttribute("role") === "button" || tag === "A") && !name) {
+        r.emptyInteractives.push(el.outerHTML.slice(0, 130));
+      }
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
+        const id = el.id;
+        const byFor = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+        const wrapped = el.closest("label");
+        if (!byFor && !wrapped && !el.getAttribute("aria-label") && el.type !== "hidden") {
+          r.unlabeledInputs.push(el.outerHTML.slice(0, 140));
+        }
+      }
+      const b = el.getBoundingClientRect();
+      if (tag === "BUTTON" || el.getAttribute("role") === "button") {
+        if (b.width < 24 || b.height < 24) r.tinyTargets.push({ name, w: Math.round(b.width), h: Math.round(b.height) });
+      }
+      if (b.right > innerWidth + 8 || b.left < -8) {
+        r.offscreen.push({ tag, name, left: Math.round(b.left), right: Math.round(b.right) });
+      }
+    });
+
+    const ids = {};
+    document.querySelectorAll("[id]").forEach((el) => (ids[el.id] = (ids[el.id] || 0) + 1));
+    r.duplicateIds = Object.entries(ids).filter(([, n]) => n > 1).map(([id]) => id);
+
+    const luminance = (color) => {
+      const m = color.match(/rgba?\(([^)]+)\)/);
+      if (!m) return null;
+      const [rr, gg, bb] = m[1].split(",").slice(0, 3).map((v) => parseFloat(v) / 255);
+      const f = (v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+      return 0.2126 * f(rr) + 0.7152 * f(gg) + 0.0722 * f(bb);
+    };
+    const backgroundOf = (el) => {
+      let node = el;
+      while (node && node !== document.documentElement) {
+        const bg = getComputedStyle(node).backgroundColor;
+        const m = bg.match(/rgba?\(([^)]+)\)/);
+        if (m) {
+          const parts = m[1].split(",").map((v) => parseFloat(v));
+          if (parts.length < 4 || parts[3] > 0.5) return bg;
+        }
+        node = node.parentElement;
+      }
+      return getComputedStyle(document.body).backgroundColor;
+    };
+    document.querySelectorAll("p, span, a, h1, h2, h3, h4, li, td, th, label, button, code, small").forEach((el) => {
+      if (!visible(el) || el.children.length > 0) return;
+      const text = (el.innerText || "").trim();
+      if (!text || text.length > 120) return;
+      const s = getComputedStyle(el);
+      const fg = luminance(s.color);
+      const bg = luminance(backgroundOf(el));
+      if (fg === null || bg === null) return;
+      const ratio = (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+      const size = parseFloat(s.fontSize);
+      const bold = (parseInt(s.fontWeight, 10) || 400) >= 700;
+      const large = size >= 24 || (size >= 18.66 && bold);
+      const min = large ? 3 : 4.5;
+      if (ratio < min) {
+        r.lowContrast.push({ text: text.slice(0, 60), ratio: Math.round(ratio * 100) / 100, min, fontSize: size });
+      }
+    });
+
+    return r;
+  });
+}
+
+// ---------------------------------------------------------------- wizard
+
+async function fillWizardStep(page) {
+  const filled = await page.evaluate((creds) => {
+    const done = [];
+    const inputs = [...document.querySelectorAll("input, select, textarea")].filter((el) => {
+      const b = el.getBoundingClientRect();
+      return b.width > 1 && b.height > 1 && el.type !== "hidden" && !el.disabled;
+    });
+    for (const el of inputs) {
+      const key = `${el.id} ${el.name} ${el.placeholder}`.toLowerCase();
+      let value = null;
+      if (el.tagName === "SELECT") {
+        const option = [...el.options].find((o) => o.value && !o.disabled);
+        if (option) {
+          el.value = option.value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          done.push({ field: key.trim(), value: option.value });
+        }
+        continue;
+      }
+      if (el.type === "email" || /email/.test(key)) value = creds.email;
+      else if (el.type === "password" || /password/.test(key)) value = creds.password;
+      else if (/slug/.test(key)) value = creds.orgSlug;
+      else if (/domain|host/.test(key)) value = creds.domain;
+      else if (/org/.test(key)) value = creds.org;
+      else if (/site.*key|key.*site|^setup-site-key/.test(key)) value = creds.siteKey;
+      else if (/site/.test(key)) value = creds.site;
+      else if (/name/.test(key)) value = creds.name;
+      else if (el.type === "checkbox") {
+        el.checked = true;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        continue;
+      } else if (el.type === "radio") {
+        if (!el.checked) {
+          el.checked = true;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        continue;
+      } else continue;
+      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+      setter.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      done.push({ field: key.trim().slice(0, 60), value: String(value).slice(0, 40) });
+    }
+    return done;
+  }, CREDS);
+  return filled;
+}
+
+async function primaryClick(page) {
+  // Click the (single) visible submit control of the current step.
+  const candidates = ['form button[type="submit"]', 'button[type="submit"]', "form button", "button"];
+  for (const sel of candidates) {
+    const loc = page.locator(sel).first();
+    if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+      const text = ((await loc.innerText().catch(() => "")) || "").trim().slice(0, 40);
+      await loc.click({ timeout: 5000 }).catch(() => {});
+      return text || sel;
+    }
+  }
+  return null;
+}
+
+/** Click the wizard's action button — matched by label, in the order the wizard presents them. */
+const WIZARD_ACTIONS = [
+  "Use this theme",
+  "Skip and finish",
+  "Create account",
+  "Create organization",
+  "Create site",
+  "Open the panel",
+  "Finish",
+  "Continue",
+  "Next",
+];
+
+async function clickAction(page) {
+  for (const text of WIZARD_ACTIONS) {
+    const loc = page.locator(`button:has-text("${text}")`).first();
+    if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+      await loc.click({ timeout: 5000 }).catch(() => {});
+      return text;
+    }
+  }
+  return primaryClick(page);
+}
+
+async function runWizard(page, report) {
+  log("wizard: detecting first-run state");
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(900);
+  const url = page.url();
+  if (!url.includes("/setup")) {
+    log(`wizard: not in setup (${url}) — installation already exists`);
+    return { ran: false, url };
+  }
+  report.steps.push({ step: 0, url, action: "reached /setup" });
+  await shot(page, "01-setup-step-1");
+  for (let i = 1; i <= 10; i++) {
+    const stepKey = await page
+      .evaluate(() => {
+        if (/Your installation is ready/i.test(document.body.innerText)) return "done";
+        const el = document.querySelector('[data-setup-step][data-step-state="current"]');
+        return el ? el.getAttribute("data-setup-step") : null;
+      })
+      .catch(() => null);
+    if (!stepKey) break;
+    if (stepKey === "done") {
+      await page.locator('button:has-text("Open the panel")').first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(900);
+      report.steps.push({ index: i, action: "open-panel", url: page.url() });
+      break;
+    }
+    if (stepKey === "theme") {
+      const option = page.locator('[data-theme-option][aria-pressed="false"]').first();
+      if ((await option.count()) > 0) await option.click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(250);
+    }
+    const filled = await fillWizardStep(page);
+    const clicked = await clickAction(page);
+    await page.waitForTimeout(1300);
+    const now = page.url();
+    report.steps.push({ index: i, stepKey, filled, clicked, url: now });
+    await shot(page, `0${i + 1}-setup-${stepKey || i}`);
+    const finished = await page
+      .evaluate(() => /Your installation is ready/i.test(document.body.innerText))
+      .catch(() => false);
+    if (finished) {
+      await page.locator('button:has-text("Open the panel")').first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(900);
+      report.steps.push({ index: i, action: "open-panel", url: page.url() });
+      break;
+    }
+    if (!now.includes("/setup")) break;
+  }
+  // "Go to panel" style finish button, if any is still on screen.
+  const finish = page.locator('button:has-text("panel"), a:has-text("panel"), button:has-text("Finish")').first();
+  if ((await finish.count()) > 0 && (await finish.isVisible().catch(() => false))) {
+    await finish.click().catch(() => {});
+    await page.waitForTimeout(900);
+  }
+  return { ran: true };
+}
+
+async function ensureSignedIn(page, report) {
+  // The panel signs the owner in during the wizard; a "Sign in to continue" screen links to the
+  // login form instead. Both paths end with the app shell rendered.
+  const goSignIn = page.locator('a:has-text("Go to sign in"), button:has-text("Go to sign in")').first();
+  if ((await goSignIn.count()) > 0 && (await goSignIn.isVisible().catch(() => false))) {
+    await goSignIn.click().catch(() => {});
+    await page.waitForTimeout(800);
+  }
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(800);
+  if (!/\/login|\/setup/.test(page.url()) && (await page.locator('nav[aria-label="Sections"]').count()) > 0) {
+    return true; // already signed in — the wizard created the session
+  }
+  if (!/\/login/.test(page.url())) {
+    await page.goto(`${URL_ADMIN}/login`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(700);
+  }
+  const email = page.locator('input[type="email"], input[name="email"], #email').first();
+  if ((await email.count()) === 0) return false;
+  await email.fill(CREDS.email).catch(() => {});
+  const pass = page.locator('input[type="password"], input[name="password"], #password').first();
+  await pass.fill(CREDS.password).catch(() => {});
+  await shot(page, "10-login-filled");
+  const clicked = await primaryClick(page);
+  await page.waitForTimeout(1200);
+  report.steps.push({ action: "login", clicked, url: page.url() });
+  return !/\/login/.test(page.url());
+}
+
+// ---------------------------------------------------------------- interaction
+
+function sampleValueFor(meta) {
+  const key = `${meta.type} ${meta.name} ${meta.label} ${meta.placeholder}`.toLowerCase();
+  if (meta.type === "email" || /e-?mail/.test(key)) return "qa-sample@omnion.test";
+  if (meta.type === "password") return "Sample-Passw0rd!";
+  if (/model/.test(key)) return "gpt-4o-mini\ntext-embedding-3-small";
+  if (/api.?key|secret|token/.test(key)) return "sk-qa-sample-key";
+  if (/^https?:\/\//.test(meta.label) || /example\.com|\.test\/|\/v1/.test(meta.label)) return "https://api.openai.com/v1";
+  if (meta.type === "url" || /url|endpoint|base/.test(key)) return "https://api.openai.com/v1";
+  if (/protocol/.test(key)) return "openai_compatible";
+  if (meta.type === "number" || /port|count|limit/.test(key)) return "42";
+  if (meta.type === "date") return "2026-01-01";
+  if (/slug/.test(key)) return "qa-sample";
+  if (/title/.test(key)) return "QA Sample Page";
+  if (/search|filter|query/.test(key)) return "qa";
+  if (/name|label/.test(key)) return "QA Provider";
+  if (meta.tag === "textarea") return "QA sample text written by the automated walkthrough.";
+  return "QA sample";
+}
+
+async function fillSubtree(page, selector) {
+  return page.evaluate((sel) => {
+    const root = document.querySelector(sel);
+    if (!root) return [];
+    const filled = [];
+    const inputs = [...root.querySelectorAll("input, select, textarea")].filter((el) => el.type !== "hidden" && !el.disabled);
+    for (const el of inputs) {
+      if (el.type === "file") continue;
+      if (el.type === "checkbox" || el.type === "radio") {
+        if (!el.checked) {
+          el.checked = true;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        continue;
+      }
+      if (el.tagName === "SELECT") {
+        const option = [...el.options].find((o) => o.value && !o.disabled);
+        if (option) {
+          el.value = option.value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          filled.push({ field: el.id || el.name || "select", value: option.value });
+        }
+        continue;
+      }
+      const key = `${el.type} ${el.name} ${el.id} ${el.placeholder}`.toLowerCase();
+      let value = "QA sample";
+      if (el.type === "email" || /e-?mail/.test(key)) value = "qa-sample@omnion.test";
+      else if (el.type === "password") value = "Sample-Passw0rd!";
+      else if (el.type === "url" || /url|endpoint/.test(key)) value = "https://api.omnion.test/v1";
+      else if (el.type === "number") value = "42";
+      else if (/slug|key/.test(key)) value = "qa-sample";
+      else if (/title|name/.test(key)) value = "QA Sample";
+      else if (el.tagName === "TEXTAREA") value = "QA sample text written by the automated walkthrough.";
+      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      filled.push({ field: (el.id || el.name || el.type || "input").slice(0, 40), value });
+    }
+    return filled;
+  }, selector);
+}
+
+async function clickPrimaryIn(page, selector) {
+  const loc = page.locator(`${selector} button[type="submit"], ${selector} button`).first();
+  if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+    const text = ((await loc.innerText().catch(() => "")) || "").trim().slice(0, 40);
+    await loc.click({ timeout: 5000 }).catch(() => {});
+    return text;
+  }
+  return null;
+}
+
+async function interact(page, pageName, report) {
+  const inventory = () =>
+    page.evaluate((max) => {
+      const visible = (el) => {
+        const b = el.getBoundingClientRect();
+        if (b.width < 1 || b.height < 1) return false;
+        const s = getComputedStyle(el);
+        return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) > 0.05;
+      };
+      const els = [...document.querySelectorAll('button, a[href], [role="button"], input, select, textarea, summary')]
+        .filter(visible)
+        .slice(0, max);
+      document.querySelectorAll("[data-qa-idx]").forEach((el) => el.removeAttribute("data-qa-idx"));
+      const seen = {};
+      return els.map((el, idx) => {
+        el.setAttribute("data-qa-idx", String(idx));
+        const label = (
+          el.getAttribute("aria-label") ||
+          el.innerText ||
+          el.getAttribute("placeholder") ||
+          el.getAttribute("title") ||
+          ""
+        )
+          .trim()
+          .replace(/\s+/g, " ")
+          .slice(0, 70);
+        const desc = `${el.tagName.toLowerCase()}|${el.getAttribute("type") || ""}|${el.getAttribute("name") || el.id || ""}|${el.getAttribute("href") || ""}|${label}`;
+        seen[desc] = (seen[desc] || 0) + 1;
+        return {
+          key: `${desc}#${seen[desc]}`,
+          idx,
+          tag: el.tagName.toLowerCase(),
+          type: el.getAttribute("type") || "",
+          name: el.getAttribute("name") || el.id || "",
+          label,
+          href: el.getAttribute("href") || "",
+          disabled: Boolean(el.disabled),
+        };
+      });
+    }, MAX_PER_PAGE);
+
+  // Every round re-inventories the page: a navigation or a modal replaces the DOM, so an element
+  // from an earlier round must never be looked up by a stale index. Handled elements are tracked
+  // by a descriptor key instead.
+  const pagePath = new URL(page.url()).pathname;
+  const clickedKeys = new Set();
+  let index = 0;
+  let meta = null;
+  for (let round = 0; round <= MAX_PER_PAGE; round += 1) {
+    if (new URL(page.url()).pathname !== pagePath) {
+      await page.goto(`${URL_ADMIN}${pagePath}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(450);
+    }
+    const items = await inventory();
+    if (round === 0) log(`interact: ${pageName} → ${items.length} elements`);
+    meta = items.find((it) => !clickedKeys.has(it.key)) || null;
+    if (!meta) break;
+    clickedKeys.add(meta.key);
+    const i = meta.idx;
+    const baseUrl = page.url();
+    if (meta.disabled) {
+      record({ page: pageName, i, ...meta, action: "skip", outcome: "disabled" });
+      continue;
+    }
+    if (/\bsign out\b/i.test(meta.label)) {
+      record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signout" });
+      continue;
+    }
+    if (meta.href && /^(mailto:|tel:|javascript:)/i.test(meta.href)) {
+      record({ page: pageName, i, ...meta, action: "skip", outcome: "non-http-href" });
+      continue;
+    }
+
+    index += 1;
+    const before = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
+    const started = Date.now();
+
+    const control = page.locator(`[data-qa-idx="${i}"]`);
+    if (meta.tag === "select") {
+      const picked = await control
+        .selectOption({ index: 1 })
+        .then(() => true)
+        .catch(() => control.selectOption({}).then(() => true).catch(() => false));
+      record({ page: pageName, i, ...meta, action: "select", outcome: picked ? "ok" : "select-failed", ms: Date.now() - started });
+      continue;
+    }
+    if (meta.tag === "input" && (meta.type === "checkbox" || meta.type === "radio")) {
+      const checked = await control.check({ timeout: 3000 }).then(() => true).catch(() => false);
+      record({ page: pageName, i, ...meta, action: "check", outcome: checked ? "ok" : "check-failed", ms: Date.now() - started });
+      continue;
+    }
+    if (["input", "textarea"].includes(meta.tag) && meta.type !== "file") {
+      const value = sampleValueFor(meta);
+      let filled = await control
+        .fill(value, { timeout: 4000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!filled) {
+        // Some inputs (rich editors, hijacked value setters) reject fill(); set the value in-page.
+        filled = await page
+          .evaluate(
+            (idx, val) => {
+              const el = document.querySelector(`[data-qa-idx="${idx}"]`);
+              if (!el) return false;
+              const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              Object.getOwnPropertyDescriptor(proto, "value").set.call(el, val);
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+              return true;
+            },
+            i,
+            value,
+          )
+          .catch(() => false);
+      }
+      record({
+        page: pageName,
+        i,
+        ...meta,
+        action: "fill",
+        value,
+        outcome: filled ? "ok" : "fill-failed",
+        ms: Date.now() - started,
+      });
+      continue;
+    }
+    if (meta.tag === "input" && meta.type === "file") {
+      const file = path.join(OUT, "upload-sample.png");
+      if (!fs.existsSync(file)) {
+        fs.writeFileSync(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAEAAAABAAQMAAACQp+OdAAAAA1BMVEX/AAAAz0kAAAAHUlEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=", "base64"));
+      }
+      const ok = await page
+        .locator(`[data-qa-idx="${i}"]`)
+        .setInputFiles(file)
+        .then(() => true)
+        .catch(() => false);
+      record({ page: pageName, i, ...meta, action: "upload", outcome: ok ? "ok" : "upload-failed" });
+      continue;
+    }
+
+    const popups = [];
+    const onPopup = (p) => popups.push(p);
+    page.context().on("page", onPopup);
+    let clickError = null;
+    try {
+      await page.locator(`[data-qa-idx="${i}"]`).click({ timeout: 4500 });
+    } catch (err) {
+      clickError = String(err.message || err).slice(0, 200);
+    }
+    await page.waitForTimeout(STEP_MS);
+    page.context().off("page", onPopup);
+    for (const p of popups) await p.close().catch(() => {});
+
+    const after = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
+    let outcome = "ok";
+    if (clickError) outcome = "click-error";
+    else if (after.url !== before.url) outcome = "navigated";
+    else if (after.dialogs > before.dialogs) outcome = "dialog";
+    else if (after.console > before.console) outcome = "console-error";
+    else if (after.net > before.net) outcome = "request-failed";
+    else if (popups.length) outcome = "popup";
+
+    const entry = {
+      page: pageName,
+      i,
+      ...meta,
+      action: "click",
+      outcome,
+      url_after: after.url,
+      errors: consoleLog.slice(before.console).map((c) => `${c.type}: ${c.text.slice(0, 120)}`),
+      net: netFailures.slice(before.net).map((n) => `${n.status || "fail"} ${n.url}`),
+      ms: Date.now() - started,
+    };
+    record(entry);
+
+    // Anything that deserves eyes: navigation, dialogs, errors, popups.
+    if (["navigated", "dialog", "console-error", "request-failed", "popup", "click-error"].includes(outcome)) {
+      await shot(page, `click-${pageName}-${index}-${outcome}`, { full: false }).catch?.(() => {});
+    }
+
+    // A modal may have appeared — fill it once and submit.
+    const dialogSel = '[role="dialog"], dialog[open]';
+    const hasForm = await page
+      .evaluate((sel) => {
+        const node = document.querySelector(sel);
+        if (!node) return false;
+        const b = node.getBoundingClientRect();
+        return b.width > 100 && b.height > 60;
+      }, dialogSel)
+      .catch(() => false);
+    if (hasForm) {
+      const filled = await fillSubtree(page, dialogSel);
+      const submitted = await clickPrimaryIn(page, dialogSel);
+      await page.waitForTimeout(700);
+      await shot(page, `form-${pageName}-${index}`);
+      record({
+        page: pageName,
+        i,
+        action: "form",
+        filled,
+        submitted,
+        outcome: submitted ? "submitted" : "filled-only",
+        url_after: page.url(),
+      });
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(200);
+      if (page.url() !== baseUrl) {
+        await page.goto(baseUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForTimeout(400);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- run
+
+async function main() {
+  const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
+  const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
+  const browser = await chromium.launch({
+    executablePath: CHROME,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`],
+  });
+
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
+  const page = await context.newPage();
+  attach(page, "main");
+
+  // Reachable?
+  try {
+    const res = await page.goto(`${URL_ADMIN}/login`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    if (!res || res.status() >= 500) throw new Error(`admin panel responded ${res && res.status()}`);
+  } catch (err) {
+    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err), ...report }, null, 2));
+    console.error(`[walk] FATAL: admin panel unreachable at ${URL_ADMIN}: ${err}`);
+    await browser.close();
+    process.exit(2);
+  }
+
+  await runWizard(page, report);
+  const signedIn = await ensureSignedIn(page, report);
+  report.signedIn = signedIn;
+  if (!signedIn) {
+    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: "could not sign in", ...report }, null, 2));
+    console.error("[walk] FATAL: could not sign in after wizard");
+    await browser.close();
+    process.exit(3);
+  }
+  await shot(page, "11-overview-after-login");
+
+  const routes = [
+    { path: "/", name: "overview" },
+    { path: "/pages", name: "pages" },
+    { path: "/media", name: "media" },
+    { path: "/sites", name: "sites" },
+    { path: "/ai", name: "ai" },
+  ];
+  for (const route of routes) {
+    log(`page: ${route.name}`);
+    await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(900);
+    const diag = await diagnostics(page);
+    await shot(page, `page-${route.name}`);
+    await interact(page, route.name, report);
+    report.pages.push({ ...route, diagnostics: diag });
+  }
+
+  // Sign-out is exercised last so it cannot break the walk.
+  const signOut = page.locator('button:has-text("Sign out")').first();
+  if ((await signOut.count()) > 0) {
+    await signOut.click().catch(() => {});
+    await page.waitForTimeout(1100);
+    report.signOut = { url: page.url(), reachedLogin: /\/login/.test(page.url()) };
+    await shot(page, "90-after-sign-out");
+    const reLogin = await ensureSignedIn(page, report);
+    report.reLogin = reLogin;
+  }
+
+  // Mobile pass.
+  const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  const mpage = await mobile.newPage();
+  attach(mpage, "mobile");
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }]) {
+    await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await mpage.waitForTimeout(800);
+    const diag = await diagnostics(mpage);
+    await shot(mpage, `mobile-${route.name}`);
+    report.mobile.push({ ...route, diagnostics: diag });
+  }
+  await mobile.close();
+
+  // Public renderer — reached through the site's own host so the renderer resolves the site.
+  const webBase = `http://${SITE_HOST}:${new URL(URL_WEB).port || 80}`;
+  try {
+    const wp = await context.newPage();
+    attach(wp, "web");
+    const res = await wp.goto(`${webBase}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await wp.waitForTimeout(1200);
+    await shot(wp, "web-home");
+    const links = await wp.evaluate(() =>
+      [...document.querySelectorAll("a[href]")].map((a) => a.getAttribute("href")).filter((h) => h && !h.startsWith("http")).slice(0, 5)
+    );
+    report.web = { status: res && res.status(), title: await wp.title().catch(() => ""), links, base: webBase };
+    if (links.length) {
+      await wp.goto(`${webBase}${links[0]}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await wp.waitForTimeout(900);
+      await shot(wp, "web-first-link");
+      report.web.firstLink = { href: links[0], url: wp.url(), diagnostics: await diagnostics(wp) };
+    }
+    await wp.close();
+  } catch (err) {
+    report.web = { error: String(err).slice(0, 300) };
+  }
+
+  await browser.close();
+
+  // ------------------------------------------------------------ roll-up
+  const clicks = clickLines.filter((e) => e.action === "click");
+  const findings = [];
+  const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
+
+  for (const p of report.pages) {
+    const d = p.diagnostics;
+    if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
+    if (d.offscreen.length) pushFindings("high", "offscreen", `${p.name}: ${d.offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(d.offscreen[0])}`);
+    if (d.brokenImages.length) pushFindings("high", "broken-image", `${p.name}: ${d.brokenImages.join(", ")}`);
+    if (d.emptyInteractives.length) pushFindings("medium", "unlabeled-control", `${p.name}: ${d.emptyInteractives.length} control(s) with no accessible name`);
+    if (d.unlabeledInputs.length) pushFindings("medium", "unlabeled-input", `${p.name}: ${d.unlabeledInputs.length} input(s) without a label`);
+    if (d.lowContrast.length) pushFindings("medium", "low-contrast", `${p.name}: ${d.lowContrast.length} text node(s) under WCAG AA, e.g. ${JSON.stringify(d.lowContrast[0])}`);
+    if (d.duplicateIds.length) pushFindings("low", "duplicate-id", `${p.name}: duplicate ids ${d.duplicateIds.join(", ")}`);
+    if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
+  }
+  for (const m of report.mobile) {
+    if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
+    if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+  }
+  for (const f of consoleLog.filter((c) => c.type !== "warning")) {
+    const isWeb = f.phase === "web";
+    pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
+  }
+  for (const n of netFailures) {
+    const isWeb = n.phase === "web";
+    pushFindings(isWeb ? "medium" : "high", isWeb ? "web-request" : "request-failed", `${n.phase} ${n.status || "net"} ${n.url} ${n.error || ""}`);
+  }
+  for (const c of clicks.filter((c) => ["click-error", "console-error", "request-failed"].includes(c.outcome))) {
+    pushFindings("high", "click-error", `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${(c.errors || []).join(" | ").slice(0, 200)}`);
+  }
+  if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
+
+  const bySeverity = { high: 0, medium: 0, low: 0 };
+  for (const f of findings) bySeverity[f.severity] += 1;
+
+  const summary = {
+    ...report,
+    counts: {
+      pages: report.pages.length,
+      clicks: clicks.length,
+      filled: clickLines.filter((e) => e.action === "fill").length,
+      forms: clickLines.filter((e) => e.action === "form").length,
+      screenshots: shots.length,
+      consoleErrors: consoleLog.filter((c) => c.type !== "warning").length,
+      warnings: consoleLog.filter((c) => c.type === "warning").length,
+      failedRequests: netFailures.length,
+      dialogs: dialogs.length,
+    },
+    bySeverity,
+    findings,
+    shots,
+    consoleLog,
+    netFailures,
+  };
+  fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 2));
+  fs.writeFileSync(path.join(OUT, "diagnostics.json"), JSON.stringify(report.pages.concat(report.mobile), null, 2));
+
+  const md = [];
+  md.push(`# Omnion QA walkthrough — ${report.startedAt}`);
+  md.push("");
+  md.push(`- Admin: ${URL_ADMIN} · Web: ${URL_WEB}`);
+  md.push(`- Pages walked: ${report.pages.length} · interactions: ${clicks.length} clicks, ${summary.counts.filled} fills, ${summary.counts.forms} form submissions`);
+  md.push(`- Screenshots: ${shots.length} · console errors: ${summary.counts.consoleErrors} · failed requests: ${netFailures.length} · dialogs: ${dialogs.length}`);
+  md.push("");
+  md.push(`## Findings — ${findings.length} (high ${bySeverity.high} · medium ${bySeverity.medium} · low ${bySeverity.low})`);
+  md.push("");
+  for (const sev of ["high", "medium", "low"]) {
+    const rows = findings.filter((f) => f.severity === sev);
+    if (!rows.length) continue;
+    md.push(`### ${sev}`);
+    for (const f of rows) md.push(`- **${f.kind}** — ${f.detail}`);
+    md.push("");
+  }
+  md.push("## Per-page diagnostics");
+  md.push("");
+  for (const p of report.pages) {
+    const d = p.diagnostics;
+    md.push(`- **${p.name}** — overflow: ${d.horizontalOverflow ? "YES" : "no"} · offscreen: ${d.offscreen.length} · broken images: ${d.brokenImages.length} · low contrast: ${d.lowContrast.length} · unlabeled inputs: ${d.unlabeledInputs.length} · duplicate ids: ${d.duplicateIds.length} · h1: ${d.h1Count}`);
+  }
+  md.push("");
+  md.push("## Interaction outcomes");
+  const outcomes = {};
+  for (const c of clicks) outcomes[c.outcome] = (outcomes[c.outcome] || 0) + 1;
+  for (const [k, v] of Object.entries(outcomes).sort((a, b) => b[1] - a[1])) md.push(`- ${k}: ${v}`);
+  md.push("");
+  md.push("## Screenshots");
+  for (const s of shots) md.push(`- ${s.name} — \`${s.file.replace(OUT + "/", "")}\` (${Math.round(s.bytes / 1024)} KB)`);
+  md.push("");
+  fs.writeFileSync(path.join(OUT, "report.md"), md.join("\n"));
+
+  log(`done: ${findings.length} findings (high ${bySeverity.high}), ${clicks.length} clicks, ${shots.length} shots`);
+  console.log(`QA_OUT=${OUT}`);
+  console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length}`);
+}
+
+main().catch(async (err) => {
+  console.error("[walk] unexpected failure:", err);
+  try {
+    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
+  } catch {
+    /* ignore */
+  }
+  process.exit(1);
+});

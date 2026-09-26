@@ -19,6 +19,9 @@ next-env.d.ts
 *.tsbuildinfo
 pnpm-debug.log*
 
+# QA artifacts (screenshots + raw logs stay on disk, never in git)
+qa-artifacts/
+
 # Turbo
 .turbo/
 
