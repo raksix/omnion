@@ -18,7 +18,7 @@ pub mod redis_client;
 pub mod telemetry;
 
 pub use config::{Config, WorkflowConfig};
-pub use db::Db;
+pub use db::{Db, MigrationStatus};
 pub use error::{ConfigError, CoreError, Result};
 pub use redis_client::RedisClient;
 pub use telemetry::Telemetry;

@@ -7,6 +7,7 @@ resolver = "2"
 members = [
     "apps/api",
     "crates/*",
+    "tools/*",
 ]
 
 [workspace.package]
@@ -48,3 +49,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hmac = "0.12"
 percent-encoding = "2"
 bytes = "1"
+
+# The `omnion` command line (tools/cli) reads the first-run password without echoing it.
+rpassword = "7"

@@ -68,6 +68,64 @@ impl Db {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Migration bookkeeping: what the binary embeds, what the database has applied.
+    ///
+    /// `omnion doctor` reports it and `omnion migrate` prints it before and after, so an
+    /// operator can see whether a deployment actually carried its schema with it. A database
+    /// that has never been migrated has no `_sqlx_migrations` table yet — that is "nothing
+    /// applied", not an error.
+    pub async fn migration_status(&self) -> Result<MigrationStatus> {
+        let applied: Vec<i64> = match sqlx::query_scalar::<_, i64>(
+            "select version from _sqlx_migrations where success order by version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(versions) => versions,
+            Err(err) if is_undefined_table(&err) => Vec::new(),
+            Err(err) => return Err(CoreError::Database(err)),
+        };
+
+        let pending = MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| !applied.contains(version))
+            .collect();
+
+        Ok(MigrationStatus { applied, pending })
+    }
+}
+
+/// Migration state of one database, against the migrations this binary embeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationStatus {
+    /// Versions recorded as successfully applied.
+    pub applied: Vec<i64>,
+    /// Versions this binary embeds that the database does not have yet.
+    pub pending: Vec<i64>,
+}
+
+impl MigrationStatus {
+    /// Number of migrations this binary embeds.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        MIGRATOR.iter().count()
+    }
+
+    /// `true` when the database has every embedded migration.
+    #[must_use]
+    pub fn is_up_to_date(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// `true` when PostgreSQL answered `undefined_table` (`42P01`).
+fn is_undefined_table(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "42P01")
 }
 
 fn pool_options(config: &DatabaseConfig) -> PgPoolOptions {
@@ -93,5 +151,25 @@ mod tests {
         let mut config = Config::default();
         config.database.url = "not-a-database".to_owned();
         assert!(Db::connect_lazy(&config.database).is_err());
+    }
+
+    #[test]
+    fn migration_status_knows_the_embedded_migrations() {
+        let status = MigrationStatus {
+            applied: Vec::new(),
+            pending: Vec::new(),
+        };
+        assert!(
+            status.total() >= 7,
+            "the binary embeds at least the seven released migrations, got {}",
+            status.total()
+        );
+        assert!(status.is_up_to_date());
+
+        let behind = MigrationStatus {
+            applied: Vec::new(),
+            pending: vec![7],
+        };
+        assert!(!behind.is_up_to_date());
     }
 }

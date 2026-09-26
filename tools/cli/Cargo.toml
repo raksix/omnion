@@ -1,0 +1,20 @@
+[package]
+name = "omnion-cli"
+description = "The omnion command line: setup, doctor and migrate for a server without a panel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "omnion"
+path = "src/main.rs"
+
+[dependencies]
+rpassword.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+omnion-core = { path = "../../crates/core" }
+omnion-identity = { path = "../../crates/identity" }
+omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-storage = { path = "../../crates/storage" }
