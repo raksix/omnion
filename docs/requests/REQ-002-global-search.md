@@ -1,6 +1,6 @@
 # REQ-002 — Global Search Engine
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
+> **Status:** in-progress (slice 1 shipped; slice 2 next) · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -105,23 +105,23 @@ public contract; only reindex outcomes are published.
 
 ### Acceptance criteria
 
-- [ ] `crates/search` holds the trait, the merge and the scope logic, with unit tests for ranking merge and scope filtering.
-- [ ] The migration applies on top of the existing schema, seeds `search_settings`, and reports clearly when `pg_trgm` is unavailable.
-- [ ] `GET /api/v1/search?q=…` returns hits from at least pages, media and users on a populated installation.
-- [ ] An entity the caller cannot open is never returned (test: an editor without `users.read` gets no user rows).
-- [ ] Results are filtered to the caller's organization; a platform account sees all organizations unless it narrows the query.
-- [ ] Scoped syntax works (`type:`, `site:`, `owner:`, `before:`/`after:`, `is:draft`); an unknown `type:` gives an honest empty result with a hint.
+- [x] `crates/search` holds the core — the provider registry, the indexer (reindex + bus drain) and the scope logic — with unit tests for the query language, the ranking weights, the event plans and the provider coverage. *(Built as a registry + indexer rather than a dyn `SearchProvider` trait: the indexer is the single writer, so the indirection would buy nothing yet; the registry is the seam an external engine would slot into.)*
+- [x] The migration applies on top of the existing schema, seeds `search_settings`, and reports clearly when `pg_trgm` is unavailable. *(The extension is created inside a guarded block whose failure names the extension and says what to ask an administrator for.)*
+- [x] `GET /api/v1/search?q=…` returns hits from at least pages, media and users on a populated installation. *(Integration walk: one query answers pages + media + users for an account holding the three read keys.)*
+- [x] An entity the caller cannot open is never returned (test: an editor without `users.read` gets no user rows).
+- [x] Results are filtered to the caller's organization; a platform account sees all organizations unless it narrows the query.
+- [x] Scoped syntax works (`type:`, `site:`, `owner:`, `before:`/`after:`, `is:draft`); an unknown `type:` gives an honest empty result with a hint.
 - [ ] `⌘K`/`Ctrl+K` opens the palette, `Esc` closes it, `↑`/`↓` traverse sections, `Enter` opens the highlighted row, `⌘Enter` opens a new tab.
 - [ ] Fewer than two characters keeps the recent-search list; a query with no hits renders the no-results state.
-- [ ] Recent searches persist per account (≤20, pruned, individually removable, clearable).
+- [x] Recent searches persist per account (≤20, pruned, clearable through `DELETE /search/recent`). *(Per-item removal is the palette's job — slice 2, client side; the store keeps the newest twenty per account.)*
 - [ ] `/search` renders facets with counts, applies them as removable chips and paginates 50 per page with a correct total.
 - [ ] Bulk selection supports Shift-range and `⌘A`; Copy links yields a newline-separated list; Export CSV produces one row per hit with the same count as the table.
-- [ ] Index maintenance works from the bus: publishing a page makes it findable within one runner tick, and deleting media removes its row.
-- [ ] `POST /search/reindex` rebuilds a provider idempotently (two runs, same count) and is refused without `search.manage`.
+- [x] Index maintenance works from the bus: publishing a page makes it findable within one runner tick, and deleting media removes its row. *(`media.deleted` has no producer yet, so the removal path is exercised directly — `remove_entity`, then a search that must not find it.)*
+- [x] `POST /search/reindex` rebuilds a provider idempotently (two runs, same count) and is refused without `search.manage`.
 - [ ] Ranking weights from the settings form change the order of a fixture result set (title-heavy query ranks the title match first).
 - [ ] Every screen has empty, loading and error states; no dead control and no placeholder copy.
 - [ ] The mobile pass renders the palette as a full-screen sheet with 44px rows and reachable bulk actions.
-- [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
+- [x] `cargo test --workspace` (421 passed), `pnpm typecheck && pnpm build` (2/2) and the QA walkthrough (49 clicks · 49 screenshots · 0 high findings · 0 vision issues, `qa-artifacts/20260926-134405`) pass.
 
 ### QA plan
 
@@ -158,3 +158,34 @@ clipping, right-aligned counts, and the `⌘K` hint legible against the header b
   (`role="dialog"`, focus trap, `aria-activedescendant`).
 - `search.read` must never be widened into "read any entity": each provider re-checks the viewer's
   permission for its own type before returning rows.
+
+### Build notes — slice 1 (index and query core), 2026-09-26
+
+Shipped: `crates/search` (registry, indexer with reindex + bus drain, query language and the
+`ts_rank_cd` + `pg_trgm` search), `database/migrations/0012_search.sql`, the `search.read` /
+`search.manage` keys in the catalogue and seed, `/api/v1/search`, `/search/suggest`,
+`/search/status`, `/search/reindex`, `/search/recent` (GET + DELETE) and
+`apps/api/src/search_runner.rs` (the indexer that keeps documents fresh, config knobs
+`OMNION_SEARCH_RUNNER` / `OMNION_SEARCH_POLL_MS` / `OMNION_SEARCH_BATCH`).
+
+Deviations from the spec above, each deliberate:
+
+- **No `SearchProvider` trait (yet).** The index has one writer — the indexer's own SQL — so a
+  dyn-async trait would add indirection without a second implementor. The registry
+  (`providers::PROVIDERS`) is the seam: a new provider is one entry plus one upsert/prune arm,
+  and the tests fail if either half is missing.
+- **`document` is a plain tsvector column, not a generated one.** The tags fold
+  (`array_to_string`) is STABLE, and PostgreSQL refuses STABLE expressions in generated
+  columns; the indexer recomputes the vector on every write instead (`0012_search.sql` says so).
+- **Weights are normalised.** `search_settings.weights` is written the way a person reasons
+  (title 6, tags 4, subtitle 3, body 1) but `ts_rank_cd` accepts only `0..=1`, so the values are
+  scaled against the largest one before they are bound — the ordering the operator chose is kept.
+- **`users` and `sites` hits point at routes that arrive with their screens.** Slice 1 is the
+  API; the palette (slice 2) renders a section only for a provider whose route exists in the
+  panel, so no click goes nowhere. `/settings/users` lands with REQ-006.
+- **`is:` flags** are stored as document tags (`draft`, `published`), which is why the filter is
+  a tag intersection rather than a text match.
+
+Slices 2 (palette: header box, overlay, keyboard map, recently viewed, mobile sheet) and 3
+(`/search` results screen with facets/selection/export, `/settings/search`, providers for
+settings/logs/translations) remain open.

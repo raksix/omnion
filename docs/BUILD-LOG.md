@@ -785,3 +785,41 @@
   `pnpm build` → 2 successful · `/healthz` 200 · `/readyz` database+redis ok · `omnion doctor` 6/6.
 - Next: **P15+ — REQ-driven queue** (`docs/requests/REQ-XXX`, owner steers priority; suggested first
   REQ-016 webhooks centre → REQ-002 command centre). The foundation phases P00–P14 are complete.
+
+## 2026-09-26 — REQ-002 · Global search (slice 1: the index and the query core)
+
+- The platform's search is an **index**, not a scatter of per-table queries: `crates/search` owns a
+  provider registry (pages, media, users, sites — one entry each: key, document type, the read
+  permission its hits require, the panel route a hit opens), an indexer that writes one
+  `search_documents` row per searchable thing (`database/migrations/0012_search.sql`), and a query
+  engine that narrows by organization, by the caller's provider permissions and by the scoped
+  syntax (`type:`, `site:`, `owner:me`, `before:`/`after:`, `is:draft`) inside the SQL — never
+  after paging. Ranking is `ts_rank_cd` over the document vector (title A / tags B / subtitle C /
+  body D) with the installation's weights (normalised into the range PostgreSQL accepts) plus a
+  `pg_trgm` prefix and near-miss match.
+- The index keeps itself fresh from the bus: `apps/api/src/search_runner.rs` walks the events
+  above a cursor row (`for update skip locked`) and applies each one to its provider;
+  `POST /api/v1/search/reindex` rebuilds a provider (or all) idempotently — upsert plus prune, so
+  a second pass writes the same count — and leaves an audit row and a `search.reindexed` event.
+  The API surface is `/api/v1/search` (ranked hits, per-provider counts, honest hints),
+  `/search/suggest` (title prefixes), `/search/status` and `/search/recent` (GET/DELETE). Two new
+  permission keys: `search.read` (the box; every base role holds it) and `search.manage` (index
+  operations).
+- Proof: `cargo fmt --all -- --check` → clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` → clean · `cargo test --workspace` → **421 passed, 0 failed (44 suites)**, including
+  the new `apps/api/tests/search.rs` (8 walks: hits across pages + media + users for a librarian
+  while an editor without `users.read` gets none; tenancy scope with a platform owner reading
+  across organizations; the scoped syntax with an unknown `type:` answering empty *and explained*;
+  publishing a page becoming findable within one indexer tick; a reindex idempotent twice over;
+  the media removal branch; suggestions; the search history; four refusals) · `pnpm typecheck &&
+  pnpm build` → 2/2 successful · `bash scripts/qa/run.sh` → 49 clicks, 49 screenshots, **0 high
+  findings, 0 vision issues** (`qa-artifacts/20260926-134405`).
+- Deviations from the spec, each deliberate and recorded in the REQ: no dyn `SearchProvider` trait
+  (the registry is the seam and the indexer is the single writer), `document` is a plain tsvector
+  column (`array_to_string` is STABLE, and generated columns refuse STABLE expressions), weights
+  are normalised (`ts_rank_cd` accepts only 0..=1), and the `users`/`sites` hits point at routes
+  that arrive with REQ-006 — slice 2 renders a section only for a provider whose route exists, so
+  no click goes nowhere.
+- Next: **REQ-002 slice 2 — the palette** (header search box, ⌘K overlay, sections by hit count,
+  keyboard map, recently viewed, all states, mobile sheet), then slice 3 (`/search` results screen
+  with facets/selection/export, `/settings/search`).

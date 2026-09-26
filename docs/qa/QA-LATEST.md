@@ -1,6 +1,6 @@
 # Omnion QA — latest pass
 
-- When: 2026-09-26T12:57:21.151Z · artifacts: `qa-artifacts/20260926-125712`
+- When: 2026-09-26T13:44:13.955Z · artifacts: `qa-artifacts/20260926-134405`
 - Interactions: 49 clicks · 8 field fills · 0 form submissions · 49 screenshots
 - Console errors: 3 · failed requests: 2 · dialogs: 1
 - Programmatic findings: 5 (high 0 · medium 5 · low 0)
