@@ -578,6 +578,75 @@ export function clearRecentSearches(): Promise<null> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Command centre (docs/requests/REQ-032)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One command the palette may offer. The list arrives already projected through the caller's
+ * effective permissions, so the panel never has to decide what an account may run.
+ */
+export type CommandInfo = {
+  id: string;
+  title: string;
+  group: string;
+  hint: string;
+  icon: string;
+  route: string;
+  keywords: string[];
+  aliases: string[];
+  permission: string | null;
+};
+
+/** One row of the account's own palette history — a search or a command. */
+export type CommandRecent = {
+  kind: "query" | "command";
+  query: string | null;
+  command_id: string | null;
+  /** A command recent carries its current title and route, so the row renders without a lookup. */
+  title: string | null;
+  route: string | null;
+  result_count: number | null;
+  created_at: string;
+};
+
+/** The commands this account may run, in registry order. */
+export async function fetchCommands(): Promise<CommandInfo[]> {
+  const body = await request<{ commands: CommandInfo[] }>("/api/v1/commands");
+  return body.commands;
+}
+
+/** The commands worth suggesting on the route the caller is on. */
+export async function fetchCommandContext(route: string): Promise<CommandInfo[]> {
+  const body = await request<{ commands: CommandInfo[] }>(
+    `/api/v1/command-center/context?route=${encodeURIComponent(route)}`,
+  );
+  return body.commands;
+}
+
+/** The account's own recent searches and commands, newest first. */
+export async function fetchCommandRecents(): Promise<CommandRecent[]> {
+  const body = await request<{ items: CommandRecent[] }>("/api/v1/command-center/recent");
+  return body.items;
+}
+
+/** Remember one search or one command for this account; repeating one moves it up. */
+export function recordCommandRecent(
+  input:
+    | { kind: "query"; query: string; result_count?: number }
+    | { kind: "command"; command_id: string },
+): Promise<null> {
+  return request<null>("/api/v1/command-center/recent", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Forget everything this account did in the palette. */
+export function clearCommandRecents(): Promise<null> {
+  return request<null>("/api/v1/command-center/recent", { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------------------------
 // AI Hub (docs/06-AI-HUB.md, P11)
 // ---------------------------------------------------------------------------------------------
 
