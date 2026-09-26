@@ -1,6 +1,6 @@
 # REQ-002 — Global Search Engine
 
-> **Status:** done · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
+> **Status:** done (f813e0d…f098d31) · **Captured:** 2026-09-25 · **Layer:** core (`crates/search`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
