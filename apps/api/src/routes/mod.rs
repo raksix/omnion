@@ -302,6 +302,13 @@ pub fn router(state: AppState) -> Router {
     let search_suggest = get(search::suggest).layer(guards::require(&state, "search.read"));
     let search_status = get(search::status).layer(guards::require(&state, "search.read"));
     let search_reindex = post(search::reindex).layer(guards::require(&state, "search.manage"));
+    // Exporting is reading: the file holds exactly the rows the same caller may already see.
+    let search_export = get(search::export).layer(guards::require(&state, "search.read"));
+    // Reading the settings is `search.read`; changing them is the separate `search.manage`, so
+    // the two halves carry their own guards.
+    let search_settings_read = get(search::settings).layer(guards::require(&state, "search.read"));
+    let search_settings_write =
+        put(search::save_settings).layer(guards::require(&state, "search.manage"));
     // The caller's own history: session-scoped by construction — it needs no permission of its
     // own beyond being signed in.
     let search_recent = get(search::recent).merge(delete(search::clear_recent));
@@ -314,6 +321,11 @@ pub fn router(state: AppState) -> Router {
         .route("/search/suggest", search_suggest)
         .route("/search/status", search_status)
         .route("/search/reindex", search_reindex)
+        .route("/search/export", search_export)
+        .route(
+            "/search/settings",
+            search_settings_read.merge(search_settings_write),
+        )
         .route("/search/recent", search_recent)
         .route(
             "/iam/permissions",

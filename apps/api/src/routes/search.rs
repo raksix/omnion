@@ -20,7 +20,8 @@ use omnion_permissions::effective_permissions;
 use omnion_search::indexer;
 use omnion_search::providers;
 use omnion_search::query::{
-    self, DEFAULT_PER_PAGE, HitPage, MAX_PER_PAGE, Query as SearchQuery, SearchRequest, Sort,
+    self, DEFAULT_PER_PAGE, HitPage, MAX_PER_PAGE, Query as SearchQuery, SearchFilters,
+    SearchRequest, Sort, UpdatedRange,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,7 +38,10 @@ use crate::state::AppState;
 // Request shapes
 // ---------------------------------------------------------------------------------------------
 
-/// Query string of `GET /api/v1/search`.
+/// Query string of `GET /api/v1/search` (and of `/search/export`, which accepts the same set).
+///
+/// The text lives in `q` — including the scoped syntax a person can type — while every filter the
+/// facet rail applies has its own parameter, so a result set is a URL and a link is a filter.
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
     /// The query text, including the scoped syntax (`type:page site:acme is:draft`).
@@ -48,6 +52,34 @@ pub struct SearchParams {
     pub per_page: Option<i64>,
     /// `relevance` (default), `newest` or `title`.
     pub sort: Option<String>,
+    /// Comma-separated provider keys or entity types (`pages,media`).
+    pub types: Option<String>,
+    /// A site id, key or domain host.
+    pub site_id: Option<String>,
+    /// `me`, or the uuid of one account.
+    pub owner: Option<String>,
+    /// An exact language code (`en`, `tr`).
+    pub language: Option<String>,
+    /// One status tag (`draft`, `published`, `archived`).
+    pub status: Option<String>,
+    /// `today`, `week`, `month`, `older` or `never`.
+    pub updated: Option<String>,
+    /// Exclusive upper bound on the last change (`YYYY-MM-DD`).
+    pub before: Option<String>,
+    /// Inclusive lower bound on the last change (`YYYY-MM-DD`).
+    pub after: Option<String>,
+    /// `true` asks for the facet rail's counts next to the hits.
+    pub facets: Option<String>,
+}
+
+/// Query string of `GET /api/v1/search/export`: the search parameters plus an optional selection.
+#[derive(Debug, Deserialize)]
+pub struct ExportParams {
+    /// Everything `GET /api/v1/search` accepts.
+    #[serde(flatten)]
+    pub search: SearchParams,
+    /// `provider:entity_type:entity_id` keys, comma-separated — export exactly these hits.
+    pub selected: Option<String>,
 }
 
 /// Query string of `GET /api/v1/search/suggest`.
@@ -83,6 +115,8 @@ pub struct HitBody {
     pub subtitle: String,
     /// Panel route a click opens.
     pub url: String,
+    /// Display name of the account the entity belongs to, when it has one.
+    pub owner: Option<String>,
     /// Tags stored with the document.
     pub tags: Vec<String>,
     /// When the entity last changed, RFC 3339.
@@ -101,9 +135,53 @@ impl From<query::Hit> for HitBody {
             title: hit.title,
             subtitle: hit.subtitle,
             url: hit.url,
+            owner: hit.owner,
             tags: hit.tags,
             updated_at: hit.entity_updated_at,
             score: hit.score,
+        }
+    }
+}
+
+/// One value of a facet rail.
+#[derive(Debug, Serialize)]
+pub struct FacetValueBody {
+    /// The machine value (`pages`, a uuid, `draft`, `week`).
+    pub value: String,
+    /// The human label.
+    pub label: String,
+    /// Hits this value would leave under every other filter.
+    pub count: i64,
+}
+
+/// One group of the facet rail.
+#[derive(Debug, Serialize)]
+pub struct FacetGroupBody {
+    /// Stable key (`type`, `site`, `owner`, `language`, `status`, `updated`).
+    pub key: &'static str,
+    /// Title the rail shows.
+    pub title: &'static str,
+    /// The values, strongest first.
+    pub values: Vec<FacetValueBody>,
+    /// How many further values exist beyond the ones listed.
+    pub more: i64,
+}
+
+impl From<query::FacetGroup> for FacetGroupBody {
+    fn from(group: query::FacetGroup) -> Self {
+        Self {
+            key: group.key,
+            title: group.title,
+            values: group
+                .values
+                .into_iter()
+                .map(|value| FacetValueBody {
+                    value: value.value,
+                    label: value.label,
+                    count: value.count,
+                })
+                .collect(),
+            more: group.more,
         }
     }
 }
@@ -144,6 +222,9 @@ pub struct SearchResponse {
     pub per_page: i64,
     /// Which provider contributed how many (ordered by count).
     pub counts: Vec<CountBody>,
+    /// The facet rail's counts; only answered when `facets=true` was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<Vec<FacetGroupBody>>,
     /// How long the search took, in milliseconds.
     pub took_ms: u64,
 }
@@ -173,6 +254,38 @@ pub struct RecentResponse {
     pub queries: Vec<String>,
 }
 
+/// One reindex pass as the status screen reads it.
+#[derive(Debug, Serialize)]
+pub struct ReindexRunBody {
+    /// Documents the pass wrote, when it finished.
+    pub indexed: Option<i64>,
+    /// Documents the pass pruned, when it finished.
+    pub pruned: Option<i64>,
+    /// Wall time, in milliseconds.
+    pub duration_ms: Option<i64>,
+    /// When the pass started, RFC 3339.
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    /// When it finished; `null` while it is running.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+}
+
+impl From<query::ReindexRun> for ReindexRunBody {
+    fn from(run: query::ReindexRun) -> Self {
+        Self {
+            indexed: run.indexed,
+            pruned: run.pruned,
+            duration_ms: run.duration_ms,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            error: run.error,
+        }
+    }
+}
+
 /// One provider's line on the status screen.
 #[derive(Debug, Serialize)]
 pub struct StatusBody {
@@ -185,8 +298,10 @@ pub struct StatusBody {
     /// When its rows were last written, RFC 3339.
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_indexed_at: Option<OffsetDateTime>,
-    /// `ready` when the provider has rows, `empty` when it has none yet.
+    /// `indexing`, `failed`, `stale`, `ready` or `empty`.
     pub state: &'static str,
+    /// The most recent pass, when one ever ran.
+    pub last_run: Option<ReindexRunBody>,
 }
 
 /// Answer of `GET /api/v1/search/status`.
@@ -196,6 +311,78 @@ pub struct StatusResponse {
     pub providers: Vec<StatusBody>,
     /// Documents across every provider.
     pub documents: i64,
+}
+
+/// The ranking weights as the settings screen writes them.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WeightsBody {
+    /// Weight of a title match.
+    pub title: i32,
+    /// Weight of a tag match.
+    pub tags: i32,
+    /// Weight of a subtitle match.
+    pub subtitle: i32,
+    /// Weight of a body match.
+    pub body: i32,
+}
+
+impl From<query::Weights> for WeightsBody {
+    fn from(weights: query::Weights) -> Self {
+        Self {
+            title: weights.title,
+            tags: weights.tags,
+            subtitle: weights.subtitle,
+            body: weights.body,
+        }
+    }
+}
+
+/// Answer of `GET /api/v1/search/settings`.
+#[derive(Debug, Serialize)]
+pub struct SettingsResponse {
+    /// The stored ranking weights.
+    pub weights: WeightsBody,
+    /// The weights an installation starts with, so "restore defaults" is the server's own answer.
+    pub defaults: WeightsBody,
+    /// Provider keys that answer a query, in registry order.
+    pub enabled_providers: Vec<String>,
+    /// Every provider key this build knows, in registry order.
+    pub available_providers: Vec<String>,
+    /// When the row was last written, RFC 3339.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+impl SettingsResponse {
+    /// Build the answer from a stored settings value.
+    #[must_use]
+    pub fn from_settings(settings: query::SearchSettings) -> Self {
+        let available: Vec<String> = providers::provider_keys()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let enabled = available
+            .iter()
+            .filter(|key| settings.enabled_providers.contains(key))
+            .cloned()
+            .collect();
+        Self {
+            weights: settings.weights.into(),
+            defaults: query::DEFAULT_WEIGHTS.into(),
+            enabled_providers: enabled,
+            available_providers: available,
+            updated_at: settings.updated_at,
+        }
+    }
+}
+
+/// Body of `PUT /api/v1/search/settings`.
+#[derive(Debug, Deserialize)]
+pub struct SaveSettingsBody {
+    /// The ranking weights to store.
+    pub weights: WeightsBody,
+    /// The provider keys that should answer a query.
+    pub enabled_providers: Vec<String>,
 }
 
 /// One provider's reindex result.
@@ -228,27 +415,11 @@ pub async fn search(
     current: CurrentSession,
     QueryParams(params): QueryParams<SearchParams>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    let query = SearchQuery::parse(params.q.as_deref().unwrap_or_default()).map_err(|_| {
-        ApiError::bad_request(
-            "query_required",
-            "the \"q\" query parameter must carry at least one non-space character",
-        )
-    })?;
-    let sort = parse_sort(params.sort.as_deref())?;
-    let providers = readable_providers(&state, &current).await?;
-
-    let request = SearchRequest {
-        query,
-        providers,
-        organization_id: current.user.organization_id,
-        user_id: current.user.id,
-        page: params.page.unwrap_or(1).max(1),
-        per_page: params
-            .per_page
-            .unwrap_or(DEFAULT_PER_PAGE)
-            .clamp(1, MAX_PER_PAGE),
-        sort,
-    };
+    let request = search_request(&state, &current, &params).await?;
+    let wants_facets = params
+        .facets
+        .as_deref()
+        .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "true" | "1" | "yes"));
 
     let started = std::time::Instant::now();
     let HitPage { hits, total } = query::search(state.db().pool(), &request).await?;
@@ -262,6 +433,17 @@ pub async fn search(
         );
     }
     let counts = query::counts(state.db().pool(), &request).await?;
+    let facets = if wants_facets {
+        Some(
+            query::facets(state.db().pool(), &request)
+                .await?
+                .into_iter()
+                .map(FacetGroupBody::from)
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     let counts = counts
         .into_iter()
@@ -287,8 +469,210 @@ pub async fn search(
         page: request.page,
         per_page: request.per_page,
         counts,
+        facets,
         took_ms: started.elapsed().as_millis() as u64,
     }))
+}
+
+/// How many hits one export may carry before it is truncated.
+pub const EXPORT_MAX_ROWS: i64 = 5_000;
+
+/// How many hits one export page holds while it walks the result set.
+const EXPORT_PAGE: i64 = 500;
+
+/// Export the current query as CSV — one row per hit, in the answer's own order.
+///
+/// With `selected=` the file holds exactly the rows the caller picked (the results screen sends
+/// them when a selection exists); without it, the whole result set, walked in pages up to
+/// [`EXPORT_MAX_ROWS`]. The count is a header the screen can check against, because a silent
+/// truncation would make the file lie about the result set.
+pub async fn export(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    QueryParams(params): QueryParams<ExportParams>,
+) -> Result<axum::response::Response, ApiError> {
+    let request = search_request(&state, &current, &params.search).await?;
+    let selected = parse_selection(params.selected.as_deref())?;
+
+    let mut rows: Vec<query::Hit> = Vec::new();
+    let mut page = request.page.max(1);
+    loop {
+        let mut paged = request.clone();
+        paged.page = page;
+        paged.per_page = EXPORT_PAGE;
+        let answer = query::search(state.db().pool(), &paged).await?;
+        let fetched = answer.hits.len() as i64;
+        rows.extend(answer.hits);
+        let exhausted = fetched < EXPORT_PAGE || rows.len() as i64 >= EXPORT_MAX_ROWS;
+        if exhausted || rows.len() as i64 >= EXPORT_MAX_ROWS {
+            break;
+        }
+        page += 1;
+    }
+
+    // A selection filters the walked rows, so the file matches what the screen showed as checked.
+    if let Some(selected) = &selected {
+        rows.retain(|hit| {
+            selected.contains(&format!(
+                "{}:{}:{}",
+                hit.provider, hit.entity_type, hit.entity_id
+            ))
+        });
+    }
+
+    let truncated = request.query.has_terms() && rows.len() as i64 > EXPORT_MAX_ROWS;
+    if rows.len() as i64 > EXPORT_MAX_ROWS {
+        rows.truncate(EXPORT_MAX_ROWS as usize);
+    }
+
+    let mut body = String::from("title,type,provider,owner,updated,tags,url,subtitle\n");
+    for hit in &rows {
+        let updated = hit
+            .entity_updated_at
+            .map(|at| at.date().to_string())
+            .unwrap_or_default();
+        body.push_str(
+            &[
+                csv_field(&hit.title),
+                csv_field(&hit.entity_type),
+                csv_field(&hit.provider),
+                csv_field(hit.owner.as_deref().unwrap_or_default()),
+                csv_field(&updated),
+                csv_field(&hit.tags.join(" ")),
+                csv_field(&hit.url),
+                csv_field(&hit.subtitle),
+            ]
+            .join(","),
+        );
+        body.push('\n');
+    }
+
+    let filename = format!(
+        "omnion-search-{}.csv",
+        time::OffsetDateTime::now_utc().date()
+    );
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "text/csv; charset=utf-8".to_owned(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        ),
+        (
+            axum::http::HeaderName::from_static("x-export-rows"),
+            rows.len().to_string(),
+        ),
+        (
+            axum::http::HeaderName::from_static("x-export-truncated"),
+            truncated.to_string(),
+        ),
+    ];
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    for (name, value) in headers {
+        if let Ok(value) = value.parse() {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    Ok(response)
+}
+
+/// One CSV field: quoted when it has to be, with inner quotes doubled (RFC 4180).
+#[must_use]
+pub fn csv_field(value: &str) -> String {
+    let needs_quotes = value
+        .chars()
+        .any(|ch| matches!(ch, ',' | '"' | '\n' | '\r'))
+        || value.starts_with(' ')
+        || value.ends_with(' ');
+    if !needs_quotes {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Parse the `selected=` list into the set of row keys it names.
+fn parse_selection(
+    raw: Option<&str>,
+) -> Result<Option<std::collections::HashSet<String>>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let keys: std::collections::HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    // A key is `provider:entity_type:entity_id` — anything else is a client mistake worth naming.
+    for key in &keys {
+        if key.split(':').count() != 3 {
+            return Err(ApiError::bad_request(
+                "invalid_selection",
+                "selected must be a comma-separated list of provider:entity_type:entity_id keys",
+            ));
+        }
+    }
+    Ok(Some(keys))
+}
+
+/// The installation's search settings.
+pub async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+    let settings = query::read_settings(state.db().pool()).await?;
+    Ok(Json(SettingsResponse::from_settings(settings)))
+}
+
+/// Save the ranking weights and the enabled providers.
+pub async fn save_settings(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<SaveSettingsBody>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let settings = query::SearchSettings {
+        weights: query::Weights {
+            title: body.weights.title,
+            tags: body.weights.tags,
+            subtitle: body.weights.subtitle,
+            body: body.weights.body,
+        },
+        enabled_providers: body
+            .enabled_providers
+            .iter()
+            .map(|key| key.trim().to_lowercase())
+            .filter(|key| !key.is_empty())
+            .collect(),
+        updated_at: None,
+    };
+
+    if let Err(error) = query::validate_settings(&settings) {
+        return Err(ApiError::bad_request(error.code(), error.to_string()));
+    }
+
+    let stored = query::write_settings(state.db().pool(), &settings).await?;
+
+    omnion_audit::record(
+        state.db().pool(),
+        NewAuditEntry::by_user(current.user.id, "search.settings.updated")
+            .target("search_settings", "1")
+            .metadata(json!({
+                "weights": {
+                    "title": stored.weights.title,
+                    "tags": stored.weights.tags,
+                    "subtitle": stored.weights.subtitle,
+                    "body": stored.weights.body,
+                },
+                "enabled_providers": stored.enabled_providers,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(SettingsResponse::from_settings(stored)))
 }
 
 /// Title-prefix suggestions for the palette's first paint.
@@ -346,6 +730,7 @@ pub async fn status(
                 documents: line.documents,
                 last_indexed_at: line.last_indexed_at,
                 state: line.state,
+                last_run: line.last_run.map(ReindexRunBody::from),
             })
             .collect(),
         documents,
@@ -479,16 +864,135 @@ fn parse_sort(raw: Option<&str>) -> Result<Sort, ApiError> {
     }
 }
 
-/// The providers the caller's own read permissions cover, in registry order.
+/// Turn the query string into the filter set the engine narrows with.
+///
+/// Everything is validated here: an unparsable date or a malformed owner is a `400` naming the
+/// parameter, never a silently ignored filter that makes the screen's chip lie about the results.
+fn filters_from(params: &SearchParams) -> Result<SearchFilters, ApiError> {
+    let mut filters = SearchFilters {
+        types: params
+            .types
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        site: params
+            .site_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        language: params
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        status: params
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        ..SearchFilters::default()
+    };
+
+    if let Some(owner) = params
+        .owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if owner.eq_ignore_ascii_case("me") {
+            filters.owner_me = true;
+        } else {
+            filters.owner_id = Some(Uuid::parse_str(owner).map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_owner",
+                    "owner is either \"me\" or the id of one account",
+                )
+            })?);
+        }
+    }
+
+    if let Some(updated) = params
+        .updated
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        filters.updated = Some(UpdatedRange::parse(updated).ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_updated_range",
+                "updated is one of today, week, month, older or never",
+            )
+        })?);
+    }
+
+    for (name, raw) in [("before", &params.before), ("after", &params.after)] {
+        let Some(raw) = raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let stamp = query::parse_filter_date(raw).ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_date",
+                format!("{name} must be a date written as YYYY-MM-DD"),
+            )
+        })?;
+        if name == "before" {
+            filters.before = Some(stamp);
+        } else {
+            filters.after = Some(stamp);
+        }
+    }
+
+    Ok(filters)
+}
+
+/// Build the engine's request from the query string and the caller's own permissions.
+async fn search_request(
+    state: &AppState,
+    current: &CurrentSession,
+    params: &SearchParams,
+) -> Result<SearchRequest, ApiError> {
+    let query = SearchQuery::parse(params.q.as_deref().unwrap_or_default()).map_err(|_| {
+        ApiError::bad_request(
+            "query_required",
+            "the \"q\" query parameter must carry at least one non-space character",
+        )
+    })?;
+    let sort = parse_sort(params.sort.as_deref())?;
+    let providers = readable_providers(state, current).await?;
+
+    Ok(SearchRequest {
+        query,
+        filters: filters_from(params)?,
+        providers,
+        organization_id: current.user.organization_id,
+        user_id: current.user.id,
+        page: params.page.unwrap_or(1).max(1),
+        per_page: params
+            .per_page
+            .unwrap_or(DEFAULT_PER_PAGE)
+            .clamp(1, MAX_PER_PAGE),
+        sort,
+    })
+}
+
+/// The providers the caller's own read permissions cover **and** the installation has enabled,
+/// in registry order.
 async fn readable_providers(
     state: &AppState,
     current: &CurrentSession,
 ) -> Result<Vec<&'static str>, ApiError> {
     let permissions =
         effective_permissions(state.db().pool(), current.user.id, scope_of(&current.user)).await?;
+    let enabled = query::enabled_providers(state.db().pool()).await?;
     Ok(providers::PROVIDERS
         .iter()
-        .filter(|spec| permissions.allows(spec.permission))
+        .filter(|spec| permissions.allows(spec.permission) && enabled.iter().any(|k| k == spec.key))
         .map(|spec| spec.key)
         .collect())
 }
@@ -503,5 +1007,107 @@ mod tests {
         assert_eq!(parse_sort(Some("newest")).expect("newest"), Sort::Newest);
         let error = parse_sort(Some("sideways")).expect_err("refused");
         assert_eq!(error.code(), "unknown_sort");
+    }
+
+    /// The nine parameters of a results-screen URL, as the wire spells them.
+    fn params(query: &str) -> SearchParams {
+        SearchParams {
+            q: Some(query.to_owned()),
+            page: None,
+            per_page: None,
+            sort: None,
+            types: None,
+            site_id: None,
+            owner: None,
+            language: None,
+            status: None,
+            updated: None,
+            before: None,
+            after: None,
+            facets: None,
+        }
+    }
+
+    #[test]
+    fn filters_read_every_parameter_they_carry() {
+        let mut parameters = params("release");
+        parameters.types = Some("Pages, MEDIA ,,".to_owned());
+        parameters.site_id = Some("acme".to_owned());
+        parameters.owner = Some("me".to_owned());
+        parameters.language = Some("TR".to_owned());
+        parameters.status = Some("draft".to_owned());
+        parameters.updated = Some("week".to_owned());
+        parameters.before = Some("2026-09-01".to_owned());
+        parameters.after = Some("2026-06-01".to_owned());
+
+        let filters = filters_from(&parameters).expect("the filters must parse");
+        assert_eq!(filters.types, vec!["pages".to_owned(), "media".to_owned()]);
+        assert_eq!(filters.site.as_deref(), Some("acme"));
+        assert!(filters.owner_me);
+        assert_eq!(filters.language.as_deref(), Some("TR"));
+        assert_eq!(filters.status.as_deref(), Some("draft"));
+        assert_eq!(filters.updated, Some(UpdatedRange::Week));
+        assert!(filters.before.is_some() && filters.after.is_some());
+    }
+
+    #[test]
+    fn an_unusable_filter_is_named_not_ignored() {
+        let mut bad_owner = params("release");
+        bad_owner.owner = Some("ada".to_owned());
+        assert_eq!(
+            filters_from(&bad_owner).expect_err("refused").code(),
+            "invalid_owner"
+        );
+
+        let mut bad_date = params("release");
+        bad_date.before = Some("soon".to_owned());
+        assert_eq!(
+            filters_from(&bad_date).expect_err("refused").code(),
+            "invalid_date"
+        );
+
+        let mut bad_range = params("release");
+        bad_range.updated = Some("century".to_owned());
+        assert_eq!(
+            filters_from(&bad_range).expect_err("refused").code(),
+            "unknown_updated_range"
+        );
+    }
+
+    #[test]
+    fn csv_fields_quote_only_what_they_must() {
+        assert_eq!(csv_field("Release notes"), "Release notes");
+        assert_eq!(csv_field("Notes, and more"), "\"Notes, and more\"");
+        assert_eq!(csv_field("He said \"hi\""), "\"He said \"\"hi\"\"\"");
+        assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+        assert_eq!(csv_field(" padded "), "\" padded \"");
+    }
+
+    #[test]
+    fn a_selection_must_name_rows_and_nothing_else() {
+        assert!(parse_selection(None).expect("none").is_none());
+        assert!(parse_selection(Some("  ")).expect("blank").is_none());
+        let keys = parse_selection(Some("pages:page:1, media:media:2"))
+            .expect("two keys")
+            .expect("some");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("pages:page:1"));
+        let error = parse_selection(Some("pages:page")).expect_err("refused");
+        assert_eq!(error.code(), "invalid_selection");
+    }
+
+    #[test]
+    fn settings_answers_the_defaults_and_the_catalogue() {
+        let answer = SettingsResponse::from_settings(query::SearchSettings {
+            weights: query::DEFAULT_WEIGHTS,
+            enabled_providers: vec!["pages".to_owned(), "unicorns".to_owned()],
+            updated_at: None,
+        });
+        assert_eq!(answer.weights.title, 6);
+        assert_eq!(answer.weights.body, 1);
+        assert_eq!(answer.defaults.title, 6);
+        // Only known keys are answered, in registry order.
+        assert_eq!(answer.enabled_providers, vec!["pages".to_owned()]);
+        assert_eq!(answer.available_providers.len(), providers::PROVIDERS.len());
     }
 }
