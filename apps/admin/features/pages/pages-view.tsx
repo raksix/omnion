@@ -443,7 +443,9 @@ export function PagesView() {
               <tbody>
                 {pages.map((page) => (
                   <tr key={page.id} className="border-t border-line transition hover:bg-canvas/60">
-                    <td className="px-4 py-3.5">
+                    {/* The page cell is the one that gives: without a bounded flexible column the
+                        table grows to its content and pushes the actions past a phone's edge. */}
+                    <td className="w-full max-w-0 px-4 py-3.5">
                       <span className="flex min-w-0 flex-col leading-tight">
                         <span className="truncate font-medium">{pageTitle(page)}</span>
                         <span className="truncate text-[11.5px] text-muted">
@@ -452,7 +454,7 @@ export function PagesView() {
                       </span>
                     </td>
                     <td className="hidden px-4 py-3.5 text-muted sm:table-cell">{page.page_type}</td>
-                    <td className="px-4 py-3.5">
+                    <td className="px-4 py-3.5 whitespace-nowrap">
                       <StatusBadge status={page.status} />
                     </td>
                     <td className="hidden px-4 py-3.5 whitespace-nowrap text-muted md:table-cell">
