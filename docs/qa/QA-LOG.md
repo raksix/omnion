@@ -67,3 +67,27 @@
 - Lesson: a Next.js dev-only failure mode can look exactly like an app defect — the giveaway is
   the `__next_error__` document plus a `<script>` payload holding the very content that never
   reached the screen. Measure `document.body.innerText`, not the response body.
+
+## 2026-09-26 · pass `20260926-115544` — ISSUE-003 fixed (palette contrast)
+
+- Counters: 49 clicks · 8 field fills · 49 screenshots · 5 programmatic findings
+  (high 0 · medium 5 · low 0) · vision review 14 shots → 8 issues (high 0 · medium 3 · low 5).
+  The contrast findings went 5 → 0; the five that remain are the web root's 404
+  console/request noise (the ISSUE-002 follow-up).
+- Fixed **ISSUE-003** (medium): the palette's text carriers sat one step too light for AA. The
+  terracotta the design language is built on (`#c96442`) is 3.9:1 against white, and both the
+  panel and the theme used it for white-on-fill controls (sidebar badge, every primary button)
+  *and* as link text on the cream canvas (3.7:1); the `accent-strong` / `positive` / `caution`
+  chips measured 4.18–4.36. The admin palette now uses `#b0563a` / `#a34a2b` / `#35704f` /
+  `#8a5d16` and the Minimal theme's accent moved to `#b0563a` (theme patch 0.1.1); every
+  text/fill pair in use is now ≥ 4.7:1.
+- Proof: `20260926-115544` — all 8 walked screens report 0 contrast failures in
+  `diagnostics.json`, the badge is gone from the vision review, and the public renderer still
+  renders (`web-home` / `web-published`: 0 vision issues, published page 200 with its heading).
+- Still open: ISSUE-004 (the Next.js dev badge now dominates the vision list — 7 of 8 findings,
+  medium on three admin screens; `devIndicators: false` is next tick's fix), ISSUE-005 (new,
+  low: a disabled filled button fades to white-on-pale-terracotta and its label is unreadable),
+  and the ISSUE-002 follow-up (publish a `home` page so the root stops answering 404).
+- Lesson: the walkthrough's contrast pass skips an element that has children, so a button whose
+  label sits next to an icon is invisible to it — vision saw what the programmatic pass could
+  not. Compare the two lists before calling a finding unreproducible.

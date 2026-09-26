@@ -53,26 +53,57 @@ cannot do something / the screen is broken, `medium` = visible defect or accessi
   no page with slug `home`. The walkthrough should publish that page too, so the site's front door
   is exercised like any other page and the root stops producing 404 noise.
 
-## ISSUE-003 — Brand badge “O” fails contrast on every screen · medium · open
+## ISSUE-003 — Palette text/fill pairs fail WCAG AA (badge, buttons, chips) · medium · fixed
 
-- **Screen:** all admin screens (sidebar + header)
-- **Evidence:** `findings` of `qa-artifacts/20260926-112300` — 5× `low-contrast`, e.g.
-  `{"text":"O","ratio":3.9,"min":4.5,"fontSize":14}` (white on the accent fill). Same set as the
-  previous pass; the walkthrough's own diagnostics also see `Active`/`Selected`/`Sign in` labels
-  at 4.18–4.26.
-- **Fix direction:** darken the badge background (or enlarge/bolden the letter so it counts as
-  large text) — the badge is the panel's only contrast failure.
+- **Screen:** every admin screen (sidebar badge, primary buttons, chips) and the public
+  renderer's links
+- **Found:** passes `20260926-101942` … `20260926-114713` — 5× `low-contrast`, e.g.
+  `{"text":"O","ratio":3.9,"min":4.5,"fontSize":14}` (white on the accent fill of the sidebar
+  badge). The walkthrough's own diagnostics name the rest of the set: `Selected` 4.18
+  (`accent-strong` on `accent-soft`), `Active` 4.26 (`positive` on `positive-soft`), `Sign in`
+  3.9 (white on the accent fill) and, on the site host, `Back to the home page` 3.7
+  (`--mn-accent` on the cream canvas). One palette, five surfaces.
+- **Root cause:** the terracotta the design language is built on (`#c96442`) is 3.9:1 against
+  white — under AA for text — and both the panel and the theme reused it for text *and* for the
+  fill behind white text.
+- **Fix:** the palette's text carriers moved one step darker; nothing else changed.
+  Admin (`apps/admin/app/globals.css`): `--color-accent #c96442 → #b0563a`,
+  `--color-accent-strong #b0563a → #a34a2b`, `--color-positive #3f7d5c → #35704f`,
+  `--color-caution #96661c → #8a5d16`. Theme (`themes/minimal/styles/minimal.css`):
+  `--mn-accent #c96442 → #b0563a`, with the theme version bumped 0.1.0 → 0.1.1
+  (`omnion.theme.json`, `package.json`). Ratios after the change: white on accent 4.95,
+  accent-strong on accent-soft 4.96, positive on positive-soft 5.11, caution on caution-soft
+  5.03, theme accent on cream 4.70.
+- **Proof:** `qa-artifacts/20260926-115544` — all 8 walked screens report **0** contrast
+  failures in `diagnostics.json` (5 before), the programmatic finding list dropped 10 → 5 (the
+  remaining 5 are the web root's 404 console/request noise, the ISSUE-002 follow-up), and the
+  vision review no longer sees the badge on any screenshot.
 
-## ISSUE-004 — Next.js dev indicator overlaps the sidebar footer · low · open
+## ISSUE-004 — Next.js dev indicator covers the sidebar's “Sign out” row · medium · open
 
-- **Screen:** every admin/web screen in development
-- **Evidence:** `findings/vision.json` of `qa-artifacts/20260926-112300` — a dark “N” badge sits
-  on top of the “Sign out” control on `page-sites`, `click-ai-18-dialog` and `click-ai-2-navigated`
-  (vision rates it medium there, low on `mobile-ai`/`mobile-overview`). It is Next.js' own
-  development indicator, not part of the UI, so it is a `low` defect for the product — but it does
-  obscure a real control while the app runs under `next dev`.
+- **Screen:** every admin/web screen while the stack runs under `next dev`
+- **Evidence:** `findings/vision.json` of `qa-artifacts/20260926-115544` — 7 of that pass's 8
+  vision findings are this badge. It is rated **medium** on `page-overview`, `page-media` and
+  `page-ai` (“covers the start of the text so it reads '…ign out'”) and low on `mobile-ai`,
+  `mobile-overview`, `mobile-pages` and `web-first-link` (a stray “N” floating in the corner).
+  It was hidden behind the contrast noise on earlier passes; with the palette clean it is the
+  only thing the vision review still reports on the admin screens.
 - **Fix direction:** `devIndicators: false` in `apps/admin/next.config.ts` and
-  `apps/web/next.config.ts` (development only; keeps QA screenshots clean).
+  `apps/web/next.config.ts` (development only — the badge is Next.js' own, it is not part of the
+  product, but it obscures a real control and lands in every QA screenshot).
+
+## ISSUE-005 — A disabled filled button keeps white text on a faded fill · low · open
+
+- **Screen:** `/ai` — the “Try it” card's Send button; every `bg-accent … disabled:opacity-60`
+  button follows the same rule
+- **Evidence:** vision of `qa-artifacts/20260926-115544`, `page-ai`: “the Send button uses white
+  text on a pale terracotta background”. `opacity-60` fades the whole control, so the label ends
+  up white-on-light-terracotta (~1.5:1) and unreadable; the button is disabled in the QA fixture
+  because no provider is connected. The walkthrough's contrast pass cannot see it: its rule skips
+  an element that has children, and this button carries an icon *and* a label.
+- **Fix direction:** mute the disabled state instead of fading it — `disabled:bg-quiet-soft
+  disabled:text-muted` (4.79:1) in place of `disabled:opacity-60` on the `bg-accent` buttons.
+  Disabled controls are exempt from WCAG, so this is a UX nit rather than an AA failure.
 
 ## Harness notes (fixed, not app defects)
 
@@ -88,3 +119,7 @@ cannot do something / the screen is broken, `medium` = visible defect or accessi
   defects. The `_next/hmr` WebSocket failures are gone with the originating fix.
 - Screenshots are captured from the QA stack (`omnion_qa` database, pm2 `omnion-qa-*`), so
   findings never depend on hand-made data.
+- The contrast pass skips a text element that has children (an icon next to a label is the common
+  case), so it cannot see every label; vision covers those. Known blind spot that is *not*
+  tracked as an issue yet: `placeholder:text-muted/70` (3.0:1) on the sign-in and wizard inputs —
+  placeholders are not text nodes, so neither pass reports them. Candidate for a polish tick.
