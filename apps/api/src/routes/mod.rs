@@ -46,9 +46,17 @@
 //! is read with `events.read`. Publishing a page records `page.published` and queues a signed
 //! delivery per subscribed endpoint; the worker that sends them lives in `crate::event_runner`.
 //! See `crate::routes::webhooks`.
+//!
+//! The automation surface (`/automations`) is trigger → condition → action (docs/requests/
+//! REQ-003, P13): a rule is a workflow whose trigger is an event, so it rides the workflow
+//! permission keys and the background matcher in `crate::automation_runner` starts one durably
+//! stepped run per match — the same engine P09's manual and scheduled runs use. The vocabulary a
+//! rule is written in is closed and readable at `/automations/catalogue`; the actions that touch
+//! the world live in `omnion-automation` (see `crate::workflow_runner`, which installs them).
 
 pub mod ai;
 pub mod auth;
+pub mod automation;
 pub mod content;
 pub mod health;
 pub mod iam;
@@ -137,6 +145,9 @@ pub fn router(state: AppState) -> Router {
 
     let page_revision =
         get(content::get_revision).layer(guards::require(&state, "content.pages.read"));
+
+    let page_revision_comments =
+        get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read"));
 
     let page_translations =
         get(content::list_translations).layer(guards::require(&state, "content.pages.read"));
@@ -252,6 +263,29 @@ pub fn router(state: AppState) -> Router {
 
     let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
+    // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
+    // read and write powers are the workflow keys the engine already defines — being allowed to
+    // define an automation and being allowed to run it are the same two powers a workflow
+    // carries. The handler checks the tenancy scope through the rule's organization.
+    let automations = get(automation::list_automations)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(
+            post(automation::create_automation).layer(guards::require(&state, "workflows.manage")),
+        );
+
+    let automation_catalogue =
+        get(automation::get_catalogue).layer(guards::require(&state, "workflows.read"));
+
+    let automation_entry = get(automation::get_automation)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(
+            put(automation::update_automation).layer(guards::require(&state, "workflows.manage")),
+        )
+        .merge(
+            delete(automation::delete_automation)
+                .layer(guards::require(&state, "workflows.manage")),
+        );
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -328,7 +362,14 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
         .route("/webhooks/{id}/test", webhook_test)
-        .route("/events", events);
+        .route("/events", events)
+        .route("/automations", automations)
+        .route("/automations/catalogue", automation_catalogue)
+        .route("/automations/{id}", automation_entry)
+        .route(
+            "/pages/{id}/revisions/{revision_id}/comments",
+            page_revision_comments,
+        );
 
     Router::new()
         .route("/healthz", get(health::healthz))

@@ -8,10 +8,17 @@
 //! Nothing here decides what work exists: the store does. A tick that cannot reach the
 //! database is logged and retried on the next one, because the work it left behind is durable
 //! rows, not an in-memory queue.
+//!
+//! The runner also *installs the host actions* (P13): a step whose action is `send_email` or
+//! `comment_revision` is handed to [`omnion_automation::AutomationActions`], which sends through
+//! the configured SMTP server and writes through the content store. Without this the engine
+//! still runs every synthetic action and fails a host action with an honest message.
 
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use omnion_core::config::WorkflowConfig;
+use omnion_automation::{AutomationActions, MailSettings};
+use omnion_core::config::{Config, WorkflowConfig};
 use omnion_workflows::engine::{self, RunnerConfig};
 use time::Duration;
 use tokio::task::JoinHandle;
@@ -34,10 +41,42 @@ pub fn runner_config(config: &WorkflowConfig) -> RunnerConfig {
     }
 }
 
+/// Translate the process configuration into the mail settings the email action uses.
+#[must_use]
+pub fn mail_settings(config: &Config) -> MailSettings {
+    let mail = &config.mail;
+    let mut settings = MailSettings::new(mail.host.clone(), mail.port, mail.from.clone())
+        .with_sending(mail.enabled)
+        .with_timeout(StdDuration::from_millis(mail.timeout_ms.max(1)));
+
+    if let (Some(username), Some(password)) = (&mail.username, &mail.password) {
+        settings = settings.with_credentials(username.clone(), password.clone());
+    }
+
+    settings
+}
+
+/// Build the host action handler of this process.
+#[must_use]
+pub fn action_handler(state: &AppState) -> Arc<AutomationActions> {
+    Arc::new(AutomationActions::new(
+        state.db().pool().clone(),
+        mail_settings(state.config()),
+    ))
+}
+
 /// Start the runner; the returned handle is kept by the binary (and ends with the process).
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
     let config = runner_config(&state.config().workflows);
+    let actions = action_handler(&state);
+
+    if !state.config().mail.is_usable() {
+        tracing::warn!(
+            host = %state.config().mail.host,
+            "platform email is switched off; a `send_email` step will fail with that reason"
+        );
+    }
 
     // `tokio` works in `std` durations; the engine works in `time` durations. The floor keeps
     // a misconfigured tick from spinning the runner.
@@ -67,7 +106,7 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
-                    match engine::tick(state.db().pool(), &config).await {
+                    match engine::tick_with(state.db().pool(), &config, actions.as_ref()).await {
                         Ok(report) if !report.is_idle() => {
                             tracing::debug!(?report, "workflow tick");
                         }

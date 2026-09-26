@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod automation_runner;
 pub mod client_ip;
 pub mod cookies;
 pub mod dto;

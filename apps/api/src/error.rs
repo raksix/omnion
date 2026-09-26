@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use omnion_ai_hub::AiHubError;
 use omnion_audit::AuditError;
+use omnion_automation::AutomationError;
 use omnion_content::ContentError;
 use omnion_core::CoreError;
 use omnion_events::EventsError;
@@ -252,6 +253,33 @@ impl From<ContentError> for ApiError {
                 "this page has no draft revision to publish",
             ),
             other => Self::bad_request("invalid_request", other.to_string()),
+        }
+    }
+}
+
+impl From<AutomationError> for ApiError {
+    fn from(error: AutomationError) -> Self {
+        match error {
+            AutomationError::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            AutomationError::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            AutomationError::Audit(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+            // The automation layer checks the event name, the conditions and the bindings; the
+            // engine checks the trigger, the actions and the steps. Both are the caller's
+            // problem, and both carry the stable code the request should be answered with.
+            AutomationError::Workflows(err) => Self::bad_request(err.code(), err.to_string()),
+            AutomationError::Invalid { code, message } => Self::bad_request(code, message),
         }
     }
 }

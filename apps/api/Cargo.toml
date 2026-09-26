@@ -19,6 +19,7 @@ uuid.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
 omnion-audit = { path = "../../crates/audit" }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
+omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }

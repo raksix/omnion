@@ -17,7 +17,7 @@ use omnion_audit::NewAuditEntry;
 use omnion_content::model::{
     NewPage, NewRevisionTranslation, Page, PageChanges, PageRevision, Translation,
 };
-use omnion_content::{pages, translations};
+use omnion_content::{comments, pages, translations};
 use omnion_events::{NewEvent, bus};
 use omnion_identity::sites::{self, Site};
 use serde::{Deserialize, Serialize};
@@ -502,6 +502,74 @@ pub async fn get_revision(
     let revision = revision_of(&state, page.id, revision_id).await?;
     Ok(Json(RevisionBody::from(&revision)))
 }
+
+/// One comment on a revision, as the panel reads it.
+#[derive(Debug, Serialize)]
+pub struct RevisionCommentBody {
+    /// Comment id.
+    pub id: Uuid,
+    /// Revision the comment is about.
+    pub revision_id: Uuid,
+    /// Account that wrote it; `None` for an automation.
+    pub author_user_id: Option<Uuid>,
+    /// `user` or `automation` — where the note came from.
+    pub source: String,
+    /// The note itself.
+    pub body: String,
+    /// When it was written.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+impl RevisionCommentBody {
+    /// Describe one stored comment.
+    fn build(comment: &comments::RevisionComment) -> Self {
+        Self {
+            id: comment.id,
+            revision_id: comment.revision_id,
+            author_user_id: comment.author_user_id,
+            source: comment.source.clone(),
+            body: comment.body.clone(),
+            created_at: comment.created_at,
+        }
+    }
+}
+
+/// The comments of one revision.
+#[derive(Debug, Serialize)]
+pub struct RevisionCommentsResponse {
+    /// Page the revision belongs to.
+    pub page_id: Uuid,
+    /// Revision the comments are about.
+    pub revision_id: Uuid,
+    /// Comments, oldest first.
+    pub comments: Vec<RevisionCommentBody>,
+}
+
+/// Read the comments of one revision (oldest first).
+///
+/// Comments are written by people (arriving with the review flow) and by automations — the
+/// `comment_revision` action of the automation layer leaves one when a rule fires on an event.
+pub async fn list_revision_comments(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path((page_id, revision_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RevisionCommentsResponse>, ApiError> {
+    let page = page_in_scope(&state, &current, page_id).await?;
+    let revision = revision_of(&state, page.id, revision_id).await?;
+
+    let notes =
+        comments::list_for_revision(state.db().pool(), revision.id, COMMENTS_PAGE_MAX).await?;
+
+    Ok(Json(RevisionCommentsResponse {
+        page_id: page.id,
+        revision_id: revision.id,
+        comments: notes.iter().map(RevisionCommentBody::build).collect(),
+    }))
+}
+
+/// Most comments one revision's list returns.
+const COMMENTS_PAGE_MAX: i64 = 200;
 
 /// Restore an earlier revision: copy it forward as a new draft.
 pub async fn restore_revision(

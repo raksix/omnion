@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_api::{event_runner, workflow_runner};
+use omnion_api::{automation_runner, event_runner, workflow_runner};
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
 use omnion_identity::users::{self, BootstrapOutcome};
@@ -93,6 +93,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     } else {
         tracing::info!("the webhook delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
+    }
+
+    // The automation matcher reads the bus in this process (docs/BUILD-BACKLOG.md P13): each
+    // tick evaluates the events after its durable cursor and starts one run per matching rule —
+    // a run the workflow engine above then advances.
+    if state.config().automation.runner_enabled {
+        let _matcher = automation_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the automation matcher is disabled (OMNION_AUTOMATION_RUNNER=false)");
     }
 
     let app = routes::router(state);
