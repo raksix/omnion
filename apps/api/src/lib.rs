@@ -13,6 +13,7 @@ pub mod dto;
 pub mod error;
 pub mod event_runner;
 pub mod guards;
+pub mod intent_resolver;
 pub mod routes;
 pub mod scope;
 pub mod search_runner;

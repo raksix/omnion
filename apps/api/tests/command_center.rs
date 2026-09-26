@@ -1007,7 +1007,6 @@ async fn a_recent_whose_command_is_out_of_reach_is_not_shown() {
     fixture.cleanup().await;
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Action commands (slice 3): the run endpoint, its confirmation rule and its audit trail
 // ---------------------------------------------------------------------------------------------
@@ -1120,7 +1119,10 @@ async fn an_action_command_runs_through_its_owning_service_and_is_audited() {
         command_run_targets(&fixture.db, owner_id).await,
         vec!["act.reindex-search".to_owned()]
     );
-    assert_eq!(usage_runs(&fixture.db, owner_id, "act.reindex-search").await, 1);
+    assert_eq!(
+        usage_runs(&fixture.db, owner_id, "act.reindex-search").await,
+        1
+    );
     assert_eq!(
         usage_runs(&fixture.db, owner_id, "act.clear-recents").await,
         0,
@@ -1135,7 +1137,10 @@ async fn an_action_command_runs_through_its_owning_service_and_is_audited() {
         2,
         "two runs leave two rows"
     );
-    assert_eq!(usage_runs(&fixture.db, owner_id, "act.reindex-search").await, 2);
+    assert_eq!(
+        usage_runs(&fixture.db, owner_id, "act.reindex-search").await,
+        2
+    );
 
     // The audit entry names the actor, the command (as the target) and the outcome — and never a
     // row of content.
@@ -1176,18 +1181,31 @@ async fn an_action_that_asks_first_never_runs_unconfirmed() {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        response.body
+    );
     assert_eq!(response.body["error"]["code"], "confirmation_required");
 
     let response = run_command(&fixture.state, &owner, "act.reindex-search", false).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        response.body
+    );
     assert_eq!(response.body["error"]["code"], "confirmation_required");
 
     assert!(
         command_run_targets(&fixture.db, owner_id).await.is_empty(),
         "an unconfirmed run leaves no audit row"
     );
-    assert_eq!(usage_runs(&fixture.db, owner_id, "act.reindex-search").await, 0);
+    assert_eq!(
+        usage_runs(&fixture.db, owner_id, "act.reindex-search").await,
+        0
+    );
 
     // The second action asks too — a clear cannot be put back either.
     let response = call(
@@ -1200,7 +1218,12 @@ async fn an_action_that_asks_first_never_runs_unconfirmed() {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        response.body
+    );
     assert_eq!(response.body["error"]["code"], "confirmation_required");
 
     // Confirmed, it runs and leaves exactly one entry.
@@ -1255,7 +1278,12 @@ async fn the_run_endpoint_re_checks_the_commands_own_permission() {
     // The editor writes content but does not manage the index: the endpoint refuses on its own,
     // without trusting the projection the panel received.
     let response = run_command(&fixture.state, &editor, "act.reindex-search", true).await;
-    assert_eq!(response.status, StatusCode::FORBIDDEN, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        response.body
+    );
     assert_eq!(response.body["error"]["code"], "command_not_allowed");
 
     let response = run_command(&fixture.state, &member, "act.reindex-search", true).await;
@@ -1338,13 +1366,176 @@ async fn every_registered_action_command_has_a_service_behind_it() {
     }
 
     // Every action asks before it runs today; the flag is the registry's, not the panel's.
-    for spec in omnion_search::COMMANDS.iter().filter(|spec| spec.is_action()) {
+    for spec in omnion_search::COMMANDS
+        .iter()
+        .filter(|spec| spec.is_action())
+    {
         assert!(
             spec.confirm,
             "{} changes data that cannot be put back, so it asks first",
             spec.id
         );
     }
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Natural-language resolution (slice 4): the reading, its permission filter and its alternatives
+// ---------------------------------------------------------------------------------------------
+
+/// Ask the resolver what one phrase means.
+async fn resolve_phrase(state: &AppState, token: &str, phrase: &str) -> TestResponse {
+    call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/command-center/resolve",
+            Some(token),
+            Some(json!({ "q": phrase })),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_interpretation_says_what_it_understood_and_runs_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+    let owner_id = caller_id(&fixture.state, &owner).await;
+
+    let before = command_run_targets(&fixture.db, owner_id).await;
+
+    let response = resolve_phrase(&fixture.state, &owner, "Open Mehmet's last 10 tickets").await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+
+    // The reading the request's own example describes, in the platform's words.
+    assert_eq!(response.body["intent"]["entity"], "tickets");
+    assert_eq!(response.body["intent"]["kind"], "search");
+    assert_eq!(response.body["intent"]["limit"], 10);
+    assert_eq!(response.body["intent"]["sort"], "newest");
+    assert_eq!(response.body["intent"]["filters"][0]["key"], "assignee");
+    assert_eq!(response.body["intent"]["filters"][0]["value"], "Mehmet");
+    assert_eq!(
+        response.body["preview_text"],
+        "Tickets · assignee: Mehmet · last 10 · newest first"
+    );
+
+    // No panel screen reads a tickets list yet, so the reading says so instead of promising one.
+    assert_eq!(response.body["runnable"], false);
+    assert_eq!(response.body["route"], Value::Null);
+    assert!(
+        response.body["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not something this panel indexes"),
+        "a domain with no screen says so in plain words: {}",
+        response.body["note"]
+    );
+    assert!(
+        !response.body["alternatives"]
+            .as_array()
+            .expect("alternatives")
+            .is_empty(),
+        "an unreadable destination still offers a way out"
+    );
+
+    // Reading a phrase writes no run and no usage: a resolution is not an execution.
+    let after = command_run_targets(&fixture.db, owner_id).await;
+    assert_eq!(
+        before, after,
+        "asking what a phrase means never runs a command"
+    );
+    assert_eq!(
+        usage_runs(&fixture.db, owner_id, "act.reindex-search").await,
+        0
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_interpretation_points_at_screens_the_caller_may_open() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let editor = fixture.editor_token().await;
+
+    // The editor holds `content.pages.read`, so the pages domain is theirs to search.
+    let pages = resolve_phrase(&fixture.state, &editor, "show me the newest pages").await;
+    assert_eq!(pages.status, StatusCode::OK, "body: {}", pages.body);
+    assert_eq!(pages.body["runnable"], true);
+    assert_eq!(pages.body["intent"]["provider"], "pages");
+    assert_eq!(
+        pages.body["route"], "/search?q=pages&type=pages&sort=newest",
+        "a runnable search lands on the results screen with its own filters"
+    );
+
+    // …and the command that opens that screen is offered as itself.
+    let media = resolve_phrase(&fixture.state, &editor, "open media").await;
+    assert_eq!(media.body["intent"]["kind"], "command");
+    assert_eq!(media.body["intent"]["command_id"], "nav.media");
+    assert_eq!(media.body["route"], "/media");
+    assert_eq!(media.body["runnable"], true);
+
+    // The editor does **not** hold `sites.read`: neither the command nor the domain may appear.
+    let sites = resolve_phrase(&fixture.state, &editor, "open sites").await;
+    assert_eq!(sites.status, StatusCode::OK, "body: {}", sites.body);
+    assert_eq!(sites.body["intent"]["command_id"], Value::Null);
+    assert_eq!(sites.body["runnable"], false);
+    let body = sites.body.to_string();
+    assert!(
+        !body.contains("nav.sites"),
+        "a command the caller may not run is not named: {body}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_phrase_the_platform_cannot_read_offers_alternatives_instead_of_a_run() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    let response = resolve_phrase(&fixture.state, &owner, "zzqqxx").await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    assert_eq!(response.body["intent"]["kind"], "unclear");
+    assert_eq!(
+        response.body["runnable"], false,
+        "a phrase nobody can read is not runnable"
+    );
+    let confidence = response.body["intent"]["confidence"]
+        .as_f64()
+        .expect("confidence");
+    assert!(confidence < 0.6, "confidence was {confidence}");
+    assert!(
+        !response.body["alternatives"]
+            .as_array()
+            .expect("alternatives")
+            .is_empty()
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_resolver_refuses_a_phrase_it_cannot_read_in_its_own_words() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+
+    let empty = resolve_phrase(&fixture.state, &owner, "   ").await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(empty.body["error"]["code"], "query_required");
+
+    let long = resolve_phrase(&fixture.state, &owner, &"x".repeat(400)).await;
+    assert_eq!(long.status, StatusCode::BAD_REQUEST);
+    assert_eq!(long.body["error"]["code"], "query_too_long");
 
     fixture.cleanup().await;
 }

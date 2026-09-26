@@ -446,6 +446,177 @@ pub async fn run(
     }))
 }
 
+/// Body of `POST /api/v1/command-center/resolve`.
+///
+/// One phrase, as the operator typed it. The box sends it after a short typing pause; the answer
+/// is an interpretation, never an action.
+#[derive(Debug, Deserialize)]
+pub struct ResolveBody {
+    /// The words typed into the palette.
+    pub q: Option<String>,
+}
+
+/// One filter the interpretation carried, as the card prints it.
+#[derive(Debug, Serialize)]
+pub struct FilterBody {
+    /// Stable key (`assignee`).
+    pub key: &'static str,
+    /// Label the card writes (`assignee`).
+    pub label: &'static str,
+    /// What was filtered on.
+    pub value: String,
+}
+
+/// The interpreted intent, in the pieces the panel renders.
+#[derive(Debug, Serialize)]
+pub struct IntentBody {
+    /// `search`, `command` or `unclear`.
+    pub kind: &'static str,
+    /// The domain word the reader used, if any.
+    pub entity: Option<String>,
+    /// The provider the domain maps to, when the index answers for it.
+    pub provider: Option<&'static str>,
+    /// The registry id a command interpretation named.
+    pub command_id: Option<&'static str>,
+    /// The words a search would carry.
+    pub query: String,
+    /// Filters the phrase carried.
+    pub filters: Vec<FilterBody>,
+    /// `newest`, `oldest` or `title`.
+    pub sort: Option<&'static str>,
+    /// How many results the phrase asked for.
+    pub limit: Option<u32>,
+    /// Confidence the reading carries, `0.0`–`0.95`.
+    pub confidence: f32,
+}
+
+/// One thing the words could have meant instead.
+#[derive(Debug, Serialize)]
+pub struct AlternativeBody {
+    /// The line the card prints.
+    pub label: String,
+    /// `search` or `command` — never an action.
+    pub kind: &'static str,
+    /// Where activating it goes.
+    pub route: String,
+    /// Provider a search alternative narrows to.
+    pub provider: Option<&'static str>,
+    /// Registry id a command alternative names.
+    pub command_id: Option<&'static str>,
+    /// How well the words matched.
+    pub confidence: f32,
+}
+
+/// Answer of `POST /api/v1/command-center/resolve`.
+///
+/// The panel renders exactly this and nothing it invented: the preview line, the two ways to act
+/// (`route` for a runnable reading, `command_id` when the platform's own run endpoint executes it)
+/// and the alternatives. `source` and `degraded` say where the reading came from, so a local
+/// reading is never dressed up as a model's.
+#[derive(Debug, Serialize)]
+pub struct ResolveResponse {
+    /// The phrase as it was read (trimmed and capped).
+    pub query: String,
+    /// `local` (the platform's grammar) or `model` (an AI Hub model read it).
+    pub source: &'static str,
+    /// `true` when a model was configured but could not answer in time.
+    pub degraded: bool,
+    /// A caveat in plain words, when the reading needs one.
+    pub note: Option<String>,
+    /// The intent in plain words ("Tickets · assignee: Mehmet · last 10 · newest first").
+    pub preview_text: String,
+    /// `true` when the reading points somewhere the caller may really open.
+    pub runnable: bool,
+    /// Where a runnable reading lands, when it opens a screen.
+    pub route: Option<String>,
+    /// Confidence of the reading.
+    pub confidence: f32,
+    /// What was understood.
+    pub intent: IntentBody,
+    /// What else the words could have meant.
+    pub alternatives: Vec<AlternativeBody>,
+    /// `provider/model` that read the phrase, when a model did.
+    pub model: Option<String>,
+}
+
+impl From<crate::intent_resolver::Resolution> for ResolveResponse {
+    fn from(resolution: crate::intent_resolver::Resolution) -> Self {
+        let intent = resolution.intent;
+        Self {
+            query: intent.query.clone(),
+            source: resolution.source,
+            degraded: resolution.degraded,
+            note: resolution.note,
+            preview_text: intent.preview(),
+            runnable: resolution.runnable,
+            route: resolution.route,
+            confidence: intent.confidence,
+            intent: IntentBody {
+                kind: intent.kind.as_str(),
+                entity: intent.entity.clone(),
+                provider: intent.provider,
+                command_id: intent.command_id,
+                query: intent.query.clone(),
+                filters: intent
+                    .filters
+                    .iter()
+                    .map(|filter| FilterBody {
+                        key: filter.key,
+                        label: filter.label,
+                        value: filter.value.clone(),
+                    })
+                    .collect(),
+                sort: intent.sort,
+                limit: intent.limit,
+                confidence: intent.confidence,
+            },
+            alternatives: resolution
+                .alternatives
+                .into_iter()
+                .map(|alternative| AlternativeBody {
+                    label: alternative.label,
+                    kind: alternative.kind,
+                    route: alternative.route,
+                    provider: alternative.provider,
+                    command_id: alternative.command_id,
+                    confidence: alternative.confidence,
+                })
+                .collect(),
+            model: resolution.model,
+        }
+    }
+}
+
+/// One interpreted intent. Nothing here runs: the panel shows what was understood, and the
+/// operator's `Run` goes through the same permission-checked path a manual command does.
+pub async fn resolve(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Json(body): Json<ResolveBody>,
+) -> Result<Json<ResolveResponse>, ApiError> {
+    let raw = body.q.unwrap_or_default();
+    let query = raw.trim();
+    if query.is_empty() {
+        return Err(ApiError::bad_request(
+            "query_required",
+            "the resolve endpoint needs the words that were typed",
+        ));
+    }
+    if query.chars().count() > omnion_search::intent::MAX_QUERY_CHARS {
+        return Err(ApiError::bad_request(
+            "query_too_long",
+            format!(
+                "the phrase is capped at {} characters",
+                omnion_search::intent::MAX_QUERY_CHARS
+            ),
+        ));
+    }
+
+    let permissions = caller_permissions(&state, &current).await?;
+    let resolution = crate::intent_resolver::resolve(&state, &current, query, &permissions).await?;
+    Ok(Json(ResolveResponse::from(resolution)))
+}
+
 /// Forget everything the caller did in the palette.
 pub async fn clear(
     State(state): State<AppState>,

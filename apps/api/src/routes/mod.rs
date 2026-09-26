@@ -324,6 +324,7 @@ pub fn router(state: AppState) -> Router {
     // refuses a navigation command outright, because a command that opens a screen is not a job.
     // See `crate::routes::commands`.
     let commands_route = get(commands::list_commands).layer(guards::require(&state, "search.read"));
+    let command_resolve = post(commands::resolve).layer(guards::require(&state, "search.read"));
     let command_context = get(commands::context).layer(guards::require(&state, "search.read"));
     let command_recent = get(commands::recent)
         .merge(post(commands::record))
@@ -348,6 +349,7 @@ pub fn router(state: AppState) -> Router {
         .route("/commands", commands_route)
         .route("/commands/{id}/run", command_run)
         .route("/command-center/context", command_context)
+        .route("/command-center/resolve", command_resolve)
         .route("/command-center/recent", command_recent)
         .route(
             "/iam/permissions",
