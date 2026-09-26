@@ -739,6 +739,12 @@ async fn publishing_a_page_makes_it_findable_within_one_indexer_tick() {
     let body = search(&fixture.state, &editor, "launch").await;
     assert_eq!(body["total"], 1, "the published page is findable: {body}");
     assert_eq!(hit_titles(&body), vec!["Launch notes".to_owned()]);
+    // The hit is a deep link: it opens the page's own editor, not just the pages screen.
+    let hit_url = body["hits"][0]["url"].as_str().unwrap_or_default();
+    assert!(
+        hit_url.contains(&format!("focus={page_id}")),
+        "the hit opens the page: {hit_url}"
+    );
 
     // owner:me answers the caller's own rows only: the editor created this page, the librarian
     // did not.
@@ -758,6 +764,183 @@ async fn publishing_a_page_makes_it_findable_within_one_indexer_tick() {
     assert_eq!(body["total"], 1, "still exactly one document: {body}");
 
     fixture.cleanup().await;
+}
+
+/// The producers the palette needed: an upload and a new site reach the index through the bus.
+///
+/// Slice 1 could index pages from the bus because content was the only module that emitted
+/// events; media, sites and accounts had plans waiting for producers. This walk drives the real
+/// routes — `POST /api/v1/sites`, `POST /api/v1/media`, `DELETE /api/v1/media/{id}` — and holds
+/// the index to what the bus carried: a new site and a new file appear within one tick, and a
+/// removed file leaves with it.
+#[tokio::test]
+async fn an_upload_and_a_new_site_reach_the_index_through_the_bus() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    fixture.reindex().await;
+    let owner = fixture.platform_token().await;
+
+    let organization_id: Uuid =
+        sqlx::query_scalar("select organization_id from sites where id = $1")
+            .bind(fixture.site_a)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the fixture's site has an organization");
+
+    // A new site, announced by the route that creates it.
+    let site_name = format!("Kaizen {} ", fixture.marker).trim().to_owned();
+    let created_site = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/sites",
+            Some(&owner),
+            Some(json!({
+                "organization_id": organization_id,
+                "key": format!("kaizen-{}", fixture.marker),
+                "name": site_name,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created_site.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created_site.body
+    );
+
+    let tick = indexer::drain(fixture.db.pool(), 200)
+        .await
+        .expect("the drain must run");
+    assert!(tick.applied >= 1, "report: {tick:?}");
+
+    let query = format!("kaizen%20{}", fixture.marker);
+    let body = search(&fixture.state, &owner, &query).await;
+    // The trigram near-miss branch also answers rows that merely carry the marker, so the claim
+    // is the honest one: the new site is found, and it ranks first.
+    assert!(
+        body["total"].as_i64().unwrap_or(0) >= 1,
+        "the new site is findable: {body}"
+    );
+    assert_eq!(
+        hit_titles(&body).first().map(String::as_str),
+        Some(site_name.as_str()),
+        "the new site ranks first: {body}"
+    );
+    assert_eq!(
+        hit_providers(&body).first().map(String::as_str),
+        Some("sites"),
+        "and it is the sites provider that answers: {body}"
+    );
+
+    // A file, announced by the upload.
+    let boundary = "omnionsearchwalk";
+    let filename = format!("zephyr-{}.png", fixture.marker);
+    let upload = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/media?site_id={}", fixture.site_a))
+        .header(header::COOKIE, format!("omnion_session={owner}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(multipart_file(boundary, &filename, "image/png")))
+        .expect("request must build");
+    let uploaded = call(&fixture.state, upload).await;
+    if uploaded.status.is_server_error() {
+        // The object store is part of the development stack; without it there is nothing to
+        // index, and the walk has to say so instead of failing on the store's behalf.
+        eprintln!(
+            "SKIP: the object store refused the upload ({}): {}",
+            uploaded.status, uploaded.body
+        );
+        fixture.cleanup().await;
+        return;
+    }
+    assert_eq!(
+        uploaded.status,
+        StatusCode::CREATED,
+        "body: {}",
+        uploaded.body
+    );
+    let media_id = uploaded.body["id"]
+        .as_str()
+        .expect("the upload answers with the row")
+        .to_owned();
+
+    let tick = indexer::drain(fixture.db.pool(), 200)
+        .await
+        .expect("the second drain must run");
+    assert!(tick.applied >= 1, "report: {tick:?}");
+
+    let query = format!("zephyr%20{}", fixture.marker);
+    let body = search(&fixture.state, &owner, &query).await;
+    assert!(
+        provider_hits(&body, "media") >= 1,
+        "the upload is findable: {body}"
+    );
+    assert_eq!(
+        hit_titles(&body).first().map(String::as_str),
+        Some(filename.as_str()),
+        "the uploaded file ranks first: {body}"
+    );
+    // The hit names the file and its site, which is what the library's `?focus=` row needs.
+    let hit_url = body["hits"][0]["url"].as_str().unwrap_or_default();
+    assert!(
+        hit_url.contains(&format!("site={}", fixture.site_a))
+            && hit_url.contains(&format!("focus={media_id}")),
+        "the hit opens the file: {hit_url}"
+    );
+
+    // Removing it takes the document with it — the branch that had no producer until now.
+    let removed = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/media/{media_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        removed.status,
+        StatusCode::NO_CONTENT,
+        "body: {}",
+        removed.body
+    );
+
+    let tick = indexer::drain(fixture.db.pool(), 200)
+        .await
+        .expect("the third drain must run");
+    assert!(tick.applied >= 1, "report: {tick:?}");
+
+    let body = search(&fixture.state, &owner, &query).await;
+    assert_eq!(
+        provider_hits(&body, "media"),
+        0,
+        "the removed file is gone: {body}"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// One file as a `multipart/form-data` body, the shape `POST /api/v1/media` reads.
+fn multipart_file(boundary: &str, filename: &str, content_type: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    // The bytes only have to be bytes: the library stores what it is handed, and search indexes
+    // the metadata, never the content.
+    body.extend_from_slice(b"\x89PNG\r\n\x1a\nsearch-walk");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
 }
 
 #[tokio::test]
