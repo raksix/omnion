@@ -32,6 +32,8 @@ export type Site = {
   key: string;
   name: string;
   status: string;
+  /** Theme the renderer activates for this site (`themes/<key>`). */
+  theme: string;
   created_at: string;
   updated_at: string;
 };
@@ -82,4 +84,56 @@ export type Media = {
   /** Public read path of the bytes (`GET /api/v1/public/media/{id}`). */
   public_path: string;
   created_at: string;
+};
+
+/** One theme this installation bundles (`GET /api/v1/onboarding`). */
+export type BundledTheme = {
+  key: string;
+  name: string;
+  description: string;
+};
+
+/** Per-step progress of the first run. */
+export type OnboardingSteps = {
+  owner: boolean;
+  organization: boolean;
+  site: boolean;
+  theme: boolean;
+  ai: boolean;
+};
+
+/** What the first run created so far. */
+export type OnboardingSummary = {
+  organization_name: string | null;
+  site_name: string | null;
+  site_theme: string | null;
+};
+
+/** One getting-started item of the dashboard checklist. */
+export type ChecklistItem = {
+  key: string;
+  label: string;
+  description: string;
+  href: string;
+  done: boolean;
+};
+
+/** The first-run picture (`GET /api/v1/onboarding`). */
+export type OnboardingStatus = {
+  /** `true` while the installation has no accounts at all. */
+  needs_setup: boolean;
+  /** `true` when accounts exist but the first run was never closed. */
+  in_progress: boolean;
+  /** `true` once the first run is closed. */
+  completed: boolean;
+  steps: OnboardingSteps;
+  summary: OnboardingSummary;
+  checklist: ChecklistItem[];
+  themes: BundledTheme[];
+};
+
+/** Answer of `POST /api/v1/onboarding/owner`. */
+export type OwnerSetupResult = {
+  user: User;
+  onboarding: OnboardingStatus;
 };

@@ -22,6 +22,8 @@ type SessionValue = {
   user: User | null;
   /** Sign in and adopt the account the API answered with. */
   signIn: (email: string, password: string) => Promise<void>;
+  /** Adopt an account the API already signed in (the first-run wizard creates one). */
+  adoptUser: (user: User) => void;
   /** End the session. */
   signOut: () => Promise<void>;
 };
@@ -44,6 +46,10 @@ export function SessionProvider({
     setUser(me);
   }, []);
 
+  const adoptUser = useCallback((me: User) => {
+    setUser(me);
+  }, []);
+
   const signOut = useCallback(async () => {
     // A session that is already gone is still a signed-out panel.
     await logoutRequest().catch(() => undefined);
@@ -51,8 +57,8 @@ export function SessionProvider({
   }, []);
 
   const value: SessionValue = useMemo(
-    () => ({ status: user ? "signed-in" : "signed-out", user, signIn, signOut }),
-    [user, signIn, signOut],
+    () => ({ status: user ? "signed-in" : "signed-out", user, signIn, adoptUser, signOut }),
+    [user, signIn, adoptUser, signOut],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;

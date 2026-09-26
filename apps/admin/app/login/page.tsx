@@ -5,7 +5,7 @@ import { useEffect, useState, type FormEvent } from "react";
 
 import { useRouter } from "next/navigation";
 
-import { ApiError } from "@/lib/api";
+import { ApiError, fetchOnboarding } from "@/lib/api";
 import { useSession } from "@/lib/session";
 
 const inputClass =
@@ -24,6 +24,21 @@ export default function LoginPage() {
       router.replace("/");
     }
   }, [status, router]);
+
+  // A fresh installation has no account to sign in with: the wizard is the way in.
+  useEffect(() => {
+    let cancelled = false;
+    fetchOnboarding()
+      .then((onboarding) => {
+        if (!cancelled && onboarding.needs_setup) {
+          router.replace("/setup");
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();

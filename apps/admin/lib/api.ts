@@ -4,7 +4,15 @@
  * The browser always calls the API on the admin panel's own origin: `next.config.ts` forwards
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
-import type { Media, Organization, Page, Site, User } from "./types";
+import type {
+  Media,
+  OnboardingStatus,
+  Organization,
+  OwnerSetupResult,
+  Page,
+  Site,
+  User,
+} from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
 export class ApiError extends Error {
@@ -95,6 +103,93 @@ export function logout(): Promise<null> {
 export async function fetchMe(): Promise<User> {
   const body = await request<{ user: User }>("/api/v1/me");
   return body.user;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Onboarding (the first run, REQ-050)
+// ---------------------------------------------------------------------------------------------
+
+/** How far the first run of this installation has come. Open: it also answers before sign-in. */
+export function fetchOnboarding(): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/v1/onboarding");
+}
+
+/** Create the owner account; the API answers with the account and signs it in. */
+export async function createOwnerAccount(input: {
+  displayName: string;
+  email: string;
+  password: string;
+}): Promise<OwnerSetupResult> {
+  return request<OwnerSetupResult>("/api/v1/onboarding/owner", {
+    method: "POST",
+    body: JSON.stringify({
+      display_name: input.displayName,
+      email: input.email,
+      password: input.password,
+    }),
+  });
+}
+
+/** Create the first organization of the first run. */
+export function createOnboardingOrganization(
+  name: string,
+  slug?: string,
+): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/v1/onboarding/organization", {
+    method: "POST",
+    body: JSON.stringify({ name, slug: slug?.trim() ? slug.trim() : null }),
+  });
+}
+
+/** Create the first site (and its domain, when one is given). */
+export function createOnboardingSite(
+  name: string,
+  key?: string,
+  domain?: string,
+): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/v1/onboarding/site", {
+    method: "POST",
+    body: JSON.stringify({
+      name,
+      key: key?.trim() ? key.trim() : null,
+      domain: domain?.trim() ? domain.trim() : null,
+    }),
+  });
+}
+
+/** Choose the theme the first site renders with. */
+export function setOnboardingTheme(theme: string): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/v1/onboarding/theme", {
+    method: "POST",
+    body: JSON.stringify({ theme }),
+  });
+}
+
+/** Record the AI step as skipped (provider connections arrive with the AI Hub). */
+export function skipAiProvider(): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/v1/onboarding/ai-provider", {
+    method: "POST",
+    body: JSON.stringify({ provider: null }),
+  });
+}
+
+/** Close the first run. */
+export function completeOnboarding(): Promise<OnboardingStatus> {
+  return request<OnboardingStatus>("/api/v1/onboarding/complete", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** Change a site (name, status, theme) — `PATCH /api/v1/sites/{id}`. */
+export function updateSite(
+  siteId: string,
+  changes: { name?: string; status?: string; theme?: string },
+): Promise<Site> {
+  return request<Site>(`/api/v1/sites/${encodeURIComponent(siteId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
 }
 
 /** The tenants the account may see. */
