@@ -1142,6 +1142,10 @@
   scripts/qa/run.sh` → 105 clicks, 117 screenshots, **0 high findings**, **0 vision issues**
   (`qa-artifacts/20260926-202816`; the 5 medium findings are the public renderer's own icon 404s,
   carried forward). This slice ships no screen, so the walkthrough inventory is unchanged.
+- **Fresh-database proof:** `create database omnion_fresh_check` + `omnion migrate` →
+  `applying 14 pending migration(s): 1 … 15` → `database is up to date (14 of 14 migrations
+  applied)`, and the database holds 11 `analytics_*` tables with zero settings rows (an empty
+  installation has no sites to seed for). The check database was dropped afterwards.
 - Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium), and
   `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
 - Next: REQ-007 stays in progress — **slice 2** (overview + the six report screens over these

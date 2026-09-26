@@ -148,8 +148,10 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
 
 - [x] The analytics migration applies on a fresh and on a populated database (shipped as
   `0015_analytics.sql` — 0012–0014 were taken by search and the command centre); the module's
-  own suite is green (`cargo test -p omnion-module-analytics` → 22/22, and the fresh-database
-  harness suites apply all fifteen migrations from scratch on every run).
+  own suite is green (`cargo test -p omnion-module-analytics` → 22/22). Fresh proof: `omnion
+  migrate` against an empty database applied all fourteen migrations (`1…15`, 0011 was never used)
+  and left the eleven `analytics_*` tables behind; populated proof: the walk suites apply the same
+  migrations to the development database on every run.
 - [ ] A beacon to `/public/analytics/collect` appears in realtime within 5 seconds and in the overview after the rollup tick.
 - [x] Cookieless mode sets no cookie and writes no `localStorage` entry: `apps/web/public/analytics.js`
   touches no storage API and the collector writes nothing to the browser (the visitor identifier is
