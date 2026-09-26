@@ -53,6 +53,12 @@ const CREDS = {
   domain: "qa.omnion.test",
 };
 
+/**
+ * The slug of the page the walkthrough creates in the panel. The panel pass publishes it and the
+ * public pass opens it again on the site's own host, so the renderer is verified end to end.
+ */
+const SAMPLE_SLUG = "qa-sample";
+
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const clickLines = [];
@@ -409,7 +415,7 @@ function sampleValueFor(meta) {
   if (/protocol/.test(key)) return "openai_compatible";
   if (meta.type === "number" || /port|count|limit/.test(key)) return "42";
   if (meta.type === "date") return "2026-01-01";
-  if (/slug/.test(key)) return "qa-sample";
+  if (/slug/.test(key)) return SAMPLE_SLUG;
   if (/title/.test(key)) return "QA Sample Page";
   if (/search|filter|query/.test(key)) return "qa";
   if (/name|label/.test(key)) return "QA Provider";
@@ -447,7 +453,7 @@ async function fillSubtree(page, selector) {
       else if (el.type === "password") value = "Sample-Passw0rd!";
       else if (el.type === "url" || /url|endpoint/.test(key)) value = "https://api.omnion.test/v1";
       else if (el.type === "number") value = "42";
-      else if (/slug|key/.test(key)) value = "qa-sample";
+      else if (/slug|key/.test(key)) value = SAMPLE_SLUG;
       else if (/title|name/.test(key)) value = "QA Sample";
       else if (el.tagName === "TEXTAREA") value = "QA sample text written by the automated walkthrough.";
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -769,15 +775,33 @@ async function main() {
     const res = await wp.goto(`${webBase}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
     await wp.waitForTimeout(1200);
     await shot(wp, "web-home");
-    const links = await wp.evaluate(() =>
-      [...document.querySelectorAll("a[href]")].map((a) => a.getAttribute("href")).filter((h) => h && !h.startsWith("http")).slice(0, 5)
-    );
-    report.web = { status: res && res.status(), title: await wp.title().catch(() => ""), links, base: webBase };
-    if (links.length) {
-      await wp.goto(`${webBase}${links[0]}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    const root = await wp.evaluate(() => ({
+      links: [...document.querySelectorAll("a[href]")].map((a) => a.getAttribute("href")).filter((h) => h && !h.startsWith("http")).slice(0, 5),
+      text: (document.body.innerText || "").replace(/\s+/g, " ").trim().slice(0, 240),
+    }));
+    report.web = { status: res && res.status(), title: await wp.title().catch(() => ""), links: root.links, text: root.text, base: webBase };
+
+    // The page the panel published in this pass must come back rendered on the site's own host.
+    const publishedRes = await wp
+      .goto(`${webBase}/${SAMPLE_SLUG}`, { waitUntil: "domcontentloaded", timeout: 30000 })
+      .catch(() => null);
+    await wp.waitForTimeout(1000);
+    await shot(wp, "web-published");
+    report.web.published = {
+      slug: SAMPLE_SLUG,
+      url: wp.url(),
+      status: publishedRes && publishedRes.status(),
+      title: await wp.title().catch(() => ""),
+      heading: await wp.locator("h1").first().innerText().catch(() => ""),
+      text: (await wp.evaluate(() => document.body.innerText.replace(/\s+/g, " ").trim())).slice(0, 300),
+      diagnostics: await diagnostics(wp),
+    };
+
+    if (root.links.length) {
+      await wp.goto(`${webBase}${root.links[0]}`, { waitUntil: "domcontentloaded" }).catch(() => {});
       await wp.waitForTimeout(900);
       await shot(wp, "web-first-link");
-      report.web.firstLink = { href: links[0], url: wp.url(), diagnostics: await diagnostics(wp) };
+      report.web.firstLink = { href: root.links[0], url: wp.url(), diagnostics: await diagnostics(wp) };
     }
     await wp.close();
   } catch (err) {
@@ -818,6 +842,18 @@ async function main() {
     pushFindings("high", "click-error", `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${(c.errors || []).join(" | ").slice(0, 200)}`);
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
+  if (report.web && !report.web.error) {
+    const published = report.web.published;
+    if (!published || published.status !== 200) {
+      pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} did not render (status ${published ? published.status : "missing"})`);
+    } else if (!published.heading) {
+      pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} rendered without its heading`);
+    }
+    // A 404 is the renderer's not-found answer: it still has to show the visitor a page.
+    if (report.web.status === 404 && !report.web.text) {
+      pushFindings("high", "web-blank", "the renderer answered 404 with no visible page — the not-found view never rendered");
+    }
+  }
 
   const bySeverity = { high: 0, medium: 0, low: 0 };
   for (const f of findings) bySeverity[f.severity] += 1;
