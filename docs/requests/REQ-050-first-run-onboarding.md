@@ -1,6 +1,6 @@
 # REQ-050 — First-run Onboarding / Setup Wizard
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** platform (`apps/admin` + CLI)
+> **Status:** delivered (P10) · **Captured:** 2026-09-25 · **Layer:** platform (`apps/admin` + CLI)
 > **Source:** owner directive — "kurulum için onboarding ekranı falan, request olarak ekle"
 
 ## Request
@@ -57,3 +57,8 @@ template, and a "requirements" section (Postgres, Redis, S3/MinIO).
 - Build phase: **P10** in [`docs/BUILD-BACKLOG.md`](../BUILD-BACKLOG.md).
 - Related: REQ-044 (Package Installer — starter module selection), REQ-043 (white-label
   branding during setup), docs/02-ARCHITECTURE.md (Docker), docs/07-IAM.md (owner role).
+- Delivered with P10: `crates/onboarding` (the flow), `tools/cli` (`omnion setup`, `doctor`,
+  `migrate`), `/api/v1/onboarding` (the wizard's surface), `/setup` in the admin panel and the
+  dashboard checklist; migration `0007` carries `sites.theme` and the `onboarding_state`
+  singleton. The installation documentation (quickstart, `.env.example`, requirements) is part
+  of P14, and the AI provider step records a skip until the AI Hub (P11) can connect one.

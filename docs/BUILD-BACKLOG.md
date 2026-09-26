@@ -80,9 +80,12 @@
 
 ## P10 — Onboarding v0 (REQ-050)
 
-- [ ] First-run wizard (admin) + `omnion` CLI skeleton (`setup`, `doctor`, `migrate`) per docs/04 tools/cli.
-- [ ] Flow: owner account → organization → first site → theme → (optional) AI provider → done checklist.
-- [ ] **Verify:** fresh-DB E2E: wizard → working admin, no manual SQL. Commit + push + log.
+- [x] First-run wizard (admin) + `omnion` CLI skeleton (`setup`, `doctor`, `migrate`) per docs/04 tools/cli.
+      `crates/onboarding` (the flow both front ends drive: owner → organization → site(+domain) → theme → AI step → done, with the derived step status and the getting-started checklist), `tools/cli` (the `omnion` binary), the `/api/v1/onboarding` surface in `apps/api`, the `/setup` wizard + dashboard checklist in `apps/admin`, and migration `0007` (`sites.theme` + the `onboarding_state` singleton).
+- [x] Flow: owner account → organization → first site → theme → (optional) AI provider → done checklist.
+      The wizard resumes from the server-derived steps (a refresh picks up at the first open one); the owner step signs the account in and binds the Owner role; the dashboard keeps the checklist, which ticks itself off as pages are published and a domain is bound. The AI step records the skip — provider connections arrive with the AI Hub (P11).
+- [x] **Verify:** fresh-DB E2E: wizard → working admin, no manual SQL. Commit + push + log.
+      `apps/api/tests/onboarding.rs` (4 walks on throwaway databases), the browser walk (10 checks, 0 console errors), the CLI walk (`omnion doctor`/`migrate`/`setup` on a fresh database) and the CI smoke extension.
 
 ## P11 — AI Hub v0 (docs/06)
 

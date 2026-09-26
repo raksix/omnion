@@ -461,3 +461,72 @@
   keep the test runner's lease longer than any test step so the reclaim path only fires in the
   walk that asks for it.
 
+## 2026-09-26 — P10 · Onboarding v0 (REQ-050)
+
+- `crates/onboarding` (`omnion-onboarding`): the first run of an installation as one flow both
+  front ends drive — `steps.rs` (owner account → organization → first site with its domain →
+  theme → AI decision → close), `state.rs` (the `onboarding_state` singleton, the derived step
+  status and the summary) and `checklist.rs` (the getting-started items, derived from the
+  platform's own rows). The owner step binds the Owner role through the same seeding path the API
+  runs at boot; every step is audited; an installation whose first account came from the
+  environment bootstrap finishes its first run through the wizard too (the oldest active account
+  acts as its owner).
+- `database/migrations/0007_onboarding.sql`: `sites.theme` (the presentation setting the renderer
+  activates) and the `onboarding_state` singleton, one timestamp per step.
+- `tools/cli` (`omnion-cli`, binary `omnion`): `setup` (interactive, flag-driven or fully
+  non-interactive; the password never echoes), `doctor` (six checks in boot order, actionable
+  hints, non-zero exit when one fails) and `migrate` (before/after migration status). The CLI
+  reads the same typed configuration the API does and runs the same flow code.
+- `apps/api`: `/api/v1/onboarding` — `GET` (open: how far the first run has come) plus `owner`,
+  `organization`, `site`, `theme`, `ai-provider` and `complete`, guarded by the flow itself (no
+  permission guard: there is nothing to check against before an account exists). The site body
+  and the public page response carry the site's theme now, and `PATCH /sites/{id}` accepts one.
+- `apps/admin`: the `/setup` wizard (five steps + done screen, Lucide icons only, resumable from
+  the server's step status), a sign-in redirect for a fresh installation, the getting-started
+  checklist card on the dashboard and a theme selector on Sites. `apps/web` resolves the theme the
+  site carries, so choosing one changes what visitors see.
+- Proof: `cargo fmt --all -- --check` clean · `cargo clippy --workspace --all-targets -- -D
+  warnings` clean · `cargo test --workspace` → **272 passed, 0 failed** across 32 suites (the new
+  `crates/onboarding` unit tests and `apps/api/tests/onboarding.rs` — four walks on throwaway
+  databases) ✅
+- Live walks (each on a database created empty for the run):
+  1. **wizard surface over HTTP** (`:18092`): `needs_setup` → owner (auto sign-in) → organization
+     → site+domain → an unknown theme refused (`400 unknown_theme`) → theme → AI skip → complete;
+     the owner then reads `/organizations` and `/sites` through the regular API; six
+     `onboarding.*` audit rows; a second owner attempt answers `409 already_installed` and an
+     anonymous step `401` ✅
+  2. **the browser** (admin panel `:3101` against API `:18094`, Chromium under Xvfb): 10/10 checks
+     with 0 console errors — all five steps walk, the dashboard shows the checklist (6 items, 2
+     open), Sites shows the theme select, and a finished installation redirects `/setup` back to
+     the panel; read back from the database: 1 user, 1 organization, 1 site (`theme=minimal`),
+     1 domain, `onboarding_completed=true` ✅
+  3. **the CLI** on a fresh database: `doctor` fails on an unmigrated schema (exit 1, hint
+     `omnion migrate`), `migrate` applies 7 migrations, `doctor` passes, `setup --non-interactive`
+     creates everything, the API serves it (login + the site with its theme), and a second
+     `setup` is refused with exit 2 ✅
+- CI: the smoke job builds the CLI too and runs a first-run walk on a database that has never been
+  migrated (`omnion doctor`/`migrate`/`setup` → the API serves the result).
+- Also fixed: the P09 workflow suite's walks are serialised behind a walk lock — its sweeps work
+  on the whole `workflows` table, so two walks in flight could settle each other's rows (4 of 5
+  runs failed before the lock, 5 of 5 pass after).
+- Next: **P11 — AI Hub v0** (docs/06: provider abstraction, providers/models tables, streaming
+  chat endpoint, provider configuration in the admin panel).
+
+### Lessons
+
+- An onboarding flow must be *derived*, not remembered: every step's status comes from the
+  platform's own rows (accounts, organizations, sites, the theme on the site), so a refresh, a
+  second tab, or an installation set up through the API directly all resume correctly without a
+  client-side state machine.
+- A wizard's first step cannot require a session: the endpoint that creates the owner account is
+  open by necessity, so its safety has to come from the data rule (only while the installation
+  has no accounts at all) — with the unique index as the backstop for two callers racing.
+- The admin panel bakes `rewrites()` into the build: pointing it at a different API origin only
+  takes effect after `next build`, so a browser walk must build the panel for the API port it
+  will talk to (a runtime env var is not enough).
+- This container's Chromium refuses `Page.captureScreenshot` even under Xvfb: a browser walk has
+  to treat pictures as a bonus and assert on the DOM (step-state attributes, checklist items,
+  console errors) instead of on screenshots.
+- Two walks that share a table-wide repair pass cannot run at once: `engine::sweep` is
+  deliberately global, so the workflow suite now holds a walk lock — determinism is worth the
+  extra ~17 s of serial runtime, and a flake that fails 4 of 5 runs is a bug, not weather.
