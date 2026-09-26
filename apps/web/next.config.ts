@@ -9,6 +9,13 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   /**
+   * The QA harness reaches the renderer through the site's own host (`qa.omnion.test`, mapped to
+   * 127.0.0.1 by the browser) instead of `localhost`. Next.js blocks cross-origin dev resources
+   * by default, and the blocked HMR socket also blocks the React debug channel — which leaves the
+   * error/not-found fallback stuck on a blank page in development. Development only.
+   */
+  allowedDevOrigins: ["qa.omnion.test"],
+  /**
    * The workspace packages behind the theme engine ship TypeScript sources; Next compiles them
    * with the app so a theme can be read and debugged where it is written.
    */
