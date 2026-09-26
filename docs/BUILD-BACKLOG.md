@@ -107,8 +107,21 @@
 
 ## P12 — Events + Webhooks v0
 
-- [ ] Event bus table + delivery worker + HMAC signatures; first fan-out: `page.published`.
-- [ ] **Verify:** local receiver test shows signed delivery. Commit + push + log.
+- [x] Event bus table + delivery worker + HMAC signatures; first fan-out: `page.published`.
+      `crates/events` (the bus, the endpoint + queue shapes, the HMAC-SHA256 scheme, the signed
+      sender and the delivery runner), `database/migrations/0009_events_webhooks.sql` (`events`,
+      `webhook_endpoints`, `webhook_deliveries`), the `/api/v1/webhooks` + `/api/v1/events` surface
+      (endpoints CRUD, the operator's test delivery, the queue history, the event feed; the signing
+      secret is write-only), `apps/api/src/event_runner.rs` driving the queue in the API process
+      (`OMNION_EVENTS_*`), the `webhooks.*`/`events.read` permissions, and `infra/mocks/
+      webhook-receiver.mjs` + `infra/mocks/webhooks-walk.sh` — the receiver both a developer and CI
+      verify a signed delivery with.
+- [x] **Verify:** local receiver test shows signed delivery. Commit + push + log.
+      `apps/api/tests/events.rs` (2 walks, real loopback receiver: fan-out, retry ladder, terminal
+      failure, tenant scope, switched-off endpoint, permission gates) plus the live walk on
+      `:8082`/`:8124` — `receiver: event=page.published signature=verified` ·
+      `platform: status=delivered attempts=1 response=200` — and the `Webhooks walk (signed
+      delivery)` CI step running the same script.
 
 ## P13 — Automation v0 (REQ-003 lite)
 

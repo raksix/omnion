@@ -623,3 +623,95 @@
   Node mock makes the same round trip reachable from CI and from a laptop. The CI step's script
   was dry-run locally before it was committed — and the dry run found that 8081 on this box is the
   Pterodactyl Wings daemon, not a free port (`ss -tlpn` before trusting a port).
+
+## 2026-09-26 — P12 · Events + Webhooks v0 (docs/01-VISION.md §13)
+
+- New crate `crates/events` (`omnion-events`) — the platform's event bus and its deliveries.
+  `model.rs` holds the recorded event, the endpoint, the queue rows and the attempt budget the
+  queue carries; `validation.rs` the shapes the platform refuses to store (a dotted, lower-case
+  event name, an absolute http(s) URL, a subscription list, the generated 32-byte secret);
+  `signature.rs` the signing scheme (HMAC-SHA256 over `<timestamp>.<raw body>` carried as
+  `X-Omnion-Signature: v1=<hex>`, verified in constant time); `store.rs` the SQL (event + fan-out
+  in one transaction, `for update skip locked` claims with a lease, settle exactly once, the retry
+  ladder); `bus.rs` `emit`/`emit_to`; `sender.rs` one signed POST — the body is serialized once and
+  both the request body and the signature are computed from those bytes, so a receiver that
+  verifies the raw bytes always agrees; and `engine.rs` `run_due`: settle the queue of endpoints
+  that were switched off, claim the due rows, deliver, retry with backoff, fail when the attempts
+  run out.
+- `database/migrations/0009_events_webhooks.sql`: `events` (dotted-name check, organization/site/
+  actor references), `webhook_endpoints` (per-organization case-insensitive unique name, the
+  subscription array with a cardinality check, a secret-length check) and `webhook_deliveries`
+  (one delivery per endpoint per event, `pending | delivered | failed`, attempts, lease, response
+  status, error) with the partial index the claim walks.
+- Fan-out: publishing a page records `page.published` (page, site, slug, revision) and the bus
+  queues one signed delivery per enabled, subscribed endpoint of that organization — the event row
+  and its deliveries are one transaction, so the queue can never reference an event that does not
+  exist. An event without an organization fans out to nobody: an endpoint belongs to one tenant,
+  and matching it against a platform-level fact would leak between tenants.
+- API (`/api/v1/webhooks`, `/api/v1/events`): endpoints list/create/get/patch/delete, the
+  operator's test delivery (`POST /webhooks/{id}/test` queues `webhook.test` — even to a
+  switched-off endpoint, which is what "test before going live" means), the queue history of one
+  endpoint (`GET /webhooks/{id}/deliveries`) and the event feed (`GET /events?name=&limit=`). The
+  signing secret is write-only: shown once when the platform generated it, never again, and a
+  rotation replaces it silently. Endpoints are tenant resources — an organization account only
+  ever sees and changes its own (a cross-tenant read is `403 cross_organization`).
+- Permissions: `webhooks.read`, `webhooks.manage`, `events.read` (categories `webhooks`, `events`);
+  Manager reads endpoints and the feed, Owner/Administrator pick the new keys up from the catalogue.
+- Runner: `apps/api/src/event_runner.rs` ticks the delivery queue in the API process
+  (`OMNION_EVENTS_*`, default on) — `poll_ms` 5000, `batch` 20, `lease_seconds` 120,
+  `request_timeout_ms` 10000, `retry_base_ms` 15000 → `retry_max_ms` 900000; a queued delivery
+  carries its five attempts.
+- `infra/mocks/webhook-receiver.mjs`: a dependency-free receiver that verifies the HMAC exactly the
+  way a third-party receiver must (and answers `401` when it does not verify). `infra/mocks/
+  webhooks-walk.sh`: the end-to-end walk — sign in, tenant + site + page, connect the receiver as
+  an endpoint, publish, wait for the signed delivery, read it back from the queue history and the
+  event feed. Developer and CI run the same script.
+
+### Verify
+
+- `cargo check --workspace --all-targets` + `cargo clippy --workspace --all-targets -- -D warnings`
+  green; `cargo test --workspace`: **332 passed, 0 failed** (the events crate contributes 22 unit
+  tests, the API suite 2 more walks).
+- `apps/api/tests/events.rs` — 2 walks on throwaway databases against a **real receiver this suite
+  starts on a loopback port**: connecting an endpoint (secret shown once, never again in any
+  response body), the duplicate-name `409` and the unusable-URL `400`, the test delivery, the
+  `page.published` fan-out (header + signature + envelope verified by the receiver's own verifier,
+  the queue history showing `delivered / attempts=1 / 200`, the event feed showing the payload), a
+  receiver that answers `500` once (the delivery stays `pending` with `attempts=1` and the refusal
+  in `error`, then delivers on the retry with `attempts=2`), a receiver that never accepts (five
+  attempts, then `failed` with `response_status=500` — the receiver saw every one), the tenant
+  scope (two organizations, one event, only the owning organization's endpoint receives it and
+  nothing is queued for the other), the permission gates (`401` anonymous, `403` for a member
+  without the keys, `403` for cross-tenant reads) and the switched-off endpoint (its queued
+  delivery settles as `failed` with the reason instead of sitting pending forever).
+- Live walk on this machine — the API binary on `:8082` against a throwaway database plus
+  `webhook-receiver.mjs` on `:8124`, driven by the committed `infra/mocks/webhooks-walk.sh`:
+  `receiver: event=page.published signature=verified bytes=477 slug=home` ·
+  `platform: status=delivered attempts=1 response=200 event=page.published` ·
+  `bus: 1 page.published event(s) on the feed` · `webhooks walk: OK — signed delivery verified end
+  to end`; the API's own log: `event recorded event_id=1 name=page.published deliveries=1` followed
+  by `webhook delivered delivery_id=cc2ff733-b27f-4b62-aa41-e39e343e084c endpoint=Walk Receiver
+  event=page.published status=200 attempt=1`.
+- CI: the `Webhooks walk (signed delivery)` step starts the receiver and a second API instance and
+  runs the same script (dry-run locally: exit 0).
+- Next: **P13 — Automation v0 (REQ-003 lite)** — trigger → condition → action on top of P09.
+
+### Lessons
+
+- One transaction for "the fact" and "who must hear about it": an event row and its queued
+  deliveries commit together, which removes the class of bug where a delivery points at an event
+  that was never recorded. The trade-off is explicit — subscriptions are matched at emission time,
+  so an endpoint connected later receives nothing retroactively.
+- Sign the exact bytes you send. Serialize the body once, sign those bytes, put those bytes on the
+  wire; a receiver that re-serializes a parsed body will verify in one language and fail in another
+  (key order, unicode escaping, float formatting).
+- The timestamp belongs inside the signed material: a receiver gets replay protection by comparing
+  it with its own clock, and Omnion needs no extra state to make the promise.
+- A queue row carries its own budget (`max_attempts`) and its attempts are counted when it is
+  claimed, not when it succeeds — so a process that dies mid-delivery still consumes an attempt and
+  a crash loop cannot retry forever.
+- "Switched off" needs an answer for the queue too: pending deliveries of a disabled endpoint are
+  settled as failed with the reason. Otherwise the history shows a queue that never moves and the
+  operator cannot tell why nothing arrived.
+- The last mile is the delivery id: `X-Omnion-Delivery` is the row's own id, which is what makes
+  the receiver's log and the panel's delivery list talk about the same attempt.
