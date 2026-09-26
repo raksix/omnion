@@ -765,3 +765,23 @@
   that reason (`step_error="the email could not be sent: sending email is switched off
   (OMNION_MAIL_ENABLED=false)"`), and the surface stays permission-gated + tenant-scoped.
 - Next: **P14 — Polish + CI v0** (make the CI workflow run for real + README quickstart).
+
+## 2026-09-26 — P14 · Polish + CI v0
+
+- CI gains the `Web — install · typecheck · build · serve (admin + public renderer)` job: pnpm comes
+  from the root `packageManager` field (no version pinned twice), `pnpm install --frozen-lockfile`,
+  `pnpm typecheck`, `pnpm build` (both Next.js apps through turbo), and then the panel is booted and
+  has to keep the promise a reader cares about — the sign-in screen answers `200` while an anonymous
+  panel route is redirected (`307`) to it. The job deliberately needs no API: it is what a fresh
+  clone can show before anything is configured.
+- README rewritten around a quickstart a fresh clone can follow: the compose stack (table of services
+  and ports) → `cargo run -p omnion-api` → first run (`omnion setup` or the `/setup` wizard) → the
+  admin panel → the public renderer, followed by the checks CI runs, the repository layout and the
+  documentation map. Every command in it was executed on the dev stack first.
+- Proof: CI run `36213754270` (head `3a8de29`) → **success**, all three jobs — the web job (40 s)
+  logged `admin panel: /login=200 · anonymous /pages=307 → /login`, and `Rust — fmt · clippy · test`
+  (smoke + AI-hub + webhooks + first-run walks) plus `Infra — compose config` stayed green. Local
+  dry runs: `pnpm install --frozen-lockfile` → "Already up to date" · `pnpm typecheck` → 2/2 ·
+  `pnpm build` → 2 successful · `/healthz` 200 · `/readyz` database+redis ok · `omnion doctor` 6/6.
+- Next: **P15+ — REQ-driven queue** (`docs/requests/REQ-XXX`, owner steers priority; suggested first
+  REQ-016 webhooks centre → REQ-002 command centre). The foundation phases P00–P14 are complete.

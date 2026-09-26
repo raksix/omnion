@@ -143,8 +143,21 @@
 
 ## P14 — Polish + CI v0
 
-- [ ] CI workflow runs for real (fmt/clippy/test + admin build); README quickstart (`docker compose up -d`).
-- [ ] **Verify:** CI green on push. Commit + push + log.
+- [x] CI workflow runs for real (fmt/clippy/test + admin build); README quickstart (`docker compose up -d`).
+      The workflow gains the `Web — install · typecheck · build · serve (admin + public renderer)` job:
+      pnpm comes from the root `packageManager` field (`pnpm/action-setup@v4`), the lockfile is installed
+      frozen, `pnpm typecheck` + `pnpm build` cover both Next.js apps through turbo, and the job boots the
+      panel and checks that the sign-in screen answers `200` while an anonymous panel route is redirected
+      (`307`) to it — no API needed, exactly what a fresh clone can show. The README is rewritten around a
+      verified quickstart (compose stack → API → first run → panel → public renderer) plus the checks, the
+      repository layout and the documentation map.
+- [x] **Verify:** CI green on push. Commit + push + log.
+      Run `36213754270` (head `3a8de29`) → **success**, all three jobs: `Web …` (40 s) logged
+      `admin panel: /login=200 · anonymous /pages=307 → /login`; `Rust — fmt · clippy · test` (with the
+      smoke, AI-Hub, webhooks and first-run walks) and `Infra — compose config` stayed green. Local dry
+      runs of the same steps: `pnpm install --frozen-lockfile` → "Already up to date" · `pnpm typecheck`
+      → 2/2 · `pnpm build` → 2 successful · panel `/login=200` / `/pages=307` · API `/healthz` 200 ·
+      `/readyz` database + redis ok · `omnion doctor` 6/6.
 
 ## P15+ — REQ-driven queue
 
