@@ -46,6 +46,8 @@ export const ANALYTICS_NAV = [
   { href: "/analytics/events", label: "Events" },
   { href: "/analytics/downloads", label: "Downloads" },
   { href: "/analytics/forms", label: "Forms" },
+  { href: "/analytics/goals", label: "Goals" },
+  { href: "/analytics/realtime", label: "Realtime" },
 ] as const;
 
 /** The named ranges the toolbar offers. */

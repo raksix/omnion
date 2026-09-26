@@ -1334,3 +1334,200 @@ export function fetchAnalyticsSnippet(siteId: string): Promise<AnalyticsSnippet>
     `/api/v1/analytics/snippet?site_id=${encodeURIComponent(siteId)}`,
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Goals, funnels and realtime (docs/requests/REQ-007, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** What a goal — or one of its steps — matches. Every missing pattern is simply not a condition. */
+export type AnalyticsGoalMatch = {
+  path?: string | null;
+  name?: string | null;
+  file?: string | null;
+};
+
+/** One step of a funnel. */
+export type AnalyticsGoalStep = {
+  position: number;
+  kind: string;
+  match: AnalyticsGoalMatch;
+};
+
+/** A goal with its funnel, as the editor reads it. */
+export type AnalyticsGoal = {
+  id: string;
+  site_id: string;
+  name: string;
+  kind: string;
+  match: AnalyticsGoalMatch;
+  enabled: boolean;
+  created_by: string | null;
+  created_at: string;
+  steps: AnalyticsGoalStep[];
+};
+
+/** A goal with how it did in the range — one row of the goal list. */
+export type AnalyticsGoalSummary = AnalyticsGoal & {
+  conversions: number;
+  visitors: number;
+  rate: number | null;
+  last_hit: string | null;
+};
+
+/** `GET /api/v1/analytics/goals`. */
+export type AnalyticsGoalsResponse = {
+  from: string;
+  to: string;
+  goals: AnalyticsGoalSummary[];
+};
+
+/** One funnel step with the visitors that reached it. */
+export type AnalyticsFunnelStep = {
+  position: number;
+  kind: string;
+  match: AnalyticsGoalMatch;
+  visitors: number;
+  drop_off: number;
+  rate: number | null;
+};
+
+/** `GET /api/v1/analytics/goals/{id}/funnel`. */
+export type AnalyticsFunnel = {
+  goal_id: string;
+  name: string;
+  enabled: boolean;
+  from: string;
+  to: string;
+  visitors: number;
+  conversions: number;
+  rate: number | null;
+  steps: AnalyticsFunnelStep[];
+};
+
+/** One step the editor sends: the funnel is replaced wholesale when `steps` is present. */
+export type AnalyticsGoalStepInput = {
+  kind: string;
+  match: AnalyticsGoalMatch;
+};
+
+/** A create body, or the full description a rewrite carries. */
+export type AnalyticsGoalInput = {
+  name: string;
+  kind: string;
+  match: AnalyticsGoalMatch;
+  enabled: boolean;
+  steps: AnalyticsGoalStepInput[];
+};
+
+/** A partial update: what is present is replaced, what is absent is kept. */
+export type AnalyticsGoalPatch = Partial<{
+  name: string;
+  kind: string;
+  match: AnalyticsGoalMatch;
+  enabled: boolean;
+  steps: AnalyticsGoalStepInput[];
+}>;
+
+/** `GET /api/v1/analytics/goals`. */
+export function fetchAnalyticsGoals(query: AnalyticsQuery): Promise<AnalyticsGoalsResponse> {
+  return request<AnalyticsGoalsResponse>(analyticsUrl("/api/v1/analytics/goals", query));
+}
+
+/** `GET /api/v1/analytics/goals/{id}`. */
+export function fetchAnalyticsGoal(id: string, query: AnalyticsQuery): Promise<AnalyticsGoal> {
+  return request<AnalyticsGoal>(
+    analyticsUrl(`/api/v1/analytics/goals/${encodeURIComponent(id)}`, query),
+  );
+}
+
+/** `POST /api/v1/analytics/goals`. */
+export function createAnalyticsGoal(
+  query: AnalyticsQuery,
+  changes: AnalyticsGoalInput,
+): Promise<AnalyticsGoal> {
+  return request<AnalyticsGoal>(analyticsUrl("/api/v1/analytics/goals", query), {
+    method: "POST",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** `PATCH /api/v1/analytics/goals/{id}`. */
+export function updateAnalyticsGoal(
+  id: string,
+  query: AnalyticsQuery,
+  changes: AnalyticsGoalPatch,
+): Promise<AnalyticsGoal> {
+  return request<AnalyticsGoal>(
+    analyticsUrl(`/api/v1/analytics/goals/${encodeURIComponent(id)}`, query),
+    { method: "PATCH", body: JSON.stringify(changes) },
+  );
+}
+
+/** `DELETE /api/v1/analytics/goals/{id}` — removes the goal, its steps and its hits. */
+export async function deleteAnalyticsGoal(id: string, query: AnalyticsQuery): Promise<void> {
+  await request<null>(analyticsUrl(`/api/v1/analytics/goals/${encodeURIComponent(id)}`, query), {
+    method: "DELETE",
+  });
+}
+
+/** `GET /api/v1/analytics/goals/{id}/funnel`. */
+export function fetchAnalyticsGoalFunnel(
+  id: string,
+  query: AnalyticsQuery,
+): Promise<AnalyticsFunnel> {
+  return request<AnalyticsFunnel>(
+    analyticsUrl(`/api/v1/analytics/goals/${encodeURIComponent(id)}/funnel`, query),
+  );
+}
+
+/** The counters of one realtime window. */
+export type AnalyticsRealtimeCounters = {
+  window_minutes: number;
+  visitors: number;
+  pageviews: number;
+  events: number;
+  conversions: number;
+};
+
+/** One page being read right now. */
+export type AnalyticsRealtimePage = {
+  path: string;
+  visitors: number;
+  views: number;
+  last_seen: string;
+};
+
+/** One thing that just happened. */
+export type AnalyticsRealtimeEvent = {
+  name: string;
+  path: string | null;
+  value: number | null;
+  occurred_at: string;
+};
+
+/** `GET /api/v1/analytics/realtime`. */
+export type AnalyticsRealtimeSnapshot = {
+  generated_at: string;
+  last_5: AnalyticsRealtimeCounters;
+  last_30: AnalyticsRealtimeCounters;
+  pages: AnalyticsRealtimePage[];
+  events: AnalyticsRealtimeEvent[];
+};
+
+/** `GET /api/v1/analytics/realtime` — the snapshot of the last half hour. */
+export function fetchAnalyticsRealtime(siteId: string): Promise<AnalyticsRealtimeSnapshot> {
+  return request<AnalyticsRealtimeSnapshot>(
+    `/api/v1/analytics/realtime?site_id=${encodeURIComponent(siteId)}`,
+  );
+}
+
+/**
+ * The address of the realtime stream, for an `EventSource`.
+ *
+ * A stream cannot send headers, so it carries the site in the query and nothing else: the
+ * session cookie is first-party (the panel proxies `/api/*`), and every connection re-checks the
+ * reader's rights on the server.
+ */
+export function analyticsRealtimeStreamUrl(siteId: string): string {
+  return `/api/v1/analytics/realtime/stream?site_id=${encodeURIComponent(siteId)}`;
+}
