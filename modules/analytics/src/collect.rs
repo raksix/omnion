@@ -199,6 +199,12 @@ pub struct RequestMeta {
     pub address: Option<IpAddr>,
     /// User agent of the caller.
     pub user_agent: String,
+    /// Country the edge reported for the caller, when it reported one.
+    ///
+    /// Nothing here geolocates: a deployment's own edge (Cloudflare's `CF-IPCountry`, Vercel's
+    /// `X-Vercel-IP-Country`, a load balancer's own header) resolved the country, and Omnion
+    /// stores only that two-letter answer — never an address, never a lookup of its own.
+    pub country: Option<String>,
     /// UTC day the beacon belongs to.
     pub day: Date,
     /// When the platform received it.
@@ -208,6 +214,25 @@ pub struct RequestMeta {
     /// `Sec-GPC: 1`.
     pub gpc: bool,
 }
+
+/// Read a country out of an edge header value: two letters, upper-cased, or nothing.
+///
+/// Placeholders the edges use for "unknown" (`XX`, `T1`) are refused: a country that is not a
+/// country would show up in the audience report as a place.
+#[must_use]
+pub fn country_from_header(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.len() != 2 || !value.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    let value = value.to_ascii_uppercase();
+    if value == "XX" || value == "T1" {
+        return None;
+    }
+
+    Some(value)
+}
+
 
 /// Why a beacon was not stored, when it was not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,9 +536,9 @@ async fn open_visit(
         "insert into analytics_visits (site_id, visitor_hash, started_at, last_seen_at, \
          pageview_count, is_bounce, entry_path, exit_path, referrer_host, referrer_path, \
          source, medium, campaign, term, content, device_type, os, browser, screen_width, \
-         screen_height, language, ip_prefix) \
+         screen_height, language, country_code, ip_prefix) \
          values ($1, $2, $3, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-         $16, $17, $18, $19, $20::inet) returning id",
+         $16, $17, $18, $19, $20, $21::inet) returning id",
     )
     .bind(site_id)
     .bind(visitor_hash)
@@ -534,6 +559,7 @@ async fn open_visit(
     .bind(screen.map(|screen| screen.width))
     .bind(screen.map(|screen| screen.height))
     .bind(pageview.and_then(|p| p.language.clone()))
+    .bind(meta.country.clone())
     .bind(ip_prefix)
     .fetch_one(pool)
     .await?;
@@ -727,11 +753,25 @@ mod tests {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                          (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
                 .to_owned(),
+            country: Some("TR".to_owned()),
             day: Date::from_calendar_date(2026, time::Month::September, 26).unwrap(),
             now: OffsetDateTime::UNIX_EPOCH,
             dnt: false,
             gpc: false,
         }
+    }
+
+    #[test]
+    fn an_edge_country_is_read_only_when_it_is_a_country() {
+        assert_eq!(country_from_header(Some("tr")), Some("TR".to_owned()));
+        assert_eq!(country_from_header(Some(" DE ")), Some("DE".to_owned()));
+        assert_eq!(country_from_header(None), None);
+        assert_eq!(country_from_header(Some("")), None);
+        assert_eq!(country_from_header(Some("TUR")), None);
+        assert_eq!(country_from_header(Some("1A")), None);
+        // The edges' own "unknown" placeholders are not places.
+        assert_eq!(country_from_header(Some("XX")), None);
+        assert_eq!(country_from_header(Some("t1")), None);
     }
 
     #[test]

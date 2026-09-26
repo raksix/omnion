@@ -152,6 +152,9 @@ impl From<AnalyticsError> for ApiError {
     fn from(error: AnalyticsError) -> Self {
         match error {
             AnalyticsError::InvalidPayload(message) => Self::bad_request("invalid_beacon", message),
+            AnalyticsError::InvalidQuery(message) => {
+                Self::bad_request("invalid_report_query", message)
+            }
             AnalyticsError::EmptyBeacon => Self::bad_request(
                 "empty_beacon",
                 "the beacon carries neither a pageview nor an event",

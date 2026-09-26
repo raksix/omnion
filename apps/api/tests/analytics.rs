@@ -1253,3 +1253,934 @@ async fn the_collect_endpoint_answers_429_above_its_budget() {
 
     fixture.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The report walks (slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/// One visit written straight into the raw tables.
+///
+/// The report suite seeds rows itself instead of posting beacons: a beacon always carries "now",
+/// and the reports are about ranges — a fixture has to be able to say *when*.
+struct RawVisit<'a> {
+    /// The visitor hash (64 hex characters in the real thing; the tests use readable stand-ins
+    /// with the same shape).
+    hash: &'a str,
+    /// When the visit happened.
+    at: OffsetDateTime,
+    /// The path its pageview was on.
+    path: &'a str,
+    /// The page title.
+    title: &'a str,
+    /// Device type.
+    device: &'a str,
+    /// Country code.
+    country: &'a str,
+    /// UTM source, when the visit carried one.
+    source: Option<&'a str>,
+    /// Referrer host, when the browser reported one.
+    referrer_host: Option<&'a str>,
+    /// How long the page was visible.
+    duration_ms: Option<i32>,
+}
+
+/// A visitor hash of the documented shape (64 hex characters) from a short label.
+fn hash(label: &str) -> String {
+    let mut value = String::new();
+    for byte in label.bytes() {
+        value.push_str(&format!("{byte:02x}"));
+    }
+    while value.len() < 64 {
+        value.push('0');
+    }
+    value.truncate(64);
+    value
+}
+
+/// Write one visit with one pageview (entry and exit) and answer its id.
+async fn seed_visit(db: &Db, site: Uuid, visit: &RawVisit<'_>) -> i64 {
+    let id: i64 = sqlx::query_scalar(
+        "insert into analytics_visits (site_id, visitor_hash, started_at, last_seen_at, \
+         pageview_count, is_bounce, entry_path, exit_path, referrer_host, device_type, \
+         country_code, source) \
+         values ($1, $2, $3, $3, 1, false, $4, $4, $5, $6, $7, $8) returning id",
+    )
+    .bind(site)
+    .bind(visit.hash)
+    .bind(visit.at)
+    .bind(visit.path)
+    .bind(visit.referrer_host)
+    .bind(visit.device)
+    .bind(visit.country)
+    .bind(visit.source)
+    .fetch_one(db.pool())
+    .await
+    .expect("the visit must be written");
+
+    sqlx::query(
+        "insert into analytics_pageviews (site_id, visit_id, path, title, occurred_at, \
+         duration_ms, scroll_depth, is_entry, is_exit) \
+         values ($1, $2, $3, $4, $5, $6, $7, true, true)",
+    )
+    .bind(site)
+    .bind(id)
+    .bind(visit.path)
+    .bind(visit.title)
+    .bind(visit.at)
+    .bind(visit.duration_ms)
+    .bind(Some(55_i16))
+    .execute(db.pool())
+    .await
+    .expect("the pageview must be written");
+
+    id
+}
+
+/// Add one more pageview to a visit (the entry and exit flags move with it).
+async fn seed_pageview(db: &Db, site: Uuid, visit_id: i64, path: &str, title: &str, at: OffsetDateTime) {
+    sqlx::query("update analytics_pageviews set is_exit = false where visit_id = $1")
+        .bind(visit_id)
+        .execute(db.pool())
+        .await
+        .expect("the previous pageview must stop being the exit");
+    sqlx::query(
+        "insert into analytics_pageviews (site_id, visit_id, path, title, occurred_at, \
+         is_entry, is_exit) values ($1, $2, $3, $4, $5, false, true)",
+    )
+    .bind(site)
+    .bind(visit_id)
+    .bind(path)
+    .bind(title)
+    .bind(at)
+    .execute(db.pool())
+    .await
+    .expect("the pageview must be written");
+}
+
+/// Write one event of a visit.
+async fn seed_event(
+    db: &Db,
+    site: Uuid,
+    visit_id: i64,
+    name: &str,
+    path: &str,
+    value: Option<f64>,
+    properties: serde_json::Value,
+    at: OffsetDateTime,
+) {
+    sqlx::query(
+        "insert into analytics_events (site_id, visit_id, name, path, value, properties, \
+         occurred_at) values ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(site)
+    .bind(visit_id)
+    .bind(name)
+    .bind(path)
+    .bind(value)
+    .bind(properties)
+    .bind(at)
+    .fetch_optional(db.pool())
+    .await
+    .expect("the event must be written");
+}
+
+/// A beacon-shaped request against a report endpoint.
+fn report_request(uri: &str, token: &str) -> Request<Body> {
+    request(Method::GET, uri, Some(token), None)
+}
+
+/// The midnight of `offset` days before today, plus a couple of hours.
+fn at_day(offset: i64, hour: u8) -> OffsetDateTime {
+    let day = OffsetDateTime::now_utc().date() - time::Duration::days(offset);
+    day.with_hms(hour, 30, 0)
+        .expect("a valid clock time")
+        .assume_utc()
+}
+
+/// The axis label of a day, in the shape the module renders it (`Sep 26`).
+fn month_day(day: Date) -> String {
+    format!(
+        "{} {}",
+        omnion_module_analytics::reports::month_short(u8::from(day.month())),
+        day.day()
+    )
+}
+
+#[tokio::test]
+async fn the_overview_matches_the_seeded_fixture_and_compares_with_the_period_before() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let reader = fixture.reader_token().await;
+    let today = OffsetDateTime::now_utc().date();
+    let from = today - time::Duration::days(6);
+
+    // Four visitors over the last seven days: one comes back on a second day (which must still
+    // count once), one downloads, one submits a form, one is the goal conversion.
+    seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("h1"),
+            at: at_day(5, 10),
+            path: "/qa/landing",
+            title: "QA landing",
+            device: "desktop",
+            country: "TR",
+            source: Some("newsletter"),
+            referrer_host: None,
+            duration_ms: Some(1_200),
+        },
+    )
+    .await;
+    seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("h1"),
+            at: at_day(2, 11),
+            path: "/qa/pricing",
+            title: "QA pricing",
+            device: "desktop",
+            country: "TR",
+            source: Some("newsletter"),
+            referrer_host: None,
+            duration_ms: Some(2_400),
+        },
+    )
+    .await;
+    seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("h2"),
+            at: at_day(1, 9),
+            path: "/qa/pricing",
+            title: "QA pricing",
+            device: "mobile",
+            country: "DE",
+            source: None,
+            referrer_host: Some("google.example"),
+            duration_ms: None,
+        },
+    )
+    .await;
+    let landing = seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("h3"),
+            at: at_day(0, 8),
+            path: "/qa/landing",
+            title: "QA landing",
+            device: "desktop",
+            country: "FR",
+            source: None,
+            referrer_host: Some("news.example"),
+            duration_ms: Some(900),
+        },
+    )
+    .await;
+    seed_pageview(
+        &fixture.db,
+        site,
+        landing,
+        "/qa/docs",
+        "QA docs",
+        at_day(0, 8) + time::Duration::minutes(3),
+    )
+    .await;
+    let form = seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("h4"),
+            at: at_day(0, 12),
+            path: "/qa/contact",
+            title: "QA contact",
+            device: "mobile",
+            country: "TR",
+            source: Some("newsletter"),
+            referrer_host: None,
+            duration_ms: Some(3_000),
+        },
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        form,
+        "form_submit",
+        "/qa/contact",
+        Some(120.0),
+        json!({ "form": "contact" }),
+        at_day(0, 12) + time::Duration::minutes(1),
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        landing,
+        "download",
+        "/qa/landing",
+        None,
+        json!({ "file": "/qa/files/guide.pdf" }),
+        at_day(0, 8) + time::Duration::minutes(4),
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        landing,
+        "signup",
+        "/qa/landing",
+        Some(49.5),
+        json!({ "plan": "pro" }),
+        at_day(0, 8) + time::Duration::minutes(5),
+    )
+    .await;
+
+    // One goal, one hit — the only way a conversion exists.
+    let goal = Uuid::new_v4();
+    sqlx::query(
+        "insert into analytics_goals (id, site_id, name, kind, match) \
+         values ($1, $2, 'Signup', 'event', '{\"name\":\"signup\"}'::jsonb)",
+    )
+    .bind(goal)
+    .bind(site)
+    .fetch_optional(fixture.db.pool())
+    .await
+    .expect("the goal must be written");
+    sqlx::query(
+        "insert into analytics_goal_hits (goal_id, visitor_hash, step_position, occurred_at) \
+         values ($1, $2, 1, $3)",
+    )
+    .bind(goal)
+    .bind(hash("h3"))
+    .bind(at_day(0, 9))
+    .fetch_optional(fixture.db.pool())
+    .await
+    .expect("the goal hit must be written");
+
+    let uri = format!(
+        "/api/v1/analytics/overview?site_id={site}&from={from}&to={today}&compare=1"
+    );
+    let response = call(&fixture.state, report_request(&uri, &reader)).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+
+    let body = &response.body;
+    assert_eq!(body["exact"], json!(true));
+    assert_eq!(body["granularity"], json!("day"), "seven days are daily buckets");
+    // Four people, six pageviews, one goal conversion, one form, one download — and the visitor
+    // who came back on a second day is still one visitor.
+    assert_eq!(body["kpis"]["visitors"]["value"], json!(4));
+    assert_eq!(body["kpis"]["pageviews"]["value"], json!(6));
+    assert_eq!(body["kpis"]["conversions"]["value"], json!(1));
+    assert_eq!(body["kpis"]["forms"]["value"], json!(1));
+    assert_eq!(body["kpis"]["downloads"]["value"], json!(1));
+
+    let series = body["series"].as_array().expect("a series");
+    assert_eq!(series.len(), 7, "one point per day of the range");
+    assert_eq!(series[0]["label"], json!(month_day(from)));
+    assert_eq!(
+        series[0]["visitors"],
+        json!(0),
+        "a day without traffic is a zero, not a gap"
+    );
+    assert_eq!(series[1]["visitors"], json!(1), "the oldest seeded day");
+    assert_eq!(series[4]["visitors"], json!(1), "the returning visitor");
+    assert_eq!(series[6]["visitors"], json!(2), "today holds two");
+    assert_eq!(series[6]["pageviews"], json!(3));
+
+    // Comparison: nothing was seeded before the window, so it says so instead of showing zero.
+    assert_eq!(body["compare"], json!(true));
+    assert_eq!(body["previous_has_data"], json!(false));
+    assert_eq!(body["kpis"]["visitors"]["previous"], json!(0));
+
+    // A visitor one day before the window makes the comparison real.
+    seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("h9"),
+            at: at_day(7, 10),
+            path: "/qa/landing",
+            title: "QA landing",
+            device: "desktop",
+            country: "TR",
+            source: None,
+            referrer_host: None,
+            duration_ms: Some(500),
+        },
+    )
+    .await;
+
+    let compared = call(&fixture.state, report_request(&uri, &reader)).await;
+    assert_eq!(compared.status, StatusCode::OK, "body: {}", compared.body);
+    assert_eq!(compared.body["previous_has_data"], json!(true));
+    assert_eq!(compared.body["kpis"]["visitors"]["previous"], json!(1));
+    assert_eq!(
+        compared.body["series"][6]["previous_visitors"],
+        json!(1),
+        "today's bucket carries the visitor of the same bucket one period earlier"
+    );
+    assert_eq!(
+        compared.body["series"][0]["previous_visitors"],
+        json!(0),
+        "a bucket whose earlier twin was empty stays zero"
+    );
+
+    // Hourly granularity is offered where the range allows it.
+    let two_days = format!(
+        "/api/v1/analytics/overview?site_id={site}&from={}&to={today}&granularity=hour",
+        today - time::Duration::days(1)
+    );
+    let hourly = call(&fixture.state, report_request(&two_days, &reader)).await;
+    assert_eq!(hourly.status, StatusCode::OK, "body: {}", hourly.body);
+    assert_eq!(hourly.body["granularity"], json!("hour"));
+    let points = hourly.body["series"].as_array().expect("a series");
+    assert_eq!(points.len(), 48, "two days are 48 hourly buckets");
+    let busy = points
+        .iter()
+        .filter(|point| point["visitors"].as_i64().unwrap_or(0) > 0)
+        .count();
+    assert!(
+        busy >= 3,
+        "each seeded hour has its own bucket — {busy} buckets carry visitors"
+    );
+
+    // The side panels answer what the overview promises.
+    assert_eq!(body["top_pages"][0]["value"], json!("/qa/landing"));
+    assert_eq!(body["top_pages"][0]["views"], json!(2));
+    assert_eq!(body["top_sources"][0]["value"], json!("newsletter"));
+    let devices: Vec<String> = body["devices"]
+        .as_array()
+        .expect("devices")
+        .iter()
+        .map(|row| row["value"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(devices.contains(&"desktop".to_owned()));
+    assert!(devices.contains(&"mobile".to_owned()));
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_page_report_filters_sorts_pages_and_exports_exactly_its_rows() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let reader = fixture.reader_token().await;
+    let member = fixture.member_token().await;
+    let other = fixture.other_reader_token().await;
+    let owner = fixture.owner_token().await;
+    let today = OffsetDateTime::now_utc().date();
+    let from = today - time::Duration::days(6);
+
+    // /qa/landing: three views by two visitors; /qa/pricing: two views; /qa/docs: one.
+    for (index, (label, path, title, device, country, source)) in [
+        ("h1", "/qa/landing", "QA landing", "desktop", "TR", Some("newsletter")),
+        ("h1", "/qa/landing", "QA landing", "desktop", "TR", Some("newsletter")),
+        ("h2", "/qa/landing", "QA landing, pricing", "mobile", "DE", None),
+        ("h3", "/qa/pricing", "QA pricing", "desktop", "FR", None),
+        ("h4", "/qa/pricing", "QA pricing", "mobile", "TR", Some("newsletter")),
+        ("h5", "/qa/docs", "QA docs", "mobile", "TR", Some("newsletter")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let visit = seed_visit(
+            &fixture.db,
+            site,
+            &RawVisit {
+                hash: &hash(label),
+                at: at_day(0, 6) + time::Duration::minutes(index as i64),
+                path,
+                title,
+                device,
+                country,
+                source,
+                referrer_host: None,
+                duration_ms: Some(1_000 + index as i32 * 100),
+            },
+        )
+        .await;
+        // A clean exit for every other visit, so entrances and exits are both exercised.
+        if index % 2 == 0 {
+            sqlx::query("update analytics_pageviews set is_exit = true where visit_id = $1")
+                .bind(visit)
+                .execute(fixture.db.pool())
+                .await
+                .expect("the exit flag must be written");
+        }
+    }
+
+    let base = format!("/api/v1/analytics/pages?site_id={site}&from={from}&to={today}");
+    let response = call(&fixture.state, report_request(&base, &reader)).await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    let rows = response.body["rows"].as_array().expect("rows");
+    assert_eq!(response.body["total"], json!(3));
+    assert_eq!(rows[0]["path"], json!("/qa/landing"));
+    assert_eq!(rows[0]["views"], json!(3));
+    assert_eq!(rows[0]["visitors"], json!(2));
+    assert_eq!(rows[0]["views_per_visitor"], json!(1.5));
+    assert_eq!(rows[0]["entrances"], json!(3));
+    assert_eq!(
+        rows[0]["title"],
+        json!("QA landing, pricing"),
+        "the most recent title of the path wins"
+    );
+    assert!(rows[0]["avg_time_ms"].as_f64().unwrap_or(0.0) > 0.0);
+    assert_eq!(rows[0]["bounce_rate"], json!(0.0), "no visit bounced");
+
+    // Sorting by visitors, ascending, flips the order.
+    let ascending = format!("{base}&sort=visitors&dir=asc");
+    let sorted = call(&fixture.state, report_request(&ascending, &reader)).await;
+    let first = &sorted.body["rows"][0];
+    assert!(
+        first["visitors"].as_i64().unwrap_or(9) <= 1,
+        "the least visited page comes first: {}",
+        first
+    );
+
+    // Filters combine: device + country + source, plus a path substring.
+    let filtered = format!("{base}&device=mobile&country=TR&source=newsletter&path=qa");
+    let narrowed = call(&fixture.state, report_request(&filtered, &reader)).await;
+    assert_eq!(narrowed.status, StatusCode::OK, "body: {}", narrowed.body);
+    let rows = narrowed.body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "pricing and docs belong to that visitor: {rows:?}");
+    let paths: Vec<&str> = rows
+        .iter()
+        .map(|row| row["path"].as_str().unwrap_or_default())
+        .collect();
+    assert!(paths.contains(&"/qa/pricing"));
+    assert!(paths.contains(&"/qa/docs"));
+    assert!(!paths.contains(&"/qa/landing"), "landing is desktop in the fixture");
+
+    // One row per page: paging is stable and the second page holds the second row.
+    let paged = format!("{base}&sort=views&dir=desc&per_page=1&page=2");
+    let page_two = call(&fixture.state, report_request(&paged, &reader)).await;
+    let rows = page_two.body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(page_two.body["total"], json!(3));
+    assert_eq!(rows[0]["path"], json!("/qa/pricing"));
+
+    // The CSV holds exactly the filtered rows, and its count rides in a header.
+    let export_uri =
+        format!("/api/v1/analytics/export?report=pages&format=csv&site_id={site}&from={from}&to={today}&device=mobile&country=TR&source=newsletter&path=qa");
+    let exported = call(&fixture.state, report_request(&export_uri, &reader)).await;
+    assert_eq!(exported.status, StatusCode::FORBIDDEN, "exporting is its own key");
+
+    let manager = fixture.manager_token().await;
+    // The response of an export is CSV, so it is read as text (and its count off the header).
+    let csv = exported_csv(&fixture, &export_uri, &manager).await;
+    let lines: Vec<&str> = csv.trim_end().split('\n').collect();
+    assert_eq!(lines.len(), 3, "a header and the two filtered rows");
+    assert!(lines[0].starts_with("path,title,views,visitors"));
+    assert!(csv.contains("/qa/pricing"));
+    assert!(csv.contains("/qa/docs"));
+    assert!(!csv.contains("/qa/landing"), "the file holds the filters, not the table");
+
+    // The page series is the drawer's own request.
+    let series_uri = format!(
+        "/api/v1/analytics/pages/series?site_id={site}&from={from}&to={today}&path=/qa/landing"
+    );
+    let series = call(&fixture.state, report_request(&series_uri, &reader)).await;
+    assert_eq!(series.status, StatusCode::OK, "body: {}", series.body);
+    let points = series.body.as_array().expect("points");
+    assert_eq!(points.len(), 7);
+    assert_eq!(points[6]["pageviews"], json!(3));
+
+    // Permissions: reading is the read key, another organization is not the caller's business.
+    let denied = call(&fixture.state, report_request(&base, &member)).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    let crossed = call(&fixture.state, report_request(&base, &other)).await;
+    assert_eq!(crossed.status, StatusCode::FORBIDDEN);
+    let owner_reads = call(&fixture.state, report_request(&base, &owner)).await;
+    assert_eq!(owner_reads.status, StatusCode::OK, "the platform Owner reaches across");
+
+    // A sort key the report does not know is refused, not silently ignored.
+    let bogus = format!("{base}&sort=views%3Bdrop%20table%20users");
+    let refused = call(&fixture.state, report_request(&bogus, &reader)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.body["error"]["code"], "invalid_report_query");
+    let bad_day = format!("/api/v1/analytics/pages?site_id={site}&from=yesterday");
+    let refused = call(&fixture.state, report_request(&bad_day, &reader)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+    fixture.cleanup().await;
+}
+
+/// Read an export as text (the JSON reader of `call` cannot).
+async fn exported_csv(fixture: &Fixture, uri: &str, token: &str) -> String {
+    let response = routes::router(fixture.state.clone())
+        .oneshot(report_request(uri, token))
+        .await
+        .expect("router must answer");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let header = response
+        .headers()
+        .get("x-export-rows")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("the export names how many rows it holds");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body must read")
+        .to_bytes();
+    let csv = String::from_utf8(bytes.to_vec()).expect("CSV is UTF-8");
+    assert_eq!(
+        csv.trim_end().lines().count() - 1,
+        header,
+        "the header names exactly the rows the file holds"
+    );
+
+    csv
+}
+
+#[tokio::test]
+async fn the_reports_answer_their_dimensions_and_an_empty_site_says_nothing_happened() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let empty = fixture.site_b;
+    let reader = fixture.reader_token().await;
+    let other_reader = fixture.other_reader_token().await;
+    let today = OffsetDateTime::now_utc().date();
+    let from = today - time::Duration::days(6);
+
+    let desktop = seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("d1"),
+            at: at_day(0, 7),
+            path: "/qa/landing",
+            title: "QA landing",
+            device: "desktop",
+            country: "TR",
+            source: Some("newsletter"),
+            referrer_host: None,
+            duration_ms: Some(700),
+        },
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        desktop,
+        "download",
+        "/qa/landing",
+        None,
+        json!({ "file": "/qa/files/guide.pdf" }),
+        at_day(0, 7) + time::Duration::minutes(1),
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        desktop,
+        "download",
+        "/qa/landing",
+        None,
+        json!({ "file": "/qa/files/guide.pdf" }),
+        at_day(0, 7) + time::Duration::minutes(2),
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        desktop,
+        "download",
+        "/qa/docs",
+        None,
+        json!({ "file": "/qa/files/notes.pdf" }),
+        at_day(0, 7) + time::Duration::minutes(3),
+    )
+    .await;
+    let mobile = seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("d2"),
+            at: at_day(1, 15),
+            path: "/qa/contact",
+            title: "QA contact",
+            device: "mobile",
+            country: "DE",
+            source: None,
+            referrer_host: Some("google.example"),
+            duration_ms: Some(1_500),
+        },
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        mobile,
+        "form_start",
+        "/qa/contact",
+        None,
+        json!({ "form": "contact" }),
+        at_day(1, 15) + time::Duration::minutes(1),
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        mobile,
+        "form_submit",
+        "/qa/contact",
+        Some(120.0),
+        json!({ "form": "contact" }),
+        at_day(1, 15) + time::Duration::minutes(2),
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        mobile,
+        "form_submit",
+        "/qa/contact",
+        Some(80.0),
+        json!({ "form": "newsletter" }),
+        at_day(1, 15) + time::Duration::minutes(3),
+    )
+    .await;
+    // A visit that carried neither a campaign nor a referrer: the report calls it direct.
+    seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &hash("d3"),
+            at: at_day(3, 13),
+            path: "/qa/pricing",
+            title: "QA pricing",
+            device: "desktop",
+            country: "FR",
+            source: None,
+            referrer_host: None,
+            duration_ms: Some(600),
+        },
+    )
+    .await;
+
+    // Sources: the UTM combination, the referrer, and the direct visit that carried neither.
+    let sources = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/sources?site_id={site}&from={from}&to={today}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(sources.status, StatusCode::OK, "body: {}", sources.body);
+    let rows = sources.body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "newsletter, google and direct: {rows:?}");
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|row| row["source"].as_str().unwrap_or_default())
+        .collect();
+    assert!(names.contains(&"newsletter"));
+    assert!(names.contains(&"google.example"));
+    assert!(names.contains(&"(direct)"));
+    for row in rows {
+        assert_eq!(row["visits"], json!(1));
+        assert_eq!(row["medium"].as_str(), None, "no medium was carried");
+    }
+
+    // Grouping collapses the combination to one dimension.
+    let grouped = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/sources?site_id={site}&from={from}&to={today}&group=device"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(grouped.status, StatusCode::BAD_REQUEST, "device is not a source dimension");
+
+    let grouped = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/sources?site_id={site}&from={from}&to={today}&group=medium"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(grouped.status, StatusCode::OK, "body: {}", grouped.body);
+    let rows = grouped.body["rows"].as_array().expect("rows");
+    assert!(
+        rows.iter().any(|row| row["source"] == json!("(none)")),
+        "a visit without a medium groups under (none): {rows:?}"
+    );
+
+    // Audience: the panels and the countries table.
+    let audience = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/audience?site_id={site}&from={from}&to={today}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(audience.status, StatusCode::OK, "body: {}", audience.body);
+    let panels = audience.body["panels"].as_array().expect("panels");
+    assert_eq!(panels.len(), 5, "devices, browsers, systems, screens, languages");
+    assert_eq!(panels[0]["kind"], json!("device"));
+    let devices: Vec<&str> = panels[0]["rows"]
+        .as_array()
+        .expect("device rows")
+        .iter()
+        .map(|row| row["value"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(devices.len(), 2);
+    assert!(devices.contains(&"desktop") && devices.contains(&"mobile"));
+    let countries = audience.body["countries"].as_array().expect("countries");
+    let codes: Vec<&str> = countries
+        .iter()
+        .map(|row| row["code"].as_str().unwrap_or_default())
+        .collect();
+    assert!(codes.contains(&"TR") && codes.contains(&"DE"));
+    let total: f64 = countries
+        .iter()
+        .map(|row| row["share"].as_f64().unwrap_or(0.0))
+        .sum();
+    assert!((total - 1.0).abs() < 0.001, "the shares add up to one");
+
+    // Events: counts, values and the property breakdown of one event.
+    let events = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/events?site_id={site}&from={from}&to={today}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(events.status, StatusCode::OK, "body: {}", events.body);
+    let rows = events.body["rows"].as_array().expect("rows");
+    let submit = rows
+        .iter()
+        .find(|row| row["name"] == json!("form_submit"))
+        .expect("the submission is reported");
+    assert_eq!(submit["count"], json!(2));
+    assert_eq!(submit["visitors"], json!(1));
+    assert_eq!(submit["value_sum"], json!(200.0));
+
+    let detail = call(
+        &fixture.state,
+        report_request(
+            &format!(
+                "/api/v1/analytics/events/form_submit?site_id={site}&from={from}&to={today}"
+            ),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK, "body: {}", detail.body);
+    let properties = detail.body["properties"].as_array().expect("properties");
+    let forms: Vec<(&str, i64)> = properties
+        .iter()
+        .filter(|row| row["key"] == json!("form"))
+        .map(|row| {
+            (
+                row["value"].as_str().unwrap_or_default(),
+                row["count"].as_i64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert_eq!(forms, vec![("contact", 1), ("newsletter", 1)]);
+    assert_eq!(detail.body["series"].as_array().expect("series").len(), 7);
+
+    // Downloads: by file and by page.
+    let downloads = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/downloads?site_id={site}&from={from}&to={today}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(downloads.status, StatusCode::OK, "body: {}", downloads.body);
+    assert_eq!(downloads.body["total"], json!(3));
+    let files = downloads.body["files"].as_array().expect("files");
+    assert_eq!(files[0]["value"], json!("/qa/files/guide.pdf"));
+    assert_eq!(files[0]["downloads"], json!(2));
+    let pages = downloads.body["pages"].as_array().expect("pages");
+    let page_names: Vec<&str> = pages
+        .iter()
+        .map(|row| row["value"].as_str().unwrap_or_default())
+        .collect();
+    assert!(page_names.contains(&"/qa/docs"));
+
+    // Forms: completion needs `form_start`; the form without one reports a dash, not a zero.
+    let forms = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/forms?site_id={site}&from={from}&to={today}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(forms.status, StatusCode::OK, "body: {}", forms.body);
+    let rows = forms.body["rows"].as_array().expect("rows");
+    let contact = rows
+        .iter()
+        .find(|row| row["form"] == json!("contact"))
+        .expect("the contact form");
+    assert_eq!(contact["submissions"], json!(1));
+    assert_eq!(contact["starts"], json!(1));
+    assert_eq!(contact["completion_rate"], json!(1.0));
+    assert_eq!(contact["abandonment"], json!(0));
+    let newsletter = rows
+        .iter()
+        .find(|row| row["form"] == json!("newsletter"))
+        .expect("the newsletter form");
+    assert_eq!(newsletter["starts"], json!(0));
+    assert_eq!(newsletter["completion_rate"], json!(null));
+    assert_eq!(newsletter["abandonment"], json!(null));
+
+    // The empty site answers, with zeroes and empty tables — never an error.
+    let other = other_reader;
+    let empty_overview = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/overview?site_id={empty}&from={from}&to={today}"),
+            &other,
+        ),
+    )
+    .await;
+    assert_eq!(empty_overview.status, StatusCode::OK, "body: {}", empty_overview.body);
+    assert_eq!(empty_overview.body["kpis"]["visitors"]["value"], json!(0));
+    for point in empty_overview.body["series"].as_array().expect("series") {
+        assert_eq!(point["visitors"], json!(0));
+        assert_eq!(point["pageviews"], json!(0));
+    }
+    assert_eq!(empty_overview.body["top_pages"], json!([]));
+
+    let empty_pages = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/pages?site_id={empty}&from={from}&to={today}"),
+            &other,
+        ),
+    )
+    .await;
+    assert_eq!(empty_pages.status, StatusCode::OK, "body: {}", empty_pages.body);
+    assert_eq!(empty_pages.body["rows"], json!([]));
+    assert_eq!(empty_pages.body["total"], json!(0));
+
+    fixture.cleanup().await;
+}

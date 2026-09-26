@@ -16,6 +16,10 @@ pub enum AnalyticsError {
     /// The beacon carries nothing to record.
     #[error("the beacon carries neither a pageview nor an event")]
     EmptyBeacon,
+    /// A report query the platform refuses (a range that ends before it starts, a sort key that
+    /// is not one of the documented ones, a filter that is too long).
+    #[error("invalid report query: {0}")]
+    InvalidQuery(String),
     /// The site has no settings row (it should have been seeded with the site).
     #[error("this site has no analytics settings")]
     SettingsNotFound,

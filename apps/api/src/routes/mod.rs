@@ -353,6 +353,25 @@ pub fn router(state: AppState) -> Router {
     let analytics_snippet =
         get(analytics::snippet).layer(guards::require(&state, "analytics.read"));
 
+    // The reports (docs/requests/REQ-007, slice 2): reading them is `analytics.read`, and taking
+    // one out as a file is the separate `analytics.export` — a screen that may read a report and
+    // an account that may walk away with the data are two different powers. The page series rides
+    // with the read key: it is one page's numbers, nothing more than the table already shows.
+    let analytics_reports = Router::new()
+        .route("/analytics/overview", get(analytics::overview))
+        .route("/analytics/pages", get(analytics::pages))
+        .route("/analytics/pages/series", get(analytics::page_series))
+        .route("/analytics/sources", get(analytics::sources))
+        .route("/analytics/audience", get(analytics::audience))
+        .route("/analytics/events", get(analytics::events))
+        .route("/analytics/events/{name}", get(analytics::event_detail))
+        .route("/analytics/downloads", get(analytics::downloads))
+        .route("/analytics/forms", get(analytics::forms))
+        .route_layer(guards::require(&state, "analytics.read"));
+
+    let analytics_export =
+        get(analytics::export).layer(guards::require(&state, "analytics.export"));
+
     let analytics_collect = Router::new()
         .route("/public/analytics/collect", post(analytics::collect))
         .layer(DefaultBodyLimit::max(
@@ -383,6 +402,8 @@ pub fn router(state: AppState) -> Router {
             analytics_settings_read.merge(analytics_settings_write),
         )
         .route("/analytics/snippet", analytics_snippet)
+        .merge(analytics_reports)
+        .route("/analytics/export", analytics_export)
         .merge(analytics_collect)
         .route(
             "/iam/permissions",

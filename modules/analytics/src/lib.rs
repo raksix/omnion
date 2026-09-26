@@ -25,6 +25,7 @@ pub mod agent;
 pub mod collect;
 pub mod error;
 pub mod model;
+pub mod reports;
 pub mod rollup;
 pub mod settings;
 pub mod visitor;

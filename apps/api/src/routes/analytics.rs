@@ -22,13 +22,15 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_module_analytics::collect::{self, Beacon, RequestMeta};
+use omnion_module_analytics::reports::{self, DateRange, Filters, Granularity, Report};
 use omnion_module_analytics::settings as store;
 use omnion_module_analytics::{Settings, SettingsChanges};
 
@@ -97,6 +99,7 @@ pub async fn collect(
     let meta = RequestMeta {
         address,
         user_agent: user_agent(&headers),
+        country: edge_country(&headers),
         day: now.date(),
         now,
         // `DNT: 1` and `Sec-GPC: 1` are the two signals a browser sends without any script.
@@ -227,6 +230,460 @@ async fn snippet_host(state: &AppState, site: &Site, headers: &HeaderMap) -> Str
     }
 
     request_host(headers).unwrap_or_else(|| format!("{}.omnion.test", site.key))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reports (panel)
+// ---------------------------------------------------------------------------------------------
+
+/// Query string every report endpoint accepts.
+///
+/// One shape for all of them on purpose: the screens share one toolbar, so they share one URL
+/// vocabulary — the range, the comparison switch, the granularity, the five filters, the sort and
+/// the page. A report simply ignores what it does not read.
+#[derive(Debug, Deserialize)]
+pub struct ReportQuery {
+    /// Site the report is about.
+    pub site_id: Uuid,
+    /// First UTC day (`YYYY-MM-DD`); seven days back when absent.
+    pub from: Option<String>,
+    /// Last UTC day; today when absent.
+    pub to: Option<String>,
+    /// `1`/`true` asks for the previous period beside every number.
+    pub compare: Option<String>,
+    /// `hour`, `day` or `auto` (the range decides).
+    pub granularity: Option<String>,
+    /// Path substring filter.
+    pub path: Option<String>,
+    /// Title substring filter.
+    pub title: Option<String>,
+    /// Device filter.
+    pub device: Option<String>,
+    /// Country filter.
+    pub country: Option<String>,
+    /// Source filter.
+    pub source: Option<String>,
+    /// Sort key of the page report.
+    pub sort: Option<String>,
+    /// `asc` or `desc`.
+    pub dir: Option<String>,
+    /// One-based page of the page report.
+    pub page: Option<i64>,
+    /// Rows per page of the page report.
+    pub per_page: Option<i64>,
+    /// Group-by mode of the sources report.
+    pub group: Option<String>,
+    /// Event name of the event detail.
+    pub event: Option<String>,
+    /// Which report to export.
+    pub report: Option<String>,
+    /// `csv` (default) or `json`.
+    pub format: Option<String>,
+}
+
+/// The resolved inputs of one report request.
+struct ReportRequest {
+    /// Site the caller may read.
+    site: Site,
+    /// The validated range.
+    range: DateRange,
+    /// The validated filters.
+    filters: Filters,
+}
+
+impl ReportRequest {
+    /// Resolve a request: the site in the caller's own organization, the range, the filters.
+    async fn resolve(
+        state: &AppState,
+        current: &CurrentSession,
+        query: &ReportQuery,
+    ) -> Result<Self, ApiError> {
+        let site = site_in_scope(state, current, query.site_id).await?;
+        let today = OffsetDateTime::now_utc().date();
+        let from = parse_day(query.from.as_deref(), today - time::Duration::days(6))?;
+        let to = parse_day(query.to.as_deref(), today)?;
+        let range = DateRange::new(from, to)?;
+        let filters = Filters::new(
+            query.path.clone(),
+            query.title.clone(),
+            query.device.clone(),
+            query.country.clone(),
+            query.source.clone(),
+        )?;
+
+        Ok(Self {
+            site,
+            range,
+            filters,
+        })
+    }
+
+    /// `true` when the caller asked for the previous period beside this one.
+    fn compare(&self, query: &ReportQuery) -> bool {
+        query
+            .compare
+            .as_deref()
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    }
+}
+
+/// `GET /api/v1/analytics/overview` — the headline numbers, the series and the side panels.
+pub async fn overview(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::Overview>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let settings = store::ensure(state.db().pool(), request.site.id).await?;
+    let granularity = Granularity::parse(query.granularity.as_deref(), request.range)?;
+    let today = OffsetDateTime::now_utc().date();
+
+    let report = reports::overview(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        request.compare(&query),
+        granularity,
+        settings.retention_days,
+        today,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/pages` — the page report, filtered, sorted and paged.
+pub async fn pages(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::PagesReport>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::pages(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        &request.filters,
+        query.sort.as_deref(),
+        query.dir.as_deref(),
+        query.page,
+        query.per_page,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/pages/series` — one page's own series for the drawer.
+///
+/// The path rides as a query parameter rather than as a path segment: a URL path is not a path,
+/// and `/pages/%2Fpricing/series` would make every router on the way a participant in the
+/// encoding question.
+pub async fn page_series(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<Vec<reports::SeriesPoint>>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let path = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_report_query",
+                "the series of a page needs its path",
+            )
+        })?;
+    let granularity = Granularity::parse(query.granularity.as_deref(), request.range)?;
+
+    let series = reports::page_series(
+        state.db().pool(),
+        request.site.id,
+        path,
+        request.range,
+        granularity,
+    )
+    .await?;
+
+    Ok(Json(series))
+}
+
+/// `GET /api/v1/analytics/sources` — referrers and UTM, grouped as the caller asks.
+pub async fn sources(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::SourcesReport>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::sources(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        &request.filters,
+        query.group.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/audience` — devices, browsers, systems, screens, languages, countries.
+pub async fn audience(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::AudienceReport>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::audience(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        &request.filters,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/events` — custom events with their counts and values.
+pub async fn events(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::EventsReport>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::events(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        &request.filters,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/events/{name}` — one event: counts, days and property breakdown.
+pub async fn event_detail(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::EventDetail>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::event_detail(
+        state.db().pool(),
+        request.site.id,
+        &name,
+        request.range,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/downloads` — downloads by file and by page.
+pub async fn downloads(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::DownloadsReport>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::downloads(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        &request.filters,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/forms` — submissions, completion and abandonment per form.
+pub async fn forms(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<Json<reports::FormsReport>, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = reports::forms(
+        state.db().pool(),
+        request.site.id,
+        request.range,
+        &request.filters,
+    )
+    .await?;
+
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/analytics/export` — the report the screen showed, as a file.
+///
+/// The file is built from the same query the screen ran (its range, its filters, its sort), so
+/// the rows in the file and the rows on the screen are the same rows — and the count rides in a
+/// header, because a silently truncated export would make the file lie.
+pub async fn export(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+    current: CurrentSession,
+) -> Result<axum::response::Response, ApiError> {
+    let request = ReportRequest::resolve(&state, &current, &query).await?;
+    let report = build_report(&state, &request, &query).await?;
+    let format = query.format.as_deref().unwrap_or("csv").trim();
+
+    match format {
+        "json" => Ok(Json(report).into_response()),
+        "csv" => {
+            let (_, rows) = report.csv_rows();
+            let filename = format!(
+                "omnion-analytics-{}-{}.csv",
+                report.key(),
+                request.range.label()
+            );
+            let headers = [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/csv; charset=utf-8".to_owned(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+                (
+                    axum::http::HeaderName::from_static("x-export-rows"),
+                    rows.len().to_string(),
+                ),
+            ];
+            let mut response =
+                axum::response::Response::new(axum::body::Body::from(report.csv()));
+            for (name, value) in headers {
+                if let Ok(value) = value.parse() {
+                    response.headers_mut().insert(name, value);
+                }
+            }
+
+            Ok(response)
+        }
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_report_query",
+            format!("format \"{other}\" is not one of csv, json"),
+        )),
+    }
+}
+
+/// Build the report `report=` names, with the same inputs the screens use.
+async fn build_report(
+    state: &AppState,
+    request: &ReportRequest,
+    query: &ReportQuery,
+) -> Result<Report, ApiError> {
+    let pool = state.db().pool();
+    let site_id = request.site.id;
+    let key = query.report.as_deref().map(str::trim).unwrap_or("overview");
+
+    let report = match key {
+        "overview" => {
+            let settings = store::ensure(pool, site_id).await?;
+            let granularity = Granularity::parse(query.granularity.as_deref(), request.range)?;
+            let today = OffsetDateTime::now_utc().date();
+            Report::Overview(
+                reports::overview(
+                    pool,
+                    site_id,
+                    request.range,
+                    request.compare(query),
+                    granularity,
+                    settings.retention_days,
+                    today,
+                )
+                .await?,
+            )
+        }
+        "pages" => Report::Pages(
+            reports::pages(
+                pool,
+                site_id,
+                request.range,
+                &request.filters,
+                query.sort.as_deref(),
+                query.dir.as_deref(),
+                query.page,
+                query.per_page,
+            )
+            .await?,
+        ),
+        "sources" => Report::Sources(
+            reports::sources(
+                pool,
+                site_id,
+                request.range,
+                &request.filters,
+                query.group.as_deref(),
+            )
+            .await?,
+        ),
+        "audience" => Report::Audience(
+            reports::audience(pool, site_id, request.range, &request.filters).await?,
+        ),
+        "events" => {
+            Report::Events(reports::events(pool, site_id, request.range, &request.filters).await?)
+        }
+        "downloads" => Report::Downloads(
+            reports::downloads(pool, site_id, request.range, &request.filters).await?,
+        ),
+        "forms" => {
+            Report::Forms(reports::forms(pool, site_id, request.range, &request.filters).await?)
+        }
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_report_query",
+                format!(
+                    "report \"{other}\" is not one of overview, pages, sources, audience, \
+                     events, downloads, forms"
+                ),
+            ));
+        }
+    };
+
+    Ok(report)
+}
+
+/// Read a day (`YYYY-MM-DD`), falling back when the caller named none.
+fn parse_day(value: Option<&str>, fallback: Date) -> Result<Date, ApiError> {
+    match value.map(str::trim).filter(|text| !text.is_empty()) {
+        None => Ok(fallback),
+        Some(text) => reports::day_from_str(text).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_report_query",
+                format!("\"{text}\" is not a day (YYYY-MM-DD)"),
+            )
+        }),
+    }
+}
+
+/// The country an edge reported for the caller, when it reported one.
+///
+/// The platform never geolocates an address itself: a deployment's edge (Cloudflare, a load
+/// balancer, a CDN in front of the API) resolved it, and only the two-letter answer is stored.
+/// The headers are read in the order the common edges set them.
+fn edge_country(headers: &HeaderMap) -> Option<String> {
+    for name in ["cf-ipcountry", "x-vercel-ip-country", "x-country-code"] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok())
+            && let Some(country) = collect::country_from_header(Some(value))
+        {
+            return Some(country);
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------------------------
