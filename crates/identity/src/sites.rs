@@ -23,14 +23,20 @@ const MAX_HOST_LENGTH: usize = 253;
 /// Longest accepted single label of a host.
 const MAX_LABEL_LENGTH: usize = 63;
 
+/// Longest accepted theme key (matches the schema check).
+const MAX_THEME_LENGTH: usize = 63;
+
 /// Statuses a site row may carry (matches the schema check).
 pub const SITE_STATUSES: [&str; 2] = ["active", "archived"];
 
 /// The status a freshly created site starts in.
 pub const DEFAULT_STATUS: &str = "active";
 
+/// Theme a site renders with when none has been chosen (the bundled `minimal` theme).
+pub const DEFAULT_THEME: &str = "minimal";
+
 /// Column list for every `Site` query.
-const SITE_COLUMNS: &str = "id, organization_id, key, name, status, created_at, updated_at";
+const SITE_COLUMNS: &str = "id, organization_id, key, name, status, theme, created_at, updated_at";
 
 /// Column list for every `SiteDomain` query.
 const DOMAIN_COLUMNS: &str = "id, site_id, host, is_primary, created_at, updated_at";
@@ -48,6 +54,8 @@ pub struct Site {
     pub name: String,
     /// `active` or `archived`.
     pub status: String,
+    /// Theme the renderer activates for this site (`themes/<key>`).
+    pub theme: String,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
     /// Last change.
@@ -88,6 +96,8 @@ pub struct NewSite {
     pub key: String,
     /// Display name.
     pub name: String,
+    /// Theme to render with; `None` uses [`DEFAULT_THEME`].
+    pub theme: Option<String>,
 }
 
 /// Fields [`update_site`] may change. `None` leaves a field untouched.
@@ -97,13 +107,15 @@ pub struct SiteChanges {
     pub name: Option<String>,
     /// New status.
     pub status: Option<String>,
+    /// New theme key.
+    pub theme: Option<String>,
 }
 
 impl SiteChanges {
     /// `true` when the request changes nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.status.is_none()
+        self.name.is_none() && self.status.is_none() && self.theme.is_none()
     }
 }
 
@@ -151,6 +163,28 @@ pub fn validate_status(status: &str) -> Result<String> {
     )))
 }
 
+/// Validate a theme key and normalize it to lowercase.
+///
+/// Same shape as the schema constraint and as a site key: the value names a directory under
+/// `themes/` (`minimal`, `starter-dark`). Which keys an installation actually bundles is the
+/// renderer's registry question, so this only checks the shape.
+pub fn validate_theme(theme: &str) -> Result<String> {
+    let theme = theme.trim().to_lowercase();
+    let shaped = !theme.is_empty()
+        && theme.len() <= MAX_THEME_LENGTH
+        && theme.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && theme.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && theme
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if shaped {
+        return Ok(theme);
+    }
+    Err(IdentityError::InvalidSite(format!(
+        "theme {theme:?} must be lowercase letters, digits and dashes (1-{MAX_THEME_LENGTH} characters)"
+    )))
+}
+
 /// Validate a domain host and normalize it to lowercase.
 ///
 /// Hosts are stored lowercase so one host cannot be registered twice; each dot-separated label
@@ -180,9 +214,13 @@ pub fn validate_host(host: &str) -> Result<String> {
 pub async fn create_site(pool: &PgPool, new: NewSite) -> Result<Site> {
     let key = validate_key(&new.key)?;
     let name = validate_name(&new.name)?;
+    let theme = match &new.theme {
+        Some(theme) => validate_theme(theme)?,
+        None => DEFAULT_THEME.to_owned(),
+    };
 
     let sql = format!(
-        "insert into sites (organization_id, key, name, status) values ($1, $2, $3, $4) \
+        "insert into sites (organization_id, key, name, status, theme) values ($1, $2, $3, $4, $5) \
          returning {SITE_COLUMNS}"
     );
 
@@ -191,6 +229,7 @@ pub async fn create_site(pool: &PgPool, new: NewSite) -> Result<Site> {
         .bind(&key)
         .bind(&name)
         .bind(DEFAULT_STATUS)
+        .bind(&theme)
         .fetch_one(pool)
         .await
         .map_err(map_site_insert_error)
@@ -298,11 +337,16 @@ pub async fn update_site(pool: &PgPool, id: Uuid, changes: &SiteChanges) -> Resu
         Some(status) => Some(validate_status(status)?),
         None => None,
     };
+    let theme = match &changes.theme {
+        Some(theme) => Some(validate_theme(theme)?),
+        None => None,
+    };
 
     let sql = format!(
         "update sites set \
             name = coalesce($2, name), \
             status = coalesce($3, status), \
+            theme = coalesce($4, theme), \
             updated_at = now() \
          where id = $1 returning {SITE_COLUMNS}"
     );
@@ -311,6 +355,7 @@ pub async fn update_site(pool: &PgPool, id: Uuid, changes: &SiteChanges) -> Resu
         .bind(id)
         .bind(name)
         .bind(status)
+        .bind(theme)
         .fetch_one(pool)
         .await
         .map_err(Into::into)
@@ -461,7 +506,7 @@ pub async fn find_site_by_host(pool: &PgPool, host: &str) -> Result<Option<Site>
     let host = validate_host(host)?;
     // Column list qualified by hand: `id`, `created_at` and `updated_at` exist on both sides
     // of the join, so an unqualified list would be ambiguous.
-    let sql = "select s.id, s.organization_id, s.key, s.name, s.status, s.created_at, s.updated_at \
+    let sql = "select s.id, s.organization_id, s.key, s.name, s.status, s.theme, s.created_at, s.updated_at \
                from sites s join site_domains d on d.site_id = s.id where d.host = $1";
     sqlx::query_as::<_, Site>(sql)
         .bind(&host)
@@ -569,12 +614,34 @@ mod tests {
     }
 
     #[test]
+    fn theme_keys_are_normalized_and_shaped() {
+        assert_eq!(validate_theme(" Minimal ").expect("valid"), "minimal");
+        assert_eq!(
+            validate_theme("Starter-Dark").expect("valid"),
+            "starter-dark"
+        );
+        for bad in ["", "-dark", "dark-", "dark_theme", "dark theme", "Dark!"] {
+            assert!(validate_theme(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(validate_theme(&"a".repeat(MAX_THEME_LENGTH + 1)).is_err());
+    }
+
+    #[test]
     fn changes_report_emptiness() {
         assert!(SiteChanges::default().is_empty());
         assert!(
             !SiteChanges {
                 name: None,
                 status: Some("archived".to_owned()),
+                theme: None,
+            }
+            .is_empty()
+        );
+        assert!(
+            !SiteChanges {
+                name: None,
+                status: None,
+                theme: Some("minimal".to_owned()),
             }
             .is_empty()
         );

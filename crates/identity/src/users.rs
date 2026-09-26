@@ -209,6 +209,19 @@ pub async fn count_users(pool: &PgPool) -> Result<i64> {
     Ok(count)
 }
 
+/// The oldest active account, if any.
+///
+/// The order is the one the Owner invariant uses (docs/07-IAM.md §20): earliest first, ties
+/// broken by id, so two processes agree on which account is "the first one".
+pub async fn earliest_active(pool: &PgPool) -> Result<Option<Uuid>> {
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "select id from users where status = 'active' order by created_at asc, id asc limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
 /// Result of [`bootstrap_first_admin`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapOutcome {

@@ -30,12 +30,12 @@ pub use sessions::{
     hash_token, resolve_session, revoke_session, touch_session,
 };
 pub use sites::{
-    NewSite, Site, SiteChanges, SiteDomain, add_domain, count_for_organization, create_site,
-    delete_site, find_site, find_site_by_global_key, find_site_by_host, find_site_by_key,
-    list_domains, list_sites, list_sites_for_organization, remove_domain, set_primary_domain,
-    update_site,
+    DEFAULT_THEME, NewSite, Site, SiteChanges, SiteDomain, add_domain, count_for_organization,
+    create_site, delete_site, find_site, find_site_by_global_key, find_site_by_host,
+    find_site_by_key, list_domains, list_sites, list_sites_for_organization, remove_domain,
+    set_primary_domain, update_site, validate_theme,
 };
 pub use users::{
-    BootstrapOutcome, NewUser, User, bootstrap_first_admin, count_users, create_user, find_by_id,
-    find_credentials, has_any, normalize_email,
+    BootstrapOutcome, NewUser, User, bootstrap_first_admin, count_users, create_user,
+    earliest_active, find_by_id, find_credentials, has_any, normalize_email,
 };
