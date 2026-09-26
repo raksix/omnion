@@ -1337,7 +1337,14 @@ async fn seed_visit(db: &Db, site: Uuid, visit: &RawVisit<'_>) -> i64 {
 }
 
 /// Add one more pageview to a visit (the entry and exit flags move with it).
-async fn seed_pageview(db: &Db, site: Uuid, visit_id: i64, path: &str, title: &str, at: OffsetDateTime) {
+async fn seed_pageview(
+    db: &Db,
+    site: Uuid,
+    visit_id: i64,
+    path: &str,
+    title: &str,
+    at: OffsetDateTime,
+) {
     sqlx::query("update analytics_pageviews set is_exit = false where visit_id = $1")
         .bind(visit_id)
         .execute(db.pool())
@@ -1358,6 +1365,10 @@ async fn seed_pageview(db: &Db, site: Uuid, visit_id: i64, path: &str, title: &s
 }
 
 /// Write one event of a visit.
+///
+/// Seeding a row takes every column it fills; bundling them into a struct would only move the
+/// list one line up, so the test helper keeps its parameters.
+#[allow(clippy::too_many_arguments)]
 async fn seed_event(
     db: &Db,
     site: Uuid,
@@ -1563,15 +1574,17 @@ async fn the_overview_matches_the_seeded_fixture_and_compares_with_the_period_be
     .await
     .expect("the goal hit must be written");
 
-    let uri = format!(
-        "/api/v1/analytics/overview?site_id={site}&from={from}&to={today}&compare=1"
-    );
+    let uri = format!("/api/v1/analytics/overview?site_id={site}&from={from}&to={today}&compare=1");
     let response = call(&fixture.state, report_request(&uri, &reader)).await;
     assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
 
     let body = &response.body;
     assert_eq!(body["exact"], json!(true));
-    assert_eq!(body["granularity"], json!("day"), "seven days are daily buckets");
+    assert_eq!(
+        body["granularity"],
+        json!("day"),
+        "seven days are daily buckets"
+    );
     // Four people, six pageviews, one goal conversion, one form, one download — and the visitor
     // who came back on a second day is still one visitor.
     assert_eq!(body["kpis"]["visitors"]["value"], json!(4));
@@ -1681,12 +1694,47 @@ async fn the_page_report_filters_sorts_pages_and_exports_exactly_its_rows() {
 
     // /qa/landing: three views by two visitors; /qa/pricing: two views; /qa/docs: one.
     for (index, (label, path, title, device, country, source)) in [
-        ("h1", "/qa/landing", "QA landing", "desktop", "TR", Some("newsletter")),
-        ("h1", "/qa/landing", "QA landing", "desktop", "TR", Some("newsletter")),
-        ("h2", "/qa/landing", "QA landing, pricing", "mobile", "DE", None),
+        (
+            "h1",
+            "/qa/landing",
+            "QA landing",
+            "desktop",
+            "TR",
+            Some("newsletter"),
+        ),
+        (
+            "h1",
+            "/qa/landing",
+            "QA landing",
+            "desktop",
+            "TR",
+            Some("newsletter"),
+        ),
+        (
+            "h2",
+            "/qa/landing",
+            "QA landing, pricing",
+            "mobile",
+            "DE",
+            None,
+        ),
         ("h3", "/qa/pricing", "QA pricing", "desktop", "FR", None),
-        ("h4", "/qa/pricing", "QA pricing", "mobile", "TR", Some("newsletter")),
-        ("h5", "/qa/docs", "QA docs", "mobile", "TR", Some("newsletter")),
+        (
+            "h4",
+            "/qa/pricing",
+            "QA pricing",
+            "mobile",
+            "TR",
+            Some("newsletter"),
+        ),
+        (
+            "h5",
+            "/qa/docs",
+            "QA docs",
+            "mobile",
+            "TR",
+            Some("newsletter"),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1750,14 +1798,21 @@ async fn the_page_report_filters_sorts_pages_and_exports_exactly_its_rows() {
     let narrowed = call(&fixture.state, report_request(&filtered, &reader)).await;
     assert_eq!(narrowed.status, StatusCode::OK, "body: {}", narrowed.body);
     let rows = narrowed.body["rows"].as_array().expect("rows");
-    assert_eq!(rows.len(), 2, "pricing and docs belong to that visitor: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "pricing and docs belong to that visitor: {rows:?}"
+    );
     let paths: Vec<&str> = rows
         .iter()
         .map(|row| row["path"].as_str().unwrap_or_default())
         .collect();
     assert!(paths.contains(&"/qa/pricing"));
     assert!(paths.contains(&"/qa/docs"));
-    assert!(!paths.contains(&"/qa/landing"), "landing is desktop in the fixture");
+    assert!(
+        !paths.contains(&"/qa/landing"),
+        "landing is desktop in the fixture"
+    );
 
     // One row per page: paging is stable and the second page holds the second row.
     let paged = format!("{base}&sort=views&dir=desc&per_page=1&page=2");
@@ -1768,10 +1823,15 @@ async fn the_page_report_filters_sorts_pages_and_exports_exactly_its_rows() {
     assert_eq!(rows[0]["path"], json!("/qa/pricing"));
 
     // The CSV holds exactly the filtered rows, and its count rides in a header.
-    let export_uri =
-        format!("/api/v1/analytics/export?report=pages&format=csv&site_id={site}&from={from}&to={today}&device=mobile&country=TR&source=newsletter&path=qa");
+    let export_uri = format!(
+        "/api/v1/analytics/export?report=pages&format=csv&site_id={site}&from={from}&to={today}&device=mobile&country=TR&source=newsletter&path=qa"
+    );
     let exported = call(&fixture.state, report_request(&export_uri, &reader)).await;
-    assert_eq!(exported.status, StatusCode::FORBIDDEN, "exporting is its own key");
+    assert_eq!(
+        exported.status,
+        StatusCode::FORBIDDEN,
+        "exporting is its own key"
+    );
 
     let manager = fixture.manager_token().await;
     // The response of an export is CSV, so it is read as text (and its count off the header).
@@ -1781,7 +1841,10 @@ async fn the_page_report_filters_sorts_pages_and_exports_exactly_its_rows() {
     assert!(lines[0].starts_with("path,title,views,visitors"));
     assert!(csv.contains("/qa/pricing"));
     assert!(csv.contains("/qa/docs"));
-    assert!(!csv.contains("/qa/landing"), "the file holds the filters, not the table");
+    assert!(
+        !csv.contains("/qa/landing"),
+        "the file holds the filters, not the table"
+    );
 
     // The page series is the drawer's own request.
     let series_uri = format!(
@@ -1799,7 +1862,11 @@ async fn the_page_report_filters_sorts_pages_and_exports_exactly_its_rows() {
     let crossed = call(&fixture.state, report_request(&base, &other)).await;
     assert_eq!(crossed.status, StatusCode::FORBIDDEN);
     let owner_reads = call(&fixture.state, report_request(&base, &owner)).await;
-    assert_eq!(owner_reads.status, StatusCode::OK, "the platform Owner reaches across");
+    assert_eq!(
+        owner_reads.status,
+        StatusCode::OK,
+        "the platform Owner reaches across"
+    );
 
     // A sort key the report does not know is refused, not silently ignored.
     let bogus = format!("{base}&sort=views%3Bdrop%20table%20users");
@@ -2005,17 +2072,25 @@ async fn the_reports_answer_their_dimensions_and_an_empty_site_says_nothing_happ
     let grouped = call(
         &fixture.state,
         report_request(
-            &format!("/api/v1/analytics/sources?site_id={site}&from={from}&to={today}&group=device"),
+            &format!(
+                "/api/v1/analytics/sources?site_id={site}&from={from}&to={today}&group=device"
+            ),
             &reader,
         ),
     )
     .await;
-    assert_eq!(grouped.status, StatusCode::BAD_REQUEST, "device is not a source dimension");
+    assert_eq!(
+        grouped.status,
+        StatusCode::BAD_REQUEST,
+        "device is not a source dimension"
+    );
 
     let grouped = call(
         &fixture.state,
         report_request(
-            &format!("/api/v1/analytics/sources?site_id={site}&from={from}&to={today}&group=medium"),
+            &format!(
+                "/api/v1/analytics/sources?site_id={site}&from={from}&to={today}&group=medium"
+            ),
             &reader,
         ),
     )
@@ -2038,7 +2113,11 @@ async fn the_reports_answer_their_dimensions_and_an_empty_site_says_nothing_happ
     .await;
     assert_eq!(audience.status, StatusCode::OK, "body: {}", audience.body);
     let panels = audience.body["panels"].as_array().expect("panels");
-    assert_eq!(panels.len(), 5, "devices, browsers, systems, screens, languages");
+    assert_eq!(
+        panels.len(),
+        5,
+        "devices, browsers, systems, screens, languages"
+    );
     assert_eq!(panels[0]["kind"], json!("device"));
     let devices: Vec<&str> = panels[0]["rows"]
         .as_array()
@@ -2082,9 +2161,7 @@ async fn the_reports_answer_their_dimensions_and_an_empty_site_says_nothing_happ
     let detail = call(
         &fixture.state,
         report_request(
-            &format!(
-                "/api/v1/analytics/events/form_submit?site_id={site}&from={from}&to={today}"
-            ),
+            &format!("/api/v1/analytics/events/form_submit?site_id={site}&from={from}&to={today}"),
             &reader,
         ),
     )
@@ -2162,7 +2239,12 @@ async fn the_reports_answer_their_dimensions_and_an_empty_site_says_nothing_happ
         ),
     )
     .await;
-    assert_eq!(empty_overview.status, StatusCode::OK, "body: {}", empty_overview.body);
+    assert_eq!(
+        empty_overview.status,
+        StatusCode::OK,
+        "body: {}",
+        empty_overview.body
+    );
     assert_eq!(empty_overview.body["kpis"]["visitors"]["value"], json!(0));
     for point in empty_overview.body["series"].as_array().expect("series") {
         assert_eq!(point["visitors"], json!(0));
@@ -2178,9 +2260,556 @@ async fn the_reports_answer_their_dimensions_and_an_empty_site_says_nothing_happ
         ),
     )
     .await;
-    assert_eq!(empty_pages.status, StatusCode::OK, "body: {}", empty_pages.body);
+    assert_eq!(
+        empty_pages.status,
+        StatusCode::OK,
+        "body: {}",
+        empty_pages.body
+    );
     assert_eq!(empty_pages.body["rows"], json!([]));
     assert_eq!(empty_pages.body["total"], json!(0));
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Goals, funnels and realtime (REQ-007, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// How many hits one goal holds.
+async fn goal_hits(fixture: &Fixture, goal_id: &str) -> i64 {
+    sqlx::query_scalar("select count(*)::bigint from analytics_goal_hits where goal_id = $1::uuid")
+        .bind(goal_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the hits must count")
+}
+
+/// The three-step goal the funnel walk works with: a landing page, a download, a form.
+fn funnel_goal() -> Value {
+    json!({
+        "name": "QA funnel",
+        "kind": "form_submit",
+        "match": { "name": "contact" },
+        "enabled": true,
+        "steps": [
+            { "kind": "pageview", "match": { "path": "/qa/landing" } },
+            { "kind": "download", "match": { "file": "/qa/files/guide.pdf" } },
+            { "kind": "form_submit", "match": { "name": "contact" } }
+        ]
+    })
+}
+
+/// A visitor whose one beacon carries the landing page, the download and the form: the ordered
+/// funnel must move three steps in a single beacon, because that is what the batch holds.
+fn completing_beacon() -> Value {
+    pageview_beacon(
+        "/qa/landing",
+        json!([
+            { "name": "download", "properties": { "file": "/qa/files/guide.pdf" } },
+            { "name": "form_submit", "value": 25.0, "properties": { "form": "contact" } }
+        ]),
+    )
+}
+
+#[tokio::test]
+async fn goals_record_ordered_deduplicated_hits_and_report_their_funnel() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let manager = fixture.manager_token().await;
+    let reader = fixture.reader_token().await;
+    let today = OffsetDateTime::now_utc().date();
+    let from = today - time::Duration::days(6);
+    let scope = format!("site_id={site}&from={from}&to={today}");
+
+    // A goal is created with its ordered steps; the goal row mirrors the last one.
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?{scope}"),
+            Some(&manager),
+            Some(funnel_goal()),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
+    let goal_id = created.body["id"].as_str().expect("a goal id").to_owned();
+    assert_eq!(created.body["steps"].as_array().expect("steps").len(), 3);
+    assert_eq!(created.body["kind"], json!("form_submit"));
+    assert_eq!(created.body["match"]["name"], json!("contact"));
+
+    // The editor's refusals are the API's refusals.
+    let empty_match = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?{scope}"),
+            Some(&manager),
+            Some(json!({
+                "name": "No match",
+                "kind": "pageview",
+                "match": {},
+                "enabled": true,
+                "steps": []
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        empty_match.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        empty_match.body
+    );
+    assert_eq!(empty_match.body["error"]["code"], json!("invalid_goal"));
+
+    let nameless = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?{scope}"),
+            Some(&manager),
+            Some(json!({
+                "name": "   ",
+                "kind": "pageview",
+                "match": { "path": "/qa/landing" },
+                "enabled": true,
+                "steps": []
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        nameless.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        nameless.body
+    );
+
+    let duplicate = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?{scope}"),
+            Some(&manager),
+            Some(funnel_goal()),
+        ),
+    )
+    .await;
+    assert_eq!(
+        duplicate.status,
+        StatusCode::CONFLICT,
+        "body: {}",
+        duplicate.body
+    );
+    assert_eq!(duplicate.body["error"]["code"], json!("goal_name_taken"));
+
+    // Reading a goal is `analytics.read`; creating one is `analytics.goals.manage`.
+    let reader_list = call(
+        &fixture.state,
+        report_request(&format!("/api/v1/analytics/goals?{scope}"), &reader),
+    )
+    .await;
+    assert_eq!(
+        reader_list.status,
+        StatusCode::OK,
+        "body: {}",
+        reader_list.body
+    );
+
+    let reader_create = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?{scope}"),
+            Some(&reader),
+            Some(json!({
+                "name": "Reader goal",
+                "kind": "pageview",
+                "match": { "path": "/qa/landing" },
+                "enabled": true,
+                "steps": []
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(reader_create.status, StatusCode::FORBIDDEN);
+
+    let member = fixture.member_token().await;
+    let member_list = call(
+        &fixture.state,
+        report_request(&format!("/api/v1/analytics/goals?{scope}"), &member),
+    )
+    .await;
+    assert_eq!(member_list.status, StatusCode::FORBIDDEN);
+
+    // Four visitors arrive; three of them enter the funnel and stop where they stop.
+    let completing = fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                completing_beacon(),
+                CHROME,
+                Some("203.0.113.41"),
+                &[],
+            ),
+        )
+        .await;
+    let reached = completing.body["reached_goals"]
+        .as_array()
+        .expect("reached goals");
+    assert_eq!(
+        reached.len(),
+        3,
+        "one beacon carried the visitor three steps: {}",
+        completing.body
+    );
+    assert_eq!(reached[0]["step_position"], json!(1));
+    assert_eq!(reached[2]["is_final"], json!(true));
+
+    fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                pageview_beacon(
+                    "/qa/landing",
+                    json!([{ "name": "download", "properties": { "file": "/qa/files/guide.pdf" } }]),
+                ),
+                CHROME,
+                Some("203.0.113.42"),
+                &[],
+            ),
+        )
+        .await;
+    fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                pageview_beacon(
+                    "/qa/pricing",
+                    json!([{ "name": "download", "properties": { "file": "/qa/files/guide.pdf" } }]),
+                ),
+                CHROME,
+                Some("203.0.113.43"),
+                &[],
+            ),
+        )
+        .await;
+    fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                pageview_beacon(
+                    "/qa/landing",
+                    json!([{ "name": "form_submit", "properties": { "form": "contact" } }]),
+                ),
+                CHROME,
+                Some("203.0.113.44"),
+                &[],
+            ),
+        )
+        .await;
+
+    // Six hits: three for the complete walk, two for the shortened one, one for the visitor who
+    // skipped the download (a later step is not reachable before the one before it).
+    assert_eq!(goal_hits(&fixture, &goal_id).await, 6);
+
+    // Re-sending the same beacon changes nothing, and says nothing.
+    let again = fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                completing_beacon(),
+                CHROME,
+                Some("203.0.113.41"),
+                &[],
+            ),
+        )
+        .await;
+    assert_eq!(again.body["reached_goals"], json!([]));
+    assert_eq!(goal_hits(&fixture, &goal_id).await, 6);
+
+    // The funnel is monotonically non-increasing, with the drop-offs the range saw.
+    let funnel = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/goals/{goal_id}/funnel?{scope}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(funnel.status, StatusCode::OK, "body: {}", funnel.body);
+    let steps = funnel.body["steps"].as_array().expect("steps");
+    let reached: Vec<i64> = steps
+        .iter()
+        .map(|step| step["visitors"].as_i64().unwrap_or_default())
+        .collect();
+    assert_eq!(reached, vec![3, 2, 1]);
+    assert!(
+        reached.windows(2).all(|pair| pair[0] >= pair[1]),
+        "a funnel that grows is not a funnel: {reached:?}"
+    );
+    assert_eq!(steps[0]["drop_off"], json!(0));
+    assert_eq!(steps[1]["drop_off"], json!(1));
+    assert_eq!(steps[2]["drop_off"], json!(1));
+    assert_eq!(funnel.body["conversions"], json!(1));
+    assert_eq!(funnel.body["visitors"], json!(4));
+    assert_eq!(funnel.body["rate"], json!(0.25));
+    assert_eq!(steps[0]["rate"], json!(0.75));
+
+    // The list agrees with the funnel and carries the last hit.
+    let list = call(
+        &fixture.state,
+        report_request(&format!("/api/v1/analytics/goals?{scope}"), &reader),
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK, "body: {}", list.body);
+    let rows = list.body["goals"].as_array().expect("goals");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], json!(goal_id));
+    assert_eq!(rows[0]["conversions"], json!(1));
+    assert_eq!(rows[0]["visitors"], json!(4));
+    assert_eq!(rows[0]["rate"], json!(0.25));
+    assert!(
+        !rows[0]["last_hit"].is_null(),
+        "the goal was hit inside the range"
+    );
+
+    // A finished goal is a platform event, recorded once for the one visitor who finished.
+    let emitted: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from events where site_id = $1 and name = 'analytics.goal_reached'",
+    )
+    .bind(site)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the events must count");
+    assert_eq!(emitted, 1);
+
+    // The switch is a partial write: it must not touch the match it did not mention.
+    let switched = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/analytics/goals/{goal_id}?{scope}"),
+            Some(&manager),
+            Some(json!({ "enabled": false })),
+        ),
+    )
+    .await;
+    assert_eq!(switched.status, StatusCode::OK, "body: {}", switched.body);
+    assert_eq!(switched.body["enabled"], json!(false));
+    assert_eq!(switched.body["steps"].as_array().expect("steps").len(), 3);
+
+    // A switched-off goal records no new hits.
+    let quiet = fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                pageview_beacon(
+                    "/qa/landing",
+                    json!([{ "name": "form_submit", "properties": { "form": "contact" } }]),
+                ),
+                CHROME,
+                Some("203.0.113.45"),
+                &[],
+            ),
+        )
+        .await;
+    assert_eq!(quiet.body["reached_goals"], json!([]));
+    assert_eq!(goal_hits(&fixture, &goal_id).await, 6);
+
+    // Deleting the goal takes its steps and hits with it.
+    let deleted = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/analytics/goals/{goal_id}?{scope}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    assert_eq!(goal_hits(&fixture, &goal_id).await, 0);
+    let steps_left: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from analytics_goal_steps where goal_id = $1::uuid",
+    )
+    .bind(&goal_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the steps must count");
+    assert_eq!(steps_left, 0);
+
+    let missing = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/goals/{goal_id}/funnel?{scope}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.body["error"]["code"], json!("goal_not_found"));
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn realtime_reads_the_last_half_hour_and_respects_the_scope() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let empty = fixture.site_b;
+    let manager = fixture.manager_token().await;
+    let reader = fixture.reader_token().await;
+    let other = fixture.other_reader_token().await;
+    let member = fixture.member_token().await;
+    let today = OffsetDateTime::now_utc().date();
+    let from = today - time::Duration::days(6);
+    let scope = format!("site_id={site}&from={from}&to={today}");
+
+    // A conversion exists before the traffic does, so the window has something to count.
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?{scope}"),
+            Some(&manager),
+            Some(json!({
+                "name": "QA landing view",
+                "kind": "pageview",
+                "match": { "path": "/qa/landing" },
+                "enabled": true,
+                "steps": []
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
+
+    // One beacon: a pageview, a download and a custom event — and a goal hit.
+    fixture
+        .collect(
+            &fixture.key_a,
+            beacon(
+                "/api/v1/public/analytics/collect",
+                pageview_beacon(
+                    "/qa/landing",
+                    json!([
+                        { "name": "download", "value": 12.5, "properties": { "file": "/qa/files/guide.pdf" } },
+                        { "name": "cta_click", "properties": { "slot": "hero" } }
+                    ]),
+                ),
+                CHROME,
+                Some("203.0.113.61"),
+                &[],
+            ),
+        )
+        .await;
+
+    // Realtime reads the raw rows: no rollup tick stands between the beacon and the screen.
+    let snapshot = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/realtime?site_id={site}"),
+            &reader,
+        ),
+    )
+    .await;
+    assert_eq!(snapshot.status, StatusCode::OK, "body: {}", snapshot.body);
+    assert_eq!(snapshot.body["last_5"]["visitors"], json!(1));
+    assert_eq!(snapshot.body["last_5"]["pageviews"], json!(1));
+    assert_eq!(snapshot.body["last_5"]["events"], json!(2));
+    assert_eq!(snapshot.body["last_5"]["conversions"], json!(1));
+    assert_eq!(snapshot.body["last_30"]["visitors"], json!(1));
+    assert_eq!(snapshot.body["last_30"]["events"], json!(2));
+
+    let pages = snapshot.body["pages"].as_array().expect("pages");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], json!("/qa/landing"));
+    assert_eq!(pages[0]["visitors"], json!(1));
+    assert_eq!(pages[0]["views"], json!(1));
+
+    let names: Vec<&str> = snapshot.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        names.contains(&"download"),
+        "the feed carries the download: {names:?}"
+    );
+    assert!(
+        names.contains(&"cta_click"),
+        "the feed carries the custom event: {names:?}"
+    );
+
+    // An event that carries a value decodes it: `numeric` is not a float, and a feed that fails
+    // on the first value would only fail in production.
+    let download = snapshot.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["name"] == json!("download"))
+        .expect("the download event");
+    assert_eq!(download["value"], json!(12.5));
+
+    // A site nobody visited answers zeroes and empty tables, not an error.
+    let quiet = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/realtime?site_id={empty}"),
+            &other,
+        ),
+    )
+    .await;
+    assert_eq!(quiet.status, StatusCode::OK, "body: {}", quiet.body);
+    assert_eq!(quiet.body["last_5"]["visitors"], json!(0));
+    assert_eq!(quiet.body["pages"], json!([]));
+    assert_eq!(quiet.body["events"], json!([]));
+
+    // The realtime view is `analytics.read`: a member without it is refused, and another
+    // organization cannot read this site's live traffic.
+    let refused = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/realtime?site_id={site}"),
+            &member,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    let cross_org = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/realtime?site_id={site}"),
+            &other,
+        ),
+    )
+    .await;
+    assert_eq!(cross_org.status, StatusCode::FORBIDDEN);
 
     fixture.cleanup().await;
 }

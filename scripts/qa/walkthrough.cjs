@@ -100,6 +100,8 @@ function record(entry) {
 
 const consoleLog = [];
 const netFailures = [];
+/** Requests the browser itself cancelled (navigation) — counted, never findings. */
+const netAborted = [];
 const dialogs = [];
 const shots = [];
 
@@ -123,7 +125,15 @@ function attach(page, phase) {
     consoleLog.push({ phase, type: "pageerror", text: String(err).slice(0, 400), url: page.url() });
   });
   page.on("requestfailed", (req) => {
-    netFailures.push({ phase, url: req.url().slice(0, 200), error: (req.failure() || {}).errorText });
+    const error = (req.failure() || {}).errorText || "";
+    // A request the browser itself cancelled is the page moving on, not a defect: every panel
+    // screen drops its in-flight fetches when the URL state changes, and the realtime screen
+    // closes its event stream when the tab goes away. They are counted, never findings.
+    if (error === "net::ERR_ABORTED") {
+      netAborted.push({ phase, url: req.url().slice(0, 200), error });
+      return;
+    }
+    netFailures.push({ phase, url: req.url().slice(0, 200), error });
   });
   page.on("response", (res) => {
     if (res.status() >= 400) netFailures.push({ phase, url: res.url().slice(0, 200), status: res.status() });
@@ -1636,6 +1646,156 @@ async function runAnalyticsDepth(page, report) {
   return steps;
 }
 
+// ---------------------------------------------------------------- goals + realtime (REQ-007, slice 3)
+
+/**
+ * The goals and realtime pass: a goal is created through the editor, a visitor completes it, and
+ * the funnel and the live counters are read back.
+ *
+ * The goal is named per run so a second pass on the same database does not collide with the name
+ * the first one created — and so the funnel the pass reads is its own, not a leftover.
+ */
+async function runGoalAndRealtimeDepth(page, report) {
+  const steps = {};
+  const name = `QA funnel ${Math.floor(Date.now() / 1000) % 1000000}`;
+
+  await page.goto(`${URL_ADMIN}/analytics/goals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  await shot(page, "page-analytics-goals");
+
+  // Open the editor and describe a two-step funnel: the landing page, then the download.
+  await page.locator("[data-goal-create]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-goal-name]").first().fill(name, { timeout: 3000 }).catch(() => {});
+  await page.locator("[data-goal-step-add]").click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page
+    .locator('[data-goal-step-kind="2"]')
+    .selectOption("download", { timeout: 3000 })
+    .catch(() => {});
+  await page
+    .locator('[data-goal-step-file="2"]')
+    .first()
+    .fill("/qa/files/guide.pdf", { timeout: 3000 })
+    .catch(() => {});
+  steps.steps = await page.locator("[data-goal-step]").count();
+
+  // A step without a match is refused by the editor before anything is sent: the save below has
+  // no path yet, and the screen must say so instead of sending a goal the API would refuse.
+  await page.locator("[data-goal-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.validation = (await page.locator("[data-goal-error]").count()) > 0 ? "refused" : "silent";
+  await page
+    .locator('[data-goal-step-path="1"]')
+    .first()
+    .fill("/qa/landing", { timeout: 3000 })
+    .catch(() => {});
+
+  await page.locator("[data-goal-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.created = (await page.locator("[data-goal-open]").count()) > 0;
+  steps.savedName = name;
+
+  // A visitor completes both steps *after* the goal exists: a goal only counts what happens
+  // while it is listening.
+  const desktop =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  const answer = await postBeacon(
+    {
+      pageview: {
+        path: "/qa/landing",
+        title: "QA landing",
+        duration_ms: 900,
+        scroll_depth: 45,
+        screen: { width: 1440, height: 900 },
+        language: "en-GB",
+      },
+      events: [
+        { name: "download", properties: { file: "/qa/files/guide.pdf" } },
+        { name: "cta_click", properties: { slot: "hero" } },
+      ],
+    },
+    { userAgent: desktop, forwardedFor: "203.0.113.90", country: "TR" },
+  );
+  steps.beacon = answer.status;
+
+  // The acceptance criterion, measured at the API: the beacon of a moment ago is visible in
+  // realtime within five seconds — no rollup tick stands between the request and the counter.
+  let latency = null;
+  try {
+    const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+    const cookies = await page.context().cookies();
+    const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+    const started = Date.now();
+    for (let attempt = 0; attempt < 10 && latency === null; attempt += 1) {
+      const res = await fetch(`${URL_ADMIN}/api/v1/analytics/realtime?site_id=${site}`, {
+        headers: { cookie: cookieHeader },
+      });
+      if (res.ok) {
+        const body = await res.json();
+        if (body.last_5?.visitors > 0) latency = Date.now() - started;
+      }
+      if (latency === null) await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+  } catch (err) {
+    latency = `error: ${String(err).slice(0, 80)}`;
+  }
+  steps.realtimeLatencyMs = latency;
+
+  // The editor selected the new goal, so its funnel is on screen; a reload makes sure the answer
+  // is the server's, not the editor's optimism.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-goal-open]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.funnelSteps = await page.locator("[data-goal-funnel-step]").count();
+  steps.funnelStep1 = (await page
+    .locator('[data-goal-funnel-count="1"]')
+    .first()
+    .innerText()
+    .catch(() => ""))
+    .trim();
+  steps.funnelStep2 = (await page
+    .locator('[data-goal-funnel-count="2"]')
+    .first()
+    .innerText()
+    .catch(() => ""))
+    .trim();
+  steps.conversions = (await page
+    .locator("[data-goal-funnel-conversions]")
+    .first()
+    .innerText()
+    .catch(() => ""))
+    .trim();
+  await shot(page, "analytics-goal-funnel");
+
+  // Realtime: the same viewer sees the beacon of a moment ago without waiting for a rollup.
+  await page.goto(`${URL_ADMIN}/analytics/realtime`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.realtimeState = (await page
+    .locator("[data-rt-state]")
+    .first()
+    .getAttribute("data-rt-state")
+    .catch(() => "")) || "";
+  steps.visitors5 = (await page
+    .locator('[data-rt-counter="5-visitors"]')
+    .first()
+    .innerText()
+    .catch(() => "0"))
+    .trim();
+  steps.events30 = (await page
+    .locator('[data-rt-counter="30-events"]')
+    .first()
+    .innerText()
+    .catch(() => "0"))
+    .trim();
+  steps.pages = await page.locator("[data-rt-pages] li").count();
+  steps.feed = await page.locator("[data-rt-events] li").count();
+  await shot(page, "page-analytics-realtime-live");
+
+  return steps;
+}
+
 // ---------------------------------------------------------------- run
 
 async function main() {
@@ -1696,6 +1856,9 @@ async function main() {
     { path: "/analytics/events", name: "analytics-events" },
     { path: "/analytics/downloads", name: "analytics-downloads" },
     { path: "/analytics/forms", name: "analytics-forms" },
+    // Goals, funnels and realtime (REQ-007, slice 3).
+    { path: "/analytics/goals", name: "analytics-goals" },
+    { path: "/analytics/realtime", name: "analytics-realtime" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -1726,6 +1889,11 @@ async function main() {
   // settings screen with slice 4 — this pass visits what exists today.
   report.analyticsDepth = await runAnalyticsDepth(page, report);
 
+  // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
+  // completes it after it exists, and the funnel and the live counters are read back.
+  report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
+  log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -1746,7 +1914,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -1902,6 +2070,7 @@ async function main() {
       consoleErrors: consoleLog.filter((c) => c.type !== "warning").length,
       warnings: consoleLog.filter((c) => c.type === "warning").length,
       failedRequests: netFailures.length,
+      abortedRequests: netAborted.length,
       dialogs: dialogs.length,
     },
     bySeverity,
