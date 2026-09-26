@@ -1088,6 +1088,51 @@ async function runCommandCenter(page, report) {
   note({ step: "people-mode", chip: peopleChip });
   await shot(page, "command-center-modes", { full: false });
 
+  // The reading (REQ-032, slice 4): a phrase is interpreted *before* anything runs, and the card
+  // offers the two ways to act on that interpretation. The audit trail is read before and after,
+  // so "it shows the intent before running" is a fact rather than a screenshot.
+  const runsBeforeReading = await auditRuns();
+  await input()
+    .fill("Open Mehmet's last 10 tickets")
+    .catch(() => {});
+  await page.waitForTimeout(1600);
+  const readingCard = page.locator("[data-palette-ai]").first();
+  const readingText = (await readingCard.innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  const readingState = await readingCard
+    .getAttribute("data-palette-ai-state")
+    .catch(() => null);
+  const runsAfterReading = await auditRuns();
+  note({
+    step: "resolve-read",
+    state: readingState,
+    reading: readingText.slice(0, 160),
+    parsedIntent: /tickets/i.test(readingText) && /assignee: mehmet/i.test(readingText),
+    offersRun: (await page.locator("[data-palette-ai-run]").count()) > 0,
+    alternatives: await page.locator("[data-palette-ai-alternative]").count(),
+    ranNothingYet: runsAfterReading.length === runsBeforeReading.length,
+  });
+  await shot(page, "command-center-resolve", { full: false });
+
+  // "Edit as search" turns the reading into the results screen, the words and the order with it.
+  await page
+    .locator("[data-palette-ai-edit]")
+    .first()
+    .click({ timeout: 4000 })
+    .catch(() => {});
+  await page.waitForTimeout(1600);
+  const editedUrl = page.url();
+  const editedParams = new URL(editedUrl).searchParams;
+  note({
+    step: "resolve-edit-as-search",
+    url: editedUrl,
+    landed: new URL(editedUrl).pathname === "/search",
+    words: editedParams.get("q") ?? "",
+    sort: editedParams.get("sort") ?? "",
+  });
+  await shot(page, "command-center-resolve-search");
+
   await input()
     .fill("")
     .catch(() => {});
