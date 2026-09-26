@@ -13,7 +13,8 @@
   --mn-ink: #262624;
   --mn-muted: #6b6560;
   --mn-line: #e8e4dc;
-  --mn-accent: #c96442;
+  /* Links carry this as text on the cream canvas — it has to stay on the AA side (>= 4.5:1). */
+  --mn-accent: #b0563a;
   --mn-accent-soft: #f7e9e2;
 
   --mn-font-body:

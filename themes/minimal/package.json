@@ -1,6 +1,6 @@
 {
   "name": "@omnion/theme-minimal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Omnion's Minimal theme — one quiet, typographic column for public sites.",
   "type": "module",

@@ -1,7 +1,7 @@
 {
   "key": "minimal",
   "name": "Minimal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A quiet, typographic theme: one column, generous spacing, light and dark.",
   "author": "Omnion",
   "engine": "omnion-web",
