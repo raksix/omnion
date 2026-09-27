@@ -409,6 +409,41 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "analytics",
         description: "Change tracking, privacy and retention settings",
     },
+    // CRM (docs/requests/REQ-051). A business separates the four powers the relationship layer
+    // actually has: seeing the people and the companies, changing them, removing them for good
+    // (archiving is a different act from editing), and the two narrower ones — merging two
+    // records is irreversible from the user's side, and the flagged fields (a contract note, a
+    // margin) are a role's decision rather than the record's.
+    PermissionDef {
+        key: "crm.contacts.read",
+        category: "crm",
+        description: "Read CRM contacts, companies and their timelines",
+    },
+    PermissionDef {
+        key: "crm.contacts.create",
+        category: "crm",
+        description: "Create CRM contacts and companies",
+    },
+    PermissionDef {
+        key: "crm.contacts.update",
+        category: "crm",
+        description: "Edit CRM contacts and companies",
+    },
+    PermissionDef {
+        key: "crm.contacts.delete",
+        category: "crm",
+        description: "Archive CRM contacts and companies",
+    },
+    PermissionDef {
+        key: "crm.contacts.merge",
+        category: "crm",
+        description: "Merge two CRM records into one",
+    },
+    PermissionDef {
+        key: "crm.fields.sensitive.read",
+        category: "crm",
+        description: "Read the CRM fields a role otherwise cannot see",
+    },
 ];
 
 /// Look a permission up by key.
@@ -599,6 +634,27 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("analytics"),
                 "{key} belongs to the analytics category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_crm_family_is_catalogued() {
+        // REQ-051: the relationship layer separates reading, creating, editing, archiving and
+        // merging, and the flagged fields are a separate power — a role that may read a contact
+        // is not automatically a role that may read its contract note.
+        for key in [
+            "crm.contacts.read",
+            "crm.contacts.create",
+            "crm.contacts.update",
+            "crm.contacts.delete",
+            "crm.contacts.merge",
+            "crm.fields.sensitive.read",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("crm"),
+                "{key} belongs to the crm category"
             );
         }
     }

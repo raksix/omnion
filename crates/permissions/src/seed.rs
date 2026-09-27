@@ -109,6 +109,12 @@ const BASE_ROLES: &[BaseRole] = &[
             "analytics.export",
             "analytics.goals.manage",
             "analytics.settings.manage",
+            "crm.contacts.read",
+            "crm.contacts.create",
+            "crm.contacts.update",
+            "crm.contacts.delete",
+            "crm.contacts.merge",
+            "crm.fields.sensitive.read",
         ]),
     },
     BaseRole {
@@ -132,6 +138,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            "crm.contacts.read",
         ]),
     },
     BaseRole {
@@ -153,6 +160,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            "crm.contacts.read",
         ]),
     },
     BaseRole {

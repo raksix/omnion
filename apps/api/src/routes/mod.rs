@@ -61,6 +61,17 @@
 //! separate `search.manage`. The indexer that keeps the documents fresh from the event bus is
 //! `crate::search_runner`. See `crate::routes::search`.
 //!
+//! The CRM surface (`/crm/*`, docs/requests/REQ-051) is the relationship layer: companies,
+//! contacts and their rollups. Reading them is `crm.contacts.read`, creating is
+//! `crm.contacts.create`, editing and archiving are `.update` / `.delete` (archiving is a
+//! different act from editing — it removes a record from the work while keeping the history),
+//! and merging two records — the one act a user cannot undo from the screen — is
+//! `crm.contacts.merge`. The **visibility level** (`own` / `team` / `all`) is read from the
+//! caller's `department` bindings and enforced in SQL inside the module, so a list, a detail
+//! screen and an export all narrow identically; a record outside the caller's scope answers
+//! `404`, never `403`. Every mutation writes an audit row and emits the documented `crm.*`
+//! events for the automation engine and webhook subscribers. See `crate::routes::crm`.
+//!
 //! The analytics surface (`/analytics/*`, docs/requests/REQ-007) is the platform's own
 //! measurement engine: the panel side (`/analytics/settings`, `/analytics/snippet`) is read
 //! with `analytics.read` and written with `analytics.settings.manage` in the caller's own
@@ -75,6 +86,7 @@ pub mod auth;
 pub mod automation;
 pub mod commands;
 pub mod content;
+pub mod crm;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -605,6 +617,44 @@ pub fn router(state: AppState) -> Router {
             omnion_module_analytics::collect::MAX_BODY_BYTES,
         ));
 
+    // The CRM surface (docs/requests/REQ-051, slice 1): reading companies and contacts is
+    // `crm.contacts.read`, creating is `.create`, editing and archiving are separate keys
+    // (archiving removes a record from the work while keeping its history) and merging — the
+    // one act a user cannot undo from the screen — is `.merge`. The `crm.fields.sensitive.read`
+    // key is resolved *inside* the handlers, because it decides which values the response
+    // carries rather than whether the request is allowed at all.
+    let crm_read = Router::new()
+        .route("/crm/contacts", get(crm::list_contacts))
+        .route("/crm/contacts/{id}", get(crm::get_contact))
+        .route("/crm/companies", get(crm::list_companies))
+        .route("/crm/companies/{id}", get(crm::get_company))
+        .route_layer(guards::require(&state, "crm.contacts.read"));
+
+    let crm_create = Router::new()
+        .route("/crm/contacts", post(crm::create_contact))
+        .route("/crm/companies", post(crm::create_company))
+        .route_layer(guards::require(&state, "crm.contacts.create"));
+
+    let crm_update = Router::new()
+        .route("/crm/contacts/{id}", patch(crm::update_contact))
+        .route("/crm/companies/{id}", patch(crm::update_company))
+        .route_layer(guards::require(&state, "crm.contacts.update"));
+
+    let crm_archive = Router::new()
+        .route("/crm/contacts/{id}", delete(crm::archive_contact))
+        .route("/crm/companies/{id}", delete(crm::archive_company))
+        .route_layer(guards::require(&state, "crm.contacts.delete"));
+
+    let crm_merge = Router::new()
+        .route("/crm/contacts/merge", post(crm::merge_contacts))
+        .route_layer(guards::require(&state, "crm.contacts.merge"));
+
+    let crm = crm_read
+        .merge(crm_create)
+        .merge(crm_update)
+        .merge(crm_archive)
+        .merge(crm_merge);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -649,6 +699,7 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_goals_write)
         .merge(analytics_privacy)
         .merge(analytics_collect)
+        .merge(crm)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
