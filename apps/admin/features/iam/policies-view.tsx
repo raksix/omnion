@@ -305,7 +305,16 @@ export function PoliciesView() {
 
   /** The draft as the API receives it. */
   const draft = useMemo<IamPolicyInput>(() => {
-    const conditions = jsonMode ? (JSON.parse(jsonText) as unknown) : conditionsFromRows(mode, rows);
+    // Never throw out of a render: a JSON body that does not parse falls back to the rows, and
+    // the draft problem below tells the reader before anything is sent.
+    let conditions = conditionsFromRows(mode, rows);
+    if (jsonMode) {
+      try {
+        conditions = JSON.parse(jsonText) as unknown;
+      } catch {
+        conditions = conditionsFromRows(mode, rows);
+      }
+    }
     return {
       name,
       description,
@@ -645,11 +654,19 @@ export function PoliciesView() {
                     onChange={(event) => {
                       if (event.target.checked) {
                         setJsonText(JSON.stringify(conditionsFromRows(mode, rows), null, 2));
+                        setError(null);
                       } else {
-                        const parsed = rowsFromConditions(JSON.parse(jsonText));
+                        let parsed: { mode: "all" | "any"; rows: ConditionRow[] } | null = null;
+                        try {
+                          parsed = rowsFromConditions(JSON.parse(jsonText));
+                        } catch {
+                          setError("The JSON conditions do not parse — fix them before leaving the JSON view.");
+                          return;
+                        }
                         if (parsed) {
                           setMode(parsed.mode);
                           setRows(parsed.rows);
+                          setError(null);
                         } else {
                           setError(
                             "This JSON nests groups deeper than the row editor shows; keep the JSON view to edit it.",
