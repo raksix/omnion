@@ -524,6 +524,19 @@ pub fn router(state: AppState) -> Router {
     let automation_rotate_hook =
         post(automation::rotate_hook).layer(guards::require(&state, "workflows.manage"));
 
+    // "Run now" is the one control that touches the world — it sends, publishes and calls
+    // for real — so it is `workflows.run`, the same power the engine itself needs.
+    let automation_run =
+        post(automation::run_automation).layer(guards::require(&state, "workflows.run"));
+
+    // Repairing a run is running power too: it puts a step back on the queue, and that
+    // step's action touches the world exactly as it did the first time. Both endpoints are
+    // the same write, because "retry" and "resume from here" mean the same thing on a trace.
+    let execution_retry_step =
+        post(automation::retry_step).layer(guards::require(&state, "workflows.run"));
+    let execution_resume_from =
+        post(automation::resume_from).layer(guards::require(&state, "workflows.run"));
+
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
@@ -804,6 +817,12 @@ pub fn router(state: AppState) -> Router {
         .route("/automations/{id}/listen", automation_listen)
         .route("/automations/{id}/tests", automation_tests)
         .route("/automations/{id}/rotate-hook", automation_rotate_hook)
+        .route("/automations/{id}/run", automation_run)
+        .route("/workflow-executions/{id}/retry-step", execution_retry_step)
+        .route(
+            "/workflow-executions/{id}/resume-from",
+            execution_resume_from,
+        )
         .route("/hooks/{token}", hooks)
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",

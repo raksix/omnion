@@ -199,9 +199,11 @@ fn outcome_for(action: &str) -> String {
         "http_request" => "would_call",
         "publish_page" => "would_publish",
         "wait_for_approval" => "would_wait",
-        "run_workflow" => "would_run",
+        "run_workflow" => "would_start",
         "fail" => "would_fail",
         "wait" => "would_wait",
+        "branch" => "would_branch",
+        "stop" => "would_stop",
         _ => "would_run",
     }
     .to_owned()
@@ -228,6 +230,22 @@ fn summary_for(action: &str, params: &Value) -> Option<String> {
         "publish_page" => text("page_id").map(|page| format!("publish page {page}")),
         "wait_for_approval" => Some("parks the run for a decision".to_owned()),
         "run_workflow" => text("workflow_id").map(|id| format!("start workflow {id}")),
+        // A branch and a stop are control steps, and the dry run says what each *decides*
+        // rather than only that it exists — a branch on a field the payload does not carry
+        // would otherwise look identical to one that would let the run go on.
+        "branch" => {
+            let field = text("field")?;
+            let operator = text("operator").unwrap_or_else(|| "equals".to_owned());
+            let value = params
+                .get("value")
+                .map(|value| match value {
+                    Value::String(text) => format!(" {text}"),
+                    other => format!(" {other}"),
+                })
+                .unwrap_or_default();
+            Some(format!("end the run unless {field} {operator}{value}"))
+        }
+        "stop" => text("reason").map(|reason| format!("stop: {reason}")),
         "wait" => params
             .get("seconds")
             .and_then(Value::as_i64)

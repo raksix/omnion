@@ -219,6 +219,7 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
                 TriggerKind::Event,
                 None,
                 &steps,
+                Some(event.payload.clone()),
             )
             .await?;
             store::note_match(&mut transaction, workflow.id).await?;
@@ -285,7 +286,7 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
 ///
 /// This is the moment the templates become values: the run's step rows carry what *this* event
 /// said, so a retry repeats the first attempt instead of reading a bus that has moved on.
-fn resolve_steps(rule: &AutomationRule, payload: &Value) -> Result<Vec<StepDefinition>> {
+pub fn resolve_steps(rule: &AutomationRule, payload: &Value) -> Result<Vec<StepDefinition>> {
     let mut steps = Vec::with_capacity(rule.actions.len());
     for action in &rule.actions {
         let mut step = action.clone();
@@ -336,6 +337,7 @@ async fn record_skip(pool: &PgPool, workflow_id: Uuid, event_id: i64, reason: &s
 pub fn update_from_rule(rule: &AutomationRule) -> Option<WorkflowUpdate> {
     let definition = rule.definition().ok()?;
     Some(WorkflowUpdate {
+        on_error: rule.on_error,
         name: rule.name.clone(),
         description: rule.description.clone(),
         site_id: rule.site_id,

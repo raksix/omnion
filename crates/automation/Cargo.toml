@@ -7,6 +7,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+# The outbound `http_request` action signs every call with HMAC-SHA256 (the rule's key
+# over the timestamp, method, path and body hash) and verifies one in constant time, so a
+# receiver has a reference implementation rather than a description of the scheme.
+hmac.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

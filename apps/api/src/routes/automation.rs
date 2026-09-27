@@ -189,6 +189,19 @@ pub struct CatalogueResponse {
     pub hook_path_template: &'static str,
     /// How a payload field is named inside a condition or a binding.
     pub binding_syntax: &'static str,
+    /// The comparison operators a `branch` step offers — the same nine the conditions use.
+    pub branch_operators: Vec<CatalogueOperator>,
+    /// The step kinds a definition may carry, in the order the editor lists them.
+    pub step_kinds: Vec<&'static str>,
+    /// What a step's own failure may do; `inherit` takes the rule's policy.
+    pub on_error_policies: Vec<&'static str>,
+    /// The longest a step may block, in milliseconds, and the default.
+    pub max_step_timeout_ms: i32,
+    pub default_step_timeout_ms: i32,
+    /// The methods an outbound call may use.
+    pub outbound_methods: Vec<&'static str>,
+    /// How many rules deep a `run_workflow` chain may go before it is refused.
+    pub max_chain_depth: usize,
     /// An example of the payload an inbound call produces.
     pub hook_sample: Value,
 }
@@ -227,6 +240,21 @@ pub fn catalogue() -> CatalogueResponse {
         hook_event: omnion_automation::catalogue::HOOK_EVENT,
         hook_path_template: "/api/v1/hooks/<token>",
         binding_syntax: "{{event.field}} — the field is read from the event payload",
+        // A branch reads what a *step* produced or what the event carried, so it offers
+        // the same nine operators plus the two namespaces it can actually read.
+        branch_operators: omnion_workflows::branch::OPERATORS
+            .iter()
+            .map(|key| CatalogueOperator {
+                key,
+                needs_value: !matches!(*key, "exists" | "not_exists"),
+            })
+            .collect(),
+        step_kinds: vec!["task", "wait", "branch", "stop"],
+        on_error_policies: vec!["inherit", "stop", "continue"],
+        max_step_timeout_ms: omnion_workflows::MAX_STEP_TIMEOUT_MS,
+        default_step_timeout_ms: omnion_workflows::DEFAULT_STEP_TIMEOUT_MS,
+        outbound_methods: omnion_workflows::actions::OUTBOUND_METHODS.to_vec(),
+        max_chain_depth: omnion_automation::outbound::MAX_CHAIN_DEPTH,
         hook_sample: omnion_automation::hooks::sample_payload(),
     }
 }
@@ -270,8 +298,41 @@ pub struct AutomationInput {
     /// Whether the rule is triggered by its own inbound webhook URL.
     #[serde(default)]
     pub hook_triggered: bool,
+    /// The rule's own error policy — what a step's failure does when the step says
+    /// `inherit`. Absent means `stop`, which is what every rule did before the policy
+    /// existed.
+    #[serde(default = "default_on_error")]
+    pub on_error: RuleOnError,
     /// Actions to run, in order.
     pub actions: Vec<StepDefinition>,
+}
+
+/// Serde default for [`AutomationInput::on_error`]: v0's behaviour, a failure ends the run.
+fn default_on_error() -> RuleOnError {
+    RuleOnError::Stop
+}
+
+/// The rule-level error policy, as the wire spells it.
+///
+/// The engine's own [`omnion_workflows::OnError`] also carries a step-level `inherit`,
+/// which a *rule* may not choose — so the two are separate types rather than one with a
+/// spare variant, and a rule cannot send `inherit` and end up deferring to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleOnError {
+    /// A failing step ends the run.
+    Stop,
+    /// A failing step is recorded and the run carries on.
+    Continue,
+}
+
+impl From<RuleOnError> for omnion_workflows::OnError {
+    fn from(policy: RuleOnError) -> Self {
+        match policy {
+            RuleOnError::Stop => Self::Stop,
+            RuleOnError::Continue => Self::Continue,
+        }
+    }
 }
 
 /// Serde default for [`AutomationInput::enabled`]: a new rule is armed.
@@ -296,6 +357,7 @@ impl AutomationInput {
             stored_conditions: self.conditions.clone(),
             actions: self.actions.clone(),
             hook_triggered: self.hook_triggered,
+            on_error: self.on_error.into(),
         };
 
         // The definition check is the full one: the event name against the bus's rule, the
@@ -466,6 +528,7 @@ pub async fn create_automation(
     let workflow = store::insert_workflow(
         state.db().pool(),
         NewWorkflow {
+            on_error: rule.on_error,
             organization_id,
             site_id: rule.site_id,
             name: rule.name.clone(),
@@ -557,6 +620,7 @@ pub async fn update_automation(
         actions: rule.actions.clone(),
         hook_triggered: rule.hook_triggered,
         hook_configured: existing.hook_token_hash.is_some(),
+        on_error: rule.on_error,
         trigger_count: existing.trigger_count,
         last_triggered_at: existing.last_triggered_at,
         created_at: existing.created_at,
@@ -831,6 +895,232 @@ pub async fn delete_automation(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Running a rule and repairing a run
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /api/v1/automations/{id}/run` — start exactly one run, now, in the real world.
+///
+/// "Run now" is the one button that touches the world, so it is deliberately different from
+/// the dry run beside it: the payload is not the author's, the actions really send, publish
+/// and call. A rule on `user.created` run from here acts on an *empty* payload — its
+/// conditions are re-evaluated against `{}` and, unless they all hold, the run ends
+/// immediately having done nothing. That is the honest answer: there is no event to invent
+/// one for. The response names it, so the panel can say "the conditions did not hold, so
+/// nothing ran" instead of showing a green run.
+pub async fn run_automation(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(automation_id): Path<Uuid>,
+    address: ClientAddress,
+) -> Result<(StatusCode, Json<RunResponse>), ApiError> {
+    let workflow = automation_in_scope(&state, &current, automation_id).await?;
+    let rule = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
+
+    // A manual run has no event, so its steps carry no `{{event.*}}` to resolve. Rather than
+    // write an empty string into somebody's published page, the run is refused with the
+    // reason — the same reason the matcher would give, and in the same words.
+    if let Err(err) = omnion_automation::matcher::resolve_steps(&rule, &json!({})) {
+        record(
+            &state,
+            NewAuditEntry::by_user(current.user.id, "automation.run_refused")
+                .organization(workflow.organization_id)
+                .target("workflow", workflow.id.to_string())
+                .metadata(json!({ "reason": err.to_string() }))
+                .ip_address(address.as_text()),
+        )
+        .await?;
+        return Err(ApiError::bad_request(
+            "automation_run_refused",
+            format!(
+                "this rule needs the event it was written for, so it cannot be run by hand: {}",
+                err
+            ),
+        ));
+    }
+
+    let steps = omnion_automation::matcher::resolve_steps(&rule, &json!({}))?;
+    let (execution, rows) = store::create_execution(
+        state.db().pool(),
+        &workflow,
+        omnion_workflows::TriggerKind::Manual,
+        Some(current.user.id),
+        &steps,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "automation.run_started")
+            .organization(workflow.organization_id)
+            .target("workflow", workflow.id.to_string())
+            .metadata(json!({
+                "execution_id": execution.id,
+                "steps": rows.len(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunResponse {
+            execution_id: execution.id,
+            workflow_id: workflow.id,
+            steps: rows.len(),
+        }),
+    ))
+}
+
+/// The answer of "run now": what started, so the panel can link to it.
+#[derive(Debug, Serialize)]
+pub struct RunResponse {
+    /// The run that started.
+    pub execution_id: Uuid,
+    /// The rule it belongs to.
+    pub workflow_id: Uuid,
+    /// How many steps it carries.
+    pub steps: usize,
+}
+
+/// Which step a retry or a resume addresses.
+#[derive(Debug, Deserialize)]
+pub struct StepRef {
+    /// 1-based position in the run, as the trace numbers it.
+    pub step_no: i32,
+}
+
+/// The answer of a retry or a resume: what is queued again.
+#[derive(Debug, Serialize)]
+pub struct RetryResponse {
+    /// The run that was re-opened.
+    pub execution_id: Uuid,
+    /// The step the operator pointed at.
+    pub step_no: i32,
+    /// How many steps went back on the queue (the chosen one and everything after it).
+    pub requeued: u64,
+}
+
+/// `POST /api/v1/workflow-executions/{id}/retry-step` — try a failed run again from a step.
+///
+/// **Retry** and **Resume from here** are the same write, and deliberately so: re-running
+/// only the failed step would let a run whose middle failed march on to completion, which
+/// is not what "try that again" means to anybody reading a trace. The chosen step and
+/// everything after it go back on the queue; the steps that already succeeded are left
+/// exactly as they are, and every outbound call carries the run id as its idempotency key,
+/// so a receiver that honours it drops the duplicate.
+pub async fn retry_step(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(execution_id): Path<Uuid>,
+    address: ClientAddress,
+    Json(input): Json<StepRef>,
+) -> Result<Json<RetryResponse>, ApiError> {
+    requeue(
+        state,
+        current,
+        execution_id,
+        input.step_no,
+        "workflow.execution.retried",
+        address,
+    )
+    .await
+}
+
+/// `POST /api/v1/workflow-executions/{id}/resume-from` — the same write, named for what the
+/// panel's button says.
+pub async fn resume_from(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(execution_id): Path<Uuid>,
+    address: ClientAddress,
+    Json(input): Json<StepRef>,
+) -> Result<Json<RetryResponse>, ApiError> {
+    requeue(
+        state,
+        current,
+        execution_id,
+        input.step_no,
+        "workflow.execution.resumed",
+        address,
+    )
+    .await
+}
+
+/// The shared body of retry and resume.
+async fn requeue(
+    state: AppState,
+    current: CurrentSession,
+    execution_id: Uuid,
+    step_no: i32,
+    audit_action: &'static str,
+    address: ClientAddress,
+) -> Result<Json<RetryResponse>, ApiError> {
+    if step_no < 1 {
+        return Err(ApiError::bad_request(
+            "invalid_step_no",
+            "a step is numbered from 1",
+        ));
+    }
+
+    let execution = store::find_execution(state.db().pool(), execution_id)
+        .await?
+        .ok_or_else(execution_not_found)?;
+    ensure_same_organization(&current, Some(execution.organization_id))?;
+
+    // A cancelled run was closed on purpose; retrying it silently would undo a decision.
+    if execution.status == "cancelled" {
+        return Err(ApiError::bad_request(
+            "execution_cancelled",
+            "this run was cancelled on purpose, so it cannot be retried; start a new one instead",
+        ));
+    }
+    if execution.status == "running" {
+        return Err(ApiError::bad_request(
+            "execution_running",
+            "this run is still going; wait for it to finish or cancel it first",
+        ));
+    }
+
+    store::find_step(state.db().pool(), execution_id, step_no)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "step_not_found",
+                format!("this run has no step {step_no}"),
+            )
+        })?;
+
+    let requeued = store::retry_step_from(state.db().pool(), execution_id, step_no).await?;
+    if requeued == 0 {
+        return Err(ApiError::bad_request(
+            "nothing_to_retry",
+            "this step and everything after it already ran; there is nothing to try again",
+        ));
+    }
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, audit_action)
+            .organization(execution.organization_id)
+            .target("workflow_execution", execution_id.to_string())
+            .metadata(json!({ "step_no": step_no, "requeued": requeued }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(RetryResponse {
+        execution_id,
+        step_no,
+        requeued,
+    }))
+}
+
+fn execution_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "execution_not_found", "no such run")
+}
+
+// ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -911,6 +1201,7 @@ mod tests {
             event: "page.published".to_owned(),
             conditions: equals("status", "published"),
             hook_triggered: false,
+            on_error: RuleOnError::Stop,
             actions: vec![StepDefinition::task(
                 "tell the editor",
                 "send_email",
@@ -989,7 +1280,10 @@ mod tests {
                 "fail",
                 "transient",
                 "send_email",
-                "comment_revision"
+                "comment_revision",
+                "http_request",
+                "publish_page",
+                "run_workflow"
             ]
         );
         assert!(
@@ -1015,6 +1309,29 @@ mod tests {
         assert_eq!(catalogue.hook_path_template, "/api/v1/hooks/<token>");
         assert!(catalogue.hook_sample["hook"]["body"].is_object());
         assert!(catalogue.binding_syntax.contains("{{event."));
+
+        // The editor can only offer what the catalogue names, so a `branch` step, a step
+        // timeout and an outbound method all have to be *here* — otherwise the panel would
+        // have to hard-code a second, drifting copy of the vocabulary.
+        assert_eq!(
+            catalogue
+                .branch_operators
+                .iter()
+                .map(|operator| operator.key)
+                .collect::<Vec<_>>(),
+            operators,
+            "a branch uses the same operators the conditions do"
+        );
+        assert_eq!(catalogue.step_kinds, vec!["task", "wait", "branch", "stop"]);
+        assert_eq!(
+            catalogue.on_error_policies,
+            vec!["inherit", "stop", "continue"]
+        );
+        assert_eq!(catalogue.default_step_timeout_ms, 30_000);
+        assert_eq!(catalogue.max_step_timeout_ms, 120_000);
+        assert!(catalogue.outbound_methods.contains(&"POST"));
+        assert!(!catalogue.outbound_methods.contains(&"TRACE"));
+        assert_eq!(catalogue.max_chain_depth, 3);
     }
 
     #[test]
@@ -1057,6 +1374,7 @@ mod tests {
             event: event.to_owned(),
             conditions,
             hook_triggered: false,
+            on_error: RuleOnError::Stop,
             actions,
         };
         let action = || {

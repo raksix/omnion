@@ -30,8 +30,11 @@
 //! * [`binding`] — `{{event.field}}` placeholders in action parameters, resolved **when the run
 //!   is materialised**, so a stored step carries the values of the event that started it;
 //! * [`matcher`] — reading the bus from a durable cursor and starting one run per match;
-//! * [`actions`] — the host actions the engine hands over: `send_email` (SMTP) and
-//!   `comment_revision` (a note on a content revision);
+//! * [`actions`] — the host actions the engine hands over: `send_email` (SMTP),
+//!   `comment_revision` (a note on a content revision), `http_request` (a signed outbound
+//!   call), `publish_page` and `run_workflow` (REQ-003 slice 2);
+//! * [`outbound`] — the three actions that leave the process, and the two bounds that keep
+//!   them bounded: the outbound host allow-list and the HMAC signature every call carries;
 //! * [`mail`] — the small SMTP client behind the email action.
 //!
 //! The crate never writes `workflows`/`workflow_steps` rows by hand: it goes through
@@ -49,6 +52,7 @@ pub mod hooks;
 pub mod mail;
 pub mod matcher;
 pub mod model;
+pub mod outbound;
 pub mod testing;
 
 pub use actions::AutomationActions;
@@ -58,3 +62,4 @@ pub use error::{AutomationError, Result};
 pub use mail::{Email, MailError, MailSettings};
 pub use matcher::{MatchReport, drain, event_cursor};
 pub use model::{AutomationRule, NewRule, build_definition};
+pub use outbound::{HttpSettings, Response as HttpResponse};

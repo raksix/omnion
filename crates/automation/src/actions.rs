@@ -1,10 +1,15 @@
-//! The host actions this layer implements: `send_email` and `comment_revision`.
+//! The host actions this layer implements: `send_email`, `comment_revision`,
+//! `http_request`, `publish_page` and `run_workflow`.
 //!
 //! The engine runs the synthetic actions itself and hands host actions over
 //! (`omnion_workflows::Handler`), because they touch the world. This is that other side:
 //!
 //! * `send_email` — one plain-text message through the SMTP server of [`crate::mail`];
-//! * `comment_revision` — one note on a content revision (`omnion_content::comments`).
+//! * `comment_revision` — one note on a content revision (`omnion_content::comments`);
+//! * `http_request` — one signed outbound call, bounded by the host allow-list
+//!   ([`crate::outbound`]);
+//! * `publish_page` — one publication, bounded by the run's organization;
+//! * `run_workflow` — one chained rule's run, bounded by the chain depth.
 //!
 //! A failure is a *message*, not an error type: the engine decides whether it means another
 //! attempt (the retry policy) or a failed run, and the message is what an operator reads in the
@@ -13,31 +18,51 @@
 
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use omnion_content::comments::{self, CommentSource, NewRevisionComment};
 use omnion_workflows::{ActionContext, ActionFuture, ActionHandler};
 
 use crate::mail::{self, Email, MailSettings};
+use crate::outbound::{self, HttpSettings};
 
 /// The engine's host actions, bound to one process's database and mail server.
 #[derive(Debug, Clone)]
 pub struct AutomationActions {
     pool: PgPool,
     mail: MailSettings,
+    http: HttpSettings,
 }
 
 impl AutomationActions {
     /// Bind the actions to a pool and a mail server.
     #[must_use]
     pub fn new(pool: PgPool, mail: MailSettings) -> Self {
-        Self { pool, mail }
+        Self {
+            pool,
+            mail,
+            http: HttpSettings::default(),
+        }
     }
 
     /// The mail server these actions send through.
     #[must_use]
     pub fn mail(&self) -> &MailSettings {
         &self.mail
+    }
+
+    /// Set the outbound HTTP settings these actions call with.
+    #[must_use]
+    pub fn with_http(mut self, http: HttpSettings) -> Self {
+        self.http = http;
+        self
+    }
+
+    /// The outbound HTTP settings.
+    #[must_use]
+    pub fn http(&self) -> &HttpSettings {
+        &self.http
     }
 }
 
@@ -52,6 +77,9 @@ impl ActionHandler for AutomationActions {
             match action {
                 "send_email" => self.send_email(params).await,
                 "comment_revision" => self.comment_revision(params, context).await,
+                "http_request" => self.http_request(params, context).await,
+                "publish_page" => self.publish_page(params, context).await,
+                "run_workflow" => self.run_workflow(params, context).await,
                 other => Err(format!(
                     "`{other}` is not a host action of the automation layer"
                 )),
@@ -92,7 +120,7 @@ impl AutomationActions {
         let body = text(params, "body")?;
 
         let comment = comments::add(
-            &self.pool,
+            context.pool,
             NewRevisionComment {
                 organization_id: context.organization_id,
                 revision_id,
@@ -109,6 +137,86 @@ impl AutomationActions {
             "comment_id": comment.id,
             "revision_id": comment.revision_id,
         }))
+    }
+
+    /// Make one signed outbound call, if the allow-list says the host may be reached.
+    async fn http_request(
+        &self,
+        params: &Value,
+        context: &ActionContext<'_>,
+    ) -> Result<Value, String> {
+        let workflow_id = self
+            .workflow_of(context)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        outbound::http_request(
+            &self.pool,
+            params,
+            &self.http,
+            context.execution_id,
+            workflow_id,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
+    /// Publish one page of the run's own organization.
+    async fn publish_page(
+        &self,
+        params: &Value,
+        context: &ActionContext<'_>,
+    ) -> Result<Value, String> {
+        outbound::publish_page(&self.pool, params, context.organization_id, context.site_id).await
+    }
+
+    /// Start another rule's run as part of this one.
+    async fn run_workflow(
+        &self,
+        params: &Value,
+        context: &ActionContext<'_>,
+    ) -> Result<Value, String> {
+        let workflow_id = self
+            .workflow_of(context)
+            .await
+            .map_err(|err| err.to_string())?;
+        let depth = self.chain_depth(context).await.unwrap_or(1);
+
+        outbound::run_workflow(
+            &self.pool,
+            params,
+            context.organization_id,
+            workflow_id,
+            depth,
+        )
+        .await
+    }
+
+    /// The rule behind a run — the signer's identity, and the self-chain guard.
+    async fn workflow_of(&self, context: &ActionContext<'_>) -> sqlx::Result<Uuid> {
+        sqlx::query_scalar("select workflow_id from workflow_executions where id = $1")
+            .bind(context.execution_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| sqlx::Error::RowNotFound)
+    }
+
+    /// How deep the current chain already is.
+    ///
+    /// A chained run carries its depth in the step that started it, so a run started by
+    /// hand is depth 1 and each `run_workflow` adds one. The bound is what stops two rules
+    /// that call each other from filling the queue.
+    async fn chain_depth(&self, context: &ActionContext<'_>) -> sqlx::Result<usize> {
+        let depth: Option<i32> = sqlx::query_scalar(
+            "select (params ->> 'chain_depth')::int from workflow_steps \
+             where execution_id = $1 and action = 'run_workflow' \
+             order by step_no desc limit 1",
+        )
+        .bind(context.execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(usize::try_from(depth.unwrap_or(0)).unwrap_or(0) + 1)
     }
 }
 
@@ -165,11 +273,13 @@ mod tests {
             attempt: 1,
         };
 
+        // A real action name the *handler* does not implement: the engine's catalogue is
+        // wider than one process's abilities, and a handler must say so rather than pretend.
         let message = handler
-            .execute("http_request", &json!({}), &context)
+            .execute("smtp_send", &json!({}), &context)
             .await
             .expect_err("the handler does not know this action");
-        assert!(message.contains("http_request"), "{message}");
+        assert!(message.contains("smtp_send"), "{message}");
         assert!(message.contains("not a host action"), "{message}");
     }
 

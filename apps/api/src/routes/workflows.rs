@@ -172,7 +172,7 @@ pub struct StepBody {
     pub step_no: i32,
     /// Step name.
     pub name: String,
-    /// `task` or `wait`.
+    /// `task`, `wait`, `branch` or `stop`.
     pub kind: String,
     /// Built-in action of a task step.
     pub action: Option<String>,
@@ -182,6 +182,13 @@ pub struct StepBody {
     pub attempts: i32,
     /// Attempts allowed in total.
     pub max_attempts: i32,
+    /// What this step's own failure does; `inherit` takes the rule's policy.
+    pub on_error: String,
+    /// How long this step may block before it is failed with the limit named.
+    pub timeout_ms: i32,
+    /// `true` when the run deliberately outlived this step's failure — the row stays
+    /// `failed` and the run is not a failure because of it.
+    pub ignored: bool,
     /// When the step may run next (retry backoff, wait deadline).
     #[serde(with = "time::serde::rfc3339")]
     pub available_at: OffsetDateTime,
@@ -208,6 +215,9 @@ impl StepBody {
             status: step.status.clone(),
             attempts: step.attempts,
             max_attempts: step.max_attempts,
+            on_error: step.on_error.clone(),
+            timeout_ms: step.timeout_ms,
+            ignored: step.ignored,
             available_at: step.available_at,
             started_at: step.started_at,
             finished_at: step.finished_at,
@@ -225,14 +235,30 @@ pub struct ExecutionDetail {
     pub execution: ExecutionSummary,
     /// Steps, in order.
     pub steps: Vec<StepBody>,
+    /// The event payload this run started from — what its branch steps read and what the
+    /// panel shows in the trace's sidebar. `None` for a manual run and a schedule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_payload: Option<serde_json::Value>,
+    /// Which controls this run offers: a settled run can be retried from a step, a running
+    /// one can be cancelled, and a cancelled one is not retried (that was a decision).
+    pub can_retry: bool,
+    pub can_cancel: bool,
 }
 
 impl ExecutionDetail {
     /// Describe one run plus its steps.
     fn build(execution: &WorkflowExecution, steps: &[WorkflowStep]) -> Self {
+        let status = execution.status();
+        let terminal = status.is_some_and(omnion_workflows::ExecutionStatus::is_terminal);
+
         Self {
             execution: ExecutionSummary::build(execution),
             steps: steps.iter().map(StepBody::build).collect(),
+            event_payload: execution.event_payload.clone(),
+            // A cancelled run is a person's decision, so "retry" must not offer to undo it
+            // silently — the panel says why instead.
+            can_retry: status == Some(omnion_workflows::ExecutionStatus::Failed),
+            can_cancel: terminal.then_some(false).unwrap_or(true),
         }
     }
 }
@@ -346,6 +372,7 @@ pub async fn create_workflow(
     let workflow = store::insert_workflow(
         state.db().pool(),
         NewWorkflow {
+            on_error: omnion_workflows::OnError::Stop,
             organization_id,
             site_id: input.site_id,
             name: name.clone(),
@@ -423,6 +450,7 @@ pub async fn update_workflow(
         state.db().pool(),
         existing.id,
         WorkflowUpdate {
+            on_error: omnion_workflows::OnError::Stop,
             name: name.clone(),
             description: input.description.trim().to_owned(),
             site_id: input.site_id,
@@ -672,6 +700,8 @@ mod tests {
             trigger_event: None,
             conditions: serde_json::json!([]),
             hook_token_hash: None,
+            on_error: "stop".to_owned(),
+            hook_secret: None,
             next_run_at: Some(OffsetDateTime::UNIX_EPOCH),
             steps: serde_json::json!([
                 { "name": "prepare", "kind": "task", "action": "noop", "params": {}, "max_attempts": 1 }
@@ -750,6 +780,7 @@ mod tests {
             started_at: OffsetDateTime::UNIX_EPOCH,
             finished_at: Some(OffsetDateTime::UNIX_EPOCH),
             error: None,
+            event_payload: Some(serde_json::json!({ "status": "published" })),
         };
         let steps = vec![WorkflowStep {
             id: Uuid::nil(),
@@ -759,6 +790,8 @@ mod tests {
             kind: "task".to_owned(),
             action: Some("noop".to_owned()),
             params: serde_json::json!({}),
+            on_error: "inherit".to_owned(),
+            timeout_ms: 30_000,
             status: "succeeded".to_owned(),
             attempts: 1,
             max_attempts: 1,
@@ -767,6 +800,7 @@ mod tests {
             finished_at: Some(OffsetDateTime::UNIX_EPOCH),
             output: Some(serde_json::json!({ "action": "noop" })),
             error: None,
+            ignored: false,
         }];
 
         let detail = ExecutionDetail::build(&execution, &steps);

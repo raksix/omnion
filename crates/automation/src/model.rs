@@ -11,7 +11,7 @@
 //! automations surface can present.
 
 use omnion_workflows::definition::{StepDefinition, Trigger, WorkflowDefinition};
-use omnion_workflows::{TriggerKind, Workflow};
+use omnion_workflows::{OnError, TriggerKind, Workflow};
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -51,6 +51,8 @@ pub struct AutomationRule {
     /// token has a trigger the caller cannot yet call, which is a state the panel says out
     /// loud instead of showing an empty box.
     pub hook_configured: bool,
+    /// The rule's own error policy: what a step's failure does when the step inherits it.
+    pub on_error: OnError,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
     /// When it last fired.
@@ -107,6 +109,7 @@ impl AutomationRule {
             // question the panel asks separately (`hook.configured`).
             hook_triggered,
             hook_configured,
+            on_error: OnError::parse(&workflow.on_error).unwrap_or(OnError::Stop),
             trigger_count: workflow.trigger_count,
             last_triggered_at: workflow.last_triggered_at,
             created_at: workflow.created_at,
@@ -159,6 +162,8 @@ pub struct NewRule {
     pub actions: Vec<StepDefinition>,
     /// Whether the rule is triggered by its own inbound webhook URL.
     pub hook_triggered: bool,
+    /// The rule's own error policy; a step that inherits takes this.
+    pub on_error: OnError,
 }
 
 impl NewRule {
