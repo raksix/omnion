@@ -451,6 +451,14 @@ pub fn router(state: AppState) -> Router {
 
     let ai_models = get(ai::list_models).layer(guards::require(&state, "ai.providers.read"));
 
+    // The provider form's own vocabulary: which protocols exist and what ranges it validates
+    // against, read with the provider list it drives (REQ-097 slice 1).
+    let ai_protocols = get(ai::list_protocols).layer(guards::require(&state, "ai.providers.read"));
+
+    // The connection test dials a provider on the operator's behalf, so it is a `manage` power.
+    let ai_provider_test =
+        post(ai::test_provider_connection).layer(guards::require(&state, "ai.providers.manage"));
+
     let ai_model = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
@@ -764,6 +772,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/providers/{id}", ai_provider)
         .route("/ai/providers/{id}/models", ai_provider_models)
         .route("/ai/providers/{id}/discover-models", ai_provider_discover)
+        .route("/ai/protocols", ai_protocols)
+        .route("/ai/providers/{id}/test", ai_provider_test)
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)

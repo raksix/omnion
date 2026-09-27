@@ -30,8 +30,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use omnion_ai_hub::{
-    AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole, ModelChanges,
-    NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, resolve, stream_chat,
+    AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole,
+    MAX_PRIORITY, MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelChanges,
+    NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, StepStatus, TestReport,
+    protocol_infos, resolve, stream_chat, test_provider,
 };
 use omnion_audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
@@ -63,10 +65,25 @@ pub struct ProviderBody {
     pub name: String,
     /// Wire protocol.
     pub protocol: String,
+    /// `cloud` or `local`.
+    pub kind: String,
     /// Base URL.
     pub base_url: String,
     /// Whether a key is stored.
     pub has_api_key: bool,
+    /// How long one call may take, in milliseconds.
+    pub timeout_ms: i32,
+    /// How often a pre-first-byte failure is retried.
+    pub max_retries: i32,
+    /// Position in the failover chain.
+    pub priority: i32,
+    /// `ok`, `degraded`, `down` or `unknown`.
+    pub last_health: String,
+    /// When a probe last took a sample here.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_checked_at: Option<OffsetDateTime>,
+    /// What the last failed probe said.
+    pub last_error: Option<String>,
     /// Whether the provider is enabled.
     pub enabled: bool,
     /// Whether it is the installation's default provider.
@@ -88,8 +105,15 @@ impl ProviderBody {
             id: provider.id,
             name: provider.name.clone(),
             protocol: provider.protocol.clone(),
+            kind: provider.kind.clone(),
             base_url: provider.base_url.clone(),
             has_api_key: provider.has_api_key(),
+            timeout_ms: provider.timeout_ms,
+            max_retries: provider.max_retries,
+            priority: provider.priority,
+            last_health: provider.last_health.clone(),
+            last_checked_at: provider.last_checked_at,
+            last_error: provider.last_error.clone(),
             enabled: provider.enabled,
             is_default: provider.is_default,
             model_count,
@@ -252,10 +276,18 @@ pub struct CreateProviderBody {
     pub name: String,
     /// Wire protocol; the OpenAI-compatible one when absent.
     pub protocol: Option<String>,
+    /// `cloud` or `local`; `cloud` when absent.
+    pub kind: Option<String>,
     /// Base URL, version segment included.
     pub base_url: String,
     /// Key to authenticate with; absent for a local endpoint that wants none.
     pub api_key: Option<String>,
+    /// How long one call may take, in milliseconds (default 30000).
+    pub timeout_ms: Option<i32>,
+    /// How often a pre-first-byte failure is retried (default 1).
+    pub max_retries: Option<i32>,
+    /// Position in the failover chain (default 100).
+    pub priority: Option<i32>,
     /// Whether the provider starts enabled (default `true`).
     pub enabled: Option<bool>,
     /// Whether it becomes the installation's default provider.
@@ -278,6 +310,14 @@ pub struct UpdateProviderBody {
     /// Absent = keep, `null` = clear, string = replace.
     #[serde(default, deserialize_with = "double_option")]
     pub api_key: Option<Option<String>>,
+    /// New kind.
+    pub kind: Option<String>,
+    /// New timeout.
+    pub timeout_ms: Option<i32>,
+    /// New retry ceiling.
+    pub max_retries: Option<i32>,
+    /// New position in the failover chain.
+    pub priority: Option<i32>,
     /// New enabled flag.
     pub enabled: Option<bool>,
     /// `true` makes it the installation's default provider.
@@ -378,8 +418,12 @@ pub async fn create_provider(
         NewProvider {
             name: body.name,
             protocol,
+            kind: body.kind.unwrap_or_else(|| "cloud".to_owned()),
             base_url: body.base_url,
             api_key: body.api_key,
+            timeout_ms: body.timeout_ms.unwrap_or(30_000),
+            max_retries: body.max_retries.unwrap_or(1),
+            priority: body.priority.unwrap_or(100),
             enabled: body.enabled.unwrap_or(true),
             is_default: body.is_default.unwrap_or(false),
         },
@@ -399,6 +443,7 @@ pub async fn create_provider(
         .metadata(json!({
             "name": provider.name,
             "protocol": provider.protocol,
+            "kind": provider.kind,
             "base_url": provider.base_url,
             "has_api_key": provider.has_api_key(),
             "models": models.len(),
@@ -433,6 +478,10 @@ pub async fn update_provider(
             name: body.name,
             base_url: body.base_url,
             api_key,
+            kind: body.kind,
+            timeout_ms: body.timeout_ms,
+            max_retries: body.max_retries,
+            priority: body.priority,
             enabled: body.enabled,
             is_default: body.is_default,
         },
@@ -448,6 +497,10 @@ pub async fn update_provider(
             "name": provider.name,
             "enabled": provider.enabled,
             "is_default": provider.is_default,
+            "kind": provider.kind,
+            "timeout_ms": provider.timeout_ms,
+            "max_retries": provider.max_retries,
+            "priority": provider.priority,
         }))
         .ip_address(address.as_text());
     omnion_audit::record(state.db().pool(), entry).await?;
@@ -582,6 +635,125 @@ pub async fn update_model(
     omnion_audit::record(state.db().pool(), entry).await?;
 
     Ok(Json(ModelBody::build(&provider, &model)))
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Handlers — protocols and the connection test
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/ai/protocols` — what the provider form offers.
+///
+/// The form's select is driven by this call rather than by a list compiled into the panel, so a
+/// protocol added to the crate appears in the UI without a second edit, and the ranges the form
+/// validates against come from the same place the API validates against.
+pub async fn list_protocols(
+    State(_state): State<AppState>,
+) -> Result<Json<ProtocolListResponse>, ApiError> {
+    Ok(Json(ProtocolListResponse {
+        protocols: protocol_infos()
+            .iter()
+            .map(|info| ProtocolBody {
+                protocol: info.protocol,
+                note: info.note,
+                chat_path: info.chat_path,
+                auth: info.auth,
+            })
+            .collect(),
+        bounds: ProtocolBounds {
+            timeout_ms_min: MIN_TIMEOUT_MS,
+            timeout_ms_max: MAX_TIMEOUT_MS,
+            max_retries_max: MAX_RETRIES_CEILING,
+            priority_min: MIN_PRIORITY,
+            priority_max: MAX_PRIORITY,
+        },
+    }))
+}
+
+/// `POST /api/v1/ai/providers/{id}/test` — the connection test, run server-side.
+///
+/// The five steps report individually, with the provider's own message on a failure (clipped, and
+/// with anything key-shaped stripped). A failing test records the verdict on the provider row and
+/// writes an `ai.provider.test_failed` audit entry; a passing one clears the stored error.
+pub async fn test_provider_connection(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> Result<Json<TestReport>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+
+    let known: Vec<String> = omnion_ai_hub::list_models(state.db().pool(), Some(id))
+        .await?
+        .into_iter()
+        .map(|model| model.model_key)
+        .collect();
+
+    let report = test_provider(&provider, &known).await;
+    let status = if report.ok { "ok" } else { "down" };
+    let error = report
+        .failing_step
+        .as_ref()
+        .and_then(|_| report.steps.iter().find(|step| matches!(step.status, StepStatus::Failed)))
+        .and_then(|step| step.error.clone());
+    // A test that failed is evidence, not noise: the verdict is stored so the list can show it,
+    // and a passing test clears the previous failure instead of leaving a stale error behind.
+    let _ = omnion_ai_hub::record_health(state.db().pool(), id, status, 0, error.as_deref())
+        .await;
+
+    if !report.ok {
+        let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.test_failed")
+            .organization(current.user.organization_id)
+            .target("ai_provider", provider.id.to_string())
+            .metadata(json!({
+                "name": provider.name,
+                "failing_step": report.failing_step,
+                "error": error,
+            }))
+            .ip_address(address.as_text());
+        omnion_audit::record(state.db().pool(), entry).await?;
+    }
+
+    Ok(Json(report))
+}
+
+/// One protocol the installation can connect, as the form reads it.
+#[derive(Debug, Serialize)]
+pub struct ProtocolBody {
+    /// Protocol key as it is stored and sent.
+    pub protocol: &'static str,
+    /// One line about what the protocol covers.
+    pub note: &'static str,
+    /// Where a call goes, relative to the base URL.
+    pub chat_path: &'static str,
+    /// How the key is sent.
+    pub auth: &'static str,
+}
+
+/// The ranges the provider form validates against, from the same constants the API uses.
+#[derive(Debug, Serialize)]
+pub struct ProtocolBounds {
+    /// Smallest accepted timeout.
+    pub timeout_ms_min: i32,
+    /// Largest accepted timeout.
+    pub timeout_ms_max: i32,
+    /// Largest accepted retry ceiling.
+    pub max_retries_max: i32,
+    /// Lowest accepted priority.
+    pub priority_min: i32,
+    /// Highest accepted priority.
+    pub priority_max: i32,
+}
+
+/// Response of `GET /ai/protocols`.
+#[derive(Debug, Serialize)]
+pub struct ProtocolListResponse {
+    /// The protocols the form offers.
+    pub protocols: Vec<ProtocolBody>,
+    /// The numeric bounds the form validates against.
+    pub bounds: ProtocolBounds,
 }
 
 // ---------------------------------------------------------------------------------------------
