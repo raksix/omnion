@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 1) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
+> **Status:** in-progress (slice 1; QA pass blocked on volume) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request

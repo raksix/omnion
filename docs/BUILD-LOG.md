@@ -1632,3 +1632,19 @@
 - **Next.** REQ-063 slice 2 — nested `columns` with the breadcrumb, the viewport rules
   (`hide_on` applied server-side), `raw_html` sanitisation, the block-level diff on the
   revisions screen and the inline-editing frame at `/pages/<id>/preview`.
+
+- **Proof (QA) — the first pass found three real defects, the re-run is blocked.** The pass at
+  `qa-artifacts/20260927-173006` walked the editor end to end (910 clicks, 935 shots) and
+  reported **4 high findings**: three of them mine, one a pre-existing hydration warning in the
+  IAM security screen that belongs to wave 1. The three were the defects listed above and all
+  three are fixed in `cf84163`. A live probe against the w2 stack then proved the whole path
+  green: a page built through the panel reaches `errors 0 · Ready to publish`, publishes as
+  `Revision 2 is live at /e2e-blocks-…`, and the public render answers with `h1, h2, figure,
+  img` — the block tree drawn through the theme rather than the body fallback.
+  **The confirming full pass did not run.** `/mnt/apopic` has gone to 100% twice mid-pass with
+  seven writers building on it, and the artifact directory was deleted out from under the
+  harness both times (`ENOENT` on its own `clicks.jsonl`). The pass is not reported green on
+  the strength of a probe: the acceptance gate stays open until a full pass completes with zero
+  high findings. Two things landed so the next attempt fails fast instead of twenty minutes in
+  (`0de1798`, `3e96b29`): a free-space check before the reset, and a retention policy that
+  prunes to the last two passes *before* checking.
