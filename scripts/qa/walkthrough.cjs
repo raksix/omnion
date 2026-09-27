@@ -127,10 +127,17 @@ const netAborted = [];
 const dialogs = [];
 const shots = [];
 
+// A full-page PNG of a long admin page is megabytes; a thousand of them is gigabytes, which is
+// more than the volume several writers share can hold. QA_SHOT_MODE=viewport (the run script drops
+// to it when the volume is tight) keeps the pass: every screen is still visited and every control
+// still clicked, the shots are just the visible frame instead of the whole scrolled page.
+const SHOT_MODE = process.env.QA_SHOT_MODE === "viewport" ? "viewport" : "full";
+const SHOT_OPTS = SHOT_MODE === "viewport" ? { type: "jpeg", quality: 72 } : {};
+
 async function shot(page, name, { full = true } = {}) {
   const file = path.join(SHOTS, `${name}.png`);
   try {
-    await page.screenshot({ path: file, fullPage: full, timeout: 15000 });
+    await page.screenshot({ path: file, fullPage: full && SHOT_MODE === "full", timeout: 15000, ...SHOT_OPTS });
     shots.push({ name, file, url: page.url(), bytes: fs.statSync(file).size });
   } catch (err) {
     log(`screenshot failed for ${name}: ${err.message}`);

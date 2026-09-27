@@ -64,16 +64,31 @@ if [ "$KEEP" -gt 0 ] 2>/dev/null; then
   done <<< "$(ls -1t "$OUT_ROOT" 2>/dev/null | tail -n +$((KEEP + 1)))"
 fi
 
-# Running out of space twenty minutes in deletes the artifact directory out from under the
-# harness, and the failure then names a missing file instead of the disk — so the check happens
-# here, where the message can still be acted on.
+# A full-page PNG of a long admin page runs to megabytes, and a pass takes around a thousand of
+# them — on a volume several writers build on at once that is the whole difference between a pass
+# that completes and one that is deleted out from under itself twenty minutes in. The walkthrough
+# can drop to fewer, shorter shots, so the space check sizes the need from the shot budget instead
+# of assuming the richest pass: too little room shrinks the budget, and only a volume that cannot
+# hold even a minimal pass is refused (and says so) before anything is reset.
+SHOT_MODE="${QA_SHOT_MODE:-full}"
 AVAIL_MB=$(( $(df -Pk "$OUT_ROOT" | awk 'NR==2 {print $4}') / 1024 ))
 NEED_MB="${QA_MIN_FREE_MB:-6000}"
 if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
-  echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; a pass needs about ${NEED_MB}MB." >&2
-  echo "[qa] free a worktree's target/ (regenerable) or lower QA_KEEP_PASSES, and re-run." >&2
-  exit 1
+  case "$SHOT_MODE" in
+    full)
+      # A full pass writes the deep full-page shots; viewport shots are an order of magnitude
+      # smaller and still visit every screen and click every control.
+      SHOT_MODE=viewport
+      step "only ${AVAIL_MB}MB free (wanted ${NEED_MB}); dropping to viewport-sized shots"
+      ;;
+    viewport)
+      echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; even a viewport pass needs about ${NEED_MB}MB." >&2
+      echo "[qa] free a worktree's target/ (regenerable) or lower QA_KEEP_PASSES, and re-run." >&2
+      exit 1
+      ;;
+  esac
 fi
+export QA_SHOT_MODE="$SHOT_MODE"
 step "free space: ${AVAIL_MB}MB"
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
