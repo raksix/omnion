@@ -92,6 +92,7 @@ pub mod scim;
 pub mod search;
 pub mod secrets;
 pub mod secrets_credentials;
+pub mod secrets_leases;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -711,6 +712,55 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "secrets.assign"));
 
+    // slice 3. Reading leases and keys is a read; issuing, revoking and deleting is its own
+    // permission, because each of those hands out or takes back the power to read a value.
+    let secrets_leases_read = Router::new()
+        .route("/secret-leases", get(secrets_leases::read_leases))
+        .route(
+            "/deployment-keys",
+            get(secrets_leases::read_deployment_keys),
+        )
+        .route(
+            "/deployment-keys/{id}/uses",
+            get(secrets_leases::read_deployment_key_uses),
+        )
+        .route_layer(guards::require(&state, "secrets.read"));
+
+    // The lease writes are `secrets.lease`; the deployment-key writes are
+    // `secrets.deploykeys.manage`. A deployment key is a machine credential, so managing one
+    // is a strictly bigger deal than managing a lease and gets its own name.
+    let secrets_lease_write = Router::new()
+        .route("/secrets/{id}/lease", post(secrets_leases::issue_lease))
+        .route(
+            "/secret-leases/{id}/revoke",
+            post(secrets_leases::revoke_lease),
+        )
+        .route_layer(guards::require(&state, "secrets.lease"));
+
+    let secrets_deploy_key_write = Router::new()
+        .route(
+            "/deployment-keys",
+            post(secrets_leases::create_deployment_key),
+        )
+        .route(
+            "/deployment-keys/{id}/revoke",
+            post(secrets_leases::revoke_deployment_key),
+        )
+        .route(
+            "/deployment-keys/{id}",
+            delete(secrets_leases::delete_deployment_key),
+        )
+        .route_layer(guards::require(&state, "secrets.deploykeys.manage"));
+
+    // Redemption is the ONE handler with no session guard. It is authenticated by the
+    // deployment key in the header instead, so it lives on its own router and is never
+    // reachable by a cookie: a browser cannot redeem a lease, which is the property the whole
+    // request rests on.
+    let secrets_lease_redeem = Router::new().route(
+        "/secret-leases/{id}/redeem",
+        post(secrets_leases::redeem_lease),
+    );
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -748,6 +798,10 @@ pub fn router(state: AppState) -> Router {
         .merge(secrets_credentials_read)
         .merge(secrets_credentials_write)
         .merge(secrets_slot_assign)
+        .merge(secrets_leases_read)
+        .merge(secrets_lease_write)
+        .merge(secrets_deploy_key_write)
+        .merge(secrets_lease_redeem)
         .route("/commands", commands_route)
         .route("/commands/{id}/run", command_run)
         .route("/command-center/context", command_context)

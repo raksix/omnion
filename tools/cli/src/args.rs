@@ -19,6 +19,27 @@ pub enum Command {
     Migrate,
     /// `omnion setup …`.
     Setup(Box<SetupOptions>),
+    /// `omnion secret …` — the loopback credential helper (REQ-125, slice 3).
+    Secret(Box<SecretOptions>),
+}
+
+/// Everything `omnion secret` accepts on the command line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SecretOptions {
+    /// The sub-action: `redeem`.
+    pub action: Option<String>,
+    /// The lease id.
+    pub lease: Option<String>,
+    /// The environment variable to inject the value under.
+    pub env_name: Option<String>,
+    /// Write a mode-0600 temporary file instead of injecting into a child.
+    pub file: bool,
+    /// A loopback `host:port`; anything else is refused.
+    pub api_url: Option<String>,
+    /// A file to read the lease token from.
+    pub token_file: Option<String>,
+    /// Check a redemption works, printing no value.
+    pub check: bool,
 }
 
 /// Everything `omnion setup` accepts on the command line.
@@ -99,6 +120,10 @@ impl Command {
                 let options = parse_setup(&mut cursor)?;
                 Ok(Self::Setup(Box::new(options)))
             }
+            "secret" => {
+                let options = parse_secret(&mut cursor)?;
+                Ok(Self::Secret(Box::new(options)))
+            }
             other => Err(format!("unknown command {other:?}")),
         }
     }
@@ -142,6 +167,50 @@ fn parse_setup(cursor: &mut Cursor<'_>) -> Result<SetupOptions, String> {
     Ok(options)
 }
 
+/// Parse the options of `omnion secret`.
+///
+/// The first non-flag argument is the action, and a non-flag argument *after* it is the child
+/// command the helper runs with the value in its environment. That is why the child is not a
+/// flag: a child command is the one thing that legitimately has positional arguments of its
+/// own, and swallowing them here would make `omnion secret redeem <id> -- npm run build`
+/// impossible to express.
+fn parse_secret(cursor: &mut Cursor<'_>) -> Result<SecretOptions, String> {
+    let mut options = SecretOptions::default();
+
+    while let Some((flag, inline)) = cursor.next() {
+        // The first bare word is the action; after that it is part of the child command, so it
+        // is collected and handed back untouched.
+        if !flag.starts_with('-') {
+            if options.action.is_none() {
+                options.action = Some(flag.to_owned());
+            } else {
+                // Hand it back: a child command's arguments must survive parsing verbatim, so
+                // this loop stops rather than trying to interpret what follows.
+                cursor.rewind_one();
+                break;
+            }
+            no_value(flag, inline)?;
+            continue;
+        }
+        match flag {
+            "--lease" => options.lease = Some(cursor.value(flag, inline)?),
+            "--as" => options.env_name = Some(cursor.value(flag, inline)?),
+            "--api-url" => options.api_url = Some(cursor.value(flag, inline)?),
+            "--token-file" => options.token_file = Some(cursor.value(flag, inline)?),
+            "--file" => {
+                no_value(flag, inline)?;
+                options.file = true;
+            }
+            "--check" => {
+                no_value(flag, inline)?;
+                options.check = true;
+            }
+            other => return Err(format!("unknown option {other:?} for `omnion secret`")),
+        }
+    }
+    Ok(options)
+}
+
 /// Print the help text.
 pub fn print_help() {
     println!(
@@ -155,6 +224,7 @@ COMMANDS
     setup      First-run setup: owner account, organization, first site, theme.
     doctor     Check the environment: configuration, database, migrations, redis, storage.
     migrate    Apply pending database migrations.
+    secret     Redeem a credential lease for a child process (never prints a value).
     help       Show this text (also -h, --help).
     version    Show the version (also -V, --version).
 
@@ -172,12 +242,33 @@ SETUP OPTIONS
     --non-interactive, --yes Never prompt; missing values are errors.
     --skip-migrations        Do not touch the schema before setting up.
 
+SECRET OPTIONS
+    The loopback helper that hands a leased value to a child process. It refuses to print a
+    value to the terminal, refuses any --api-url that is not loopback, and reads the lease
+    token from the environment or a file — never from a flag, so it stays out of the shell
+    history.
+
+    redeem                     Redeem a lease. One of:
+      --lease <id>             The lease to redeem.
+      --as <NAME>              Environment variable to inject under (OMNION_SECRET).
+      --file                   Write a mode-0600 temporary file, removed on exit.
+      --api-url <host:port>    Loopback only; defaults to the configured API address.
+      --token-file <path>      Read the lease token from a file.
+      --check                  Verify the redemption works, printing the name and hint only.
+    <command> [args…]           The child to run with the value in its environment.
+
+SECRET ENVIRONMENT
+    OMNION_DEPLOYMENT_KEY      The machine identity, shown once when the key was created.
+    OMNION_LEASE_TOKEN         The lease token, shown once when the lease was issued.
+
 ENVIRONMENT
     The connection comes from the same variables the API reads
     (OMNION_DATABASE_URL, OMNION_REDIS_URL, …). See docs/02-ARCHITECTURE.md.
 
 EXAMPLES
     omnion doctor
+    OMNION_DEPLOYMENT_KEY=omnion_dk_… OMNION_LEASE_TOKEN=… omnion secret redeem \
+        --lease 6f1c… --as STRIPE_KEY -- node deploy.js
     omnion setup --non-interactive --name 'Ada Lovelace' --email ada@example.com \\
         --password-stdin --organization 'Acme' --site 'Acme' --domain acme.example.com
 
@@ -217,6 +308,14 @@ impl<'a> Cursor<'a> {
             Some((flag, value)) if flag.starts_with("--") => Some((flag, Some(value))),
             _ => Some((arg.as_str(), None)),
         }
+    }
+
+    /// Rewind one argument so the next `next()` returns it again.
+    ///
+    /// The cursor walks a borrowed slice, so handing an argument back is just stepping back:
+    /// the child command's own arguments are seen verbatim by whatever runs them.
+    fn rewind_one(&mut self) {
+        self.index = self.index.saturating_sub(1);
     }
 
     /// The value of a flag: inline, or the next argument (which must not be another flag).

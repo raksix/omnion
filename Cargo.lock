@@ -1329,6 +1329,7 @@ dependencies = [
  "omnion-onboarding",
  "omnion-storage",
  "rpassword",
+ "serde",
  "serde_json",
  "tokio",
 ]

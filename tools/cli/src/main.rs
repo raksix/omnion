@@ -21,6 +21,7 @@ mod doctor;
 mod migrate;
 mod output;
 mod prompt;
+mod secret;
 mod setup;
 
 use std::process::ExitCode;
@@ -43,6 +44,13 @@ async fn main() -> ExitCode {
         Ok(Command::Doctor { json }) => doctor::run(json).await,
         Ok(Command::Migrate) => migrate::run().await,
         Ok(Command::Setup(options)) => setup::run(*options).await,
+        Ok(Command::Secret(options)) => match secret::run(*options, api_url()).await {
+            Ok(code) => code,
+            Err(message) => {
+                eprintln!("omnion: {message}");
+                ExitCode::from(1)
+            }
+        },
         Err(message) => {
             eprintln!("omnion: {message}");
             eprintln!();
@@ -50,4 +58,13 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The address the helper redeems against, from the same configuration the API reads.
+///
+/// Only the authority is used, and the helper refuses anything that is not loopback — but
+/// reading it from the typed config means an operator who has already set
+/// `OMNION_API_URL` does not have to repeat themselves on every pipeline.
+fn api_url() -> String {
+    std::env::var("OMNION_API_URL").unwrap_or_else(|_| "127.0.0.1:8080".to_owned())
 }
