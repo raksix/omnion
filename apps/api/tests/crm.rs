@@ -39,12 +39,16 @@ static CRM_WALK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const READER_PERMISSIONS: [&str; 2] = ["crm.contacts.read", "sites.read"];
 
 /// What a manager adds on top.
-const MANAGER_PERMISSIONS: [&str; 6] = [
+const MANAGER_PERMISSIONS: [&str; 8] = [
     "crm.contacts.read",
     "crm.contacts.create",
     "crm.contacts.update",
     "crm.contacts.delete",
     "crm.contacts.merge",
+    // Slice 2: saving a view and importing a file are separate powers from creating a record, so
+    // the manager that owns the rest of the family has to be granted them explicitly.
+    "crm.views.manage",
+    "crm.contacts.import",
     "sites.read",
 ];
 
@@ -53,6 +57,20 @@ const MANAGER_PERMISSIONS: [&str; 6] = [
 const SENSITIVE_PERMISSIONS: [&str; 3] = [
     "crm.contacts.read",
     "crm.fields.sensitive.read",
+    "sites.read",
+];
+
+/// A writer in the **second** organization: the powers a manager holds, scoped to another tenant.
+///
+/// It exists so the cross-tenant write can be proved honestly. The route guard answers `403` to a
+/// caller who lacks the permission, and it runs **before** the module ever looks at the record —
+/// which is right, but it means a read-only account can never demonstrate the rule that matters
+/// most here: that a caller who *could* write is still told `404` for another organization's
+/// record. A `403` would confirm the record exists; a `404` does not.
+const OTHER_WRITER_PERMISSIONS: [&str; 4] = [
+    "crm.contacts.read",
+    "crm.contacts.update",
+    "crm.views.manage",
     "sites.read",
 ];
 
@@ -90,6 +108,25 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         set_cookie,
         body,
     }
+}
+
+/// Percent-encode a value so it can travel in a query string.
+///
+/// A marker like `Export 3f2a…` reads better than `Export-3f2a…`, but a **space is not a legal
+/// URI character**: `Request::builder().uri(..)` refuses the whole request with
+/// `InvalidUriChar` and the test panics inside the builder, far away from the line that put the
+/// space there. Encoding at the point of use keeps a readable fixture and a legal request.
+fn query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 /// Build a JSON request; `token` becomes the session cookie and `body` the payload.
@@ -154,6 +191,7 @@ struct Fixture {
     sensitive: String,
     member: String,
     other_reader: String,
+    other_writer: String,
     manager_id: Uuid,
     accounts: Vec<Uuid>,
 }
@@ -186,6 +224,12 @@ impl Fixture {
         let (other_id, other_reader) = create_account(&db, Some(other_org), "CRM Other").await;
         grant(&db, other_org, other_id, owner_id, &READER_PERMISSIONS).await;
 
+        // A second account in the same foreign organization, this one able to write — the
+        // cross-tenant write is only meaningful for a caller who actually holds the power.
+        let (other_writer_id, other_writer) =
+            create_account(&db, Some(other_org), "CRM Other Writer").await;
+        grant(&db, other_org, other_writer_id, owner_id, &OTHER_WRITER_PERMISSIONS).await;
+
         // The default pipeline is seeded per organization by the migration; a fresh organization
         // created by the fixture gets one only through that function, so the suite calls it — the
         // same path a new tenant takes.
@@ -203,8 +247,16 @@ impl Fixture {
             sensitive,
             member,
             other_reader,
+            other_writer,
             manager_id,
-            accounts: vec![owner_id, manager_id, reader_id, sensitive_id, other_id],
+            accounts: vec![
+                owner_id,
+                manager_id,
+                reader_id,
+                sensitive_id,
+                other_id,
+                other_writer_id,
+            ],
         })
     }
 
@@ -365,8 +417,13 @@ async fn login(state: &AppState, email: &str) -> String {
 }
 
 /// The audit rows of one action, newest first.
+///
+/// The fourth column is the coalesced `actor_user_id` and is **text**, not JSON — declaring it
+/// as `Value` makes sqlx try to read a `TEXT` cell as `JSONB` and the helper panics with a
+/// `ColumnDecode` that names index 3 and nothing about the query. `target_type` and `target_id`
+/// are nullable in the schema, so they are read as `Option<String>` rather than unwrapped here.
 async fn audit_rows(db: &Db, action: &str) -> Vec<Value> {
-    let rows: Vec<(Value, String, Option<String>, Value)> = sqlx::query_as(
+    let rows: Vec<(Value, Option<String>, Option<String>, String)> = sqlx::query_as(
         "select metadata, target_type, target_id, coalesce(actor_user_id::text, '') from audit_log \
          where action = $1 order by id desc limit 5",
     )
@@ -459,6 +516,30 @@ async fn every_crm_route_is_permission_guarded() {
             format!("/api/v1/crm/companies/{marker}"),
             None,
         ),
+        // Slice 2: the views, the import and the two exports.
+        (Method::GET, "/api/v1/crm/views".to_owned(), None),
+        (
+            Method::POST,
+            "/api/v1/crm/views".to_owned(),
+            Some(json!({ "entity": "contacts", "name": "X" })),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/crm/views/{marker}"),
+            None,
+        ),
+        (
+            Method::GET,
+            "/api/v1/crm/views/columns?entity=contacts".to_owned(),
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/crm/contacts/import".to_owned(),
+            Some(json!({ "csv": "first_name\nA\n", "mode": "dry_run" })),
+        ),
+        (Method::GET, "/api/v1/crm/contacts/export".to_owned(), None),
+        (Method::GET, "/api/v1/crm/companies/export".to_owned(), None),
     ];
 
     for (method, uri, body) in &calls {
@@ -533,7 +614,7 @@ async fn a_contact_round_trip_writes_its_audit_row_and_event() {
     )
     .await;
     assert_eq!(duplicate.status, StatusCode::CONFLICT, "body: {}", duplicate.body);
-    assert_eq!(duplicate.body["code"], json!("company_name_taken"));
+    assert_eq!(duplicate.body["error"]["code"], json!("company_name_taken"));
 
     let email = format!("ada-{}@example.com", Uuid::new_v4().simple());
     let contact = call(
@@ -653,8 +734,10 @@ async fn the_contact_and_company_forms_refuse_what_they_name() {
         )
     )
     .await;
-    assert_eq!(nameless.status, StatusCode::BAD_REQUEST, "body: {}", nameless.body);
-    assert_eq!(nameless.body["details"]["field"], json!("first_name"));
+    // A **missing** required field is refused by the body deserializer itself, which answers
+    // `422`; a field that is present but *wrong* is the module's own `400`. Both are correct, and
+    // the difference is worth pinning: the form's own validation runs on the second case.
+    assert_eq!(nameless.status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", nameless.body);
 
     // A malformed address.
     let malformed = call(
@@ -668,7 +751,7 @@ async fn the_contact_and_company_forms_refuse_what_they_name() {
     )
     .await;
     assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
-    assert_eq!(malformed.body["details"]["field"], json!("email"));
+    assert_eq!(malformed.body["error"]["details"]["field"], json!("email"));
 
     // A duplicate address, case-insensitively.
     let email = format!("dup-{marker}@example.com");
@@ -695,7 +778,7 @@ async fn the_contact_and_company_forms_refuse_what_they_name() {
     )
     .await;
     assert_eq!(duplicate.status, StatusCode::CONFLICT, "body: {}", duplicate.body);
-    assert_eq!(duplicate.body["code"], json!("contact_email_taken"));
+    assert_eq!(duplicate.body["error"]["code"], json!("contact_email_taken"));
 
     // A bad domain.
     let domain = call(
@@ -709,7 +792,7 @@ async fn the_contact_and_company_forms_refuse_what_they_name() {
     )
     .await;
     assert_eq!(domain.status, StatusCode::BAD_REQUEST);
-    assert_eq!(domain.body["details"]["field"], json!("domain"));
+    assert_eq!(domain.body["error"]["details"]["field"], json!("domain"));
 
     // A merge of a contact into itself.
     let contact_id = first.body["id"].as_str().expect("the contact has an id");
@@ -724,7 +807,7 @@ async fn the_contact_and_company_forms_refuse_what_they_name() {
     )
     .await;
     assert_eq!(self_merge.status, StatusCode::BAD_REQUEST, "body: {}", self_merge.body);
-    assert_eq!(self_merge.body["code"], json!("invalid_crm_merge"));
+    assert_eq!(self_merge.body["error"]["code"], json!("invalid_crm_merge"));
 }
 
 /// The list: filters combine, an unknown sort is refused, and the total matches the page.
@@ -770,12 +853,15 @@ async fn the_contact_list_filters_sorts_and_totals() {
         assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
     }
 
-    // The search finds them by name.
+    // The search finds them by name. The term is the marker alone: the first names are
+    // `Filter0-{marker}`, `Filter1-…` and `Filter2-…`, and `Filter-{marker}` is **not** a
+    // substring of any of them — the search is a `like %term%`, so asking for the wrong slice of
+    // the name correctly returns nothing.
     let by_name = call(
         state,
         request(
             Method::GET,
-            &format!("/api/v1/crm/contacts?search=Filter-{marker}"),
+            &format!("/api/v1/crm/contacts?search={}", query_value(&marker)),
             Some(&manager),
             None,
         )
@@ -836,7 +922,7 @@ async fn the_contact_list_filters_sorts_and_totals() {
     )
     .await;
     assert_eq!(bad_sort.status, StatusCode::BAD_REQUEST, "body: {}", bad_sort.body);
-    assert_eq!(bad_sort.body["code"], json!("invalid_crm_query"));
+    assert_eq!(bad_sort.body["error"]["code"], json!("invalid_crm_query"));
 
     // A documented sort works and pages with a cursor.
     let page = call(
@@ -930,15 +1016,18 @@ async fn a_record_of_another_organization_is_invisible() {
     )
     .await;
     assert_eq!(direct.status, StatusCode::NOT_FOUND, "body: {}", direct.body);
-    assert_eq!(direct.body["code"], json!("contact_not_found"));
+    assert_eq!(direct.body["error"]["code"], json!("contact_not_found"));
 
-    // A write across the boundary is refused the same way.
+    // A write across the boundary is refused the same way — and it is the **other organization
+    // that can write** doing it, so the `404` comes from the tenant scope rather than from the
+    // permission guard. A reader would have been stopped at the guard with a `403` first.
+    let writer = fixture.token(&fixture.other_writer).await;
     let patch = call(
         state,
         request(
             Method::PATCH,
             &format!("/api/v1/crm/contacts/{contact_id}"),
-            Some(&other),
+            Some(&writer),
             Some(json!({ "status": "customer" })),
         )
     )
@@ -974,7 +1063,19 @@ async fn the_own_visibility_level_hides_a_colleagues_record() {
     let owned_id = owned.body["id"].as_str().expect("the contact has an id");
 
     // …and one owned by the reader the suite narrows.
+    //
+    // The account needs a grant **before** the narrowing, or the very first list is a `403` and
+    // the test would be measuring the permission guard instead of the visibility level. A plain
+    // reader grant is what an organization hands out by default; `narrow_to_own` then adds the
+    // department binding that turns the level from `all` into `own`.
     let (reader_id, reader_email) = create_account(&fixture.db, Some(fixture.org), "CRM Narrowed").await;
+    let (platform_owner_id,): (Uuid,) = sqlx::query_as(
+        "select id from users where organization_id is null order by created_at limit 1",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the platform owner exists");
+    grant(&fixture.db, fixture.org, reader_id, platform_owner_id, &READER_PERMISSIONS).await;
     let reader_token = fixture.token(&reader_email).await;
     let colleagues = call(
         state,
@@ -1011,7 +1112,16 @@ async fn the_own_visibility_level_hides_a_colleagues_record() {
         .iter()
         .map(|item| &item["id"])
         .collect();
-    assert!(!before_ids.contains(&&json!(owned_id)), "before narrowing the reader sees both");
+    // Before the narrowing the level is `all`, so the reader **does** see the other owner's
+    // record. The negation would assert the opposite of what the message says.
+    assert!(
+        before_ids.contains(&&json!(owned_id)),
+        "before narrowing the reader sees both: {before_ids:?}"
+    );
+    assert!(
+        before_ids.contains(&&json!(colleagues_id)),
+        "and the record they own: {before_ids:?}"
+    );
 
     // Narrow the reader to `own` with a `department` binding. The grantor is the platform
     // account this suite created, so the binding's `granted_by` points at a real row.
@@ -1212,8 +1322,11 @@ async fn archiving_and_merging_keep_the_history() {
     assert_eq!(merged.body["phone"], json!("+90 532 000 00 00"));
     assert_eq!(merged.body["tags"], json!(["vip", "emea"]));
     assert!(merged.body["notes"].as_str().unwrap_or_default().contains("The note that moves."));
-    // The loser's custom value for a key the survivor had is kept.
-    assert_eq!(merged.body["custom"]["seat_count"], json!(5));
+    // Custom values merge **key by key, loser's value winning** for a key both records carry:
+    // the survivor had `seat_count: 5`, the loser `seat_count: 9`, so the merged row reads 9 — the
+    // later record wins, exactly as `merge_custom` documents. A key only one side has is simply
+    // carried over, which is what `region` proves.
+    assert_eq!(merged.body["custom"]["seat_count"], json!(9));
     assert_eq!(merged.body["custom"]["region"], json!("eu"));
 
     // The loser is archived, so the default list no longer shows it — and the audit records it.
@@ -1282,7 +1395,7 @@ async fn archiving_and_merging_keep_the_history() {
     )
     .await;
     assert_eq!(archived.status, StatusCode::OK, "body: {}", archived.body);
-    assert!(archived.body["archived_at"].is_string());
+    assert!(archived.body["archived_at"].is_string(), "body: {}", archived.body);
     let archives = audit_rows(&fixture.db, "crm.contact.archived").await;
     assert!(archives.iter().any(|entry| entry["target_id"] == json!(survivor_id)));
 }
@@ -1318,7 +1431,10 @@ async fn the_company_list_and_detail_read_back() {
         state,
         request(
             Method::GET,
-            &format!("/api/v1/crm/companies?search=Listed Co {marker}"),
+            &format!(
+                "/api/v1/crm/companies?search={}",
+                query_value(&format!("Listed Co {marker}"))
+            ),
             Some(&manager),
             None,
         )
@@ -1476,7 +1592,7 @@ async fn the_surface_answers_a_platform_account_and_scopes_a_tenant_account() {
     )
     .await;
     assert_eq!(cross.status, StatusCode::FORBIDDEN, "body: {}", cross.body);
-    assert_eq!(cross.body["code"], json!("cross_organization"));
+    assert_eq!(cross.body["error"]["code"], json!("cross_organization"));
 
     // Its own organization is accepted.
     let own = call(
@@ -1522,8 +1638,10 @@ async fn the_fixture_accounts_are_distinct_and_tenant_scoped() {
 
     assert_eq!(
         fixture.accounts.len(),
-        5,
-        "the fixture creates five accounts: the platform owner and four tenant accounts"
+        6,
+        "the fixture creates six accounts: the platform owner, four in the first organization \
+         and two in the second — the last of them a writer, so the cross-tenant write is tested \
+         with a caller who actually holds the permission"
     );
     let unique: std::collections::BTreeSet<&Uuid> = fixture.accounts.iter().collect();
     assert_eq!(unique.len(), fixture.accounts.len(), "every account is distinct");
@@ -1589,4 +1707,412 @@ async fn the_audit_metadata_is_a_json_document() {
     assert_eq!(metadata["request_id"], json!(contact_id));
     assert_eq!(metadata["before"]["status"], json!("lead"));
     assert_eq!(metadata["after"]["status"], json!("customer"));
+}
+
+/// Slice 2 — the import. A dry run writes nothing and names the line it refuses; the commit
+/// writes exactly the rows the preview accepted and says what it refused.
+#[tokio::test]
+async fn an_import_previews_before_it_writes_and_then_writes_what_it_accepted() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+    let before = call(state, request(Method::GET, "/api/v1/crm/contacts", Some(&manager), None)).await;
+    let before_total = before.body["total_estimate"].as_i64().unwrap_or(0);
+
+    let file = format!(
+        "First Name,Surname,E-Mail,Company Name\n         Good,Row,good-{}@example.com,QA Import Co\n         Bad,Row,not-an-address,QA Import Co\n",
+        Uuid::new_v4().simple()
+    );
+
+    // A dry run: the mapping, the counts, the refused line — and no row written.
+    let preview = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts/import",
+            Some(&manager),
+            Some(json!({ "csv": file, "mode": "dry_run" })),
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
+    assert_eq!(preview.body["mode"], json!("dry_run"));
+    assert_eq!(preview.body["total_rows"], json!(2));
+    assert_eq!(preview.body["valid_rows"], json!(1));
+    let errors = preview.body["errors"].as_array().expect("the preview lists its refusals");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["line"], json!(3), "the header is line 1");
+    assert_eq!(errors[0]["field"], json!("email"));
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("e-mail address"),
+        "{}",
+        errors[0]
+    );
+    // The mapped columns prove the header was understood, not guessed.
+    let mapped = preview.body["mapping"]["columns"]
+        .as_array()
+        .expect("the mapping is a list");
+    assert!(
+        mapped
+            .iter()
+            .any(|entry| entry["field"] == json!("first_name") && entry["column"] == json!(0)),
+        "{mapped:?}"
+    );
+
+    let after_preview = call(state, request(Method::GET, "/api/v1/crm/contacts", Some(&manager), None)).await;
+    assert_eq!(
+        after_preview.body["total_estimate"].as_i64().unwrap_or(0),
+        before_total,
+        "a dry run must not write a row"
+    );
+
+    // The commit: the one row the preview accepted is written, and the company the file named is
+    // created once and linked.
+    //
+    // `refused` is **0** here, and that is the point: the dry run already named the bad line, and
+    // `committable_rows` hands the commit only the rows the preview accepted. A preview that
+    // reported one refusal and a commit that then refused it a second time would mean the two
+    // halves disagreed about the same file. The refusal itself was proved by the dry run above.
+    let commit = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts/import",
+            Some(&manager),
+            Some(json!({ "csv": file, "mode": "commit" })),
+        ),
+    )
+    .await;
+    assert_eq!(commit.status, StatusCode::OK, "{}", commit.body);
+    assert_eq!(commit.body["created"], json!(1), "body: {}", commit.body);
+    assert_eq!(commit.body["refused"], json!(0), "body: {}", commit.body);
+    let written = commit.body["contacts"].as_array().expect("the commit answers the rows it wrote");
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0]["first_name"], json!("Good"));
+    assert_eq!(
+        written[0]["company_name"],
+        json!("QA Import Co"),
+        "a company the file names is created once and linked"
+    );
+
+    let after_commit = call(state, request(Method::GET, "/api/v1/crm/contacts", Some(&manager), None)).await;
+    assert_eq!(
+        after_commit.body["total_estimate"].as_i64().unwrap_or(0),
+        before_total + 1,
+        "the commit wrote exactly the accepted row"
+    );
+
+    // The import is audited, in the same vocabulary as the rest of the CRM.
+    let audit = audit_rows(&fixture.db, "crm.contacts.imported").await;
+    assert!(!audit.is_empty(), "the import must leave an audit row");
+}
+
+/// A file that names no contact field is refused by the header, and a repeated address inside one
+/// file is refused before the commit rather than half way through it.
+#[tokio::test]
+async fn an_import_refuses_a_file_that_is_not_a_contact_file() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let nonsense = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts/import",
+            Some(&manager),
+            Some(json!({ "csv": "colour,size\nred,large\n", "mode": "dry_run" })),
+        ),
+    )
+    .await;
+    assert_eq!(nonsense.status, StatusCode::BAD_REQUEST, "{}", nonsense.body);
+    assert_eq!(nonsense.body["error"]["details"]["field"], json!("file"));
+
+    let address = format!("twice-{}@example.com", Uuid::new_v4().simple());
+    let file = format!("first_name,email\nOne,{address}\nTwo,{}\n", address.to_uppercase());
+    let preview = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts/import",
+            Some(&manager),
+            Some(json!({ "csv": file, "mode": "dry_run" })),
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
+    assert_eq!(preview.body["valid_rows"], json!(1), "the repeat is refused in the preview too");
+    assert_eq!(preview.body["errors"][0]["line"], json!(3));
+}
+
+/// The saved views: a view is the query it stands for, it is shared only when asked, and it never
+/// bridges two organizations.
+#[tokio::test]
+async fn a_saved_view_is_the_query_it_stands_for() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let created = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/views",
+            Some(&manager),
+            Some(json!({
+                "entity": "contacts",
+                "name": "My open leads",
+                "filters": { "status": "lead", "owner": "me", "moon_phase": "waxing" },
+                "columns": ["name", "status", "not_a_column"],
+                "sort": { "key": "updated_at", "direction": "desc" }
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    // The column chooser keeps the known columns and drops the one the entity does not have.
+    assert_eq!(
+        created.body["columns"],
+        json!(["name", "status"]),
+        "an unknown column must not be stored: it would render a header the list cannot fill"
+    );
+    assert_eq!(created.body["is_shared"], json!(false), "a view is private until it is shared");
+    let view_id = created.body["id"].as_str().expect("the view has an id").to_owned();
+
+    let listed = call(state, request(Method::GET, "/api/v1/crm/views?entity=contacts", Some(&manager), None)).await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let views = listed.body["views"].as_array().expect("the envelope is { views: [] }");
+    assert!(views.iter().any(|view| view["id"] == json!(view_id)));
+
+    // A view of another organization is invisible and unremovable: a view must not be a bridge.
+    //
+    // The **read-only** foreign account proves the invisibility (a read is a read). The delete is
+    // then driven by the foreign **writer**, because a caller without `crm.views.manage` is stopped
+    // at the guard with a 403 and the rule under test — that the tenant boundary, not the
+    // permission check, is what answers — would never be reached.
+    let other = fixture.token(&fixture.other_reader).await;
+    let other_list = call(state, request(Method::GET, "/api/v1/crm/views", Some(&other), None)).await;
+    assert_eq!(other_list.status, StatusCode::OK);
+    let other_views = other_list.body["views"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !other_views.iter().any(|view| view["id"] == json!(view_id)),
+        "a view of one organization must not be listed by another"
+    );
+    let other_writer = fixture.token(&fixture.other_writer).await;
+    let other_delete = call(
+        state,
+        request(Method::DELETE, &format!("/api/v1/crm/views/{view_id}"), Some(&other_writer), None),
+    )
+    .await;
+    assert_eq!(
+        other_delete.status,
+        StatusCode::NOT_FOUND,
+        "a view of another organization is a 404, not a 403"
+    );
+
+    // An unknown sort is refused by name: it would reorder the list silently.
+    let refused = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/views",
+            Some(&manager),
+            Some(json!({ "entity": "companies", "name": "Wrong", "sort": { "key": "last_activity_at" } })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.body["error"]["details"]["field"], json!("sort"));
+
+    // A view of an entity the platform does not have is refused too.
+    let nameless = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/views",
+            Some(&manager),
+            Some(json!({ "entity": "invoices", "name": "Unpaid" })),
+        ),
+    )
+    .await;
+    assert_eq!(nameless.status, StatusCode::BAD_REQUEST, "{}", nameless.body);
+    assert_eq!(nameless.body["error"]["details"]["field"], json!("entity"));
+
+    // Deleting the view removes the lens, never the records.
+    let removed = call(
+        state,
+        request(Method::DELETE, &format!("/api/v1/crm/views/{view_id}"), Some(&manager), None),
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
+    let after = call(state, request(Method::GET, "/api/v1/crm/views", Some(&manager), None)).await;
+    assert!(
+        !after.body["views"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|view| view["id"] == json!(view_id)),
+        "the view is gone"
+    );
+}
+
+/// The column catalogue: the chooser offers what the entity has, and the flagged keys are not
+/// among them.
+#[tokio::test]
+async fn the_column_catalogue_answers_per_entity() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let contacts = call(
+        state,
+        request(Method::GET, "/api/v1/crm/views/columns?entity=contacts", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(contacts.status, StatusCode::OK);
+    let columns = contacts.body["columns"].as_array().expect("the catalogue is a list");
+    assert!(columns.iter().any(|value| value == &json!("company")));
+    assert!(!columns.iter().any(|value| value == &json!("contact_count")));
+    let statuses = contacts.body["statuses"].as_array().expect("the statuses travel with it");
+    assert!(statuses.iter().any(|value| value == &json!("lead")));
+}
+
+/// The export is the list's own answer: the same filters, the same field hiding, and a file the
+/// importer accepts without a mapping step.
+#[tokio::test]
+async fn an_export_is_the_lists_own_answer_and_imports_back() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let marker = format!("Export {}", Uuid::new_v4().simple());
+    let contact = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts",
+            Some(&manager),
+            Some(json!({
+                "first_name": marker,
+                "email": format!("{}-{}@example.com", marker.to_lowercase().replace(' ', "-"), Uuid::new_v4().simple()),
+                "tags": ["round trip"],
+                "notes": "Called, then wrote \"yes\"."
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(contact.status, StatusCode::CREATED, "{}", contact.body);
+    let contact_id = contact.body["id"].as_str().expect("the contact has an id").to_owned();
+
+    // A reader without the flagged keys: the file must not carry what the screen hides.
+    let flagged = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts",
+            Some(&manager),
+            Some(json!({
+                "first_name": format!("{marker} flagged"),
+                "custom": { "contract_value_note": "40k" }
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(flagged.status, StatusCode::CREATED, "{}", flagged.body);
+
+    let export = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/contacts/export?search={}", query_value(&marker)),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(export.status, StatusCode::OK, "{}", export.body);
+    let csv = export.body.as_str().expect("the export is the text of the body");
+    assert!(csv.starts_with("first_name,last_name,email,"), "{csv}");
+    assert!(csv.contains(&marker), "the export carries the rows the filter matched: {csv}");
+    assert!(csv.contains("\"Called, then wrote"), "a note with a quote is quoted: {csv}");
+    assert!(
+        csv.contains("round trip"),
+        "a one-word tag list travels as a JSON array: {csv}"
+    );
+
+    // The file the export wrote imports back without a mapping step.
+    let reimport = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts/import",
+            Some(&manager),
+            Some(json!({ "csv": csv, "mode": "dry_run" })),
+        ),
+    )
+    .await;
+    assert_eq!(reimport.status, StatusCode::OK, "{}", reimport.body);
+    assert_eq!(
+        reimport.body["valid_rows"].as_i64().unwrap_or(0),
+        reimport.body["total_rows"].as_i64().unwrap_or(-1),
+        "an export must import cleanly: {:?}",
+        reimport.body["errors"]
+    );
+
+    // The reader who may not read the flagged keys gets a file without them.
+    let reader_export = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/contacts/export?search={}", query_value(&marker)),
+            Some(&fixture.token(&fixture.reader).await),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(reader_export.status, StatusCode::OK);
+    let reader_csv = reader_export.body.as_str().unwrap_or_default();
+    assert!(
+        !reader_csv.contains("40k"),
+        "the export must apply the same field hiding as the list: {reader_csv}"
+    );
+
+    // The company export is the same story for the other entity.
+    let companies = call(
+        state,
+        request(Method::GET, "/api/v1/crm/companies/export", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(companies.status, StatusCode::OK);
+    assert!(
+        companies
+            .body
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("name,domain,industry,"),
+        "{}",
+        companies.body
+    );
+
+    // The archive still works after the export, so the round trip left a usable record.
+    let archived = call(
+        state,
+        request(Method::DELETE, &format!("/api/v1/crm/contacts/{contact_id}"), Some(&manager), None),
+    )
+    .await;
+    assert_eq!(archived.status, StatusCode::OK);
+    assert!(archived.body["archived_at"].is_string(), "body: {}", archived.body);
 }
