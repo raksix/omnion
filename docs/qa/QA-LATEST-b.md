@@ -1,6 +1,6 @@
-# Omnion QA — latest pass
+# Omnion QA — latest pass (b)
 
-- When: 2026-09-27T17:51:13.669Z · artifacts: `qa-artifacts/20260927-175102` · stack `b` (API `:18090`, panel `:3110`, renderer `:3240`, database `omnion_qa_b`)
+- When: 2026-09-27T17:51:13.669Z · artifacts: `qa-artifacts/20260927-175102`
 - Interactions: 855 clicks · 72 field fills · 1 form submissions · 887 screenshots
 - Console errors: 5 · failed requests: 4 · dialogs: 2
 - Programmatic findings: 5 (high 0 · medium 5 · low 0)
@@ -13,9 +13,3 @@
 - **[medium] web-console** — web http://qa.omnion.test:3240/: Failed to load resource: the server responded with a status of 404 (Not Found)
 - **[medium] web-request** — web 404 http://qa.omnion.test:3240/ 
 - **[medium] web-request** — web 404 http://qa.omnion.test:3240/ 
-
-> The five mediums are the public renderer answering `404 nothing published here` for a site with no
-> page at its root — correct behaviour, carried since run `20260927-112459`. The vision items (3) sit
-> on REQ-007's analytics screens: the settings snippet block clips its last line (medium ×2) and the
-> traffic legend names a `Page views` series the chart does not draw (low ×1). The stack's own report
-> file is `docs/qa/QA-LATEST-b.md`.
