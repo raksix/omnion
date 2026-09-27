@@ -148,9 +148,7 @@ pub fn stored_fields() -> Vec<StoredField> {
 #[must_use]
 pub fn cutoff_for(retention_days: i32, now: OffsetDateTime) -> OffsetDateTime {
     let days = i64::from(retention_days.clamp(1, MAX_RETENTION_DAYS));
-    (now.date() - Duration::days(days))
-        .midnight()
-        .assume_utc()
+    (now.date() - Duration::days(days)).midnight().assume_utc()
 }
 
 /// What one retention run removed, table by table.
@@ -189,7 +187,14 @@ pub async fn purge(
     retention_days: i32,
     actor: Option<Uuid>,
 ) -> Result<PurgeOutcome> {
-    purge_at(pool, site_id, retention_days, actor, OffsetDateTime::now_utc()).await
+    purge_at(
+        pool,
+        site_id,
+        retention_days,
+        actor,
+        OffsetDateTime::now_utc(),
+    )
+    .await
 }
 
 /// [`purge`] with the clock handed in, so a test can name the cutoff it expects.
@@ -223,13 +228,12 @@ pub async fn purge_at(
         .await?
         .rows_affected() as i64;
 
-    let visits =
-        sqlx::query("delete from analytics_visits where site_id = $1 and started_at < $2")
-            .bind(site_id)
-            .bind(cutoff)
-            .execute(&mut *transaction)
-            .await?
-            .rows_affected() as i64;
+    let visits = sqlx::query("delete from analytics_visits where site_id = $1 and started_at < $2")
+        .bind(site_id)
+        .bind(cutoff)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected() as i64;
 
     let goal_hits = sqlx::query(
         "delete from analytics_goal_hits where occurred_at < $2 and goal_id in \
@@ -362,12 +366,13 @@ pub async fn erase_visitor(
     .await?
     .rows_affected() as i64;
 
-    let visits = sqlx::query("delete from analytics_visits where site_id = $1 and visitor_hash = $2")
-        .bind(site_id)
-        .bind(&handle)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected() as i64;
+    let visits =
+        sqlx::query("delete from analytics_visits where site_id = $1 and visitor_hash = $2")
+            .bind(site_id)
+            .bind(&handle)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected() as i64;
 
     let goal_hits = sqlx::query(
         "delete from analytics_goal_hits where visitor_hash = $2 and goal_id in \
@@ -435,8 +440,7 @@ pub struct PurgeRecord {
 }
 
 /// The columns every read of the audit trail uses.
-const PURGE_COLUMNS: &str =
-    "id, site_id, kind, cutoff, rows_removed, actor_user_id, created_at";
+const PURGE_COLUMNS: &str = "id, site_id, kind, cutoff, rows_removed, actor_user_id, created_at";
 
 /// The most recent run of one site, whatever its kind.
 pub async fn last_purge(pool: &PgPool, site_id: Uuid) -> Result<Option<PurgeRecord>> {
@@ -602,7 +606,10 @@ mod tests {
     #[test]
     fn the_cutoff_is_the_midnight_that_many_days_back() {
         let cutoff = cutoff_for(7, clock());
-        assert_eq!(cutoff.date(), Date::from_calendar_date(2026, Month::September, 19).unwrap());
+        assert_eq!(
+            cutoff.date(),
+            Date::from_calendar_date(2026, Month::September, 19).unwrap()
+        );
         assert_eq!(cutoff.time(), time::Time::MIDNIGHT);
 
         // Whole days, so two runs an hour apart agree on the window.
@@ -621,9 +628,15 @@ mod tests {
         assert!(is_visitor_hash(&"0123456789abcdef".repeat(4)));
         assert!(!is_visitor_hash(&"a".repeat(63)));
         assert!(!is_visitor_hash(&"a".repeat(65)));
-        assert!(!is_visitor_hash(&"A".repeat(64)), "upper-case is not the shape");
+        assert!(
+            !is_visitor_hash(&"A".repeat(64)),
+            "upper-case is not the shape"
+        );
         assert!(!is_visitor_hash(&"g".repeat(64)), "g is not hexadecimal");
-        assert!(!is_visitor_hash("203.0.113.9"), "an address is not a handle");
+        assert!(
+            !is_visitor_hash("203.0.113.9"),
+            "an address is not a handle"
+        );
     }
 
     #[test]
@@ -636,7 +649,11 @@ mod tests {
             .filter(|field| field.personal)
             .map(|field| field.column)
             .collect();
-        assert!(personal.iter().any(|column| column.contains("visitor_hash")));
+        assert!(
+            personal
+                .iter()
+                .any(|column| column.contains("visitor_hash"))
+        );
         assert!(personal.iter().any(|column| column.contains("ip_prefix")));
 
         // The two columns the privacy promise turns on are described as personal, and nothing

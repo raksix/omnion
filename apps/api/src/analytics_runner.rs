@@ -103,18 +103,19 @@ async fn watch_spikes(state: &AppState, watched: &mut HashMap<Uuid, OffsetDateTi
             }
         }
 
-        let organization: Option<Uuid> =
-            match sqlx::query_scalar("select organization_id from sites where id = $1")
-                .bind(site_id)
-                .fetch_optional(pool)
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(site_id = %site_id, error = %error, "the spike site could not be read");
-                    continue;
-                }
-            };
+        let organization: Option<Uuid> = match sqlx::query_scalar(
+            "select organization_id from sites where id = $1",
+        )
+        .bind(site_id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(site_id = %site_id, error = %error, "the spike site could not be read");
+                continue;
+            }
+        };
 
         let emission = bus::emit(
             pool,

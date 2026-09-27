@@ -36,7 +36,9 @@ use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_module_analytics::collect::{self, Beacon, RequestMeta};
 use omnion_module_analytics::goals::{self, Goal, GoalChanges, GoalPatch};
-use omnion_module_analytics::privacy::{self, ErasureOutcome, PurgeOutcome, PurgeRecord, StoredField};
+use omnion_module_analytics::privacy::{
+    self, ErasureOutcome, PurgeOutcome, PurgeRecord, StoredField,
+};
 use omnion_module_analytics::realtime::{self, RealtimeSnapshot};
 use omnion_module_analytics::reports::{self, DateRange, Filters, Granularity, Report};
 use omnion_module_analytics::settings as store;
@@ -182,10 +184,7 @@ pub struct SettingsResponse {
 }
 
 /// The whole settings payload of one site.
-async fn settings_payload(
-    state: &AppState,
-    site_id: Uuid,
-) -> Result<SettingsResponse, ApiError> {
+async fn settings_payload(state: &AppState, site_id: Uuid) -> Result<SettingsResponse, ApiError> {
     let pool = state.db().pool();
     let settings = store::ensure(pool, site_id).await?;
 
@@ -240,8 +239,13 @@ pub async fn purge(
     let site = site_in_scope(&state, &current, query.site_id).await?;
     let pool = state.db().pool();
     let settings = store::ensure(pool, site.id).await?;
-    let outcome =
-        privacy::purge(pool, site.id, settings.retention_days, Some(current.user.id)).await?;
+    let outcome = privacy::purge(
+        pool,
+        site.id,
+        settings.retention_days,
+        Some(current.user.id),
+    )
+    .await?;
 
     let emission = bus::emit(
         pool,

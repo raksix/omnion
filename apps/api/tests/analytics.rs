@@ -3070,7 +3070,10 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
     )
     .bind(Uuid::new_v4())
     .bind(fixture.organizations[0])
-    .bind(format!("Compliance {}", &Uuid::new_v4().simple().to_string()[..8]))
+    .bind(format!(
+        "Compliance {}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    ))
     .bind(&receiver.url)
     .bind("0123456789abcdef0123456789abcdef")
     .bind(vec![
@@ -3153,7 +3156,11 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
         .expect("the ancient salt must be written");
 
     // Running a purge is `analytics.settings.manage`, like the settings themselves.
-    for (label, token) in [("reader", &reader), ("member", &member), ("other org", &other_reader)] {
+    for (label, token) in [
+        ("reader", &reader),
+        ("member", &member),
+        ("other org", &other_reader),
+    ] {
         let refused = call(
             &fixture.state,
             request(
@@ -3197,18 +3204,27 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
     );
 
     // Exactly the intended rows went, and nothing else did.
-    assert_eq!(visits_for(&fixture.db, site, &stale).await, 0, "the stale visit is gone");
-    assert_eq!(visits_for(&fixture.db, site, &fresh).await, 1, "the recent visit stays");
+    assert_eq!(
+        visits_for(&fixture.db, site, &stale).await,
+        0,
+        "the stale visit is gone"
+    );
+    assert_eq!(
+        visits_for(&fixture.db, site, &fresh).await,
+        1,
+        "the recent visit stays"
+    );
     assert_eq!(
         rows(&fixture.db, "analytics_visits", other_site).await,
         1,
         "another site is never touched"
     );
-    let salts: i64 = sqlx::query_scalar("select count(*)::bigint from analytics_salts where day = $1::date")
-        .bind(&ancient_salt)
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("the salt count must run");
+    let salts: i64 =
+        sqlx::query_scalar("select count(*)::bigint from analytics_salts where day = $1::date")
+            .bind(&ancient_salt)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the salt count must run");
     assert_eq!(salts, 0, "a salt past every window is pruned with the rows");
 
     // The audit row, and the event the platform records for a subscriber.
@@ -3239,7 +3255,15 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
         },
     )
     .await;
-    seed_pageview(&fixture.db, site, visit_id, "/qa/erase/thanks", "Thanks", at_day(1, 10)).await;
+    seed_pageview(
+        &fixture.db,
+        site,
+        visit_id,
+        "/qa/erase/thanks",
+        "Thanks",
+        at_day(1, 10),
+    )
+    .await;
     seed_event(
         &fixture.db,
         site,
@@ -3285,7 +3309,11 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
     )
     .await;
     assert_eq!(goal.status, StatusCode::CREATED, "body: {}", goal.body);
-    let goal_id: Uuid = goal.body["id"].as_str().expect("a goal id").parse().expect("a uuid");
+    let goal_id: Uuid = goal.body["id"]
+        .as_str()
+        .expect("a goal id")
+        .parse()
+        .expect("a uuid");
     sqlx::query(
         "insert into analytics_goal_hits (goal_id, visitor_hash, step_position, occurred_at) \
          values ($1, $2, 1, now())",
@@ -3307,7 +3335,12 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
         ),
     )
     .await;
-    assert_eq!(bad_handle.status, StatusCode::BAD_REQUEST, "body: {}", bad_handle.body);
+    assert_eq!(
+        bad_handle.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        bad_handle.body
+    );
     assert_eq!(bad_handle.body["error"]["code"], json!("invalid_visitor"));
 
     let refused = call(
@@ -3340,8 +3373,16 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
     assert_eq!(erased.body["goal_hits"], json!(1));
     assert_eq!(erased.body["rows_removed"], json!(5));
 
-    assert_eq!(visits_for(&fixture.db, site, &doomed).await, 0, "every visit of the handle is gone");
-    assert_eq!(goal_hits_for(&fixture.db, site, &doomed).await, 0, "and every goal hit");
+    assert_eq!(
+        visits_for(&fixture.db, site, &doomed).await,
+        0,
+        "every visit of the handle is gone"
+    );
+    assert_eq!(
+        goal_hits_for(&fixture.db, site, &doomed).await,
+        0,
+        "and every goal hit"
+    );
     assert_eq!(
         visits_for(&fixture.db, other_site, &doomed).await,
         1,
@@ -3367,7 +3408,10 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
     let audit = audit_rows(&fixture.db, site).await;
     assert_eq!(audit.len(), 3, "retention + two erasures: {audit:?}");
     assert_eq!(audit[1].0, "erasure");
-    assert_eq!(audit[1].2, 5, "the first erasure removed the visitor's rows");
+    assert_eq!(
+        audit[1].2, 5,
+        "the first erasure removed the visitor's rows"
+    );
     assert!(audit[1].1.is_none(), "an erasure has no cutoff");
     assert_eq!(audit[2].2, 0, "the second erasure found nothing left");
     let recorded = event_payloads(&fixture.db, site, "analytics.erasure_completed").await;
@@ -3378,7 +3422,10 @@ async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
 
     // And both facts reach a subscribed endpoint over HTTP — the delivery engine's own walk.
     let delivered = deliver_queued(&fixture).await;
-    assert!(delivered.delivered >= 2, "two deliveries went out: {delivered:?}");
+    assert!(
+        delivered.delivered >= 2,
+        "two deliveries went out: {delivered:?}"
+    );
     let seen = receiver.events();
     assert!(
         seen.contains(&"analytics.retention_purged".to_owned()),

@@ -69,7 +69,10 @@ pub const PAGE_SORTS: [(&str, &str); 7] = [
     ("visitors", "visitors"),
     ("views_per_visitor", "views::float8 / greatest(visitors, 1)"),
     ("avg_time", "avg_time_ms"),
-    ("bounce_rate", "bounced_visits::float8 / greatest(visits, 1)"),
+    (
+        "bounce_rate",
+        "bounced_visits::float8 / greatest(visits, 1)",
+    ),
     ("entrances", "entrances"),
     ("exits", "exits"),
 ];
@@ -165,7 +168,11 @@ impl Granularity {
     /// The natural bucket size of a range: hours for the last two days, days beyond that.
     #[must_use]
     pub fn auto(range: DateRange) -> Self {
-        if range.days() <= 2 { Self::Hour } else { Self::Day }
+        if range.days() <= 2 {
+            Self::Hour
+        } else {
+            Self::Day
+        }
     }
 
     /// Seconds one bucket spans.
@@ -1600,7 +1607,9 @@ pub async fn pages(
          where pages.site_id = $1 and pages.occurred_at >= $2 and pages.occurred_at < $3{clause}"
     );
 
-    let total_sql = format!("select count(*)::bigint from (select pages.path {base} group by pages.path) grouped");
+    let total_sql = format!(
+        "select count(*)::bigint from (select pages.path {base} group by pages.path) grouped"
+    );
     let mut total_query = sqlx::query_scalar::<_, i64>(&total_sql)
         .bind(site_id)
         .bind(from)
@@ -1624,14 +1633,31 @@ pub async fn pages(
          {base} group by pages.path order by {sort_fragment} {order}, pages.path asc \
          limit ${limit} offset ${offset}"
     );
-    let mut query = sqlx::query_as::<_, (String, Option<String>, i64, i64, Option<f64>, i64, i64, i64, i64)>(&rows_sql)
-        .bind(site_id)
-        .bind(from)
-        .bind(to);
+    let mut query = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<f64>,
+            i64,
+            i64,
+            i64,
+            i64,
+        ),
+    >(&rows_sql)
+    .bind(site_id)
+    .bind(from)
+    .bind(to);
     for value in narrowing.binds() {
         query = query.bind(value);
     }
-    let rows = query.bind(per_page).bind((page - 1) * per_page).fetch_all(pool).await?;
+    let rows = query
+        .bind(per_page)
+        .bind((page - 1) * per_page)
+        .fetch_all(pool)
+        .await?;
 
     let rows = rows
         .into_iter()
@@ -1917,9 +1943,21 @@ pub async fn audience(
     let limit = narrowing.next_index();
 
     let panels: [(&str, &str, &str); 5] = [
-        ("device", "Devices", "coalesce(visits.device_type, '(unknown)')"),
-        ("browser", "Browsers", "coalesce(visits.browser, '(unknown)')"),
-        ("os", "Operating systems", "coalesce(visits.os, '(unknown)')"),
+        (
+            "device",
+            "Devices",
+            "coalesce(visits.device_type, '(unknown)')",
+        ),
+        (
+            "browser",
+            "Browsers",
+            "coalesce(visits.browser, '(unknown)')",
+        ),
+        (
+            "os",
+            "Operating systems",
+            "coalesce(visits.os, '(unknown)')",
+        ),
         (
             "screen",
             "Screen sizes",
@@ -2030,10 +2068,11 @@ pub async fn events(
          where events.site_id = $1 and events.occurred_at >= $2 and events.occurred_at < $3{clause} \
          group by events.name order by 2 desc, 1 asc limit ${limit}"
     );
-    let mut query = sqlx::query_as::<_, (String, i64, i64, Option<f64>, Option<OffsetDateTime>)>(&sql)
-        .bind(site_id)
-        .bind(from)
-        .bind(to);
+    let mut query =
+        sqlx::query_as::<_, (String, i64, i64, Option<f64>, Option<OffsetDateTime>)>(&sql)
+            .bind(site_id)
+            .bind(from)
+            .bind(to);
     for value in narrowing.binds() {
         query = query.bind(value);
     }
@@ -2257,7 +2296,11 @@ pub async fn forms(
                     value_sum,
                     starts,
                     completion_rate: ratio(submissions as f64, starts as f64),
-                    abandonment: if starts > 0 { Some(starts - submissions) } else { None },
+                    abandonment: if starts > 0 {
+                        Some(starts - submissions)
+                    } else {
+                        None
+                    },
                     last_seen,
                 },
             )
@@ -2285,7 +2328,11 @@ mod tests {
         let previous = week.previous();
         assert_eq!(previous.to, day(2026, 9, 19));
         assert_eq!(previous.from, day(2026, 9, 13));
-        assert_eq!(previous.days(), 7, "the comparison period is the same length");
+        assert_eq!(
+            previous.days(),
+            7,
+            "the comparison period is the same length"
+        );
     }
 
     #[test]
@@ -2356,7 +2403,14 @@ mod tests {
         assert!(Filters::new(None, None, Some("toaster".to_owned()), None, None).is_err());
         assert!(Filters::new(None, None, None, Some("TUR".to_owned()), None).is_err());
         assert!(
-            Filters::new(Some("x".repeat(MAX_FILTER_LENGTH + 1)), None, None, None, None).is_err()
+            Filters::new(
+                Some("x".repeat(MAX_FILTER_LENGTH + 1)),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
         );
         assert!(
             Filters::new(Some("   ".to_owned()), None, None, None, None)
@@ -2382,15 +2436,28 @@ mod tests {
         .unwrap();
         let narrowing = narrow_pages(&filters);
         assert_eq!(narrowing.len(), 3);
-        assert!(narrowing.clause().contains("pages.path ilike '%' || $4 || '%'"));
-        assert!(narrowing.clause().contains("coalesce(visits.device_type, '') = $5"));
+        assert!(
+            narrowing
+                .clause()
+                .contains("pages.path ilike '%' || $4 || '%'")
+        );
+        assert!(
+            narrowing
+                .clause()
+                .contains("coalesce(visits.device_type, '') = $5")
+        );
         assert!(narrowing.clause().contains("$6"));
-        assert!(!narrowing.clause().contains("$7"), "an unused filter binds nothing");
+        assert!(
+            !narrowing.clause().contains("$7"),
+            "an unused filter binds nothing"
+        );
         assert_eq!(narrowing.next_index(), 7);
 
         let visits = narrow_visits(&filters);
         assert!(
-            visits.clause().contains("exists (select 1 from analytics_pageviews pages"),
+            visits
+                .clause()
+                .contains("exists (select 1 from analytics_pageviews pages"),
             "a visit is narrowed by the paths it viewed"
         );
         let events = narrow_events(&filters);
