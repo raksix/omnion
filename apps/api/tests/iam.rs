@@ -396,8 +396,14 @@ async fn the_iam_surface_is_permission_gated_end_to_end() {
         "update body: {}",
         updated.body
     );
-    assert_eq!(updated.body["denied_permissions"], 1);
-    assert_eq!(updated.body["allowed_permissions"], 1);
+    assert_eq!(updated.body["role"]["denied_permissions"], 1);
+    assert_eq!(updated.body["role"]["allowed_permissions"], 1);
+    assert_eq!(
+        updated.body["diff"]["added"].as_array().map(Vec::len),
+        Some(2),
+        "the save reports what it changed: {}",
+        updated.body
+    );
 
     // A fresh account holds nothing: the guard refuses the same routes it just answered.
     let (member_id, member_email) = fixture.add_account(Some(fixture.organization_id)).await;
@@ -567,7 +573,7 @@ async fn the_iam_surface_is_permission_gated_end_to_end() {
     let actions = keys_of(&audit.body, "entries", "action");
     for expected in [
         "iam.role.created",
-        "iam.role.permissions_updated",
+        "iam.role.permissions_changed",
         "iam.binding.granted",
     ] {
         assert!(
@@ -954,7 +960,15 @@ async fn cross_organization_work_and_system_roles_are_refused() {
     )
     .await;
     assert_eq!(bad_key.status, StatusCode::BAD_REQUEST, "{}", bad_key.body);
-    assert_eq!(bad_key.body["error"]["code"], "invalid_request");
+    assert_eq!(bad_key.body["error"]["code"], "invalid_entries");
+    assert!(
+        bad_key.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("content.pages.explode"),
+        "the refusal names the key it rejected: {}",
+        bad_key.body
+    );
 
     // Without a session nothing is answered at all.
     let anonymous = call(
@@ -984,4 +998,496 @@ async fn cross_organization_work_and_system_roles_are_refused() {
         .expect("organization cleanup must run");
 
     fixture.cleanup().await;
+}
+
+/// REQ-006, slice 1 — role depth over HTTP: the matrix save is atomic, inheritance refuses
+/// cycles and depth, precedence holds through the guard, and the history carries a diff.
+///
+/// Precedence is proven where it actually decides: an account with no binding is refused, a
+/// binding that allows the read key is admitted, and a second role that denies the same key
+/// takes the admission away again.
+#[tokio::test]
+async fn role_depth_lifecycle_is_proven_end_to_end() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.owner_token().await;
+    let org = fixture.organization_id;
+
+    // A custom role with one explicit allow.
+    let alpha = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/roles",
+            Some(&owner),
+            Some(json!({ "key": "depth-alpha", "name": "Depth Alpha", "priority": 420 })),
+        ),
+    )
+    .await;
+    assert_eq!(alpha.status, StatusCode::CREATED, "{}", alpha.body);
+    let alpha_id = alpha.body["id"].as_str().expect("a role carries an id").to_owned();
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/roles/{alpha_id}/permissions"),
+            Some(&owner),
+            Some(json!({ "permissions": [{ "key": "iam.roles.read", "effect": "allow" }] })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+    assert_eq!(saved.body["version"], 1, "the first save is version 1: {}", saved.body);
+    assert_eq!(saved.body["diff"]["added"].as_array().map(Vec::len), Some(1));
+
+    // The detail carries the entries, the version and the member count.
+    let detail = call(
+        &fixture.state,
+        request(Method::GET, &format!("/api/v1/iam/roles/{alpha_id}"), Some(&owner), None),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK, "{}", detail.body);
+    assert_eq!(detail.body["role"]["key"], "depth-alpha");
+    assert_eq!(detail.body["version"], 1);
+    assert_eq!(detail.body["member_count"], 0);
+    let entries = keys_of(&detail.body, "permissions", "key");
+    assert_eq!(entries, vec!["iam.roles.read".to_owned()], "{}", detail.body);
+
+    // A second role that denies the same key; it inherits the first one.
+    let beta = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/roles",
+            Some(&owner),
+            Some(json!({
+                "key": "depth-beta",
+                "name": "Depth Beta",
+                "priority": 410,
+                "inherits_role_id": alpha_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(beta.status, StatusCode::CREATED, "{}", beta.body);
+    let beta_id = beta.body["id"].as_str().expect("id").to_owned();
+
+    let denied = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/roles/{beta_id}/permissions"),
+            Some(&owner),
+            Some(json!({ "permissions": [{ "key": "iam.roles.read", "effect": "deny" }] })),
+        ),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::OK, "{}", denied.body);
+
+    // The detail of the child shows its chain.
+    let beta_detail = call(
+        &fixture.state,
+        request(Method::GET, &format!("/api/v1/iam/roles/{beta_id}"), Some(&owner), None),
+    )
+    .await;
+    assert_eq!(beta_detail.body["chain"][0]["key"], "depth-alpha", "{}", beta_detail.body);
+    assert_eq!(
+        beta_detail.body["inherited_by"].as_array().map(Vec::len),
+        Some(0)
+    );
+    let alpha_children = call(
+        &fixture.state,
+        request(Method::GET, &format!("/api/v1/iam/roles/{alpha_id}"), Some(&owner), None),
+    )
+    .await;
+    assert_eq!(alpha_children.body["inherited_by"][0]["key"], "depth-beta");
+
+    // A cycle is refused with the field named, and so is self-inheritance.
+    let cycle = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            Some(json!({ "inherits_role_id": beta_id })),
+        ),
+    )
+    .await;
+    assert_eq!(cycle.status, StatusCode::CONFLICT, "{}", cycle.body);
+    assert_eq!(cycle.body["error"]["code"], "role_inheritance_cycle");
+    assert!(
+        cycle.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("inherits_role_id"),
+        "the refusal names the field: {}",
+        cycle.body
+    );
+
+    let self_parent = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/iam/roles/{beta_id}"),
+            Some(&owner),
+            Some(json!({ "inherits_role_id": beta_id })),
+        ),
+    )
+    .await;
+    assert_eq!(self_parent.status, StatusCode::CONFLICT, "{}", self_parent.body);
+    assert_eq!(self_parent.body["error"]["code"], "role_inheritance_cycle");
+
+    // The chain stops at eight ancestors: nine roles are a ladder, ten are refused.
+    let mut previous: Option<String> = None;
+    for index in 1..=9 {
+        let mut body = json!({
+            "key": format!("depth-c{index}"),
+            "name": format!("Depth Chain {index}"),
+            "priority": 200,
+        });
+        if let Some(parent) = &previous {
+            body["inherits_role_id"] = json!(parent);
+        }
+        let created = call(
+            &fixture.state,
+            request(Method::POST, "/api/v1/iam/roles", Some(&owner), Some(body)),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "chain step {index}: {}",
+            created.body
+        );
+        previous = created.body["id"].as_str().map(str::to_owned);
+    }
+    let too_deep = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/roles",
+            Some(&owner),
+            Some(json!({
+                "key": "depth-c10",
+                "name": "Depth Chain 10",
+                "inherits_role_id": previous,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(too_deep.status, StatusCode::BAD_REQUEST, "{}", too_deep.body);
+    assert_eq!(too_deep.body["error"]["code"], "role_inheritance_depth");
+
+    // Precedence, through the guard: no binding → no read; an allow → read; a deny → no read.
+    let (member_id, _member_email) = fixture.add_account(Some(org)).await;
+    let member_token = fixture_token(&fixture, member_id).await;
+    let unbound = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/iam/roles", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(unbound.status, StatusCode::FORBIDDEN, "{}", unbound.body);
+    let allow_binding = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "user_id": member_id,
+                "role_id": alpha_id,
+                "scope_type": "organization",
+                "organization_id": org,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(allow_binding.status, StatusCode::CREATED, "{}", allow_binding.body);
+
+    let allowed = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/iam/roles", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::OK, "{}", allowed.body);
+
+    // The members tab now answers with the carrier of the role.
+    let members = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{alpha_id}/members"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(members.status, StatusCode::OK, "{}", members.body);
+    assert_eq!(members.body["members"][0]["user_id"], member_id.to_string());
+    assert_eq!(members.body["members"][0]["active"], true);
+
+    let deny_binding = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "user_id": member_id,
+                "role_id": beta_id,
+                "scope_type": "organization",
+                "organization_id": org,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(deny_binding.status, StatusCode::CREATED, "{}", deny_binding.body);
+
+    let denied_again = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/iam/roles", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(
+        denied_again.status,
+        StatusCode::FORBIDDEN,
+        "an explicit deny beats an explicit allow: {}",
+        denied_again.body
+    );
+
+    // The preview refuses the same set the save would, without writing anything.
+    let preview = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/roles/{alpha_id}/preview"),
+            Some(&owner),
+            Some(json!({
+                "permissions": [
+                    { "key": "iam.roles.read", "effect": "allow" },
+                    { "key": "iam.roles.read", "effect": "deny" },
+                    { "key": "nope.nope", "effect": "allow" }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
+    let problems = preview.body["problems"].as_array().expect("problems").len();
+    assert!(problems >= 2, "unknown key and duplicate entry: {}", preview.body);
+
+    // The atomic refusal: an unknown key or a duplicate fails the whole set — nothing is stored.
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/roles/{alpha_id}/permissions"),
+            Some(&owner),
+            Some(json!({
+                "permissions": [
+                    { "key": "content.pages.read", "effect": "allow" },
+                    { "key": "content.pages.read", "effect": "deny" },
+                    { "key": "nope.nope", "effect": "allow" }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.body["error"]["code"], "invalid_entries");
+    let refused_message = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        refused_message.contains("nope.nope") && refused_message.contains("content.pages.read"),
+        "the refusal names what it rejected: {refused_message}"
+    );
+
+    let after_refusal = call(
+        &fixture.state,
+        request(Method::GET, &format!("/api/v1/iam/roles/{alpha_id}"), Some(&owner), None),
+    )
+    .await;
+    assert_eq!(
+        keys_of(&after_refusal.body, "permissions", "key"),
+        vec!["iam.roles.read".to_owned()],
+        "a refused save stores nothing: {}",
+        after_refusal.body
+    );
+
+    // A stale version is refused; the current one is accepted and carries its diff.
+    let stale = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/roles/{alpha_id}/permissions"),
+            Some(&owner),
+            Some(json!({
+                "permissions": [{ "key": "iam.roles.read", "effect": "allow" }],
+                "expected_version": 42
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT, "{}", stale.body);
+    assert_eq!(stale.body["error"]["code"], "role_version_conflict");
+
+    let fresh = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/roles/{alpha_id}/permissions"),
+            Some(&owner),
+            Some(json!({
+                "permissions": [
+                    { "key": "iam.roles.read", "effect": "allow" },
+                    { "key": "content.pages.read", "effect": "allow" }
+                ],
+                "expected_version": 1
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(fresh.status, StatusCode::OK, "{}", fresh.body);
+    assert_eq!(fresh.body["version"], 2);
+    assert_eq!(fresh.body["diff"]["added"].as_array().map(Vec::len), Some(1));
+
+    // The history shows both versions, each with the diff it introduced.
+    let history = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{alpha_id}/versions"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(history.status, StatusCode::OK, "{}", history.body);
+    let versions = history.body["versions"].as_array().expect("versions");
+    assert_eq!(versions.len(), 2, "{}", history.body);
+    assert_eq!(versions[0]["version"], 2);
+    assert_eq!(versions[0]["diff_total"], 1);
+    assert_eq!(versions[0]["diff"]["added"][0]["key"], "content.pages.read");
+    assert_eq!(versions[1]["version"], 1);
+    assert_eq!(versions[1]["diff_total"], 1, "the first version adds its whole set");
+
+    // A field change is a version too.
+    let renamed = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            Some(json!({ "name": "Depth Alpha Renamed", "priority": 430 })),
+        ),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.body);
+    assert_eq!(renamed.body["name"], "Depth Alpha Renamed");
+    let history = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{alpha_id}/versions"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(history.body["versions"][0]["change"], "updated");
+    assert_eq!(history.body["versions"][0]["version"], 3);
+
+    // The server refuses the same shape the panel refuses in the field: an empty name is a
+    // validation error, not a silent no-op.
+    let nameless = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            Some(json!({ "name": "   " })),
+        ),
+    )
+    .await;
+    assert_eq!(nameless.status, StatusCode::BAD_REQUEST, "{}", nameless.body);
+    assert_eq!(nameless.body["error"]["code"], "invalid_request");
+
+    // Duplicate: the copy carries the set and starts its own history.
+    let copy = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/roles/{alpha_id}/duplicate"),
+            Some(&owner),
+            Some(json!({ "key": "depth-gamma", "name": "Depth Gamma" })),
+        ),
+    )
+    .await;
+    assert_eq!(copy.status, StatusCode::CREATED, "{}", copy.body);
+    let gamma_id = copy.body["id"].as_str().expect("id").to_owned();
+    assert_eq!(copy.body["organization_id"], org.to_string());
+    assert_eq!(copy.body["allowed_permissions"], 2, "{}", copy.body);
+    let gamma_versions = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{gamma_id}/versions"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(gamma_versions.body["versions"][0]["change"], "duplicated");
+
+    // Delete: platform roles never, a bound role never, an unbound custom role yes.
+    let platform = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/iam/roles/{}", fixture.system_role("editor").await),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(platform.status, StatusCode::FORBIDDEN, "{}", platform.body);
+    assert_eq!(platform.body["error"]["code"], "system_role");
+
+    let bound = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(bound.status, StatusCode::CONFLICT, "{}", bound.body);
+    assert_eq!(bound.body["error"]["code"], "role_has_bindings");
+
+    let removed = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/iam/roles/{gamma_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
+
+    fixture.cleanup().await;
+}
+
+/// Sign one account of the fixture in and hand back its session token.
+async fn fixture_token(fixture: &Fixture, user_id: Uuid) -> String {
+    let email: String = sqlx::query_scalar("select email from users where id = $1")
+        .bind(user_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the account must exist");
+    login(&fixture.state, &email).await
 }
