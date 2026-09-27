@@ -1706,3 +1706,74 @@ the seven parallel writers' `target/` directories together are ~19 GB on a 60 GB
 writer reclaimed only its own cache (`cargo clean -p omnion-api`, 6.6 GB) and rebuilt with
 `CARGO_BUILD_JOBS=2`. A shared `CARGO_TARGET_DIR` or a per-stack trim rule would remove the
 pressure permanently; it is the owner's call, not a code change.
+
+## 2026-09-27 · REQ-051 slice 2 — the contact and company screens, and three bugs the tests found
+
+**What.** The list, the form and the import/export drawer for both entities
+(`apps/admin/features/crm/`, `apps/admin/lib/crm.ts`, `apps/admin/app/crm/`), the CSV and
+the saved views behind them (`modules/crm/src/csv.rs`, `modules/crm/src/views.rs`), and the
+routes that mount them (`apps/api/src/routes/crm_views.rs`). The list is a URL, so a filtered
+list is a link and a saved view is the same fields; it pages on the API's cursor rather than
+an offset, because archiving a row shifts an offset. Inline edit is optimistic with a rollback
+you can see, and a refusal is rendered under the field that caused it.
+
+**Three defects the tests found, all of which a screen would have shown as broken.**
+
+1. The company detail's rollup projected four scalar subqueries **without aliases**, so
+   Postgres returned them as `?column?`, `FromRow` could not bind `contact_count`, and a
+   perfectly good company answered `500`. The error names a column that is really in the
+   migration, so it reads as a missing column rather than an unlabelled projection.
+2. The keyset paging predicate **closed the cursor subquery on its first `)`**, leaving `from`
+   dangling — the contact list answered `500` on its *second* page, the first page being
+   perfectly fine. It also never filtered that subquery by the cursor id, so even once the SQL
+   parsed the row comparison would have degraded into a set comparison.
+3. `Contact` and `Company` serialized `OffsetDateTime` through `time`'s default, which emits
+   its internal tuple: **every date on every CRM screen reached the panel as
+   `[2026,270,20,…]`** instead of an ISO-8601 string. The rest of the API already carries
+   `time::serde::rfc3339`; the CRM structs had simply never been given it.
+
+A fourth, smaller one: the import answered `created` with the length of the *filtered*
+re-read, so a caller whose visibility level or field hiding kept a row back was told fewer
+rows had been written than actually were — and the answer disagreed with the audit row and
+the event, which both count what was written.
+
+**Seven of the eleven original failures were the tests' own fault, and that is the half worth
+writing down.** Six assertions read `body["code"]` and two read `body["details"]` where the
+API nests both under `error`; a marker with a literal space went into a query string
+unencoded, so the request builder refused the URI and the panic pointed at the builder rather
+than at the line that put the space there; a search for `Filter-{marker}` against names
+`Filter0-{marker}` correctly found nothing; an assertion said "before narrowing the reader
+sees both" and then asserted the negation; the custom merge expected the survivor's value
+while `merge_custom` documents the loser's winning; the commit was expected to refuse a row
+the dry run had already refused, although `committable_rows` hands it only the accepted ones.
+
+Worse, three fixtures made their own tests measure the wrong thing: the cross-tenant write,
+the cross-tenant view delete and the `own`-level reader were all driven by accounts that
+**lacked the permission under test**, so the guard answered `403` first and the rule they
+claimed to prove was never reached. A tenant-404 test that passes for the wrong reason is
+worse than a failing one.
+
+**Proof.** `cargo test -p omnion-api --test crm` → **20/20** (0 failed, exit 0).
+`cargo test -p omnion-module-crm` → **84/84**. `cargo test --workspace` → **191 passed**;
+the only 2 failures are `apps/api/tests/events.rs`, which passes on its own (`2 passed`) and
+fails only in a parallel run on its temporary-database teardown — a race between suites, not a
+defect, and not in this wave. `apps/admin` `tsc --noEmit` → **0 errors**. The QA browser pass
+is **not** recorded here: this tick is not the slice's close tick and the run window closed
+before the 6-10 minute pass could finish, so slice 3's close tick carries it.
+
+**A migration number is global across branches, and it is worth repeating after being bitten
+twice.** `0021` was claimed by `0021_iam_sso.sql` on main while this file was in flight, and
+the symptom was not a conflict: sqlx reported `Migration(VersionMissing(19))`, because the
+branch was also missing 19 and 20 (the sibling writers' slots) and a gap reads as a missing
+version long before it reads as a collision. The file is now `0022_crm.sql`, contents
+unchanged.
+
+**Next.** Slice 3 — deals and the pipeline board: the stage editor, the board with drag *and*
+the `ctrl + ←/→` keyboard path, per-stage count/sum/weighted forecast from one SQL expression,
+and the won/lost flows with the lost reason and the close date.
+
+**Environment note.** `/mnt/apopic` hit 100% twice more during this tick — once with `git
+commit` failing outright with `No space left on device`, and once with cargo dying inside
+`ld`. The seven writers' `target/` directories are now ~24 GB on a 60 GB mount. This writer
+reclaimed only its own `target/debug/incremental` (2.4 GB). A shared `CARGO_TARGET_DIR` or a
+per-stack trim rule would remove the pressure permanently; it is the owner's call.

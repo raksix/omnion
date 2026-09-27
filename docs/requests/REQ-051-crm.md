@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — slice 1 shipped (data model + the contacts/companies API, its permission keys, audit and events); slice 2 (the contact & company screens) is next · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
+> **Status:** in-progress — slices 1 and 2 shipped (data model, the contacts/companies API, and the contact & company screens with saved views, the column chooser, inline edit, archive/merge and CSV import/export); slice 3 (deals + the pipeline board) is next · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -134,14 +134,14 @@ Payloads carry ids and the changed field list only — never a rendered document
 
 ### Acceptance criteria
 
-- [x] Migration `0021_crm.sql` applies on a populated database without touching existing rows; `cargo test -p omnion-module-crm` is green (38 unit tests).
+- [x] Migration `0022_crm.sql` applies on a populated database without touching existing rows; `cargo test -p omnion-module-crm` is green (84 unit tests). (Renumbered from `0021`, which `0021_iam_sso.sql` on main took while this file was in flight; a migration number is global across branches.)
 - [x] Every `/api/v1/crm/*` route answers 401 unauthenticated, 403 with the permission missing, and 200 with it granted; a contact from another organization is invisible (404) — proved by `every_crm_route_is_permission_guarded` and `a_record_of_another_organization_is_invisible`.
 - [ ] Creating, updating, archiving and merging a contact/company/deal writes an audit entry with actor, before/after diff and request id. (Contacts and companies proved; deals arrive with slice 3.)
 - [ ] `crm.contact.created`, `crm.deal.stage_changed` and `crm.deal.won` appear in the event feed with the documented payload and reach a subscribed webhook endpoint. (`crm.contact.created`/`updated`/`merged`/`archived` and the company names land in the feed; the deal events arrive with slice 3.)
-- [ ] Contact list: search, owner, status, tag and date filters combine; sort persists in a saved view; column chooser survives reload. (The API side is proved by `the_contact_list_filters_sorts_and_totals`; the screen is slice 2.)
-- [ ] Inline edit of owner/status/tags saves optimistically and rolls back with a visible error when the API rejects it. (Slice 2.)
+- [x] Contact list: search, owner, status, tag and date filters combine; sort persists in a saved view; column chooser survives reload — `the_contact_list_filters_sorts_and_totals` and `a_saved_view_is_the_query_it_stands_for`, with the screen in the walkthrough route list.
+- [x] Inline edit of owner/status/tags saves optimistically and rolls back with a visible error when the API rejects it — the screen sends the patch, restores the previous value and shows the refusal under the field.
 - [x] The API rejects a malformed e-mail and a duplicate e-mail (case-insensitive) with a field-level message in `error.details.field` — `the_contact_and_company_forms_refuse_what_they_name`.
-- [ ] CSV import runs a dry run that shows row count, mapped columns and per-row errors before commit; commit writes only the valid rows. (Slice 2.)
+- [x] CSV import runs a dry run that shows row count, mapped columns and per-row errors before commit; commit writes only the valid rows — `an_import_previews_before_it_writes_and_then_writes_what_it_accepted`, and `an_export_is_the_lists_own_answer_and_imports_back` proves the export applies the same field hiding as the list and re-imports.
 - [ ] Pipeline board drag moves a deal, persists the new stage, updates per-stage count/sum/weighted sum, and is reversible with `ctrl + ←/→`.
 - [ ] Moving a deal to `lost` requires a reason; moving to `won` records/confirms the close date and emits `crm.deal.won`.
 - [x] Visibility scoping works: a member with `own` sees only their records (enforced in SQL, a hidden record is a `404`), a team lead sees the group's, an unnarrowed account sees the organization's — `the_own_visibility_level_hides_a_colleagues_record`.
@@ -162,7 +162,7 @@ What the visual check should see: a board with four stage columns, per-column co
 ### Slices
 
 1. **Data + API core.** Migration, companies/contacts CRUD with filters and paging, permission keys registered, audit + events wired, integration tests. Done when `cargo test -p omnion-module-crm` is green and a signed-in curl round-trip creates a contact that produces an audit row and a `crm.contact.created` event. **Shipped** as `database/migrations/0021_crm.sql` (the spec's `0011` was taken by IAM before this work started; a migration number is global, so the next free one was taken and the file is still additive), `modules/crm` (`omnion-module-crm`) and `apps/api/src/routes/crm.rs`.
-2. **Contact & company screens.** List, filters, saved views, column chooser, inline edit, create/edit form with validation, archive/merge, CSV import (dry run + commit) and export. Done when the walkthrough clicks both screens end to end and the QA pass reports zero high findings.
+2. **Contact & company screens.** List, filters, saved views, column chooser, inline edit, create/edit form with validation, archive/merge, CSV import (dry run + commit) and export. Done when the walkthrough clicks both screens end to end and the QA pass reports zero high findings. **Shipped** in `apps/admin/features/crm/`, `apps/admin/lib/crm.ts`, `modules/crm/src/{csv,views}.rs` and `apps/api/src/routes/crm_views.rs`.
 3. **Deals + pipeline board.** Stages editor, board with drag + keyboard move, per-stage totals and weighted forecast, won/lost flows, list mode. Done when QA drags a card, reloads, and the stage plus `crm.deal.stage_changed` persist.
 4. **Activities, timeline, copilot, search & automations.** Activity capture, merged timeline, copilot read-only actions, global-search registration, workflow triggers and the `form.submitted` consumer. Done when a logged activity appears in the record timeline and in search, and an automation rule triggered by `crm.deal.stage_changed` runs once.
 
