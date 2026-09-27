@@ -48,6 +48,7 @@ export const ANALYTICS_NAV = [
   { href: "/analytics/forms", label: "Forms" },
   { href: "/analytics/goals", label: "Goals" },
   { href: "/analytics/realtime", label: "Realtime" },
+  { href: "/analytics/settings", label: "Settings" },
 ] as const;
 
 /** The named ranges the toolbar offers. */
@@ -130,12 +131,19 @@ export function useAnalytics(): AnalyticsContextValue {
 export function AnalyticsShell({
   active,
   report,
+  toolbar = true,
   children,
 }: {
   /** The screen's route, for the sub-navigation and the export. */
   active: string;
   /** The report key the export sends. */
   report: string;
+  /**
+   * `false` on a screen that is not a report — the settings screen has no date range and
+   * nothing to export, and a toolbar full of controls that do not apply is a row of dead
+   * buttons. The section navigation stays either way.
+   */
+  toolbar?: boolean;
   children: ReactNode;
 }) {
   const router = useRouter();
@@ -232,7 +240,9 @@ export function AnalyticsShell({
     [compare, from, granularity, params, selectedSite, to],
   );
 
-  // The keyboard of the section (the spec's list, nothing more).
+  // The keyboard of the section (the spec's list, nothing more). On a screen without the
+  // report toolbar only the navigation prefix stays: a shortcut that would open a date picker
+  // nobody rendered is a shortcut that does nothing.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -246,20 +256,29 @@ export function AnalyticsShell({
       }
 
       if (event.key === "d") {
+        if (!toolbar) {
+          return;
+        }
         event.preventDefault();
         rangeInput.current?.focus();
         return;
       }
       if (event.key === "c") {
-        patch({ compare: compare ? null : "1" });
+        if (toolbar) {
+          patch({ compare: compare ? null : "1" });
+        }
         return;
       }
       if (event.key === "r") {
-        setRefreshToken((token) => token + 1);
+        if (toolbar) {
+          setRefreshToken((token) => token + 1);
+        }
         return;
       }
       if (event.key === "e") {
-        void exportReport(report);
+        if (toolbar) {
+          void exportReport(report);
+        }
         return;
       }
       if (event.key === "g") {
@@ -278,7 +297,7 @@ export function AnalyticsShell({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [compare, exportReport, params, patch, report, router]);
+  }, [compare, exportReport, params, patch, report, router, toolbar]);
 
   const value = useMemo<AnalyticsContextValue>(
     () => ({
@@ -348,10 +367,11 @@ export function AnalyticsShell({
           })}
         </nav>
 
-        <div
-          data-analytics-toolbar
-          className="flex flex-wrap items-end gap-3 rounded-xl border border-line bg-surface px-4 py-3"
-        >
+        {toolbar ? (
+          <div
+            data-analytics-toolbar
+            className="flex flex-wrap items-end gap-3 rounded-xl border border-line bg-surface px-4 py-3"
+          >
           <div className="flex flex-wrap items-center gap-1.5">
             {PRESETS.map((entry) => (
               <button
@@ -480,6 +500,7 @@ export function AnalyticsShell({
             ) : null}
           </p>
         </div>
+        ) : null}
 
         {siteStatus === "loading" ? (
           <p className="text-[12.5px] text-muted">Loading the sites of this account…</p>

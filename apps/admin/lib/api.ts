@@ -1531,3 +1531,131 @@ export function fetchAnalyticsRealtime(siteId: string): Promise<AnalyticsRealtim
 export function analyticsRealtimeStreamUrl(siteId: string): string {
   return `/api/v1/analytics/realtime/stream?site_id=${encodeURIComponent(siteId)}`;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Settings and privacy operations (docs/requests/REQ-007, slices 1 and 4)
+// ---------------------------------------------------------------------------------------------
+
+/** One site's analytics configuration, as the settings screen reads it. */
+export type AnalyticsSettings = {
+  site_id: string;
+  tracking_enabled: boolean;
+  /** `cookieless` (the default) or `cookie`. */
+  mode: string;
+  anonymize_ip: boolean;
+  respect_dnt: boolean;
+  bot_filter: boolean;
+  sample_rate: number;
+  retention_days: number;
+  excluded_paths: string[];
+  excluded_ips: string[];
+  updated_by: string | null;
+  updated_at: string;
+};
+
+/** A full settings update: the screen sends every field, so a partial write is impossible. */
+export type AnalyticsSettingsChanges = {
+  tracking_enabled: boolean;
+  mode: string;
+  anonymize_ip: boolean;
+  respect_dnt: boolean;
+  bot_filter: boolean;
+  sample_rate: number;
+  retention_days: number;
+  excluded_paths: string[];
+  excluded_ips: string[];
+};
+
+/** One row of the "what we store" table. */
+export type AnalyticsStorageField = {
+  table: string;
+  column: string;
+  purpose: string;
+  personal: boolean;
+};
+
+/** One row of the purge and erasure audit trail. */
+export type AnalyticsPurgeRecord = {
+  id: string;
+  site_id: string | null;
+  kind: string;
+  cutoff: string | null;
+  rows_removed: number;
+  actor_user_id: string | null;
+  created_at: string;
+};
+
+/** `GET`/`PUT /api/v1/analytics/settings`. */
+export type AnalyticsSettingsResponse = {
+  settings: AnalyticsSettings;
+  defaults: AnalyticsSettingsChanges;
+  /** The cutoff `POST /analytics/purge` would use at this moment. */
+  purge_cutoff: string;
+  last_purge: AnalyticsPurgeRecord | null;
+  storage: AnalyticsStorageField[];
+};
+
+/** What one retention run removed, table by table. */
+export type AnalyticsPurgeOutcome = {
+  purge_id: string;
+  site_id: string;
+  kind: string;
+  cutoff: string;
+  visits: number;
+  pageviews: number;
+  events: number;
+  goal_hits: number;
+  salts: number;
+  rows_removed: number;
+  created_at: string;
+};
+
+/** What one erasure removed. */
+export type AnalyticsErasureOutcome = {
+  purge_id: string;
+  site_id: string;
+  visitor: string;
+  visits: number;
+  pageviews: number;
+  events: number;
+  goal_hits: number;
+  rows_removed: number;
+  created_at: string;
+};
+
+/** `GET /api/v1/analytics/settings` — how this site counts. */
+export function fetchAnalyticsSettings(siteId: string): Promise<AnalyticsSettingsResponse> {
+  return request<AnalyticsSettingsResponse>(
+    `/api/v1/analytics/settings?site_id=${encodeURIComponent(siteId)}`,
+  );
+}
+
+/** `PUT /api/v1/analytics/settings` — replace the configuration in one write. */
+export function updateAnalyticsSettings(
+  siteId: string,
+  changes: AnalyticsSettingsChanges,
+): Promise<AnalyticsSettingsResponse> {
+  return request<AnalyticsSettingsResponse>(
+    `/api/v1/analytics/settings?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PUT", body: JSON.stringify(changes) },
+  );
+}
+
+/** `POST /api/v1/analytics/purge` — run the retention purge now (audited). */
+export function runAnalyticsPurge(siteId: string): Promise<AnalyticsPurgeOutcome> {
+  return request<AnalyticsPurgeOutcome>(
+    `/api/v1/analytics/purge?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/** `DELETE /api/v1/analytics/visitors/{hash}` — erase every row of one visitor handle. */
+export function eraseAnalyticsVisitor(
+  siteId: string,
+  handle: string,
+): Promise<AnalyticsErasureOutcome> {
+  return request<AnalyticsErasureOutcome>(
+    `/api/v1/analytics/visitors/${encodeURIComponent(handle)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
