@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, Bot, FileText, Globe, Images, LayoutDashboard, LogOut, Menu, Scale, ShieldCheck, SlidersHorizontal, Sparkles, UserCog, UsersRound, X } from "lucide-react";
+import { BarChart3, Bot, FileText, Fingerprint, Globe, Images, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -27,6 +27,9 @@ const NAV = [
   { href: "/settings/iam/service-accounts", label: "Service accounts", icon: Bot },
   { href: "/settings/iam/simulator", label: "Simulator", icon: Scale },
   { href: "/settings/iam/roles", label: "Roles", icon: ShieldCheck },
+  { href: "/settings/iam/security", label: "Security", icon: LockKeyhole },
+  { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
+  { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
 ] as const;
 
