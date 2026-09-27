@@ -1628,6 +1628,24 @@
   writing screenshots. Reclaimed by deleting this worktree's own regenerable `target/` (7.8 GB
   back); no other writer's files were touched. A periodic `target/` prune is needed before the
   waves can all run at once.
+
+- **QA gate: blocked by the shared volume, not by this change.** Four attempts, all failing the
+  same way and none of them a defect in the new screen. The evidence: with the volume at
+  `%100` the admin's Turbopack cache write fails
+  (`failed to write ... .next/dev/cache/turbopack/.../00000031.sst: No space left on device`),
+  which leaves Chromium crashing on the *overview* page — before the walkthrough ever reaches
+  `/secrets/root-key`. A standalone Playwright probe of the same w6 stack
+  (`/login` → 200, `/` → 307, no crash) passes, which is what separates "the box is out of room"
+  from "the screen is broken". The one run that did get past the reset did reach the new route
+  and interact with it (`page: secrets-root-key → interact: 24 elements`) before the disk failed
+  on the next screenshot.
+  `/mnt/apopic` is a 60 GB volume shared by the seven worktrees; the cargo `target/` directories
+  alone were 2.3 GB (w4) + 6.3 GB (w3) + 8.6 GB (w5) + 9.6 GB (w7) at the time. Deleting this
+  worktree's own regenerable `target/` frees 2.6–7.8 GB, but the other writers rebuild
+  immediately and the volume is back at `%100` within minutes. **A `cargo clean` sweep across the
+  idle worktrees, or a larger volume, is needed before the seven waves can run their QA gates
+  concurrently.** Until then slice 1 ships with its Rust and web proofs green and the QA box
+  honestly unticked.
 - **Next.** REQ-125 slice 2 — typed credential profiles with their per-kind validators, the slot
   assignment model and its resolver, `/secrets/credentials` and `/secrets/slots`.
 
