@@ -93,10 +93,10 @@ Providers are installation-level, so these events carry `organization_id = null`
 
 ### Acceptance criteria
 
-- [ ] Connecting a provider with each of the three protocols stores it and lists it with the right kind and health `unknown`.
-- [ ] A protocol outside `SUPPORTED_PROTOCOLS` is refused with a stable code naming the supported values (API) and a disabled option (UI).
-- [ ] The API key is never returned by any endpoint; a stored key shows as "Stored", Replace changes it, Clear removes it, blank keeps it.
-- [ ] The connection test reports per-step outcomes and a total latency against a live local endpoint, and names the failing step against a dead one.
+- [x] Connecting a provider with each of the three protocols stores it and lists it with the right kind and health `unknown`.
+- [x] A protocol outside `SUPPORTED_PROTOCOLS` is refused with a stable code naming the supported values (API) and a disabled option (UI).
+- [x] The API key is never returned by any endpoint; a stored key shows as "Stored", Replace changes it, Clear removes it, blank keeps it.
+- [x] The connection test reports per-step outcomes and a total latency against a live local endpoint, and names the failing step against a dead one.
 - [ ] Discovery against a live endpoint returns a diff; applying it adds, updates and removes exactly the models in the diff, and re-running discovery without changes produces an empty diff.
 - [ ] A streamed answer from each adapter produces the same normalised event sequence (`text`… `usage`, `done`), and a mid-stream vendor error surfaces as one `error` event plus a failed usage row.
 - [ ] A model with `supports_streaming = false` refuses a streaming request with a clear message; a model with `supports_vision = false` refuses an image-bearing request before any call leaves the process.

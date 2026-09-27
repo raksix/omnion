@@ -1698,3 +1698,48 @@
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-27 · REQ-097 · AI provider runtime — slice 1 (adapters and the connection test)
+
+- **What.** v0 spoke one wire (OpenAI-compatible) and had no way to check a connection from the
+  panel. This slice turns that into a runtime: `crates/ai-hub/src/protocol.rs` adds a
+  `ProtocolAdapter` trait with three implementations — `openai_compatible` (the existing one, now
+  behind the trait), `anthropic_messages` and `google_gemini` — and `client.rs` routes every call
+  through them, so the path, the auth headers, the request body, the answer and the stream frames
+  are each the vendor's business and nothing above the client changes. A fourth adapter attaches
+  through the trait alone.
+- **Data.** Migration `0022_ai_provider_runtime.sql` adds `kind`, `timeout_ms`, `max_retries`,
+  `priority`, `last_health`, `last_checked_at` and `last_error` to `ai_providers`, widens
+  `ai_providers_protocol_check` to the three adapters, and adds the `ai_providers_priority_idx`
+  the failover walk will read. `0008` is untouched — released migrations are append-only.
+- **Connection test.** `crates/ai-hub/src/connection_test.rs` runs five steps server-side (resolve,
+  TLS, authenticate, list models, one chat answer), each with its own latency, and reports the
+  provider's own message (clipped to 500 characters, anything key-shaped stripped) instead of a
+  platform sentence. A host that never answered leaves every later step `pending` rather than
+  ticking them green; a host that answered and refused names the auth step. `POST
+  /ai/providers/{id}/test` stores the verdict on the row and audits a failure as
+  `ai.provider.test_failed`. `GET /ai/protocols` drives the form's select and the numeric bounds
+  it validates against, so the panel and the API share one list.
+- **Panel.** The connect form gained Protocol, Kind, Timeout, Max retries and Priority (all
+  range-validated from the API's own bounds, each refusal landing under its own field), the list
+  rows gained a Cloud/Local badge, a health dot paired with its label, the last probe's error and
+  a Test button; the test opens a modal with the five steps. The key field still renders "Stored",
+  never a value.
+- **Proof (Rust).** `cargo test --workspace` → **48 ai-hub units + 6 AI Hub integration tests**,
+  all green, on top of the other suites. The integration suite grew a three-protocol mock (an
+  OpenAI-compatible list, a messages endpoint and a `generateContent` endpoint with Gemini's own
+  `models/{model}:{operation}` list shape) and four new walks: all three protocols connect, test
+  green on every applicable step and stream into the *same* normalised event sequence; a dead
+  endpoint names `resolve` and leaves the rest pending while the row goes `down` with a stored
+  error; a platform metadata endpoint (`169.254.169.254`) is refused before a socket opens; and
+  every numeric bound, the `manage` gate on the test and the total failover order are enforced.
+- **Two vendor shapes the first draft got wrong, both caught by the suite rather than by reading.**
+  (1) Gemini spells its streaming operation as a *path* (`:streamGenerateContent`), not a flag in
+  the body — so `chat_path` takes the stream flag, and the adapter's body carries no `stream`
+  field at all. (2) The messages protocol has no `system` role: the system block is lifted out of
+  the conversation, and the protocol *requires* an answer budget, so a caller that set none gets
+  the platform's default instead of an unanswerable request.
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`).
+- **Next.** REQ-097 slice 2 — the capability flags on `ai_models` (image generation, audio
+  generation, transcription, JSON mode, `max_output_tokens`), the Models tab, discovery as a
+  reviewable diff with an explicit apply, and router enforcement of each flag.
