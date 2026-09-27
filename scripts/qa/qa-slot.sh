@@ -25,19 +25,25 @@ mine="$LOCKDIR/$$-$(date +%s)"
 
 count_places() { find "$LOCKDIR" -maxdepth 1 -type f | wc -l; }
 
-# A stale place from a killed pass would block the queue forever: reclaim one that is
-# older than the maximum wait and whose owning process is gone.
+# A stale place from a killed pass would block the queue forever: reclaim one whose
+# owning process is gone. The age guard is only a grace period for a place that is
+# *still* being created — a dead owner is reaped immediately, because waiting
+# WAIT+900 to release a place nobody is using just stalls every later pass.
 reap() {
   local f pid age
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
     pid="$(basename "$f" | cut -d- -f1)"
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
-    [ "$age" -gt $(( WAIT + 900 )) ] || continue
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if kill -0 "$pid" 2>/dev/null; then
+      # Live owner: only reclaim a place older than the maximum wait.
+      [ "$age" -gt $(( WAIT + 900 )) ] || continue
       rm -f "$f" "${HOLDERDIR}/${f##*/}" 2>/dev/null || true
-      echo "[qa-slot] reclaimed a stale place from pid $pid (${age}s old)" >&2
+      echo "[qa-slot] reclaimed an expired place from pid $pid (${age}s old)" >&2
+      continue
     fi
+    rm -f "$f" "${HOLDERDIR}/${f##*/}" 2>/dev/null || true
+    echo "[qa-slot] reclaimed a stale place from pid $pid (${age}s old)" >&2
   done
 }
 reap
@@ -47,7 +53,11 @@ while :; do
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
-    while :; do sleep 30; done &          # keeps the place while this caller lives
+    # The holder must NOT inherit stdout: run.sh reads this script through a
+    # `$(… | tail -n 1)` command substitution, and a background child that keeps
+    # the pipe open makes the substitution wait for an EOF that never arrives —
+    # the pass then hangs forever instead of running. Close fd 1 for the holder.
+    ( while :; do sleep 30; done ) >/dev/null 2>&1 &   # keeps the place while this caller lives
     echo $! > "${HOLDERDIR}/${mine##*/}"
     echo "$!"                                 # stdout: the holder pid for run.sh
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
