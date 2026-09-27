@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 
 import "./globals.css";
+import { AppReady } from "@/components/app-ready";
 import { SessionProvider } from "@/lib/session";
 import { readSessionUser } from "@/lib/session-server";
 import { SitesProvider } from "@/lib/sites";
@@ -29,6 +30,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
         <SessionProvider initialUser={user}>
           <SitesProvider>{children}</SitesProvider>
         </SessionProvider>
+        <AppReady />
       </body>
     </html>
   );

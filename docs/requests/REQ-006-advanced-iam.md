@@ -428,6 +428,11 @@ What the visual check should see: a matrix with a sticky category header, tri-st
   patch → deactivate over the real router with a real token, the secret never in the database,
   the log carrying each outcome, and a revoked token refused on its next call).
 - **Proof (web).** `pnpm typecheck && pnpm build` green with both routes in the table.
+- **Proof (QA).** `bash scripts/qa/run.sh` → `qa-artifacts/20260927-175102`: 29 pages, 855 clicks,
+  887 screenshots, **0 high findings** (5 medium: the carried-forward public-renderer root 404s),
+  vision 3 items on REQ-007's analytics screens. The `iam-approvals` pass reads a create → approve
+  (window chip) → reject → in-field refusal, and `iam-provisioning` a mint → SCIM create/patch →
+  sync log → revoked `401`, on desktop and mobile.
 - **Remaining in this slice**: nothing. Slice 4b-2 carries enterprise sign-in (OIDC/OAuth2/SAML
   providers with JIT provisioning and claim → role mapping).
 
