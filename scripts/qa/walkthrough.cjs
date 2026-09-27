@@ -3478,16 +3478,13 @@ async function runIamApprovalsDepth(page, report) {
   await shot(page, "page-iam-approvals-rejected");
 
   // ---- A refusal the field can explain ----------------------------------------------------
+  // The field refuses a key that is not shaped like one, so a mistyped ask never leaves the
+  // browser — the API's own refusal (`400 unknown permission`) is proven over HTTP in
+  // `apps/api/tests/iam_approvals.rs`, and the console stays clean here.
   await page.locator("[data-approval-tab='all']").first().click({ timeout: 4000 }).catch(() => {});
   await page.waitForTimeout(800);
   await page.locator("[data-request-new]").first().click({ timeout: 4000 }).catch(() => {});
-  await page.locator("[data-request-permission]").first().fill("not.a.permission").catch(() => {});
-  // The `400` this submit provokes is the assertion below (the sentence names the unknown key),
-  // so it is registered as deliberate rather than reported as a defect.
-  expectRefusal(
-    "/api/v1/iam/requests",
-    "the ask form refuses a permission key outside the catalogue — the message is asserted",
-  );
+  await page.locator("[data-request-permission]").first().fill("Not A Key").catch(() => {});
   await page.locator("[data-request-submit]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForSelector("[data-approvals-error]", { timeout: 12000 }).catch(() => {});
   const refusal = (await page
@@ -3495,7 +3492,8 @@ async function runIamApprovalsDepth(page, report) {
     .first()
     .innerText()
     .catch(() => "")).trim();
-  note({ step: "unknown-permission-refused", refusal });
+  const askedNothing = (await page.locator("[data-approvals-notice]").count()) === 0;
+  note({ step: "unshaped-key-refused-in-field", refusal, askedNothing });
   await shot(page, "page-iam-approvals-refusal");
 
   report.iamApprovals = { steps };
