@@ -301,6 +301,13 @@ const HEADING_LEVELS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
 /// Alignment values every block accepts.
 const ALIGNMENTS: &[&str] = &["left", "center", "right"];
 
+/// Values a block's `meta.hide_on` may carry (REQ-063: "per-block viewport settings").
+///
+/// `none` is the default and is written nowhere: a block that is visible everywhere stores no
+/// `meta` at all, so the common case costs nothing in the payload and a revision diff does not
+/// gain a line per block that has no opinion about the viewport.
+pub const HIDE_ON_VALUES: &[&str] = &["none", "mobile", "desktop"];
+
 /// The block library (REQ-063 §Scope). Sixteen types, four of them containers.
 pub const REGISTRY: &[BlockDefinition] = &[
     // ---- Text -------------------------------------------------------------------------------
@@ -599,6 +606,14 @@ pub struct Block {
     pub kind: String,
     /// The type's props, already normalized against its schema.
     pub props: Value,
+    /// Per-block presentation settings (`hide_on`, `align`, `anchor`, `id`, `class`, `aria_label`).
+    ///
+    /// A separate object from `props` because a prop is the block's *content* — the words, the
+    /// URL, the number — and every prop is declared by a schema entry in the registry, while
+    /// `meta` is what the author set about how this block behaves. The editor's Layout and
+    /// Visibility sections write here, the diff shows it on its own line, and adding a setting
+    /// never needs a registry change.
+    pub meta: Value,
     /// Child blocks — containers only.
     pub children: Vec<Block>,
 }
@@ -624,6 +639,7 @@ impl Block {
             .to_owned();
 
         let props = object.get("props").cloned().unwrap_or_else(|| json!({}));
+        let meta = object.get("meta").cloned().unwrap_or_else(|| json!({}));
         let children = match object.get("children") {
             Some(Value::Array(items)) => items
                 .iter()
@@ -644,22 +660,27 @@ impl Block {
                 id,
                 kind,
                 props,
+                meta,
                 children,
             },
         ))
     }
 
-    /// Write a block back out in the canonical shape (id, type, props, children).
+    /// Write a block back out in the canonical shape (id, type, props, meta, children).
     ///
-    /// A leaf block carries no `children` key at all rather than an empty array: a page is
-    /// read and diffed by people, and `"children": []` on every text block is noise in a
-    /// revision diff that the block-level compare (slice 2) has to render.
+    /// A leaf block carries no `children` key at all rather than an empty array, and a block
+    /// with no settings carries no `meta` key either: a page is read and diffed by people, and
+    /// `"children": []` on every text block is noise in a revision diff that the block-level
+    /// compare (slice 2) has to render. The same is true of a `meta` an author never set.
     fn to_value(&self) -> Value {
         let mut value = json!({
             "id": self.id.to_string(),
             "type": self.kind,
             "props": self.props.clone(),
         });
+        if meta_is_meaningful(&self.meta) {
+            value["meta"] = self.meta.clone();
+        }
         if !self.children.is_empty() {
             value["children"] = Value::Array(self.children.iter().map(Self::to_value).collect());
         }
@@ -685,6 +706,163 @@ pub fn parse_blocks(value: &Value) -> Result<Vec<Block>> {
 #[must_use]
 pub fn blocks_to_value(blocks: &[Block]) -> Value {
     Value::Array(blocks.iter().map(Block::to_value).collect())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-block settings (`meta`)
+// ---------------------------------------------------------------------------------------------
+
+/// A block's `hide_on` setting, normalised.
+///
+/// The three values are the REQ's (`none`, `mobile`, `desktop`) and nothing else. A value
+/// outside the list is read as `Visible` here and reported by [`validate`] as
+/// `block_meta_invalid`, so a typo degrades to "the block shows" — a page that renders one
+/// block too many — rather than to a block that silently disappears from every viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Viewport {
+    /// `hide_on: none`, or no `meta` at all: the block renders everywhere.
+    #[default]
+    Both,
+    /// `hide_on: mobile`: the block is dropped from a phone render.
+    Mobile,
+    /// `hide_on: desktop`: the block is dropped from a wide render.
+    Desktop,
+}
+
+impl Viewport {
+    /// The name the payload uses.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "none",
+            Self::Mobile => "mobile",
+            Self::Desktop => "desktop",
+        }
+    }
+
+    /// Read a `hide_on` value; anything unrecognised is [`Viewport::Both`].
+    #[must_use]
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "mobile" => Self::Mobile,
+            "desktop" => Self::Desktop,
+            _ => Self::Both,
+        }
+    }
+
+    /// `true` when a block asking for this viewport is dropped from the render the reader is
+    /// being served.
+    #[must_use]
+    pub fn hides(self, read_on: ReadOn) -> bool {
+        match (self, read_on) {
+            (Self::Mobile, ReadOn::Mobile) | (Self::Desktop, ReadOn::Desktop) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The viewport a page is being read on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadOn {
+    /// A wide screen — a desktop or a tablet in landscape.
+    #[default]
+    Desktop,
+    /// A phone-sized screen.
+    Mobile,
+}
+
+impl ReadOn {
+    /// The name the API reports and the theme's stylesheet keys its media query on.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Mobile => "mobile",
+        }
+    }
+}
+
+/// The `hide_on` a block asks for.
+#[must_use]
+pub fn block_hide_on(block: &Block) -> Viewport {
+    block
+        .meta
+        .get("hide_on")
+        .and_then(Value::as_str)
+        .map(Viewport::from_str)
+        .unwrap_or_default()
+}
+
+/// `true` when a block is dropped from the render a reader on `read_on` gets.
+///
+/// This is the server-side half of "per-block viewport settings". A block hidden with CSS is
+/// still in the HTML a phone downloads, still read by a screen reader, and still counted by a
+/// reader-mode extractor; the REQ asks for absence, and absence is a decision this server makes
+/// before the page leaves the building.
+#[must_use]
+pub fn block_is_hidden(block: &Block, read_on: ReadOn) -> bool {
+    block_hide_on(block).hides(read_on)
+}
+
+/// Drop every block a reader on `read_on` must not see, at every depth.
+///
+/// A container is dropped when the filtering emptied it — it had blocks and now has none, so
+/// what is left is a shell with nothing in it. A column that was *already* empty stays: the
+/// author made that gap on purpose (the validator calls it out as a warning), and the two
+/// viewports must not disagree about which of them the author was looking at. A `columns` block
+/// that loses columns has its `columns` prop rewritten to the count that survived, because the
+/// renderer lays the grid out from that prop and a three-column grid with two cells renders a
+/// gap on a phone.
+#[must_use]
+pub fn filter_for_viewport(blocks: &[Block], read_on: ReadOn) -> Vec<Block> {
+    blocks
+        .iter()
+        .filter(|block| !block_is_hidden(block, read_on))
+        .filter_map(|block| {
+            let mut kept = block.clone();
+            kept.children = filter_for_viewport(&block.children, read_on);
+            if !block.children.is_empty() && kept.children.is_empty() {
+                return None;
+            }
+            if kept.kind == "columns" {
+                if let Some(object) = kept.props.as_object_mut() {
+                    object.insert(
+                        "columns".to_owned(),
+                        json!(i64::try_from(kept.children.len()).unwrap_or(i64::MAX)),
+                    );
+                }
+            }
+            Some(kept)
+        })
+        .collect()
+}
+
+/// `true` when a `meta` object says anything worth storing.
+///
+/// A block that has never been given a setting writes no `meta` key at all, so a page of twenty
+/// ordinary text blocks does not gain twenty empty objects in its stored JSON — and a revision
+/// diff only shows a block's settings when the author actually set one. `hide_on: none` is the
+/// one value that counts as "nothing": the editor's Visibility control writes it when the
+/// author picks *everywhere*, and [`normalize`] drops it, so the common case has one
+/// representation rather than two.
+#[must_use]
+pub fn meta_is_meaningful(meta: &Value) -> bool {
+    let Some(object) = meta.as_object() else {
+        return false;
+    };
+    object.iter().any(|(key, value)| {
+        if value.is_null() {
+            return false;
+        }
+        if key == "hide_on" && value.as_str() == Some("none") {
+            return false;
+        }
+        match value {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Bool(flag) => *flag,
+            _ => true,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -773,12 +951,20 @@ impl BlockIssue {
     /// levels deep or one naming a type this platform does not ship is not content at all —
     /// storing it would put a row in the database that no renderer can draw and no later edit
     /// can make sense of, so the save itself is refused.
+    ///
+    /// A block whose *settings* are unreadable belongs with the unstorable ones rather than with
+    /// the unfinished ones, and the reason is the same in both directions: `hide_on` is read
+    /// server-side to decide whether the block is in the response at all. A save that accepted
+    /// `hide_on: "tablet"` would publish a page whose author believes a block is off on phones
+    /// while it renders on every one of them — a silent disagreement between the panel and the
+    /// site, which is worse than a refused save the author can fix in the inspector.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         matches!(
             self.code,
             "block_payload_invalid"
                 | "block_props_invalid"
+                | "block_meta_invalid"
                 | "block_too_many"
                 | "block_too_deep"
                 | "block_unknown_type"
@@ -956,6 +1142,7 @@ fn validate_block(
     }
 
     validate_props(block, entry, index, issues);
+    validate_meta(block, index, issues);
     check_heading_order(block, entry, index, issues, previous_heading);
 
     if !entry.container && !block.children.is_empty() {
@@ -1209,6 +1396,79 @@ fn validate_props(
     }
 }
 
+/// Check a block's own settings (`meta`).
+///
+/// `meta` is the one part of a block the registry does not describe, because a setting is not
+/// content: the REQ's Layout / Visibility / Advanced sections all write here, and a new setting
+/// is one line in this function rather than a new `PropDef` in a `const` that three other
+/// places read. That also means this function is the only place a typo in a hand-written or
+/// imported payload can be caught — and it is an **error**, because the alternative is a block
+/// that silently never renders.
+fn validate_meta(block: &Block, index: usize, issues: &mut Vec<BlockIssue>) {
+    let Some(object) = block.meta.as_object() else {
+        if !block.meta.is_null() {
+            issues.push(BlockIssue::new(
+                block,
+                format!("[{index}].meta"),
+                "block_meta_invalid",
+                "a block's settings must be a JSON object",
+                Severity::Error,
+            ));
+        }
+        return;
+    };
+
+    // `hide_on` is the one setting the platform reads, so it is the one that is closed. A value
+    // outside the list is an error rather than a warning: an unrecognised value would be read
+    // as "visible everywhere", and the author who wrote it believes otherwise.
+    if let Some(value) = object.get("hide_on") {
+        let text = value.as_str().unwrap_or_default();
+        if !HIDE_ON_VALUES.contains(&text) {
+            issues.push(BlockIssue::new(
+                block,
+                format!("[{index}].meta.hide_on"),
+                "block_meta_invalid",
+                format!(
+                    "hidden on must be one of {}, not {text:?}",
+                    HIDE_ON_VALUES.join(", ")
+                ),
+                Severity::Error,
+            ));
+        }
+    }
+
+    for (key, value) in object {
+        let known = matches!(
+            key.as_str(),
+            "hide_on" | "align" | "anchor" | "id" | "class" | "aria_label" | "style"
+        );
+        if !known {
+            issues.push(BlockIssue::new(
+                block,
+                format!("[{index}].meta.{key}"),
+                "block_meta_unknown",
+                format!(
+                    "{key:?} is not a block setting; this platform reads {}",
+                    [
+                        "hide_on", "align", "anchor", "id", "class", "aria_label", "style"
+                    ]
+                    .join(", ")
+                ),
+                Severity::Warning,
+            ));
+        }
+        if !value.is_null() && !matches!(value, Value::String(_) | Value::Bool(_)) {
+            issues.push(BlockIssue::new(
+                block,
+                format!("[{index}].meta.{key}"),
+                "block_meta_invalid",
+                "a block setting is text or a yes/no value",
+                Severity::Error,
+            ));
+        }
+    }
+}
+
 /// Warn when a heading skips a level. The first heading of a page is free: a page may start at
 /// any level, and its `h1` is the page title the layout already renders.
 fn check_heading_order(
@@ -1238,6 +1498,23 @@ fn check_heading_order(
                 "block_heading_order",
                 format!(
                     "an h{level} follows an h{previous}; screen readers read the outline in order"
+                ),
+                Severity::Warning,
+            ));
+        }
+        // The other direction, and the one the REQ names first: the page's own `h1` is the
+        // document's title, so an `h1` that arrives after another heading means a section
+        // heading is read *before* the title. Screen readers list the outline exactly in
+        // document order, so this is the shape that most damages navigation — and it is a
+        // warning rather than an error because the page still renders and reads.
+        if level == 1 {
+            issues.push(BlockIssue::new(
+                block,
+                format!("[{index}].props.level"),
+                "block_heading_order",
+                format!(
+                    "this h1 comes after an h{previous}; the page's h1 is its title and belongs \
+                     above every other heading"
                 ),
                 Severity::Warning,
             ));
@@ -1276,6 +1553,16 @@ pub fn normalize(block: &mut Block) {
                         .or_insert_with(|| prop.default.to_value());
                 }
             }
+        }
+    }
+    // `hide_on: none` is what the editor's Visibility control writes when the author picks
+    // "everywhere", and it means the same thing as no setting at all. Storing it would make
+    // every block on the page carry a `meta` the reader has to skip, and would make a diff
+    // report a change where the author only reopened the panel. The value is dropped here,
+    // which is why the editor has one code path for "show everywhere" instead of two.
+    if let Some(object) = block.meta.as_object_mut() {
+        if object.get("hide_on").and_then(Value::as_str) == Some("none") {
+            object.remove("hide_on");
         }
     }
     for child in &mut block.children {
@@ -1983,5 +2270,213 @@ mod tests {
             .filter(|issue| issue.code == "block_child_not_allowed")
             .count();
         assert_eq!(wrong, 2, "both direct children are named");
+    }
+
+    // ---- Per-block settings (`meta`, REQ-063 slice 2) ----------------------------------------
+
+    /// A block with a setting, for the tests below.
+    fn block_with_meta(kind: &str, props: Value, meta: Value) -> Value {
+        let mut value = block(kind, props);
+        value["meta"] = meta;
+        value
+    }
+
+    /// The REQ's own sentence: an `h2` before the page's `h1` warns, and reordering clears it.
+    ///
+    /// This is the direction the first implementation did not have. It caught `h4` after `h2`
+    /// (a level skipped going *down*), which is the same rule read the other way round — but
+    /// "an h1 that arrives late" is a different defect with a different fix, and it is the one
+    /// the REQ names: the page title is rendered by the layout, so a block `h1` is a second
+    /// title, and it has to sit above the section headings.
+    #[test]
+    fn an_h1_after_another_heading_warns_and_the_warning_clears_on_reorder() {
+        let late = validate(&json!([
+            block("heading", json!({ "text": "Section", "level": "h2" })),
+            block("heading", json!({ "text": "The title", "level": "h1" })),
+        ]));
+        assert!(late.can_publish, "a late h1 still renders and reads");
+        let warnings: Vec<_> = late
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "block_heading_order")
+            .collect();
+        assert_eq!(warnings.len(), 1, "the late h1 is the one warning");
+        assert_eq!(warnings[0].severity, "warning");
+
+        // The same two blocks with the h1 first: nothing to warn about. This is the "the
+        // warning disappears after reordering" half of the criterion, and it is why the
+        // assertion is on the *same* two blocks rather than on a new payload.
+        let fixed = validate(&json!([
+            block("heading", json!({ "text": "The title", "level": "h1" })),
+            block("heading", json!({ "text": "Section", "level": "h2" })),
+        ]));
+        assert!(
+            fixed.issues.is_empty(),
+            "the reordered pair warns: {:?}",
+            fixed.issues
+        );
+    }
+
+    /// The first heading of a page is free at any level, so a page whose only heading is an
+    /// `h3` is silent — otherwise every page without a page-title block would get a warning.
+    #[test]
+    fn a_lone_heading_at_any_level_is_silent() {
+        for level in ["h1", "h2", "h3", "h4", "h5", "h6"] {
+            let report = validate(&json!([block("heading", json!({ "text": "Only", "level": level }))]));
+            assert!(
+                report.issues.is_empty(),
+                "a single {level} warned: {:?}",
+                report.issues
+            );
+        }
+    }
+
+    #[test]
+    fn a_hide_on_value_outside_the_list_is_refused() {
+        let report = validate(&json!([block_with_meta(
+            "text",
+            json!({ "text": "x" }),
+            json!({ "hide_on": "tablet" }),
+        )]));
+        assert!(!report.can_publish, "an unknown viewport must not be storable");
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "block_meta_invalid")
+            .expect("the setting is named");
+        assert_eq!(issue.severity, "error");
+        assert!(issue.message.contains("mobile"), "the list is in the message");
+    }
+
+    /// The three real values are accepted, and `none` is stored as *no* setting.
+    #[test]
+    fn every_hide_on_value_validates_and_none_is_stored_as_absence() {
+        for value in ["mobile", "desktop"] {
+            let report = validate(&json!([block_with_meta(
+                "text",
+                json!({ "text": "x" }),
+                json!({ "hide_on": value }),
+            )]));
+            assert!(report.issues.is_empty(), "{value} warned: {:?}", report.issues);
+        }
+
+        let mut blocks = parse_blocks(&json!([block_with_meta(
+            "text",
+            json!({ "text": "x" }),
+            json!({ "hide_on": "none" }),
+        )]))
+        .expect("parseable");
+        for block in &mut blocks {
+            let _ = normalize(block);
+        }
+        let stored = blocks_to_value(&blocks);
+        assert!(
+            stored[0].get("meta").is_none(),
+            "hide_on: none must store no meta at all: {stored}"
+        );
+    }
+
+    /// An unknown key is a warning, not an error: a payload written by a future editor must
+    /// still render, and the author needs to be told the setting will be ignored.
+    #[test]
+    fn a_setting_this_platform_does_not_read_is_a_warning() {
+        let report = validate(&json!([block_with_meta(
+            "text",
+            json!({ "text": "x" }),
+            json!({ "hover": "lift" }),
+        )]));
+        assert!(report.can_publish, "an unknown setting does not break the page");
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "block_meta_unknown")
+            .expect("the setting is named");
+        assert_eq!(issue.severity, "warning");
+    }
+
+    /// The whole point of the criterion: the block is *absent* from the mobile render, not
+    /// present-but-hidden. That is why this is a function on the server rather than a class in
+    /// the theme's stylesheet.
+    #[test]
+    fn a_block_hidden_on_mobile_is_absent_from_the_mobile_render() {
+        let blocks = parse_blocks(&json!([
+            block_with_meta("text", json!({ "text": "everywhere" }), json!({})),
+            block_with_meta("text", json!({ "text": "wide only" }), json!({ "hide_on": "mobile" })),
+            block_with_meta("text", json!({ "text": "phone only" }), json!({ "hide_on": "desktop" })),
+        ]))
+        .expect("parseable");
+
+        let desktop = filter_for_viewport(&blocks, ReadOn::Desktop);
+        let texts = |list: &[Block]| -> Vec<String> {
+            list.iter().map(|b| b.props["text"].as_str().unwrap_or("").to_owned()).collect()
+        };
+        assert_eq!(
+            texts(&desktop),
+            vec!["everywhere", "wide only"],
+            "the desktop render keeps both `none` and `mobile`-hidden blocks"
+        );
+
+        let mobile = filter_for_viewport(&blocks, ReadOn::Mobile);
+        assert_eq!(
+            texts(&mobile),
+            vec!["everywhere", "phone only"],
+            "the mobile render drops the block the author hid from phones"
+        );
+        assert!(
+            !blocks_to_value(&mobile).to_string().contains("wide only"),
+            "the hidden block must not survive anywhere in the mobile payload"
+        );
+    }
+
+    /// Nesting is where a viewport rule would stop being honest: a block hidden inside a column
+    /// has to go too, and a column whose only block is hidden leaves the grid it was in.
+    #[test]
+    fn the_filter_reaches_a_nested_block_and_recounts_a_columns_prop() {
+        let mut value = block("columns", json!({ "columns": 3 }));
+        value["children"] = json!([
+            column(vec![block("text", json!({ "text": "left" }))]),
+            column(vec![block_with_meta(
+                "text",
+                json!({ "text": "middle" }),
+                json!({ "hide_on": "mobile" }),
+            )]),
+            column(vec![block("text", json!({ "text": "right" }))]),
+        ]);
+        let blocks = parse_blocks(&json!([value])).expect("parseable");
+
+        let mobile = filter_for_viewport(&blocks, ReadOn::Mobile);
+        assert_eq!(mobile[0].children.len(), 2, "the whole column went, not just the block");
+        // The renderer lays the grid out from the `columns` prop. A three-column grid with two
+        // cells renders a gap on a phone, so the prop has to follow the structure.
+        assert_eq!(
+            mobile[0].props["columns"].as_i64(),
+            Some(2),
+            "the grid prop follows the columns that survived"
+        );
+    }
+
+    #[test]
+    fn a_meta_that_says_nothing_is_not_stored() {
+        for meta in [json!({}), json!({ "hide_on": "" }), json!({ "hide_on": "none" })] {
+            assert!(
+                !meta_is_meaningful(&meta),
+                "{meta} should not be stored as a setting"
+            );
+        }
+        assert!(meta_is_meaningful(&json!({ "hide_on": "mobile" })));
+        assert!(meta_is_meaningful(&json!({ "aria_label": "Pricing" })));
+    }
+
+    /// A round trip through the store shape keeps a block's settings, because a setting the
+    /// save dropped would be a setting the author cannot see they had set.
+    #[test]
+    fn a_block_setting_survives_the_store_round_trip() {
+        let original = json!([block_with_meta(
+            "image",
+            json!({ "src": "/m/1", "alt": "A logo" }),
+            json!({ "hide_on": "mobile", "align": "center" }),
+        )]);
+        let blocks = parse_blocks(&original).expect("parseable");
+        assert_eq!(blocks_to_value(&blocks), original);
     }
 }
