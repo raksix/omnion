@@ -1477,3 +1477,47 @@
   and signature verification), then slice 4 (enterprise sign-in, SCIM, ABAC policy builder,
   approvals, the safety invariants). Slice 3b needs a crypto dependency (`p256`/`ed25519-dalek` +
   a CBOR reader) that the workspace does not carry yet.
+## 2026-09-27 — REQ-006 · slice 3b · WebAuthn passkeys
+
+- **What.** Passkeys are real: `crates/identity/src/webauthn/` carries a small CBOR reader
+  (`cbor.rs`), the COSE credential key (`cose.rs`, ES256 + EdDSA) and both ceremonies (`mod.rs`).
+  Registration checks the ceremony type, the challenge this server issued, the origin it serves,
+  the relying-party hash, a present user, the attested COSE key and — for a `packed` statement
+  without a certificate chain — its self signature; an assertion verifies
+  `authenticatorData || SHA-256(clientDataJSON)` with the stored key and refuses a signature
+  counter that does not move forward. Migration `0018_webauthn.sql` adds `webauthn_challenges`
+  (single-use, purpose-scoped, one live per account+purpose). The API gained
+  `/api/v1/auth/webauthn/register/begin|complete`, `/passkeys`, `/passkeys/{id}` and
+  `/authenticate/begin|complete`, with `auth::start_session` shared by both sign-in paths; the
+  panel gained the passkeys section in the user detail's Second factors tab and the second step of
+  the sign-in screen (code, recovery code, **Use a passkey**).
+- **The documented loopback exception.** A WebAuthn relying-party id must be a domain, so the QA
+  stack (served on `127.0.0.1`) cannot run a ceremony at all; the server binds credentials to
+  `OMNION_WEBAUTHN_RP_ID` (default `localhost`) and `OriginPolicy` accepts a loopback origin from
+  any port unless `OMNION_WEBAUTHN_ALLOW_LOOPBACK=false`. That rule has its own unit test and the
+  browser pass relies on it — a test that silently skips is not evidence.
+- **Proof (Rust).** `cargo test --workspace` → **630 tests, 0 failures** (exit 0; +16 on the last
+  tick). The ceremony units cover ES256 and EdDSA round trips, a verified and a broken packed self
+  attestation, and every refusal; `apps/api/tests/webauthn.rs::a_passkey_enrols_and_signs_in_end_to_end`
+  drives the slice over the real router with a software authenticator (options → registration →
+  duplicate credential `409` → foreign origin `400 webauthn_refused` → passkey list → password
+  sign-in answering `mfa_required` → assertion options → assertion opening a session whose auth
+  methods carry `webauthn` and whose counter moved → replayed counter refused → step-up-gated
+  removal → password-only sign-in again).
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`).
+- **Proof (QA).** `bash scripts/qa/run.sh` → `qa-artifacts/20260927-084333`: **727 clicks, 754
+  screenshots, 5 findings (0 high** — the five carried-forward public-renderer 404s**)**, vision
+  review 0 issues / 0 failures, and `Refusals provoked on purpose — 2` (the step-up gate, with its
+  reason). The run before it read **7 findings (2 high)**: the pass's own designed step-up refusal
+  (403 + its console line) was being counted as a defect, so the harness gained `expectRefusal` —
+  a single-use, index-bounded allowance a pass registers immediately before a deliberate act, with
+  what it swallows reported instead of hidden. The pass still asserts the refusal happened (the
+  prompt appeared) and the retry succeeded (the row is gone). The new
+  `iam-passkeys` pass enrols a passkey with a Chrome **virtual authenticator** on
+  `http://localhost:<port>` (the loopback exception), shows the row, has the sign-in answer the
+  factor step, completes it with the passkey, removes it through the step-up prompt and proves the
+  account is password-only again — the first run of the pass was red (`rows: 0`), the debug probe
+  named the cause (an IP literal is not a valid relying-party id), and the fix is in the pass.
+- **Next.** REQ-006 slice 4 — enterprise sign-in (OIDC/OAuth2/SAML with JIT + claim mapping), SCIM
+  provisioning, the ABAC policy builder + dry run, permission requests/approvals and the safety
+  invariants.
