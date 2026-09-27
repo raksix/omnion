@@ -199,7 +199,7 @@ pub async fn update_page(
                 }
                 let mut parsed = crate::blocks::parse_blocks(payload)?;
                 for block in &mut parsed {
-                    crate::blocks::normalize(block);
+                    let _ = crate::blocks::normalize(block);
                 }
                 crate::blocks::blocks_to_value(&parsed)
             }

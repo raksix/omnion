@@ -1165,7 +1165,7 @@ pub fn normalize(block: &mut Block) {
         }
     }
     for child in &mut block.children {
-        normalize(child);
+        let _ = normalize(child);
     }
 }
 

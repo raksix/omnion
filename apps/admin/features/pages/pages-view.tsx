@@ -37,7 +37,7 @@ function revisionNote(page: Page): string {
 /** Blocks the page's working draft carries, nested ones included (REQ-063). */
 function blockCountOf(page: Page): number {
   const walk = (nodes: unknown[]): number =>
-    nodes.reduce((sum, node) => {
+    nodes.reduce<number>((sum, node) => {
       if (typeof node !== "object" || node === null) {
         return sum;
       }
@@ -388,6 +388,7 @@ export function PagesView() {
             </button>
             <button
               type="button"
+              data-page-new
               onClick={openCreate}
               className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong"
             >

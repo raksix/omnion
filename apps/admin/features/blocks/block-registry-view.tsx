@@ -139,6 +139,7 @@ export function BlockRegistryView() {
                   <li key={entry.key}>
                     <button
                       type="button"
+                      data-registry-row={entry.key}
                       onClick={() => setOpen(expanded ? null : entry.key)}
                       aria-expanded={expanded}
                       aria-label={`${expanded ? "Hide" : "Show"} the props of ${entry.label}`}

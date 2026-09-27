@@ -332,7 +332,7 @@ export function BlockEditor() {
   const canMoveDown = selected ? position < siblings.length - 1 : false;
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4" data-block-editor>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-baseline gap-2">
           <h2 className="text-[15px] font-medium">{pageTitle(page)}</h2>
@@ -351,6 +351,7 @@ export function BlockEditor() {
           </Link>
           <button
             type="button"
+            data-block-insert-toggle
             onClick={() => setInsertOpen((open) => !open)}
             aria-expanded={insertOpen}
             className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
@@ -360,6 +361,7 @@ export function BlockEditor() {
           </button>
           <button
             type="button"
+            data-block-save
             onClick={save}
             disabled={saving}
             className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas disabled:opacity-50"
@@ -369,6 +371,7 @@ export function BlockEditor() {
           </button>
           <button
             type="button"
+            data-block-publish
             onClick={publish}
             disabled={publishing || blocking.length > 0}
             title={
@@ -452,7 +455,11 @@ export function BlockEditor() {
 
         {/* Centre: the canvas. */}
         <div className="min-w-0">
-          <div ref={canvasRef} className="rounded-xl border border-line bg-surface p-4">
+          <div
+            ref={canvasRef}
+            data-block-canvas
+            className="rounded-xl border border-line bg-surface p-4"
+          >
             <BlockCanvas
               registry={registry}
               blocks={blocks}
@@ -547,7 +554,13 @@ export function BlockEditor() {
       </div>
 
       {/* Bottom bar: what the page is made of, what is wrong with it, and when it was saved. */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-line bg-surface px-4 py-2.5 text-[12px] text-muted">
+      <div
+        data-block-status
+        data-block-count={blockCount}
+        data-block-errors={blocking.length}
+        data-block-warnings={issues.length - blocking.length}
+        className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-line bg-surface px-4 py-2.5 text-[12px] text-muted"
+      >
         <span className="flex items-center gap-1.5">
           <Pencil className="size-3" aria-hidden />
           {words} words · {blockCount} blocks

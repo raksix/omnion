@@ -176,6 +176,8 @@ function CanvasBlock({
 
   return (
     <div
+      data-block-canvas-block={block.type}
+      data-block-has-error={blocking ? "true" : "false"}
       className={`relative rounded-lg border transition ${
         active ? "border-accent ring-2 ring-accent/15" : "border-line hover:border-accent/40"
       } ${blocking ? "border-accent-strong" : ""}`}

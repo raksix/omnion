@@ -2519,6 +2519,10 @@ async function main() {
   const routes = [
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
+    // The block registry reference (REQ-063, slice 1) — no untested screen: it is walked here
+    // and expanded, and the editor it documents is driven by the depth pass below, which first
+    // creates a page to edit (the editor's address carries the page's id, not its slug).
+    { path: "/blocks", name: "blocks" },
     { path: "/media", name: "media" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
@@ -2577,6 +2581,12 @@ async function main() {
     await interact(page, route.name, report);
     report.pages.push({ ...route, diagnostics: diag });
   }
+
+  // The block editor's pass (REQ-063, slice 1): a page of its own, then the insert panel, the
+  // generated inspector, live validation refusing and clearing a publish, reorder/duplicate/
+  // delete, save, publish, and the public page the published block tree actually renders.
+  report.blockEditor = await runBlockEditorDepth(page, report);
+  log(`block editor: ${JSON.stringify(report.blockEditor)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
@@ -3636,4 +3646,193 @@ async function runIamProvisioningDepth(page, report) {
 
   report.iamProvisioning = { steps };
   log(`iam provisioning: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The block editor's own pass (REQ-063, slice 1).
+ *
+ * It creates a page through the panel's own form — the editor's address carries the page's id,
+ * not its slug, so there has to be one — and then drives the screen the way an author does:
+ * insert a block from the panel, edit one of its props in the inspector, watch the API's own
+ * validation refuse the publish until the block is whole, reorder, duplicate, delete, save the
+ * draft and publish. Every assertion here is about a *screen state*, because "the editor works"
+ * is not a thing a screenshot can prove.
+ */
+async function runBlockEditorDepth(page, report) {
+  const steps = {};
+  const note = (action) => record({ page: "page-editor-depth", action });
+
+  // ---- A page to edit -----------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/pages`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-page-new]", { timeout: 20000 }).catch(() => {});
+  await page.locator("[data-page-new]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("#page-title").fill("QA block page").catch(() => {});
+  await page.locator("#page-slug").fill("qa-block-page").catch(() => {});
+  await page.locator("#page-body").fill("The pre-block text of the QA page.").catch(() => {});
+  await shot(page, "block-editor-page-form");
+  await page.locator("form button[type=submit]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.created =
+    (await page.locator("text=QA block page").count()) > 0 ||
+    (await page.locator('a[href^="/pages/"][href$="/edit"]').count()) > 0;
+
+  // The editor's address is the page's id, so the row's own link is how a person gets there.
+  const editorLink = page.locator('a[href^="/pages/"][href$="/edit"]').first();
+  if ((await editorLink.count()) === 0) {
+    steps.blocked = "no page row carried an editor link";
+    report.blockEditor = steps;
+    return steps;
+  }
+  const href = await editorLink.getAttribute("href");
+  await editorLink.click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-block-editor]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.path = href;
+  steps.outlineRows = await page.locator("[data-block-outline-row]").count();
+  await shot(page, "page-block-editor-empty");
+
+  // ---- Insert ---------------------------------------------------------------------------------
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-block-insert-panel]", { timeout: 8000 }).catch(() => {});
+  steps.insertCategories = await page.locator("[data-block-insert-panel] h3").count();
+  await shot(page, "page-block-editor-insert");
+  // The panel is searchable, and searching narrows it — a panel that only lists is a list.
+  await page.locator("#block-search").fill("head").catch(() => {});
+  await page.waitForTimeout(400);
+  steps.searchNarrows =
+    (await page.locator("[data-block-insert-option]").count()) < 16 &&
+    (await page.locator("[data-block-insert-option=heading]").count()) > 0;
+  await page.locator("#block-search").fill("").catch(() => {});
+  await page.waitForTimeout(300);
+
+  // A heading first, then a text, then a columns container: the container is what proves
+  // nesting, and the heading is what the heading-order rule is about.
+  await page.locator("[data-block-insert-option=heading]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-block-insert-option=text]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-block-insert-option=columns]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.afterInsert = await page.locator("[data-block-canvas-block]").count();
+  steps.panelClosed = (await page.locator("[data-block-insert-panel]").count()) === 0;
+  note("inserted three blocks");
+  await shot(page, "page-block-editor-canvas");
+
+  // ---- Inspector ----------------------------------------------------------------------------
+  // The heading's text prop: `heading`'s first prop is the text, and the panel generated it
+  // from the schema, so it is the field the schema names.
+  const headingField = page.locator('[data-block-inspector] label').filter({ hasText: "Heading" }).locator("input, textarea, select").first();
+  await headingField.fill("QA heading from the walkthrough").catch(() => {});
+  await page.waitForTimeout(900);
+  steps.inspectedValue = (await page.locator('[data-block-canvas-block=heading]').first().innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+  steps.outlineAfterEdit = (
+    await page.locator("[data-block-outline-row]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  note("edited the heading's prop");
+
+  // The second block is the text one; its inspector is the one that appears when it is picked.
+  const rows = page.locator("[data-block-outline-row]");
+  if ((await rows.count()) > 1) {
+    await rows.nth(1).click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    const textField = page.locator('[data-block-inspector] label').filter({ hasText: "Text" }).locator("textarea").first();
+    await textField.fill("A paragraph written by the QA walkthrough.").catch(() => {});
+    await page.waitForTimeout(800);
+  }
+  await shot(page, "page-block-editor-inspector");
+
+  // ---- Live validation ----------------------------------------------------------------------
+  // The API's own dry run is what the badges come from, so a block that cannot be published
+  // has to be visible here — and a warning must not be a blocker.
+  steps.statusLine = (await page.locator("[data-block-status]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  steps.blockCount = await page.locator("[data-block-status]").getAttribute("data-block-count");
+  steps.errors = await page.locator("[data-block-status]").getAttribute("data-block-errors");
+  steps.warnings = await page.locator("[data-block-status]").getAttribute("data-block-warnings");
+  note("read the validation summary");
+
+  // An image with no alternative text is the blocking case the REQ names; the publish button
+  // must be gone rather than merely failing after a round trip.
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-block-insert-option=image]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const imageBlock = page.locator("[data-block-canvas-block=image]").first();
+  steps.imageNeedsAttention =
+    (await imageBlock.getAttribute("data-block-has-error").catch(() => "false")) === "true";
+  steps.publishDisabledOnError = await page.locator("[data-block-publish]").isDisabled();
+  steps.issueMessages = await page.locator("[data-block-issues] li").count();
+  await shot(page, "page-block-editor-validation");
+
+  // Filling the field clears it, and the same page then publishes — which is the whole point of
+  // validation being the API's: the editor and the save can never disagree about it.
+  const imageBlockRow = page.locator("[data-block-outline-row]").last();
+  await imageBlockRow.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const altField = page.locator('[data-block-inspector] label').filter({ hasText: "Alternative text" }).locator("input, textarea").first();
+  await altField.fill("A screenshot of the QA walkthrough").catch(() => {});
+  await page.waitForTimeout(1000);
+  steps.clearedAfterFix =
+    (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0";
+  steps.publishEnabledAfterFix = !(await page.locator("[data-block-publish]").isDisabled());
+  note("fixed the blocking issue in the field");
+
+  // ---- Reorder, duplicate, delete ------------------------------------------------------------
+  const order = async () =>
+    (
+      await page.locator("[data-block-canvas-block]").evaluateAll((nodes) =>
+        nodes.map((node) => node.getAttribute("data-block-canvas-block")),
+      )
+    ).join(",");
+  const beforeOrder = await order();
+  await page.locator('[data-block-inspector] button[aria-label="Move block up"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.reordered = (await order()) !== beforeOrder;
+  steps.orderBefore = beforeOrder;
+  steps.orderAfter = await order();
+  note("moved a block up");
+
+  const blocksBefore = (await page.locator("[data-block-canvas-block]").count());
+  await page.locator('[data-block-inspector] button[aria-label="Duplicate block"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.duplicated = (await page.locator("[data-block-canvas-block]").count()) === blocksBefore + 1;
+  note("duplicated a block");
+
+  await page.locator('[data-block-inspector] button[aria-label="Delete block"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.deleted = (await page.locator("[data-block-canvas-block]").count()) === blocksBefore;
+  note("deleted a block");
+
+  // ---- Save and publish ---------------------------------------------------------------------
+  await page.locator("[data-block-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.saved =
+    (await page.locator("[data-block-status]").innerText().catch(() => "")).includes("Last saved") ||
+    (await page.locator("text=revision").count()) > 0;
+  await shot(page, "page-block-editor-saved");
+
+  await page.locator("[data-block-publish]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.published = (await page.locator("text=/is live at/i").count()) > 0;
+  await shot(page, "page-block-editor-published");
+
+  // ---- The page really renders ---------------------------------------------------------------
+  // The public renderer draws the published block tree; a page that saved but renders nothing
+  // is the "preview lies" bug the REQ names, and it is only visible from the outside.
+  await page.goto(`${URL_WEB}/qa-block-page`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const rendered = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.publicRendered = rendered.includes("QA heading from the walkthrough");
+  steps.publicHasSemanticFigure = (await page.locator("figure").count()) > 0;
+  steps.publicHasImage = (await page.locator("img").count()) > 0;
+  await shot(page, "web-block-page-rendered");
+  note("checked the public render");
+
+  report.blockEditor = steps;
+  return steps;
 }

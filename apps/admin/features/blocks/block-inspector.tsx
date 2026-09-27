@@ -65,7 +65,7 @@ export function InsertPanel({ registry, onPick, onClose }: InsertPanelProps) {
   const total = grouped.reduce((sum, group) => sum + group.entries.length, 0);
 
   return (
-    <div className="rounded-xl border border-line bg-surface">
+    <div className="rounded-xl border border-line bg-surface" data-block-insert-panel>
       <div className="flex items-center gap-2 border-b border-line px-3 py-2">
         <label className="sr-only" htmlFor="block-search">
           Search block types
@@ -104,6 +104,7 @@ export function InsertPanel({ registry, onPick, onClose }: InsertPanelProps) {
                   <li key={entry.key}>
                     <button
                       type="button"
+                      data-block-insert-option={entry.key}
                       onClick={() => onPick(entry)}
                       aria-label={`Insert ${entry.label} block`}
                       className="flex w-full cursor-pointer items-start gap-2 rounded-lg border border-line px-2.5 py-2 text-left transition hover:border-accent/40 hover:bg-canvas"
@@ -215,7 +216,7 @@ export function BlockInspector({
       </div>
 
       {issues.length > 0 ? (
-        <ul className="flex flex-col gap-1.5" aria-label="Block issues">
+        <ul className="flex flex-col gap-1" aria-label="Block issues" data-block-issues>
           {issues.map((issue) => (
             <li
               key={`${issue.code}-${issue.path}`}
