@@ -30,3 +30,12 @@ subtle = "2"
 base64.workspace = true
 p256.workspace = true
 ed25519-dalek.workspace = true
+
+# Enterprise sign-in (REQ-006, slice 4b-2): the OIDC/OAuth2 token exchange and discovery fetch, and
+# the RS256 verification of an ID token. The identity crate reaches the network only here — every
+# other sign-in path is local. `xmltree` is the SAML assertion reader (it parses into a tree, but
+# the signature is verified over the exact posted bytes, which this module keeps).
+reqwest = { workspace = true, features = ["json"] }
+rsa.workspace = true
+url.workspace = true
+xmltree = "0.11"
