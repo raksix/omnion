@@ -58,6 +58,15 @@ pub enum StepKind {
     Task,
     /// Pauses the run for a fixed number of seconds; the engine resumes it later.
     Wait,
+    /// Ends the run when a comparison over the resolved inputs does not hold.
+    ///
+    /// The engine evaluates it; nothing outside sees it. It is a *step* rather than a
+    /// property of a step because a branch is a position in the run: the same field read
+    /// before step 3 and after step 9 can answer differently, and the panel draws the
+    /// difference on the trace.
+    Branch,
+    /// Ends the run on purpose, with a reason an operator reads in the trace.
+    Stop,
 }
 
 impl StepKind {
@@ -67,6 +76,8 @@ impl StepKind {
         match self {
             Self::Task => "task",
             Self::Wait => "wait",
+            Self::Branch => "branch",
+            Self::Stop => "stop",
         }
     }
 
@@ -76,10 +87,63 @@ impl StepKind {
         match raw {
             "task" => Some(Self::Task),
             "wait" => Some(Self::Wait),
+            "branch" => Some(Self::Branch),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    /// `true` when a step of this kind never runs an action.
+    #[must_use]
+    pub const fn is_control(self) -> bool {
+        matches!(self, Self::Wait | Self::Branch | Self::Stop)
+    }
+}
+
+/// What a step's own failure does (REQ-003 slice 2).
+///
+/// This is the per-step half of the rule's error policy: `inherit` defers to the rule's
+/// own setting, so a step an author never touched behaves the way every step behaved
+/// before the policy existed — a failure ends the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnError {
+    /// Take the rule's own policy.
+    Inherit,
+    /// End the run.
+    Stop,
+    /// Record the failure and let the run continue to the next step.
+    Continue,
+}
+
+impl OnError {
+    /// Canonical lowercase name stored in the database.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Stop => "stop",
+            Self::Continue => "continue",
+        }
+    }
+
+    /// Parse a stored value.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "inherit" => Some(Self::Inherit),
+            "stop" => Some(Self::Stop),
+            "continue" => Some(Self::Continue),
             _ => None,
         }
     }
 }
+
+/// Longest a step may block before the engine fails it with the limit named.
+pub const MAX_STEP_TIMEOUT_MS: i32 = 120_000;
+
+/// Default step timeout, and the floor (a step's timeout is `> 0`).
+pub const DEFAULT_STEP_TIMEOUT_MS: i32 = 30_000;
 
 /// Lifecycle of one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +270,14 @@ pub struct Workflow {
     /// The token itself is never stored: it is shown once when it is minted, and only this
     /// hash can match a call. The automation layer owns it (see `omnion-automation::hooks`).
     pub hook_token_hash: Option<String>,
+    /// The rule's own error policy, which a step inherits when it does not set one.
+    pub on_error: String,
+    /// The key that signs an outbound `http_request` from this rule.
+    ///
+    /// Never returned by the API, never audited, never rendered — the same rule the inbound
+    /// token follows, and for the same reason: an audit row is read by more people than the
+    /// secret is meant for.
+    pub hook_secret: Option<String>,
     /// Next time the scheduler should start this workflow.
     pub next_run_at: Option<OffsetDateTime>,
     /// Ordered step definitions, as stored JSON.
@@ -242,8 +314,8 @@ impl Workflow {
 
 /// Columns of `workflows`, in the order [`Workflow`] expects.
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
-     trigger_kind, schedule, trigger_event, conditions, hook_token_hash, next_run_at, steps, \
-     last_triggered_at, trigger_count, created_by, created_at, updated_at";
+     trigger_kind, schedule, trigger_event, conditions, hook_token_hash, on_error, hook_secret, \
+     next_run_at, steps, last_triggered_at, trigger_count, created_by, created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]
@@ -266,6 +338,8 @@ pub struct NewWorkflow {
     pub trigger_event: Option<String>,
     /// Conditions of an event trigger, as stored JSON array.
     pub conditions: serde_json::Value,
+    /// The rule's error policy; a step that inherits takes this.
+    pub on_error: OnError,
     /// First due time when scheduled.
     pub next_run_at: Option<OffsetDateTime>,
     /// Step definitions as stored JSON.
@@ -295,6 +369,11 @@ pub struct WorkflowExecution {
     pub finished_at: Option<OffsetDateTime>,
     /// Error of the failing step, when the run failed.
     pub error: Option<String>,
+    /// The event payload the run started from, when it started from an event.
+    ///
+    /// A branch step reads `event.<field>` out of it and the run detail shows it beside the
+    /// trace. A manual run and a schedule carry `None` — there is no event behind them.
+    pub event_payload: Option<serde_json::Value>,
 }
 
 impl WorkflowExecution {
@@ -313,7 +392,7 @@ impl WorkflowExecution {
 
 /// Columns of `workflow_executions`, in the order [`WorkflowExecution`] expects.
 pub const EXECUTION_COLUMNS: &str = "id, workflow_id, organization_id, status, trigger_kind, \
-     triggered_by, started_at, finished_at, error";
+     triggered_by, started_at, finished_at, error, event_payload";
 
 /// One materialised step of a run.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -326,12 +405,16 @@ pub struct WorkflowStep {
     pub step_no: i32,
     /// Step name from the definition.
     pub name: String,
-    /// `task` or `wait`.
+    /// `task`, `wait`, `branch` or `stop`.
     pub kind: String,
     /// Built-in action of a task step.
     pub action: Option<String>,
     /// Step parameters, as stored JSON.
     pub params: serde_json::Value,
+    /// What this step's own failure does (`inherit` takes the rule's policy).
+    pub on_error: String,
+    /// How long the step may block before it is failed with the limit named.
+    pub timeout_ms: i32,
     /// `pending`, `running`, `waiting`, `succeeded`, `failed` or `cancelled`.
     pub status: String,
     /// Attempts made so far (the first run counts as one).
@@ -348,6 +431,8 @@ pub struct WorkflowStep {
     pub output: Option<serde_json::Value>,
     /// Message of the last failure.
     pub error: Option<String>,
+    /// `true` when the run deliberately outlived this step's failure.
+    pub ignored: bool,
 }
 
 impl WorkflowStep {
@@ -362,11 +447,18 @@ impl WorkflowStep {
     pub fn kind(&self) -> Option<StepKind> {
         StepKind::parse(&self.kind)
     }
+
+    /// The parsed error policy.
+    #[must_use]
+    pub fn on_error(&self) -> Option<OnError> {
+        OnError::parse(&self.on_error)
+    }
 }
 
 /// Columns of `workflow_steps`, in the order [`WorkflowStep`] expects.
-pub const STEP_COLUMNS: &str = "id, execution_id, step_no, name, kind, action, params, status, \
-     attempts, max_attempts, available_at, started_at, finished_at, output, error";
+pub const STEP_COLUMNS: &str = "id, execution_id, step_no, name, kind, action, params, on_error, \
+     timeout_ms, status, attempts, max_attempts, available_at, started_at, finished_at, output, \
+     error, ignored";
 
 #[cfg(test)]
 mod tests {

@@ -50,9 +50,11 @@ pub const ACTIONS: &[ActionDef] = &[
 
 /// Actions the host runs through its [`crate::ActionHandler`].
 ///
-/// These are the automation layer's first two real actions: the engine knows their names and
-/// their parameters (a definition is validated without a handler present), and refuses to run
-/// them by itself.
+/// These are the automation layer's real actions: the engine knows their names and their
+/// parameters (a definition is validated without a handler present), and refuses to run them
+/// by itself. The three added by REQ-003 slice 2 are the ones that *leave the process* —
+/// an outbound call, a publication and a chained rule — and each of them is bounded by
+/// something the platform controls rather than by what the author typed.
 pub const HOST_ACTIONS: &[ActionDef] = &[
     ActionDef {
         key: "send_email",
@@ -62,7 +64,26 @@ pub const HOST_ACTIONS: &[ActionDef] = &[
         key: "comment_revision",
         description: "Leaves a comment on a content revision.",
     },
+    ActionDef {
+        key: "http_request",
+        description: "Calls an allowed host and signs the request with the rule's key.",
+    },
+    ActionDef {
+        key: "publish_page",
+        description: "Publishes a content page of this organization.",
+    },
+    ActionDef {
+        key: "run_workflow",
+        description: "Starts another rule's run as part of this one.",
+    },
 ];
+
+/// Methods an outbound call may use.
+///
+/// The engine holds the list so a definition naming `TRACE` is refused when it is written;
+/// the automation layer re-checks it against its own settings table at call time, because
+/// the two answer different questions (is this a method at all / may this host be reached).
+pub const OUTBOUND_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 
 /// Every action key, in catalogue order (synthetic first, then host actions).
 #[must_use]
@@ -127,6 +148,34 @@ pub fn validate_params(action: &str, params: &Value) -> Result<()> {
         "comment_revision" => {
             require_text(params, "comment_revision", "revision_id")?;
             require_text(params, "comment_revision", "body")?;
+            Ok(())
+        }
+        // The shape check only. Whether the *host* is allowed is the automation layer's
+        // answer, because the allow-list is a row in its settings table rather than a fact
+        // the engine could know — a definition with a URL the engine cannot run is refused
+        // when the rule is written, with the host named.
+        "http_request" => {
+            require_text(params, "http_request", "url")?;
+            if let Some(method) = params.get("method").and_then(Value::as_str) {
+                let method = method.trim().to_ascii_uppercase();
+                if !OUTBOUND_METHODS.contains(&method.as_str()) {
+                    return Err(WorkflowError::invalid(
+                        "invalid_step_params",
+                        format!(
+                            "`{method}` is not a method a rule may call; use one of: {}",
+                            OUTBOUND_METHODS.join(", ")
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "publish_page" => {
+            require_text(params, "publish_page", "page_id")?;
+            Ok(())
+        }
+        "run_workflow" => {
+            require_text(params, "run_workflow", "workflow_id")?;
             Ok(())
         }
         other => Err(WorkflowError::invalid(
@@ -206,18 +255,26 @@ mod tests {
                 "fail",
                 "transient",
                 "send_email",
-                "comment_revision"
+                "comment_revision",
+                "http_request",
+                "publish_page",
+                "run_workflow"
             ]
         );
         for action in ACTIONS.iter().chain(HOST_ACTIONS.iter()) {
             assert!(!action.description.trim().is_empty(), "{}", action.key);
             assert!(is_action(action.key));
         }
-        assert!(!is_action("http_request"));
+        assert!(!is_action("smtp_send"), "the set is closed");
 
-        // The two sets are disjoint and the host knows which is which.
+        // The two sets are disjoint and the host knows which is which. The three outbound
+        // actions (REQ-003 slice 2) are host actions like the other two: they leave the
+        // process, so the engine never runs them itself.
         assert!(is_host_action("send_email"));
         assert!(is_host_action("comment_revision"));
+        assert!(is_host_action("http_request"));
+        assert!(is_host_action("publish_page"));
+        assert!(is_host_action("run_workflow"));
         assert!(!is_host_action("noop"));
         assert!(ACTIONS.iter().all(|action| !is_host_action(action.key)));
     }
@@ -270,6 +327,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_outbound_actions_check_their_shape_before_a_handler_ever_sees_them() {
+        // A definition is validated without a handler installed, so a rule that could not
+        // possibly run is refused when it is written rather than when its event arrives.
+        assert!(
+            validate_params(
+                "http_request",
+                &serde_json::json!({ "url": "https://a.test/x" })
+            )
+            .is_ok()
+        );
+        assert!(validate_params("http_request", &serde_json::json!({})).is_err());
+        assert!(validate_params("http_request", &serde_json::json!({ "url": "  " })).is_err());
+        assert!(
+            validate_params(
+                "http_request",
+                &serde_json::json!({ "url": "https://a.test/x", "method": "trace" })
+            )
+            .is_err(),
+            "a method outside the list is refused when the rule is written"
+        );
+        assert!(
+            validate_params(
+                "http_request",
+                &serde_json::json!({ "url": "https://a.test/x", "method": "post" })
+            )
+            .is_ok(),
+            "the method is case-insensitive"
+        );
+
+        assert!(
+            validate_params(
+                "publish_page",
+                &serde_json::json!({ "page_id": "{{event.page_id}}" })
+            )
+            .is_ok(),
+            "a template counts as a value"
+        );
+        assert!(validate_params("publish_page", &serde_json::json!({})).is_err());
+
+        assert!(
+            validate_params(
+                "run_workflow",
+                &serde_json::json!({ "workflow_id": "{{event.workflow_id}}" })
+            )
+            .is_ok()
+        );
+        assert!(validate_params("run_workflow", &serde_json::json!({})).is_err());
     }
 
     #[test]

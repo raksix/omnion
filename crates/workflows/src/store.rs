@@ -25,8 +25,9 @@ fn workflow_columns() -> &'static str {
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
     let sql = format!(
         "insert into workflows (organization_id, site_id, name, description, enabled, \
-         trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {}",
+         trigger_kind, schedule, trigger_event, conditions, on_error, next_run_at, steps, \
+         created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) returning {}",
         workflow_columns()
     );
 
@@ -40,6 +41,7 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.schedule)
         .bind(new.trigger_event)
         .bind(new.conditions)
+        .bind(new.on_error.as_str())
         .bind(new.next_run_at)
         .bind(new.steps)
         .bind(new.created_by)
@@ -100,6 +102,8 @@ pub struct WorkflowUpdate {
     pub conditions: serde_json::Value,
     /// New next due time (schedules only).
     pub next_run_at: Option<OffsetDateTime>,
+    /// The rule's own error policy.
+    pub on_error: crate::model::OnError,
     /// New step definitions as stored JSON.
     pub steps: serde_json::Value,
 }
@@ -113,7 +117,7 @@ pub async fn update_workflow(
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
          trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
-         conditions = $11, updated_at = now() \
+         conditions = $11, on_error = $12, updated_at = now() \
          where id = $1 returning {}",
         workflow_columns()
     );
@@ -130,6 +134,7 @@ pub async fn update_workflow(
         .bind(update.steps)
         .bind(update.trigger_event)
         .bind(update.conditions)
+        .bind(update.on_error.as_str())
         .fetch_optional(pool)
         .await?;
 
@@ -216,8 +221,15 @@ pub async fn create_execution(
     steps: &[StepDefinition],
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     let mut transaction = pool.begin().await?;
-    let created =
-        create_execution_in(&mut transaction, workflow, trigger, triggered_by, steps).await?;
+    let created = create_execution_in(
+        &mut transaction,
+        workflow,
+        trigger,
+        triggered_by,
+        steps,
+        None,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(created)
 }
@@ -226,17 +238,20 @@ pub async fn create_execution(
 ///
 /// The automation layer needs it: a match starts a run and advances the event cursor in ONE
 /// transaction, so a crash can never leave a cursor that skipped an event whose run never
-/// existed (and a replay can never start the same run twice).
+/// existed (and a replay can never start the same run twice). It also passes the event
+/// payload, because a branch step reads `event.<field>` from the run and the run detail
+/// shows the payload beside the trace.
 pub async fn create_execution_in(
     connection: &mut sqlx::PgConnection,
     workflow: &Workflow,
     trigger: TriggerKind,
     triggered_by: Option<Uuid>,
     steps: &[StepDefinition],
+    event_payload: Option<serde_json::Value>,
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
-         triggered_by) values ($1, $2, 'running', $3, $4) returning {}",
+         triggered_by, event_payload) values ($1, $2, 'running', $3, $4, $5) returning {}",
         EXECUTION_COLUMNS
     );
 
@@ -245,12 +260,14 @@ pub async fn create_execution_in(
         .bind(workflow.organization_id)
         .bind(trigger.as_str())
         .bind(triggered_by)
+        .bind(event_payload)
         .fetch_one(&mut *connection)
         .await?;
 
     let step_sql = format!(
-        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, status, \
-         attempts, max_attempts) values ($1, $2, $3, $4, $5, $6, 'pending', 0, $7) \
+        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, on_error, \
+         timeout_ms, status, attempts, max_attempts) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 0, $9) \
          returning {}",
         STEP_COLUMNS
     );
@@ -264,6 +281,8 @@ pub async fn create_execution_in(
             .bind(step.kind.as_str())
             .bind(step.action.as_deref())
             .bind(step.params.clone())
+            .bind(step.on_error.as_str())
+            .bind(step.timeout_ms)
             .bind(step.max_attempts)
             .fetch_one(&mut *connection)
             .await?;
@@ -404,12 +423,16 @@ pub struct ClaimedStep {
     pub step_no: i32,
     /// Step name.
     pub name: String,
-    /// `task` or `wait`.
+    /// `task`, `wait`, `branch` or `stop`.
     pub kind: String,
     /// Built-in action of a task step.
     pub action: Option<String>,
     /// Step parameters.
     pub params: serde_json::Value,
+    /// What this step's own failure does (`inherit` takes the rule's policy).
+    pub on_error: String,
+    /// How long the step may block before it is failed with the limit named.
+    pub timeout_ms: i32,
     /// Attempt number of the claim (1 for the first).
     pub attempts: i32,
     /// Attempts allowed in total.
@@ -442,7 +465,7 @@ pub async fn claim_due_step(pool: &PgPool) -> Result<Option<ClaimedStep>> {
          set status = 'running', attempts = s.attempts + 1, started_at = now() \
          from due where s.id = due.id \
          returning s.id, s.execution_id, s.step_no, s.name, s.kind, s.action, s.params, \
-                   s.attempts, s.max_attempts",
+                   s.on_error, s.timeout_ms, s.attempts, s.max_attempts",
     )
     .fetch_optional(pool)
     .await?;
@@ -530,6 +553,156 @@ pub async fn cancel_step(pool: &PgPool, step_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// Mark a step failed, and mark that the run deliberately outlived it.
+///
+/// The row stays `failed` — the trace must not pretend a step succeeded — and `ignored` is
+/// what tells [`settle_execution`] that this failure does not make the run a failure. A run
+/// whose only failure was outlived settles as completed, and its summary still names what
+/// happened, because the trace keeps the row and the error.
+pub async fn fail_step_ignored(pool: &PgPool, step_id: Uuid, message: &str) -> Result<()> {
+    sqlx::query(
+        "update workflow_steps set status = 'failed', finished_at = now(), error = $2, \
+         ignored = true where id = $1 and status = 'running'",
+    )
+    .bind(step_id)
+    .bind(message)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Close every step after `step_id` as cancelled, because a branch or a stop ended the run.
+///
+/// `cancelled` rather than `succeeded` is the honest state: those steps never ran, and the
+/// trace must say so. Their cancellation does not fail the run either — the run's own
+/// terminal state is written separately by the caller, and a run that stopped on purpose is
+/// a completed run.
+pub async fn end_run_after_branch(pool: &PgPool, execution_id: Uuid, step_id: Uuid) -> Result<u64> {
+    let closed = sqlx::query(
+        "update workflow_steps set status = 'cancelled', finished_at = now(), \
+             error = 'the run ended before this step' \
+         where execution_id = $1 and id <> $2 \
+           and status in ('pending', 'waiting', 'running')",
+    )
+    .bind(execution_id)
+    .bind(step_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(closed)
+}
+
+/// Write a run's terminal state directly, for the two cases the engine decides itself.
+///
+/// Only the two *voluntary* endings use this: a branch that decided, and a stop step. A
+/// failure still goes through [`settle_execution`], because only that one derives the status
+/// from the rows.
+pub async fn settle_execution_as(pool: &PgPool, execution_id: Uuid, status: &str) -> Result<bool> {
+    let settled = sqlx::query(
+        "update workflow_executions set status = $2, finished_at = now() \
+         where id = $1 and status = 'running'",
+    )
+    .bind(execution_id)
+    .bind(status)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(settled > 0)
+}
+
+/// Put a claimed step back in the queue without counting an attempt.
+///
+/// For a step whose claim was lost to a stopped runner and that has no attempts to spend —
+/// a wait that never parked, a branch or a stop that never decided. The attempt counter is
+/// left alone, which is what makes the lost claim invisible to the step's own budget.
+pub async fn requeue_step(pool: &PgPool, step_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "update workflow_steps set status = 'pending', started_at = null, \
+         available_at = now() where id = $1 and status = 'running'",
+    )
+    .bind(step_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Re-open a run from one of its steps: the step and everything after it go back on the
+/// queue, and the steps that already succeeded are left untouched.
+///
+/// This is **Retry** and **Resume from here** on the run detail, and they are the same
+/// write on purpose. Re-running only the failed step would let a run whose middle failed
+/// march on to completion, so a retry deliberately re-runs the whole tail — which is
+/// exactly what an operator means by "try that again" on a run detail.
+///
+/// Three invariants the write keeps:
+///
+/// * a `cancelled` step is re-opened but a **cancelled run is not** — cancellation was a
+///   person's decision, and "retry" must not silently undo it;
+/// * the attempt counter of a re-opened step is reset, because the operator's click is a
+///   new attempt budget, not the last one of the old one;
+/// * `ignored` is cleared, so a step that once failed and was deliberately outlived does
+///   not stay exempt when it is run again.
+///
+/// It answers how many steps it re-opened, so the caller can log it and the panel can say
+/// "steps 3–5 are queued again" rather than "something happened".
+pub async fn retry_step_from(pool: &PgPool, execution_id: Uuid, step_no: i32) -> Result<u64> {
+    let requeued = sqlx::query(
+        "update workflow_steps set status = 'pending', error = null, ignored = false, \
+             attempts = 0, available_at = now(), started_at = null, finished_at = null, \
+             output = null \
+         where execution_id = $1 and step_no >= $2 \
+           and status in ('failed', 'cancelled', 'pending', 'waiting')",
+    )
+    .bind(execution_id)
+    .bind(step_no)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    sqlx::query(
+        "update workflow_executions set status = 'running', finished_at = null, error = null \
+         where id = $1 and status = 'failed'",
+    )
+    .bind(execution_id)
+    .execute(pool)
+    .await?;
+
+    Ok(requeued)
+}
+
+/// One step of a run, as the retry/resume endpoints need to address it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StepPosition {
+    /// The step's 1-based position in its run.
+    pub step_no: i32,
+    /// The step's current status.
+    pub status: String,
+    /// The step's `on_error` policy, for the log line.
+    pub on_error: String,
+}
+
+/// Read the one step a retry/resume request addresses, or `None` when it does not exist.
+pub async fn find_step(
+    pool: &PgPool,
+    execution_id: Uuid,
+    step_no: i32,
+) -> Result<Option<StepPosition>> {
+    let step: Option<StepPosition> = sqlx::query_as(
+        "select step_no, status, on_error from workflow_steps \
+         where execution_id = $1 and step_no = $2",
+    )
+    .bind(execution_id)
+    .bind(step_no)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(step)
+}
+
 /// Derive a run's terminal state once no step is open, and write it.
 ///
 /// Answers `Some(status)` only for the call that actually settled the run, so the caller can
@@ -548,7 +721,7 @@ pub async fn settle_execution(
     let counts: Counts = sqlx::query_as(
         "select \
              count(*) filter (where status in ('pending', 'running', 'waiting')) as open, \
-             count(*) filter (where status = 'failed') as failed, \
+             count(*) filter (where status = 'failed' and not ignored) as failed, \
              count(*) filter (where status = 'cancelled') as cancelled \
          from workflow_steps where execution_id = $1",
     )
@@ -568,11 +741,13 @@ pub async fn settle_execution(
         ExecutionStatus::Completed
     };
 
-    // A failed run reports the first failure it met, so a later reader sees why.
+    // A failed run reports the first failure it met, so a later reader sees why. A failure
+    // the run deliberately outlived is not one: `ignored` is the flag that says the author
+    // chose to continue past it, so the run is not a failure because of that row.
     let error: Option<String> = if status == ExecutionStatus::Failed {
         sqlx::query_scalar::<_, Option<String>>(
             "select error from workflow_steps where execution_id = $1 and status = 'failed' \
-             order by step_no asc limit 1",
+             and not ignored order by step_no asc limit 1",
         )
         .bind(execution_id)
         .fetch_one(pool)
@@ -666,8 +841,8 @@ pub async fn stale_steps(
     limit: i64,
 ) -> Result<Vec<WorkflowStep>> {
     let sql = "select s.id, s.execution_id, s.step_no, s.name, s.kind, s.action, s.params, \
-                      s.status, s.attempts, s.max_attempts, s.available_at, s.started_at, \
-                      s.finished_at, s.output, s.error \
+                      s.on_error, s.timeout_ms, s.status, s.attempts, s.max_attempts, \
+                      s.available_at, s.started_at, s.finished_at, s.output, s.error, s.ignored \
                from workflow_steps s \
                join workflow_executions e on e.id = s.execution_id \
                where s.status = 'running' and e.status = 'running' \

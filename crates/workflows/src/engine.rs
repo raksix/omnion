@@ -12,10 +12,11 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::actions;
+use crate::branch;
 use crate::definition::{MAX_ATTEMPTS, wait_seconds_from};
 use crate::error::{Result, WorkflowError};
 use crate::handler::{ActionContext, ActionHandler, NoActionHandler};
-use crate::model::{ExecutionStatus, StepKind, TriggerKind, Workflow, WorkflowExecution};
+use crate::model::{ExecutionStatus, OnError, StepKind, TriggerKind, Workflow, WorkflowExecution};
 use crate::store::{self, ClaimedStep};
 
 /// Knobs of the runner, filled from `OMNION_WORKFLOW_*` (see `omnion_core::config`).
@@ -264,6 +265,12 @@ async fn reclaim_stale_steps(pool: &PgPool, config: &RunnerConfig) -> Result<Vec
                     .await?;
                 }
             }
+            Some(StepKind::Branch) | Some(StepKind::Stop) => {
+                // A control step the dead runner claimed never wrote anything, so it goes
+                // straight back to pending: a comparison is not "attempt 2 of 2", and a
+                // decision is not re-made.
+                store::requeue_step(pool, step.id).await?;
+            }
             None => {
                 store::fail_step(pool, step.id, "the step carries an unknown kind").await?;
             }
@@ -402,6 +409,99 @@ async fn advance_step(
                 ..StepOutcome::default()
             })
         }
+        StepKind::Branch => {
+            // A branch is a write like a wait: it succeeds and the run goes on, or it
+            // succeeds and the run *ends* — either way the step itself succeeded, because a
+            // branch that stopped the run is the branch working, not the branch failing.
+            let scope = branch_scope(pool, claimed.execution_id).await?;
+            let outcome = branch::evaluate(&claimed.params, &scope);
+
+            match outcome {
+                Ok(true) => {
+                    let field = claimed
+                        .params
+                        .get("field")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    store::complete_step(
+                        pool,
+                        claimed.id,
+                        &json!({ "branch": { "field": field, "holds": true } }),
+                    )
+                    .await?;
+                    tracing::debug!(step_id = %claimed.id, field, "a branch let the run go on");
+                    Ok(StepOutcome {
+                        settled: settle_after_step(pool, claimed).await?,
+                        ..StepOutcome::default()
+                    })
+                }
+                Ok(false) => {
+                    // The comparison did not hold: the run ends *here*, and every step after
+                    // it is closed as cancelled so the trace shows they were never reached.
+                    let field = claimed
+                        .params
+                        .get("field")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    store::complete_step(
+                        pool,
+                        claimed.id,
+                        &json!({ "branch": { "field": field, "holds": false } }),
+                    )
+                    .await?;
+                    store::end_run_after_branch(pool, claimed.execution_id, claimed.id).await?;
+                    store::settle_execution_as(pool, claimed.execution_id, "completed").await?;
+                    tracing::info!(
+                        step_id = %claimed.id,
+                        field,
+                        "a branch ended the run before the steps after it"
+                    );
+                    Ok(StepOutcome {
+                        settled: Some(ExecutionStatus::Completed),
+                        ..StepOutcome::default()
+                    })
+                }
+                // A field nothing produced: a broken definition, not a branch that decided.
+                Err(message) => {
+                    store::fail_step(pool, claimed.id, &message).await?;
+                    let settled = settle_after_step(pool, claimed).await?;
+                    Ok(StepOutcome {
+                        settled,
+                        ..StepOutcome::default()
+                    })
+                }
+            }
+        }
+        StepKind::Stop => {
+            // A stop is a decision, not a failure: the run completes, the steps after it are
+            // closed, and the trace says why. That is the difference from a step that ran out
+            // of attempts, which is what an operator has to go and fix.
+            let reason = claimed
+                .params
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the run was stopped here")
+                .to_owned();
+
+            store::complete_step(
+                pool,
+                claimed.id,
+                &json!({ "stopped": true, "reason": reason }),
+            )
+            .await?;
+            store::end_run_after_branch(pool, claimed.execution_id, claimed.id).await?;
+            store::settle_execution_as(pool, claimed.execution_id, "completed").await?;
+            tracing::info!(
+                step_id = %claimed.id,
+                step = %claimed.name,
+                reason,
+                "a stop step ended the run"
+            );
+            Ok(StepOutcome {
+                settled: Some(ExecutionStatus::Completed),
+                ..StepOutcome::default()
+            })
+        }
         StepKind::Task => {
             let action = claimed.action.clone().unwrap_or_default();
             let outcome = if actions::is_host_action(&action) {
@@ -421,7 +521,26 @@ async fn advance_step(
                     step_no: claimed.step_no,
                     attempt: claimed.attempts,
                 };
-                handler.execute(&action, &claimed.params, &context).await
+                // A step's `timeout_ms` is a *budget on this attempt*, not a deadline the
+                // engine schedules around: the runner does not sleep, so the only way to
+                // honour it is to stop waiting for the future and record the limit. The
+                // attempt's side effects are the action's own idempotency contract's problem,
+                // which is why every outbound call carries the run id as its key.
+                let budget = std::time::Duration::from_millis(u64::from(
+                    claimed.timeout_ms.clamp(1, 120_000) as u32,
+                ));
+                match tokio::time::timeout(
+                    budget,
+                    handler.execute(&action, &claimed.params, &context),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(format!(
+                        "the step did not answer within {} ms; the action was abandoned",
+                        claimed.timeout_ms
+                    )),
+                }
             } else {
                 actions::run(&action, &claimed.params, claimed.attempts)
             };
@@ -456,6 +575,26 @@ async fn advance_step(
                         });
                     }
 
+                    // Out of attempts. The per-step policy decides whether the run outlives
+                    // it, and this is where the request's "routes to a failure branch" lives
+                    // in v0 shape: `continue` records the failure and lets the rest run, and
+                    // `stop` (or the rule's own policy) ends the run as a failure.
+                    let policy =
+                        effective_on_error(&claimed.on_error, pool, claimed.execution_id).await?;
+                    if policy == OnError::Continue {
+                        store::fail_step_ignored(pool, claimed.id, &message).await?;
+                        tracing::warn!(
+                            step_id = %claimed.id,
+                            step = %claimed.name,
+                            error = %message,
+                            "a step failed and the run was told to continue past it"
+                        );
+                        return Ok(StepOutcome {
+                            settled: settle_after_step(pool, claimed).await?,
+                            ..StepOutcome::default()
+                        });
+                    }
+
                     store::fail_step(pool, claimed.id, &message).await?;
                     tracing::warn!(
                         step_id = %claimed.id,
@@ -471,6 +610,71 @@ async fn advance_step(
             }
         }
     }
+}
+
+/// The object a branch reads: the run's event payload and every finished step's output.
+///
+/// Built per branch, not cached, because a run has at most 50 steps and a branch that reads
+/// a stale output is worse than one that reads a fresh query.
+async fn branch_scope(pool: &PgPool, execution_id: Uuid) -> Result<serde_json::Value> {
+    let event: Option<serde_json::Value> =
+        sqlx::query_scalar("select event_payload from workflow_executions where id = $1")
+            .bind(execution_id)
+            .fetch_optional(pool)
+            .await?;
+
+    let rows: Vec<(i32, Option<serde_json::Value>)> = sqlx::query_as(
+        "select step_no, output from workflow_steps \
+         where execution_id = $1 and output is not null order by step_no",
+    )
+    .bind(execution_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut steps = serde_json::Map::new();
+    for (step_no, output) in rows {
+        steps.insert(
+            step_no.to_string(),
+            output.unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    Ok(json!({
+        "event": event.unwrap_or(serde_json::Value::Null),
+        "steps": serde_json::Value::Object(steps),
+    }))
+}
+
+/// The error policy that applies to a step: its own, or the rule's when it inherits.
+///
+/// The rule's policy is the workflow's own setting; the automation layer has not yet added
+/// a per-rule one (slice 4), so `inherit` means what it meant before the policy existed —
+/// stop. Reading it here rather than at write time means changing the rule changes the runs
+/// that have not reached the step yet.
+async fn effective_on_error(stored: &str, pool: &PgPool, execution_id: Uuid) -> Result<OnError> {
+    let own = OnError::parse(stored).ok_or_else(|| {
+        WorkflowError::invalid(
+            "workflow_store_error",
+            format!("step carries the unknown error policy {stored:?}"),
+        )
+    })?;
+
+    if own != OnError::Inherit {
+        return Ok(own);
+    }
+
+    let rule_policy: Option<String> = sqlx::query_scalar(
+        "select w.on_error from workflows w \
+         join workflow_executions e on e.workflow_id = w.id where e.id = $1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(rule_policy
+        .as_deref()
+        .and_then(OnError::parse)
+        .unwrap_or(OnError::Stop))
 }
 
 /// The site of the workflow behind an execution, for the action context.

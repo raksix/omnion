@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod branch;
 pub mod cron;
 pub mod definition;
 pub mod engine;
@@ -32,6 +33,6 @@ pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};
 pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
 pub use model::{
-    ExecutionStatus, NewWorkflow, StepKind, StepStatus, TriggerKind, Workflow, WorkflowExecution,
-    WorkflowStep,
+    DEFAULT_STEP_TIMEOUT_MS, ExecutionStatus, MAX_STEP_TIMEOUT_MS, NewWorkflow, OnError, StepKind,
+    StepStatus, TriggerKind, Workflow, WorkflowExecution, WorkflowStep,
 };

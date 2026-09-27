@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::actions;
+use crate::branch::MAX_STOP_REASON;
 use crate::cron::CronSchedule;
 use crate::error::{Result, WorkflowError};
-use crate::model::{StepKind, TriggerKind};
+use crate::model::{DEFAULT_STEP_TIMEOUT_MS, MAX_STEP_TIMEOUT_MS, OnError, StepKind, TriggerKind};
 
 /// Most steps one definition may carry.
 pub const MAX_STEPS: usize = 50;
@@ -178,17 +179,37 @@ impl Trigger {
 pub struct StepDefinition {
     /// Display name; unique within the workflow.
     pub name: String,
-    /// `task` or `wait`.
+    /// `task`, `wait`, `branch` or `stop`.
     pub kind: StepKind,
     /// Built-in action of a task step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// Action parameters (task) or `{"seconds": n}` (wait).
+    /// Action parameters (task), `{"seconds": n}` (wait), a comparison (branch) or a reason
+    /// (stop).
     #[serde(default = "empty_params")]
     pub params: Value,
-    /// Attempts allowed in total (1–5); a wait step is never retried.
+    /// What this step's own failure does (REQ-003 slice 2). `inherit` — the default — takes
+    /// the rule's policy, so a definition written before the policy existed behaves exactly
+    /// as it did.
+    #[serde(default = "inherit_error")]
+    pub on_error: OnError,
+    /// How long the step may block before the engine fails it with the limit named. A wait
+    /// parks rather than blocking, so its own bound applies instead.
+    #[serde(default = "default_timeout")]
+    pub timeout_ms: i32,
+    /// Attempts allowed in total (1–5); a control step is never retried.
     #[serde(default = "one")]
     pub max_attempts: i32,
+}
+
+/// Serde default for [`StepDefinition::on_error`]: take the rule's own policy.
+fn inherit_error() -> OnError {
+    OnError::Inherit
+}
+
+/// Serde default for [`StepDefinition::timeout_ms`].
+fn default_timeout() -> i32 {
+    DEFAULT_STEP_TIMEOUT_MS
 }
 
 /// Serde default for [`StepDefinition::max_attempts`]: one attempt, no retries.
@@ -233,6 +254,8 @@ impl StepDefinition {
             kind: StepKind::Task,
             action: Some(action.into()),
             params,
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
             max_attempts: 1,
         }
     }
@@ -245,6 +268,49 @@ impl StepDefinition {
             kind: StepKind::Wait,
             action: None,
             params: serde_json::json!({ "seconds": seconds }),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
+            max_attempts: 1,
+        }
+    }
+
+    /// A branch step: the run ends when `field` does not stand in `operator` against `value`.
+    ///
+    /// The comparison is the engine's, not the automation layer's: a branch reads what a
+    /// *step* produced (`{{steps.2.output.ok}}`), and the engine is what knows a step's
+    /// output. The operator set is the same closed one the panel offers everywhere else.
+    #[must_use]
+    pub fn branch(
+        name: impl Into<String>,
+        field: impl Into<String>,
+        operator: impl Into<String>,
+        value: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: StepKind::Branch,
+            action: Some(crate::branch::BRANCH_ACTION.to_owned()),
+            params: serde_json::json!({
+                "field": field.into(),
+                "operator": operator.into(),
+                "value": value,
+            }),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
+            max_attempts: 1,
+        }
+    }
+
+    /// A stop step: the run ends here, with a reason the trace shows.
+    #[must_use]
+    pub fn stop(name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: StepKind::Stop,
+            action: None,
+            params: serde_json::json!({ "reason": reason.into() }),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
             max_attempts: 1,
         }
     }
@@ -256,9 +322,46 @@ impl StepDefinition {
         self
     }
 
+    /// Set what this step's own failure does.
+    #[must_use]
+    pub fn on_error(mut self, policy: OnError) -> Self {
+        self.on_error = policy;
+        self
+    }
+
+    /// Set how long this step may block.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout_ms: i32) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
     /// Seconds a wait step parks for.
     pub fn wait_seconds(&self) -> Result<i64> {
         wait_seconds_from(&self.params)
+    }
+
+    /// The reason a stop step carries.
+    pub fn stop_reason(&self) -> Result<&str> {
+        let reason = self
+            .params
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if reason.is_empty() {
+            return Err(WorkflowError::invalid(
+                "invalid_stop",
+                "a stop step needs a non-empty `reason` an operator can read",
+            ));
+        }
+        if reason.chars().count() > MAX_STOP_REASON {
+            return Err(WorkflowError::invalid(
+                "invalid_stop",
+                format!("a stop reason is at most {MAX_STOP_REASON} characters"),
+            ));
+        }
+        Ok(reason)
     }
 
     /// Check the step against the engine's rules.
@@ -281,6 +384,12 @@ impl StepDefinition {
                 "invalid_step_params",
                 format!("step \"{name}\" needs a JSON object as its parameters"),
             ));
+        }
+
+        // A control step never blocks on an action, so its timeout is the engine's business
+        // and only a task step's is the author's — a `wait` that blocks would be a bug.
+        if self.kind == StepKind::Task {
+            self.validate_timeout(name)?;
         }
 
         match self.kind {
@@ -313,7 +422,40 @@ impl StepDefinition {
                 }
                 self.wait_seconds().map(|_| ())
             }
+            StepKind::Branch => {
+                if self.max_attempts != 1 {
+                    return Err(WorkflowError::invalid(
+                        "invalid_max_attempts",
+                        format!("step \"{name}\" is a branch; a comparison is not retried"),
+                    ));
+                }
+                crate::branch::validate_params(&self.params)
+                    .map_err(|err| WorkflowError::invalid("invalid_branch", err))
+            }
+            StepKind::Stop => {
+                if self.action.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_stop",
+                        format!("step \"{name}\" is a stop step and cannot name an action"),
+                    ));
+                }
+                self.stop_reason().map(|_| ())
+            }
         }
+    }
+
+    /// A task step's timeout must be positive and inside the engine's ceiling.
+    fn validate_timeout(&self, name: &str) -> Result<()> {
+        if !(1..=MAX_STEP_TIMEOUT_MS).contains(&self.timeout_ms) {
+            return Err(WorkflowError::invalid(
+                "invalid_step_timeout",
+                format!(
+                    "step \"{name}\" allows {} ms; the engine takes 1 to {MAX_STEP_TIMEOUT_MS}",
+                    self.timeout_ms
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Attempts must sit inside the engine's cap.
@@ -519,11 +661,11 @@ mod tests {
     fn unknown_actions_are_refused() {
         let steps = vec![StepDefinition::task(
             "call",
-            "http_request",
+            "smtp_send",
             serde_json::json!({}),
         )];
         let error = WorkflowDefinition::new(Trigger::manual(), steps)
-            .expect_err("v0 ships a closed action set");
+            .expect_err("the action set is closed");
         assert_eq!(error.code(), "invalid_step_action");
         assert!(error.to_string().contains("noop"), "{error}");
     }

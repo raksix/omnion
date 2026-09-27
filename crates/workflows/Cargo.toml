@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 serde.workspace = true
+# The runner applies a step's `timeout_ms` with `tokio::time::timeout` — a per-attempt budget
+# the engine enforces by refusing to wait longer, not by scheduling around (REQ-003 slice 2).
+tokio.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
