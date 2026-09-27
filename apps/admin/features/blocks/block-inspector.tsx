@@ -19,11 +19,13 @@ import type {
   BlockIssue,
   BlockPropSchema,
   BlockRegistry,
+  BlockSettings,
   ContentBlock,
 } from "@omnion/types";
 import { AlertTriangle, Plus, Search } from "lucide-react";
 
 import { categoryLabel, definitionFor, propValue } from "./block-library";
+import { blockSettings } from "./block-tree";
 
 // ---------------------------------------------------------------------------------------------
 // The insert panel
@@ -145,6 +147,8 @@ type InspectorProps = {
   issues: BlockIssue[];
   /** Writing one prop. */
   onChange: (key: string, value: unknown) => void;
+  /** Writing one of the block's own settings (`meta`). */
+  onSetting: (key: keyof BlockSettings, value: string) => void;
   /** The block's manipulation actions (move, duplicate, delete). */
   actions: React.ReactNode;
   /** The breadcrumb that says where the block sits, for a nested selection. */
@@ -159,11 +163,17 @@ export function BlockInspector({
   block,
   issues,
   onChange,
+  onSetting,
   actions,
   breadcrumb,
   onCrumb,
 }: InspectorProps) {
   const definition = definitionFor(registry, block.type);
+  const settings = blockSettings(block);
+  // The API reports a bad setting on a `meta.*` path, and the field that owns it is one of the
+  // three below — matching on the key is what puts the message under the right control instead
+  // of in the generic issue list, where an author cannot tell which box to fix.
+  const metaIssue = issues.find((issue) => issue.path.includes(".meta."));
 
   return (
     <div className="flex flex-col gap-3">
@@ -215,6 +225,65 @@ export function BlockInspector({
               block is removed.
             </p>
           )}
+
+          {/* Visibility. The control is a single "hidden from" choice rather than two switches,
+              because the three states are one setting with three values and the server stores it
+              as one. It says plainly that the block is left out of that render entirely — an
+              author who thinks this is a CSS toggle would not know the block is still in the
+              page for screen readers. */}
+          <fieldset className="flex flex-col gap-1.5 border-t border-line pt-3">
+            <legend className="text-[11px] tracking-wide text-muted uppercase">Visibility</legend>
+            <label htmlFor="block-meta-hide-on" className="flex flex-col gap-1">
+              <span className="text-[12px] font-medium">Hide on</span>
+              <select
+                id="block-meta-hide-on"
+                name="block-meta-hide-on"
+                data-block-hide-on
+                value={settings.hide_on ?? "none"}
+                onChange={(event) => onSetting("hide_on", event.target.value)}
+                className="w-full rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+              >
+                <option value="none">Everywhere</option>
+                <option value="mobile">Phones (left out of the mobile render)</option>
+                <option value="desktop">Desktops (left out of the wide render)</option>
+              </select>
+              <span className="text-[11px] text-muted">
+                A hidden block is not drawn on that screen at all — it is not in the HTML, not in
+                the page outline and not for a screen reader.
+              </span>
+            </label>
+            {metaIssue ? (
+              <span className="text-[11px] text-accent-strong">{metaIssue.message}</span>
+            ) : null}
+          </fieldset>
+
+          {/* Advanced: the addressing settings. They are text fields rather than schema props
+              because nothing about them depends on the block type — an anchor on a heading and
+              an anchor on a pricing table mean exactly the same thing. */}
+          <fieldset className="flex flex-col gap-1.5 border-t border-line pt-3">
+            <legend className="text-[11px] tracking-wide text-muted uppercase">Advanced</legend>
+            <SettingField
+              id="block-meta-anchor"
+              label="Anchor"
+              hint="A page link can point at it as /page#anchor."
+              value={settings.anchor ?? ""}
+              onChange={(value) => onSetting("anchor", value)}
+            />
+            <SettingField
+              id="block-meta-aria"
+              label="Accessible label"
+              hint="Names the block for someone who cannot see it."
+              value={settings.aria_label ?? ""}
+              onChange={(value) => onSetting("aria_label", value)}
+            />
+            <SettingField
+              id="block-meta-class"
+              label="CSS class"
+              hint="Extra class names the active theme may style."
+              value={settings.class ?? ""}
+              onChange={(value) => onSetting("class", value)}
+            />
+          </fieldset>
         </div>
         {actions ? (
           <div className="flex flex-wrap items-center gap-2 border-t border-line px-3 py-2">
@@ -253,6 +322,48 @@ type PropFieldProps = {
   issue: BlockIssue | undefined;
   onChange: (value: unknown) => void;
 };
+
+type SettingFieldProps = {
+  /** DOM id, also the input's `name`. */
+  id: string;
+  /** What the field is called. */
+  label: string;
+  /** What the value is for — a setting is invisible, so its hint is the documentation. */
+  hint: string;
+  /** The value the block carries. */
+  value: string;
+  /** Writing a new value; an empty string clears the setting. */
+  onChange: (value: string) => void;
+};
+
+/**
+ * One of the block's own settings.
+ *
+ * Deliberately a plain labelled input rather than a generated field: a setting has no schema,
+ * no default and no validation rule of its own, so the only thing the author needs from it is
+ * to know what it does. Clearing the box clears the setting — that is what the empty state
+ * means, and it is why `setSetting` deletes the key rather than storing an empty string.
+ */
+function SettingField({ id, label, hint, value, onChange }: SettingFieldProps) {
+  const hintId = `${id}-hint`;
+  return (
+    <label htmlFor={id} className="flex flex-col gap-1">
+      <span className="text-[12px] font-medium">{label}</span>
+      <input
+        id={id}
+        name={id}
+        type="text"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        aria-describedby={hintId}
+        className="w-full rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+      />
+      <span id={hintId} className="text-[11px] text-muted">
+        {hint}
+      </span>
+    </label>
+  );
+}
 
 /** One field of a block, drawn from its schema entry. */
 function PropField({ prop, value, issue, onChange }: PropFieldProps) {

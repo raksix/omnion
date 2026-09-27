@@ -13,7 +13,7 @@
  * public renderer emits, with no editor affordances in it at all.
  */
 import type { BlockIssue, BlockRegistry, ContentBlock } from "@omnion/types";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, EyeOff } from "lucide-react";
 
 import { definitionFor, propValue } from "./block-library";
 
@@ -122,9 +122,22 @@ function CanvasBlock({
       );
 
   const active = samePath(selected, path);
+  // A block the author hid from a viewport is *absent* from that render, so the canvas is the
+  // only place it can be seen at all. Without this badge the setting is invisible: the author
+  // sets it, saves, and the page looks unchanged until a phone is held up to it.
+  const hiddenOn = block.meta?.hide_on;
   const heading = (
     <span className="mb-1 flex items-center gap-2 text-[11px] tracking-wide text-muted uppercase">
       {definition?.label ?? block.type}
+      {hiddenOn && hiddenOn !== "none" ? (
+        <span
+          data-block-hidden-on={hiddenOn}
+          className="inline-flex items-center gap-1 rounded-full bg-quiet-soft px-1.5 py-0.5 text-[10.5px] text-muted normal-case"
+        >
+          <EyeOff className="size-2.5" aria-hidden />
+          Not on {hiddenOn === "mobile" ? "phones" : "desktops"}
+        </span>
+      ) : null}
       {blocking ? (
         <span className="inline-flex items-center gap-1 rounded-full bg-accent-soft px-1.5 py-0.5 text-[10.5px] text-accent-strong normal-case">
           <AlertTriangle className="size-2.5" aria-hidden />

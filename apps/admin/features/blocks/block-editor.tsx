@@ -56,6 +56,7 @@ import {
   removeBlock,
   removeColumn,
   setProp,
+  setSetting,
   walk,
   wordCount,
 } from "@/features/blocks/block-tree";
@@ -543,6 +544,11 @@ export function BlockEditor() {
               issues={selectedIssues}
               onChange={(key, value) =>
                 setBlocks((current) => (selected ? setProp(current, selected, key, value) : current))
+              }
+              onSetting={(key, value) =>
+                setBlocks((current) =>
+                  selected ? setSetting(current, selected, key, value) : current,
+                )
               }
               breadcrumb={crumbs}
               onCrumb={setSelected}

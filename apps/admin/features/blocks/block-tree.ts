@@ -12,7 +12,12 @@
  * Depth is capped by the registry (`MAX_DEPTH` in `crates/content`) rather than here, so the
  * rule the server enforces and the rule the editor offers are the same one.
  */
-import type { BlockDefinition, BlockRegistry, ContentBlock } from "@omnion/types";
+import type {
+  BlockDefinition,
+  BlockRegistry,
+  BlockSettings,
+  ContentBlock,
+} from "@omnion/types";
 
 /** Deepest nesting the editor offers. Mirrors the server's `MAX_DEPTH`. */
 export const MAX_DEPTH = 3;
@@ -141,6 +146,36 @@ export function setProp(
     ...block,
     props: { ...block.props, [key]: value },
   }));
+}
+
+/** The settings a block carries, or an empty object when it has none. */
+export function blockSettings(block: ContentBlock): BlockSettings {
+  return block.meta ?? {};
+}
+
+/**
+ * Set one setting of a block.
+ *
+ * Picking *everywhere* deletes the key rather than storing `none`. Both would render the same,
+ * but only one is what the server and the diff understand — the server normalises `none` away on
+ * save, so a block that kept it would look changed on every load and the author's "reset" would
+ * show up as an edit they never made.
+ */
+export function setSetting(
+  blocks: ContentBlock[],
+  path: number[],
+  key: keyof BlockSettings,
+  value: string,
+): ContentBlock[] {
+  return updateBlock(blocks, path, (block) => {
+    const settings = { ...blockSettings(block) };
+    if (value === "") {
+      delete settings[key];
+    } else {
+      settings[key] = value as never;
+    }
+    return { ...block, meta: settings };
+  });
 }
 
 /** Remove the block at a path, with its subtree. */
