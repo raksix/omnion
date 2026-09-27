@@ -1757,3 +1757,120 @@
   seven Next dev servers, three Next production servers, a 4.2G JVM and the whole QA stack at
   once, and a `Page crashed` is that, not a finding. `summary.json` records the crash as its
   `fatal` and holds no findings, so nothing here is being reported as a pass.
+
+## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
+
+- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
+  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
+  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
+  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
+  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
+  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
+  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
+  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
+  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
+  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
+  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
+  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
+  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
+  three unclaimed worktrees have already collided on 0019.
+- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
+  this part). The cryptography is tested against *real* cryptography, not against itself: the
+  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
+  the genuine signature and reject a tampered one.
+- **The SAML signature check is two checks, and the second one is the one that matters.** XML
+  Signature binds a document to a key in two independent steps, and my first implementation only
+  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
+  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
+  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
+  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
+  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
+  rewrite a claim, the signature alone signs the algorithm but not the document.
+- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
+  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
+  multi-valued attribute as several elements lost half a group membership and under-granted a
+  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
+  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
+  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
+  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
+  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
+  as text fails silently three frames deep.
+- **The disk is a blocker, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
+  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
+  "No space left on device". The reclamation is deliberately conservative: only **derived**
+  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
+  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
+  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
+  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
+  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
+  `node_modules` each) should be pruned — no wave owns them yet.
+- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
+  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
+  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
+  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
+  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
+  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.
+
+## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
+
+- **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
+  that proves both. **`61ef619`** — `crates/identity/src/sso/provisioning.rs` (JIT: match on the
+  stored subject index first, the address second, `JIT_PASSWORD_MARKER` in place of a password,
+  and a *refusal* rather than a silent row when provisioning is off); the identity HTTP client
+  grows the two calls the `code` flow needs; `/api/v1/iam/providers` (list, connect, patch, remove,
+  `…/test` for the discovery check, `…/events` for the sign-in log); and `/api/v1/auth/sso`
+  (the public `providers` list, `start`, the generated SAML panel page, and the `callback` that
+  answers both a `code` query and a posted assertion). **`f599c3c`** — `/settings/iam/authentication`,
+  the nav entry, the API client and the `iam-authentication` pass in `scripts/qa/walkthrough.cjs`.
+  **`apps/api/tests/sso.rs`** — the integration walk.
+- **Proof.** `cargo test -p omnion-identity --lib` → **107 tests, 0 failures**. `cargo test -p
+  omnion-api --lib` → **97 tests, 0 failures**. `cargo test -p omnion-api --test sso` → **1 walk,
+  0 failures** over the real router: the management surface (401 without a session, an empty
+  organization listing no provider and three kinds), a provider created **switched off with JIT
+  off**, the secret answered as a *name* plus a boolean (`secret_present: false` for a variable
+  this process does not define) and no `client_secret` field anywhere in the payload, a bad
+  `secret_ref` refused with `details.field = secret_ref`, an unreadable role mapping refused at save
+  time, the discovery test answering `200 {status: "failed", detail: …}` for an unreachable host, a
+  disabled provider `404 provider_disabled` **and written to the sign-in log**, JIT refusing then
+  provisioning the same identity to `Created` with the marker in `password_hash` and the subject
+  indexed under `sso_subjects`, the second sign-in `Existing` on the same account, a deactivated
+  account staying deactivated, the event log readable over HTTP, removal taking the log with it
+  (`on delete cascade`), and an ambiguous host answered `501 organization_required` rather than
+  guessed.
+- **The two design decisions this tick actually settled.** (1) **A public sign-in has to resolve
+  its own organization.** My first version took "the installation's only organization", which is
+  right for a first-run install and *silently wrong* for a second tenant — a sign-in link for one
+  organization could complete against another. The walk caught it by creating a second organization.
+  It now follows the same rule the public content surface uses: the browser's own host answers for
+  its site, and a site belongs to an organization; several organizations and an unknown host is an
+  honest `501` naming the fix. (2) **A refusal is a fact, not a silence.** A disabled provider
+  refusing to start wrote nothing, so an operator who switched a provider off and then wondered
+  "is anybody still trying to sign in with it?" had no way to find out. `live_provider` now writes
+  the `auth_provider_events` row before refusing.
+- **Two test-authoring bugs the walk caught in itself, both worth naming.** A group claim is only
+  read when the provider *names* one, so a test provider with `group_claim: None` proved nothing
+  about groups — the fixture was wrong, not the code. And a test fixture that registers a globally
+  unique host has to clear a stale one first, or the second run fails on the first run's leftovers.
+- **The disk is still the constraint, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` (one 60 GB loop image shared by eight worktrees' `target/`) fell to **3.1 GB free**
+  during this tick. Reclamation stayed conservative and derived-only: `target/debug/{deps,
+  incremental,build}` in the **unclaimed** `omnion-w5` and `omnion-w7` worktrees, neither of which
+  had a live `cargo`/`rustc`; no source, no branch, no running process touched. That returned
+  17 GB. **Owner action:** the box needs more room, or the unclaimed `omnion-w4`…`omnion-w7`
+  worktrees should be pruned — no wave owns them yet.
+- **A note on where the walk runs.** The shared dev database `omnion` has migration **19** applied
+  from a sibling branch that `main` does not have, so `db.migrate()` refuses with
+  `VersionMissing(19)` and every integration test that migrates fails there. CI starts a clean
+  database and is unaffected. The walk was proven against a fresh `omnion_sso_test` database.
+  **Owner action:** either reconcile the 0019 slot between the waves, or point the local
+  integration runs at a per-branch database.
+- **Next.** The one thing the walk deliberately does not fake: a **full round trip against a live
+  OIDC/SAML provider**. That needs a local stub identity server the walk can point at — discovery
+  document, JWKS, token endpoint and a signed ID token for OIDC; a signed assertion with the
+  enveloped digest for SAML — so the `code` exchange, the RS256 verification, the PKCE binding and
+  the claim → role mapping are all proven end to end rather than one layer at a time. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.
