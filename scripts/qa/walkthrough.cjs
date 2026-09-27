@@ -863,6 +863,185 @@ async function uploadMediaSample(page) {
   };
 }
 
+
+// ---------------------------------------------------------------- AI provider runtime (REQ-097)
+
+// ---------------------------------------------------------------------------------------------
+// The AI provider runtime (REQ-097, slice 1): the protocol-driven form, its own field refusal,
+// a real connection against a live local endpoint, and the five-step connection test.
+// ---------------------------------------------------------------------------------------------
+
+/** A minimal OpenAI-compatible endpoint on loopback, so the test has something real to answer. */
+function startFakeProvider() {
+  const http = require("node:http");
+  const models = { object: "list", data: [{ id: "qa-small" }, { id: "qa-large" }] };
+  const answer = (model) => ({
+    choices: [{ message: { role: "assistant", content: `Hello from the QA mock (${model}).` }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  });
+  const sse = (model) => {
+    const text = `Hello from the QA mock (${model}).`;
+    let out = "";
+    for (const word of text.split(" ")) out += `data: ${JSON.stringify({ choices: [{ delta: { content: word + " " } }] })}\n\n`;
+    out += `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`;
+    out += "data: [DONE]\n\n";
+    return out;
+  };
+
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(models));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
+        const model = body.model || "qa-small";
+        if (body.stream) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(sse(model));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(answer(model)));
+      });
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "not found" } }));
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({ baseUrl: `http://127.0.0.1:${port}/v1`, close: () => server.close() });
+    });
+  });
+}
+
+/**
+ * The AI provider runtime: the form refuses a malformed base URL in the field, a real local
+ * endpoint is connected, the connection test walks its five steps, and a second provider pointed
+ * at nothing names the failing step instead of failing the screen.
+ */
+async function runAiProviderDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-providers", action: "ai-providers", ...step });
+  };
+  const fake = await startFakeProvider();
+
+  try {
+    await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1400);
+
+    // The empty state offers the action that gets past it.
+    const empty = await page.locator("text=No provider is connected yet").count();
+    const connectButton = await page.locator('button:has-text("Connect provider")').count();
+    note({ step: "empty", empty, connectButton });
+    await shot(page, "ai-providers-empty");
+
+    // Open the form and read the protocols the API itself offers.
+    await page.locator('button:has-text("Connect provider")').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const protocolOptions = await page.locator("[data-provider-protocol] option").allTextContents();
+    note({ step: "protocols", options: protocolOptions.join(", "), count: protocolOptions.length });
+
+    // A malformed base URL is refused in the field, not by a bare banner.
+    await page.locator("[data-provider-name]").fill("QA Refused").catch(() => {});
+    await page.locator("[data-provider-url]").fill("not-a-url").catch(() => {});
+    await page.locator('[data-testid="connect-submit"], form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const fieldError = await page.locator("[data-field-error]").count();
+    const fieldErrorText = await page.locator("[data-field-error]").first().innerText().catch(() => "");
+    note({ step: "refusal", fieldError, text: fieldErrorText.replace(/\s+/g, " ").slice(0, 140) });
+    await shot(page, "ai-providers-refusal");
+
+    // Now a real endpoint: the local one the pass just started.
+    await page.locator("[data-provider-name]").fill("QA Local").catch(() => {});
+    await page.locator("[data-provider-kind]").selectOption("local").catch(() => {});
+    await page.locator("[data-provider-url]").fill(fake.baseUrl).catch(() => {});
+    await page.locator('form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+    const listed = await page.locator("[data-provider-kind-badge]").count();
+    const listedName = await page.locator("[data-provider-kind-badge]").first().innerText().catch(() => "");
+    note({ step: "connected", listed, kindBadge: listedName });
+    await shot(page, "ai-providers-connected");
+
+    // The five-step connection test against that live endpoint.
+    await page.locator("[data-provider-test]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(3200);
+    const modal = await page.locator("[data-test-modal]").count();
+    const testSteps = await page.locator("[data-test-step]").count();
+    const stepStates = await page
+      .evaluate(() =>
+        [...document.querySelectorAll("[data-test-step]")].map(
+          (node) => `${node.getAttribute("data-test-step")}:${node.querySelector("span:last-child")?.textContent?.trim() ?? ""}`,
+        ),
+      )
+      .catch(() => []);
+    const summary = await page.locator("[data-test-summary]").innerText().catch(() => "");
+    note({
+      step: "test",
+      modal,
+      steps: testSteps,
+      states: stepStates.join(" | "),
+      summary: summary.replace(/\s+/g, " ").slice(0, 200),
+    });
+    await shot(page, "ai-providers-test");
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.locator('[data-test-modal] button[aria-label*="Close"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+
+    // A provider pointed at nothing: the test names the step, and the row shows the verdict.
+    await page.locator('button:has-text("Connect provider")').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    await page.locator("[data-provider-name]").fill("QA Dead").catch(() => {});
+    await page.locator("[data-provider-kind]").selectOption("local").catch(() => {});
+    await page.locator("[data-provider-url]").fill("http://127.0.0.1:1/v1").catch(() => {});
+    await page.locator('form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    await page.locator('[data-provider-test="QA Dead"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(3200);
+    const failingStep = await page.locator("[data-failing-step]").first().innerText().catch(() => "");
+    const stepTexts = await page
+      .evaluate(() =>
+        [...document.querySelectorAll("[data-test-step]")].map((node) => ({
+          step: node.getAttribute("data-test-step"),
+          status: node.textContent.includes("ms") ? "ran" : "did not run",
+        })),
+      )
+      .catch(() => []);
+    note({ step: "dead", failingStep: failingStep.replace(/\s+/g, " ").slice(0, 160), steps: JSON.stringify(stepTexts) });
+    await shot(page, "ai-providers-dead");
+    await page.locator('[data-test-modal] button[aria-label*="Close"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+
+    // The dead provider's verdict is on the row, and the health dot pairs with its label.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    const dots = await page
+      .evaluate(() =>
+        [...document.querySelectorAll("[data-health-dot]")].map(
+          (node) => `${node.getAttribute("data-health-dot")}:${node.parentElement?.textContent?.trim() ?? ""}`,
+        ),
+      )
+      .catch(() => []);
+    const rowError = await page.locator("[data-provider-error]").count();
+    note({ step: "verdict", dots: dots.join(" | "), rowErrors: rowError });
+    await shot(page, "ai-providers-verdict");
+  } finally {
+    fake.close();
+  }
+
+  report.aiProviders = steps;
+}
+
 // ---------------------------------------------------------------- palette (REQ-002)
 
 /**
@@ -2483,7 +2662,15 @@ async function main() {
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
     executablePath: CHROME,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`],
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      // Several writers run their own pass on one box; a capped renderer cache is what keeps a
+      // pass alive there instead of dying with "Page crashed" on a long walk.
+      "--js-flags=--max-old-space-size=512",
+      "--disable-gpu",
+      `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`,
+    ],
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
@@ -2597,6 +2784,11 @@ async function main() {
     await interact(page, route.name, report);
     report.pages.push({ ...route, diagnostics: diag });
   }
+
+  // The AI provider runtime pass (REQ-097, slice 1): the form's own refusal, a real local
+  // endpoint, the five-step connection test, and a dead endpoint that names its failing step.
+  report.aiProviders = await runAiProviderDepth(page, report);
+  log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
