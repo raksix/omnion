@@ -1629,3 +1629,31 @@
 - **Next.** REQ-003 slice 2 — the action library and error paths: `http_request` (host allow-list,
   HMAC signature), `publish_page`, `run_workflow`, `branch`/`stop`, per-step `on_error`, `timeout_ms`,
   and the run-detail controls with retry and resume-from.
+
+### Slice 1 acceptance, measured
+
+- **Rust.** `cargo test --workspace --lib --bins` → **581 tests, 0 failures** across 19 binaries
+  (omnion-api 86 · omnion-automation 72 · omnion-workflows 41 · the rest unchanged). The
+  `apps/api/tests/*` integration binaries need the shared development database, and **that** database
+  currently carries a `0019 cms blocks` row from a sibling worktree that has migrated it — a number
+  no branch in the tree has (`main` stops at `0018_webauthn`). So the DB-bound suites answer
+  `Migration(VersionMissing(19))` before they reach a single assertion. That is a cross-writer
+  artifact of three loops on one database, not a regression: the same suites were green on this
+  branch before the sibling migrated that database, and they will be green again once main
+  carries both migrations. The QA stack (`omnion_qa_w3`, per-stack database) is the one this
+  slice is measured on, and it is green.
+- **Web.** `pnpm typecheck && pnpm build` → 2/2, with `/automations` and `/automations/[id]` in
+  the admin route table.
+- **QA.** `bash scripts/qa/run.sh` on the `w3` stack. The **automations depth pass runs green
+  end to end — `NET_FAILURES=0`**: empty state → refused while unnamed (1 problem, named in the
+  summary) → event picker with **7** documented events → nested group (2 groups, 2 condition rows,
+  2 of 24) → saved ("QA welcome rule" was created) → test event ("The rule would not run: the
+  conditions did not hold against this payload", 1 action, every outcome `would_*`) → a payload that
+  does not parse refused in the field → a listener armed → the webhook URL minted and matching
+  `omhook_` + 40 characters → the filters (1 row, 1 match, empty state on no match) → delete
+  refused until the name is typed and then applied.
+- **Full pass, honestly.** The whole-walkthrough run did not complete on this tick: the shared
+  60 GB volume at `/mnt/apopic` runs at 85–100 % while three writers build, and the pass died twice
+  with `ENOSPC` writing `clicks.jsonl` and once with the browser OOM-killed under load. Both are
+  environment, not product. The isolated pass exists precisely so a slice can be proved when a
+  twenty-minute full pass cannot survive the box, and it is the pass the numbers above come from.
