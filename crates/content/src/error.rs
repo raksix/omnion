@@ -24,6 +24,9 @@ pub enum ContentError {
     /// A summary is not usable (too long).
     #[error("invalid summary: {0}")]
     InvalidSummary(String),
+    /// A block payload is not a block tree this platform can read (REQ-063).
+    #[error("invalid blocks: {0}")]
+    InvalidBlock(String),
     /// A page type key is not usable.
     #[error("invalid page type: {0}")]
     InvalidPageType(String),
@@ -67,6 +70,7 @@ impl ContentError {
             Self::InvalidBody(_) => "invalid_body",
             Self::InvalidComment(_) => "invalid_comment",
             Self::InvalidSummary(_) => "invalid_summary",
+            Self::InvalidBlock(_) => "invalid_block",
             Self::InvalidPageType(_) => "invalid_page_type",
             Self::InvalidStatus(_) => "invalid_status",
             Self::InvalidLanguage(_) => "invalid_language",

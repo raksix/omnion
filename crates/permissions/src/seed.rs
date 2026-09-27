@@ -77,6 +77,9 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.publish",
             "content.pages.schedule",
             "content.pages.restore",
+            "content.blocks.read",
+            "content.patterns.manage",
+            "content.templates.manage",
             "media.read",
             "media.upload",
             "media.update",
@@ -122,6 +125,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.publish",
             "content.pages.schedule",
             "content.pages.restore",
+            "content.blocks.read",
             "media.read",
             "media.update",
             "ai.chat",
@@ -145,6 +149,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.update",
             "content.pages.publish",
             "content.pages.schedule",
+            "content.blocks.read",
             "media.read",
             "media.upload",
             "media.update",
@@ -499,6 +504,10 @@ mod tests {
             !keys.contains(&"search.manage"),
             "running the index is not a member's power"
         );
+        assert!(
+            !keys.contains(&"content.blocks.read"),
+            "the block registry is not a member's power"
+        );
 
         let editor = BASE_ROLES
             .iter()
@@ -512,6 +521,14 @@ mod tests {
         assert!(
             !keys.contains(&"users.read"),
             "editors do not read accounts"
+        );
+        assert!(
+            keys.contains(&"content.blocks.read"),
+            "editors read the block registry they author against"
+        );
+        assert!(
+            !keys.contains(&"content.patterns.manage"),
+            "a saved pattern is a library asset, not an editor's call"
         );
     }
 }

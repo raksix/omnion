@@ -73,6 +73,7 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
+pub mod blocks;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -338,6 +339,16 @@ pub fn router(state: AppState) -> Router {
 
     // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
     // history needs the read key; every mutation carries its own.
+    // The block registry (REQ-063, slice 1): the registry document and the dry-run validator
+    // both change nothing, so they read with `content.blocks.read` — the power an editor needs
+    // to author against the registry at all. Writing a block tree is `content.pages.update` on
+    // the page it belongs to, so the two halves of the editor carry the two keys that mean
+    // something: "may I see what I can build" and "may I change this page".
+    let blocks_registry =
+        get(blocks::list_blocks).layer(guards::require(&state, "content.blocks.read"));
+    let blocks_validate =
+        post(blocks::validate_blocks).layer(guards::require(&state, "content.blocks.read"));
+
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
         .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
@@ -724,6 +735,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{id}/domains", domains)
         .route("/sites/{id}/domains/{domain_id}", domain)
         .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
+        .route("/blocks", blocks_registry)
+        .route("/blocks/validate", blocks_validate)
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)

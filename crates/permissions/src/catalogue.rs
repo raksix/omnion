@@ -58,6 +58,24 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Restore an earlier revision",
     },
+    // The block system (REQ-063). Reading the block registry and validating a block tree touch
+    // nothing, so they ride the read key a content editor already holds; the pattern library is
+    // its own surface because a pattern is a reusable asset other pages depend on.
+    PermissionDef {
+        key: "content.blocks.read",
+        category: "content",
+        description: "Read the block registry and validate block trees",
+    },
+    PermissionDef {
+        key: "content.patterns.manage",
+        category: "content",
+        description: "Create, edit and remove content patterns",
+    },
+    PermissionDef {
+        key: "content.templates.manage",
+        category: "content",
+        description: "Create and edit page templates",
+    },
     // Media.
     PermissionDef {
         key: "media.read",
@@ -599,6 +617,24 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("analytics"),
                 "{key} belongs to the analytics category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_system_family_is_catalogued() {
+        // REQ-063: the registry and its dry-run validator change nothing, so they read with the
+        // rest of the content surface; the pattern and template libraries are their own powers
+        // because a saved asset is depended on by pages other than the one that made it.
+        for key in [
+            "content.blocks.read",
+            "content.patterns.manage",
+            "content.templates.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("content"),
+                "{key} belongs to the content category"
             );
         }
     }

@@ -21,7 +21,7 @@ use omnion_content::{comments, pages, translations};
 use omnion_events::{NewEvent, bus};
 use omnion_identity::sites::{self, Site};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -52,6 +52,9 @@ pub struct RevisionBody {
     pub body: String,
     /// Short summary, when the author wrote one.
     pub summary: Option<String>,
+    /// The page's block tree as stored JSON (REQ-063). `[]` for a revision that renders from
+    /// its body, which is every revision written before the block system.
+    pub blocks: Value,
     /// Revision this one was restored from, when it was.
     pub restored_from_id: Option<Uuid>,
     /// Creation timestamp, RFC 3339.
@@ -72,6 +75,7 @@ impl From<&PageRevision> for RevisionBody {
             title: revision.title.clone(),
             body: revision.body.clone(),
             summary: revision.summary.clone(),
+            blocks: revision.blocks.clone(),
             restored_from_id: revision.restored_from_id,
             created_at: revision.created_at,
             published_at: revision.published_at,
@@ -225,6 +229,9 @@ pub struct UpdatePageRequest {
     /// New summary; an empty string clears it (appends a revision).
     #[serde(default)]
     pub summary: Option<String>,
+    /// New block tree as stored JSON (REQ-063, appends a revision after validation).
+    #[serde(default)]
+    pub blocks: Option<Value>,
 }
 
 impl UpdatePageRequest {
@@ -235,6 +242,7 @@ impl UpdatePageRequest {
             title: self.title,
             body: self.body,
             summary: self.summary,
+            blocks: self.blocks,
         }
     }
 }
@@ -370,6 +378,26 @@ pub async fn update_page(
         pages::update_page(state.db().pool(), page.id, &changes, Some(current.user.id)).await?;
     let body = load_page_body(&state, &updated).await?;
 
+    // A block save is a structural change, and the platform's own bus is where downstream
+    // listeners learn about those. The payload carries the count, never the tree: the events
+    // surface is read by integrations that must not be handed a page's whole body.
+    if let Some(draft) = &body.draft {
+        let block_count = omnion_content::validate(&draft.blocks).block_count;
+        let _report = bus::emit(
+            state.db().pool(),
+            NewEvent::new("content.blocks.updated")
+                .organization(site_of(&state, updated.site_id).await?.organization_id)
+                .site(updated.site_id)
+                .actor(current.user.id)
+                .payload(json!({
+                    "page_id": updated.id,
+                    "revision_no": draft.revision_no,
+                    "block_count": block_count,
+                })),
+        )
+        .await?;
+    }
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "page.updated")
@@ -378,6 +406,7 @@ pub async fn update_page(
                 "slug": updated.slug,
                 "revision_no": body.draft.as_ref().map(|draft| draft.revision_no),
                 "content_changed": appends,
+                "blocks_changed": changes.blocks.is_some(),
             }))
             .ip_address(address.as_text())
             .organization(site_of(&state, updated.site_id).await?.organization_id),
@@ -424,6 +453,23 @@ pub async fn publish_page(
     let page = page_in_scope(&state, &current, page_id).await?;
     let site = site_of(&state, page.site_id).await?;
 
+    // A draft whose block tree still has an error is refused here, not rendered: the editor's
+    // Save is deliberately allowed to keep an incomplete tree (an author is mid-sentence), so
+    // publication is the moment the page has to be whole. The message names the first block and
+    // what it needs, which is the sentence the author has to act on.
+    if let Some(draft) = pages::current_draft(state.db().pool(), page.id).await? {
+        let report = omnion_content::validate(&draft.blocks);
+        if let Some(issue) = report.first_error() {
+            return Err(ApiError::bad_request(
+                "blocks_not_publishable",
+                format!(
+                    "this page cannot be published yet: {} (block {}, {})",
+                    issue.message, issue.block_id, issue.path
+                ),
+            ));
+        }
+    }
+
     let (page, published) = pages::publish_page(state.db().pool(), page.id).await?;
 
     // Fan-out (docs/BUILD-BACKLOG.md P12): the platform's own bus records the publication, and
@@ -445,6 +491,7 @@ pub async fn publish_page(
                 "revision_id": published.id,
                 "revision_no": published.revision_no,
                 "title": published.title,
+                "block_count": omnion_content::validate(&published.blocks).block_count,
             })),
     )
     .await?;
@@ -768,6 +815,7 @@ mod tests {
             title: None,
             body: None,
             summary: None,
+            blocks: None,
         }
         .changes();
         assert_eq!(rename.slug.as_deref(), Some(" About "));
@@ -778,9 +826,27 @@ mod tests {
             title: None,
             body: None,
             summary: None,
+            blocks: None,
         }
         .changes();
         assert!(empty.is_empty(), "an empty patch changes nothing");
+    }
+
+    #[test]
+    fn a_block_only_patch_is_a_content_change() {
+        // REQ-063: blocks live on the revision, so saving a block tree writes a draft revision
+        // exactly like saving the body does. A panel that only sends `blocks` must therefore
+        // never look like a no-op.
+        let blocks_only = UpdatePageRequest {
+            slug: None,
+            title: None,
+            body: None,
+            summary: None,
+            blocks: Some(serde_json::json!([])),
+        }
+        .changes();
+        assert!(blocks_only.touches_content());
+        assert!(!blocks_only.is_empty());
     }
 
     #[test]

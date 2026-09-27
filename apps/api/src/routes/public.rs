@@ -67,6 +67,9 @@ pub struct PublicRevisionBody {
     pub body: String,
     /// Summary, when the author wrote one.
     pub summary: Option<String>,
+    /// The block tree the theme renders (REQ-063). `[]` when the revision predates the block
+    /// system — the renderer then draws the body, so released content never breaks.
+    pub blocks: serde_json::Value,
     /// When the revision was published, when it ever was.
     #[serde(with = "time::serde::rfc3339::option")]
     pub published_at: Option<OffsetDateTime>,
@@ -161,6 +164,7 @@ pub async fn get_published_page(
             title: revision.title,
             body: revision.body,
             summary: revision.summary,
+            blocks: revision.blocks,
             published_at: revision.published_at,
         },
     }))
