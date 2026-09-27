@@ -1751,3 +1751,9 @@
 - **Next.** The rest of slice 2: nested `columns` with breadcrumb selection, `hide_on` applied
   server-side, heading-order linting surfaced as block warnings, the block-level diff on
   `/pages/<id>/revisions` and the inline-editing frame at `/pages/<id>/preview`.
+- **Second pass, on the tmpfs.** `QA_OUT_ROOT=/dev/shm/omnion-qa-w2` → the pass reached **screen 24 of 42**
+  (`/analytics/pages`) with **733 control interactions and 495 screenshots** before the browser
+  page crashed. Both earlier failures were the volume; this one is the container: the box runs
+  seven Next dev servers, three Next production servers, a 4.2G JVM and the whole QA stack at
+  once, and a `Page crashed` is that, not a finding. `summary.json` records the crash as its
+  `fatal` and holds no findings, so nothing here is being reported as a pass.
