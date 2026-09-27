@@ -1740,6 +1740,26 @@
   the conversation, and the protocol *requires* an answer budget, so a caller that set none gets
   the platform's default instead of an unanswerable request.
 - **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`).
+- **Proof (QA).** The pass on the private `w7` stack (ports 18086/3106/3206, database
+  `omnion_qa_w7`) recorded **1 066 clicks over 22 screens with zero console errors**; the one
+  `click-error` in the log is on `analytics-forms`, which this slice does not touch. The new
+  `ai-providers` pass reads: empty state with a working Connect action → a malformed base URL
+  refused **in the field** ("a base URL must start with http:// or https://") → a real local
+  endpoint connected with its **Local** badge → the five-step test green on every applicable
+  step (`resolve 342 ms · tls not applicable ("the endpoint is plain http") · auth 0 ms ·
+  models 0 ms · stream 22 ms`, 367 ms in total, "serves 2 models, none registered yet") → a
+  second provider on a dead port stopping at **resolve** ("the test stopped at resolve: the host
+  did not answer") with every later step unrun → the rows carrying `down:Down` / `ok:Ok` and the
+  dead provider's stored error after a reload. Evidence in
+  `docs/qa/evidence/req-097-slice1/`.
+- **One defect the pass found, fixed in this tick (`0ea6306`).** The protocol select read ONE
+  option where there are three, and the cause was two bugs: the form fetched `/ai/protocols`
+  inside the same `Promise.all` as the provider and model lists, so a failure in either discarded
+  a good answer, and the fallback itself held a single entry — which is not a choice and hid the
+  fact that the runtime ships three adapters. All three calls now settle independently
+  (`allSettled`), and the fallback carries all three. Re-proved against the running stack: three
+  options, the note under the select follows the chosen protocol, the key field is a
+  `type="password"` input rendering no value, zero console errors.
 - **Next.** REQ-097 slice 2 — the capability flags on `ai_models` (image generation, audio
   generation, transcription, JSON mode, `max_output_tokens`), the Models tab, discovery as a
   reviewable diff with an explicit apply, and router enforcement of each flag.
