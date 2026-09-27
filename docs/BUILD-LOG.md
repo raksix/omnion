@@ -1581,3 +1581,64 @@
 - **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
+
+## 2026-09-27 — REQ-006 slice 4b-1 · Permission requests → approvals, and SCIM 2.0 provisioning
+
+- **What shipped.** `crates/identity` gained the SCIM provisioning token store (`mc_…`-style
+  secrets hashed at rest, mint/verify, revocation, and the sync log the panel reads);
+  `crates/permissions` gained `approvals` — a request asks for ONE permission with a reason and a
+  window, a decision turns it into a **time-boxed binding** (`grant-<permission>`, priority 100,
+  `expires_at`), so an approved request grants exactly inside its window and expires on its own with
+  nobody acting. The API serves `GET/POST /iam/approval-requests`, `POST /{id}/approve|reject`,
+  `GET/POST /iam/provisioning/tokens`, `DELETE /iam/provisioning/tokens/{id}` and the SCIM 2.0
+  surface (`GET /scim/v2/Users`, `POST /scim/v2/Users`, `PATCH /scim/v2/Users/{id}`,
+  `GET /scim/v2/ServiceProviderConfig`) behind a bearer token, with `iam.approval.requested|
+  approved|rejected` events and audit rows. The panel gained `/settings/iam/approvals` (inbox with
+  a request form, approve/reject with a note, the window chip, the decided tabs) and
+  `/settings/iam/provisioning` (token minting with the secret shown once, revocation, and the sync
+  log with created/updated/deactivated rows).
+- **Proof (Rust).** `cargo test --workspace` → **660 tests, 0 failures** (exit 0, 54 suites; +7 on
+  this slice: `apps/api/tests/iam_approvals.rs::an_approved_request_grants_only_inside_its_window`
+  — the granted window is moved into the past and the permission leaves with nobody acting, the
+  member cannot read the inbox, decide, or read the user list after a refusal, and the audit trail
+  carries the three events — and `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs`,
+  which creates → patches → deactivates a user over the real router and reads the sync log back).
+  **Run it against a database of your own:** the shared development database now carries migrations
+  0019/0020 applied by the concurrent sibling clones (branches for later REQs), so every suite that
+  migrates dies with `Migration(VersionMissing(19))`. `docker exec omnion-postgres psql -U omnion
+  -d postgres -c "CREATE DATABASE omnion_tickbuild"` then
+  `OMNION_DATABASE_URL=…/omnion_tickbuild cargo test --workspace` is green; the failures are
+  cross-branch interference, not the tree.
+- **Proof (web).** `pnpm typecheck && pnpm build` → exit 0, both apps.
+- **Proof (QA).** `bash scripts/qa/run.sh` (stack `b`: ports 18090/3110/3240, database
+  `omnion_qa_b`) → `qa-artifacts/20260927-175102`: **29 pages, 855 clicks, 72 field fills, 887
+  screenshots, 5 findings (0 high** · 5 medium · 0 low — the five carried-forward
+  public-renderer root 404s; the renderer correctly answers “nothing published here” for a site
+  with no page at its root and the pass still records it)**, vision review 3 items on the analytics
+  screens (medium ×2: the analytics-settings snippet block clips its last line; low ×1: the legend
+  names a `Page views` series the chart does not draw — REQ-007 territory, untouched here). The new
+  passes read: **iam-approvals** — request created (0 → 1 pending) → approved (window chip
+  `expires 9/27/2026, 7:04:07 PM · 30m`) → rejected (1 in the decided tab) → an unshaped
+  permission key refused in the field; **iam-provisioning** — token minted (1 → 2, secret shown
+  once) → SCIM round trip (create `201` active, patch `200` deactivated, listed once) → sync log (2
+  rows: one created, one deactivated, with its sentence) → revoked (2 revoked, the next SCIM call
+  `401`). Both screens are walked on desktop and mobile.
+- **The pass caught its own machinery, and that was the finding to fix.** Run `20260927-163614`
+  reported 13 high hydration console errors across six screens (`/search`, `/settings/search`,
+  `/settings/iam`, `/users`, `/groups`, `/sessions`) and a media `503`. Root cause of the hydration
+  reports: the pass stamps `data-qa-idx` on every element and clicks the moment a document is
+  ready — inside `next dev`'s hydration window; five out-of-band Playwright probes could not
+  reproduce a mismatch without the pass's own writes, the markup involved carries no data, and the
+  same pages were clean in every earlier pass. The apps now announce hydration
+  (`apps/admin/components/app-ready.tsx` sets `data-app-ready="1"` from an effect) and every
+  navigation in `scripts/qa/walkthrough.cjs` waits for that mark before anything touches the page —
+  the next pass: **0 hydration reports, 0 high findings**. Two more run-time lessons: the media
+  `503` did not survive re-checking (30 consecutive list requests plus the page's own loads, all
+  `200` — a transient of the disposable stack), and the web checks had been reading port `3220`,
+  which on this box belongs to an unrelated application (the published-page check read a stranger's
+  login screen). The stack now names its own ports (`QA_WEB_PORT=3240`), its own database and its
+  own report file, and the published sample reads back as `200 · “QA Sample Page · QA Site” ·
+  heading “QA Sample Page” · Revision 2`.
+- **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
+  organization with JIT provisioning and claim → role mapping, local sign-in staying available.
+  That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
