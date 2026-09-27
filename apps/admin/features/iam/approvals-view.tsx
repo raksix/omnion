@@ -36,6 +36,14 @@ const WINDOWS: { label: string; minutes: number }[] = [
 
 const TABS = ["pending", "approved", "rejected", "expired", "all"] as const;
 
+/**
+ * Shape of a permission key (`iam.policies.read`): the field refuses anything else before the
+ * request leaves the browser, so a mistyped ask never becomes a `400` in the console — the API's
+ * own refusals (an unknown key, an unusable window) are proven over HTTP in
+ * `apps/api/tests/iam_approvals.rs`.
+ */
+const KEY_SHAPE = /^[a-z][a-z0-9_-]*(\.[a-z0-9_*-]+)*$/;
+
 /** `true` when the API refused because the caller may not read the inbox. */
 function isForbidden(cause: unknown): boolean {
   return cause instanceof ApiError && cause.status === 403;
@@ -146,13 +154,21 @@ export function ApprovalsView() {
   }, [user, platformAccount, selectedOrg, loadMine]);
 
   const submitAsk = async () => {
+    const permission = askPermission.trim();
+    if (!KEY_SHAPE.test(permission)) {
+      setError(
+        "A permission key looks like `iam.policies.read` — lowercase letters, dots and dashes.",
+      );
+      return;
+    }
+
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
       const resource = askResource.trim();
       const created = await createIamRequest({
-        permissionKey: askPermission.trim(),
+        permissionKey: permission,
         justification: askJustification.trim(),
         resourceType: resource ? "path" : null,
         resourceId: resource || null,
