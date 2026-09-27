@@ -368,6 +368,7 @@ export function UsersView() {
         <select
           value={statusFilter}
           data-users-status
+          aria-label="Filter by status"
           onChange={(event) => setStatusFilter(event.target.value)}
           className="h-8 rounded-lg border border-line bg-surface px-2 text-[12.5px] text-ink outline-none focus:border-accent"
         >
@@ -379,6 +380,7 @@ export function UsersView() {
         <select
           value={mfaFilter}
           data-users-mfa
+          aria-label="Filter by MFA requirement"
           onChange={(event) => setMfaFilter(event.target.value)}
           className="h-8 rounded-lg border border-line bg-surface px-2 text-[12.5px] text-ink outline-none focus:border-accent"
         >
@@ -389,6 +391,7 @@ export function UsersView() {
         <select
           value={roleFilter}
           data-users-role
+          aria-label="Filter by role"
           onChange={(event) => setRoleFilter(event.target.value)}
           className="h-8 rounded-lg border border-line bg-surface px-2 text-[12.5px] text-ink outline-none focus:border-accent"
         >
