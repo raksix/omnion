@@ -49,6 +49,20 @@ wait_http() { # url, seconds
   return 1
 }
 
+# The browser pass is the heaviest step in the loop and several worktrees may run
+# side by side. Take a slot first so the passes queue instead of all landing on the
+# machine at once; the wait is bounded and then the pass proceeds regardless.
+QA_SLOT_PID=""
+if [ "${QA_SLOTS:-2}" != "0" ]; then
+  step "waiting for a QA slot (max ${QA_SLOTS:-2} concurrent passes)"
+  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-900}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  export QA_SLOT_PID
+fi
+# Free the place whenever this pass ends, however it ends.
+if [ -n "$QA_SLOT_PID" ]; then
+  trap 'kill "$QA_SLOT_PID" 2>/dev/null || true' EXIT INT TERM
+fi
+
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
