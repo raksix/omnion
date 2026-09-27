@@ -33,6 +33,8 @@ import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import {
   ApiError,
+  type AiCapability,
+  type AiDiscoveryReport,
   type AiHealthStatus,
   type AiModel,
   type AiProtocol,
@@ -41,6 +43,7 @@ import {
   type AiProviderKind,
   type AiTestReport,
   type AiTestStep,
+  applyAiProviderDiscovery,
   connectAiProvider,
   discoverAiProviderModels,
   fetchAiModels,
@@ -54,6 +57,42 @@ import {
   updateAiProvider,
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
+
+/**
+ * The PATCH body for one capability toggle.
+ *
+ * The panel's toggle names are the API's wire names — the catalog ships with the model, so this
+ * is a lookup rather than a second list that could fall behind the crate.
+ */
+function capabilityPatch(
+  capability: AiCapability,
+  on: boolean,
+): Parameters<typeof updateAiModel>[1] {
+  switch (capability) {
+    case "streaming":
+      return { supportsStreaming: on };
+    case "tools":
+      return { supportsTools: on };
+    case "vision":
+      return { supportsVision: on };
+    case "json_mode":
+      return { supportsJsonMode: on };
+    case "embeddings":
+      return { supportsEmbeddings: on };
+    case "image_generation":
+      return { supportsImageGeneration: on };
+    case "audio_generation":
+      return { supportsAudioGeneration: on };
+    case "transcription":
+      return { supportsTranscription: on };
+    // `chat` is true for every registered model and `list_models` is a fact about the endpoint.
+    // The editor renders both read-only, and this is the guard that keeps a future caller from
+    // sending a PATCH the server would have to ignore silently.
+    case "chat":
+    case "list_models":
+      return {};
+  }
+}
 
 /** One capability pill under a model. */
 function Flag({ label, on }: { label: string; on: boolean }) {
@@ -89,6 +128,142 @@ function HealthDot({ status }: { status: AiHealthStatus }) {
 }
 
 /** The five steps of the connection test, each with its own verdict. */
+/**
+ * The capability editor of one model.
+ *
+ * The catalog comes from the API with the model, so this component never compiles a flag list of
+ * its own: a capability added to the crate appears here with its own note, and `editable` says
+ * which toggles are the model's to claim. Every toggle writes through immediately, because a
+ * flag the panel shows and a flag the router reads are the same column — an operator who
+ * switched vision off must be able to see the effect in the very next request, not after a
+ * second Save.
+ */
+function CapabilityEditor({
+  model,
+  onToggle,
+  disabled,
+}: {
+  model: AiModel;
+  onToggle: (capability: AiCapability, on: boolean) => void;
+  disabled: boolean;
+}) {
+  const claimed = new Set(model.capabilities);
+
+  return (
+    <div
+      data-capability-editor={model.model_id}
+      className="mt-2 flex flex-col gap-1.5 rounded-lg border border-line bg-canvas px-2.5 py-2"
+    >
+      <p className="text-[11px] text-muted">
+        What this model can do. The router refuses a request that needs a flag switched off here,
+        before any call leaves the platform.
+      </p>
+      <div className="grid gap-x-4 gap-y-1 sm:grid-cols-2">
+        {model.capability_catalog.map((entry) => {
+          const on = claimed.has(entry.capability);
+          return (
+            <label
+              key={entry.capability}
+              title={entry.note}
+              className="flex items-start gap-2 text-[11.5px]"
+            >
+              <input
+                type="checkbox"
+                checked={on}
+                disabled={disabled || !entry.editable}
+                onChange={(event) => onToggle(entry.capability, event.target.checked)}
+                data-capability-flag={`${model.model_id}:${entry.capability}`}
+                className="mt-0.5 size-3.5 shrink-0 accent-[var(--color-accent)] disabled:opacity-50"
+              />
+              <span className={entry.editable ? "" : "text-muted"}>
+                {entry.capability.replace(/_/g, " ")}
+                {entry.editable ? null : (
+                  <span className="ml-1 text-[10.5px] uppercase tracking-wide text-muted">
+                    (endpoint)
+                  </span>
+                )}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What a discovery run found, as a reviewable diff.
+ *
+ * The apply button is disabled on an empty diff and says so, rather than being a live button
+ * that writes nothing: the second run after an apply is exactly the case where the operator
+ * needs to be told "already up to date" instead of being shown a button that does not work.
+ */
+function DiscoveryDiff({
+  report,
+  busy,
+  onApply,
+}: {
+  report: AiDiscoveryReport;
+  busy: boolean;
+  onApply: () => void;
+}) {
+  const tone: Record<AiDiscoveryReport["lines"][number]["action"], string> = {
+    added: "bg-accent-soft text-accent-strong",
+    changed: "bg-caution-soft text-caution",
+    removed: "bg-danger-soft text-danger",
+  };
+
+  return (
+    <div
+      data-discovery-diff={report.provider_name}
+      className="mt-2 flex flex-col gap-2 rounded-lg border border-line bg-canvas px-2.5 py-2"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[12px] font-medium">Discovery</span>
+        <span data-discovery-counts className="text-[11.5px] text-muted">
+          {report.added} to add · {report.changed} to change · {report.removed} to remove ·{" "}
+          {report.reported_count} reported, {report.stored_count} stored
+        </span>
+        <button
+          type="button"
+          disabled={busy || report.up_to_date}
+          onClick={onApply}
+          data-discovery-apply={report.provider_name}
+          className="ml-auto rounded-lg bg-accent px-2.5 py-1 text-[11.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
+        >
+          {report.up_to_date ? "Already up to date" : "Apply this diff"}
+        </button>
+      </div>
+
+      {report.up_to_date ? (
+        <p data-discovery-uptodate className="text-[11.5px] text-muted">
+          The provider serves exactly what the registry holds. Nothing to apply.
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {report.lines.map((line) => (
+            <li
+              key={`${line.action}:${line.model_key}`}
+              data-discovery-line={`${line.action}:${line.model_key}`}
+              className="flex flex-wrap items-center gap-2 text-[11.5px]"
+            >
+              <span
+                className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${tone[line.action]}`}
+              >
+                {line.action}
+              </span>
+              <span className="font-mono">{line.model_key}</span>
+              {line.changed_fields.length > 0 ? (
+                <span className="text-muted">({line.changed_fields.join(", ")})</span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function TestSteps({ steps }: { steps: AiTestStep[] }) {
   const icon = (status: AiTestStep["status"]) => {
     if (status === "ok") {
@@ -252,6 +427,12 @@ export function AiView() {
   const [editing, setEditing] = useState<string | null>(null);
   const [editingKeys, setEditingKeys] = useState("");
 
+  // Slice 2 (REQ-097): the capability editor and the discovery diff. Both are per-model and
+  // per-provider, so both are keyed by the row they belong to rather than living in one global
+  // piece of state — a diff from one provider must never appear under another.
+  const [flagsOpen, setFlagsOpen] = useState<string | null>(null);
+  const [discovery, setDiscovery] = useState<Record<string, AiDiscoveryReport>>({});
+
   // The chat.
   const [chatModel, setChatModel] = useState("");
   // A prompt handed over by the palette's `Ask AI` row arrives in the URL; the reader still
@@ -373,6 +554,63 @@ export function AiView() {
         cause instanceof ApiError ? cause.message : "The provider could not be connected.";
       setFieldError({ field: fieldOf(message), message });
       setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Write one capability flag and say so.
+   *
+   * The change lands in the same column the router reads, so the notice names the capability
+   * rather than a generic "saved" — an operator needs to know that the next request will now be
+   * refused (or no longer refused) because of this exact flag.
+   */
+  const setCapability = async (model: AiModel, capability: AiCapability, on: boolean) => {
+    await run(
+      () => updateAiModel(model.id, capabilityPatch(capability, on)),
+      `${model.model_key}: ${capability.replace(/_/g, " ")} ${on ? "enabled" : "disabled"}.`,
+    );
+  };
+
+  const runDiscovery = async (provider: AiProvider) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const found = await discoverAiProviderModels(provider.id);
+      setDiscovery((current) => ({ ...current, [provider.id]: found }));
+      setNotice(
+        found.up_to_date
+          ? `${provider.name} serves exactly what the registry holds.`
+          : `${provider.name}: ${found.added} to add, ${found.changed} to change, ${found.removed} to remove.`,
+      );
+    } catch (cause: unknown) {
+      setError(cause instanceof ApiError ? cause.message : "The provider could not be asked.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyDiscovery = async (provider: AiProvider) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const applied = await applyAiProviderDiscovery(provider.id);
+      // The diff that comes back is the one that *was* applied; re-read so the panel shows the
+      // state after the write rather than the request that caused it.
+      const after = await discoverAiProviderModels(provider.id);
+      setDiscovery((current) => ({ ...current, [provider.id]: after }));
+      setNotice(
+        applied.up_to_date
+          ? `${provider.name} was already up to date.`
+          : `${provider.name}: applied ${applied.added} added, ${applied.removed} removed.`,
+      );
+    } catch (cause: unknown) {
+      setError(
+        cause instanceof ApiError ? cause.message : "The discovery diff could not be applied.",
+      );
     } finally {
       setBusy(false);
     }
@@ -869,28 +1107,7 @@ export function AiView() {
                       <button
                         type="button"
                         disabled={busy}
-                        onClick={async () => {
-                          setBusy(true);
-                          setError(null);
-                          setNotice(null);
-                          try {
-                            const found = await discoverAiProviderModels(provider.id);
-                            setEditingKeys(found.models.join("\n"));
-                            setNotice(
-                              found.models.length === 0
-                                ? "The provider reported no models."
-                                : `The provider reported ${found.models.length} models — review, then save.`,
-                            );
-                          } catch (cause: unknown) {
-                            setError(
-                              cause instanceof ApiError
-                                ? cause.message
-                                : "The provider could not be asked.",
-                            );
-                          } finally {
-                            setBusy(false);
-                          }
-                        }}
+                        onClick={() => void runDiscovery(provider)}
                         data-provider-discover={provider.name}
                         className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-surface disabled:opacity-60"
                       >
@@ -899,6 +1116,13 @@ export function AiView() {
                       </button>
                     </div>
                   </div>
+                ) : null}
+                {discovery[provider.id] ? (
+                  <DiscoveryDiff
+                    report={discovery[provider.id]}
+                    busy={busy}
+                    onApply={() => void applyDiscovery(provider)}
+                  />
                 ) : null}
               </li>
             ))}
@@ -929,8 +1153,9 @@ export function AiView() {
               <li
                 key={model.id}
                 data-model-row={model.model_id}
-                className="flex flex-wrap items-center gap-2 px-4 py-2.5"
+                className="flex flex-col gap-0 px-4 py-2.5"
               >
+                <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-[12.5px]">{model.model_key}</span>
                 <span className="text-[11.5px] text-muted">{model.provider_name}</span>
                 {model.is_default ? (
@@ -939,14 +1164,37 @@ export function AiView() {
                     Default
                   </span>
                 ) : null}
-                <Flag label="tools" on={model.supports_tools} />
-                <Flag label="vision" on={model.supports_vision} />
-                <Flag label="stream" on={model.supports_streaming} />
+                {model.capabilities
+                  .filter((capability) => capability !== "chat")
+                  .map((capability) => (
+                    <Flag
+                      key={capability}
+                      label={capability.replace(/_/g, " ")}
+                      on
+                    />
+                  ))}
                 {model.context_window ? (
                   <span className="text-[11px] text-muted">
                     {model.context_window.toLocaleString("en-US")} ctx
                   </span>
                 ) : null}
+                {model.max_output_tokens ? (
+                  <span className="text-[11px] text-muted">
+                    max {model.max_output_tokens.toLocaleString("en-US")}
+                  </span>
+                ) : null}
+                <button
+                  type="button"
+                  disabled={busy}
+                  aria-expanded={flagsOpen === model.model_id}
+                  onClick={() =>
+                    setFlagsOpen((open) => (open === model.model_id ? null : model.model_id))
+                  }
+                  data-model-flags={model.model_id}
+                  className="rounded-lg border border-line px-2 py-1 text-[11.5px] transition hover:bg-canvas disabled:opacity-60"
+                >
+                  {flagsOpen === model.model_id ? "Close flags" : "Capabilities"}
+                </button>
                 <span className="ml-auto flex items-center gap-1.5">
                   {model.enabled && !model.is_default ? (
                     <button
@@ -981,6 +1229,26 @@ export function AiView() {
                     {model.enabled ? "Disable" : "Enable"}
                   </button>
                 </span>
+                </div>
+                {flagsOpen === model.model_id ? (
+                  <CapabilityEditor
+                    model={model}
+                    disabled={busy}
+                    onToggle={(capability, on) => void setCapability(model, capability, on)}
+                  />
+                ) : null}
+                {discovery[model.provider_id] ? (
+                  <DiscoveryDiff
+                    report={discovery[model.provider_id]}
+                    busy={busy}
+                    onApply={() => {
+                      const owner = providers?.find(
+                        (provider) => provider.id === model.provider_id,
+                      );
+                      if (owner) void applyDiscovery(owner);
+                    }}
+                  />
+                ) : null}
               </li>
             ))}
           </ul>

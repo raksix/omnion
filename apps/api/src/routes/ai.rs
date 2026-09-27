@@ -31,9 +31,9 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use omnion_ai_hub::{
     AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole,
-    MAX_PRIORITY, MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelChanges,
-    NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, StepStatus, TestReport,
-    protocol_infos, resolve, stream_chat, test_provider,
+    MAX_PRIORITY, MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelCapability,
+    ModelChanges, NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, StepStatus,
+    TestReport, protocol_infos, stream_chat, test_provider,
 };
 use omnion_audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
@@ -146,12 +146,26 @@ pub struct ModelBody {
     pub supports_streaming: bool,
     /// Embedding output.
     pub supports_embeddings: bool,
+    /// Image generation.
+    pub supports_image_generation: bool,
+    /// Audio generation.
+    pub supports_audio_generation: bool,
+    /// Transcription.
+    pub supports_transcription: bool,
+    /// Structured output through the provider's own mode.
+    pub supports_json_mode: bool,
+    /// Largest answer the model advertises.
+    pub max_output_tokens: Option<i32>,
     /// Whether the model is enabled.
     pub enabled: bool,
-    /// Whether it is the installation's default model.
+    /// Whether the model is the installation's default model.
     pub is_default: bool,
     /// `provider/model` — how the router addresses this pair.
     pub model_id: String,
+    /// The closed capability vocabulary, so the panel renders every flag from one list.
+    pub capability_catalog: Vec<CapabilityInfo>,
+    /// The capabilities this model actually claims, in catalog order.
+    pub capabilities: Vec<ModelCapability>,
     /// When it was registered.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -174,13 +188,42 @@ impl ModelBody {
             supports_vision: model.supports_vision,
             supports_streaming: model.supports_streaming,
             supports_embeddings: model.supports_embeddings,
+            supports_image_generation: model.supports_image_generation,
+            supports_audio_generation: model.supports_audio_generation,
+            supports_transcription: model.supports_transcription,
+            supports_json_mode: model.supports_json_mode,
+            max_output_tokens: model.max_output_tokens,
             enabled: model.enabled,
             is_default: model.is_default,
             model_id: omnion_ai_hub::model_id(provider, model),
+            capability_catalog: ModelCapability::ALL
+                .iter()
+                .map(|capability| CapabilityInfo {
+                    capability: *capability,
+                    note: capability.note(),
+                    editable: capability.is_model_flag(),
+                })
+                .collect(),
+            capabilities: model.capabilities(),
             created_at: model.created_at,
             updated_at: model.updated_at,
         }
     }
+}
+
+/// One entry of the closed capability vocabulary, as the panel's flag editor reads it.
+///
+/// The catalog travels with the models rather than being compiled into the panel, so a flag
+/// added to the crate appears in the editor without a second edit — and the `editable` marker
+/// tells the panel which toggles are a model's to claim and which are facts about the endpoint.
+#[derive(Debug, Serialize)]
+pub struct CapabilityInfo {
+    /// Wire name, used as the toggle key.
+    pub capability: ModelCapability,
+    /// One line the panel shows under the toggle.
+    pub note: &'static str,
+    /// `true` when a model row can turn this on.
+    pub editable: bool,
 }
 
 /// Response of the provider list.
@@ -197,15 +240,56 @@ pub struct ModelListResponse {
     pub models: Vec<ModelBody>,
 }
 
-/// Response of a provider model sync.
+/// Response of a discovery run: what the endpoint serves against what the registry holds.
+///
+/// The endpoint's own list comes back in `reported` so an operator can see what it published,
+/// and `lines` says what *applying* it would do. Nothing is written by this call — that is the
+/// apply endpoint's job, and it is a separate request with a separate confirmation.
 #[derive(Debug, Serialize)]
 pub struct DiscoverResponse {
     /// Provider that was asked.
     pub provider_id: Uuid,
     /// Its name.
     pub provider_name: String,
-    /// Model keys it reported.
-    pub models: Vec<String>,
+    /// Model keys it reported, sorted and deduplicated.
+    pub reported: Vec<String>,
+    /// Model keys the registry held before this run.
+    pub stored: Vec<String>,
+    /// The diff, in key order.
+    pub lines: Vec<omnion_ai_hub::DiscoveryLine>,
+    /// How many keys the endpoint serves.
+    pub reported_count: usize,
+    /// How many models the registry holds for this provider.
+    pub stored_count: usize,
+    /// How many would be added.
+    pub added: usize,
+    /// How many would be removed.
+    pub removed: usize,
+    /// How many would change.
+    pub changed: usize,
+    /// `true` when applying would change nothing.
+    pub up_to_date: bool,
+}
+
+impl DiscoverResponse {
+    /// Describe one discovery run.
+    fn build(diff: omnion_ai_hub::DiscoveryDiff) -> Self {
+        use omnion_ai_hub::DiscoveryAction;
+
+        Self {
+            reported_count: diff.reported.len(),
+            stored_count: diff.stored.len(),
+            added: diff.count(DiscoveryAction::Added),
+            removed: diff.count(DiscoveryAction::Removed),
+            changed: diff.count(DiscoveryAction::Changed),
+            up_to_date: diff.is_empty(),
+            provider_id: diff.provider_id,
+            provider_name: diff.provider_name,
+            reported: diff.reported,
+            stored: diff.stored,
+            lines: diff.lines,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -240,6 +324,21 @@ pub enum ModelInput {
         /// Embedding output.
         #[serde(default)]
         supports_embeddings: Option<bool>,
+        /// Image generation.
+        #[serde(default)]
+        supports_image_generation: Option<bool>,
+        /// Audio generation.
+        #[serde(default)]
+        supports_audio_generation: Option<bool>,
+        /// Transcription.
+        #[serde(default)]
+        supports_transcription: Option<bool>,
+        /// Structured output.
+        #[serde(default)]
+        supports_json_mode: Option<bool>,
+        /// Largest answer the model advertises.
+        #[serde(default)]
+        max_output_tokens: Option<i32>,
     },
 }
 
@@ -256,6 +355,11 @@ impl ModelInput {
                 supports_vision,
                 supports_streaming,
                 supports_embeddings,
+                supports_image_generation,
+                supports_audio_generation,
+                supports_transcription,
+                supports_json_mode,
+                max_output_tokens,
             } => NewAiModel {
                 model_key: key,
                 display_name,
@@ -264,6 +368,11 @@ impl ModelInput {
                 supports_vision,
                 supports_streaming,
                 supports_embeddings,
+                supports_image_generation,
+                supports_audio_generation,
+                supports_transcription,
+                supports_json_mode,
+                max_output_tokens,
             },
         }
     }
@@ -332,12 +441,46 @@ pub struct ReplaceModelsBody {
 }
 
 /// Body of `PATCH /ai/models/{id}`.
+///
+/// `max_output_tokens` distinguishes three cases the way the provider key does: absent keeps the
+/// stored ceiling, `null` forgets it, a number replaces it.
 #[derive(Debug, Deserialize)]
 pub struct UpdateModelBody {
     /// New enabled flag.
     pub enabled: Option<bool>,
-    /// `true` makes it the installation's default model.
+    /// `true` makes this the installation's default model.
     pub is_default: Option<bool>,
+    /// New display name.
+    pub display_name: Option<String>,
+    /// New context window in tokens.
+    pub context_window: Option<i32>,
+    /// New tool-calling flag.
+    pub supports_tools: Option<bool>,
+    /// New image-input flag.
+    pub supports_vision: Option<bool>,
+    /// New streaming flag.
+    pub supports_streaming: Option<bool>,
+    /// New embeddings flag.
+    pub supports_embeddings: Option<bool>,
+    /// New image-generation flag.
+    pub supports_image_generation: Option<bool>,
+    /// New audio-generation flag.
+    pub supports_audio_generation: Option<bool>,
+    /// New transcription flag.
+    pub supports_transcription: Option<bool>,
+    /// New JSON-mode flag.
+    pub supports_json_mode: Option<bool>,
+    /// Absent = keep, `null` = clear, number = replace.
+    #[serde(default, deserialize_with = "double_option_i32")]
+    pub max_output_tokens: Option<Option<i32>>,
+}
+
+/// Read `null` as "forget this limit", an absent field as "leave it".
+fn double_option_i32<'de, D>(deserializer: D) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i32>::deserialize(deserializer).map(Some)
 }
 
 /// Query of `GET /ai/models`.
@@ -582,6 +725,11 @@ pub async fn replace_provider_models(
 }
 
 /// `POST /api/v1/ai/providers/{id}/discover-models` — ask the provider which models it serves.
+///
+/// The endpoint is dialled and its list compared with the registry; **nothing is written**. The
+/// panel renders the diff and the operator confirms by calling the apply route, so an endpoint
+/// that suddenly reports two hundred models cannot rewrite the registry by being asked a
+/// question.
 pub async fn discover_provider_models(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -591,13 +739,49 @@ pub async fn discover_provider_models(
         .ok_or(AiHubError::ProviderNotFound)?;
 
     let target = ProviderTarget::from_provider(&provider);
-    let models = omnion_ai_hub::list_remote_models(&target).await?;
+    let reported = omnion_ai_hub::list_remote_models(&target).await?;
+    let diff = omnion_ai_hub::discovery_diff(state.db().pool(), &provider, &reported).await?;
 
-    Ok(Json(DiscoverResponse {
-        provider_id: provider.id,
-        provider_name: provider.name,
-        models,
-    }))
+    Ok(Json(DiscoverResponse::build(diff)))
+}
+
+/// `POST /api/v1/ai/providers/{id}/apply-discovery` — apply the diff a discovery run reported.
+///
+/// The apply reconciles **keys** and nothing else: what the endpoint serves is added, what it
+/// stopped serving is removed, and every row that survives keeps the capability flags the
+/// operator gave it. Running it twice is a no-op, which is what makes a second discovery run
+/// report an empty diff.
+pub async fn apply_provider_discovery(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> Result<Json<DiscoverResponse>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+
+    let target = ProviderTarget::from_provider(&provider);
+    let reported = omnion_ai_hub::list_remote_models(&target).await?;
+    let diff =
+        omnion_ai_hub::apply_discovery(state.db().pool(), &provider, &reported).await?;
+
+    let models = omnion_ai_hub::list_models(state.db().pool(), Some(provider.id)).await?;
+
+    let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.discovery_applied")
+        .organization(current.user.organization_id)
+        .target("ai_provider", provider.id.to_string())
+        .metadata(json!({
+            "name": provider.name,
+            "added": diff.count(omnion_ai_hub::DiscoveryAction::Added),
+            "removed": diff.count(omnion_ai_hub::DiscoveryAction::Removed),
+            "changed": diff.count(omnion_ai_hub::DiscoveryAction::Changed),
+            "models": models.len(),
+        }))
+        .ip_address(address.as_text());
+    omnion_audit::record(state.db().pool(), entry).await?;
+
+    Ok(Json(DiscoverResponse::build(diff)))
 }
 
 /// `PATCH /api/v1/ai/models/{id}`.
@@ -614,6 +798,17 @@ pub async fn update_model(
         ModelChanges {
             enabled: body.enabled,
             is_default: body.is_default,
+            display_name: body.display_name,
+            context_window: body.context_window,
+            supports_tools: body.supports_tools,
+            supports_vision: body.supports_vision,
+            supports_streaming: body.supports_streaming,
+            supports_embeddings: body.supports_embeddings,
+            supports_image_generation: body.supports_image_generation,
+            supports_audio_generation: body.supports_audio_generation,
+            supports_transcription: body.supports_transcription,
+            supports_json_mode: body.supports_json_mode,
+            max_output_tokens: body.max_output_tokens,
         },
     )
     .await?;
@@ -630,6 +825,9 @@ pub async fn update_model(
             "model": model.model_key,
             "enabled": model.enabled,
             "is_default": model.is_default,
+            "capabilities": model.capabilities(),
+            "context_window": model.context_window,
+            "max_output_tokens": model.max_output_tokens,
         }))
         .ip_address(address.as_text());
     omnion_audit::record(state.db().pool(), entry).await?;
@@ -839,7 +1037,15 @@ pub async fn chat(
         });
     }
 
-    let resolved = resolve(state.db().pool(), body.model.as_deref()).await?;
+    // Everything decidable before the first byte is decided here, with a normal HTTP status: a
+    // stream asked of a model that cannot stream is refused with 400 and the model's key in the
+    // message, rather than opening a stream that can only end in an error frame.
+    let resolved = omnion_ai_hub::resolve_for(
+        state.db().pool(),
+        body.model.as_deref(),
+        &[ModelCapability::Chat, ModelCapability::Streaming],
+    )
+    .await?;
     let request = ChatRequest {
         model: resolved.model.model_key.clone(),
         messages,

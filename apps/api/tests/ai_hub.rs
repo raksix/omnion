@@ -583,7 +583,9 @@ async fn the_ai_hub_connects_a_provider_and_streams_a_chat_through_it() {
         "connecting a provider leaves exactly one default model"
     );
 
-    // Discovery asks the provider what it serves.
+    // Discovery asks the provider what it serves, and answers a diff. Slice 1 proved the list;
+    // slice 2 made this a diff, so the assertion is the diff's own shape — the endpoint's list
+    // under `reported`, and what applying it would do under the counts.
     let discovered = harness
         .call(post(
             &format!("/api/v1/ai/providers/{provider_id}/discover-models"),
@@ -593,9 +595,19 @@ async fn the_ai_hub_connects_a_provider_and_streams_a_chat_through_it() {
         .await;
     assert_eq!(discovered.status, StatusCode::OK, "{:?}", discovered.body);
     assert_eq!(
-        discovered.body["models"],
+        discovered.body["reported"],
         json!(["mock-large", "mock-small"]),
         "the provider's own list comes back sorted"
+    );
+    assert_eq!(discovered.body["stored_count"], 2, "both models are registered");
+    assert_eq!(
+        discovered.body["up_to_date"], true,
+        "the endpoint serves exactly what the registry holds, so the diff is empty"
+    );
+    assert_eq!(
+        discovered.body["lines"].as_array().map(Vec::len),
+        Some(0),
+        "a registry that already matches produces no lines"
     );
 
     // The chat, streamed, addressed as `provider/model`.
@@ -1359,6 +1371,297 @@ async fn the_runtime_columns_and_the_test_permission_are_enforced() {
         .await;
     assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{:?}", unknown.body);
     assert_eq!(unknown.body["error"]["code"], "provider_not_found");
+
+    harness.dispose().await;
+}
+
+/// Slice 2 (REQ-097): the capability flags are data the registry edits and the router enforces,
+/// and discovery is a reviewable diff rather than a write.
+///
+/// The mock serves `mock-small` and `mock-large`; the walk registers one model by hand, edits
+/// its flags, asks for a stream it cannot serve, reads a diff, applies it, and reads the diff
+/// again — which has to be empty, or the first apply did not do what it said.
+#[tokio::test]
+async fn the_capability_flags_and_the_discovery_diff_are_one_row_the_router_reads() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let owner_token = token_of(&owner);
+
+    // One model registered by hand, with the flags the walk will read and edit.
+    let created = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Flags",
+                "kind": "local",
+                "base_url": mock.base_url,
+                "models": [{
+                    "key": "mock-small",
+                    "display_name": "Small",
+                    "context_window": 8192,
+                    "max_output_tokens": 2048,
+                    "supports_tools": true,
+                }],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let provider_id = created.body["id"].as_str().expect("an id").to_owned();
+
+    let listed = harness
+        .call(get("/api/v1/ai/models", Some(&owner_token)))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let model = listed.body["models"]
+        .as_array()
+        .expect("a model list")
+        .first()
+        .expect("the registered model")
+        .clone();
+    let model_id = model["id"].as_str().expect("a model id").to_owned();
+
+    // The panel's catalog and the row's own claims come from the same response, and `chat` is
+    // already on because a registered model is a chat model by construction.
+    let catalog: Vec<&str> = model["capability_catalog"]
+        .as_array()
+        .expect("a catalog")
+        .iter()
+        .filter_map(|entry| entry["capability"].as_str())
+        .collect();
+    assert_eq!(
+        catalog,
+        vec![
+            "chat",
+            "streaming",
+            "tools",
+            "vision",
+            "json_mode",
+            "embeddings",
+            "image_generation",
+            "audio_generation",
+            "transcription",
+            "list_models",
+        ],
+        "the closed vocabulary travels with the row"
+    );
+    assert_eq!(model["max_output_tokens"], 2048);
+    let claimed: Vec<&str> = model["capabilities"]
+        .as_array()
+        .expect("claimed")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(claimed.contains(&"chat"));
+    assert!(claimed.contains(&"tools"));
+    assert!(!claimed.contains(&"vision"), "nothing published vision yet");
+
+    // Switching streaming off is refused by the router before a call leaves the process: the
+    // chat answers 400 with the model and the capability, not a provider error.
+    let refused = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/models/{model_id}"),
+            Some(&owner_token),
+            Some(json!({ "supports_streaming": false })),
+        ))
+        .await;
+    assert_eq!(refused.status, StatusCode::OK, "{:?}", refused.body);
+    assert_eq!(refused.body["supports_streaming"], false);
+
+    let chat_refused = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat(Some("Flags/mock-small")),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(
+        chat_refused.status, StatusCode::BAD_REQUEST,
+        "a model that cannot stream must refuse the stream: {:?}",
+        chat_refused.body
+    );
+    assert_eq!(chat_refused.body["error"]["code"], "capability_unsupported");
+    let message = chat_refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(message.contains("mock-small"), "{message}");
+    assert!(message.contains("streaming"), "{message}");
+
+    // The token limits are checked where the operator edits them, not at request time.
+    let too_big = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/models/{model_id}"),
+            Some(&owner_token),
+            Some(json!({ "max_output_tokens": 0 })),
+        ))
+        .await;
+    assert_eq!(too_big.status, StatusCode::BAD_REQUEST, "{:?}", too_big.body);
+    assert_eq!(too_big.body["error"]["code"], "invalid_model");
+
+    let over_context = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/models/{model_id}"),
+            Some(&owner_token),
+            Some(json!({ "context_window": 1024, "max_output_tokens": 4096 })),
+        ))
+        .await;
+    assert_eq!(
+        over_context.status, StatusCode::BAD_REQUEST,
+        "an answer longer than the context that holds it: {:?}",
+        over_context.body
+    );
+
+    // The flags the panel shows equal the flags the router reads — asserted against the same
+    // row, in one request, after streaming is switched back on.
+    let restored = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/models/{model_id}"),
+            Some(&owner_token),
+            Some(json!({ "supports_streaming": true, "supports_vision": true })),
+        ))
+        .await;
+    assert_eq!(restored.status, StatusCode::OK);
+    let shown: Vec<&str> = restored.body["capabilities"]
+        .as_array()
+        .expect("capabilities")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(shown.contains(&"streaming"), "{shown:?}");
+    assert!(shown.contains(&"vision"), "{shown:?}");
+    assert_eq!(restored.body["supports_vision"], true);
+
+    // Discovery reads the endpoint and writes nothing: the diff names both sides.
+    let discovered = harness
+        .call(post(
+            &format!("/api/v1/ai/providers/{provider_id}/discover-models"),
+            json!({}),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(discovered.status, StatusCode::OK, "{:?}", discovered.body);
+    assert_eq!(discovered.body["added"], 1, "mock-large is new");
+    assert_eq!(discovered.body["removed"], 0);
+    assert_eq!(discovered.body["up_to_date"], false);
+    assert_eq!(discovered.body["reported_count"], 2);
+    assert_eq!(discovered.body["stored_count"], 1);
+
+    // Reading a diff does not change the registry: the model count is still one.
+    let unchanged = harness
+        .call(get("/api/v1/ai/models", Some(&owner_token)))
+        .await;
+    assert_eq!(
+        unchanged.body["models"].as_array().map(Vec::len),
+        Some(1),
+        "a discovery read must never write"
+    );
+
+    // Applying adds exactly the models the diff named, and keeps the flags the operator gave
+    // the row that survived.
+    let applied = harness
+        .call(post(
+            &format!("/api/v1/ai/providers/{provider_id}/apply-discovery"),
+            json!({}),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(applied.status, StatusCode::OK, "{:?}", applied.body);
+    assert_eq!(applied.body["added"], 1);
+
+    let after = harness
+        .call(get("/api/v1/ai/models", Some(&owner_token)))
+        .await;
+    let models = after.body["models"].as_array().expect("a model list");
+    assert_eq!(models.len(), 2, "the added model is there");
+    let kept = models
+        .iter()
+        .find(|model| model["model_key"] == "mock-small")
+        .expect("the hand-registered model");
+    assert_eq!(kept["supports_vision"], true, "an apply must not reset flags");
+    assert_eq!(kept["max_output_tokens"], 2048);
+    let added = models
+        .iter()
+        .find(|model| model["model_key"] == "mock-large")
+        .expect("the discovered model");
+    assert_eq!(
+        added["supports_vision"], false,
+        "a discovered model claims nothing it was not told"
+    );
+    assert_eq!(added["supports_streaming"], true);
+
+    // Re-running discovery over the same endpoint reports an empty diff — the case that makes
+    // the first apply trustworthy.
+    let second = harness
+        .call(post(
+            &format!("/api/v1/ai/providers/{provider_id}/discover-models"),
+            json!({}),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(second.body["up_to_date"], true, "{:?}", second.body);
+    assert_eq!(second.body["added"], 0);
+    assert_eq!(second.body["removed"], 0);
+    assert_eq!(
+        second.body["lines"].as_array().map(Vec::len),
+        Some(0),
+        "a second run must find nothing to do"
+    );
+
+    // A removal is reported too: the registry carries a model the endpoint does not serve.
+    let planted = harness
+        .call(request(
+            Method::PUT,
+            &format!("/api/v1/ai/providers/{provider_id}/models"),
+            Some(&owner_token),
+            Some(json!({ "models": [
+                { "key": "mock-small" },
+                { "key": "mock-large" },
+                { "key": "retired-model" },
+            ] })),
+        ))
+        .await;
+    assert_eq!(planted.status, StatusCode::OK, "{:?}", planted.body);
+
+    let third = harness
+        .call(post(
+            &format!("/api/v1/ai/providers/{provider_id}/discover-models"),
+            json!({}),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(third.body["removed"], 1, "{:?}", third.body);
+    assert_eq!(third.body["lines"][0]["action"], "removed");
+    assert_eq!(third.body["lines"][0]["model_key"], "retired-model");
+
+    // The chat still works on the model the walk edited, so an edit did not break the pair.
+    let answered = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat(Some("Flags/mock-small")),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(answered.status, StatusCode::OK, "{:?}", answered.body);
+    assert!(!streamed_answer(&sse_events(&answered.text)).is_empty());
 
     harness.dispose().await;
 }

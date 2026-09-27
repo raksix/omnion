@@ -1040,6 +1040,132 @@ async function runAiProviderDepth(page, report) {
   }
 
   report.aiProviders = steps;
+
+  // Slice 2 lives on the same screen, so it rides in the same pass: the model rows open their
+  // flag editor, one flag is switched off and on again, and Discover is asked twice — once to
+  // see a diff, once to see the empty diff that proves the first apply did what it said.
+  const capabilities = await readCapabilityEditor(page);
+  note({ step: "capabilities", ...capabilities });
+  await shot(page, "ai-capability-editor");
+
+  const toggled = await toggleOneCapability(page);
+  note({ step: "capability-toggle", ...toggled });
+  await shot(page, "ai-capability-toggled");
+
+  const firstDiff = await discoverTwice(page, fake);
+  note({ step: "discovery", ...firstDiff });
+  await shot(page, "ai-discovery-diff");
+
+  report.aiProviders = steps;
+}
+
+/** Open the first model's flag editor and read the catalog it renders. */
+async function readCapabilityEditor(page) {
+  await page.locator("[data-model-flags]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const flags = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-capability-flag]")].map((node) => {
+      const key = node.getAttribute("data-capability-flag") ?? "";
+      return `${key.split(":")[1]}:${node.checked ? "on" : "off"}${node.disabled ? "/locked" : ""}`;
+    }),
+  );
+  const editor = await page.locator("[data-capability-editor]").count();
+  const notes = await page.locator("[data-capability-editor] label span").allTextContents();
+
+  return {
+    editor,
+    flags: flags.join(" "),
+    flagCount: flags.length,
+    notes: notes.map((text) => text.replace(/\s+/g, " ").trim()).slice(0, 4).join(" / "),
+  };
+}
+
+/** Switch one editable capability off and back on, and read the notice each time. */
+async function toggleOneCapability(page) {
+  const flag = page.locator('[data-capability-flag$=":vision"]').first();
+  const existed = (await flag.count()) > 0;
+  if (!existed) return { toggled: false, reason: "no vision flag in the catalog" };
+
+  const before = await flag.isChecked().catch(() => false);
+  await flag.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const after = await flag.isChecked().catch(() => !before);
+  const notice = await page.locator("text=/vision (enabled|disabled)/").first().innerText().catch(() => "");
+  await shot(page, "ai-capability-off");
+
+  // Put it back, so the pass leaves the registry as it found it.
+  await flag.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const restored = await flag.isChecked().catch(() => false);
+
+  return {
+    toggled: true,
+    before,
+    after,
+    restored,
+    flipped: before !== after,
+    notice: notice.replace(/\s+/g, " ").slice(0, 120),
+  };
+}
+
+/** Discover, read the diff, apply it, and discover again — the second run must be empty. */
+async function discoverTwice(page, fake) {
+  await page
+    .locator('[data-provider-discover="QA Local"]')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+
+  const first = await page.evaluate(() => {
+    const root = document.querySelector("[data-discovery-diff]");
+    if (!root) return null;
+    return {
+      counts: root.querySelector("[data-discovery-counts]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      lines: [...root.querySelectorAll("[data-discovery-line]")].map(
+        (node) => node.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      ),
+      applyLabel: root.querySelector("[data-discovery-apply]")?.textContent?.trim() ?? "",
+      applyDisabled: root.querySelector("[data-discovery-apply]")?.disabled ?? null,
+    };
+  });
+
+  // Apply only when the diff actually has something to do.
+  let applied = "skipped";
+  if (first && first.applyLabel === "Apply this diff") {
+    await page
+      .locator('[data-discovery-apply="QA Local"]')
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForTimeout(2800);
+    applied = "clicked";
+  }
+
+  // The second discovery is the proof: nothing left to do.
+  await page
+    .locator('[data-provider-discover="QA Local"]')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+  const second = await page.evaluate(() => {
+    const root = document.querySelector('[data-discovery-diff="QA Local"]');
+    if (!root) return null;
+    return {
+      upToDate: (root.querySelector("[data-discovery-uptodate]")?.textContent ?? "").trim().length > 0,
+      applyLabel: root.querySelector("[data-discovery-apply]")?.textContent?.trim() ?? "",
+      applyDisabled: root.querySelector("[data-discovery-apply]")?.disabled ?? null,
+    };
+  });
+  await shot(page, "ai-discovery-uptodate");
+
+  return {
+    first,
+    applied,
+    second,
+    fakeEndpoint: fake.baseUrl,
+  };
 }
 
 // ---------------------------------------------------------------- palette (REQ-002)

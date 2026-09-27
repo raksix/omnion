@@ -446,8 +446,13 @@ pub fn router(state: AppState) -> Router {
     let ai_provider_models =
         put(ai::replace_provider_models).layer(guards::require(&state, "ai.providers.manage"));
 
+    // Discovery reads the endpoint and answers a diff; applying it is a second, separate request
+    // with its own confirmation, so an endpoint that answers with a surprise cannot rewrite the
+    // registry just because somebody pressed Discover (REQ-097 slice 2).
     let ai_provider_discover =
         post(ai::discover_provider_models).layer(guards::require(&state, "ai.providers.manage"));
+    let ai_provider_apply_discovery =
+        post(ai::apply_provider_discovery).layer(guards::require(&state, "ai.providers.manage"));
 
     let ai_models = get(ai::list_models).layer(guards::require(&state, "ai.providers.read"));
 
@@ -772,6 +777,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/providers/{id}", ai_provider)
         .route("/ai/providers/{id}/models", ai_provider_models)
         .route("/ai/providers/{id}/discover-models", ai_provider_discover)
+        .route("/ai/providers/{id}/apply-discovery", ai_provider_apply_discovery)
         .route("/ai/protocols", ai_protocols)
         .route("/ai/providers/{id}/test", ai_provider_test)
         .route("/ai/models", ai_models)

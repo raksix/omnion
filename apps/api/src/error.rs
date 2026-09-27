@@ -776,6 +776,14 @@ impl From<AiHubError> for ApiError {
             ),
             AiHubError::InvalidProvider(message) => Self::bad_request("invalid_provider", message),
             AiHubError::InvalidModel(message) => Self::bad_request("invalid_model", message),
+            // A model that cannot do what the request needs is a `400` and not a `409`: nothing
+            // about the installation is in conflict, the caller asked for a capability this
+            // model does not claim, and the fix is a flag edit or a different model. The code
+            // and the message both name the capability so a client can branch on it.
+            AiHubError::CapabilityUnsupported { model, capability } => Self::bad_request(
+                "capability_unsupported",
+                format!("the model \"{model}\" does not support {capability}"),
+            ),
             AiHubError::InvalidChatRequest(message) => {
                 Self::bad_request("invalid_chat_request", message)
             }

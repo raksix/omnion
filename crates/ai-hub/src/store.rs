@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use crate::error::{AiHubError, Result};
 use crate::model::{
-    AiModel, ApiKeyChange, ModelChanges, NewAiModel, NewProvider, Provider, ProviderChanges,
-    normalize_base_url, validate_kind, validate_model_key, validate_name, validate_priority,
-    validate_protocol, validate_retries, validate_timeout,
+    AiModel, ApiKeyChange, DiscoveryAction, DiscoveryDiff, MAX_DISPLAY_NAME_LEN, ModelChanges,
+    NewAiModel, NewProvider, Provider, ProviderChanges, diff_discovery, normalize_base_url,
+    validate_kind, validate_model_key, validate_name, validate_priority, validate_protocol,
+    validate_retries, validate_timeout, validate_token_limits,
 };
 
 /// Columns read back from `ai_providers`.
@@ -24,10 +25,15 @@ const PROVIDER_COLUMNS: &str = "id, name, protocol, kind, base_url, api_key, tim
      max_retries, priority, last_health, last_checked_at, last_error, enabled, is_default, \
      created_at, updated_at";
 
-/// Columns read back from `ai_models`.
+/// Columns read back from `ai_models`, capability flags included.
+///
+/// The list is written out in full rather than `select *` so a new column cannot silently start
+/// flowing into a struct that was not reviewed for it, and so the one place that says "these are
+/// the facts about a model" stays readable.
 const MODEL_COLUMNS: &str = "id, provider_id, model_key, display_name, context_window, \
-     supports_tools, supports_vision, supports_streaming, supports_embeddings, enabled, \
-     is_default, created_at, updated_at";
+     supports_tools, supports_vision, supports_streaming, supports_embeddings, \
+     supports_image_generation, supports_audio_generation, supports_transcription, \
+     supports_json_mode, max_output_tokens, enabled, is_default, created_at, updated_at";
 
 // ---------------------------------------------------------------------------------------------
 // Providers
@@ -340,9 +346,12 @@ pub async fn replace_models(
 
     let insert = format!(
         "insert into ai_models (provider_id, model_key, display_name, context_window, \
-         supports_tools, supports_vision, supports_streaming, supports_embeddings) \
+         supports_tools, supports_vision, supports_streaming, supports_embeddings, \
+         supports_image_generation, supports_audio_generation, supports_transcription, \
+         supports_json_mode, max_output_tokens) \
          values ($1, $2, $3, $4, coalesce($5, false), coalesce($6, false), \
-         coalesce($7, true), coalesce($8, false)) \
+         coalesce($7, true), coalesce($8, false), coalesce($9, false), coalesce($10, false), \
+         coalesce($11, false), coalesce($12, false), $13) \
          on conflict (provider_id, model_key) do update set \
          display_name = coalesce(excluded.display_name, ai_models.display_name), \
          context_window = coalesce(excluded.context_window, ai_models.context_window), \
@@ -350,12 +359,18 @@ pub async fn replace_models(
          supports_vision = coalesce($6, ai_models.supports_vision), \
          supports_streaming = coalesce($7, ai_models.supports_streaming), \
          supports_embeddings = coalesce($8, ai_models.supports_embeddings), \
+         supports_image_generation = coalesce($9, ai_models.supports_image_generation), \
+         supports_audio_generation = coalesce($10, ai_models.supports_audio_generation), \
+         supports_transcription = coalesce($11, ai_models.supports_transcription), \
+         supports_json_mode = coalesce($12, ai_models.supports_json_mode), \
+         max_output_tokens = coalesce($13, ai_models.max_output_tokens), \
          updated_at = now() \
          returning {MODEL_COLUMNS}"
     );
 
     let mut stored: Vec<AiModel> = Vec::with_capacity(models.len());
     for model in models {
+        validate_token_limits(model.context_window, model.max_output_tokens)?;
         let row: AiModel = sqlx::query_as(&insert)
             .bind(provider_id)
             .bind(model.model_key.trim())
@@ -365,6 +380,11 @@ pub async fn replace_models(
             .bind(model.supports_vision)
             .bind(model.supports_streaming)
             .bind(model.supports_embeddings)
+            .bind(model.supports_image_generation)
+            .bind(model.supports_audio_generation)
+            .bind(model.supports_transcription)
+            .bind(model.supports_json_mode)
+            .bind(model.max_output_tokens)
             .fetch_one(&mut *tx)
             .await?;
         stored.push(row);
@@ -377,7 +397,12 @@ pub async fn replace_models(
     Ok(stored)
 }
 
-/// Change one model (switch it on or off, make it the default).
+/// Change one model: its capability flags, its limits, whether it is on, and whether it is the
+/// installation's default.
+///
+/// The token limits are validated against each other *and* against what the row already holds,
+/// so an edit that lowers the context window under an existing answer ceiling is refused here
+/// rather than leaving a row the router cannot honour.
 pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Result<AiModel> {
     let mut tx = pool.begin().await?;
 
@@ -408,13 +433,56 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
             .await?;
     }
 
+    let context_window = changes.context_window.or(current.context_window);
+    let max_output_tokens = changes
+        .max_output_tokens
+        .unwrap_or(current.max_output_tokens);
+    validate_token_limits(context_window, max_output_tokens)?;
+
+    let display_name = changes.display_name.as_deref().map(str::trim);
+    if let Some(name) = display_name
+        && name.chars().count() > MAX_DISPLAY_NAME_LEN
+    {
+        return Err(AiHubError::InvalidModel(format!(
+            "a display name may carry at most {MAX_DISPLAY_NAME_LEN} characters"
+        )));
+    }
+
     let sql = format!(
-        "update ai_models set enabled = $2, is_default = $3, updated_at = now() \
+        "update ai_models set \
+         display_name = coalesce($3, display_name), \
+         context_window = coalesce($4, context_window), \
+         supports_tools = coalesce($5, supports_tools), \
+         supports_vision = coalesce($6, supports_vision), \
+         supports_streaming = coalesce($7, supports_streaming), \
+         supports_embeddings = coalesce($8, supports_embeddings), \
+         supports_image_generation = coalesce($9, supports_image_generation), \
+         supports_audio_generation = coalesce($10, supports_audio_generation), \
+         supports_transcription = coalesce($11, supports_transcription), \
+         supports_json_mode = coalesce($12, supports_json_mode), \
+         max_output_tokens = case when $13 then $14 else max_output_tokens end, \
+         enabled = $2, is_default = $15, updated_at = now() \
          where id = $1 returning {MODEL_COLUMNS}"
     );
+    let (set_ceiling, ceiling) = match changes.max_output_tokens {
+        None => (false, None),
+        Some(value) => (true, value),
+    };
     let _stored: AiModel = sqlx::query_as(&sql)
         .bind(id)
         .bind(enabled)
+        .bind(display_name)
+        .bind(context_window)
+        .bind(changes.supports_tools)
+        .bind(changes.supports_vision)
+        .bind(changes.supports_streaming)
+        .bind(changes.supports_embeddings)
+        .bind(changes.supports_image_generation)
+        .bind(changes.supports_audio_generation)
+        .bind(changes.supports_transcription)
+        .bind(changes.supports_json_mode)
+        .bind(set_ceiling)
+        .bind(ceiling)
         .bind(is_default)
         .fetch_one(&mut *tx)
         .await?;
@@ -428,6 +496,94 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
     let fresh: AiModel = sqlx::query_as(&sql).bind(id).fetch_one(pool).await?;
 
     Ok(fresh)
+}
+
+/// What a discovery run would do, without writing anything.
+///
+/// The endpoint is asked (or the caller passes what it reported), the stored set is read, and
+/// the two are compared. This never mutates: the panel shows the result and the operator
+/// confirms, which is what makes a diff reviewable.
+pub async fn discovery_diff(
+    pool: &PgPool,
+    provider: &Provider,
+    reported: &[String],
+) -> Result<DiscoveryDiff> {
+    let stored = list_models(pool, Some(provider.id)).await?;
+    let lines = diff_discovery(&stored, reported);
+
+    let mut reported_keys = reported.to_vec();
+    reported_keys.sort();
+    reported_keys.dedup();
+    let mut stored_keys: Vec<String> =
+        stored.iter().map(|model| model.model_key.clone()).collect();
+    stored_keys.sort();
+
+    Ok(DiscoveryDiff {
+        provider_id: provider.id,
+        provider_name: provider.name.clone(),
+        reported: reported_keys,
+        stored: stored_keys,
+        lines,
+    })
+}
+
+/// Apply a discovery diff: add what the endpoint serves, remove what it stopped serving.
+///
+/// The capability flags of the rows that are added are all `false` except streaming, because a
+/// model list carries no capability metadata — the operator is who turns the rest on, and a row
+/// that claimed otherwise would be a guess the router then enforced. A row that is already
+/// stored keeps every flag it had: discovery reconciles *keys*, never capabilities.
+pub async fn apply_discovery(pool: &PgPool, provider: &Provider, reported: &[String]) -> Result<DiscoveryDiff> {
+    let diff = discovery_diff(pool, provider, reported).await?;
+
+    let additions: Vec<String> = diff
+        .lines
+        .iter()
+        .filter(|line| line.action == DiscoveryAction::Added)
+        .map(|line| line.model_key.clone())
+        .collect();
+    let removals: Vec<String> = diff
+        .lines
+        .iter()
+        .filter(|line| line.action == DiscoveryAction::Removed)
+        .map(|line| line.model_key.clone())
+        .collect();
+
+    if additions.is_empty() && removals.is_empty() {
+        // Nothing to do: the apply is idempotent, so a double confirm writes nothing and the
+        // second discovery run over the same endpoint reports an empty diff.
+        return Ok(diff);
+    }
+
+    let mut tx = pool.begin().await?;
+    if !removals.is_empty() {
+        sqlx::query("delete from ai_models where provider_id = $1 and model_key = any($2)")
+            .bind(provider.id)
+            .bind(&removals)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    if !additions.is_empty() {
+        let insert = format!(
+            "insert into ai_models (provider_id, model_key, supports_streaming) \
+             values ($1, $2, true) \
+             on conflict (provider_id, model_key) do nothing"
+        );
+        for key in &additions {
+            validate_model_key(key)?;
+            sqlx::query(&insert)
+                .bind(provider.id)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    repair_default_model(&mut tx).await?;
+    tx.commit().await?;
+
+    Ok(diff)
 }
 
 /// Keep the default model honest: clear defaults that are switched off, promote the oldest

@@ -35,6 +35,19 @@ pub enum AiHubError {
     /// The model definition (or the model selection) is unusable.
     #[error("invalid model: {0}")]
     InvalidModel(String),
+    /// The request needs a capability the model does not claim.
+    ///
+    /// The refusal happens before any call leaves the process, so a caller that asked for a
+    /// stream from a model that cannot stream gets this instead of a provider error 20 seconds
+    /// later — and the message names both the model and the capability, so the fix is a flag
+    /// edit rather than a search.
+    #[error("the model \"{model}\" does not support {capability}")]
+    CapabilityUnsupported {
+        /// Wire key of the model that was asked.
+        model: String,
+        /// Wire name of the capability it does not claim.
+        capability: &'static str,
+    },
     /// The chat request itself is unusable.
     #[error("invalid chat request: {0}")]
     InvalidChatRequest(String),
@@ -82,6 +95,7 @@ impl AiHubError {
             Self::ProviderDisabled(_) => "provider_disabled",
             Self::InvalidProvider(_) => "invalid_provider",
             Self::InvalidModel(_) => "invalid_model",
+            Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",
             Self::Upstream { .. } => "provider_error",

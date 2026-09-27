@@ -1,6 +1,6 @@
 # REQ-097 — AI Provider Runtime & Local Models
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -97,10 +97,10 @@ Providers are installation-level, so these events carry `organization_id = null`
 - [x] A protocol outside `SUPPORTED_PROTOCOLS` is refused with a stable code naming the supported values (API) and a disabled option (UI).
 - [x] The API key is never returned by any endpoint; a stored key shows as "Stored", Replace changes it, Clear removes it, blank keeps it.
 - [x] The connection test reports per-step outcomes and a total latency against a live local endpoint, and names the failing step against a dead one.
-- [ ] Discovery against a live endpoint returns a diff; applying it adds, updates and removes exactly the models in the diff, and re-running discovery without changes produces an empty diff.
+- [x] Discovery against a live endpoint returns a diff; applying it adds, updates and removes exactly the models in the diff, and re-running discovery without changes produces an empty diff.
 - [ ] A streamed answer from each adapter produces the same normalised event sequence (`text`… `usage`, `done`), and a mid-stream vendor error surfaces as one `error` event plus a failed usage row.
-- [ ] A model with `supports_streaming = false` refuses a streaming request with a clear message; a model with `supports_vision = false` refuses an image-bearing request before any call leaves the process.
-- [ ] The flags the panel shows equal the flags the router reads (asserted in a test against the same row).
+- [x] A model with `supports_streaming = false` refuses a streaming request with a clear message; a model with `supports_vision = false` refuses an image-bearing request before any call leaves the process.
+- [x] The flags the panel shows equal the flags the router reads (asserted in a test against the same row).
 - [ ] The health probe writes a sample per enabled provider per tick, and a provider that starts failing goes `degraded` then `down` with an `ai.provider.health_changed` event each time the status changes.
 - [ ] "Probe now" writes exactly one sample and refreshes the header without a page reload.
 - [ ] The failover order PUT persists the rank order; the chain preview hides disabled providers and shows rank collisions resolved by name.
@@ -120,9 +120,9 @@ The visual check must see: one primary button per screen, a readable status-dot 
 
 ### Slices
 
-1. **Adapters and the connection test** — protocol trait, the two new adapters, `SUPPORTED_PROTOCOLS` widening, migration `0016` provider columns, `/ai/protocols`, the test endpoint and modal, the wider form.
+1. **Adapters and the connection test** — protocol trait, the two new adapters, `SUPPORTED_PROTOCOLS` widening, migration `0016` provider columns, `/ai/protocols`, the test endpoint and modal, the wider form. **Shipped.**
    *Done when:* all three protocols connect, test and stream against real endpoints, and a failing step is named with the provider's own error.
-2. **Capability flags and discovery** — modality flags on `ai_models`, the Models tab, the discovery diff with apply, router enforcement of each flag, `max_output_tokens`.
+2. **Capability flags and discovery** — modality flags on `ai_models`, the Models tab, the discovery diff with apply, router enforcement of each flag, `max_output_tokens`. **Shipped.**
    *Done when:* a discovery diff applies once and repeats empty, and a flag set to false is refused by both the API and the panel.
 3. **Health, failover and telemetry** — health table, probe runner with pruning, status computation, Health and Usage tabs, failover order UI and substitution logic, the provider events.
    *Done when:* a provider taken down mid-day shows `down` with samples and an event, a task-routed request fails over once, and a pinned one does not.

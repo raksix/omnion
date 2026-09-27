@@ -875,6 +875,27 @@ export type AiTestReport = {
   summary: string;
 };
 
+/** One named thing a model can do. The vocabulary is closed and comes from the API. */
+export type AiCapability =
+  | "chat"
+  | "streaming"
+  | "tools"
+  | "vision"
+  | "json_mode"
+  | "embeddings"
+  | "image_generation"
+  | "audio_generation"
+  | "transcription"
+  | "list_models";
+
+/** One entry of the closed capability catalog the flag editor renders. */
+export type AiCapabilityInfo = {
+  capability: AiCapability;
+  note: string;
+  /** `false` for a fact about the endpoint rather than a model's to claim. */
+  editable: boolean;
+};
+
 /** One model of the registry, with the provider it belongs to. */
 export type AiModel = {
   id: string;
@@ -887,9 +908,18 @@ export type AiModel = {
   supports_vision: boolean;
   supports_streaming: boolean;
   supports_embeddings: boolean;
+  supports_image_generation: boolean;
+  supports_audio_generation: boolean;
+  supports_transcription: boolean;
+  supports_json_mode: boolean;
+  max_output_tokens: number | null;
   enabled: boolean;
   is_default: boolean;
   model_id: string;
+  /** The closed vocabulary, so a new flag needs no second edit in the panel. */
+  capability_catalog: AiCapabilityInfo[];
+  /** The capabilities this model actually claims, in catalog order. */
+  capabilities: AiCapability[];
   created_at: string;
   updated_at: string;
 };
@@ -903,6 +933,37 @@ export type AiModelInput = {
   supports_vision?: boolean;
   supports_streaming?: boolean;
   supports_embeddings?: boolean;
+  supports_image_generation?: boolean;
+  supports_audio_generation?: boolean;
+  supports_transcription?: boolean;
+  supports_json_mode?: boolean;
+  max_output_tokens?: number;
+};
+
+/** What one discovery line means for the registry. */
+export type AiDiscoveryAction = "added" | "changed" | "removed";
+
+/** One line of a discovery diff. */
+export type AiDiscoveryLine = {
+  model_key: string;
+  action: AiDiscoveryAction;
+  changed_fields: string[];
+};
+
+/** What a discovery run found, and what applying it would do. Nothing is written by the read. */
+export type AiDiscoveryReport = {
+  provider_id: string;
+  provider_name: string;
+  reported: string[];
+  stored: string[];
+  lines: AiDiscoveryLine[];
+  reported_count: number;
+  stored_count: number;
+  added: number;
+  removed: number;
+  changed: number;
+  /** `true` when applying would change nothing. */
+  up_to_date: boolean;
 };
 
 /** One message of a chat request. */
@@ -1032,24 +1093,68 @@ export async function replaceAiProviderModels(
   return body.models;
 }
 
-/** Ask a provider which models it serves. */
-export function discoverAiProviderModels(
-  providerId: string,
-): Promise<{ provider_id: string; provider_name: string; models: string[] }> {
-  return request(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
+/**
+ * Ask a provider which models it serves and get back a **diff** — what applying it would add,
+ * change and remove. Nothing is written: the panel shows the diff and the operator confirms by
+ * calling `applyAiProviderDiscovery`.
+ */
+export function discoverAiProviderModels(providerId: string): Promise<AiDiscoveryReport> {
+  return request<AiDiscoveryReport>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
 }
 
-/** Switch a model on or off, or make it the installation's default. */
+/** Apply the diff a discovery run reported, after the operator confirmed it. */
+export function applyAiProviderDiscovery(providerId: string): Promise<AiDiscoveryReport> {
+  return request<AiDiscoveryReport>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/apply-discovery`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/**
+ * Change one model: its capability flags, its token limits, whether it is on, and whether it is
+ * the installation's default.
+ *
+ * `maxOutputTokens: null` forgets the stored ceiling and `undefined` leaves it alone, exactly
+ * like the provider key's three cases.
+ */
 export function updateAiModel(
   modelId: string,
-  changes: { enabled?: boolean; isDefault?: boolean },
+  changes: {
+    enabled?: boolean;
+    isDefault?: boolean;
+    displayName?: string;
+    contextWindow?: number | null;
+    supportsTools?: boolean;
+    supportsVision?: boolean;
+    supportsStreaming?: boolean;
+    supportsEmbeddings?: boolean;
+    supportsImageGeneration?: boolean;
+    supportsAudioGeneration?: boolean;
+    supportsTranscription?: boolean;
+    supportsJsonMode?: boolean;
+    maxOutputTokens?: number | null;
+  },
 ): Promise<AiModel> {
   const body: Record<string, unknown> = {};
   if (changes.enabled !== undefined) body.enabled = changes.enabled;
   if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
+  if (changes.displayName !== undefined) body.display_name = changes.displayName;
+  if (changes.contextWindow !== undefined) body.context_window = changes.contextWindow;
+  if (changes.supportsTools !== undefined) body.supports_tools = changes.supportsTools;
+  if (changes.supportsVision !== undefined) body.supports_vision = changes.supportsVision;
+  if (changes.supportsStreaming !== undefined) body.supports_streaming = changes.supportsStreaming;
+  if (changes.supportsEmbeddings !== undefined) body.supports_embeddings = changes.supportsEmbeddings;
+  if (changes.supportsImageGeneration !== undefined)
+    body.supports_image_generation = changes.supportsImageGeneration;
+  if (changes.supportsAudioGeneration !== undefined)
+    body.supports_audio_generation = changes.supportsAudioGeneration;
+  if (changes.supportsTranscription !== undefined)
+    body.supports_transcription = changes.supportsTranscription;
+  if (changes.supportsJsonMode !== undefined) body.supports_json_mode = changes.supportsJsonMode;
+  if (changes.maxOutputTokens !== undefined) body.max_output_tokens = changes.maxOutputTokens;
   return request<AiModel>(`/api/v1/ai/models/${encodeURIComponent(modelId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
