@@ -117,7 +117,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [x] Inserting one of every type produces a valid draft, and saving it round-trips through the API without losing props.
 - [x] Reordering with drag (and with `⌘⌥↑/↓`) persists the new order and does not change block ids, proven by reloading the editor.
 - [x] Duplicate clones a block with a new id and keeps the original untouched; delete removes only the selected block or subtree after the confirm.
-- [ ] A `columns` container accepts 2–4 child columns, each accepting child blocks, and the editor's breadcrumb selects a nested block directly.
+- [x] A `columns` container accepts 2–4 child columns, each accepting child blocks, and the editor's breadcrumb selects a nested block directly.
 - [x] Required-prop validation blocks publish (`block_alt_missing`, `block_prop_required`) but still allows saving a draft, and the offending block is highlighted.
 - [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering.
 - [x] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
@@ -166,11 +166,35 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    `/pages/<id>/edit` are both in the walkthrough inventory with a depth pass on each.
 2. **Containers, validation, revision diff.** Nested `columns`, breadcrumb selection, accessibility and viewport rules (`hide_on` server-side), heading-order linting, `raw_html` sanitisation, block-level diff on the revisions screen, inline-editing frame at `/pages/<id>/preview`. *Done when:* acceptance 4, 6–8, 13–15 pass.
 
-   - **Done in this slice so far:** `raw_html` sanitisation (acceptance 8). `crates/content/src/sanitize.rs`
-     is the sanitiser — an allow-list scanner that removes rather than escapes, reports what it
+   - **Done in this slice so far (1/4):** `raw_html` sanitisation (acceptance 8) and nested
+     columns with the breadcrumb (acceptance 4). `crates/content/src/sanitize.rs` is the
+     sanitiser — an allow-list scanner that removes rather than escapes, reports what it
      removed, and is applied by `blocks::sanitize_tree` on the way into storage, so a stored
      payload is already safe. The `embed` host allow-list ships with it (empty by default, so no
      `iframe` renders until an operator allow-lists a host). 22 sanitiser tests + 4 tree tests.
+
+     **Acceptance 4 shipped as a `column` block type.** The REQ's sentence is "2–4 child
+     columns, *each accepting child blocks*", and a child column has to be a node for that to
+     hold: a `columns` block whose children are content blocks cannot express "these two, side
+     by side" — it can only express a list that happens to be indented. So the registry gained a
+     seventeenth entry, `column`, marked `structure_only`: it is stored, validated, rendered,
+     diffed and documented on `/blocks`, and it is deliberately *not* in the insert panel,
+     because an author who dropped one at the top level would get a block the renderer cannot
+     place. Three rules live in the validator rather than the editor, because a payload reaches
+     storage from a template, a pattern, an import and a second browser session: a Columns block
+     holds two to four columns (`block_column_count`), its children are Column blocks
+     (`block_child_not_allowed`), and a Column outside a Columns block is refused
+     (`block_column_orphan`). An empty Column is only a *warning* — it renders as a gap, so the
+     page still publishes. The rule that needed the parent's key threaded through the walk is
+     the orphan check, and `validate_block` carries `parent: Option<&'static str>` for it.
+
+     The editor builds the structure rather than letting the author create an invalid payload:
+     inserting *Columns* creates the wrappers and drops the author inside the first one, and the
+     breadcrumb numbers its columns (`Column 2 / Text`) because four crumbs all reading
+     "Column" cannot say which one the author is in — which is the entire reason the breadcrumb
+     exists. `Add column` moves the `columns` prop with the structure, since the renderer reads
+     one and the validator checks the other. 73 content tests, 8 of them new for the column
+     rules.
 3. **Patterns and templates.** Migration `0111_content_patterns.sql`; pattern library with insert/create-from-selection/edit/duplicate, page templates with sample content, `/pages/from-template`, and the initial template set (landing, about, pricing, blog post, contact). *Done when:* acceptance 10–11 pass and the vision review confirms the templates render as real pages.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
 
