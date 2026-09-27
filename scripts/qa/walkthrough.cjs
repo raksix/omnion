@@ -2520,6 +2520,10 @@ async function main() {
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
     { path: "/media", name: "media" },
+    // The automations screen (REQ-003, slice 1) — walked here, and its depth pass below
+    // creates a rule, nests a condition group, runs a test event, mints a hook URL and
+    // deletes the rule again.
+    { path: "/automations", name: "automations" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
@@ -2650,6 +2654,12 @@ async function main() {
   await runIamProvisioningDepth(page, report);
   log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
+  // The automations pass (REQ-003, slice 1): the rule list, the editor with a nested
+  // condition group, the dry run, the one-shot listener, the inbound-webhook URL and the
+  // delete. It runs before the sign-out below and leaves the database as it found it.
+  await runAutomationsDepth(page, report);
+  log(`automations: ${JSON.stringify(report.automations)}`);
+
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
   const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
@@ -2659,7 +2669,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/automations", name: "automations" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -3636,4 +3646,207 @@ async function runIamProvisioningDepth(page, report) {
 
   report.iamProvisioning = { steps };
   log(`iam provisioning: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The automations depth pass (REQ-003, slice 1).
+ *
+ * Drives the screen the way a person would: create a rule from the empty state, give it a
+ * nested condition group, read the validation summary, save, run a test event and read the
+ * dry-run report, arm a one-shot listener, switch the rule to the webhook trigger and mint a
+ * URL, then delete it by typing its name.
+ *
+ * Every step that changes the world does so through the panel, and the pass ends with the
+ * rule removed so the next run starts from the same state this one did.
+ */
+async function runAutomationsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "automations-depth", action: "automations", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-new]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
+  // The empty state is what a fresh database shows; the pass starts by creating the first rule.
+  const emptyState = (await page.locator("[data-automation-empty-new]").count()) > 0;
+  note({ step: "list", emptyState, rows: await page.locator("[data-automation-row]").count() });
+  await shot(page, "page-automations-empty");
+
+  await page.locator("[data-automation-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-automation-editor]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // A rule with no name is refused in the field, and the summary names the problem.
+  await page.locator("[data-automation-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  note({
+    step: "empty-name",
+    problems: await page.locator("[data-automation-problem]").count(),
+    summary: (await page.locator("[data-automation-problems]").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .slice(0, 120),
+  });
+  await shot(page, "page-automations-problems");
+
+  await page.locator("[data-automation-name]").first().fill("QA welcome rule").catch(() => {});
+  await page
+    .locator("[data-automation-description]")
+    .first()
+    .fill("Created by the walkthrough")
+    .catch(() => {});
+
+  // Pick an event, then a field the picker offers — the list of fields comes from the
+  // event's documented payload, so a field outside it is not selectable at all.
+  const eventOptions = await page.locator("[data-automation-event] option").count();
+  await page
+    .selectOption("[data-automation-event]", "user.created")
+    .catch(async () => {
+      await page.locator("[data-automation-event] option").first().click().catch(() => {});
+    });
+  await page.waitForTimeout(400);
+
+  // A nested condition: an `all` inside the root, which is the shape the request names.
+  await page.locator("[data-automation-add-condition]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-add-group]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const fieldOptions = await page.locator("[data-automation-field] option").count();
+  note({
+    step: "conditions",
+    eventOptions,
+    fieldOptions,
+    groups: await page.locator("[data-automation-group]").count(),
+    rows: await page.locator("[data-automation-condition]").count(),
+    legend: (await page.locator("[data-automation-editor] legend").nth(1).innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim(),
+  });
+
+  // A second condition, so the group holds more than one row.
+  await page.locator("[data-automation-add-condition]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-value]").first().fill("qa@example.com").catch(() => {});
+  await shot(page, "page-automations-editor");
+
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const rowsAfterSave = await page.locator("[data-automation-row]").count();
+  const notice = (await page.locator("[data-automation-notice]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  note({ step: "saved", rowsAfterSave, notice });
+  await shot(page, "page-automations-list");
+
+  // Open the rule the walkthrough just created and read the catalogue-backed editor.
+  const firstRow = page.locator("[data-automation-row]").first();
+  const ruleName = (await firstRow.locator("a").first().innerText().catch(() => "")).trim();
+  const ruleHref = await firstRow.locator("a").first().getAttribute("href").catch(() => null);
+  await firstRow.locator("a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-row] a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The test fire: a hand-written payload, and a report that must say `would_*` on every row
+  // and never claim it sent anything.
+  await page.locator("[data-automation-payload]").first().fill('{"status":"published","slug":"home"}').catch(() => {});
+  await page.locator("[data-automation-run-test]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const verdict = (await page
+    .locator("[data-automation-report-verdict]")
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ").trim();
+  const outcomes = await page.locator("[data-automation-report-action]").count();
+  const outcomeWords = await page.locator("[data-automation-report-action]").allInnerTexts();
+  note({
+    step: "test-event",
+    verdict: verdict.slice(0, 140),
+    actions: outcomes,
+    simulated: outcomeWords.every((text) => /would_/.test(text)),
+  });
+  await shot(page, "page-automations-test-report");
+
+  // A payload that does not parse is refused in the field, not sent to the API.
+  await page.locator("[data-automation-payload]").first().fill("{not json").catch(() => {});
+  await page.locator("[data-automation-run-test]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  note({
+    step: "bad-payload",
+    error: (await page.locator("[data-automation-save-error]").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .slice(0, 120),
+  });
+
+  // The one-shot listener.
+  await page.locator("[data-automation-listen]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const listenerRows = await page.locator("[data-automation-test-row]").count();
+  const armedText = await page.locator("[data-automation-test-row]").first().innerText().catch(() => "");
+  note({ step: "listener", rows: listenerRows, armed: /armed/.test(armedText) });
+
+  // The webhook trigger: switching to it, then minting a URL — the only control that shows one.
+  await page.locator("[data-automation-trigger-hook]").first().check({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const hookEmpty = (await page.locator("[data-automation-hook-empty]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  // Reopen the rule and mint the URL.
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await page.locator("[data-automation-row] a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-hook-rotate]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const hookUrl = (await page.locator("[data-automation-hook-url] code").first().innerText().catch(() => "")).trim();
+  note({
+    step: "hook",
+    hintBeforeMinting: hookEmpty.slice(0, 100),
+    urlMinted: /\/api\/v1\/hooks\/omhook_/.test(hookUrl),
+    tokenShape: /omhook_[a-z0-9]{40}$/.test(hookUrl),
+  });
+  await shot(page, "page-automations-hook");
+
+  // The list's own filters, read on the rule the pass created.
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  const allRows = await page.locator("[data-automation-row]").count();
+  await page.locator("[data-automation-search]").first().fill("QA welcome rule").catch(() => {});
+  await page.waitForTimeout(600);
+  const searched = await page.locator("[data-automation-row]").count();
+  await page.locator("[data-automation-search]").first().fill("nothing matches this").catch(() => {});
+  await page.waitForTimeout(600);
+  const empty = (await page.locator("text=No rule matches these filters").count()) > 0;
+  await page.locator("[data-automation-search]").first().fill("").catch(() => {});
+  await page.waitForTimeout(500);
+  note({ step: "filters", allRows, searched, emptyWhenNoMatch: empty });
+
+  // Delete by typing the name, and prove the row is gone.
+  await page.locator("[data-automation-row] a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+  await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  // The wrong name must not delete anything.
+  const stillThere = (await page.locator("[data-automation-row]").count()) > 0;
+  await page.locator("[data-automation-delete-input]").first().fill(ruleName || "QA welcome rule").catch(() => {});
+  await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({
+    step: "delete",
+    ruleName,
+    ruleHref,
+    stillThereWhileUnconfirmed: stillThere,
+    rowsAfterDelete: await page.locator("[data-automation-row]").count(),
+  });
+  await shot(page, "page-automations-after-delete");
+
+  report.automations = { steps };
+  log(`automations: ${JSON.stringify(steps)}`);
 }
