@@ -327,6 +327,111 @@ pub async fn revoke_factor(pool: &PgPool, user_id: Uuid, factor_id: Uuid) -> Res
     Ok(revoked > 0)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Passkeys (WebAuthn)
+// ---------------------------------------------------------------------------------------------
+
+/// How many passkeys one account may hold.
+pub const MAX_PASSKEYS: i64 = 10;
+
+/// The live passkeys of an account, newest first.
+pub async fn list_passkeys(pool: &PgPool, user_id: Uuid) -> Result<Vec<MfaFactor>> {
+    let factors: Vec<MfaFactor> = sqlx::query_as(&format!(
+        "select {FACTOR_COLUMNS} from mfa_factors \
+         where user_id = $1 and kind = 'webauthn' and revoked_at is null \
+         order by created_at desc"
+    ))
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(factors)
+}
+
+/// A live passkey of an account by its credential id.
+pub async fn find_passkey(
+    pool: &PgPool,
+    user_id: Uuid,
+    credential_id: &str,
+) -> Result<Option<MfaFactor>> {
+    let factor: Option<MfaFactor> = sqlx::query_as(&format!(
+        "select {FACTOR_COLUMNS} from mfa_factors \
+         where user_id = $1 and kind = 'webauthn' and credential_id = $2 and revoked_at is null"
+    ))
+    .bind(user_id)
+    .bind(credential_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(factor)
+}
+
+/// Whether any live passkey already carries this credential id.
+///
+/// A credential id identifies one authenticator across the whole installation: enrolling it a
+/// second time (on another account) would give two factor rows that answer the same assertion.
+pub async fn passkey_exists(pool: &PgPool, credential_id: &str) -> Result<bool> {
+    let exists: Option<Uuid> = sqlx::query_scalar(
+        "select id from mfa_factors \
+         where kind = 'webauthn' and credential_id = $1 and revoked_at is null",
+    )
+    .bind(credential_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(exists.is_some())
+}
+
+/// Store a passkey a verified registration produced.
+///
+/// The factor is confirmed on the spot: the ceremony is what confirms it — the authenticator
+/// signed with the very key it attested to, which is a stronger proof than a code typed back.
+pub async fn create_passkey(
+    pool: &PgPool,
+    user_id: Uuid,
+    label: &str,
+    credential_id: &str,
+    public_key: &str,
+    sign_count: u32,
+    transports: &[String],
+) -> Result<MfaFactor> {
+    let label = label.trim();
+    let label: String = if label.is_empty() {
+        "Passkey".to_owned()
+    } else {
+        label.chars().take(MAX_LABEL_LENGTH).collect()
+    };
+
+    let factor: MfaFactor = sqlx::query_as(&format!(
+        "insert into mfa_factors \
+            (user_id, kind, label, credential_id, public_key, sign_count, transports, \
+             confirmed_at, last_used_at) \
+         values ($1, 'webauthn', $2, $3, $4, $5, $6, now(), now()) \
+         returning {FACTOR_COLUMNS}"
+    ))
+    .bind(user_id)
+    .bind(&label)
+    .bind(credential_id)
+    .bind(public_key)
+    .bind(i64::from(sign_count))
+    .bind(transports.to_vec())
+    .fetch_one(pool)
+    .await?;
+
+    Ok(factor)
+}
+
+/// Record that a passkey just verified, moving its counter forward.
+pub async fn record_passkey_use(
+    pool: &PgPool,
+    factor_id: Uuid,
+    sign_count: u32,
+) -> Result<()> {
+    sqlx::query("update mfa_factors set last_used_at = now(), sign_count = $2 where id = $1")
+        .bind(factor_id)
+        .bind(i64::from(sign_count))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Read one live factor of an account.
 pub async fn find_factor(
     pool: &PgPool,

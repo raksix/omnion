@@ -469,6 +469,24 @@ pub async fn consume_challenge(pool: &PgPool, token: &str, purpose: &str) -> Res
     Ok(user_id)
 }
 
+/// Whose live sign-in a challenge token belongs to, **without** consuming it.
+///
+/// The passkey ceremony needs to know which account it is finishing before it verifies anything
+/// — the challenge that starts a session is consumed only once the assertion has matched, so a
+/// failed attempt does not cost the caller their half-finished sign-in.
+pub async fn peek_challenge(pool: &PgPool, token: &str, purpose: &str) -> Result<Option<Uuid>> {
+    let token_hash = sessions::hash_token(token);
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "select user_id from mfa_challenges \
+         where token_hash = $1 and purpose = $2 and consumed_at is null and expires_at > now()",
+    )
+    .bind(&token_hash)
+    .bind(purpose)
+    .fetch_optional(pool)
+    .await?;
+    Ok(user_id)
+}
+
 /// Increment the failure counter and lock the account when the threshold is reached.
 async fn register_failure(
     pool: &PgPool,
