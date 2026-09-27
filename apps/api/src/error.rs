@@ -523,6 +523,22 @@ impl From<PermissionsError> for ApiError {
             PermissionsError::InvalidPolicy(message) => {
                 Self::bad_request("invalid_policy", message)
             }
+            // Permission requests and approvals (REQ-006, slice 4b): a missing request is a 404,
+            // a second decision on the same request a 409, and an unusable window a 400 that
+            // repeats the range it refused.
+            PermissionsError::RequestNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "request_not_found",
+                "no such permission request",
+            ),
+            PermissionsError::RequestAlreadyDecided => Self::new(
+                StatusCode::CONFLICT,
+                "request_already_decided",
+                "this request has already been decided",
+            ),
+            PermissionsError::InvalidRequest(message) => {
+                Self::bad_request("invalid_request", message)
+            }
             PermissionsError::InvalidGroupName(name) => Self::bad_request(
                 "invalid_group_name",
                 format!("{name:?} is not a usable group name"),

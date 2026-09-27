@@ -77,7 +77,9 @@ pub mod commands;
 pub mod content;
 pub mod health;
 pub mod iam;
+pub mod iam_approvals;
 pub mod iam_policy;
+pub mod iam_provisioning;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
@@ -85,10 +87,11 @@ pub mod media;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod scim;
 pub mod search;
 pub mod tenancy;
-pub mod webhooks;
 pub mod webauthn;
+pub mod webhooks;
 pub mod workflows;
 
 use axum::Router;
@@ -194,9 +197,7 @@ pub fn router(state: AppState) -> Router {
 
     let iam_policy = get(iam_policy::get_policy)
         .layer(guards::require(&state, "iam.policies.read"))
-        .merge(
-            put(iam_policy::update_policy).layer(guards::require(&state, "iam.policies.manage")),
-        )
+        .merge(put(iam_policy::update_policy).layer(guards::require(&state, "iam.policies.manage")))
         .merge(
             delete(iam_policy::delete_policy).layer(guards::require(&state, "iam.policies.manage")),
         );
@@ -206,6 +207,39 @@ pub fn router(state: AppState) -> Router {
 
     let iam_policy_test =
         post(iam_policy::test_policy).layer(guards::require(&state, "iam.policies.read"));
+
+    // Permission requests and approvals (REQ-006, slice 4b): asking needs only a session, the
+    // inbox needs `iam.approvals.read` and deciding needs `iam.approvals.decide`.
+    let iam_approvals =
+        get(iam_approvals::list_approvals).layer(guards::require(&state, "iam.approvals.read"));
+    let iam_approval_decide =
+        post(iam_approvals::decide_approval).layer(guards::require(&state, "iam.approvals.decide"));
+    let iam_requests =
+        get(iam_approvals::list_my_requests).merge(post(iam_approvals::create_request));
+
+    // SCIM 2.0 provisioning (REQ-006, slice 4b): authenticated by a provisioning token, so the
+    // surface sits outside the session guard and verifies its own bearer credential.
+    let scim_users = get(scim::list_users).merge(post(scim::create_user));
+    let scim_user = get(scim::get_user)
+        .merge(put(scim::replace_user))
+        .merge(patch(scim::patch_user))
+        .merge(delete(scim::delete_user));
+    let scim_groups = get(scim::list_groups).merge(post(scim::create_group));
+    let scim_group = get(scim::get_group)
+        .merge(patch(scim::patch_group))
+        .merge(delete(scim::delete_group));
+    let scim_config = get(scim::service_provider_config);
+    let scim_schemas = get(scim::schemas);
+
+    // Provisioning tokens and their sync log (REQ-006, slice 4b): one management key covers the
+    // tokens and the log, because both describe how the directory talks to this platform.
+    let iam_provisioning_tokens = get(iam_provisioning::list_tokens)
+        .merge(post(iam_provisioning::create_token))
+        .layer(guards::require(&state, "iam.provisioning.manage"));
+    let iam_provisioning_token = delete(iam_provisioning::revoke_token)
+        .layer(guards::require(&state, "iam.provisioning.manage"));
+    let iam_provisioning_log =
+        get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage"));
 
     // Security policy, sessions, devices and second factors (REQ-006, slice 3). Reading a list
     // needs its read key; every mutation carries its own, and the dangerous ones (resetting
@@ -579,7 +613,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/webauthn/passkeys", webauthn_passkeys)
         .route("/auth/webauthn/passkeys/{factor_id}", webauthn_passkey)
         .route("/auth/webauthn/register/begin", webauthn_register_begin)
-        .route("/auth/webauthn/register/complete", webauthn_register_complete)
+        .route(
+            "/auth/webauthn/register/complete",
+            webauthn_register_complete,
+        )
         .route("/auth/webauthn/authenticate/begin", auth_webauthn_begin)
         .route(
             "/auth/webauthn/authenticate/complete",
@@ -646,6 +683,18 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/policies/{id}", iam_policy)
         .route("/iam/policies/{id}/versions", iam_policy_versions)
         .route("/iam/policies/{id}/test", iam_policy_test)
+        .route("/iam/approvals", iam_approvals)
+        .route("/iam/approvals/{id}/decide", iam_approval_decide)
+        .route("/iam/requests", iam_requests)
+        .route("/iam/provisioning/tokens", iam_provisioning_tokens)
+        .route("/iam/provisioning/tokens/{id}", iam_provisioning_token)
+        .route("/iam/provisioning/log", iam_provisioning_log)
+        .route("/scim/v2/ServiceProviderConfig", scim_config)
+        .route("/scim/v2/Schemas", scim_schemas)
+        .route("/scim/v2/Users", scim_users)
+        .route("/scim/v2/Users/{id}", scim_user)
+        .route("/scim/v2/Groups", scim_groups)
+        .route("/scim/v2/Groups/{id}", scim_group)
         .route("/iam/security-policies", iam_security_policy)
         .route("/iam/sessions", iam_sessions)
         .route("/iam/sessions/{id}", iam_session)
