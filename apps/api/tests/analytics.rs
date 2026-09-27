@@ -13,13 +13,19 @@
 //! API's validation, and it is scoped to the caller's own organization; and the public
 //! collection endpoint answers `429` above its per-site budget instead of degrading.
 
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::routing::post as route_post;
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
+use omnion_events::{NewEvent, bus, engine, sender, signature};
 use omnion_identity::users::{self, NewUser};
 use omnion_module_analytics::rollup;
 use omnion_module_analytics::settings as analytics_store;
@@ -27,6 +33,7 @@ use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput
 use omnion_permissions::{bindings, roles as role_store, seed};
 use serde_json::{Value, json};
 use time::{Date, OffsetDateTime};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -2810,6 +2817,673 @@ async fn realtime_reads_the_last_half_hour_and_respects_the_scope() {
     )
     .await;
     assert_eq!(cross_org.status, StatusCode::FORBIDDEN);
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Privacy operations (docs/requests/REQ-007, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// A receiver the delivery engine can POST to, so "the event reached a subscribed endpoint" is
+/// proven by bytes rather than by a queue row.
+struct ComplianceReceiver {
+    /// Where the endpoint points.
+    url: String,
+    /// Deliveries as they arrived, oldest first.
+    seen: Arc<Mutex<Vec<Value>>>,
+    /// The task serving the port; aborted when the receiver drops.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Shared state of the receiver.
+#[derive(Clone)]
+struct ReceiverState {
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+impl ComplianceReceiver {
+    /// Start the receiver on an ephemeral loopback port.
+    async fn start() -> Self {
+        let state = ReceiverState {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the receiver must bind a port");
+        let address = listener.local_addr().expect("the receiver has an address");
+
+        let app = Router::new()
+            .route("/hooks/omnion", route_post(capture_delivery))
+            .with_state(state.clone());
+
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Self {
+            url: format!("http://{address}/hooks/omnion"),
+            seen: state.seen,
+            task,
+        }
+    }
+
+    /// The names of the events the receiver captured, in the order they arrived.
+    fn events(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .expect("the receiver lock")
+            .iter()
+            .filter_map(|delivery| delivery["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The payload of the first delivery of one event.
+    fn payload(&self, name: &str) -> Option<Value> {
+        self.seen
+            .lock()
+            .expect("the receiver lock")
+            .iter()
+            .find(|delivery| delivery["name"].as_str() == Some(name))
+            .map(|delivery| delivery["payload"].clone())
+    }
+}
+
+impl Drop for ComplianceReceiver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// `POST /hooks/omnion` — capture one delivery.
+async fn capture_delivery(
+    State(state): State<ReceiverState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let event = headers
+        .get(signature::EVENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+
+    state
+        .seen
+        .lock()
+        .expect("the receiver lock")
+        .push(json!({ "name": event, "payload": payload["payload"].clone() }));
+
+    StatusCode::OK
+}
+
+/// Queue a delivery tick with the fast backoff this suite uses.
+async fn deliver_queued(fixture: &Fixture) -> engine::RunReport {
+    let client = sender::client(std::time::Duration::from_secs(5)).expect("the client must build");
+    let config = engine::RunnerConfig {
+        batch: 50,
+        lease_seconds: 30,
+        request_timeout: std::time::Duration::from_secs(5),
+        retry_base: time::Duration::milliseconds(40),
+        retry_max: time::Duration::milliseconds(320),
+    };
+
+    engine::run_due(fixture.db.pool(), &client, &config)
+        .await
+        .expect("the delivery tick must run")
+}
+
+/// How many rows of one table carry a visitor handle on a site.
+async fn visits_for(db: &Db, site: Uuid, handle: &str) -> i64 {
+    sqlx::query_scalar(
+        "select count(*)::bigint from analytics_visits where site_id = $1 and visitor_hash = $2",
+    )
+    .bind(site)
+    .bind(handle)
+    .fetch_one(db.pool())
+    .await
+    .expect("the count must run")
+}
+
+/// How many goal hits one handle carries on a site.
+async fn goal_hits_for(db: &Db, site: Uuid, handle: &str) -> i64 {
+    sqlx::query_scalar(
+        "select count(*)::bigint from analytics_goal_hits h \
+         join analytics_goals g on g.id = h.goal_id \
+         where g.site_id = $1 and h.visitor_hash = $2",
+    )
+    .bind(site)
+    .bind(handle)
+    .fetch_one(db.pool())
+    .await
+    .expect("the count must run")
+}
+
+/// The audit rows of one site: `(kind, cutoff, rows_removed)` oldest first.
+async fn audit_rows(db: &Db, site: Uuid) -> Vec<(String, Option<OffsetDateTime>, i64)> {
+    sqlx::query_as::<_, (String, Option<OffsetDateTime>, i64)>(
+        "select kind, cutoff, rows_removed from analytics_purges where site_id = $1 \
+         order by created_at, kind",
+    )
+    .bind(site)
+    .fetch_all(db.pool())
+    .await
+    .expect("the audit rows must read")
+}
+
+/// The payloads of one event name on a site, oldest first.
+async fn event_payloads(db: &Db, site: Uuid, name: &str) -> Vec<Value> {
+    sqlx::query_scalar("select payload from events where site_id = $1 and name = $2 order by id")
+        .bind(site)
+        .bind(name)
+        .fetch_all(db.pool())
+        .await
+        .expect("the events must read")
+}
+
+/// The settings body the walks store: a full update, exactly as the screen sends it.
+fn settings_body(retention_days: i32) -> Value {
+    json!({
+        "tracking_enabled": true,
+        "mode": "cookieless",
+        "anonymize_ip": true,
+        "respect_dnt": true,
+        "bot_filter": true,
+        "sample_rate": 100,
+        "retention_days": retention_days,
+        "excluded_paths": ["/qa/private/*"],
+        "excluded_ips": []
+    })
+}
+
+#[tokio::test]
+async fn the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let other_site = fixture.site_b;
+    let manager = fixture.manager_token().await;
+    let reader = fixture.reader_token().await;
+    let member = fixture.member_token().await;
+    let other_reader = fixture.other_reader_token().await;
+    let today = OffsetDateTime::now_utc().date();
+
+    // The settings screen's own read: the cutoff the purge would use, the last run and the
+    // storage table all arrive with the settings — so a missing purge cutoff can never be
+    // rendered as an empty button label.
+    let loaded = call(
+        &fixture.state,
+        report_request(
+            &format!("/api/v1/analytics/settings?site_id={site}"),
+            &manager,
+        ),
+    )
+    .await;
+    assert_eq!(loaded.status, StatusCode::OK, "body: {}", loaded.body);
+    assert_eq!(loaded.body["last_purge"], json!(null));
+    assert!(
+        loaded.body["storage"].as_array().expect("storage").len() >= 8,
+        "the storage table covers the schema: {}",
+        loaded.body["storage"]
+    );
+    assert!(
+        loaded.body["storage"]
+            .as_array()
+            .expect("storage")
+            .iter()
+            .any(|field| field["personal"] == json!(true)),
+        "the table names the personal columns"
+    );
+
+    // Retention of 7 days, so the fixture below can sit on both sides of the cutoff.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/analytics/settings?site_id={site}"),
+            Some(&manager),
+            Some(settings_body(7)),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+    let expected_cutoff = (today - time::Duration::days(7))
+        .midnight()
+        .assume_utc()
+        .date()
+        .to_string();
+    assert!(
+        saved.body["purge_cutoff"]
+            .as_str()
+            .expect("a cutoff")
+            .starts_with(&expected_cutoff),
+        "the screen can name the cutoff before the button is pressed: {}",
+        saved.body["purge_cutoff"]
+    );
+
+    // A receiver subscribed to both compliance events, through a real endpoint row.
+    let receiver = ComplianceReceiver::start().await;
+    sqlx::query(
+        "insert into webhook_endpoints (id, organization_id, name, url, secret, events, enabled) \
+         values ($1, $2, $3, $4, $5, $6, true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.organizations[0])
+    .bind(format!("Compliance {}", &Uuid::new_v4().simple().to_string()[..8]))
+    .bind(&receiver.url)
+    .bind("0123456789abcdef0123456789abcdef")
+    .bind(vec![
+        "analytics.retention_purged".to_owned(),
+        "analytics.erasure_completed".to_owned(),
+    ])
+    .execute(fixture.db.pool())
+    .await
+    .expect("the endpoint must be created");
+
+    // Rows on both sides of the cutoff, on two sites, plus a salt far outside every window.
+    let stale = hash("purge-stale");
+    let fresh = hash("purge-fresh");
+    let other = hash("purge-other");
+    let stale_visit = seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &stale,
+            at: at_day(30, 9),
+            path: "/qa/old",
+            title: "Old page",
+            device: "desktop",
+            country: "TR",
+            source: None,
+            referrer_host: None,
+            duration_ms: Some(900),
+        },
+    )
+    .await;
+    seed_event(
+        &fixture.db,
+        site,
+        stale_visit,
+        "signup",
+        "/qa/old",
+        Some(9.0),
+        json!({ "plan": "old" }),
+        at_day(30, 9),
+    )
+    .await;
+    seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &fresh,
+            at: at_day(2, 9),
+            path: "/qa/recent",
+            title: "Recent page",
+            device: "desktop",
+            country: "TR",
+            source: None,
+            referrer_host: None,
+            duration_ms: Some(500),
+        },
+    )
+    .await;
+    seed_visit(
+        &fixture.db,
+        other_site,
+        &RawVisit {
+            hash: &other,
+            at: at_day(30, 9),
+            path: "/qa/other",
+            title: "Another site",
+            device: "desktop",
+            country: "TR",
+            source: None,
+            referrer_host: None,
+            duration_ms: None,
+        },
+    )
+    .await;
+    let ancient_salt = (today - time::Duration::days(400)).to_string();
+    sqlx::query("insert into analytics_salts (day, salt) values ($1::date, $2)")
+        .bind(&ancient_salt)
+        .bind("f".repeat(64))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the ancient salt must be written");
+
+    // Running a purge is `analytics.settings.manage`, like the settings themselves.
+    for (label, token) in [("reader", &reader), ("member", &member), ("other org", &other_reader)] {
+        let refused = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                &format!("/api/v1/analytics/purge?site_id={site}"),
+                Some(token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "{label} may not purge: {}",
+            refused.body
+        );
+    }
+
+    let purged = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/purge?site_id={site}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(purged.status, StatusCode::OK, "body: {}", purged.body);
+    assert_eq!(purged.body["kind"], json!("retention"));
+    assert_eq!(purged.body["visits"], json!(1), "body: {}", purged.body);
+    assert_eq!(purged.body["pageviews"], json!(1));
+    assert_eq!(purged.body["events"], json!(1));
+    assert_eq!(purged.body["goal_hits"], json!(0));
+    assert_eq!(purged.body["rows_removed"], json!(3));
+    assert!(
+        purged.body["cutoff"]
+            .as_str()
+            .expect("a cutoff")
+            .starts_with(&expected_cutoff)
+    );
+
+    // Exactly the intended rows went, and nothing else did.
+    assert_eq!(visits_for(&fixture.db, site, &stale).await, 0, "the stale visit is gone");
+    assert_eq!(visits_for(&fixture.db, site, &fresh).await, 1, "the recent visit stays");
+    assert_eq!(
+        rows(&fixture.db, "analytics_visits", other_site).await,
+        1,
+        "another site is never touched"
+    );
+    let salts: i64 = sqlx::query_scalar("select count(*)::bigint from analytics_salts where day = $1::date")
+        .bind(&ancient_salt)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the salt count must run");
+    assert_eq!(salts, 0, "a salt past every window is pruned with the rows");
+
+    // The audit row, and the event the platform records for a subscriber.
+    let audit = audit_rows(&fixture.db, site).await;
+    assert_eq!(audit.len(), 1, "one run, one audit row: {audit:?}");
+    assert_eq!(audit[0].0, "retention");
+    assert_eq!(audit[0].2, 3);
+    assert!(audit[0].1.is_some(), "a retention run names its cutoff");
+    let recorded = event_payloads(&fixture.db, site, "analytics.retention_purged").await;
+    assert_eq!(recorded.len(), 1, "one purge, one event");
+    assert_eq!(recorded[0]["rows_removed"], json!(3));
+
+    // The erasure: the same handle on two sites, with a pageview, an event and a goal hit.
+    let doomed = hash("erase-me");
+    let visit_id = seed_visit(
+        &fixture.db,
+        site,
+        &RawVisit {
+            hash: &doomed,
+            at: at_day(1, 10),
+            path: "/qa/erase",
+            title: "Erase me",
+            device: "mobile",
+            country: "TR",
+            source: None,
+            referrer_host: None,
+            duration_ms: Some(1200),
+        },
+    )
+    .await;
+    seed_pageview(&fixture.db, site, visit_id, "/qa/erase/thanks", "Thanks", at_day(1, 10)).await;
+    seed_event(
+        &fixture.db,
+        site,
+        visit_id,
+        "signup",
+        "/qa/erase",
+        Some(10.0),
+        json!({ "plan": "pro" }),
+        at_day(1, 11),
+    )
+    .await;
+    seed_visit(
+        &fixture.db,
+        other_site,
+        &RawVisit {
+            hash: &doomed,
+            at: at_day(1, 10),
+            path: "/qa/erase",
+            title: "Erase me elsewhere",
+            device: "mobile",
+            country: "TR",
+            source: None,
+            referrer_host: None,
+            duration_ms: None,
+        },
+    )
+    .await;
+
+    let goal = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/analytics/goals?site_id={site}"),
+            Some(&manager),
+            Some(json!({
+                "name": "Erase walk",
+                "kind": "pageview",
+                "match": { "path": "/qa/erase" },
+                "enabled": true,
+                "steps": []
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(goal.status, StatusCode::CREATED, "body: {}", goal.body);
+    let goal_id: Uuid = goal.body["id"].as_str().expect("a goal id").parse().expect("a uuid");
+    sqlx::query(
+        "insert into analytics_goal_hits (goal_id, visitor_hash, step_position, occurred_at) \
+         values ($1, $2, 1, now())",
+    )
+    .bind(goal_id)
+    .bind(&doomed)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the goal hit must be written");
+
+    // A handle that is not a hash is a `400`, not an erasure of something else.
+    let bad_handle = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/analytics/visitors/203.0.113.7?site_id={site}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(bad_handle.status, StatusCode::BAD_REQUEST, "body: {}", bad_handle.body);
+    assert_eq!(bad_handle.body["error"]["code"], json!("invalid_visitor"));
+
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/analytics/visitors/{doomed}?site_id={site}"),
+            Some(&reader),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    let erased = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/analytics/visitors/{doomed}?site_id={site}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(erased.status, StatusCode::OK, "body: {}", erased.body);
+    assert_eq!(erased.body["visitor"], json!(doomed));
+    assert_eq!(erased.body["visits"], json!(1), "body: {}", erased.body);
+    assert_eq!(erased.body["pageviews"], json!(2));
+    assert_eq!(erased.body["events"], json!(1));
+    assert_eq!(erased.body["goal_hits"], json!(1));
+    assert_eq!(erased.body["rows_removed"], json!(5));
+
+    assert_eq!(visits_for(&fixture.db, site, &doomed).await, 0, "every visit of the handle is gone");
+    assert_eq!(goal_hits_for(&fixture.db, site, &doomed).await, 0, "and every goal hit");
+    assert_eq!(
+        visits_for(&fixture.db, other_site, &doomed).await,
+        1,
+        "the same handle on another site is another site's data"
+    );
+
+    // Erasing again removes nothing and still answers: an erasure that failed on a retry would
+    // be a compliance problem of its own.
+    let again = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/analytics/visitors/{doomed}?site_id={site}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(again.body["rows_removed"], json!(0));
+
+    // Two runs, two audit rows; the erasure names the handle it erased.
+    let audit = audit_rows(&fixture.db, site).await;
+    assert_eq!(audit.len(), 3, "retention + two erasures: {audit:?}");
+    assert_eq!(audit[1].0, "erasure");
+    assert_eq!(audit[1].2, 5, "the first erasure removed the visitor's rows");
+    assert!(audit[1].1.is_none(), "an erasure has no cutoff");
+    assert_eq!(audit[2].2, 0, "the second erasure found nothing left");
+    let recorded = event_payloads(&fixture.db, site, "analytics.erasure_completed").await;
+    assert_eq!(recorded.len(), 2, "one event per erasure run");
+    assert_eq!(recorded[0]["visitor"], json!(doomed));
+    assert_eq!(recorded[0]["rows_removed"], json!(5));
+    assert_eq!(recorded[1]["rows_removed"], json!(0));
+
+    // And both facts reach a subscribed endpoint over HTTP — the delivery engine's own walk.
+    let delivered = deliver_queued(&fixture).await;
+    assert!(delivered.delivered >= 2, "two deliveries went out: {delivered:?}");
+    let seen = receiver.events();
+    assert!(
+        seen.contains(&"analytics.retention_purged".to_owned()),
+        "the purge reached the receiver: {seen:?}"
+    );
+    assert!(
+        seen.contains(&"analytics.erasure_completed".to_owned()),
+        "the erasure reached the receiver: {seen:?}"
+    );
+    let payload = receiver
+        .payload("analytics.erasure_completed")
+        .expect("the erasure payload");
+    assert_eq!(payload["visitor"], json!(doomed));
+    assert_eq!(payload["rows_removed"], json!(5));
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_spike_watch_sees_an_hour_above_three_times_its_trailing_median() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let now = OffsetDateTime::now_utc();
+    let completed = omnion_module_analytics::privacy::hour_start(now) - time::Duration::hours(1);
+
+    // A quiet week: one bucket a day at five visitors — a flat site, from the watch's point of
+    // view. The hour that just closed ran forty.
+    for offset in 1_i64..=7 {
+        sqlx::query(
+            "insert into analytics_hourly (site_id, bucket, metric, dimension_kind, \
+             dimension_value, count) values ($1, $2, 'visitors', 'total', '', $3)",
+        )
+        .bind(site)
+        .bind(completed - time::Duration::days(offset))
+        .bind(5_i64)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the quiet bucket must be written");
+    }
+    sqlx::query(
+        "insert into analytics_hourly (site_id, bucket, metric, dimension_kind, \
+         dimension_value, count) values ($1, $2, 'visitors', 'total', '', $3)",
+    )
+    .bind(site)
+    .bind(completed)
+    .bind(40_i64)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the busy bucket must be written");
+
+    let finding = omnion_module_analytics::privacy::detect_spike(fixture.db.pool(), site, now)
+        .await
+        .expect("the watch must run")
+        .expect("forty against a median of five is a spike");
+    assert_eq!(finding.hour, completed);
+    assert_eq!(finding.visitors, 40);
+    assert!((finding.median - 5.0).abs() < 0.001);
+    assert!(finding.factor >= 8.0, "factor: {}", finding.factor);
+
+    // The guard reads the events themselves: until the fact is recorded, the hour is news.
+    assert!(
+        !omnion_module_analytics::privacy::spike_recorded(fixture.db.pool(), site, completed)
+            .await
+            .expect("the guard must run")
+    );
+
+    bus::emit(
+        fixture.db.pool(),
+        NewEvent::new("analytics.traffic_spike")
+            .organization(fixture.organizations[0])
+            .site(site)
+            .payload(json!({
+                "hour": omnion_module_analytics::privacy::hour_label(completed),
+                "visitors": finding.visitors,
+                "median": finding.median,
+                "factor": finding.factor,
+            })),
+    )
+    .await
+    .expect("the spike must be recorded");
+
+    assert!(
+        omnion_module_analytics::privacy::spike_recorded(fixture.db.pool(), site, completed)
+            .await
+            .expect("the guard must run"),
+        "a recorded hour is not announced twice"
+    );
+    let recorded = event_payloads(&fixture.db, site, "analytics.traffic_spike").await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["visitors"], json!(40));
+
+    // A quiet hour of the same site is not news, and neither is an empty one.
+    assert!(
+        omnion_module_analytics::privacy::detect_spike(
+            fixture.db.pool(),
+            site,
+            completed + time::Duration::days(1) + time::Duration::hours(2),
+        )
+        .await
+        .expect("the watch must run")
+        .is_none(),
+        "an hour nobody spiked is not a spike"
+    );
 
     fixture.cleanup().await;
 }
