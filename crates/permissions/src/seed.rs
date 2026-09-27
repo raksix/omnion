@@ -87,6 +87,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "workflows.read",
             "workflows.manage",
             "workflows.run",
+            "workflows.approve",
             "users.read",
             "users.update",
             "iam.permissions.read",
@@ -443,10 +444,19 @@ mod tests {
                 .keys()
         };
 
-        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
+        for key in [
+            "workflows.read",
+            "workflows.manage",
+            "workflows.run",
+            "workflows.approve",
+        ] {
             assert!(keys_of("manager").contains(&key), "manager holds {key}");
         }
         assert!(keys_of("moderator").contains(&"workflows.run"));
+        assert!(
+            !keys_of("moderator").contains(&"workflows.approve"),
+            "a moderator may run a rule but may not wave through what it parks"
+        );
         assert!(!keys_of("moderator").contains(&"workflows.manage"));
         assert!(keys_of("editor").contains(&"workflows.read"));
         assert!(!keys_of("editor").contains(&"workflows.run"));

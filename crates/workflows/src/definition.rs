@@ -315,6 +315,41 @@ impl StepDefinition {
         }
     }
 
+    /// An approval step: the run parks until a person decides (REQ-003 slice 3).
+    ///
+    /// The parameters are the gate's own (`permission`, `message`, `expires_in_hours`) and
+    /// they are written here from checked values rather than taken raw, so a constructor
+    /// call cannot build a gate the validator would refuse. `None` for any of them means
+    /// the default — which is what makes dropping the step into a rule enough.
+    #[must_use]
+    pub fn approval(
+        name: impl Into<String>,
+        permission: Option<&str>,
+        message: Option<&str>,
+        expires_in_hours: Option<i32>,
+    ) -> Self {
+        let mut params = serde_json::Map::new();
+        if let Some(permission) = permission {
+            params.insert("permission".to_owned(), serde_json::json!(permission));
+        }
+        if let Some(message) = message {
+            params.insert("message".to_owned(), serde_json::json!(message));
+        }
+        if let Some(hours) = expires_in_hours {
+            params.insert("expires_in_hours".to_owned(), serde_json::json!(hours));
+        }
+
+        Self {
+            name: name.into(),
+            kind: StepKind::Approval,
+            action: None,
+            params: serde_json::Value::Object(params),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
+            max_attempts: 1,
+        }
+    }
+
     /// Allow more than one attempt.
     #[must_use]
     pub fn retrying(mut self, max_attempts: i32) -> Self {
@@ -440,6 +475,26 @@ impl StepDefinition {
                     ));
                 }
                 self.stop_reason().map(|_| ())
+            }
+            StepKind::Approval => {
+                // A gate claims no action, and it is resumed rather than retried — the same
+                // two rules a wait follows, because it is the same kind of machine.
+                if self.action.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_approval",
+                        format!(
+                            "step \"{name}\" is an approval step and cannot name an action; \
+                             the engine decides it"
+                        ),
+                    ));
+                }
+                if self.max_attempts != 1 {
+                    return Err(WorkflowError::invalid(
+                        "invalid_max_attempts",
+                        format!("step \"{name}\" is an approval; a gate is resumed, not retried"),
+                    ));
+                }
+                crate::approval::params_from(&self.params).map(|_| ())
             }
         }
     }

@@ -30,6 +30,9 @@
 //! * [`binding`] — `{{event.field}}` placeholders in action parameters, resolved **when the run
 //!   is materialised**, so a stored step carries the values of the event that started it;
 //! * [`matcher`] — reading the bus from a durable cursor and starting one run per match;
+//! * [`authority`] — whose permissions a host action runs with, resolved *at run time*, and
+//!   the `automation.rule.permission_revoked` refusal a rule stops on when that authority is
+//!   gone (REQ-003 slice 3);
 //! * [`actions`] — the host actions the engine hands over: `send_email` (SMTP),
 //!   `comment_revision` (a note on a content revision), `http_request` (a signed outbound
 //!   call), `publish_page` and `run_workflow` (REQ-003 slice 2);
@@ -43,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod authority;
 pub mod binding;
 pub mod catalogue;
 pub mod condition;
@@ -56,6 +60,7 @@ pub mod outbound;
 pub mod testing;
 
 pub use actions::AutomationActions;
+pub use authority::Authority;
 pub use binding::{resolve_params, validate_bindings};
 pub use condition::{Condition, ConditionOperator};
 pub use error::{AutomationError, Result};

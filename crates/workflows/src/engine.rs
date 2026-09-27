@@ -12,6 +12,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::actions;
+use crate::approval;
 use crate::branch;
 use crate::definition::{MAX_ATTEMPTS, wait_seconds_from};
 use crate::error::{Result, WorkflowError};
@@ -96,6 +97,8 @@ pub struct SweepReport {
     pub steps_reclaimed: usize,
     /// Runs that were left open without any step to run and were settled.
     pub executions_settled: usize,
+    /// Gates that expired without a decision and ended their run.
+    pub approvals_expired: usize,
 }
 
 /// What running one claimed step did.
@@ -158,7 +161,10 @@ pub async fn tick_with(
             Some(ExecutionStatus::Completed) => report.completed += 1,
             Some(ExecutionStatus::Failed) => report.failed += 1,
             Some(ExecutionStatus::Cancelled) => report.cancelled += 1,
-            Some(ExecutionStatus::Running) | None => {}
+            // A run parked on a person is not settled by a step — the gate's own write
+            // moves it back to `running` when somebody decides. Counting it here would
+            // report a settled run for a run that is only waiting.
+            Some(ExecutionStatus::Running) | Some(ExecutionStatus::AwaitingApproval) | None => {}
         }
     }
 
@@ -173,6 +179,15 @@ pub async fn sweep(pool: &PgPool, config: &RunnerConfig) -> Result<SweepReport> 
     let mut touched: Vec<Uuid> = store::resolve_due_waits(pool, config.sweep_batch).await?;
     let waits_resolved = touched.len();
 
+    // A gate nobody decided stops being a question after its deadline. Expiring it here is
+    // what stops a run from sitting in `awaiting_approval` forever with nobody watching:
+    // the gate is decided as a rejection (a *nobody answered* is a no), the run is reopened
+    // so the engine's own resume claim can see that decision, and the audit trail says why
+    // it ended.
+    let expired = expire_stale_approvals(pool, config).await?;
+    let approvals_expired = expired.len();
+    touched.extend(expired.iter().copied());
+
     let reclaimed = reclaim_stale_steps(pool, config).await?;
     touched.extend(reclaimed.iter().copied());
 
@@ -186,9 +201,11 @@ pub async fn sweep(pool: &PgPool, config: &RunnerConfig) -> Result<SweepReport> 
         audit_settlement(pool, *execution_id).await?;
     }
 
-    if waits_resolved > 0 || !reclaimed.is_empty() || !recovered.is_empty() {
+    if waits_resolved > 0 || approvals_expired > 0 || !reclaimed.is_empty() || !recovered.is_empty()
+    {
         tracing::info!(
             waits_resolved,
+            approvals_expired,
             steps_reclaimed = reclaimed.len(),
             executions_settled = recovered.len(),
             "workflow sweep"
@@ -199,6 +216,7 @@ pub async fn sweep(pool: &PgPool, config: &RunnerConfig) -> Result<SweepReport> 
         waits_resolved,
         steps_reclaimed: reclaimed.len(),
         executions_settled: recovered.len(),
+        approvals_expired,
     })
 }
 
@@ -271,6 +289,39 @@ async fn reclaim_stale_steps(pool: &PgPool, config: &RunnerConfig) -> Result<Vec
                 // decision is not re-made.
                 store::requeue_step(pool, step.id).await?;
             }
+            Some(StepKind::Approval) => {
+                // A gate whose runner died between the claim and the write has no approval
+                // row yet, so the step simply parks again on its first claim. A gate whose
+                // row *is* there is already waiting for a person and the run is parked with
+                // it — requeueing the step would let the engine claim a run a decision has
+                // not been asked about, so it goes back to `waiting` and the run's own
+                // status (which the claim query reads) keeps the two in step.
+                match step.approval_id {
+                    None => store::requeue_step(pool, step.id).await?,
+                    Some(approval_id) => {
+                        let decided = approval::decision_of(pool, approval_id).await?;
+                        match decided {
+                            Some(_) => store::requeue_step(pool, step.id).await?,
+                            None => {
+                                // Park until the gate's own deadline: the run status may have
+                                // been lost to the crash, and the deadline is the same one
+                                // the sweeper expires on, so this cannot wait forever.
+                                let seconds = step
+                                    .params
+                                    .get("expires_in_hours")
+                                    .and_then(serde_json::Value::as_i64)
+                                    .unwrap_or(i64::from(approval::DEFAULT_TTL_HOURS));
+                                store::set_step_waiting(
+                                    pool,
+                                    step.id,
+                                    store::now() + Duration::hours(seconds),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+            }
             None => {
                 store::fail_step(pool, step.id, "the step carries an unknown kind").await?;
             }
@@ -330,6 +381,98 @@ pub async fn start_run_with(
 
     record_start(pool, workflow, &execution, trigger, steps.len()).await?;
     Ok(execution)
+}
+
+/// Decide the gates whose deadline passed without a decision, and hand their runs back to
+/// the engine so the resume claim can see the decision.
+///
+/// Expiry is a *rejection* rather than a third state on purpose: a gate nobody answered is
+/// a no, and a no is a state the engine already knows how to end a run on. A third state
+/// would need a third ending, and the run-history UI would need a third colour, for what is
+/// the same fact — "it did not go ahead".
+///
+/// The write is guarded on `decision is null`, so a person pressing *Reject* in the same
+/// millisecond wins exactly one of the two, and the loser sees the row already decided
+/// rather than overwriting a human's decision with a clock's.
+async fn expire_stale_approvals(pool: &PgPool, config: &RunnerConfig) -> Result<Vec<Uuid>> {
+    let expired = approval::expired_approvals(pool, config.sweep_batch).await?;
+    let mut ended = Vec::with_capacity(expired.len());
+
+    for approval_id in expired {
+        if !approval::expire_approval(pool, approval_id).await? {
+            // Somebody decided it between the read and the write.
+            continue;
+        }
+
+        // The row knows its run and its step, so the run is reopened and the step re-queued
+        // for the engine's second claim — the same path an approval takes, which is the
+        // point: an expired gate and a rejected one reach the run's end by the same write.
+        let gate: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "select execution_id, step_id, organization_id from workflow_approvals where id = $1",
+        )
+        .bind(approval_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((execution_id, step_id, organization_id)) = gate else {
+            continue;
+        };
+
+        approval::resume_after_decision(pool, execution_id, step_id).await?;
+
+        let entry = omnion_audit::NewAuditEntry::system("workflow.approval.expired")
+            .organization(organization_id)
+            .target("workflow_approval", approval_id.to_string())
+            .metadata(json!({
+                "execution_id": execution_id,
+                "step_id": step_id,
+                "reason": "the approval expired before anybody decided it",
+            }));
+        if let Err(err) = omnion_audit::record(pool, entry).await {
+            // A gap in the trail is worth a log line, never a failed sweep: the *decision*
+            // already happened, and undoing it because the audit row could not be written
+            // would be a worse answer than a missing one.
+            tracing::warn!(approval_id = %approval_id, error = %err, "an expired approval's audit row could not be written");
+        }
+
+        tracing::info!(
+            approval_id = %approval_id,
+            execution_id = %execution_id,
+            "an approval expired and its run was handed back to the engine"
+        );
+        ended.push(execution_id);
+    }
+
+    Ok(ended)
+}
+
+/// Write the audit row of a gate that has just been opened.
+///
+/// The **token is deliberately absent** from the metadata: an audit row is read by far more
+/// people than a decision credential is meant for, and the same rule the inbound hook token
+/// follows. What the row carries instead is everything an operator needs to find the gate —
+/// the run, the step, the permission that may open it, and when it stops waiting.
+#[allow(clippy::too_many_arguments)]
+async fn record_approval_requested(
+    pool: &PgPool,
+    execution: &WorkflowExecution,
+    step_no: i32,
+    issued: &approval::IssuedToken,
+    params: &approval::ApprovalParams,
+) -> Result<()> {
+    let entry = omnion_audit::NewAuditEntry::system(approval::REQUESTED_EVENT)
+        .organization(execution.organization_id)
+        .target("workflow_execution", execution.id.to_string())
+        .metadata(json!({
+            "workflow_id": execution.workflow_id,
+            "step_no": step_no,
+            "permission": params.permission,
+            "message": params.message,
+            "expires_at": approval::approval_deadline(params, store::now()),
+            "token_hash": issued.hash,
+        }));
+
+    omnion_audit::record(pool, entry).await?;
+    Ok(())
 }
 
 /// Write the audit row of a run that has just been created.
@@ -499,6 +642,124 @@ async fn advance_step(
             );
             Ok(StepOutcome {
                 settled: Some(ExecutionStatus::Completed),
+                ..StepOutcome::default()
+            })
+        }
+        StepKind::Approval => {
+            // A gate is claimed twice, exactly like a wait: the first claim writes the
+            // approval row and parks the run, the second is the *resume* the decision hands
+            // back. A parked run is not claimable, so the second claim can only happen after
+            // somebody's decision has reopened it — which is the whole protection, and it is
+            // the reason `is_claimable` is a separate question from "is the run open".
+            if claimed.attempts > 1 {
+                // The gate is resumed by a decision, not by the clock — so the first thing
+                // the resume checks is whether the run was let go *at all*. A claim that
+                // reaches here with the gate still undecided is not a race to win: it parks
+                // itself again, which is the one behaviour that keeps a half-resumed run
+                // from marching past a gate nobody opened.
+                let decided = match claimed.approval_id {
+                    Some(approval_id) => approval::decision_of(pool, approval_id).await?,
+                    None => None,
+                };
+
+                let Some(decision) = decided else {
+                    // Park it again, until the gate's own deadline. `set_step_waiting`
+                    // keeps the attempt count, so the resume claim is still there when the
+                    // decision lands, and it does not spin: `available_at` is the deadline,
+                    // not now.
+                    let deadline = store::now()
+                        + Duration::hours(i64::from(
+                            approval::params_from(&claimed.params)?.expires_in_hours,
+                        ));
+                    store::set_step_waiting(pool, claimed.id, deadline).await?;
+                    tracing::warn!(
+                        step_id = %claimed.id,
+                        "a gate was claimed for a resume with no decision behind it; parked again"
+                    );
+                    return Ok(StepOutcome {
+                        waited: true,
+                        ..StepOutcome::default()
+                    });
+                };
+
+                match decision {
+                    approval::Decision::Approved => {
+                        // Approved: the gate *succeeds* and the run carries on. The output
+                        // names who decided, because "who let this through" is the question
+                        // an audit asks of every gated effect.
+                        let decided_by: Option<Uuid> = sqlx::query_scalar(
+                            "select decided_by from workflow_approvals where id = $1",
+                        )
+                        .bind(claimed.approval_id)
+                        .fetch_one(pool)
+                        .await?;
+                        store::complete_step(
+                            pool,
+                            claimed.id,
+                            &json!({
+                                "approved": true,
+                                "approval_id": claimed.approval_id,
+                                "decided_by": decided_by,
+                            }),
+                        )
+                        .await?;
+                        tracing::info!(step_id = %claimed.id, "an approval resumed the run");
+                        return Ok(StepOutcome {
+                            settled: settle_after_step(pool, claimed).await?,
+                            ..StepOutcome::default()
+                        });
+                    }
+                    approval::Decision::Rejected => {
+                        // Rejected: the run ends *here* and the steps after it are closed,
+                        // exactly as a branch closes them. A person decided this, so the
+                        // step is cancelled rather than failed and the run settles as
+                        // cancelled: nothing in the rule went wrong, it was told not to.
+                        let note = claimed
+                            .params
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("an approver rejected this step")
+                            .to_owned();
+                        approval::end_at_rejection(
+                            pool,
+                            claimed.execution_id,
+                            claimed.id,
+                            &format!("rejected by an approver: {note}"),
+                        )
+                        .await?;
+                        tracing::info!(
+                            step_id = %claimed.id,
+                            "an approval was rejected and the run ended there"
+                        );
+                        return Ok(StepOutcome {
+                            settled: Some(ExecutionStatus::Cancelled),
+                            ..StepOutcome::default()
+                        });
+                    }
+                }
+            }
+
+            // The first claim: write the gate, park the step, park the run. Three writes in
+            // one transaction (see `approval::open`) so a gate row, a parked step and a
+            // parked run either all exist or none do.
+            let Some(execution) = store::find_execution(pool, claimed.execution_id).await? else {
+                return Ok(StepOutcome::default());
+            };
+            let params = approval::params_from(&claimed.params)?;
+            let issued = approval::open(
+                pool,
+                &execution,
+                claimed.id,
+                claimed.step_no,
+                &params,
+                store::now(),
+            )
+            .await?;
+
+            record_approval_requested(pool, &execution, claimed.step_no, &issued, &params).await?;
+
+            Ok(StepOutcome {
+                waited: true,
                 ..StepOutcome::default()
             })
         }
@@ -746,7 +1007,9 @@ async fn record_settlement(
         ExecutionStatus::Completed => "workflow.execution.completed",
         ExecutionStatus::Failed => "workflow.execution.failed",
         ExecutionStatus::Cancelled => "workflow.execution.cancelled",
-        ExecutionStatus::Running => return Ok(()),
+        // Not settled: a running run has not finished, and a run parked on a person is the
+        // definition of not finished. Neither is a settlement to audit.
+        ExecutionStatus::Running | ExecutionStatus::AwaitingApproval => return Ok(()),
     };
 
     // The settled row carries the failure message the steps left behind.

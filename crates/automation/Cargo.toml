@@ -25,4 +25,8 @@ uuid.workspace = true
 omnion-audit = { path = "../audit" }
 omnion-content = { path = "../content" }
 omnion-events = { path = "../events" }
+# A rule's host actions resolve the run-as account's *effective* permissions at run time
+# (REQ-003 slice 3), so the layer needs the same resolution the guard uses — a second
+# implementation of "does this account hold this key" is a second answer to the question.
+omnion-permissions = { path = "../permissions" }
 omnion-workflows = { path = "../workflows" }

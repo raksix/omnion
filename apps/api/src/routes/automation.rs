@@ -71,6 +71,13 @@ pub struct AutomationBody {
     pub actions: Value,
     /// The rule's own failure policy; a step that inherits takes this.
     pub on_error: &'static str,
+    /// Whose authority the rule's host actions run with; `null` means the author.
+    pub run_as_user_id: Option<Uuid>,
+    /// Which of the two it is, in a sentence the panel shows beside the picker.
+    pub run_as_description: &'static str,
+    /// What each host action of this platform needs, so the panel can show what a run-as
+    /// account is being asked for rather than an opaque id.
+    pub action_permissions: &'static [(&'static str, &'static str)],
     /// How many runs the trigger has started.
     pub trigger_count: i32,
     /// When the rule last fired.
@@ -133,6 +140,9 @@ impl AutomationBody {
             condition_count,
             actions,
             on_error: rule.on_error.as_str(),
+            run_as_user_id: rule.run_as_user_id,
+            run_as_description: rule.authority().describe(),
+            action_permissions: omnion_automation::authority::ACTION_PERMISSIONS,
             trigger_count: rule.trigger_count,
             last_triggered_at: rule.last_triggered_at,
             created_at: rule.created_at,
@@ -306,6 +316,14 @@ pub struct AutomationInput {
     /// existed.
     #[serde(default = "default_on_error")]
     pub on_error: RuleOnError,
+    /// Whose authority the rule's host actions run with (REQ-003 slice 3).
+    ///
+    /// Absent (or `null`) follows the rule's author. A named account is the case the copy
+    /// could not express: a shared "content publisher" service identity that keeps working
+    /// after the person who wrote the rule leaves. It is resolved at *run* time, so handing a
+    /// rule to an account changes what happens from the next run, not from a redeploy.
+    #[serde(default)]
+    pub run_as_user_id: Option<Uuid>,
     /// Actions to run, in order.
     pub actions: Vec<StepDefinition>,
 }
@@ -361,6 +379,7 @@ impl AutomationInput {
             actions: self.actions.clone(),
             hook_triggered: self.hook_triggered,
             on_error: self.on_error.into(),
+            run_as_user_id: self.run_as_user_id,
         };
 
         // The definition check is the full one: the event name against the bus's rule, the
@@ -585,6 +604,7 @@ pub async fn create_automation(
             schedule: None,
             trigger_event: definition.trigger.event.clone(),
             conditions: definition.conditions_json()?,
+            run_as_user_id: rule.run_as_user_id,
             next_run_at: None,
             steps: definition.steps_json()?,
             created_by: Some(current.user.id),
@@ -659,6 +679,7 @@ pub async fn update_automation(
     let update = update_from_rule(&AutomationRule {
         id: existing.id,
         organization_id: existing.organization_id,
+        created_by: existing.created_by,
         site_id: rule.site_id,
         name: rule.name.clone(),
         description: rule.description.clone(),
@@ -669,6 +690,7 @@ pub async fn update_automation(
         hook_triggered: rule.hook_triggered,
         hook_configured: existing.hook_token_hash.is_some(),
         on_error: rule.on_error,
+        run_as_user_id: rule.run_as_user_id,
         trigger_count: existing.trigger_count,
         last_triggered_at: existing.last_triggered_at,
         created_at: existing.created_at,
@@ -1242,6 +1264,7 @@ mod tests {
     fn input() -> AutomationInput {
         AutomationInput {
             organization_id: None,
+            run_as_user_id: None,
             site_id: None,
             name: "  Welcome the editor  ".to_owned(),
             description: "  announces a publication  ".to_owned(),
@@ -1436,6 +1459,7 @@ mod tests {
     fn a_rule_the_matcher_could_not_run_is_refused_when_it_is_written() {
         let base = |event: &str, conditions: Value, actions: Vec<StepDefinition>| AutomationInput {
             organization_id: None,
+            run_as_user_id: None,
             site_id: None,
             name: "rule".to_owned(),
             description: String::new(),

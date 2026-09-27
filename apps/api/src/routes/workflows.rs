@@ -382,6 +382,11 @@ pub async fn create_workflow(
             schedule: definition.trigger.cron.clone(),
             trigger_event: definition.trigger.event.clone(),
             conditions: definition.conditions_json()?,
+            // The manual/scheduled surface has no run-as picker: those workflows are run by
+            // the people who manage them, so they follow their author. The field is
+            // automation's (`crates/automation::authority`), and a second way to set it here
+            // would be a second answer to "who does this run as".
+            run_as_user_id: None,
             next_run_at,
             steps: definition.steps_json()?,
             created_by: Some(current.user.id),
@@ -459,6 +464,9 @@ pub async fn update_workflow(
             schedule: definition.trigger.cron.clone(),
             trigger_event: definition.trigger.event.clone(),
             conditions: definition.conditions_json()?,
+            // Carried through rather than cleared: a workflow that was an event rule and is
+            // being converted back must not silently lose the account it was handed.
+            run_as_user_id: existing.run_as_user_id,
             next_run_at,
             steps: definition.steps_json()?,
         },
@@ -689,6 +697,7 @@ mod tests {
 
     fn workflow_row() -> Workflow {
         Workflow {
+            run_as_user_id: None,
             id: Uuid::nil(),
             organization_id: Uuid::nil(),
             site_id: None,
@@ -771,6 +780,7 @@ mod tests {
     #[test]
     fn the_detail_body_flattens_the_run_and_lists_its_steps() {
         let execution = WorkflowExecution {
+            approval_id: None,
             id: Uuid::nil(),
             workflow_id: Uuid::nil(),
             organization_id: Uuid::nil(),
@@ -783,6 +793,7 @@ mod tests {
             event_payload: Some(serde_json::json!({ "status": "published" })),
         };
         let steps = vec![WorkflowStep {
+            approval_id: None,
             id: Uuid::nil(),
             execution_id: Uuid::nil(),
             step_no: 1,

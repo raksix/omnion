@@ -11,7 +11,12 @@ serde.workspace = true
 # The runner applies a step's `timeout_ms` with `tokio::time::timeout` — a per-attempt budget
 # the engine enforces by refusing to wait longer, not by scheduling around (REQ-003 slice 2).
 tokio.workspace = true
+# A decision token is a credential: SHA-256 so only its hash reaches the database, and
+# 32 characters of CSPRNG output so two gates never share one (REQ-003 slice 3).
+hex.workspace = true
+rand.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true

@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod approval;
 pub mod branch;
 pub mod cron;
 pub mod definition;
@@ -28,6 +29,7 @@ pub mod handler;
 pub mod model;
 pub mod store;
 
+pub use approval::{APPROVAL_PERMISSION, ApprovalParams, Decision as ApprovalDecision};
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
 pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};

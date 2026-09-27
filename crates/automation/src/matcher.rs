@@ -346,6 +346,11 @@ pub fn update_from_rule(rule: &AutomationRule) -> Option<WorkflowUpdate> {
         schedule: None,
         trigger_event: Some(rule.event.clone()),
         conditions: definition.conditions_json().ok()?,
+        // Carried through rather than defaulted: a whole-rule write (arm, disarm, rename)
+        // that dropped this would silently move a rule off the service account it was
+        // deliberately handed to, which is the kind of change nobody notices until a run
+        // stops with a permission error.
+        run_as_user_id: rule.run_as_user_id,
         next_run_at: None,
         steps: definition.steps_json().ok()?,
     })
@@ -359,6 +364,8 @@ mod tests {
 
     fn rule_with(actions: Vec<StepDefinition>) -> AutomationRule {
         AutomationRule {
+            created_by: None,
+            run_as_user_id: None,
             id: Uuid::nil(),
             organization_id: Uuid::nil(),
             site_id: None,

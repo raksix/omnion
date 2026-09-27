@@ -25,9 +25,9 @@ fn workflow_columns() -> &'static str {
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
     let sql = format!(
         "insert into workflows (organization_id, site_id, name, description, enabled, \
-         trigger_kind, schedule, trigger_event, conditions, on_error, next_run_at, steps, \
-         created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) returning {}",
+         trigger_kind, schedule, trigger_event, conditions, on_error, run_as_user_id, \
+         next_run_at, steps, created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) returning {}",
         workflow_columns()
     );
 
@@ -42,6 +42,7 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.trigger_event)
         .bind(new.conditions)
         .bind(new.on_error.as_str())
+        .bind(new.run_as_user_id)
         .bind(new.next_run_at)
         .bind(new.steps)
         .bind(new.created_by)
@@ -104,6 +105,9 @@ pub struct WorkflowUpdate {
     pub next_run_at: Option<OffsetDateTime>,
     /// The rule's own error policy.
     pub on_error: crate::model::OnError,
+    /// Whose authority the rule's host actions run with (REQ-003 slice 3). `None` means the
+    /// author, so a whole-rule write cannot silently leave a run-as nobody.
+    pub run_as_user_id: Option<Uuid>,
     /// New step definitions as stored JSON.
     pub steps: serde_json::Value,
 }
@@ -117,7 +121,7 @@ pub async fn update_workflow(
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
          trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
-         conditions = $11, on_error = $12, updated_at = now() \
+         conditions = $11, on_error = $12, run_as_user_id = $13, updated_at = now() \
          where id = $1 returning {}",
         workflow_columns()
     );
@@ -135,6 +139,7 @@ pub async fn update_workflow(
         .bind(update.trigger_event)
         .bind(update.conditions)
         .bind(update.on_error.as_str())
+        .bind(update.run_as_user_id)
         .fetch_optional(pool)
         .await?;
 
@@ -282,7 +287,7 @@ pub async fn create_execution_in(
         let action = match step.kind {
             StepKind::Branch => Some(crate::branch::BRANCH_ACTION.to_owned()),
             StepKind::Task => step.action.clone(),
-            StepKind::Wait | StepKind::Stop => None,
+            StepKind::Wait | StepKind::Stop | StepKind::Approval => None,
         };
 
         let row: WorkflowStep = sqlx::query_as(&step_sql)
@@ -448,13 +453,19 @@ pub struct ClaimedStep {
     pub attempts: i32,
     /// Attempts allowed in total.
     pub max_attempts: i32,
+    /// The approval row gating this step, when it is an approval step that has parked.
+    pub approval_id: Option<Uuid>,
 }
 
 /// Claim the next step that is due.
 ///
-/// One statement, one row: the run's oldest open step that is due and whose earlier steps have
-/// all finished. The row lock makes the claim exclusive even when several API instances run the
-/// engine at the same time.
+/// One statement, one row: the run's oldest open step that is due and whose earlier steps
+/// have all finished. The row lock makes the claim exclusive even when several API
+/// instances run the engine at the same time.
+///
+/// The `e.status = 'running'` filter is the whole of the approval gate's protection: a run
+/// parked on a person has no claimable step, so nothing behind a pending decision can
+/// progress — not the gate itself, not the effect the gate was there to hold back.
 pub async fn claim_due_step(pool: &PgPool) -> Result<Option<ClaimedStep>> {
     let claimed: Option<ClaimedStep> = sqlx::query_as(
         "with due as ( \
@@ -476,7 +487,7 @@ pub async fn claim_due_step(pool: &PgPool) -> Result<Option<ClaimedStep>> {
          set status = 'running', attempts = s.attempts + 1, started_at = now() \
          from due where s.id = due.id \
          returning s.id, s.execution_id, s.step_no, s.name, s.kind, s.action, s.params, \
-                   s.on_error, s.timeout_ms, s.attempts, s.max_attempts",
+                   s.on_error, s.timeout_ms, s.attempts, s.max_attempts, s.approval_id",
     )
     .fetch_optional(pool)
     .await?;
@@ -874,6 +885,11 @@ pub async fn stale_steps(
 ///
 /// An instance can stop between "the last step succeeded" and "the run is completed"; the next
 /// sweep closes those runs instead of leaving them running forever.
+///
+/// A run parked on a person is **not** one of them: its gate step is `waiting`, so the
+/// `not exists` guard already skips it, and the `status = 'running'` filter is the second
+/// line — a run that a decision reopened and that happens to have no open step is settled
+/// by that decision's own write, not by this one.
 pub async fn reconcile_executions(pool: &PgPool, limit: i64) -> Result<Vec<Uuid>> {
     let stale: Vec<Uuid> = sqlx::query_scalar(
         "select e.id from workflow_executions e \

@@ -22,8 +22,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use omnion_content::comments::{self, CommentSource, NewRevisionComment};
+use omnion_events::model::NewEvent;
 use omnion_workflows::{ActionContext, ActionFuture, ActionHandler};
 
+use crate::authority;
 use crate::mail::{self, Email, MailSettings};
 use crate::outbound::{self, HttpSettings};
 
@@ -74,6 +76,16 @@ impl ActionHandler for AutomationActions {
         context: &'a ActionContext<'_>,
     ) -> ActionFuture<'a> {
         Box::pin(async move {
+            // The authority check comes **first**, before any parameter is read and before
+            // the world is touched. A refusal is not an action failure that a retry could
+            // fix — the premise is false — so it is reported as a message the engine's
+            // `stop` policy ends the run on, and the event is recorded so an operator can
+            // see it without opening every run.
+            if let Err(err) = self.authorise(context, action).await {
+                self.record_revocation(context, action, &err).await;
+                return Err(err.as_step_error());
+            }
+
             match action {
                 "send_email" => self.send_email(params).await,
                 "comment_revision" => self.comment_revision(params, context).await,
@@ -192,6 +204,97 @@ impl AutomationActions {
         .await
     }
 
+    /// Check this step's action against the rule's authority.
+    ///
+    /// The account is read from the rule *at this moment* (REQ-003 slice 3), so a rule whose
+    /// run-as account lost a permission stops on its next run rather than on the next
+    /// deployment. An action with no permission of its own passes: the engine is the whole
+    /// authority for something that touches only the run.
+    async fn authorise(
+        &self,
+        context: &ActionContext<'_>,
+        action: &str,
+    ) -> std::result::Result<(), authority::Refusal> {
+        if authority::permission_for(action).is_none() {
+            return Ok(());
+        }
+
+        let authority = self.authority_of(context).await?;
+        authority::authorise_action(&self.pool, &authority, context.organization_id, action).await
+    }
+
+    /// The rule's authority, read now rather than snapshotted.
+    ///
+    /// A missing rule is a refusal rather than a panic: the execution row outlives the
+    /// rule when a rule is deleted mid-run, and a rule that is gone has no authority to
+    /// act with.
+    async fn authority_of(
+        &self,
+        context: &ActionContext<'_>,
+    ) -> std::result::Result<authority::Authority, authority::Refusal> {
+        let row: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+            "select w.run_as_user_id, w.created_by from workflows w \
+                 join workflow_executions e on e.workflow_id = w.id where e.id = $1",
+        )
+        .bind(context.execution_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| authority::Refusal {
+            permission: "workflows.run",
+            user_id: None,
+            action: "this action",
+            message: format!(
+                "the run-as account could not be read, so the step was not run: {err}"
+            ),
+        })?;
+
+        Ok(match row {
+            Some((run_as, created_by)) => authority::Authority::of(run_as, created_by),
+            None => authority::Authority::of(None, None),
+        })
+    }
+
+    /// Record a `permission_revoked` refusal on the bus, best-effort.
+    ///
+    /// Best-effort on purpose: the refusal has already stopped the run and the step already
+    /// carries the message, so a bus that is down must not turn a *refusal* into a retry —
+    /// which is exactly what would happen if this were `?`. The warning is the signal that
+    /// the notification did not go out.
+    async fn record_revocation(
+        &self,
+        context: &ActionContext<'_>,
+        action: &str,
+        refusal: &authority::Refusal,
+    ) {
+        let emission = omnion_events::bus::emit(
+            &self.pool,
+            NewEvent::new(authority::PERMISSION_REVOKED_EVENT)
+                .organization(context.organization_id)
+                .site(context.site_id)
+                .payload(refusal.as_event_payload()),
+        )
+        .await;
+
+        match emission {
+            Ok(report) => tracing::warn!(
+                execution_id = %context.execution_id,
+                step_no = context.step_no,
+                action,
+                permission = refusal.permission,
+                event_id = report.event.id,
+                "a rule lost the authority an action needed and its run stopped"
+            ),
+            Err(err) => tracing::warn!(
+                execution_id = %context.execution_id,
+                step_no = context.step_no,
+                action,
+                permission = refusal.permission,
+                error = %err,
+                "a rule lost the authority an action needed; the refusal could not be broadcast"
+            ),
+        }
+    }
+
     /// The rule behind a run — the signer's identity, and the self-chain guard.
     async fn workflow_of(&self, context: &ActionContext<'_>) -> sqlx::Result<Uuid> {
         sqlx::query_scalar("select workflow_id from workflow_executions where id = $1")
@@ -284,7 +387,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_revision_id_that_is_not_one_fails_with_a_readable_message() {
+    async fn the_authority_check_runs_before_any_parameter_is_read() {
+        // The order is the feature: a step whose run-as account cannot even be read is
+        // refused as `permission_revoked` and never reaches its own parameter validation.
+        // A test that only checked "a malformed revision id is refused" would have passed
+        // either way, and would not have noticed the two checks swapping places — which is
+        // the swap that would let a rule with no authority read a target id first.
         let handler = AutomationActions::new(pool_for_tests(), mail_settings());
         let never = pool_for_tests();
         let context = ActionContext {
@@ -304,12 +412,25 @@ mod tests {
                 &context,
             )
             .await
-            .expect_err("a malformed id cannot be a comment target");
-        assert!(message.contains("not a revision id"), "{message}");
+            .expect_err("no authority, no action");
+        assert!(
+            message.starts_with(crate::authority::PERMISSION_REVOKED_EVENT),
+            "the refusal is reported as the event the request names: {message}"
+        );
+        assert!(!message.contains("not a revision id"), "{message}");
     }
 
     #[tokio::test]
-    async fn an_email_with_an_unusable_recipient_fails_before_any_connection() {
+    async fn an_action_with_no_permission_of_its_own_never_reaches_the_account() {
+        // The synthetic actions are the engine's, and the engine is their whole authority.
+        // Asking the database about a run-as account for an `echo` would be a query per step
+        // for a step that cannot touch the world — and, worse, would make an echo fail on a
+        // host whose database is briefly unreachable.
+        assert_eq!(crate::authority::permission_for("echo"), None);
+
+        // The handler refuses an action it does not implement, and it says so *without*
+        // asking about authority first — an unknown action has no permission, and its
+        // refusal is about the action's name, not about an account.
         let handler = AutomationActions::new(pool_for_tests(), mail_settings());
         let never = pool_for_tests();
         let context = ActionContext {
@@ -323,14 +444,13 @@ mod tests {
         };
 
         let message = handler
-            .execute(
-                "send_email",
-                &json!({ "to": "not-an-address", "subject": "Hi", "body": "Hello" }),
-                &context,
-            )
+            .execute("smtp_send", &json!({}), &context)
             .await
-            .expect_err("the recipient is refused");
-        assert!(message.contains("could not be sent"), "{message}");
-        assert!(message.contains("invalid address"), "{message}");
+            .expect_err("not a host action");
+        assert!(message.contains("not a host action"), "{message}");
+        assert!(
+            !message.starts_with(crate::authority::PERMISSION_REVOKED_EVENT),
+            "an unknown action is not a permission problem: {message}"
+        );
     }
 }

@@ -119,6 +119,16 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "workflows",
         description: "Start and cancel workflow runs",
     },
+    // Deciding an approval is deliberately a *fourth* key rather than a variant of
+    // `workflows.run`: a person who may start a rule and a person who may let a parked run
+    // go on are two different powers. Folding them together would mean the editor who builds
+    // a rule can also wave through everything that rule asks for — which is exactly the
+    // "you approved your own automation" back door the separate key prevents.
+    PermissionDef {
+        key: "workflows.approve",
+        category: "workflows",
+        description: "Decide the approvals a rule is waiting for",
+    },
     // Users.
     PermissionDef {
         key: "users.read",
@@ -562,13 +572,25 @@ mod tests {
     fn the_workflow_family_is_catalogued() {
         // P09: the automation surface is guarded by three keys — read, manage and run — so a
         // role can be trusted to trigger a workflow without letting it rewrite definitions.
-        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
+        for key in [
+            "workflows.read",
+            "workflows.manage",
+            "workflows.run",
+            "workflows.approve",
+        ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
                 Some("workflows"),
                 "{key} belongs to the workflows category"
             );
         }
+        // Deciding an approval is not `workflows.run`: a role that may start a rule must not
+        // be able to wave through everything that rule parks, or the gate is a formality.
+        assert_ne!(
+            get("workflows.approve").map(|entry| entry.key),
+            get("workflows.run").map(|entry| entry.key),
+            "approving is its own power"
+        );
     }
 
     #[test]

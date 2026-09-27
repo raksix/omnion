@@ -31,6 +31,8 @@ pub struct AutomationRule {
     pub id: Uuid,
     /// Organization that owns the rule.
     pub organization_id: Uuid,
+    /// Account that created the rule — the authority it follows unless one is chosen.
+    pub created_by: Option<Uuid>,
     /// Site the rule is bound to, when it is.
     pub site_id: Option<Uuid>,
     /// Display name.
@@ -53,6 +55,12 @@ pub struct AutomationRule {
     pub hook_configured: bool,
     /// The rule's own error policy: what a step's failure does when the step inherits it.
     pub on_error: OnError,
+    /// Whose authority the rule's host actions run with (REQ-003 slice 3).
+    ///
+    /// `None` follows the author. Resolved at *run* time, never at write time: a rule whose
+    /// author loses a permission must stop on its next run, not keep the snapshot it had when
+    /// it was saved.
+    pub run_as_user_id: Option<Uuid>,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
     /// When it last fired.
@@ -94,6 +102,7 @@ impl AutomationRule {
         Ok(Some(Self {
             id: workflow.id,
             organization_id: workflow.organization_id,
+            created_by: workflow.created_by,
             site_id: workflow.site_id,
             name: workflow.name.clone(),
             description: workflow.description.clone(),
@@ -110,11 +119,21 @@ impl AutomationRule {
             hook_triggered,
             hook_configured,
             on_error: OnError::parse(&workflow.on_error).unwrap_or(OnError::Stop),
+            run_as_user_id: workflow.run_as_user_id,
             trigger_count: workflow.trigger_count,
             last_triggered_at: workflow.last_triggered_at,
             created_at: workflow.created_at,
             updated_at: workflow.updated_at,
         }))
+    }
+
+    /// Whose authority this rule's host actions run with.
+    ///
+    /// The account is resolved here, not at write time, so the panel's "runs as" line and
+    /// the engine's own check can never disagree about which account is in play.
+    #[must_use]
+    pub fn authority(&self) -> crate::authority::Authority {
+        crate::authority::Authority::of(self.run_as_user_id, self.created_by)
     }
 
     /// The conditions of this rule as a group tree.
@@ -164,6 +183,8 @@ pub struct NewRule {
     pub hook_triggered: bool,
     /// The rule's own error policy; a step that inherits takes this.
     pub on_error: OnError,
+    /// Whose authority the rule runs with. `None` follows the author.
+    pub run_as_user_id: Option<Uuid>,
 }
 
 impl NewRule {

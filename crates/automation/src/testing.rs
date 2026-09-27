@@ -471,6 +471,8 @@ mod tests {
 
     fn rule_with(conditions: Value, actions: Vec<StepDefinition>) -> AutomationRule {
         AutomationRule {
+            created_by: None,
+            run_as_user_id: None,
             id: Uuid::nil(),
             organization_id: Uuid::nil(),
             site_id: None,

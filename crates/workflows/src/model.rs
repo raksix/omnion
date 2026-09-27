@@ -67,6 +67,13 @@ pub enum StepKind {
     Branch,
     /// Ends the run on purpose, with a reason an operator reads in the trace.
     Stop,
+    /// Parks the run until a person with `workflows.approve` decides (REQ-003 slice 3).
+    ///
+    /// It is a kind rather than a host action on purpose: the gate has no effect of its own
+    /// — it *suspends* — so the engine owns it, exactly as it owns a wait. An author parks
+    /// the run by naming the permission that may let it go on; the engine then writes the
+    /// approval row, emits the event and stops claiming steps until the decision lands.
+    Approval,
 }
 
 impl StepKind {
@@ -78,6 +85,7 @@ impl StepKind {
             Self::Wait => "wait",
             Self::Branch => "branch",
             Self::Stop => "stop",
+            Self::Approval => "approval",
         }
     }
 
@@ -89,6 +97,7 @@ impl StepKind {
             "wait" => Some(Self::Wait),
             "branch" => Some(Self::Branch),
             "stop" => Some(Self::Stop),
+            "approval" => Some(Self::Approval),
             _ => None,
         }
     }
@@ -96,7 +105,17 @@ impl StepKind {
     /// `true` when a step of this kind never runs an action.
     #[must_use]
     pub const fn is_control(self) -> bool {
-        matches!(self, Self::Wait | Self::Branch | Self::Stop)
+        matches!(
+            self,
+            Self::Wait | Self::Branch | Self::Stop | Self::Approval
+        )
+    }
+
+    /// `true` when a step of this kind *parks* rather than finishing: it is claimed once to
+    /// park and once to be let go, so the claim count is the state.
+    #[must_use]
+    pub const fn parks(self) -> bool {
+        matches!(self, Self::Wait | Self::Approval)
     }
 }
 
@@ -150,6 +169,14 @@ pub const DEFAULT_STEP_TIMEOUT_MS: i32 = 30_000;
 pub enum ExecutionStatus {
     /// Steps are still being worked through.
     Running,
+    /// Parked on a person: a `wait_for_approval` step wrote its row and the run is waiting
+    /// for a decision (REQ-003 slice 3).
+    ///
+    /// It is neither `Running` nor terminal, and that is the whole point. `Running` would
+    /// lie — the engine must not claim a step while a person is thinking, and every listing
+    /// that counts "in progress" would count a parked run as busy. Terminal would be worse:
+    /// a decision reopens the run, and a state that can be reopened is not a final one.
+    AwaitingApproval,
     /// Every step succeeded.
     Completed,
     /// A step ran out of attempts.
@@ -164,6 +191,7 @@ impl ExecutionStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::AwaitingApproval => "awaiting_approval",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -175,6 +203,7 @@ impl ExecutionStatus {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "running" => Some(Self::Running),
+            "awaiting_approval" => Some(Self::AwaitingApproval),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
@@ -185,7 +214,17 @@ impl ExecutionStatus {
     /// `true` when no further work can happen.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    /// `true` while the engine may claim a step of this run.
+    ///
+    /// The run is *open* for a person and *claimable* for the engine are different questions:
+    /// an approval parks the first without occupying the second, which is why the two are
+    /// two methods and not one.
+    #[must_use]
+    pub const fn is_claimable(self) -> bool {
+        matches!(self, Self::Running)
     }
 }
 
@@ -278,6 +317,17 @@ pub struct Workflow {
     /// token follows, and for the same reason: an audit row is read by more people than the
     /// secret is meant for.
     pub hook_secret: Option<String>,
+    /// Whose authority the rule's host actions run with (REQ-003 slice 3).
+    ///
+    /// `None` means the author, read from `created_by` at run time — not a copied id, so
+    /// the rule follows its author. A rule whose author has been deleted resolves to nobody
+    /// and every host action stops with `automation.rule.permission_revoked`, which is the
+    /// only honest answer: a deleted account's authority is not a permission anybody holds.
+    ///
+    /// The column is set explicitly when an operator hands a rule to a service account, which
+    /// is the case the copy could not express: a shared "content publisher" identity that
+    /// keeps working after its human leaves.
+    pub run_as_user_id: Option<Uuid>,
     /// Next time the scheduler should start this workflow.
     pub next_run_at: Option<OffsetDateTime>,
     /// Ordered step definitions, as stored JSON.
@@ -315,7 +365,8 @@ impl Workflow {
 /// Columns of `workflows`, in the order [`Workflow`] expects.
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
      trigger_kind, schedule, trigger_event, conditions, hook_token_hash, on_error, hook_secret, \
-     next_run_at, steps, last_triggered_at, trigger_count, created_by, created_at, updated_at";
+     run_as_user_id, next_run_at, steps, last_triggered_at, trigger_count, created_by, \
+     created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]
@@ -340,6 +391,8 @@ pub struct NewWorkflow {
     pub conditions: serde_json::Value,
     /// The rule's error policy; a step that inherits takes this.
     pub on_error: OnError,
+    /// Whose authority the rule's host actions run with. `None` means the author.
+    pub run_as_user_id: Option<Uuid>,
     /// First due time when scheduled.
     pub next_run_at: Option<OffsetDateTime>,
     /// Step definitions as stored JSON.
@@ -369,6 +422,15 @@ pub struct WorkflowExecution {
     pub finished_at: Option<OffsetDateTime>,
     /// Error of the failing step, when the run failed.
     pub error: Option<String>,
+    /// The approval that gates the step this run is parked on, when it is parked (REQ-003
+    /// slice 3).
+    ///
+    /// A copy of the step's `approval_id` rather than a lookup: the panel's pending panel and
+    /// a run's own summary both read it, and a join back from the run would make the panel
+    /// query the steps table to answer "is this run waiting on somebody?" — the question a
+    /// list of runs asks about every row it draws.
+    #[sqlx(default)]
+    pub approval_id: Option<Uuid>,
     /// The event payload the run started from, when it started from an event.
     ///
     /// A branch step reads `event.<field>` out of it and the run detail shows it beside the
@@ -398,7 +460,7 @@ impl WorkflowExecution {
 
 /// Columns of `workflow_executions`, in the order [`WorkflowExecution`] expects.
 pub const EXECUTION_COLUMNS: &str = "id, workflow_id, organization_id, status, trigger_kind, \
-     triggered_by, started_at, finished_at, error, \
+     triggered_by, started_at, finished_at, error, approval_id, \
      coalesce(event_payload, 'null'::jsonb) as event_payload";
 
 /// One materialised step of a run.
@@ -440,6 +502,13 @@ pub struct WorkflowStep {
     pub error: Option<String>,
     /// `true` when the run deliberately outlived this step's failure.
     pub ignored: bool,
+    /// The approval row gating this step, when it is an approval step (REQ-003 slice 3).
+    ///
+    /// `None` for every other kind, and for an approval step that has not parked yet: the row
+    /// is written by the claim that parks it, so a step the engine has not reached has
+    /// nothing to point at.
+    #[sqlx(default)]
+    pub approval_id: Option<Uuid>,
 }
 
 impl WorkflowStep {
@@ -465,7 +534,7 @@ impl WorkflowStep {
 /// Columns of `workflow_steps`, in the order [`WorkflowStep`] expects.
 pub const STEP_COLUMNS: &str = "id, execution_id, step_no, name, kind, action, params, on_error, \
      timeout_ms, status, attempts, max_attempts, available_at, started_at, finished_at, output, \
-     error, ignored";
+     error, ignored, approval_id";
 
 #[cfg(test)]
 mod tests {
@@ -488,10 +557,35 @@ mod tests {
 
     #[test]
     fn the_step_kinds_round_trip() {
-        for kind in [StepKind::Task, StepKind::Wait] {
+        for kind in [
+            StepKind::Task,
+            StepKind::Wait,
+            StepKind::Branch,
+            StepKind::Stop,
+            StepKind::Approval,
+        ] {
             assert_eq!(StepKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(StepKind::parse("loop"), None);
+    }
+
+    #[test]
+    fn an_approval_step_is_a_control_step_that_parks() {
+        // Both halves matter and they are different: `is_control` says the engine owns the
+        // step (no action is named), `parks` says the claim count *is* the state (claim once
+        // to park, once to be let go). A gate that was a task step would be handed to the
+        // host handler with nothing to run; a gate that did not park would be claimed
+        // forever.
+        assert!(StepKind::Approval.is_control());
+        assert!(StepKind::Approval.parks());
+        assert!(StepKind::Wait.parks());
+        assert!(!StepKind::Task.is_control());
+        assert!(!StepKind::Task.parks());
+        assert!(
+            !StepKind::Branch.parks(),
+            "a branch decides, it does not park"
+        );
+        assert!(!StepKind::Stop.parks());
     }
 
     #[test]
@@ -506,6 +600,35 @@ mod tests {
             assert_eq!(ExecutionStatus::parse(status.as_str()), Some(status));
         }
         assert_eq!(ExecutionStatus::parse("paused"), None);
+    }
+
+    #[test]
+    fn a_parked_run_is_open_but_not_claimable() {
+        // The distinction the engine depends on: a run waiting on a person must not be
+        // settled (a decision reopens it) and must not be claimed (nothing may progress
+        // until somebody decides). Collapsing either half into `Running` or into a terminal
+        // state is the bug this test exists to prevent.
+        let parked = ExecutionStatus::AwaitingApproval;
+        assert!(!parked.is_terminal(), "a decision reopens it");
+        assert!(
+            !parked.is_claimable(),
+            "no step may progress behind a person's back"
+        );
+        assert_eq!(ExecutionStatus::parse("awaiting_approval"), Some(parked));
+        assert_eq!(parked.as_str(), "awaiting_approval");
+
+        assert!(ExecutionStatus::Running.is_claimable());
+        for terminal in [
+            ExecutionStatus::Completed,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Cancelled,
+        ] {
+            assert!(terminal.is_terminal(), "{terminal:?}");
+            assert!(
+                !terminal.is_claimable(),
+                "a finished run is not claimable either"
+            );
+        }
     }
 
     #[test]
