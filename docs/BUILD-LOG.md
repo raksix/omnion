@@ -1642,3 +1642,59 @@
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
+
+## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
+
+- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
+  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
+  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
+  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
+  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
+  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
+  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
+  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
+  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
+  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
+  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
+  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
+  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
+  three unclaimed worktrees have already collided on 0019.
+- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
+  this part). The cryptography is tested against *real* cryptography, not against itself: the
+  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
+  the genuine signature and reject a tampered one.
+- **The SAML signature check is two checks, and the second one is the one that matters.** XML
+  Signature binds a document to a key in two independent steps, and my first implementation only
+  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
+  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
+  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
+  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
+  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
+  rewrite a claim, the signature alone signs the algorithm but not the document.
+- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
+  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
+  multi-valued attribute as several elements lost half a group membership and under-granted a
+  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
+  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
+  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
+  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
+  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
+  as text fails silently three frames deep.
+- **The disk is a blocker, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
+  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
+  "No space left on device". The reclamation is deliberately conservative: only **derived**
+  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
+  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
+  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
+  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
+  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
+  `node_modules` each) should be pruned — no wave owns them yet.
+- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
+  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
+  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
+  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
+  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
+  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.
