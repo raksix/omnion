@@ -264,7 +264,7 @@ pub async fn read_root_key(
     .collect();
 
     let versions_to_rewrap: i32 = sqlx::query_scalar(
-        "select count(*) from secret_versions v \
+        "select count(*)::int from secret_versions v \
          join secret_root_keys k on k.key_id = v.key_id where k.status <> 'active'",
     )
     .fetch_one(pool)

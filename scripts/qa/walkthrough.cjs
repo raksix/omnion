@@ -2526,6 +2526,9 @@ async function main() {
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
     { path: "/settings/search", name: "search-settings" },
+    // The secret key ring and its rotation ceremony (REQ-125, slice 1) — the depth pass below
+    // runs the whole ceremony and asserts the document never carries key material.
+    { path: "/secrets/root-key", name: "secrets-root-key" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -2620,6 +2623,11 @@ async function main() {
   // enrolment dialog.
   await runIamSecurityDepth(page, report);
   log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
+
+  // The key ring and the rotation ceremony (REQ-125, slice 1): the self-check, the guarded
+  // three-step wizard, a real rotation, the live counter, pause and resume.
+  await runSecretsRootKeyDepth(page, report);
+  log(`secrets root key: ${JSON.stringify(report.secretsRootKey)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -3032,6 +3040,115 @@ async function runIamPoliciesDepth(page, report) {
 
   report.iamPolicies = { steps };
   log(`iam policies: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The secret key ring and its rotation ceremony (docs/requests/REQ-125, slice 1).
+ *
+ * The pass drives the whole ceremony: the self-check, the three-step wizard (including the
+ * refusal to continue before the acknowledgement is ticked), a real rotation, the live counter,
+ * the pause and the resume. It then asserts the property that only a real run can show — the
+ * rendered document never carries key material.
+ */
+async function runSecretsRootKeyDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "secrets-root-key-depth", action: "secrets", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/secrets/root-key`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-root-key-seal]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  const sealHealthy = await page
+    .locator("[data-root-key-seal]")
+    .first()
+    .evaluate((node) => node.className.includes("bg-surface"))
+    .catch(() => false);
+  const ringRows = await page.locator("[data-root-key-row]").count();
+  const rotateEnabled = await page
+    .locator("[data-root-key-rotate]")
+    .first()
+    .isEnabled()
+    .catch(() => false);
+  note({ step: "opened", sealHealthy, ringRows, rotateEnabled });
+  await shot(page, "page-secrets-root-key");
+
+  // ---- The wizard refuses to continue before the acknowledgement --------------------------------
+  await page.locator("[data-root-key-rotate]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-root-key-wizard]", { timeout: 10000 }).catch(() => {});
+  const confirmTitle = (
+    await page.locator("[data-root-key-wizard] h3").first().innerText().catch(() => "")
+  ).trim();
+  const blockedBeforeTick = await page
+    .locator("[data-root-key-rotate-confirm]")
+    .first()
+    .isDisabled()
+    .catch(() => false);
+  const wizardText = await page
+    .locator("[data-root-key-wizard]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  const warningShown = wizardText.toLowerCase().includes("unrecoverable");
+  note({ step: "wizard-opens-guarded", confirmTitle, blockedBeforeTick, warningShown });
+  await shot(page, "page-secrets-root-key-wizard");
+
+  // Escape closes the wizard without touching the ring.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(500);
+  const closedByEscape = (await page.locator("[data-root-key-wizard]").count()) === 0;
+
+  // ---- The rotation, for real ------------------------------------------------------------------
+  await page.locator("[data-root-key-rotate]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-root-key-wizard]", { timeout: 10000 }).catch(() => {});
+  await page.locator("[data-root-key-accept]").first().check({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-root-key-rotate-confirm]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-root-key-counter]", { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const counterText = (
+    await page.locator("[data-root-key-counter]").first().innerText().catch(() => "")
+  ).trim();
+  const progressNow = await page
+    .locator("[data-root-key-job] [role=progressbar]")
+    .first()
+    .getAttribute("aria-valuenow")
+    .catch(() => null);
+  const rowsAfterRotation = await page.locator("[data-root-key-row]").count();
+  note({ step: "rotated", closedByEscape, counterText, progressNow, rowsAfterRotation });
+  await shot(page, "page-secrets-root-key-rotating");
+
+  // ---- Pause, then resume ----------------------------------------------------------------------
+  let paused = false;
+  const pauseButton = page.locator("[data-root-key-pause]").first();
+  if ((await pauseButton.count()) > 0) {
+    await pauseButton.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForSelector("[data-root-key-resume]", { timeout: 15000 }).catch(() => {});
+    paused = (await page.locator("[data-root-key-resume]").count()) > 0;
+    await shot(page, "page-secrets-root-key-paused");
+  }
+  const resumeButton = page.locator("[data-root-key-resume]").first();
+  if ((await resumeButton.count()) > 0) {
+    await resumeButton.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  note({ step: "pause-resume", paused });
+
+  // ---- The one thing no other pass can assert: no key material in the document -----------------
+  const documentText = await page.evaluate(() => document.body.innerText);
+  const leakedMaterial =
+    documentText.includes("v1.") ||
+    documentText.includes("wrapped_key") ||
+    documentText.includes("seal_checksum");
+  note({ step: "no-material-in-document", leakedMaterial, documentChars: documentText.length });
+
+  await page.waitForTimeout(1200);
+  await shot(page, "page-secrets-root-key-done");
+
+  report.secretsRootKey = { steps };
+  log(`secrets root key: ${JSON.stringify(steps)}`);
 }
 
 async function runIamSecurityDepth(page, report) {

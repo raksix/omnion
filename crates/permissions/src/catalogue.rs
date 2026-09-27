@@ -296,12 +296,12 @@ pub const CATALOGUE: &[PermissionDef] = &[
         description: "Issue and revoke short-lived secret leases",
     },
     PermissionDef {
-        key: "secrets.deploy_keys.read",
+        key: "secrets.deploykeys.read",
         category: "secrets",
         description: "Read deployment keys and their use log",
     },
     PermissionDef {
-        key: "secrets.deploy_keys.manage",
+        key: "secrets.deploykeys.manage",
         category: "secrets",
         description: "Create, revoke and delete deployment keys",
     },

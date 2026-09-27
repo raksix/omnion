@@ -163,7 +163,7 @@ pub async fn list_root_keys(pool: &PgPool) -> Result<Vec<RootKeyRow>> {
     let rows = sqlx::query_as::<_, RootKeyRow>(
         "select k.id, k.key_id, k.wrapped_key, k.seal_checksum, k.status, k.fingerprint, \
                 k.created_at, k.retired_at, k.retired_reason, \
-                (select count(*) from secret_versions v where v.key_id = k.key_id) as version_count \
+                (select count(*)::int from secret_versions v where v.key_id = k.key_id) as version_count \
          from secret_root_keys k \
          order by k.created_at desc, k.id desc",
     )
@@ -177,7 +177,7 @@ pub async fn active_key_row(pool: &PgPool) -> Result<Option<RootKeyRow>> {
     let row = sqlx::query_as::<_, RootKeyRow>(
         "select k.id, k.key_id, k.wrapped_key, k.seal_checksum, k.status, k.fingerprint, \
                 k.created_at, k.retired_at, k.retired_reason, \
-                (select count(*) from secret_versions v where v.key_id = k.key_id) as version_count \
+                (select count(*)::int from secret_versions v where v.key_id = k.key_id) as version_count \
          from secret_root_keys k where k.status = 'active' \
          order by k.created_at desc limit 1",
     )
@@ -353,10 +353,11 @@ pub async fn start_rotation(pool: &PgPool) -> Result<RewrapJob> {
         .execute(pool)
         .await?;
 
-    let total: i32 = sqlx::query_scalar("select count(*) from secret_versions where key_id = $1")
-        .bind(&current.key_id)
-        .fetch_one(pool)
-        .await?;
+    let total: i32 =
+        sqlx::query_scalar("select count(*)::int from secret_versions where key_id = $1")
+            .bind(&current.key_id)
+            .fetch_one(pool)
+            .await?;
 
     let job = sqlx::query_as::<_, RewrapJob>(
         "insert into secret_rewrap_jobs \
@@ -391,7 +392,7 @@ pub async fn recover_missing_job(pool: &PgPool) -> Result<Option<RewrapJob>> {
     };
     // A `retiring` key that still carries versions is a flip whose job was lost.
     let stranded: Option<(String, i32)> = sqlx::query_as(
-        "select key_id, count(*) as total from secret_versions \
+        "select key_id, count(*)::int as total from secret_versions \
          where key_id <> $1 group by key_id having count(*) > 0 limit 1",
     )
     .bind(&active.key_id)
@@ -590,7 +591,7 @@ pub async fn finish_job(pool: &PgPool, job_id: Uuid) -> Result<()> {
 pub async fn ring_coverage(pool: &PgPool) -> Result<Vec<(String, String, i32)>> {
     let rows = sqlx::query_as(
         "select k.key_id, k.status, \
-                (select count(*) from secret_versions v where v.key_id = k.key_id) as versions \
+                (select count(*)::int from secret_versions v where v.key_id = k.key_id) as versions \
          from secret_root_keys k order by k.created_at desc",
     )
     .fetch_all(pool)

@@ -3141,3 +3141,91 @@ export function fetchIamProvisioningLog(input: {
   const query = params.toString();
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
+
+
+/* ------------------------------------------------------------------------------------------
+ * The secret key ring (docs/requests/REQ-125, slice 1).
+ *
+ * Nothing in this block ever carries a secret value: the ring exposes fingerprints, coverage
+ * counters and a re-wrap job's progress, and the only response in the whole request that may
+ * ever hold a value is the loopback redemption of slice 3.
+ * ---------------------------------------------------------------------------------------- */
+
+/** One key in the installation ring. Metadata only — no material, no checksum. */
+export type RootKey = {
+  key_id: string;
+  status: "active" | "retiring" | "retired";
+  fingerprint: string;
+  version_count: number;
+  created_at: string;
+  retired_at: string | null;
+  retired_reason: string | null;
+};
+
+/** The seal self-check's verdict, in the panel's words. */
+export type SealReport = {
+  healthy: boolean;
+  sealed: number;
+  unsealed: [string, string][];
+  source: string | null;
+  guidance: string;
+};
+
+/** A re-wrap job and its real counter. */
+export type RewrapJob = {
+  id: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed";
+  from_key_id: string;
+  to_key_id: string;
+  rewrapped_count: number;
+  total_count: number;
+  progress: number;
+  resume_note: string | null;
+  pause_reason: string | null;
+  last_error: string | null;
+  started_at: string;
+  completed_at: string | null;
+};
+
+/** Everything the key ring screen needs in one read. */
+export type RootKeyState = {
+  keys: RootKey[];
+  seal: SealReport;
+  job: RewrapJob | null;
+  recent_jobs: RewrapJob[];
+  versions_to_rewrap: number;
+  has_active_key: boolean;
+};
+
+/** Read the ring, the self-check and the live job. */
+export function fetchRootKeyState(): Promise<RootKeyState> {
+  return request<RootKeyState>("/api/v1/secrets/root-key");
+}
+
+/** Start the rotation ceremony. Answers the job it opened. */
+export function rotateRootKey(): Promise<RewrapJob> {
+  return request<RewrapJob>("/api/v1/secrets/root-key/rotate", { method: "POST" });
+}
+
+/** One re-wrap job's counter. */
+export function fetchRewrapJob(id: string): Promise<RewrapJob> {
+  return request<RewrapJob>(
+    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}`,
+  );
+}
+
+/** Pause a running walk; the counter and cursor are kept. */
+export function pauseRewrapJob(id: string): Promise<RewrapJob> {
+  return request<RewrapJob>(
+    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/pause`,
+    { method: "POST" },
+  );
+}
+
+/** Resume a paused walk from its cursor. */
+export function resumeRewrapJob(id: string): Promise<RewrapJob> {
+  return request<RewrapJob>(
+    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/resume`,
+    { method: "POST" },
+  );
+}
