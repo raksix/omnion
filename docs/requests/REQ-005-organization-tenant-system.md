@@ -1,6 +1,6 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** in-progress · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -148,16 +148,17 @@ automation engine uses; the token never appears in an event payload.
 
 ### Acceptance criteria
 
-- [ ] The organizations list, organization detail with every tab, the switcher, the invite dialog and the invitation page exist at the routes above and appear in the QA walkthrough inventory.
-- [ ] A user belonging to two organizations can switch between them with the header switcher, and the site list, pages and media follow the switch.
+- [x] The organizations list, organization detail with every tab, the switcher, the invite dialog and the invitation page exist at the routes above and appear in the QA walkthrough inventory.
+- [x] A user belonging to two organizations can switch between them with the header switcher, and the site list, pages and media follow the switch.
 - [ ] Backfill is proven: every pre-existing user has exactly one primary membership, every organization has a settings and a limits row, and no orphan row exists.
-- [ ] Inviting an existing member is refused naming them; inviting the same address twice returns the pending invitation instead of creating a duplicate.
-- [ ] The invitation link opens the preview, acceptance works for an existing account and for a new sign-up, and both land on the organization overview.
-- [ ] Expired, revoked and already-accepted tokens each render their own explanation, and a rate-limited preview does not reveal whether the organization exists.
+  _Membership half proven by `the_backfill_gives_every_home_organization_one_primary_membership`; the settings and limits rows arrive with slice 3._
+- [x] Inviting an existing member is refused naming them; inviting the same address twice returns the pending invitation instead of creating a duplicate.
+- [x] The invitation link opens the preview, acceptance works for an existing account and for a new sign-up, and both land on the organization overview.
+- [x] Expired, revoked and already-accepted tokens each render their own explanation, and a rate-limited preview does not reveal whether the organization exists.
 - [ ] Accepting an invitation at the seat limit is refused with `organization.limit.reached` naming the ceiling; raising the limit makes the same invitation acceptable.
 - [ ] Creating a site beyond `site_limit` is refused the same way and the panel disables the control with that reason.
-- [ ] Removing the last owner is refused by the API and disabled in the UI with the reason shown.
-- [ ] A member with `content.pages.read` in organization A gets 404 for a page id of organization B, and cannot see B's audit feed.
+- [x] Removing the last owner is refused by the API and disabled in the UI with the reason shown.
+- [x] A member with `content.pages.read` in organization A gets 404 for a page id of organization B, and cannot see B's audit feed.
 - [ ] A platform account can list every organization and must send `organization_id` on a write; omitting it is a 400 naming the field.
 - [ ] Department CRUD works, a department cannot become its own ancestor, and a role bound at department scope appears in `/iam/effective-permissions` for its members.
 - [ ] Switching a module off for an organization hides its navigation entry and makes its API answer 403 naming the module; switching it back on restores both.

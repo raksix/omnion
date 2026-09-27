@@ -25,6 +25,41 @@ import type { Organization } from "@/lib/types";
 /** The statuses a filter offers — the three the schema allows. */
 const STATUSES = ["active", "suspended", "archived"] as const;
 
+/** The longest slug the schema accepts (crates/identity::organizations::MAX_SLUG_LENGTH). */
+const MAX_SLUG_LENGTH = 64;
+
+/**
+ * Turn a name into a slug the server will accept, and say so when it cannot.
+ *
+ * The server's rule is strict — a slug starts with a lowercase letter or digit, carries only
+ * lowercase letters, digits and single dashes. Falling back to the raw name sent "QA sample" to
+ * the API and took a 400 the reader could not have predicted, so the form normalizes here and
+ * says plainly that it did.
+ */
+function slugify(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, MAX_SLUG_LENGTH);
+}
+
+/** Why a slug is unusable, or `null` when it is fine. Mirrors the server's rule. */
+function slugProblem(slug: string): string | null {
+  if (!slug) return "A slug is required.";
+  if (slug.length > MAX_SLUG_LENGTH) {
+    return `A slug is at most ${MAX_SLUG_LENGTH} characters.`;
+  }
+  if (!/^[a-z0-9]/.test(slug)) {
+    return "A slug starts with a lowercase letter or a digit.";
+  }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) {
+    return "A slug uses lowercase letters, digits and single dashes.";
+  }
+  return null;
+}
+
 /** The create/suspend controls. */
 function CreateForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
   const [name, setName] = useState("");
@@ -37,10 +72,18 @@ function CreateForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => 
       setError("A name is required.");
       return;
     }
+    // An empty slug is a request to derive one, not a broken form — but the derived slug still
+    // has to satisfy the server's rule, so it is checked here rather than discovered as a 400.
+    const effectiveSlug = slug.trim() || slugify(name);
+    const problem = slugProblem(effectiveSlug);
+    if (problem) {
+      setError(problem);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      await createOrganization({ name: name.trim(), slug: slug.trim() || name.trim() });
+      await createOrganization({ name: name.trim(), slug: effectiveSlug });
       onDone();
     } catch (cause) {
       setError(
@@ -68,9 +111,16 @@ function CreateForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => 
           <input
             value={slug}
             onChange={(event) => setSlug(event.target.value)}
-            placeholder="acme-corp"
+            placeholder={slugify(name) || "acme-corp"}
             className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[13px] font-normal outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
           />
+          <span className="text-[11.5px] font-normal text-muted">
+            {slug.trim()
+              ? "Lowercase letters, digits and single dashes."
+              : name.trim()
+                ? `Leave empty to use "${slugify(name)}".`
+                : "How the organization is addressed in a URL."}
+          </span>
         </label>
       </div>
       {error ? (

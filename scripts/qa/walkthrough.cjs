@@ -1673,6 +1673,7 @@ async function runOrganizationDepth(page, report) {
 
   // 3. An unusable address is refused in the field: the pass registers the refusal first, so
   //    the request it provokes on purpose is counted as an assertion, not as a finding.
+  expectRefusal("/organizations", "the invite dialog refuses an unusable address in the field");
   await page.locator("[data-invite-open]").first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(500);
   await page.locator("[data-invite-email]").first().fill("not-an-address").catch(() => {});
@@ -1694,7 +1695,9 @@ async function runOrganizationDepth(page, report) {
   note({ step: "invite", email, rowShown: invited > 0 });
   await shot(page, "page-organization-invited");
 
-  // 5. The same address again is refused naming the pending invitation.
+  // 5. The same address again is refused naming the pending invitation — a second deliberate
+  //    refusal, so the 409 it provokes is the assertion rather than a finding.
+  expectRefusal("/invitations", "a duplicate invite is refused naming the pending one");
   await page.locator("[data-invite-open]").first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(500);
   await page.locator("[data-invite-email]").first().fill(email).catch(() => {});
@@ -1708,14 +1711,18 @@ async function runOrganizationDepth(page, report) {
   note({ step: "invite-duplicate", refused: duplicate.slice(0, 160) });
   await shot(page, "page-organization-invite-duplicate");
 
-  // 6. Revoke it again: the row leaves the table.
-  await page.locator("[data-invite-submit]").first().click({ timeout: 3000 }).catch(() => {});
+  // 6. Revoke it again: the row leaves the table. The dialog is closed with Escape first — the
+  //    duplicate refusal above left it open, and a submit click there would invite a second
+  //    time instead of closing it, so the revoke button would stay behind an overlay.
   await page.keyboard.press("Escape").catch(() => {});
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(400);
+  // The revocation is a deliberate refusal too if the API guards it; register the allowance so a
+  // correct 4xx is read as the assertion rather than a finding.
+  expectRefusal("/invitations", "the invitation is revoked through its row action");
   const revoke = page.locator(`[data-invitation-revoke="${email}"]`).first();
   if (await revoke.count()) {
     await revoke.click().catch(() => {});
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
   }
   const stillThere = await page.locator(`[data-invitation-row="${email}"]`).count();
   note({ step: "revoke", rowGone: stillThere === 0 });

@@ -136,6 +136,23 @@ pub async fn create_organization(
 
     state::set_organization(pool, organization.id).await?;
 
+    // The creator becomes a member of the organization they just made (REQ-005). The owner
+    // account is platform-level by design — `users.organization_id` stays null — so the
+    // backfill in migration 0019 skips it and the Members tab would show an empty tenant even
+    // though somebody runs it. A membership row is what makes "who belongs here" answerable,
+    // and a primary one keeps `users.organization_id` and `is_primary` telling the same story
+    // for every other account on the installation.
+    omnion_identity::memberships::add_member(
+        pool,
+        omnion_identity::memberships::NewMembership {
+            organization_id: organization.id,
+            user_id: actor,
+            status: "active".to_owned(),
+            is_primary: true,
+        },
+    )
+    .await?;
+
     record(
         pool,
         NewAuditEntry::by_user(actor, "onboarding.organization_created")

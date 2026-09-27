@@ -297,6 +297,35 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
         json!("Acme Corporation")
     );
 
+    // REQ-005: the owner is platform-level (`users.organization_id` is null by design), so the
+    // 0019 backfill cannot give it a membership. Creating the first organization has to enroll
+    // its creator, or the Members tab of the installation's only tenant lists nobody.
+    let organization_id = organization.body["organization"]["id"]
+        .as_str()
+        .expect("the organization carries its id")
+        .to_owned();
+    let members = harness
+        .call(get(
+            &format!("/api/v1/organizations/{organization_id}/members"),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(
+        members.status,
+        StatusCode::OK,
+        "reading the members must work: {:?}",
+        members.body
+    );
+    let listed = members.body["members"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        1,
+        "the creator is the only member so far: {:?}",
+        members.body
+    );
+    assert_eq!(listed[0]["is_primary"], json!(true));
+    assert_eq!(listed[0]["status"], json!("active"));
+
     let site = harness
         .call(post(
             "/api/v1/onboarding/site",
