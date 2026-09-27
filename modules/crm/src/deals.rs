@@ -182,6 +182,7 @@ pub struct Deal {
     /// Win probability as a percentage, or `None` when the stage's own is used.
     pub probability: Option<i32>,
     /// When it is expected to close.
+    #[serde(default, with = "crate::dates::option")]
     pub expected_close_on: Option<Date>,
     /// Where it came from.
     pub source: Option<String>,
@@ -302,6 +303,7 @@ const DEAL_SELECT: &str = "select d.id, d.organization_id, d.pipeline_id, d.stag
 
 /// A deal as the create form describes it.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct DealChanges {
     /// Headline (required).
     pub title: String,
@@ -322,6 +324,7 @@ pub struct DealChanges {
     /// Win probability.
     pub probability: Option<i32>,
     /// Expected close date.
+    #[serde(default, with = "crate::dates::option")]
     pub expected_close_on: Option<Date>,
     /// Where it came from.
     pub source: Option<String>,
@@ -331,6 +334,7 @@ pub struct DealChanges {
 
 /// A partial update of a deal's own fields (the stage moves through [`StageMove`]).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct DealPatch {
     /// Headline.
     pub title: Option<String>,
@@ -347,6 +351,7 @@ pub struct DealPatch {
     /// Win probability.
     pub probability: Option<i32>,
     /// Expected close date.
+    #[serde(default, with = "crate::dates::option")]
     pub expected_close_on: Option<Date>,
     /// Source.
     pub source: Option<String>,
@@ -354,6 +359,7 @@ pub struct DealPatch {
 
 /// A stage move: the drag, and the `ctrl + ←/→` the keyboard sends.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct StageMove {
     /// The stage the deal goes to.
     pub stage_id: Uuid,
@@ -361,7 +367,7 @@ pub struct StageMove {
     #[serde(default)]
     pub lost_reason: Option<String>,
     /// Confirm when the target stage is a `won` one; today when absent.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub close_on: Option<Date>,
 }
 
@@ -1119,7 +1125,7 @@ pub async fn create_deal(
         "insert into crm_deals (id, organization_id, pipeline_id, stage_id, title, company_id, \
          contact_id, owner_user_id, amount, currency, probability, expected_close_on, source, \
          lost_reason) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9::numeric, $10, $11, $12, $13, $14)",
     )
     .bind(id)
     .bind(organization_id)
@@ -1207,6 +1213,24 @@ pub async fn patch_deal(
         }};
     }
 
+    // Same as `set!`, but the column is numeric and the value arrives as a normalised money
+    // string. Postgres will not coerce a text parameter into `numeric` on its own, and a bare
+    // `amount = $n` answers "column amount is of type numeric but expression is of type text" —
+    // so the cast belongs in the statement, and money stays `numeric` rather than becoming a float.
+    macro_rules! set_numeric {
+        ($column:expr, $value:expr) => {{
+            if touched > 0 {
+                builder.push(", ");
+            }
+            builder
+                .push($column)
+                .push(" = ")
+                .push_bind($value)
+                .push("::numeric");
+            touched += 1;
+        }};
+    }
+
     if let Some(title) = patch.title.as_deref() {
         let title = title.trim();
         if title.is_empty() {
@@ -1231,7 +1255,7 @@ pub async fn patch_deal(
         set!("owner_user_id", owner);
     }
     if let Some(amount) = patch.amount.as_deref() {
-        set!("amount", validate_amount(Some(amount))?);
+        set_numeric!("amount", validate_amount(Some(amount))?);
     }
     if let Some(currency) = patch.currency.as_deref() {
         set!("currency", validate_currency(Some(currency))?);

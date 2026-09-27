@@ -150,8 +150,9 @@ pub struct NewDeal {
     /// Probability.
     #[serde(default)]
     pub probability: Option<i32>,
-    /// Expected close.
-    #[serde(default)]
+    /// Expected close. The same `YYYY-MM-DD` the panel's date input produces — a bare `Date`
+    /// would ask for a tuple no form can send, and the create would 422 for everyone.
+    #[serde(default, with = "omnion_module_crm::dates::option")]
     pub expected_close_on: Option<Date>,
     /// Source.
     #[serde(default)]
@@ -204,6 +205,10 @@ impl From<StageChangesBody> for deals::StageChanges {
 /// be a third party's webhook — so the payload carries what a rule needs to act and nothing a
 /// rule could exfiltrate.
 fn deal_ref(deal: &Deal) -> Value {
+    // `json!` builds a `Value` directly and never consults serde, so a `Date` in this map would
+    // serialise as `time`'s tuple (`[2026, 273]`) rather than as a date a subscriber can read.
+    // Formatting here keeps the payload in the same `YYYY-MM-DD` the API itself speaks.
+    let expected_close_on = deal.expected_close_on.as_ref().map(omnion_module_crm::dates::to_wire);
     json!({
         "deal_id": deal.id,
         "organization_id": deal.organization_id,
@@ -215,7 +220,7 @@ fn deal_ref(deal: &Deal) -> Value {
         "owner_user_id": deal.owner_user_id,
         "amount": deal.amount,
         "currency": deal.currency,
-        "expected_close_on": deal.expected_close_on,
+        "expected_close_on": expected_close_on,
     })
 }
 
@@ -499,13 +504,20 @@ pub async fn move_deal_stage(
                 NewEvent::new("crm.deal.won")
                     .organization(organization_id)
                     .actor(current.user.id)
+                    // `close_on` is formatted rather than placed as a `Date`: `json!` bypasses
+                    // serde, so the raw value would reach every subscriber as a `[2026, 273]`
+                    // tuple. An event is a contract with a third party, and a date is the one
+                    // field they are certain to read.
                     .payload(json!({
                         "deal_id": after.id,
                         "stage_id": after.stage_id,
                         "amount": after.amount,
                         "currency": after.currency,
                         "owner_user_id": after.owner_user_id,
-                        "close_on": after.expected_close_on,
+                        "close_on": after
+                            .expected_close_on
+                            .as_ref()
+                            .map(omnion_module_crm::dates::to_wire),
                     })),
             )
             .await;
