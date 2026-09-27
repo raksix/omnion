@@ -2590,6 +2590,12 @@ async function main() {
     report.reLogin = reLogin;
   }
 
+  // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
+  // owner's own account, the panel lists it, the sign-in asks for it and completes with it, and
+  // the pass is removed again so the account is back to its password.
+  await runPasskeysDepth(page, report);
+  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
+
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
   const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
@@ -3014,4 +3020,158 @@ async function runIamSecurityDepth(page, report) {
 
   report.iamSecurity = { steps };
   log(`iam security: ${JSON.stringify(steps)}`);
+}
+
+
+/**
+ * The passkey pass (REQ-006, slice 3b).
+ *
+ * A **virtual authenticator** stands in for a real one: Chrome's own WebAuthn device over CDP.
+ * The ceremony runs on `http://localhost:<port>` rather than `127.0.0.1` on purpose — a WebAuthn
+ * relying-party id must be a *domain*, so the browser refuses an IP literal outright ("This is an
+ * invalid domain"), while `localhost` is a valid RP id and is still a loopback origin (the
+ * documented exception in `crates/identity/src/webauthn`). Nothing is stubbed: the browser builds
+ * a real attestation and assertion, and the API verifies the challenge, the relying-party hash,
+ * the origin and the signature.
+ *
+ * The pass signs in on the localhost origin of the same panel, which leaves the walk's own
+ * session untouched, and removes the passkey again at the end (through the step-up prompt) so the
+ * account the rest of the walk signs in with is password-only.
+ */
+async function runPasskeysDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-passkeys", action: "webauthn", ...step });
+  };
+
+  // The panel's origin a credential can actually be bound to: `localhost`, not `127.0.0.1`.
+  const admin = /127\.0\.0\.1/.test(URL_ADMIN)
+    ? URL_ADMIN.replace("127.0.0.1", "localhost")
+    : URL_ADMIN;
+
+  const client = await page.context().newCDPSession(page);
+  await client.send("WebAuthn.enable", { enableUI: false });
+  const { authenticatorId } = await client.send("WebAuthn.addVirtualAuthenticator", {
+    options: {
+      protocol: "ctap2",
+      transport: "internal",
+      hasResidentKey: true,
+      hasUserVerification: true,
+      isUserVerified: true,
+      automaticPresenceSimulation: true,
+    },
+  });
+  note({ step: "virtual-authenticator", id: authenticatorId, origin: admin });
+
+  // ---- A session on the loopback origin the credential belongs to ------------------------
+  await page.goto(`${admin}/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('input[name="email"]', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator('input[name="email"]').first().fill(CREDS.email).catch(() => {});
+  await page.locator('input[name="password"]').first().fill(CREDS.password).catch(() => {});
+  await page.locator('form button[type="submit"]').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  note({ step: "signed-in-on-loopback", url: page.url(), reachedApp: !/\/login/.test(page.url()) });
+
+  // ---- Enrolment on the owner's own account ----------------------------------------------
+  await page.goto(`${admin}/settings/iam/users`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-user-open]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator(`[data-user-open="${CREDS.email}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-user-detail-title]", { timeout: 20000 }).catch(() => {});
+  await page.locator('[data-user-tab="factors"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-passkeys]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  note({
+    step: "passkeys-section",
+    present: (await page.locator("[data-passkeys]").count()) > 0,
+    empty: (await page.locator("[data-passkeys-empty]").count()) > 0,
+    enrolButton: (await page.locator("[data-passkey-enrol]").count()) > 0,
+  });
+  await shot(page, "page-iam-passkeys");
+
+  await page.locator("[data-passkey-enrol]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-passkey-row]", { timeout: 40000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const enrolled = await page.locator("[data-passkey-row]").count();
+  const factorRows = await page.locator('[data-factor-row="webauthn"]').count();
+  const sectionText = (
+    await page.locator("[data-passkeys]").first().innerText().catch(() => "")
+  ).replace(/\s+/g, " ");
+  note({
+    step: "passkey-enrolled",
+    rows: enrolled,
+    webauthnFactorRows: factorRows,
+    text: sectionText.slice(0, 140),
+  });
+  await shot(page, "page-iam-passkeys-enrolled");
+
+  // ---- The sign-in asks for the passkey, and the passkey answers -------------------------
+  const signOut = page.locator('button:has-text("Sign out")').first();
+  if ((await signOut.count()) > 0) {
+    await signOut.click().catch(() => {});
+    await page.waitForTimeout(1400);
+  }
+  await page.goto(`${admin}/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('input[name="email"]', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator('input[name="email"]').first().fill(CREDS.email).catch(() => {});
+  await page.locator('input[name="password"]').first().fill(CREDS.password).catch(() => {});
+  await page.locator('form button[type="submit"]').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-login-mfa-code]", { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const mfaStep = (await page.locator("[data-login-mfa-code]").count()) > 0;
+  const passkeyButton = (await page.locator("[data-login-passkey]").count()) > 0;
+  note({ step: "signin-asks-for-factor", mfaStep, passkeyButton });
+  await shot(page, "page-login-passkey-step");
+
+  if (passkeyButton) {
+    await page.locator("[data-login-passkey]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForFunction(() => !/\/login/.test(window.location.pathname), undefined, {
+      timeout: 40000,
+    }).catch(() => {});
+  }
+  await page.waitForTimeout(1200);
+  const signedIn = !/\/login/.test(page.url());
+  const shell = (await page.locator('nav[aria-label="Sections"]').count()) > 0;
+  note({ step: "passkey-signin", signedIn, shell });
+  await shot(page, "page-after-passkey-signin");
+
+  // ---- Removal (the step-up prompt proves the caller again) -------------------------------
+  await page.goto(`${admin}/settings/iam/users`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-user-open]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator(`[data-user-open="${CREDS.email}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-user-detail-title]", { timeout: 20000 }).catch(() => {});
+  await page.locator('[data-user-tab="factors"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-passkey-remove]", { timeout: 25000 }).catch(() => {});
+  await page.locator("[data-passkey-remove]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-step-up]", { timeout: 12000 }).catch(() => {});
+  const stepUpShown = (await page.locator("[data-step-up]").count()) > 0;
+  await page.locator("[data-step-up-password]").first().fill(CREDS.password).catch(() => {});
+  await page.locator("[data-step-up-submit]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const remaining = await page.locator("[data-passkey-row]").count();
+  note({ step: "passkey-removed", stepUpShown, remaining });
+
+  // ---- The account is password-only again, which the rest of the walk depends on ---------
+  const plain = await fetch(`${admin}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: CREDS.email, password: CREDS.password }),
+  })
+    .then(async (response) => {
+      const body = await response.json().catch(() => null);
+      return { status: response.status, mfaRequired: Boolean(body && body.mfa_required) };
+    })
+    .catch(() => ({ status: 0, mfaRequired: false }));
+  note({ step: "account-back-to-password", ...plain });
+
+  // Leave the walk's own origin on the page.
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(500);
+
+  report.passkeys = { steps };
+  log(`passkeys: ${JSON.stringify(steps)}`);
 }
