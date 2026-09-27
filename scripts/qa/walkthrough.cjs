@@ -560,6 +560,26 @@ async function clickPrimaryIn(page, selector) {
 }
 
 /**
+ * `next dev` compiles a route on first visit and hydrates it asynchronously. A pass that stamps
+ * attributes or clicks inside that window makes React report "a tree hydrated but some attributes of
+ * the server rendered HTML didn't match" — a description of the pass's own mid-hydration changes,
+ * not of the product. The apps announce hydration with `data-app-ready="1"`, so every document load
+ * waits for that marker before anything else touches the page. Best effort: a screen that never
+ * hydrates is still walked, and its console stays under inspection.
+ */
+function markHydrationWait(page, timeout = 20000) {
+  const navigate = page.goto.bind(page);
+  page.goto = async (...args) => {
+    const response = await navigate(...args);
+    await page
+      .waitForFunction(() => !!document.querySelector('[data-app-ready="1"]'), null, { timeout })
+      .catch(() => {});
+    return response;
+  };
+  return page;
+}
+
+/**
  * Give a click's own work the moment it needs: a client-side navigation (Next's router) can
  * commit *after* the click returns, and the next element is then looked up on a page that is
  * already going away — which reads as "click timed out" and blames the screen.
@@ -2467,7 +2487,7 @@ async function main() {
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
-  const page = await context.newPage();
+  const page = markHydrationWait(await context.newPage());
   attach(page, "main");
 
   // Reachable?
@@ -2663,7 +2683,7 @@ async function main() {
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
   const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
-  const mpage = await mobile.newPage();
+  const mpage = markHydrationWait(await mobile.newPage());
   attach(mpage, "mobile");
   report.mobileLogin = await ensureSignedIn(mpage, report);
   if (!report.mobileLogin) {
