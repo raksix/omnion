@@ -396,6 +396,46 @@ impl From<PermissionsError> for ApiError {
                 code: "system_role",
                 message: "platform roles are managed by the platform".to_owned(),
             },
+            // REQ-006 role depth: the field-level refusals carry the field they belong to, so the
+            // matrix screen can point at `inherits_role_id` instead of showing a generic message.
+            PermissionsError::InheritanceCycle | PermissionsError::SelfInheritance => Self {
+                status: StatusCode::CONFLICT,
+                code: "role_inheritance_cycle",
+                message:
+                    "the role cannot inherit from itself or one of its own descendants (inherits_role_id)"
+                        .to_owned(),
+            },
+            PermissionsError::InheritanceDepthExceeded { max } => Self::bad_request(
+                "role_inheritance_depth",
+                format!("inheritance chains may not exceed {max} levels (inherits_role_id)"),
+            ),
+            PermissionsError::RoleHasBindings(count) => Self {
+                status: StatusCode::CONFLICT,
+                code: "role_has_bindings",
+                message: format!(
+                    "the role still carries {count} live binding(s); revoke them before deleting it"
+                ),
+            },
+            PermissionsError::VersionConflict { expected, current } => Self {
+                status: StatusCode::CONFLICT,
+                code: "role_version_conflict",
+                message: format!(
+                    "the role changed since it was read: expected version {expected}, current version {current}"
+                ),
+            },
+            PermissionsError::InvalidEntries { unknown, duplicates } => {
+                let mut parts: Vec<String> = Vec::new();
+                if !unknown.is_empty() {
+                    parts.push(format!("unknown permission key(s): {}", unknown.join(", ")));
+                }
+                if !duplicates.is_empty() {
+                    parts.push(format!("duplicate entr(ies): {}", duplicates.join(", ")));
+                }
+                Self::bad_request(
+                    "invalid_entries",
+                    format!("the permission set was refused — {}", parts.join("; ")),
+                )
+            }
             // Everything else is a bad request: the caller handed in something the store
             // cannot accept (key shape, priority range, unknown permission, bad scope).
             other => Self::bad_request("invalid_request", other.to_string()),

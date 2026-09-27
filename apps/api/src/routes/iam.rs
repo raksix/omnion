@@ -13,12 +13,14 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use std::collections::BTreeMap;
 use omnion_audit::NewAuditEntry;
 use omnion_permissions::model::{
-    Effect, NewBinding, NewRole, PermissionSummary, Role, RolePermissionInput,
+    Effect, NewBinding, NewRole, ParentChange, PermissionSummary, Role, RolePermission,
+    RolePermissionInput, RoleUpdate,
 };
 use omnion_permissions::{PermissionsError, Scope};
-use omnion_permissions::{bindings, catalogue, evaluate, roles as role_store};
+use omnion_permissions::{bindings, catalogue, evaluate, roles as role_store, versions};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -353,6 +355,9 @@ impl From<EffectBody> for Effect {
 pub struct SetRolePermissionsRequest {
     /// The complete set the role should end up with.
     pub permissions: Vec<PermissionEntryBody>,
+    /// The version the caller read the role at; a mismatch refuses the save (`409`).
+    #[serde(default)]
+    pub expected_version: Option<i32>,
 }
 
 /// `POST /api/v1/iam/bindings`.
@@ -438,13 +443,39 @@ pub async fn list_permissions() -> Json<PermissionsResponse> {
     Json(PermissionsResponse { permissions })
 }
 
+/// Query parameters of `GET /api/v1/iam/roles`.
+#[derive(Debug, Deserialize)]
+pub struct RolesQuery {
+    /// Tenant whose roles to list; a platform account must name one to see it (a tenant account
+    /// is always answered for its own organization).
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
 /// List the roles visible to the caller.
+///
+/// Platform roles always answer. A tenant account sees its own organization's roles; a platform
+/// account names the tenant it wants with `?organization_id=`, so a role created for a tenant is
+/// not invisible to the account that created it.
 pub async fn list_roles(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(query): Query<RolesQuery>,
 ) -> Result<Json<RolesResponse>, ApiError> {
     let pool = state.db().pool();
-    let roles = role_store::list_roles(pool, current.user.organization_id).await?;
+    let organization_id = match current.user.organization_id {
+        Some(own) => {
+            if let Some(requested) = query.organization_id {
+                if requested != own {
+                    return Err(crate::scope::cross_organization());
+                }
+            }
+            Some(own)
+        }
+        None => query.organization_id,
+    };
+
+    let roles = role_store::list_roles(pool, organization_id).await?;
     let ids: Vec<Uuid> = roles.iter().map(|role| role.id).collect();
     let summaries = role_store::permission_summary(pool, &ids).await?;
 
@@ -495,14 +526,495 @@ pub async fn create_role(
     ))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Role depth (REQ-006, slice 1): detail, edit, delete, duplicate, preview and version history
+// ---------------------------------------------------------------------------------------------
+
+/// One permission entry as the API returns it.
+#[derive(Debug, Serialize)]
+pub struct PermissionEntryView {
+    /// Permission key.
+    pub key: String,
+    /// `allow` or `deny`.
+    pub effect: &'static str,
+}
+
+impl From<&RolePermission> for PermissionEntryView {
+    fn from(entry: &RolePermission) -> Self {
+        Self {
+            key: entry.key.clone(),
+            effect: entry.effect.as_str(),
+        }
+    }
+}
+
+/// One entry whose effect flipped between two versions.
+#[derive(Debug, Serialize)]
+pub struct ChangedEntryView {
+    /// Permission key.
+    pub key: String,
+    /// Effect before.
+    pub from: &'static str,
+    /// Effect after.
+    pub to: &'static str,
+}
+
+/// What a save (or a preview) changes about a role's permission set.
+#[derive(Debug, Serialize)]
+pub struct RoleDiffView {
+    /// Keys the new set adds.
+    pub added: Vec<PermissionEntryView>,
+    /// Keys whose effect flips.
+    pub changed: Vec<ChangedEntryView>,
+    /// Keys the new set drops.
+    pub removed: Vec<PermissionEntryView>,
+}
+
+impl From<&omnion_permissions::RoleDiff> for RoleDiffView {
+    fn from(diff: &omnion_permissions::RoleDiff) -> Self {
+        Self {
+            added: diff.added.iter().map(PermissionEntryView::from).collect(),
+            changed: diff
+                .changed
+                .iter()
+                .map(|change| ChangedEntryView {
+                    key: change.key.clone(),
+                    from: change.from.map(Effect::as_str).unwrap_or("inherit"),
+                    to: change.to.map(Effect::as_str).unwrap_or("inherit"),
+                })
+                .collect(),
+            removed: diff
+                .removed
+                .iter()
+                .map(PermissionEntryView::from)
+                .collect(),
+        }
+    }
+}
+
+/// A role as another role's chain or member list refers to it.
+#[derive(Debug, Serialize)]
+pub struct RoleRefView {
+    /// Role id.
+    pub id: Uuid,
+    /// Stable key.
+    pub key: String,
+    /// Display name.
+    pub name: String,
+    /// Hierarchy position.
+    pub priority: i32,
+    /// Platform-managed role.
+    pub is_system: bool,
+}
+
+impl From<&Role> for RoleRefView {
+    fn from(role: &Role) -> Self {
+        Self {
+            id: role.id,
+            key: role.key.clone(),
+            name: role.name.clone(),
+            priority: role.priority,
+            is_system: role.is_system,
+        }
+    }
+}
+
+/// Response body of `GET /api/v1/iam/roles/{id}`.
+#[derive(Debug, Serialize)]
+pub struct RoleDetailResponse {
+    /// The role itself, with its allow/deny counts.
+    pub role: RoleBody,
+    /// The role's own permission entries (not the inherited ones).
+    pub permissions: Vec<PermissionEntryView>,
+    /// Roles this one inherits from, nearest first.
+    pub chain: Vec<RoleRefView>,
+    /// Roles that inherit from this one directly.
+    pub inherited_by: Vec<RoleRefView>,
+    /// Live bindings carrying this role.
+    pub member_count: i64,
+    /// Latest version number (`0` when the role has no history yet).
+    pub version: i32,
+}
+
+/// One version of a role, with the diff against the version before it.
+#[derive(Debug, Serialize)]
+pub struct RoleVersionView {
+    /// One-based version number.
+    pub version: i32,
+    /// Name at this version.
+    pub name: String,
+    /// Description at this version.
+    pub description: String,
+    /// Priority at this version.
+    pub priority: i32,
+    /// What kind of change produced it.
+    pub change: String,
+    /// Who made the change.
+    pub changed_by: Option<Uuid>,
+    /// When it was written, RFC 3339.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// The permission set at this version.
+    pub permissions: Vec<PermissionEntryView>,
+    /// What changed against the previous version.
+    pub diff: RoleDiffView,
+    /// How many entries the diff touches.
+    pub diff_total: usize,
+}
+
+/// Response body of `GET /api/v1/iam/roles/{id}/versions`.
+#[derive(Debug, Serialize)]
+pub struct RoleVersionsResponse {
+    /// The role the history belongs to.
+    pub role_id: Uuid,
+    /// Versions, newest first.
+    pub versions: Vec<RoleVersionView>,
+}
+
+/// Response body of the permission save.
+#[derive(Debug, Serialize)]
+pub struct RoleSaveResponse {
+    /// The role after the save.
+    pub role: RoleBody,
+    /// The set as written.
+    pub permissions: Vec<PermissionEntryView>,
+    /// What the save changed.
+    pub diff: RoleDiffView,
+    /// The version number the save wrote.
+    pub version: i32,
+}
+
+/// Response body of the preview (`POST /api/v1/iam/roles/{id}/preview`).
+#[derive(Debug, Serialize)]
+pub struct RolePreviewResponse {
+    /// What saving this set would change.
+    pub diff: RoleDiffView,
+    /// Why the set would be refused, in caller-facing language (empty when it is acceptable).
+    pub problems: Vec<String>,
+    /// The version the preview was computed against.
+    pub version: i32,
+    /// `true` when the set equals what the role already holds.
+    pub unchanged: bool,
+}
+
+/// `PATCH /api/v1/iam/roles/{id}`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateRoleRequest {
+    /// New display name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// New hierarchy position.
+    #[serde(default)]
+    pub priority: Option<i32>,
+    /// Whether inherited permissions apply.
+    #[serde(default)]
+    pub inherit_permissions: Option<bool>,
+    /// New parent role.
+    #[serde(default)]
+    pub inherits_role_id: Option<Uuid>,
+    /// Set to `true` to detach the role from its parent (takes precedence over
+    /// `inherits_role_id`).
+    #[serde(default)]
+    pub detach_parent: Option<bool>,
+}
+
+/// `POST /api/v1/iam/roles/{id}/duplicate`.
+#[derive(Debug, Deserialize)]
+pub struct DuplicateRoleRequest {
+    /// Key of the copy.
+    pub key: String,
+    /// Display name of the copy.
+    pub name: String,
+    /// Organization the copy belongs to; defaults to the caller's own.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// Read one role's detail.
+pub async fn get_role(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+) -> Result<Json<RoleDetailResponse>, ApiError> {
+    let pool = state.db().pool();
+    let role = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, role.organization_id)?;
+
+    let permissions = role_store::permission_entries(pool, &[role_id])
+        .await?
+        .remove(&role_id)
+        .unwrap_or_default();
+    let summary = role_store::permission_summary(pool, &[role_id]).await?;
+    let chain = role_store::ancestors(pool, role_id).await?;
+    let inherited_by = role_store::children(pool, role_id).await?;
+    let member_count = bindings::count_live_for_role(pool, role_id).await?;
+    let version = versions::latest_version(pool, role_id).await?.unwrap_or(0);
+
+    Ok(Json(RoleDetailResponse {
+        role: RoleBody::new(&role, summary.get(&role_id).copied().unwrap_or_default()),
+        permissions: permissions.iter().map(PermissionEntryView::from).collect(),
+        chain: chain.iter().map(RoleRefView::from).collect(),
+        inherited_by: inherited_by.iter().map(RoleRefView::from).collect(),
+        member_count,
+        version,
+    }))
+}
+
+/// Update a custom role's fields and its parent link.
+pub async fn update_role(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+    address: ClientAddress,
+    Json(body): Json<UpdateRoleRequest>,
+) -> Result<Json<RoleBody>, ApiError> {
+    let pool = state.db().pool();
+    let role = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, role.organization_id)?;
+
+    let parent = if body.detach_parent == Some(true) {
+        ParentChange::Clear
+    } else if let Some(parent_id) = body.inherits_role_id {
+        ParentChange::Set(parent_id)
+    } else {
+        ParentChange::Keep
+    };
+
+    let updated = role_store::update_role(
+        pool,
+        role_id,
+        RoleUpdate {
+            name: body.name,
+            description: body.description,
+            priority: body.priority,
+            parent,
+            inherit_permissions: body.inherit_permissions,
+        },
+    )
+    .await?;
+
+    // A field change is a version too, so the history tab covers the whole role and not only
+    // its permission set.
+    let entries = role_store::permission_entries(pool, &[role_id])
+        .await?
+        .remove(&role_id)
+        .unwrap_or_default();
+    versions::record(pool, &updated, &entries, "updated", Some(current.user.id)).await?;
+
+    let summary = role_store::permission_summary(pool, &[role_id]).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.role.updated")
+            .target("role", role_id.to_string())
+            .metadata(json!({
+                "key": updated.key,
+                "priority": updated.priority,
+                "inherits_role_id": updated.inherits_role_id,
+                "inherit_permissions": updated.inherit_permissions,
+            }))
+            .ip_address(address.as_text())
+            .organization(updated.organization_id),
+    )
+    .await?;
+
+    Ok(Json(RoleBody::new(
+        &updated,
+        summary.get(&role_id).copied().unwrap_or_default(),
+    )))
+}
+
+/// Delete a custom role that carries no live binding.
+pub async fn delete_role(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+    address: ClientAddress,
+) -> Result<StatusCode, ApiError> {
+    let pool = state.db().pool();
+    let role = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, role.organization_id)?;
+
+    role_store::delete_role(pool, role_id).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.role.deleted")
+            .target("role", role_id.to_string())
+            .metadata(json!({ "key": role.key, "name": role.name }))
+            .ip_address(address.as_text())
+            .organization(role.organization_id),
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Clone a role — the way an organization customises a platform role.
+pub async fn duplicate_role(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+    address: ClientAddress,
+    Json(body): Json<DuplicateRoleRequest>,
+) -> Result<(StatusCode, Json<RoleBody>), ApiError> {
+    let pool = state.db().pool();
+    let source = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, source.organization_id)?;
+
+    let organization_id = resolve_organization(&current, body.organization_id)?;
+    let role = role_store::duplicate_role(pool, role_id, organization_id, &body.key, &body.name)
+        .await?;
+
+    let entries = role_store::permission_entries(pool, &[role.id])
+        .await?
+        .remove(&role.id)
+        .unwrap_or_default();
+    versions::record(pool, &role, &entries, "duplicated", Some(current.user.id)).await?;
+
+    let summary = role_store::permission_summary(pool, &[role.id]).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.role.duplicated")
+            .organization(organization_id)
+            .target("role", role.id.to_string())
+            .metadata(json!({
+                "source_role_id": source.id,
+                "key": role.key,
+                "entries": entries.len(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RoleBody::new(
+            &role,
+            summary.get(&role.id).copied().unwrap_or_default(),
+        )),
+    ))
+}
+
+/// Read a role's version history, each version with its diff.
+pub async fn list_role_versions(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+) -> Result<Json<RoleVersionsResponse>, ApiError> {
+    let pool = state.db().pool();
+    let role = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, role.organization_id)?;
+
+    let rows = versions::list(pool, role_id).await?;
+    let mut views = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        // The list is newest first, so the version before this one is the next row.
+        let diff = match rows.get(index + 1) {
+            Some(previous) => versions::diff(&previous.entries(), &row.entries()),
+            None => versions::diff(&[], &row.entries()),
+        };
+        views.push(RoleVersionView {
+            version: row.version,
+            name: row.name.clone(),
+            description: row.description.clone(),
+            priority: row.priority,
+            change: row.change.clone(),
+            changed_by: row.changed_by,
+            created_at: row.created_at,
+            permissions: row.entries().iter().map(PermissionEntryView::from).collect(),
+            diff: RoleDiffView::from(&diff),
+            diff_total: diff.total(),
+        });
+    }
+
+    Ok(Json(RoleVersionsResponse {
+        role_id,
+        versions: views,
+    }))
+}
+
+/// Preview a permission set: what it would change and why it would be refused.
+///
+/// Nothing is written here — the screen shows the diff before the save, and the same validation
+/// runs again inside the save itself.
+pub async fn preview_role_permissions(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+    Json(body): Json<SetRolePermissionsRequest>,
+) -> Result<Json<RolePreviewResponse>, ApiError> {
+    let pool = state.db().pool();
+    let role = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, role.organization_id)?;
+    if role.is_system {
+        return Err(PermissionsError::SystemRole.into());
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    let mut validated: BTreeMap<String, Effect> = BTreeMap::new();
+    for entry in &body.permissions {
+        if !catalogue::is_known(&entry.key) {
+            problems.push(format!("unknown permission key: {}", entry.key));
+            continue;
+        }
+        if validated.insert(entry.key.clone(), entry.effect.into()).is_some() {
+            problems.push(format!("duplicate entry: {}", entry.key));
+        }
+    }
+    problems.sort();
+    problems.dedup();
+
+    let current_entries = role_store::permission_entries(pool, &[role_id])
+        .await?
+        .remove(&role_id)
+        .unwrap_or_default();
+    let proposed: Vec<RolePermission> = validated
+        .iter()
+        .map(|(key, effect)| RolePermission {
+            key: key.clone(),
+            effect: *effect,
+        })
+        .collect();
+    let diff = versions::diff(&current_entries, &proposed);
+    let version = versions::latest_version(pool, role_id).await?.unwrap_or(0);
+
+    Ok(Json(RolePreviewResponse {
+        diff: RoleDiffView::from(&diff),
+        problems,
+        version,
+        unchanged: diff.is_empty(),
+    }))
+}
+
 /// Replace the permission set of a role the organization owns.
+///
+/// The save is atomic: an unknown key, a duplicate entry or a stale `expected_version` refuses
+/// the whole request before anything is written, and the answer carries the diff that was
+/// applied plus the version number the history now shows.
 pub async fn set_role_permissions(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(role_id): Path<Uuid>,
     address: ClientAddress,
     Json(body): Json<SetRolePermissionsRequest>,
-) -> Result<Json<RoleBody>, ApiError> {
+) -> Result<Json<RoleSaveResponse>, ApiError> {
     let pool = state.db().pool();
     let role = role_store::find_role(pool, role_id)
         .await?
@@ -518,30 +1030,141 @@ pub async fn set_role_permissions(
         })
         .collect();
 
-    role_store::set_role_permissions(pool, role_id, &entries).await?;
-    let summaries = role_store::permission_summary(pool, &[role_id]).await?;
-    let updated = role_store::find_role(pool, role_id)
-        .await?
-        .ok_or(PermissionsError::RoleNotFound)?;
-
-    record(
-        &state,
-        NewAuditEntry::by_user(current.user.id, "iam.role.permissions_updated")
-            .target("role", role_id.to_string())
-            .metadata(json!({
-                "key": updated.key,
-                "entries": entries.len(),
-                "organization_id": updated.organization_id,
-            }))
-            .ip_address(address.as_text())
-            .organization(updated.organization_id),
+    let outcome = role_store::replace_role_permissions(
+        pool,
+        role_id,
+        &entries,
+        body.expected_version,
+        Some(current.user.id),
     )
     .await?;
 
-    Ok(Json(RoleBody::new(
-        &updated,
-        summaries.get(&role_id).copied().unwrap_or_default(),
-    )))
+    let summaries = role_store::permission_summary(pool, &[role_id]).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.role.permissions_changed")
+            .target("role", role_id.to_string())
+            .metadata(json!({
+                "key": outcome.role.key,
+                "entries": outcome.entries.len(),
+                "version": outcome.version,
+                "added": outcome.diff.added.len(),
+                "changed": outcome.diff.changed.len(),
+                "removed": outcome.diff.removed.len(),
+                "organization_id": outcome.role.organization_id,
+            }))
+            .ip_address(address.as_text())
+            .organization(outcome.role.organization_id),
+    )
+    .await?;
+
+    Ok(Json(RoleSaveResponse {
+        role: RoleBody::new(
+            &outcome.role,
+            summaries.get(&role_id).copied().unwrap_or_default(),
+        ),
+        permissions: outcome
+            .entries
+            .iter()
+            .map(PermissionEntryView::from)
+            .collect(),
+        diff: RoleDiffView::from(&outcome.diff),
+        version: outcome.version,
+    }))
+}
+
+/// One member of a role — a person the role currently or formerly applied to.
+#[derive(Debug, Serialize)]
+pub struct RoleMemberView {
+    /// The account.
+    pub user_id: Uuid,
+    /// Account e-mail.
+    pub email: String,
+    /// Display name.
+    pub display_name: String,
+    /// Where the role applies.
+    pub scope: ScopeBody,
+    /// When it stops applying (temporary roles).
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    /// When it was revoked.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+    /// Whether the binding applies right now.
+    pub active: bool,
+    /// When it was granted.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Response body of `GET /api/v1/iam/roles/{id}/members`.
+#[derive(Debug, Serialize)]
+pub struct RoleMembersResponse {
+    /// The role the members carry.
+    pub role_id: Uuid,
+    /// Members, live bindings first.
+    pub members: Vec<RoleMemberView>,
+}
+
+/// Read who carries a role.
+pub async fn list_role_members(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(role_id): Path<Uuid>,
+) -> Result<Json<RoleMembersResponse>, ApiError> {
+    let pool = state.db().pool();
+    let role = role_store::find_role(pool, role_id)
+        .await?
+        .ok_or(PermissionsError::RoleNotFound)?;
+    ensure_same_organization(&current, role.organization_id)?;
+
+    #[derive(sqlx::FromRow)]
+    struct MemberRow {
+        user_id: Uuid,
+        email: String,
+        display_name: String,
+        scope_type: String,
+        organization_id: Option<Uuid>,
+        site_id: Option<Uuid>,
+        expires_at: Option<OffsetDateTime>,
+        revoked_at: Option<OffsetDateTime>,
+        created_at: OffsetDateTime,
+    }
+
+    let rows: Vec<MemberRow> = sqlx::query_as(
+        "select b.user_id, u.email, u.display_name, b.scope_type, b.organization_id, b.site_id, \
+         b.expires_at, b.revoked_at, b.created_at \
+         from role_bindings b join users u on u.id = b.user_id \
+         where b.role_id = $1 \
+         order by (b.revoked_at is null) desc, b.created_at desc",
+    )
+    .bind(role_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PermissionsError::Database)?;
+
+    let now = OffsetDateTime::now_utc();
+    let mut members = Vec::with_capacity(rows.len());
+    for row in rows {
+        let scope = Scope::from_parts(&row.scope_type, row.organization_id, row.site_id)?;
+        let active = row.revoked_at.is_none() && row.expires_at.is_none_or(|expires| expires > now);
+        members.push(RoleMemberView {
+            user_id: row.user_id,
+            email: row.email,
+            display_name: row.display_name,
+            scope: scope.into(),
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
+            active,
+            created_at: row.created_at,
+        });
+    }
+
+    Ok(Json(RoleMembersResponse {
+        role_id,
+        members,
+    }))
 }
 
 /// List the role assignments of an account (the caller's own by default).

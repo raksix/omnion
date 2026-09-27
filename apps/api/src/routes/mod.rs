@@ -100,6 +100,25 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "iam.roles.read"))
         .merge(post(iam::create_role).layer(guards::require(&state, "iam.roles.manage")));
 
+    // Role depth (REQ-006, slice 1): reading a role and its history is `iam.roles.read`, while
+    // editing, cloning, previewing and deleting are `iam.roles.manage`.
+    let role_detail = get(iam::get_role)
+        .layer(guards::require(&state, "iam.roles.read"))
+        .merge(patch(iam::update_role).layer(guards::require(&state, "iam.roles.manage")))
+        .merge(delete(iam::delete_role).layer(guards::require(&state, "iam.roles.manage")));
+
+    let role_versions =
+        get(iam::list_role_versions).layer(guards::require(&state, "iam.roles.read"));
+
+    let role_members =
+        get(iam::list_role_members).layer(guards::require(&state, "iam.roles.read"));
+
+    let role_duplicate =
+        post(iam::duplicate_role).layer(guards::require(&state, "iam.roles.manage"));
+
+    let role_preview =
+        post(iam::preview_role_permissions).layer(guards::require(&state, "iam.roles.manage"));
+
     let bindings = get(iam::list_bindings)
         .layer(guards::require(&state, "iam.bindings.read"))
         .merge(post(iam::create_binding).layer(guards::require(&state, "iam.bindings.manage")));
@@ -442,6 +461,11 @@ pub fn router(state: AppState) -> Router {
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
         )
         .route("/iam/roles", roles)
+        .route("/iam/roles/{id}", role_detail)
+        .route("/iam/roles/{id}/versions", role_versions)
+        .route("/iam/roles/{id}/members", role_members)
+        .route("/iam/roles/{id}/duplicate", role_duplicate)
+        .route("/iam/roles/{id}/preview", role_preview)
         .route(
             "/iam/roles/{id}/permissions",
             put(iam::set_role_permissions).layer(guards::require(&state, "iam.roles.manage")),
