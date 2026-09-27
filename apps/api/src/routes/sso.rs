@@ -84,6 +84,26 @@ pub struct SsoQuery {
     pub return_to: Option<String>,
 }
 
+/// Query of the SAML relay page.
+///
+/// `state` is the challenge `start` issued. It is *not* read from the query of the same name on
+/// any other route: the OIDC flows carry their state to the provider, not to us, so this is the
+/// only place a SAML `RelayState` is introduced.
+///
+/// `return_to` is accepted and ignored. The redirect that reaches this page carries it, and
+/// dropping it here would make the URL look lossy; the panel path the callback honours is the one
+/// stored on the challenge, so reading it from the query would only add a way to be tampered with.
+#[derive(Debug, Deserialize)]
+pub struct SamlPageQuery {
+    /// Panel path to return to after the sign-in (accepted, not used — see above).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub return_to: Option<String>,
+    /// The challenge this page must hand back to the callback.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
 /// The query a provider sends back on the OIDC/OAuth2 callback.
 #[derive(Debug, Deserialize)]
 pub struct CallbackQuery {
@@ -193,7 +213,8 @@ pub async fn start(
 
     match provider.kind {
         ProviderKind::Saml => Ok(redirect(&format!(
-            "/api/v1/auth/sso/{slug}/saml?return_to={return_to}"
+            "/api/v1/auth/sso/{slug}/saml?return_to={return_to}&state={}",
+            issued.state
         ))),
         ProviderKind::Oidc | ProviderKind::Oauth2 => {
             let discovery = discovery_for(&provider).await?;
@@ -229,13 +250,27 @@ pub async fn start(
 ///
 /// A SAML provider authenticates the *browser* and posts the assertion to our assertion consumer
 /// service (ACS) URL, so there has to be a page on our side that does the POST. The relay state
-/// is the challenge's own `state`, carried through the provider untouched.
+/// is the challenge's own `state`, carried through the provider untouched — `start` puts it in
+/// this page's URL, and the page hands it on as the form's `RelayState`.
+///
+/// Both values are HTML-escaped before they are written into the document. A `state` this server
+/// issued is base64url, but a `return_to` is operator- and browser-supplied, and neither is
+/// allowed to close the attribute it sits in.
 pub async fn saml_page(
     Path(slug): Path<String>,
-    Query(query): Query<SsoQuery>,
+    Query(query): Query<SamlPageQuery>,
 ) -> Response {
-    let return_to = sanitize_return_to(query.return_to.as_deref());
-    let action = format!("/api/v1/auth/sso/{slug}/callback");
+    // The relay page is reached from `start`, which already put the challenge in the URL. The
+    // `return_to` is *not* read here on purpose: the page is a transport for the challenge, and
+    // the panel path the callback honours is the one on the challenge row, read back when it is
+    // claimed — so editing the URL here cannot retarget the sign-in.
+    let state = query
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(html_escape);
+    let action = html_escape(&format!("/api/v1/auth/sso/{slug}/callback"));
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -249,23 +284,40 @@ pub async fn saml_page(
   <h1 id="sso-title">Signing you in</h1>
   <p id="sso-status">Handing the assertion back to the platform.</p>
   <form id="sso-form" method="post" action="{action}">
-    <input type="hidden" name="RelayState" value="{return_to}" />
+    <input type="hidden" name="RelayState" value="{}" />
     <noscript>
       <button type="submit" id="sso-continue">Continue</button>
     </noscript>
   </form>
 </body>
-</html>"#
+</html>"#,
+        state.as_deref().unwrap_or("")
     );
-    // The page carries the *path* it returns to, not the challenge: the browser posts it, the
-    // callback rejects it as a state it never issued, and a person without JavaScript is told to
-    // start again rather than being signed in with a forged state.
+    // The page is the transport for the challenge and nothing else: the return path the callback
+    // honours is the one on the challenge row, read back when it is claimed, so a browser cannot
+    // talk the callback into a different destination by editing the form.
     let script = r#"<script>document.getElementById('sso-form').submit();</script>"#;
     (
         [(CONTENT_TYPE, "text/html; charset=utf-8")],
         format!("{html}{script}"),
     )
         .into_response()
+}
+
+/// Escape the five characters that can end an HTML attribute or start a tag.
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The OIDC/OAuth2 callback.
@@ -622,6 +674,7 @@ async fn resolve_code_flow(
         .filter(|value| !value.is_empty())
         && query.code.is_empty()
     {
+        // An implicit flow has no code, so there is no code binding to check at all.
         verify_token(token, &discovery, provider, None).await?
     } else {
         if query.code.is_empty() {
@@ -640,7 +693,11 @@ async fn resolve_code_flow(
             .get("access_token")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let verified = verify_token(&id_token, &discovery, provider, challenge.code_verifier.as_deref()).await?;
+        // A token issued *for this code* carries that code's hash (OIDC Core §3.1.3.6). The check is
+        // the second half of the code binding — the first is PKCE, which the token endpoint
+        // enforces when we send the verifier — and a provider that omits `c_hash` is not refused
+        // for it: the claim is a RECOMMENDED, and an optional claim cannot be a mandatory rule.
+        let verified = verify_token(&id_token, &discovery, provider, Some(&query.code)).await?;
         // A generic OAuth2 provider may send no ID token; the userinfo endpoint is then the
         // identity, and it is read with the access token rather than the (absent) ID token.
         if verified.claims.get("sub").is_none()
@@ -702,11 +759,18 @@ async fn exchange_code(
 }
 
 /// Verify a token's signature against the published keys, then its registered claims.
+///
+/// `code` is the authorization code this sign-in exchanged, when there was one. It is what the
+/// token's `c_hash` is checked against; an implicit flow has no code and therefore no code
+/// binding. The PKCE verifier is deliberately *not* a parameter: it is proven at the token
+/// endpoint, which is where the verifier is sent and where a provider that does not accept it
+/// refuses the exchange. Re-checking it here — or worse, comparing it against a claim the
+/// provider cannot compute — would be a second, weaker copy of a guarantee that already holds.
 async fn verify_token(
     token: &str,
     discovery: &Discovery,
     provider: &AuthProvider,
-    code_verifier: Option<&str>,
+    code: Option<&str>,
 ) -> Result<VerifiedAssertion, ApiError> {
     if token.is_empty() {
         return Err(ApiError::bad_request(
@@ -744,14 +808,14 @@ async fn verify_token(
         if let Ok(fresh) = http_client().get_json(&discovery.jwks_uri).await {
             if oidc::verify_signature(token, &header, &oidc::parse_jwks(&fresh)).is_ok() {
                 cache.put(&key, fresh);
-                return verify_claims_only(token, discovery, provider, code_verifier);
+                return verify_claims_only(token, discovery, provider, code);
             }
         }
         cache.invalidate(&key);
         return Err(ApiError::bad_request("token_refused", error.to_string()));
     }
 
-    verify_claims_only(token, discovery, provider, code_verifier)
+    verify_claims_only(token, discovery, provider, code)
 }
 
 /// The registered-claim half, once the signature has held.
@@ -759,31 +823,24 @@ fn verify_claims_only(
     token: &str,
     discovery: &Discovery,
     provider: &AuthProvider,
-    code_verifier: Option<&str>,
+    code: Option<&str>,
 ) -> Result<VerifiedAssertion, ApiError> {
     let claims = oidc::decode_claims(token)
         .map_err(|error| ApiError::bad_request("token_refused", error.to_string()))?;
 
-    // A `code` flow binds the token to this challenge with the PKCE `S256` of the verifier we
-    // issued. A token carrying no `c_hash` did not come from a code exchange, and one carrying a
-    // different hash was issued for somebody else's sign-in — both are refusals, not warnings.
-    if let Some(verifier) = code_verifier.filter(|value| !value.is_empty()) {
-        let expected = oidc::pkce_challenge(verifier);
-        match claims.values.get("c_hash").and_then(Value::as_str) {
-            Some(hash) if hash == expected => {}
-            Some(_) => {
-                return Err(ApiError::bad_request(
-                    "token_refused",
-                    "the token was not issued for this sign-in",
-                ));
-            }
-            None => {
-                return Err(ApiError::bad_request(
-                    "token_refused",
-                    "the token does not bind itself to this sign-in",
-                ));
-            }
-        }
+    // The token is bound to *this* sign-in by the `c_hash` of the code it was issued for
+    // (OIDC Core §3.1.3.6). A hash for a different code means the token was minted for somebody
+    // else's sign-in — a refusal. A *missing* hash is not: the claim is a RECOMMENDED, and plenty
+    // of providers omit it, so its absence is not evidence of an attack and the PKCE binding the
+    // token endpoint already enforced stands on its own.
+    if let Some(code) = code.map(str::trim).filter(|value| !value.is_empty())
+        && let Some(hash) = claims.values.get("c_hash").and_then(Value::as_str)
+        && hash != oidc::code_hash(code)
+    {
+        return Err(ApiError::bad_request(
+            "token_refused",
+            "the token was not issued for this sign-in",
+        ));
     }
 
     oidc::verify_claims(
@@ -889,15 +946,28 @@ async fn apply_mapped_roles(
 
     let mut applied: Vec<String> = Vec::new();
     for slug in slugs {
-        let Some(role) = role_store::find_role_by_key(pool, Some(organization_id), &slug).await? else {
-            // A rule naming a role nobody has must not fail the sign-in: the person still gets in,
-            // and the operator sees a warning instead of an outage.
-            tracing::warn!(
-                provider = %provider.slug,
-                role = %slug,
-                "a claim maps to a role that does not exist in this organization"
-            );
-            continue;
+        // A role is found the way the rest of the platform finds one: this organization's own
+        // role if it defines one, otherwise the platform's base role of that name. Asking for
+        // *only* the organization's own role is what made a claim → role mapping silently do
+        // nothing for every tenant — the base roles are seeded at platform scope, so a directory
+        // mapping `editors` → `editor` matched nothing and the person signed in with no role and
+        // no error, which is the worst possible outcome for a feature whose whole point is the
+        // mapping.
+        let role = match role_store::find_role_by_key(pool, Some(organization_id), &slug).await? {
+            Some(role) => role,
+            None => match role_store::find_role_by_key(pool, None, &slug).await? {
+                Some(role) => role,
+                None => {
+                    // A rule naming a role nobody has must not fail the sign-in: the person still
+                    // gets in, and the operator sees a warning instead of an outage.
+                    tracing::warn!(
+                        provider = %provider.slug,
+                        role = %slug,
+                        "a claim maps to a role this organization and the platform do not define"
+                    );
+                    continue;
+                }
+            },
         };
         if grant(pool, role.id, user_id, organization_id).await? {
             applied.push(slug);
@@ -1342,6 +1412,8 @@ async fn log_event(
 
 #[cfg(test)]
 mod tests {
+    use http_body_util::BodyExt;
+
     use super::*;
 
     /// A provider row that names its group claim, so the group mapping is actually exercised.
@@ -1457,5 +1529,52 @@ mod tests {
         row.config = json!({});
         let error = client_id(&row).expect_err("no client id");
         assert_eq!(error.code(), "provider_misconfigured");
+    }
+
+    #[test]
+    fn escaping_covers_everything_that_can_end_an_attribute() {
+        assert_eq!(html_escape(r#"a"b'c<d>e&f"#), "a&quot;b&#39;c&lt;d&gt;e&amp;f");
+        // A state we issued is base64url and passes through untouched — escaping a value that
+        // cannot contain a dangerous character must not corrupt it either.
+        assert_eq!(html_escape("aB3-_xyz"), "aB3-_xyz");
+    }
+
+    #[tokio::test]
+    async fn the_saml_page_carries_the_challenge_and_not_the_return_path() {
+        // The page exists to hand the challenge back to the callback. Carrying the return path
+        // instead is what made every SAML sign-in fail with `invalid_state` before this was fixed,
+        // because the callback claims a challenge from `RelayState` and a path is not one.
+        let response = saml_page(
+            Path("okta".to_owned()),
+            Query(SamlPageQuery {
+                return_to: Some("/media".to_owned()),
+                state: Some("the-challenge".to_owned()),
+            }),
+        )
+        .await;
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::OK);
+        let page = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(page.contains(r#"value="the-challenge""#), "{page}");
+        assert!(!page.contains(r#"value="/media""#), "{page}");
+        assert!(page.contains(r#"action="/api/v1/auth/sso/okta/callback""#), "{page}");
+    }
+
+    #[tokio::test]
+    async fn a_saml_page_asked_to_close_its_own_attribute_cannot() {
+        // `state` is base64url when we issue it, but the route is public: a crafted value must not
+        // be able to inject markup into the page the browser auto-submits.
+        let response = saml_page(
+            Path("okta".to_owned()),
+            Query(SamlPageQuery {
+                return_to: None,
+                state: Some(r#"" autofocus onfocus="alert(1)" x="#.to_owned()),
+            }),
+        )
+        .await;
+        let (_, body) = response.into_parts();
+        let page = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(!page.contains("onfocus=\"alert"), "{page}");
+        assert!(page.contains("&quot;"), "{page}");
     }
 }
