@@ -51,12 +51,18 @@ base64 = "0.22"
 p256 = "0.13"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
+# Enterprise sign-in (crates/identity/src/sso): verifying an OIDC ID token means checking an
+# RSASSA-PKCS1-v1_5 signature over the exact bytes a provider sent, so the verification is the
+# crate's own rather than a hand-rolled modular exponentiation.
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+
 # Object storage (crates/storage): the S3/MinIO client signs its own requests (SigV4) over a
 # plain HTTP client, so the media library needs no vendor SDK.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 hmac = "0.12"
 percent-encoding = "2"
 bytes = "1"
+url = "2"
 
 # The `omnion` command line (tools/cli) reads the first-run password without echoing it.
 rpassword = "7"

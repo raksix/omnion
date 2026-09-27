@@ -13,7 +13,8 @@ export default function MediaPage() {
         title="Media"
         description="The files of the selected site, stored in the platform's object store"
       >
-        {/* The view reads `?focus=` (a search hit marks its file), which needs a boundary. */}
+        {/* The view reads `?folder=` (a folder is a shareable deep link) and `?focus=` (a search
+            hit marks its file), both of which need a boundary. */}
         <Suspense fallback={<p className="text-[13px] text-muted">Loading the library…</p>}>
           <MediaView />
         </Suspense>

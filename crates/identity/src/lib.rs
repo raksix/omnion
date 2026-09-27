@@ -7,7 +7,8 @@
 //! The modules compose rather than duplicate: [`signin`] runs the checks the policy describes
 //! (address lists, lockout, password, factor) and never re-implements a hash; [`sessions`]
 //! reads its lifetimes from [`security`]; [`mfa`] keeps secrets behind [`secrets`] envelopes.
-//! Provider-based sign-in (OIDC/SAML) and SCIM provisioning arrive in a later slice.
+//! Provider-based sign-in (OIDC/OAuth2/SAML) lives in [`sso`]: the configuration rows, the
+//! `state` a round trip is bound to, the protocol exchanges and the claim → role mapping.
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +24,7 @@ pub mod security;
 pub mod sessions;
 pub mod signin;
 pub mod sites;
+pub mod sso;
 pub mod totp;
 pub mod users;
 pub mod webauthn;
