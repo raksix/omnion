@@ -373,6 +373,12 @@ pub struct WorkflowExecution {
     ///
     /// A branch step reads `event.<field>` out of it and the run detail shows it beside the
     /// trace. A manual run and a schedule carry `None` — there is no event behind them.
+    /// This is `COALESCE`-shaped rather than `Option`-shaped on purpose: the column is
+    /// nullable in SQL, so reading it as `Option<Value>` would need the row to carry SQL
+    /// NULL as *JSON* null, and every `select` would have to say `coalesce(event_payload,
+    /// 'null'::jsonb)`. A missing payload and a JSON `null` payload mean the same thing to
+    /// a caller, and the read must not be able to fail on one of them.
+    #[sqlx(default)]
     pub event_payload: Option<serde_json::Value>,
 }
 
@@ -392,7 +398,8 @@ impl WorkflowExecution {
 
 /// Columns of `workflow_executions`, in the order [`WorkflowExecution`] expects.
 pub const EXECUTION_COLUMNS: &str = "id, workflow_id, organization_id, status, trigger_kind, \
-     triggered_by, started_at, finished_at, error, event_payload";
+     triggered_by, started_at, finished_at, error, \
+     coalesce(event_payload, 'null'::jsonb) as event_payload";
 
 /// One materialised step of a run.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]

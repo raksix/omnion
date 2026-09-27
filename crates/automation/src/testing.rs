@@ -464,6 +464,7 @@ mod tests {
     use super::*;
     use crate::condition::{Condition, ConditionOperator};
     use crate::groups::{ConditionGroup, ConditionNode};
+    use omnion_workflows::OnError;
     use omnion_workflows::definition::StepDefinition;
     use serde_json::json;
     use time::OffsetDateTime as Offset;
@@ -481,6 +482,7 @@ mod tests {
             actions,
             hook_triggered: false,
             hook_configured: false,
+            on_error: OnError::Stop,
             trigger_count: 0,
             last_triggered_at: None,
             created_at: Offset::UNIX_EPOCH,

@@ -373,6 +373,49 @@ impl AutomationInput {
     }
 }
 
+/// Check every `http_request` step's host against the installation's allow-list.
+///
+/// This is the *write-time* half of the bound; the action re-checks at call time because
+/// the list can change between writing a rule and running it. Refusing here is what the
+/// request asks for — "refused at save time naming the host" — and it is the difference
+/// between an author learning about it now and about it three weeks later when the rule
+/// first fires.
+async fn check_outbound_hosts(
+    state: &AppState,
+    actions: &[StepDefinition],
+) -> Result<(), ApiError> {
+    let steps: Vec<&StepDefinition> = actions
+        .iter()
+        .filter(|step| step.action.as_deref() == Some("http_request"))
+        .collect();
+    if steps.is_empty() {
+        return Ok(());
+    }
+
+    let allowed = omnion_automation::outbound::allowed_hosts(state.db().pool()).await?;
+    for step in steps {
+        // A URL the engine itself refused never reaches here; a URL that parses but names
+        // a host outside the list does.
+        let Ok(target) = omnion_automation::outbound::parse_target(
+            step.params
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ) else {
+            continue;
+        };
+        if !omnion_automation::outbound::host_allowed(&target.host, &allowed) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "host_not_allowed",
+                omnion_automation::outbound::host_refusal(&target.host, &allowed),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// A test payload for a dry run.
 #[derive(Debug, Deserialize)]
 pub struct TestRequest {
@@ -524,6 +567,7 @@ pub async fn create_automation(
 
     let rule = input.rule(organization_id)?;
     let definition = rule.definition()?;
+    check_outbound_hosts(&state, &rule.actions).await?;
 
     let workflow = store::insert_workflow(
         state.db().pool(),
@@ -607,6 +651,7 @@ pub async fn update_automation(
 
     let rule = input.rule(existing.organization_id)?;
     let definition = rule.definition()?;
+    check_outbound_hosts(&state, &rule.actions).await?;
 
     let update = update_from_rule(&AutomationRule {
         id: existing.id,

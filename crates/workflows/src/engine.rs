@@ -596,11 +596,17 @@ async fn advance_step(
                     }
 
                     store::fail_step(pool, claimed.id, &message).await?;
+                    // A run that stops on a failure stops *there*: the steps after it are
+                    // closed as cancelled, exactly as a branch closes them. Without this the
+                    // run is not "stopped" at all — the next tick claims step N+1 and the
+                    // failure only shows up in the summary, which is the one thing a `stop`
+                    // policy is supposed to prevent.
+                    store::end_run_after_branch(pool, claimed.execution_id, claimed.id).await?;
                     tracing::warn!(
                         step_id = %claimed.id,
                         step = %claimed.name,
                         attempts = claimed.attempts,
-                        "a step ran out of attempts"
+                        "a step ran out of attempts and the run stopped there"
                     );
                     Ok(StepOutcome {
                         settled: settle_after_step(pool, claimed).await?,
@@ -617,11 +623,15 @@ async fn advance_step(
 /// Built per branch, not cached, because a run has at most 50 steps and a branch that reads
 /// a stale output is worse than one that reads a fresh query.
 async fn branch_scope(pool: &PgPool, execution_id: Uuid) -> Result<serde_json::Value> {
-    let event: Option<serde_json::Value> =
-        sqlx::query_scalar("select event_payload from workflow_executions where id = $1")
-            .bind(execution_id)
-            .fetch_optional(pool)
-            .await?;
+    // `coalesce` because sqlx decodes a *column* into `Value`, and a SQL NULL is not JSON
+    // null: without it a run with no payload — a manual run, a schedule — fails the branch
+    // with a decode error instead of evaluating the comparison.
+    let event: Option<serde_json::Value> = sqlx::query_scalar(
+        "select coalesce(event_payload, 'null'::jsonb) from workflow_executions where id = $1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await?;
 
     let rows: Vec<(i32, Option<serde_json::Value>)> = sqlx::query_as(
         "select step_no, output from workflow_steps \

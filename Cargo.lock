@@ -1303,6 +1303,7 @@ name = "omnion-automation"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "hmac",
  "omnion-audit",
  "omnion-content",
  "omnion-events",

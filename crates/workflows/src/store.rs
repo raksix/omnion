@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::definition::StepDefinition;
 use crate::error::{Result, WorkflowError};
 use crate::model::{
-    EXECUTION_COLUMNS, ExecutionStatus, NewWorkflow, STEP_COLUMNS, StepStatus, TriggerKind,
-    WORKFLOW_COLUMNS, Workflow, WorkflowExecution, WorkflowStep,
+    EXECUTION_COLUMNS, ExecutionStatus, NewWorkflow, STEP_COLUMNS, StepKind, StepStatus,
+    TriggerKind, WORKFLOW_COLUMNS, Workflow, WorkflowExecution, WorkflowStep,
 };
 
 /// Columns of `workflows` for one `select`, in [`Workflow`] order.
@@ -274,12 +274,23 @@ pub async fn create_execution_in(
 
     let mut rows = Vec::with_capacity(steps.len());
     for (index, step) in steps.iter().enumerate() {
+        // A control step's `action` is derived, not authored: the definition check already
+        // refused a branch that names an action and a stop that does not, and the panel
+        // writes `{"kind": "branch", "params": {…}}` with no `action` field at all. Storing
+        // `None` for one of those would trip `workflow_steps_action_shape`, which is the
+        // database doing exactly its job.
+        let action = match step.kind {
+            StepKind::Branch => Some(crate::branch::BRANCH_ACTION.to_owned()),
+            StepKind::Task => step.action.clone(),
+            StepKind::Wait | StepKind::Stop => None,
+        };
+
         let row: WorkflowStep = sqlx::query_as(&step_sql)
             .bind(execution.id)
             .bind(index as i32 + 1)
             .bind(step.name.trim())
             .bind(step.kind.as_str())
-            .bind(step.action.as_deref())
+            .bind(action)
             .bind(step.params.clone())
             .bind(step.on_error.as_str())
             .bind(step.timeout_ms)

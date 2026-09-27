@@ -27,6 +27,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use omnion_events::model::{EVENT_COLUMNS, Event};
+use omnion_workflows::OnError;
 use omnion_workflows::definition::StepDefinition;
 use omnion_workflows::store::{self, WorkflowUpdate};
 use omnion_workflows::{TriggerKind, Workflow, WorkflowExecution, engine};
@@ -375,6 +376,7 @@ mod tests {
             actions,
             hook_triggered: false,
             hook_configured: false,
+            on_error: OnError::Stop,
             trigger_count: 0,
             last_triggered_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
