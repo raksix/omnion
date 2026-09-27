@@ -1581,3 +1581,53 @@
 - **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
+
+## 2026-09-27 — REQ-125 · slice 1 · the secret key hierarchy, the rotation ceremony and its screen
+
+- **What.** The key ring (docs/requests/REQ-125, slice 1). `crates/secrets` is the pure half: an
+  installation root key is never stored by the platform, only *wrapped* by an operator-supplied
+  key-encryption key (`OMNION_KEY_ENCRYPTION_KEY`, or the file it names), and every sealed
+  version records the `key_id` that sealed it. `crates/secrets/src/store.rs` is the database
+  half, `apps/api/src/routes/secrets.rs` the surface
+  (`GET /secrets/root-key`, `POST /secrets/root-key/rotate`, the job's `GET`/`pause`/`resume`),
+  and `apps/api/src/secrets_runner.rs` the background walk. The panel gained
+  `/secrets/root-key`: the self-check, the ring, a three-step rotation wizard and a real
+  progress counter.
+- **The rule the design rests on.** Unsealing reads the version's *own* `key_id`, never the
+  active key — so a version the walk has not reached keeps resolving on the retired key, and a
+  rotation is an online ceremony rather than a maintenance window. The ceremony is ordered so a
+  crash cannot lose data: the replacement is generated and written *wrapped* while the old key
+  is still active, the old one steps down to `retiring`, the new one goes `active`, and only
+  then is the job row created. A flip whose job row was lost is repaired **on the read of the
+  ring** (`recover_missing_job`), not on a timer. `start_rotation` refuses outright when the
+  seal self-check is unhealthy, and `rewrap` fails closed — a wrong operator key can never
+  overwrite a stored envelope.
+- **Proof (Rust).** `cargo test --workspace` → **681 tests, 0 failures** (exit 0; +26 unit tests
+  in `omnion-secrets` and one end-to-end walk,
+  `apps/api/tests/secret_key_ring.rs::the_key_ring_and_its_rotation_are_proven_end_to_end`, which
+  unseals *the same stored envelope* before, during and after the walk, proves a wrong operator
+  key is refused with the ring left intact, drives pause/resume to a completed job, and greps
+  every response body for the fixture value and for `wrapped_key`/`seal_checksum`).
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`), with
+  `/secrets/root-key` in the route table and a Secrets entry in the navigation.
+- **Proof (QA).** `QA_STACK=w6 … bash scripts/qa/run.sh` → see the entry appended below once the
+  pass finishes; the new `secrets-root-key` run drives the sealed wizard, Escape, a real
+  rotation, the counter, pause and resume, and asserts the document carries no envelope.
+- **Three findings this tick cost time on, worth not repeating.** (1) Postgres `count(*)` is
+  `int8`; sqlx will not coerce it into an `i32`, so every count in this feature is cast in SQL
+  (`count(*)::int`). (2) `permissions_key_format` forbids underscores inside a key segment, so
+  `secrets.deploy_keys.read` is listed by the catalogue and rejected by the database — it is
+  `secrets.deploykeys.read`. (3) **The parallel waves all opened a `0019` migration and they all
+  share the `omnion` development database**, so `cargo test` failed with `VersionMismatch(19)`
+  on a migration this writer never ran; each worktree needs its own database (`omnion_w6_dev`,
+  following w5's precedent) or the suites cannot run at all in parallel.
+- **Blocker cleared, and a warning for the other six writers.** `/mnt/apopic` hit **100% (0 bytes
+  free)** mid-tick: the seven worktrees' cargo `target/` directories plus docker-data fill the
+  60 GB volume, and a full disk silently truncated `scripts/qa/walkthrough.cjs` to **0 bytes**
+  during a write (restored with `git checkout --`). The QA pass then died with `ENOSPC` while
+  writing screenshots. Reclaimed by deleting this worktree's own regenerable `target/` (7.8 GB
+  back); no other writer's files were touched. A periodic `target/` prune is needed before the
+  waves can all run at once.
+- **Next.** REQ-125 slice 2 — typed credential profiles with their per-kind validators, the slot
+  assignment model and its resolver, `/secrets/credentials` and `/secrets/slots`.
+

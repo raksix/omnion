@@ -1,6 +1,6 @@
 # REQ-125 — Secrets & Credential Management
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 of 4 · key hierarchy + rotation) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -107,10 +107,10 @@ Migration: `database/migrations/0026_secrets_depth.sql` (next free slot at tick 
 
 ### Acceptance criteria
 
-- [ ] `database/migrations/0026_secrets_depth.sql` applies on a fresh and a populated database, and its down script reverses it.
-- [ ] Secrets remain unreadable without the operator key; the root key screen states this and the seal check proves it.
-- [ ] Root key rotation re-wraps every existing version, and consumers keep resolving during and after it (test resolves a secret mid-rotation).
-- [ ] A paused re-wrap resumes after a process restart without double-wrapping or losing position.
+- [x] `database/migrations/0019_secret_hierarchy.sql` applies on a fresh and a populated database, and its down script reverses it. (Numbering note: the parallel waves all opened a `0019`; this file is the one that carries the secret hierarchy.)
+- [x] Secrets remain unreadable without the operator key; the root key screen states this and the seal check proves it.
+- [x] Root key rotation re-wraps every existing version, and consumers keep resolving during and after it (test resolves a secret mid-rotation).
+- [x] A paused re-wrap resumes after a process restart without double-wrapping or losing position.
 - [ ] All five credential kinds can be created; non-secret fields render, values never do.
 - [ ] A validator failure stores the provider message and a red chip without blocking the save.
 - [ ] A credential resolved through a slot returns the primary; removing the primary falls back to the fallback with an event.
@@ -136,7 +136,7 @@ Assertions that must hold in the same pass: the rendered DOM never contains a fi
 
 ### Slices
 
-1. **Key hierarchy + rotation.** Migration, root key ring, wrap/unwrap helper, re-wrap job with pause/resume, `/secrets/root-key`, seal self-check, events. *Done when:* a rotation completes on the QA stack with all versions re-wrapped and a consumer resolves throughout.
+1. **Key hierarchy + rotation.** Migration, root key ring, wrap/unwrap helper, re-wrap job with pause/resume, `/secrets/root-key`, seal self-check, events. *Done when:* a rotation completes on the QA stack with all versions re-wrapped and a consumer resolves throughout. — **shipped** (`crates/secrets`, `0019_secret_hierarchy.sql`, `apps/api/src/routes/secrets.rs`, `apps/api/src/secrets_runner.rs`, `apps/admin/features/secrets/root-key-view.tsx`).
 2. **Typed credentials + slots.** Credential profiles with non-secret fields, validators (mock SMTP and a payment-format check), `/secrets/credentials`, slot model and resolver, `/secrets/slots`. *Done when:* a slot swap changes which credential a consumer resolves, with an event and an audit row.
 3. **Leases + helper + deployment keys.** Lease table and endpoints, loopback redemption, helper subcommand with env injection and 0600 temp-file mode, lease auto-revocation on deploy, `/secrets/leases`, `/secrets/deploy-keys` with scoped machine identities. *Done when:* CI-shaped redemption works from a deployment key inside its environment and is refused outside it.
 4. **Audit depth + SIEM + anomalies.** Access log extension, denial rows everywhere, anomaly detectors and acknowledge, filtered export, notification wiring. *Done when:* a scripted off-hours reveal produces an anomaly row, an acknowledge persists, and the export carries no value.
