@@ -2983,3 +2983,161 @@ export function fetchIamPolicyVersions(
 ): Promise<{ policy_id: string; current_version: number; versions: IamPolicyVersion[] }> {
   return request(`/api/v1/iam/policies/${id}/versions`);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Permission requests and approvals (REQ-006, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/** One permission request, as the inbox shows it. */
+export type IamApprovalRequest = {
+  id: string;
+  organization_id: string;
+  permission_key: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  justification: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  requester: { id: string; email: string; name: string };
+  decided_by: { id: string; email: string | null } | null;
+  decided_at: string | null;
+  decision_note: string;
+  grant_minutes: number | null;
+  binding_id: string | null;
+  grant_expires_at: string | null;
+  grant_active: boolean;
+  created_at: string;
+};
+
+/** Counts behind the inbox tabs. */
+export type IamApprovalCounts = {
+  pending: number;
+  approved: number;
+  rejected: number;
+  expired: number;
+};
+
+/** The inbox: requests of the organization, newest first. */
+export function fetchIamApprovals(input: {
+  organizationId?: string | null;
+  status?: string;
+}): Promise<{ organization_id: string; requests: IamApprovalRequest[]; counts: IamApprovalCounts }> {
+  const params = new URLSearchParams();
+  if (input.organizationId) params.set("organization_id", input.organizationId);
+  if (input.status) params.set("status", input.status);
+  const query = params.toString();
+  return request(`/api/v1/iam/approvals${query ? `?${query}` : ""}`);
+}
+
+/** Approve (with a window) or reject a request. */
+export function decideIamApproval(
+  id: string,
+  input: { decision: "approve" | "reject"; grantMinutes?: number; note?: string },
+): Promise<IamApprovalRequest> {
+  return request(`/api/v1/iam/approvals/${id}/decide`, {
+    method: "POST",
+    body: JSON.stringify({
+      decision: input.decision,
+      ...(input.grantMinutes ? { grant_minutes: input.grantMinutes } : {}),
+      note: input.note ?? "",
+    }),
+  });
+}
+
+/** Ask for a permission (any signed-in account may ask for itself). */
+export function createIamRequest(input: {
+  permissionKey: string;
+  justification?: string;
+  resourceType?: string | null;
+  resourceId?: string | null;
+  organizationId?: string | null;
+}): Promise<IamApprovalRequest> {
+  return request("/api/v1/iam/requests", {
+    method: "POST",
+    body: JSON.stringify({
+      permission_key: input.permissionKey,
+      justification: input.justification ?? "",
+      resource_type: input.resourceType ?? null,
+      resource_id: input.resourceId ?? null,
+      ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+    }),
+  });
+}
+
+/** The caller's own requests. */
+export function fetchMyIamRequests(
+  organizationId?: string | null,
+): Promise<{ organization_id: string; requests: IamApprovalRequest[] }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request(`/api/v1/iam/requests${query}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCIM provisioning (REQ-006, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/** One provisioning token; the secret is only ever returned at minting. */
+export type IamProvisioningToken = {
+  id: string;
+  organization_id: string;
+  name: string;
+  prefix: string;
+  created_by: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+};
+
+/** One line of the SCIM sync log. */
+export type IamSyncLogEntry = {
+  id: number;
+  organization_id: string;
+  direction: string;
+  resource: string;
+  external_id: string | null;
+  entity_id: string | null;
+  action: string;
+  outcome: string;
+  detail: string;
+  created_at: string;
+};
+
+/** The organization's provisioning tokens. */
+export function fetchIamProvisioningTokens(
+  organizationId?: string | null,
+): Promise<{ organization_id: string; tokens: IamProvisioningToken[] }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request(`/api/v1/iam/provisioning/tokens${query}`);
+}
+
+/** Mint a token; `secret` is shown once and never stored in readable form. */
+export function createIamProvisioningToken(input: {
+  name?: string;
+  organizationId?: string | null;
+}): Promise<{ token: IamProvisioningToken; secret: string }> {
+  return request("/api/v1/iam/provisioning/tokens", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name ?? "",
+      ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+    }),
+  });
+}
+
+/** Revoke a token. */
+export function revokeIamProvisioningToken(
+  id: string,
+): Promise<{ revoked: boolean; token: IamProvisioningToken | null }> {
+  return request(`/api/v1/iam/provisioning/tokens/${id}`, { method: "DELETE" });
+}
+
+/** The sync log, newest first. */
+export function fetchIamProvisioningLog(input: {
+  organizationId?: string | null;
+  limit?: number;
+}): Promise<{ organization_id: string; log: IamSyncLogEntry[] }> {
+  const params = new URLSearchParams();
+  if (input.organizationId) params.set("organization_id", input.organizationId);
+  if (input.limit) params.set("limit", String(input.limit));
+  const query = params.toString();
+  return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
+}
