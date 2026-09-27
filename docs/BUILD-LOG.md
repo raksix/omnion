@@ -1521,3 +1521,63 @@
 - **Next.** REQ-006 slice 4 — enterprise sign-in (OIDC/OAuth2/SAML with JIT + claim mapping), SCIM
   provisioning, the ABAC policy builder + dry run, permission requests/approvals and the safety
   invariants.
+
+## 2026-09-27 — REQ-006 · slice 4a · the ABAC policy engine, the builder and the safety invariants
+
+- **What.** Policies are real and they change decisions. `crates/policy-engine` is the pure half —
+  a condition tree (`all`/`any`/`not` plus leaves of attribute → operator → value), seven operators
+  (`==`, `!=`, `>`, `<`, `in`, `starts_with`, `contains`), `*` wildcard target patterns, the
+  missing-attribute-reads-as-null rule and the decision rule (highest priority first, equal
+  priorities resolve to deny, disabled decides nothing). `crates/permissions` gained `policies`
+  (CRUD + a version row on every save + the attribute merge + the overlay) and `invariants` (the
+  two refusals that protect a last owner and the caller's own last privileged binding).
+  `evaluate::authorize_subject` — the one decision path the guard, the effective-permissions screen
+  and the simulator share — now resolves RBAC and then hands the answer to `policies::apply`, so a
+  deny policy takes away what RBAC granted, an allow policy grants what RBAC never gave, and the
+  `403` reports the policy by name in `details.source.policy`. The API gained
+  `/api/v1/iam/policies` (+ `/{id}`, `/versions`, `/test`) where the dry run writes nothing and
+  accepts an unsaved draft; the panel gained `/settings/iam/policies` — condition rows with
+  ALL/ANY and NOT, a JSON view for trees the rows cannot express, the THEN block, the dry run with
+  its highlighted leaves and the version history.
+- **The invariants count scope classes, not "the organization".** The first attempt counted every
+  live privileged binding whose `organization_id` matched — and the platform Owner's binding is
+  GLOBAL (`seed::bind_owner`), so on a shared development database the count matched every global
+  owner binding in the database and the refusal never fired. Fixed by keying the count on the
+  binding's own class: an organization-scoped binding is defended by its organization
+  (`organization_id = $org`), a global one by the other global ones (`scope_type = 'global'`), and
+  the self-lockout rule is checked first because it is the actionable sentence when both apply.
+- **Proof (Rust).** `cargo test --workspace` → **653 tests, 0 failures** (exit 0; +23 on this
+  slice: 14 policy-engine units, 6 overlay/attribute/validation units, 2 invariant units, and
+  `apps/api/tests/iam_policy.rs::abac_policies_and_the_safety_invariants_are_proven_end_to_end`,
+  which drives the slice over the real router: the member without `iam.policies.read` is refused,
+  the deny policy removes `users.read` from the Owner (403, `reason=policy_denied`, the policy
+  named in `details.source.policy`, and the simulator agreeing), the allow policy grants the same
+  permission to a member whose RBAC set provably does not carry it, priority 900 takes it back,
+  disabling the deny returns the allow, the history reads three versions back, the dry run reports
+  a satisfied leaf with its resolved value (and the opposite when the path does not match), the
+  four `invalid_policy` refusals answer `400`, and the invariants answer `self_lockout` then
+  `last_owner_binding` then let an ordinary revocation through — with the audit trail and the
+  `iam.policy_changed` events read back).
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`), with
+  `/settings/iam/policies` in the route table.
+- **Proof (QA).** `bash scripts/qa/run.sh` → `qa-artifacts/20260927-112459`: **772 clicks, 803
+  screenshots, 5 findings (0 high** — the five carried-forward public-renderer 404s**)**, vision
+  review 0 issues / 0 failures, `Refusals provoked on purpose — 2`. The pass's new `iam-policies`
+  run reads: builder filled (1 target chip, 1 condition row) → dry run `APPLIES (deny)` with 1
+  matched leaf → saved (0 → 1 rows, 2 versions) → delete armed then gone, back to the start state →
+  the out-of-range priority refused in the field. The route is walked on desktop and mobile
+  (`page-iam-policies`, `page-iam-policy-{editor,test,history,refusal}`, `mobile-iam-policies`).
+- **Two defects the QA pass caught, both fixed in this tick.** (1) The condition rows took their
+  ids from a module-level counter, so the server rendered them with different ids than the client —
+  React refused to patch the tree (a hydration error, 20 console errors, plus the dev overlay's own
+  Reload/Back buttons that the walk then timed out on). The row the editor opens with now carries a
+  constant id and only rows the reader adds use a counter (they exist on the client alone); the same
+  pass had flagged four inputs without a label, and the five standalone controls gained
+  `aria-label`s. (2) The generic clicker types junk into every textarea, and the JSON view's parse
+  escaped out of a render (`SyntaxError`); both JSON paths now refuse in the field — the draft
+  falls back to the rows and says the JSON does not parse, the toggle keeps the reader in the JSON
+  view with the reason. An adversarial probe (junk in the attributes, junk in the JSON view, Test
+  in both states, save) reports zero console errors. A second full pass after the fixes: 0 high.
+- **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
+  and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
+  requests/approvals as time-boxed bindings.

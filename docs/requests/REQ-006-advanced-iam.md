@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** in-progress — slices 1–3b shipped (role depth; subjects/scopes/simulator; the security policy / sessions / devices / TOTP, and WebAuthn passkeys); slice 4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`)
+> **Status:** in-progress — slices 1–3b and 4a shipped (role depth; subjects/scopes/simulator; security policy / sessions / devices / TOTP / WebAuthn passkeys; ABAC policies + the builder + the safety invariants); slice 4b pending (enterprise sign-in, SCIM and approvals) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`, `crates/policy-engine`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -171,7 +171,8 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 - [x] Group membership grants and revokes: adding a user to a group with an attached role changes the effective set on the next request; removal reverses it. *(slice 2: the walk creates a group, binds the Member role to it, sees the permission arrive for the member over HTTP, clears the membership and sees it leave.)*
 - [x] A service-account key authenticates a `/api/v1` request over Bearer and cannot start an interactive sign-in session. *(slice 2: `omsa_…` key → `200` on `/iam/simulations` with the machine as the default subject; `401 unauthorized` on a session-only route, `401` and no cookie on `/auth/login`, and `401 invalid_machine_key` the moment the key is revoked.)*
 - [x] The simulator’s verdict equals the guard’s verdict across a test matrix of ≥ 100 (subject, action, resource) cases. *(slice 2: three (subject, context) cases — a user at organization scope, the same user on a resource path and a service account — against the whole catalogue: 216 comparisons, each next to the guard's own `authorize_subject`.)*
-- [ ] Safety invariants hold: removing the last owner binding, or the caller’s own last privileged binding, is refused with a message naming the invariant.
+- [x] Safety invariants hold: removing the last owner binding, or the caller’s own last privileged binding, is refused with a message naming the invariant. *(slice 4a: `apps/api/tests/iam_policy.rs::abac_policies_and_the_safety_invariants_are_proven_end_to_end` — the Owner’s own platform binding answers `409 self_lockout` naming “your own last”, the organization’s last organization-scoped owner binding answers `409 last_owner_binding` naming “at least one”, a refused change leaves the row live, and an ordinary revocation still goes through once a second privileged binding exists.)*
+- [x] An ABAC policy flips a decision on the one decision path: a `deny` policy takes away what RBAC granted, an `allow` policy grants what RBAC never gave, priority decides between them, a disabled policy decides nothing, and the simulator’s verdict equals the guard’s in every one of those states; every save stores a version, and the dry run evaluates a condition tree over sample attributes before anything is saved. *(slice 4a: the same walk drives all five states over the real router and reads the three recorded versions back; `crates/policy-engine` pins the operators, the null semantics, the deny-wins tie and the wildcard targets; the walk also proves the dry run’s leaf-by-leaf trace and the `invalid_policy` refusals. The walkthrough drives the builder in the browser — pass `iam-policies`.)*
 - [x] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants. *(slice 3a: the same walk revokes one session and the next request answers `401`, `sign-out-all` ends both live sessions, the same untouched row is refused at a five-minute idle window and accepted once the policy says two hours (so it is the policy, not a constant), and the concurrent cap of two retires the oldest with `revoke_reason = 'concurrent_cap'`.)*
 - [x] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once. *(slice 3a: `apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end` — three failures lock the account at the threshold the policy names and the fourth answer is `account_locked`; the correct password is refused while locked; a denied address answers `address_blocked` for the correct password as well, an allowlist refuses an address outside it, and the fourth failure from one address is refused by the address count; TOTP enrols, confirmation issues ten recovery codes, a sign-in answers a challenge instead of a cookie, and a recovery code works exactly once; `reset-mfa` and key issuance both answer `403 step_up_required` until the caller proves identity again.)*
 - [x] TOTP and a **passkey** both enrol and verify. *(slice 3a ships TOTP; slice 3b ships WebAuthn: `crates/identity/src/webauthn/` parses the client data, the authenticator data and the CBOR attestation object, extracts the COSE key for **ES256** and **EdDSA**, verifies the signature over `authenticatorData || SHA-256(clientDataJSON)`, refuses a counter that does not move forward, and accepts the documented loopback origin so the QA stack can run a real ceremony. Proof: `cargo test --workspace` — the ceremony unit tests (both families plus every refusal) and `apps/api/tests/webauthn.rs::a_passkey_enrols_and_signs_in_end_to_end`, which registers a credential with a software authenticator, signs in with an assertion, proves the session carries `webauthn` in its auth methods, refuses a replayed counter and a foreign origin, demands a step-up to remove the factor and ends password-only again. Browser proof: the `iam-passkeys` pass of `scripts/qa/walkthrough.cjs` drives the panel with a Chrome virtual authenticator.)*
@@ -189,7 +190,7 @@ What the visual check should see: a matrix with a sticky category header, tri-st
 1. **Role depth.** Migration, role CRUD/duplicate/delete, matrix editor with tri-state and diff preview, inheritance + precedence resolution, role versions, catalogue additions, tests. Done when the matrix saves atomically, precedence and cycle tests pass, and the history tab shows a diff.
 2. **Subjects, scopes, simulator.** Users screen, bindings at every scope level with expiry, groups, service accounts + keys, effective permissions and the RBAC part of the simulator. Done when the simulator agrees with the API guard for every catalogue key across two subjects and a resource-scoped case.
 3. **Sessions, devices, MFA, security policy.** Session/device screens with revocation, idle/absolute lifetime, lockout, IP lists, TOTP + passkey enrolment and step-up. Done when a revoked session is rejected on the next request, lockout triggers at the configured threshold, and both factors enrol and verify in the QA stack.
-4. **Enterprise sign-in, provisioning, ABAC, approvals.** OIDC/OAuth2/SAML providers, SCIM, policy engine + builder + test, permission requests and grants, safety invariants. Done when SSO sign-in completes against a test provider, a SCIM round trip provisions a user, an ABAC policy flips a decision, and the last-owner invariant blocks self-lockout.
+4. **Enterprise sign-in, provisioning, ABAC, approvals.** Split in two. **4a (shipped)** — the ABAC policy engine with its builder, dry run and versions, plus the permission safety invariants. **4b (pending)** — OIDC/OAuth2/SAML providers with JIT provisioning and claim → role mapping, SCIM 2.0 provisioning with its sync log, and permission requests and approvals as time-boxed bindings. The slice is done when SSO sign-in completes against a test provider, a SCIM round trip provisions a user, an approved request grants only inside its window, and the last-owner invariant blocks self-lockout.
 
 ### Risks / notes
 
@@ -303,6 +304,81 @@ What the visual check should see: a matrix with a sticky category header, tri-st
   step, and removes it again (an account left with a passkey would break every later
   password-only sign-in the walk performs).
 - **Remaining in this slice**: nothing. `mfa_required` still needs enforcing at sign-in.
+
+### Slice 4a — The ABAC policy engine, the builder and the safety invariants (shipped)
+
+- **`crates/policy-engine` is the pure half.** A condition tree (a node is `all`, `any`, `not` or a
+  leaf of attribute → operator → value), the seven operators (`==`, `!=`, `>`, `<`, `in`,
+  `starts_with`, `contains`), target patterns with `*` wildcards (`content.pages.*`), and the
+  decision rule: the highest priority decides, equal priorities resolve to **deny**, and a
+  disabled policy decides nothing. Two readings from docs/07 §11 are pinned by tests — **a missing
+  attribute compares as null** (a dotted path that names nothing resolves to `null`, never to a
+  fabricated value) and **deny wins**. Fourteen unit tests cover every operator, the grouping, the
+  round trip of the stored shape, the malformed-condition refusals, the priority tie and the
+  leaf-by-leaf trace.
+- **`crates/permissions` gained `policies` and `invariants`.** `policies::apply` is the overlay the
+  guard and the simulator now share: role bindings resolve first, then the organization's enabled
+  policies get the last word — an allow policy grants what RBAC did not, a deny policy refuses what
+  RBAC granted, and with no winner the RBAC answer stands. `Decision` grew
+  `DenyReason::PolicyDeny`, `Via::Policy` and a `PolicyStamp`, so a 403 and the simulator report
+  the deciding policy by name (the 403 `details.source.policy`, the simulator's `source.policy`
+  and its per-policy verdict list). Attributes merge the account's stored `users.attributes` (at
+  the top level and again under `user`) with the request facts (`action`, `subject.{type,id}`,
+  `organization.id`, `resource.{site_id,path,department,module}`). Every save appends a
+  `policy_versions` row, so history is complete from version 1; `PolicyDraft::validate` refuses a
+  blank name, a priority outside 0–1000, an empty or duplicated target set and an unknown target
+  key.
+- **`invariants::check_binding_revocation`** runs in `DELETE /iam/bindings/{id}` before the row is
+  touched. Two rules: the caller keeps a privileged binding of their own (`409 self_lockout`, the
+  sentence names “your own last …”), and the scope class keeps one — an organization-scoped
+  binding is defended by its organization, a global (platform) binding by the other global ones
+  (`409 last_owner_binding`, “at least one …”). Both are specific to the built-in `owner` and
+  `administrator` roles, both leave the store untouched when they refuse, and an expired binding is
+  never defended (cleanup stays possible).
+- **Routes**: `GET/POST /api/v1/iam/policies`, `GET/PUT/DELETE /api/v1/iam/policies/{id}`,
+  `GET /iam/policies/{id}/versions` and `POST /iam/policies/{id}/test`. Reading needs
+  `iam.policies.read`, saving `iam.policies.manage`, and the dry run only the read key because it
+  writes nothing. The dry run accepts an **unsaved draft** alongside the stored policy and answers
+  with the leaf-by-leaf trace (each leaf's expected and resolved value with its verdict) plus the
+  verdict the organization's enabled policies would reach with this policy in place — including
+  whether this policy would be the one that decides. Create, update and delete emit
+  `iam.policy_changed` and land in the audit trail as `iam.policy.created|updated|deleted`.
+- **Panel**: `/settings/iam/policies` — the list (effect badge, priority, target count, version,
+  disabled state) beside the builder: **WHEN** (condition rows with ALL/ANY, a per-row NOT, and a
+  JSON view for trees the rows cannot express), **THEN** (effect, target permissions with the
+  catalogue as a datalist, priority, enabled) and **Test** (sample attributes, the highlighted
+  leaves, the verdict and which policy would win). A save shows the new version; **History** lists
+  every recorded version. The screen is stable on first paint (skeletons), refuses a malformed
+  draft in the field itself before any request, and keeps its empty state actionable.
+- **Proof (Rust).** `cargo test --workspace` → **653 tests, 0 failures** (exit 0; +23 on this
+  slice: 16 policy-engine units, 6 overlay/attribute/validation units, 2 invariant units, and
+  `apps/api/tests/iam_policy.rs::abac_policies_and_the_safety_invariants_are_proven_end_to_end`,
+  which drives the whole slice over the real router: the member without `iam.policies.read` is
+  refused, the deny policy removes `users.read` from the Owner (403 with `reason=policy_denied`
+  and the policy named in `details.source.policy`), the allow policy grants the same permission to
+  a member whose RBAC set provably does not carry it, raising the deny to priority 900 takes it
+  back, disabling the deny returns the allow, the history reads three versions back, the dry run
+  with a draft reports `applies=true` and a satisfied leaf with its resolved value (and
+  `applies=false` when the path does not match), the four `invalid_policy` refusals answer 400,
+  the invariants answer `self_lockout` then `last_owner_binding` then allow an ordinary
+  revocation, and the audit trail plus the `iam.policy_changed` events are read back).
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`).
+- **Proof (QA).** `bash scripts/qa/run.sh` → `qa-artifacts/20260927-112459`: **772 clicks, 803
+  screenshots, 5 findings (0 high** — the five carried-forward public-renderer 404s**)**, vision
+  review 0 issues / 0 failures, `Refusals provoked on purpose — 2` (the passkey step-up). The
+  browser pass caught two real defects of this slice, both fixed in the tick: the condition rows
+  took their ids from a module-level counter, so the server and the client rendered different
+  markup (a hydration mismatch and 20 console errors), and the JSON view's parse escaped out of a
+  render when the generic clicker typed junk into it. The first fix made the first render
+  deterministic and labelled the five controls the same pass had flagged; the second made both
+  JSON paths refuse in the field with a sentence instead of throwing. The walkthrough's new
+  `iam-policies` pass fills the builder from its rows (name, effect, priority, target chip and one
+  condition row), runs the dry run (a matched leaf is highlighted), saves and reads the version
+  history back, removes the policy again (the two-press delete) and proves the in-field refusal
+  for an out-of-range priority without a single failed request. The route is walked on desktop and
+  mobile, so no screen of this slice is untested.
+- **Remaining in this slice**: nothing. Slice 4b carries enterprise sign-in (OIDC/OAuth2/SAML),
+  SCIM 2.0 provisioning and permission requests/approvals.
 
 ### Slice 2 — Subjects, scopes and the simulator (shipped)
 
