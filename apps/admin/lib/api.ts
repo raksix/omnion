@@ -2820,3 +2820,166 @@ export function stepUpSession(input: {
     }),
   });
 }
+
+/**
+ * ABAC policies (REQ-006, slice 4a): the condition tree, the THEN block and the dry run.
+ *
+ * A policy is evaluated after the roles have had their say — an `allow` policy can grant what
+ * RBAC did not, a `deny` policy takes away what RBAC granted, and the highest priority decides
+ * first (equal priorities resolve to deny).
+ */
+export type IamPolicy = {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string;
+  effect: "allow" | "deny";
+  priority: number;
+  conditions: unknown;
+  target_permissions: string[];
+  enabled: boolean;
+  version: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** What a create or update carries. */
+export type IamPolicyInput = {
+  name: string;
+  description?: string;
+  effect: "allow" | "deny";
+  priority: number;
+  conditions: unknown;
+  target_permissions: string[];
+  enabled: boolean;
+  organizationId?: string | null;
+};
+
+/** One leaf of the condition tree, as the dry run evaluated it. */
+export type IamPolicyLeafTrace = {
+  path: string;
+  attribute: string;
+  operator: string;
+  expected: unknown;
+  resolved: unknown;
+  satisfied: boolean;
+};
+
+/** The dry run's answer. */
+export type IamPolicyTest = {
+  policy_id: string;
+  policy_name: string;
+  permission: string;
+  draft: boolean;
+  enabled: boolean;
+  targeted: boolean;
+  conditions_satisfied: boolean;
+  applies: boolean;
+  effect: "allow" | "deny";
+  decides: boolean;
+  decision: {
+    effect: "allow" | "deny";
+    policy_id: string;
+    policy_name: string;
+    priority: number;
+  } | null;
+  trace: IamPolicyLeafTrace[];
+  attributes: Record<string, unknown>;
+  note: string;
+};
+
+/** One recorded policy version. */
+export type IamPolicyVersion = {
+  version: number;
+  effect: "allow" | "deny";
+  priority: number;
+  conditions: unknown;
+  target_permissions: string[];
+  enabled: boolean;
+  created_at: string;
+  changed_by: string | null;
+};
+
+/** List the organization's policies. */
+export function fetchIamPolicies(
+  organizationId?: string | null,
+): Promise<{ organization_id: string; policies: IamPolicy[] }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request(`/api/v1/iam/policies${query}`);
+}
+
+/** Create a policy. */
+export function createIamPolicy(input: IamPolicyInput): Promise<IamPolicy> {
+  return request("/api/v1/iam/policies", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      description: input.description ?? "",
+      effect: input.effect,
+      priority: input.priority,
+      conditions: input.conditions,
+      target_permissions: input.target_permissions,
+      enabled: input.enabled,
+      ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+    }),
+  });
+}
+
+/** Save a policy (the version moves forward). */
+export function updateIamPolicy(id: string, input: IamPolicyInput): Promise<IamPolicy> {
+  return request(`/api/v1/iam/policies/${id}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      name: input.name,
+      description: input.description ?? "",
+      effect: input.effect,
+      priority: input.priority,
+      conditions: input.conditions,
+      target_permissions: input.target_permissions,
+      enabled: input.enabled,
+    }),
+  });
+}
+
+/** Remove a policy. */
+export function deleteIamPolicy(id: string): Promise<{ deleted: boolean }> {
+  return request(`/api/v1/iam/policies/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Dry run: what would this policy do, and would it decide?
+ *
+ * Nothing is written; `policy` may carry an unsaved draft so the builder can test before saving.
+ */
+export function testIamPolicy(
+  id: string,
+  input: { permission: string; attributes: Record<string, unknown>; policy?: IamPolicyInput },
+): Promise<IamPolicyTest> {
+  return request(`/api/v1/iam/policies/${id}/test`, {
+    method: "POST",
+    body: JSON.stringify({
+      permission: input.permission,
+      attributes: input.attributes,
+      ...(input.policy
+        ? {
+            policy: {
+              name: input.policy.name,
+              description: input.policy.description ?? "",
+              effect: input.policy.effect,
+              priority: input.policy.priority,
+              conditions: input.policy.conditions,
+              target_permissions: input.policy.target_permissions,
+              enabled: input.policy.enabled,
+            },
+          }
+        : {}),
+    }),
+  });
+}
+
+/** The recorded versions of a policy, newest first. */
+export function fetchIamPolicyVersions(
+  id: string,
+): Promise<{ policy_id: string; current_version: number; versions: IamPolicyVersion[] }> {
+  return request(`/api/v1/iam/policies/${id}/versions`);
+}
