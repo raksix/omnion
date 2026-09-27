@@ -268,22 +268,30 @@ export function AiView() {
     let cancelled = false;
     setError(null);
 
-    Promise.all([fetchAiProviders(), fetchAiModels()])
-      .then(([loadedProviders, loadedModels]) => {
-        if (!cancelled) {
-          setProviders(loadedProviders);
-          setModels(loadedModels);
-        }
-      })
-      .catch((cause: unknown) => {
+    // The three calls settle independently on purpose: a provider list that fails must not take
+    // the model registry and the form's protocol vocabulary down with it.
+    Promise.allSettled([fetchAiProviders(), fetchAiModels(), fetchAiProtocols()])
+      .then((results) => {
         if (cancelled) {
           return;
         }
-        setProviders(null);
-        setModels(null);
-        setError(
-          cause instanceof ApiError ? cause.message : "The AI Hub could not be loaded.",
-        );
+
+        const [providersResult, modelsResult, protocolsResult] = results;
+        setProviders(providersResult.status === "fulfilled" ? providersResult.value : null);
+        setModels(modelsResult.status === "fulfilled" ? modelsResult.value : null);
+        if (protocolsResult.status === "fulfilled") {
+          setProtocols(protocolsResult.value.protocols);
+          setBounds(protocolsResult.value.bounds);
+        }
+
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure && failure.status === "rejected") {
+          setError(
+            failure.reason instanceof ApiError
+              ? failure.reason.message
+              : "The AI Hub could not be loaded.",
+          );
+        }
       });
 
     return () => {
@@ -436,7 +444,19 @@ export function AiView() {
       protocol: "openai_compatible",
       note: "Chat completions with a bearer key; the default for local servers.",
       chat_path: "/chat/completions",
-      auth: "Authorization: Bearer <key>",
+      auth: "Authorization: Bearer with the stored key",
+    },
+    {
+      protocol: "anthropic_messages",
+      note: "The messages wire shape: a system block outside the conversation, token counts under input/output names.",
+      chat_path: "/messages",
+      auth: "x-api-key plus an anthropic-version header",
+    },
+    {
+      protocol: "google_gemini",
+      note: "generateContent: contents with roles user/model, usage under usageMetadata.",
+      chat_path: "/models/{model}:generateContent",
+      auth: "x-goog-api-key",
     },
   ];
   const selectedProtocol = protocolOptions.find((option) => option.protocol === protocol);
