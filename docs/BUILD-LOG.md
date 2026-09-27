@@ -1698,3 +1698,64 @@
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
+
+- **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
+  that proves both. **`61ef619`** — `crates/identity/src/sso/provisioning.rs` (JIT: match on the
+  stored subject index first, the address second, `JIT_PASSWORD_MARKER` in place of a password,
+  and a *refusal* rather than a silent row when provisioning is off); the identity HTTP client
+  grows the two calls the `code` flow needs; `/api/v1/iam/providers` (list, connect, patch, remove,
+  `…/test` for the discovery check, `…/events` for the sign-in log); and `/api/v1/auth/sso`
+  (the public `providers` list, `start`, the generated SAML panel page, and the `callback` that
+  answers both a `code` query and a posted assertion). **`f599c3c`** — `/settings/iam/authentication`,
+  the nav entry, the API client and the `iam-authentication` pass in `scripts/qa/walkthrough.cjs`.
+  **`apps/api/tests/sso.rs`** — the integration walk.
+- **Proof.** `cargo test -p omnion-identity --lib` → **107 tests, 0 failures**. `cargo test -p
+  omnion-api --lib` → **97 tests, 0 failures**. `cargo test -p omnion-api --test sso` → **1 walk,
+  0 failures** over the real router: the management surface (401 without a session, an empty
+  organization listing no provider and three kinds), a provider created **switched off with JIT
+  off**, the secret answered as a *name* plus a boolean (`secret_present: false` for a variable
+  this process does not define) and no `client_secret` field anywhere in the payload, a bad
+  `secret_ref` refused with `details.field = secret_ref`, an unreadable role mapping refused at save
+  time, the discovery test answering `200 {status: "failed", detail: …}` for an unreachable host, a
+  disabled provider `404 provider_disabled` **and written to the sign-in log**, JIT refusing then
+  provisioning the same identity to `Created` with the marker in `password_hash` and the subject
+  indexed under `sso_subjects`, the second sign-in `Existing` on the same account, a deactivated
+  account staying deactivated, the event log readable over HTTP, removal taking the log with it
+  (`on delete cascade`), and an ambiguous host answered `501 organization_required` rather than
+  guessed.
+- **The two design decisions this tick actually settled.** (1) **A public sign-in has to resolve
+  its own organization.** My first version took "the installation's only organization", which is
+  right for a first-run install and *silently wrong* for a second tenant — a sign-in link for one
+  organization could complete against another. The walk caught it by creating a second organization.
+  It now follows the same rule the public content surface uses: the browser's own host answers for
+  its site, and a site belongs to an organization; several organizations and an unknown host is an
+  honest `501` naming the fix. (2) **A refusal is a fact, not a silence.** A disabled provider
+  refusing to start wrote nothing, so an operator who switched a provider off and then wondered
+  "is anybody still trying to sign in with it?" had no way to find out. `live_provider` now writes
+  the `auth_provider_events` row before refusing.
+- **Two test-authoring bugs the walk caught in itself, both worth naming.** A group claim is only
+  read when the provider *names* one, so a test provider with `group_claim: None` proved nothing
+  about groups — the fixture was wrong, not the code. And a test fixture that registers a globally
+  unique host has to clear a stale one first, or the second run fails on the first run's leftovers.
+- **The disk is still the constraint, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` (one 60 GB loop image shared by eight worktrees' `target/`) fell to **3.1 GB free**
+  during this tick. Reclamation stayed conservative and derived-only: `target/debug/{deps,
+  incremental,build}` in the **unclaimed** `omnion-w5` and `omnion-w7` worktrees, neither of which
+  had a live `cargo`/`rustc`; no source, no branch, no running process touched. That returned
+  17 GB. **Owner action:** the box needs more room, or the unclaimed `omnion-w4`…`omnion-w7`
+  worktrees should be pruned — no wave owns them yet.
+- **A note on where the walk runs.** The shared dev database `omnion` has migration **19** applied
+  from a sibling branch that `main` does not have, so `db.migrate()` refuses with
+  `VersionMissing(19)` and every integration test that migrates fails there. CI starts a clean
+  database and is unaffected. The walk was proven against a fresh `omnion_sso_test` database.
+  **Owner action:** either reconcile the 0019 slot between the waves, or point the local
+  integration runs at a per-branch database.
+- **Next.** The one thing the walk deliberately does not fake: a **full round trip against a live
+  OIDC/SAML provider**. That needs a local stub identity server the walk can point at — discovery
+  document, JWKS, token endpoint and a signed ID token for OIDC; a signed assertion with the
+  enveloped digest for SAML — so the `code` exchange, the RS256 verification, the PKCE binding and
+  the claim → role mapping are all proven end to end rather than one layer at a time. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.

@@ -25,7 +25,7 @@
 use axum::Json;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, USER_AGENT};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
@@ -125,9 +125,10 @@ pub struct SamlForm {
 /// rendered a provider's configuration would be leaking it to anybody who can reach `/login`.
 pub async fn list_providers(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<SsoQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let organization_id = default_organization(state.db().pool()).await?;
+    let organization_id = organization_for_request(state.db().pool(), &headers).await?;
     let list = providers::list_enabled(state.db().pool(), organization_id).await?;
 
     let rows = list
@@ -158,11 +159,20 @@ pub async fn list_providers(
 pub async fn start(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    headers: HeaderMap,
+    client: ClientAddress,
     Query(query): Query<SsoQuery>,
 ) -> Result<Response, ApiError> {
     let pool = state.db().pool();
-    let organization_id = default_organization(pool).await?;
-    let provider = live_provider(pool, organization_id, &slug).await?;
+    let organization_id = organization_for_request(pool, &headers).await?;
+    let provider = live_provider(
+        pool,
+        organization_id,
+        &slug,
+        client.as_text(),
+        user_agent(&headers),
+    )
+    .await?;
 
     let return_to = sanitize_return_to(query.return_to.as_deref());
     let flow = oidc::flow_of(provider.kind);
@@ -267,7 +277,7 @@ pub async fn callback(
     client: ClientAddress,
 ) -> Result<Response, ApiError> {
     let pool = state.db().pool();
-    let organization_id = default_organization(pool).await?;
+    let organization_id = organization_for_request(pool, &headers).await?;
     let provider = providers::find_provider_by_slug(pool, organization_id, &slug)
         .await?
         .ok_or_else(provider_unknown)?;
@@ -354,7 +364,7 @@ pub async fn saml_callback(
     Form(form): Form<SamlForm>,
 ) -> Result<Response, ApiError> {
     let pool = state.db().pool();
-    let organization_id = default_organization(pool).await?;
+    let organization_id = organization_for_request(pool, &headers).await?;
     let provider = providers::find_provider_by_slug(pool, organization_id, &slug)
         .await?
         .ok_or_else(provider_unknown)?;
@@ -936,38 +946,102 @@ async fn grant(
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// The installation's single organization, or an honest refusal.
-async fn default_organization(pool: &PgPool) -> Result<Uuid, ApiError> {
-    let ids = sqlx::query_scalar::<_, Uuid>("select id from organizations order by created_at limit 2")
-        .fetch_all(pool)
-        .await
-        .map_err(|error| ApiError::from(omnion_identity::IdentityError::Database(error)))?;
-    match ids.as_slice() {
+/// The organization a public sign-in is addressed to.
+///
+/// A sign-in has no session, so there is no caller's organization to read. The resolution is the
+/// same one the public content surface uses (`crate::routes::public::resolve_site`): the browser's
+/// own host answers for its site, and a site belongs to an organization. A single-organization
+/// installation — the first-run case and every QA stack — needs no host at all.
+///
+/// What it must never do is *guess*: with several organizations and no way to tell them apart, a
+/// guess would let a sign-in link for one tenant complete against another. So the answer is an
+/// honest `501` naming the fix (register a domain), not a coin toss.
+async fn organization_for_request(
+    pool: &PgPool,
+    headers: &HeaderMap,
+) -> Result<Uuid, ApiError> {
+    let organizations = sqlx::query_scalar::<_, Uuid>(
+        "select id from organizations order by created_at limit 2",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| ApiError::from(omnion_identity::IdentityError::Database(error)))?;
+
+    match organizations.as_slice() {
         [only] => Ok(*only),
         [] => Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_organization",
             "this installation has no organization yet",
         )),
-        _ => Err(ApiError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "organization_required",
-            "this installation holds several organizations; address a sign-in to one of its own \
-             hostnames",
-        )),
+        // Several organizations: the host decides, exactly as it does for a rendered page.
+        _ => {
+            let host = headers
+                .get("x-forwarded-host")
+                .or_else(|| headers.get(header::HOST))
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(',').next().unwrap_or(value).trim())
+                .map(|value| value.split(':').next().unwrap_or(value).to_owned())
+                .map(|value| value.to_ascii_lowercase())
+                .filter(|value| !value.is_empty());
+
+            let Some(host) = host else {
+                return Err(multi_organization());
+            };
+            let organization_id = sqlx::query_scalar::<_, Uuid>(
+                "select s.organization_id from sites s \
+                 join site_domains d on d.site_id = s.id \
+                 where lower(d.host) = $1 and s.organization_id is not null limit 1",
+            )
+            .bind(&host)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| ApiError::from(omnion_identity::IdentityError::Database(error)))?;
+
+            organization_id.ok_or_else(multi_organization)
+        }
     }
 }
 
+/// The refusal a multi-organization installation answers with until a host is registered.
+fn multi_organization() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "organization_required",
+        "this installation holds several organizations; reach the panel on one of its own \
+         hostnames so the sign-in knows which organization it is for",
+    )
+}
+
 /// The enabled provider a slug names, or a refusal that says which of the two it was.
+///
+/// A disabled provider *is* an attempt worth recording: an operator who switched a provider off
+/// and then sees "somebody tried to sign in with it" is looking at the one question the switch
+/// raises. So this path writes an `auth_provider_events` row before refusing — a refusal is a
+/// fact, not a silence.
 async fn live_provider(
     pool: &PgPool,
     organization_id: Uuid,
     slug: &str,
+    client: Option<String>,
+    agent: Option<String>,
 ) -> Result<AuthProvider, ApiError> {
     let provider = providers::find_provider_by_slug(pool, organization_id, slug)
         .await?
         .ok_or_else(provider_unknown)?;
     if !provider.enabled {
+        log_event(
+            pool,
+            &provider,
+            None,
+            None,
+            "refused",
+            Some("provider_disabled"),
+            &[],
+            client,
+            agent,
+        )
+        .await;
         return Err(provider_disabled());
     }
     Ok(provider)
