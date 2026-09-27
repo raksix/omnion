@@ -15,8 +15,10 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod connection_test;
 pub mod error;
 pub mod model;
+pub mod protocol;
 pub mod router;
 pub mod store;
 
@@ -25,14 +27,18 @@ pub use client::{
     list_remote_models, stream_chat, validate_request,
 };
 pub use error::{AiHubError, Result};
+pub use connection_test::{TestReport, TestStep, StepStatus, run_test as test_provider};
 pub use model::{
-    AiModel, ApiKeyChange, DEFAULT_PROTOCOL, MAX_MODEL_KEY_LEN, MAX_NAME_LEN, ModelChanges,
-    NewAiModel, NewProvider, Provider, ProviderChanges, ProviderSummary, SUPPORTED_PROTOCOLS,
-    normalize_base_url, validate_model_key, validate_name, validate_protocol,
+    AiModel, ApiKeyChange, DEFAULT_PROTOCOL, HEALTH_STATUSES, MAX_MODEL_KEY_LEN, MAX_NAME_LEN,
+    MAX_PRIORITY, MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelChanges,
+    NewAiModel, NewProvider, PROVIDER_KINDS, Provider, ProviderChanges, ProviderSummary,
+    SUPPORTED_PROTOCOLS, normalize_base_url, validate_kind, validate_model_key, validate_name,
+    validate_priority, validate_protocol, validate_retries, validate_timeout,
 };
+pub use protocol::{ProtocolAdapter, ProtocolInfo, StreamPiece, adapter_for, protocol_infos};
 pub use router::{ResolvedModel, model_id, resolve};
 pub use store::{
-    create_provider, delete_provider, find_default_model, find_model, find_model_by_key,
-    find_provider, find_provider_by_name, list_models, list_providers, replace_models,
-    update_model, update_provider,
+    create_provider, delete_provider, failover_chain, find_default_model, find_model,
+    find_model_by_key, find_provider, find_provider_by_name, list_models, list_providers,
+    record_health, replace_models, update_model, update_provider,
 };

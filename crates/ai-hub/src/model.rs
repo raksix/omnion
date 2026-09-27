@@ -19,10 +19,31 @@ use crate::error::{AiHubError, Result};
 
 /// Wire protocols an installation can connect.
 ///
-/// v0 speaks the OpenAI-compatible protocol only — the one OpenAI itself, OpenCode,
-/// CommandCode, Ollama and a local vLLM server all expose (docs/06-AI-HUB.md §1: "almost any
-/// service exposing an OpenAI-compatible API can connect").
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["openai_compatible"];
+/// The OpenAI-compatible protocol is the one OpenAI itself, OpenCode, CommandCode, Ollama and a
+/// local vLLM server all expose (docs/06-AI-HUB.md §1: "almost any service exposing an
+/// OpenAI-compatible API can connect"); the other two cover the messages and generateContent
+/// shapes (docs/requests/REQ-097). A fourth adapter attaches through the trait in
+/// [`crate::protocol`] without a fourth value here.
+pub const SUPPORTED_PROTOCOLS: &[&str] =
+    &["openai_compatible", "anthropic_messages", "google_gemini"];
+
+/// Where a provider lives. The runtime dials both the same way; the kind is what a screen groups
+/// by and what tells an operator that a provider answers on their own network.
+pub const PROVIDER_KINDS: &[&str] = &["cloud", "local"];
+
+/// Health verdicts a provider carries. `unknown` is a real value: never probed yet.
+pub const HEALTH_STATUSES: &[&str] = &["ok", "degraded", "down", "unknown"];
+
+/// Smallest timeout a provider may be given, in milliseconds.
+pub const MIN_TIMEOUT_MS: i32 = 1000;
+/// Largest timeout a provider may be given, in milliseconds.
+pub const MAX_TIMEOUT_MS: i32 = 120_000;
+/// Retry ceiling for one call, before the first byte.
+pub const MAX_RETRIES_CEILING: i32 = 5;
+/// Priority bounds, lowest asked first.
+pub const MIN_PRIORITY: i32 = 1;
+/// Priority bounds, lowest asked first.
+pub const MAX_PRIORITY: i32 = 1000;
 
 /// Protocol used when a request does not name one.
 pub const DEFAULT_PROTOCOL: &str = "openai_compatible";
@@ -41,8 +62,22 @@ pub struct Provider {
     pub id: Uuid,
     /// Display name, unique per installation (case-insensitive).
     pub name: String,
-    /// Wire protocol (`openai_compatible`).
+    /// Wire protocol (`openai_compatible`, `anthropic_messages`, `google_gemini`).
     pub protocol: String,
+    /// `cloud` or `local` (docs/requests/REQ-097).
+    pub kind: String,
+    /// How long one call may take, in milliseconds.
+    pub timeout_ms: i32,
+    /// How often a failure before the first byte is retried.
+    pub max_retries: i32,
+    /// Position in the failover chain; lower is asked first.
+    pub priority: i32,
+    /// `ok`, `degraded`, `down` or `unknown` as the last probe left it.
+    pub last_health: String,
+    /// When a probe last took a sample here.
+    pub last_checked_at: Option<OffsetDateTime>,
+    /// What the last failed probe said, clipped.
+    pub last_error: Option<String>,
     /// Base URL of the API, version segment included (e.g. `https://api.example.com/v1`).
     pub base_url: String,
     /// Key the platform authenticates with. Never leaves the platform again.
@@ -72,10 +107,18 @@ pub struct NewProvider {
     pub name: String,
     /// Wire protocol (validated by [`validate_protocol`]).
     pub protocol: String,
+    /// `cloud` or `local` (validated by [`validate_kind`]).
+    pub kind: String,
     /// Base URL (normalized by [`normalize_base_url`]).
     pub base_url: String,
     /// Key to authenticate with; `None` for a local endpoint that wants none.
     pub api_key: Option<String>,
+    /// How long one call may take, in milliseconds (validated by [`validate_timeout`]).
+    pub timeout_ms: i32,
+    /// How often a pre-first-byte failure is retried (validated by [`validate_retries`]).
+    pub max_retries: i32,
+    /// Position in the failover chain (validated by [`validate_priority`]).
+    pub priority: i32,
     /// Whether the provider starts enabled.
     pub enabled: bool,
     /// Whether the provider becomes the installation's default.
@@ -103,6 +146,14 @@ pub struct ProviderChanges {
     pub base_url: Option<String>,
     /// What happens to the key.
     pub api_key: ApiKeyChange,
+    /// New kind.
+    pub kind: Option<String>,
+    /// New timeout.
+    pub timeout_ms: Option<i32>,
+    /// New retry ceiling.
+    pub max_retries: Option<i32>,
+    /// New position in the failover chain.
+    pub priority: Option<i32>,
     /// New enabled flag.
     pub enabled: Option<bool>,
     /// `true` makes this provider the installation's default.
@@ -210,6 +261,51 @@ pub fn validate_protocol(protocol: &str) -> Result<()> {
     )))
 }
 
+/// Check a provider kind against [`PROVIDER_KINDS`].
+pub fn validate_kind(kind: &str) -> Result<()> {
+    if PROVIDER_KINDS.contains(&kind) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "kind \"{kind}\" is not supported (supported: {})",
+        PROVIDER_KINDS.join(", ")
+    )))
+}
+
+/// Check a provider timeout: the bounds the form and the database both enforce.
+pub fn validate_timeout(timeout_ms: i32) -> Result<()> {
+    if (MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "a timeout must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds"
+    )))
+}
+
+/// Check a provider retry ceiling.
+pub fn validate_retries(max_retries: i32) -> Result<()> {
+    if (0..=MAX_RETRIES_CEILING).contains(&max_retries) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "max retries must be between 0 and {MAX_RETRIES_CEILING}"
+    )))
+}
+
+/// Check a provider priority.
+pub fn validate_priority(priority: i32) -> Result<()> {
+    if (MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "a priority must be between {MIN_PRIORITY} and {MAX_PRIORITY}"
+    )))
+}
+
 /// Check a provider name: visible characters, bounded length.
 pub fn validate_name(name: &str) -> Result<()> {
     let trimmed = name.trim();
@@ -301,10 +397,24 @@ pub struct ProviderSummary {
     pub name: String,
     /// Wire protocol.
     pub protocol: String,
+    /// `cloud` or `local`.
+    pub kind: String,
     /// Base URL.
     pub base_url: String,
     /// Whether a key is stored.
     pub has_api_key: bool,
+    /// How long one call may take, in milliseconds.
+    pub timeout_ms: i32,
+    /// How often a pre-first-byte failure is retried.
+    pub max_retries: i32,
+    /// Position in the failover chain.
+    pub priority: i32,
+    /// `ok`, `degraded`, `down` or `unknown`.
+    pub last_health: String,
+    /// When a probe last took a sample here.
+    pub last_checked_at: Option<OffsetDateTime>,
+    /// What the last failed probe said.
+    pub last_error: Option<String>,
     /// Whether the provider is enabled.
     pub enabled: bool,
     /// Whether the provider is the installation's default.
@@ -317,8 +427,15 @@ impl From<&Provider> for ProviderSummary {
             id: provider.id,
             name: provider.name.clone(),
             protocol: provider.protocol.clone(),
+            kind: provider.kind.clone(),
             base_url: provider.base_url.clone(),
             has_api_key: provider.has_api_key(),
+            timeout_ms: provider.timeout_ms,
+            max_retries: provider.max_retries,
+            priority: provider.priority,
+            last_health: provider.last_health.clone(),
+            last_checked_at: provider.last_checked_at,
+            last_error: provider.last_error.clone(),
             enabled: provider.enabled,
             is_default: provider.is_default,
         }
@@ -367,8 +484,38 @@ mod tests {
     }
 
     #[test]
+    fn the_runtime_ranges_are_checked() {
+        assert!(validate_kind("cloud").is_ok());
+        assert!(validate_kind("local").is_ok());
+        assert!(validate_kind("on-premises").is_err());
+        assert!(validate_kind("").is_err());
+
+        assert!(validate_timeout(MIN_TIMEOUT_MS).is_ok());
+        assert!(validate_timeout(MAX_TIMEOUT_MS).is_ok());
+        assert!(validate_timeout(MIN_TIMEOUT_MS - 1).is_err());
+        assert!(validate_timeout(MAX_TIMEOUT_MS + 1).is_err());
+
+        assert!(validate_retries(0).is_ok());
+        assert!(validate_retries(MAX_RETRIES_CEILING).is_ok());
+        assert!(validate_retries(-1).is_err());
+        assert!(validate_retries(MAX_RETRIES_CEILING + 1).is_err());
+
+        assert!(validate_priority(MIN_PRIORITY).is_ok());
+        assert!(validate_priority(MAX_PRIORITY).is_ok());
+        assert!(validate_priority(0).is_err());
+        assert!(validate_priority(MAX_PRIORITY + 1).is_err());
+    }
+
+    #[test]
+    fn the_health_vocabulary_is_closed() {
+        assert_eq!(HEALTH_STATUSES, &["ok", "degraded", "down", "unknown"]);
+    }
+
+    #[test]
     fn protocols_are_checked() {
-        assert!(validate_protocol(DEFAULT_PROTOCOL).is_ok());
+        for protocol in SUPPORTED_PROTOCOLS {
+            assert!(validate_protocol(protocol).is_ok(), "{protocol}");
+        }
         assert!(validate_protocol("anthropic").is_err());
         assert_eq!(
             AiHubError::InvalidProvider(String::new())
@@ -417,8 +564,15 @@ mod tests {
             id: Uuid::nil(),
             name: "Local".to_owned(),
             protocol: DEFAULT_PROTOCOL.to_owned(),
+            kind: "local".to_owned(),
             base_url: "http://127.0.0.1:11434/v1".to_owned(),
             api_key: Some(String::new()),
+            timeout_ms: 30_000,
+            max_retries: 1,
+            priority: 100,
+            last_health: "unknown".to_owned(),
+            last_checked_at: None,
+            last_error: None,
             enabled: true,
             is_default: false,
             created_at: OffsetDateTime::UNIX_EPOCH,

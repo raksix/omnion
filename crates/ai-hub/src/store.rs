@@ -15,11 +15,13 @@ use uuid::Uuid;
 use crate::error::{AiHubError, Result};
 use crate::model::{
     AiModel, ApiKeyChange, ModelChanges, NewAiModel, NewProvider, Provider, ProviderChanges,
-    normalize_base_url, validate_model_key, validate_name, validate_protocol,
+    normalize_base_url, validate_kind, validate_model_key, validate_name, validate_priority,
+    validate_protocol, validate_retries, validate_timeout,
 };
 
 /// Columns read back from `ai_providers`.
-const PROVIDER_COLUMNS: &str = "id, name, protocol, base_url, api_key, enabled, is_default, \
+const PROVIDER_COLUMNS: &str = "id, name, protocol, kind, base_url, api_key, timeout_ms, \
+     max_retries, priority, last_health, last_checked_at, last_error, enabled, is_default, \
      created_at, updated_at";
 
 /// Columns read back from `ai_models`.
@@ -59,6 +61,10 @@ pub async fn find_provider_by_name(pool: &PgPool, name: &str) -> Result<Option<P
 pub async fn create_provider(pool: &PgPool, new: NewProvider) -> Result<Provider> {
     validate_name(&new.name)?;
     validate_protocol(&new.protocol)?;
+    validate_kind(&new.kind)?;
+    validate_timeout(new.timeout_ms)?;
+    validate_retries(new.max_retries)?;
+    validate_priority(new.priority)?;
     let base_url = normalize_base_url(&new.base_url)?;
     let name = new.name.trim().to_owned();
     let api_key = new.api_key.filter(|key| !key.trim().is_empty());
@@ -69,14 +75,19 @@ pub async fn create_provider(pool: &PgPool, new: NewProvider) -> Result<Provider
     }
 
     let sql = format!(
-        "insert into ai_providers (name, protocol, base_url, api_key, enabled, is_default) \
-         values ($1, $2, $3, $4, $5, $6) returning {PROVIDER_COLUMNS}"
+        "insert into ai_providers (name, protocol, kind, base_url, api_key, timeout_ms, \
+         max_retries, priority, enabled, is_default) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning {PROVIDER_COLUMNS}"
     );
     let stored: Result<Provider> = sqlx::query_as(&sql)
         .bind(&name)
         .bind(&new.protocol)
+        .bind(&new.kind)
         .bind(&base_url)
         .bind(api_key.as_deref())
+        .bind(new.timeout_ms)
+        .bind(new.max_retries)
+        .bind(new.priority)
         .bind(new.enabled)
         .bind(new.is_default)
         .fetch_one(&mut *tx)
@@ -106,6 +117,18 @@ pub async fn update_provider(
         Some(base_url) => Some(normalize_base_url(&base_url)?),
         None => None,
     };
+    if let Some(kind) = &changes.kind {
+        validate_kind(kind)?;
+    }
+    if let Some(timeout_ms) = changes.timeout_ms {
+        validate_timeout(timeout_ms)?;
+    }
+    if let Some(max_retries) = changes.max_retries {
+        validate_retries(max_retries)?;
+    }
+    if let Some(priority) = changes.priority {
+        validate_priority(priority)?;
+    }
 
     let mut tx = pool.begin().await?;
     if changes.is_default == Some(true) {
@@ -114,8 +137,11 @@ pub async fn update_provider(
 
     let sql = format!(
         "update ai_providers set name = coalesce($2, name), base_url = coalesce($3, base_url), \
-         api_key = case when $4 then $5 else api_key end, enabled = coalesce($6, enabled), \
-         is_default = coalesce($7, is_default), updated_at = now() \
+         api_key = case when $4 then $5 else api_key end, \
+         kind = coalesce($6, kind), timeout_ms = coalesce($7, timeout_ms), \
+         max_retries = coalesce($8, max_retries), priority = coalesce($9, priority), \
+         enabled = coalesce($10, enabled), is_default = coalesce($11, is_default), \
+         updated_at = now() \
          where id = $1 returning {PROVIDER_COLUMNS}"
     );
     let (replace_key, api_key) = match changes.api_key {
@@ -130,6 +156,10 @@ pub async fn update_provider(
         .bind(base_url.as_deref())
         .bind(replace_key)
         .bind(api_key.as_deref())
+        .bind(changes.kind.as_deref())
+        .bind(changes.timeout_ms)
+        .bind(changes.max_retries)
+        .bind(changes.priority)
         .bind(changes.enabled)
         .bind(changes.is_default)
         .fetch_optional(&mut *tx)
@@ -167,6 +197,49 @@ pub async fn delete_provider(pool: &PgPool, id: Uuid) -> Result<()> {
     tx.commit().await?;
 
     Ok(())
+}
+
+/// Record one health verdict for a provider, as the probe runner and `Probe now` both do.
+pub async fn record_health(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    // The sample row lands with the health table in slice 3; until then the verdict itself is
+    // all the runtime stores, and this argument keeps the call shape the probe runner will use.
+    _latency_ms: i32,
+    error: Option<&str>,
+) -> Result<Provider> {
+    if !crate::model::HEALTH_STATUSES.contains(&status) {
+        return Err(AiHubError::InvalidProvider(format!(
+            "\"{status}\" is not a health status"
+        )));
+    }
+
+    let sql = format!(
+        "update ai_providers set last_health = $2, last_checked_at = now(), last_error = $3, \
+         updated_at = now() where id = $1 returning {PROVIDER_COLUMNS}"
+    );
+    let stored: Option<Provider> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(status)
+        .bind(error)
+        .fetch_optional(pool)
+        .await?;
+
+    stored.ok_or(AiHubError::ProviderNotFound)
+}
+
+/// The enabled providers in failover order: priority first, then `lower(name)`.
+///
+/// The order is total: two providers may share a priority, and then their names decide, so the
+/// chain a caller walks never depends on insertion order.
+pub async fn failover_chain(pool: &PgPool) -> Result<Vec<Provider>> {
+    let sql = format!(
+        "select {PROVIDER_COLUMNS} from ai_providers where enabled \
+         order by priority, lower(name), id"
+    );
+    let providers: Vec<Provider> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    Ok(providers)
 }
 
 /// Clear the installation's default provider.
