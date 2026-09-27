@@ -321,6 +321,14 @@ async function primaryClick(page) {
     const loc = page.locator(sel).first();
     if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
       const text = ((await loc.innerText().catch(() => "")) || "").trim().slice(0, 40);
+      // A step's own POST can still be in flight, and the button says so ("Creating…", disabled).
+      // Clicking it again submits the step twice: the platform refuses the duplicate — correctly —
+      // but that refusal lands while the next step's form is being filled, and the wizard can drop
+      // what was typed there. Wait for the busy state to clear instead of clicking into it.
+      const busy = await loc
+        .evaluate((el) => el.disabled || /(?:…|\.\.\.)$/.test((el.textContent || "").trim()))
+        .catch(() => false);
+      if (busy) return null;
       await loc.click({ timeout: 5000 }).catch(() => {});
       return text || sel;
     }
@@ -345,6 +353,10 @@ async function clickAction(page) {
   for (const text of WIZARD_ACTIONS) {
     const loc = page.locator(`button:has-text("${text}")`).first();
     if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+      const busy = await loc
+        .evaluate((el) => el.disabled || /(?:…|\.\.\.)$/.test((el.textContent || "").trim()))
+        .catch(() => false);
+      if (busy) return null;
       await loc.click({ timeout: 5000 }).catch(() => {});
       return text;
     }
@@ -1274,6 +1286,270 @@ async function runCommandCenter(page, report) {
 }
 
 /**
+ * The subjects-and-scopes pass (REQ-006, slice 2).
+ *
+ * Drives the whole slice through the panel: the overview counts, two accounts created from the
+ * users screen (one plain, one that will only hold a resource-scoped role), a role attached at
+ * organisation scope and one at a path glob, the effective-permissions tab, the simulator
+ * answering ALLOWED and DENIED with its chain, a group with a member and a role, and a machine
+ * identity whose key is shown exactly once and then revoked.
+ */
+async function runIamSubjectsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-subjects-depth", action: "iam", ...step });
+  };
+
+  const pickFirstOption = async (selector) => {
+    const value = await page
+      .locator(`${selector} option`)
+      .nth(1)
+      .getAttribute("value")
+      .catch(() => null);
+    if (value) {
+      await page.selectOption(selector, value).catch(() => {});
+    }
+    return value;
+  };
+
+  // The overview: every count card is a link, and the numbers are real.
+  await page.goto(`${URL_ADMIN}/settings/iam`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-iam-overview-card]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const overviewCards = await page.locator("[data-iam-overview-card]").count();
+  const overviewText = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({
+    step: "overview",
+    cards: overviewCards,
+    showsAccounts: /Accounts/i.test(overviewText),
+    showsExpiring: /Running out within seven days/i.test(overviewText),
+    showsRecent: /Recent privileged actions/i.test(overviewText),
+  });
+  await shot(page, "page-iam-overview");
+
+  // The users screen: search, then create an account without a password (an invite).
+  await page.goto(`${URL_ADMIN}/settings/iam/users`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-user-create-open]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator("[data-users-search]").first().fill("qa").catch(() => {});
+  await page.waitForTimeout(700);
+  await page.locator("[data-users-search]").first().fill("").catch(() => {});
+  await page.waitForTimeout(700);
+  note({ step: "users-list", rows: await page.locator("[data-user-row]").count() });
+
+  await page.locator("[data-user-create-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-user-new-email]").first().fill("qa-subject@example.com").catch(() => {});
+  await page.locator("[data-user-new-name]").first().fill("QA Subject").catch(() => {});
+  await pickFirstOption("[data-user-new-role]");
+  await page.locator("[data-user-create-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const createNotice = (await page.locator("[data-users-notice]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "user-created", notice: createNotice.slice(0, 120), created: /was created/i.test(createNotice) });
+
+  // A second account exists for the resource-scoped demonstration only.
+  await page.locator("[data-user-create-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-user-new-email]").first().fill("qa-scoped@example.com").catch(() => {});
+  await page.locator("[data-user-new-name]").first().fill("QA Scoped").catch(() => {});
+  await page.locator("[data-user-create-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await shot(page, "page-iam-users");
+
+  // Open the first account, attach a role at organisation scope.
+  await page.locator('[data-user-open="qa-subject@example.com"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-user-detail-title]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const subjectUrl = page.url();
+  const subjectId = /\/settings\/iam\/users\/([0-9a-f-]+)/.exec(subjectUrl)?.[1] || "";
+  note({ step: "user-opened", subjectId: Boolean(subjectId) });
+  await shot(page, "page-iam-user-detail");
+
+  await page.locator('[data-user-tab="bindings"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.selectOption("[data-user-binding-role]", { label: "Member (member)" }).catch(async () => {
+    await pickFirstOption("[data-user-binding-role]");
+  });
+  await page.selectOption("[data-user-binding-scope]", "organization").catch(() => {});
+  await page.locator("[data-user-binding-add]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const bindingRows = await page.locator("[data-user-binding-row]").count();
+  const bindingNotice = (await page.locator("[data-user-detail-notice]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "binding-org", rows: bindingRows, notice: bindingNotice.slice(0, 120) });
+
+  // The effective set resolves through the same function the guard runs.
+  await page.locator('[data-user-tab="effective"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const granted = await page.locator("[data-effective-granted]").count();
+  const grantedKeys = await page.locator("[data-effective-granted]").evaluateAll((nodes) =>
+    nodes.slice(0, 6).map((node) => node.getAttribute("data-effective-granted")),
+  );
+  note({ step: "effective", granted, hasPagesRead: grantedKeys.includes("content.pages.read") });
+  await shot(page, "page-iam-user-effective");
+
+  // The second account gets a resource-scoped binding only: /blog/*.
+  await page.goto(`${URL_ADMIN}/settings/iam/users`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.locator('[data-user-open="qa-scoped@example.com"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-user-detail-title]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const scopedUrl = page.url();
+  const scopedId = /\/settings\/iam\/users\/([0-9a-f-]+)/.exec(scopedUrl)?.[1] || "";
+  await page.locator('[data-user-tab="bindings"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.selectOption("[data-user-binding-role]", { label: "Member (member)" }).catch(async () => {
+    await pickFirstOption("[data-user-binding-role]");
+  });
+  await page.selectOption("[data-user-binding-scope]", "resource").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-user-binding-resource]").first().fill("/blog/*").catch(() => {});
+  await page.locator("[data-user-binding-add]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  note({
+    step: "binding-resource",
+    scopedId: Boolean(scopedId),
+    rows: await page.locator("[data-user-binding-row]").count(),
+  });
+  await shot(page, "page-iam-user-resource-binding");
+
+  // The simulator: an account that holds the role at organisation scope is allowed inside it…
+  await page.goto(`${URL_ADMIN}/settings/iam/simulator`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-sim-run]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.selectOption("[data-sim-subject-type]", "user").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.selectOption("[data-sim-subject]", { label: "QA Subject" }).catch(async () => {
+    await page.selectOption("[data-sim-subject]", subjectId).catch(() => {});
+  });
+  await page.selectOption("[data-sim-permission]", "content.pages.read").catch(() => {});
+  await page.locator("[data-sim-run]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const allowedVerdict = (await page.locator("[data-sim-verdict]").first().innerText().catch(() => "")).trim();
+  const allowedSource = (await page.locator("[data-sim-source]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  const allowedSteps = await page.locator("[data-sim-step]").count();
+  note({
+    step: "simulate-allowed",
+    verdict: allowedVerdict,
+    source: allowedSource.slice(0, 120),
+    steps: allowedSteps,
+  });
+  await shot(page, "page-iam-simulator-allowed");
+
+  // … and denied for a permission no bound role holds (the simulator names the reason).
+  await page.selectOption("[data-sim-permission]", "users.read").catch(() => {});
+  await page.locator("[data-sim-run]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const deniedVerdict = (await page.locator("[data-sim-verdict]").first().innerText().catch(() => "")).trim();
+  note({ step: "simulate-denied", verdict: deniedVerdict });
+
+  // The resource-scoped account: the same permission is allowed on /blog/… and denied on /legal/….
+  await page.selectOption("[data-sim-subject]", { label: "QA Scoped" }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.selectOption("[data-sim-permission]", "content.pages.read").catch(() => {});
+  await page.locator("[data-sim-path]").first().fill("/blog/hello-world").catch(() => {});
+  await page.locator("[data-sim-run]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const blogVerdict = (await page.locator("[data-sim-verdict]").first().innerText().catch(() => "")).trim();
+  await page.locator("[data-sim-path]").first().fill("/legal/terms").catch(() => {});
+  await page.locator("[data-sim-run]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const legalVerdict = (await page.locator("[data-sim-verdict]").first().innerText().catch(() => "")).trim();
+  const legalStates = await page.locator("[data-sim-step-state]").evaluateAll((nodes) =>
+    nodes.map((node) => node.getAttribute("data-sim-step-state")),
+  );
+  note({
+    step: "simulate-resource-scope",
+    blog: blogVerdict,
+    legal: legalVerdict,
+    outOfScope: legalStates.filter((state) => state === "out_of_scope").length,
+  });
+  await shot(page, "page-iam-simulator-resource");
+
+  // Groups: a team with a member and a role attached.
+  await page.goto(`${URL_ADMIN}/settings/iam/groups`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-group-create-open]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator("[data-group-create-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-group-new-name]").first().fill("QA Team").catch(() => {});
+  await page.locator("[data-group-new-description]").first().fill("Created by the walkthrough").catch(() => {});
+  await page.locator("[data-group-create-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  if ((await page.locator("[data-group-panel]").count()) === 0) {
+    await page.locator('[data-group-open="qa-team"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+  const groupOptions = await page.locator("[data-group-member-option]").count();
+  await page
+    .locator('[data-group-member-option="qa-subject@example.com"] input')
+    .first()
+    .check({ timeout: 4000 })
+    .catch(() => {});
+  await page.locator("[data-group-members-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await page.selectOption("[data-group-role-select]", { label: "Member (member)" }).catch(async () => {
+    await pickFirstOption("[data-group-role-select]");
+  });
+  await page.locator("[data-group-role-attach]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  note({
+    step: "groups",
+    directory: groupOptions,
+    panel: (await page.locator("[data-group-panel]").count()) > 0,
+    members: await page.locator("[data-group-member-option] input:checked").count(),
+    roles: await page.locator("[data-group-role]").count(),
+  });
+  await shot(page, "page-iam-groups");
+
+  // Service accounts: a key is shown once and can be revoked again.
+  await page.goto(`${URL_ADMIN}/settings/iam/service-accounts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-sa-create-open]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator("[data-sa-create-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-sa-new-name]").first().fill("qa-runner").catch(() => {});
+  await page.locator("[data-sa-new-description]").first().fill("Created by the walkthrough").catch(() => {});
+  await page.locator("[data-sa-new-first-key]").first().check().catch(() => {});
+  await page.locator("[data-sa-create-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const token = (await page.locator("[data-sa-token]").first().innerText().catch(() => "")).trim();
+  note({
+    step: "service-account",
+    tokenShown: /^omsa_[a-z0-9]{10}_[a-z0-9]{32}$/.test(token),
+    tokenPrefix: token.slice(0, 15),
+    keys: await page.locator("[data-sa-key]").count(),
+  });
+  await shot(page, "page-iam-service-accounts");
+
+  await page.locator("[data-sa-key-revoke]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const revokedNotice = (await page.locator("[data-sa-notice]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({
+    step: "key-revoked",
+    notice: revokedNotice.slice(0, 120),
+    revokeButtons: await page.locator("[data-sa-key-revoke]").count(),
+  });
+
+  // The role members tab now answers with subjects, not just accounts.
+  await page.goto(`${URL_ADMIN}/settings/iam/roles`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  const memberRole = await page.locator('[data-role-open="member"]').first().getAttribute("href").catch(() => null);
+  if (memberRole) {
+    await page.goto(`${URL_ADMIN}${memberRole}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    await page
+      .locator("button", { hasText: /^Members \(/ })
+      .first()
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForTimeout(900);
+    note({ step: "role-members", rows: await page.locator("[data-role-member]").count() });
+  }
+
+  const summary = { steps, subjectId: subjectId || null, scopedId: scopedId || null };
+  report.iamSubjects = summary;
+  log(`iam subjects depth: ${JSON.stringify(steps)}`);
+  return summary;
+}
+
+/**
  * The role-depth pass (REQ-006, slice 1).
  *
  * Drives the real lifecycle through the panel: a custom role is created from the list, a matrix
@@ -2174,6 +2450,25 @@ async function main() {
   }
 
   await runWizard(page, report);
+
+  // `--only=wizard` re-checks the first-run flow on its own (reset the database first): it drives
+  // the steps, then reports what the onboarding endpoints answered. A full pass is minutes; this is
+  // the tool for "did the setup step just get refused?".
+  if (process.argv.includes("--only=wizard")) {
+    const onboardingFailures = netFailures.filter((f) => String(f.url || "").includes("/onboarding/"));
+    const finished = await page
+      .evaluate(() => /Your installation is ready/i.test(document.body.innerText))
+      .catch(() => false);
+    const away = !page.url().includes("/setup");
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ ...report, netFailures, onboardingFailures, wizardFinished: finished, wizardAway: away }, null, 2),
+    );
+    console.log(`WIZARD_ONBOARDING_FAILURES=${onboardingFailures.length} WIZARD_FINISHED=${finished} WIZARD_LEFT_SETUP=${away}`);
+    await browser.close();
+    process.exit(onboardingFailures.length === 0 ? 0 : 1);
+  }
+
   const signedIn = await ensureSignedIn(page, report);
   report.signedIn = signedIn;
   if (!signedIn) {
@@ -2198,7 +2493,14 @@ async function main() {
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
-    { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/roles", name: "iam-roles" },
+    { path: "/settings/search", name: "search-settings" },
+    // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
+    // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
+    { path: "/settings/iam", name: "iam-overview" },
+    { path: "/settings/iam/users", name: "iam-users" },
+    { path: "/settings/iam/groups", name: "iam-groups" },
+    { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
+    { path: "/settings/iam/simulator", name: "iam-simulator" },
     // The role screens (REQ-006, slice 1) — no untested screen: the list is walked here, and its
     // depth pass below creates a role, drives the matrix and reads the history back.
     { path: "/settings/iam/roles", name: "iam-roles" },
@@ -2260,6 +2562,10 @@ async function main() {
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
   report.iamRoles = await runIamRolesDepth(page, report);
+
+  // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
+  // machine identities and the simulator.
+  await runIamSubjectsDepth(page, report);
   log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -2282,7 +2588,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
