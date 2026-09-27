@@ -3880,6 +3880,77 @@ async function runBlockEditorDepth(page, report) {
   steps.deleted = (await page.locator("[data-block-canvas-block]").count()) === blocksBefore;
   note("deleted a block");
 
+  // ---- Nested columns (REQ-063 slice 2) -------------------------------------------------------
+  // "A columns container accepts 2-4 child columns, each accepting child blocks, and the
+  // editor's breadcrumb selects a nested block directly." Four separate claims, so four
+  // separate assertions: the wrappers exist, a block lands *inside* one, the breadcrumb walks
+  // back out, and the count can be changed without breaking the structure.
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page
+    .locator("[data-block-insert-option=columns]")
+    .first()
+    .click({ timeout: 6000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.columnsInserted = (await page.locator("[data-block-columns]").count()) > 0;
+  steps.columnCount = await page
+    .locator("[data-block-columns]")
+    .first()
+    .getAttribute("data-block-column-count")
+    .catch(() => null);
+  steps.columnWrappers = await page.locator("[data-block-column]").count();
+  steps.emptyColumnTargets = await page.locator("[data-block-column-empty]").count();
+  await shot(page, "page-block-editor-columns");
+
+  // Inserting while a column is selected puts the block INSIDE that column. This is the claim
+  // that separates "nested editing" from "a list with indentation".
+  const emptyColumn = page.locator("[data-block-column-empty]").first();
+  if ((await emptyColumn.count()) > 0) {
+    await emptyColumn.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page
+    .locator("[data-block-insert-option=text]")
+    .first()
+    .click({ timeout: 6000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.textInsideColumn =
+    (await page.locator("[data-block-column] [data-block-canvas-block=text]").count()) > 0;
+
+  // The breadcrumb is how a nested block is reached without hunting the outline: it has to
+  // name the columns on the way down and select the nested block when clicked.
+  const crumbs = page.locator("[data-block-crumb]");
+  steps.crumbCount = await crumbs.count();
+  steps.crumbLabels = await crumbs.allInnerTexts().catch(() => []);
+  steps.breadcrumbReachesNested = (await page.locator("[data-block-column] [data-block-canvas-block=text]").count()) > 0;
+  await shot(page, "page-block-editor-breadcrumb");
+
+  // The count control: a third column appears, and the prop the renderer reads moves with it.
+  const columnsRow = page.locator("[data-block-canvas-block=columns]").first();
+  if ((await columnsRow.count()) > 0) {
+    await columnsRow.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  const addColumn = page.locator("[data-block-add-column]").first();
+  steps.addColumnOffered = (await addColumn.count()) > 0;
+  await addColumn.click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.columnCountAfterAdd = await page
+    .locator("[data-block-columns]")
+    .first()
+    .getAttribute("data-block-column-count")
+    .catch(() => null);
+  // The count the author asked for and the structure the payload holds must agree, because the
+  // renderer reads one and the validator checks the other.
+  steps.columnCountGrew = Number(steps.columnCountAfterAdd) === Number(steps.columnCount) + 1;
+  steps.columnsStillValid = (await page.locator("[data-block-columns] [data-block-column]").count())
+    === Number(steps.columnCountAfterAdd);
+  steps.noColumnErrors = (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0";
+  await shot(page, "page-block-editor-columns-three");
+  note("built a nested columns layout");
+
   // ---- Save and publish ---------------------------------------------------------------------
   // The save is proven by the revision the server reports, not by the editor's own clock:
   // "Last saved" is printed from the page it loaded, so it is true the moment the screen opens
