@@ -57,6 +57,26 @@ pub enum IdentityError {
     /// A domain host is not usable (shape or case).
     #[error("invalid host: {0}")]
     InvalidHost(String),
+    /// A security-policy field is out of range or not usable.
+    #[error("{field}: {message}")]
+    InvalidPolicy {
+        /// The control the reader has to fix.
+        field: String,
+        /// What is wrong with it.
+        message: String,
+    },
+    /// An IP list entry is not a usable address or network.
+    #[error("invalid network: {0}")]
+    InvalidNetwork(String),
+    /// A secret envelope could not be read (wrong key, or the value was tampered with).
+    #[error("the stored secret could not be read")]
+    Crypto,
+    /// No such second factor for this account.
+    #[error("no such second factor")]
+    FactorNotFound,
+    /// A factor field is not usable (kind, label, or a code that does not match).
+    #[error("{0}")]
+    InvalidFactor(String),
 }
 
 /// Result alias used across the identity crate.

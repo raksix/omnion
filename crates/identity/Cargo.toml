@@ -16,3 +16,10 @@ argon2.workspace = true
 rand.workspace = true
 sha2.workspace = true
 hex.workspace = true
+tracing.workspace = true
+
+# TOTP (RFC 6238) needs HMAC over SHA-1 — the RFC's PRF and what authenticator apps implement.
+# Secret envelopes are encrypt-then-MAC with HMAC-SHA256 (crates/identity/src/secrets.rs).
+hmac = "0.12"
+sha1 = "0.10"
+subtle = "2"
