@@ -49,6 +49,18 @@ wait_http() { # url, seconds
   return 1
 }
 
+# A pass writes close to a thousand screenshots. Running out of space twenty minutes in deletes
+# the artifact directory out from under the harness, and the failure then names a missing file
+# instead of the disk — so the check happens here, where the message can be acted on.
+AVAIL_KB="$(df -Pk "$(dirname "$OUT")" | awk 'NR==2 {print $4}')"
+AVAIL_MB=$((AVAIL_KB / 1024))
+if [ "$AVAIL_MB" -lt "${QA_MIN_FREE_MB:-6000}" ]; then
+  echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; a pass needs about ${QA_MIN_FREE_MB:-6000}MB." >&2
+  echo "[qa] free a worktree's target/ (regenerable) and re-run." >&2
+  exit 1
+fi
+step "free space: ${AVAIL_MB}MB"
+
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 

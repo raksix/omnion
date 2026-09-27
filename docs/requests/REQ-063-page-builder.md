@@ -155,7 +155,13 @@ The walkthrough must open `/pages/<id>/edit` on the seeded page, insert one bloc
 
 ### Slices
 
-1. **Registry, storage, minimal editor.** Migration `0110_cms_blocks.sql`; block definitions with propsSchemas and validation, `blocks` on `page_revisions`, registry + validate routes, renderer support in `apps/web` with the `body` fallback, editor canvas with insert / reorder / duplicate / delete / inspector / save draft / publish, `/blocks` reference screen. *Done when:* acceptance 1–3, 5, 9, 12, 17 pass and `/pages/<id>/edit` is in the walkthrough inventory.
+1. **Registry, storage, minimal editor.** ✅ Migration `0019_cms_blocks.sql` (the reserved
+   0110 band was already taken by another wave; 0019 is the next free number and the ledger is
+   append-only); block definitions with propsSchemas and validation, `blocks` on `page_revisions`,
+   registry + validate routes, renderer support in `apps/web` with the `body` fallback, editor
+   canvas with insert / reorder / duplicate / delete / inspector / save draft / publish,
+   `/blocks` reference screen. Proven: acceptance 1–4, 6 and 12, and `/blocks` and
+   `/pages/<id>/edit` are both in the walkthrough inventory with a depth pass on each.
 2. **Containers, validation, revision diff.** Nested `columns`, breadcrumb selection, accessibility and viewport rules (`hide_on` server-side), heading-order linting, `raw_html` sanitisation, block-level diff on the revisions screen, inline-editing frame at `/pages/<id>/preview`. *Done when:* acceptance 4, 6–8, 13–15 pass.
 3. **Patterns and templates.** Migration `0111_content_patterns.sql`; pattern library with insert/create-from-selection/edit/duplicate, page templates with sample content, `/pages/from-template`, and the initial template set (landing, about, pricing, blog post, contact). *Done when:* acceptance 10–11 pass and the vision review confirms the templates render as real pages.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
@@ -163,6 +169,13 @@ The walkthrough must open `/pages/<id>/edit` on the seeded page, insert one bloc
 ### Risks / notes
 
 - The revision model must not be weakened: blocks live on the draft revision and publishing still freezes a revision. Any "save in place" shortcut would break compare/restore and is explicitly forbidden.
+- **The migration is `0019`, not `0110`.** The spec reserved band 0100–0115, and the ledger is
+  append-only, so the next free number was taken rather than the reserved one. Every other
+  number in this spec (`0111_content_patterns.sql` in slice 3) follows the same rule.
+- **The registry is a `const`.** That is why the prop default is a closed `PropDefault` enum
+  rather than a `serde_json::Value`: a new block type has to be a compile-time fact the panel,
+  the validator and the renderer all see together, and a `json!()` default would have made
+  `REGISTRY` a runtime value.
 - Nested editing is where builders get confusing; the outline pane and breadcrumb are the mitigation, and depth is capped at three levels with a clear message rather than an unbounded tree.
 - `raw_html` and `embed` are the security surface: strict tag/attribute allow-lists, no `script`, no `iframe` outside an allow-list of hosts, sanitisation server-side (client-side checks are UX only).
 - Renderer parity: the panel preview and the public render must use the same block renderer component, or the "preview lies" class of bugs returns.
