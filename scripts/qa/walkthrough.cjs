@@ -1274,6 +1274,171 @@ async function runCommandCenter(page, report) {
 }
 
 /**
+ * The role-depth pass (REQ-006, slice 1).
+ *
+ * Drives the real lifecycle through the panel: a custom role is created from the list, a matrix
+ * cell is cycled through all three states (allow → deny → inherit), the diff preview is read,
+ * the set is saved, the page is reloaded to prove the save stuck, and the history tab is checked
+ * for the diff it introduced. The copy flow and the guarded delete follow, so every control of
+ * the two screens has been used by the time the pass ends.
+ */
+async function runIamRolesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-roles-depth", action: "iam", ...step });
+  };
+
+  const listUrl = `${URL_ADMIN}/settings/iam/roles`;
+  await page.goto(listUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-role-create-open]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(500);
+
+  const platformRoles = await page.locator("[data-role-row]").count();
+  const platformRow = await page.locator('[data-role-row="editor"]').count();
+  note({ step: "list", rows: platformRoles, hasPlatformEditor: platformRow > 0 });
+  await shot(page, "page-iam-roles");
+
+  // Create a custom role through the form.
+  await page.locator("[data-role-create-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-role-new-key]").first().fill("qa-depth-role").catch(() => {});
+  await page.locator("[data-role-new-name]").first().fill("QA Depth Role").catch(() => {});
+  await page
+    .locator("[data-role-new-description]")
+    .first()
+    .fill("Created by the walkthrough")
+    .catch(() => {});
+  await page.locator("[data-role-new-priority]").first().fill("450").catch(() => {});
+  await page.locator("[data-role-create-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const created = await page
+    .locator("[data-role-version]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  const detailUrl = page.url();
+  const roleId = /\/settings\/iam\/roles\/([0-9a-f-]+)/.exec(detailUrl)?.[1] || "";
+  note({ step: "create", url: detailUrl, roleId: Boolean(roleId), version: created.trim() });
+  if (!roleId) {
+    const failure = (await page.locator("[data-role-create-error]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+    note({ step: "create-failed", error: failure.slice(0, 160) });
+    const early = { steps, roleId: null };
+    report.iamRoles = early;
+    log(`iam roles depth: ${JSON.stringify(steps)}`);
+    return early;
+  }
+
+  // Filter to one permission so its row is on screen, then cycle the cell three ways.
+  await page.locator("[data-matrix-search]").first().fill("content.pages.read").catch(() => {});
+  await page.waitForTimeout(400);
+  const row = '[data-matrix-row="content.pages.read"]';
+  const cellOn = async (value) =>
+    page
+      .locator(`${row} [data-matrix-cell="content.pages.read"][data-matrix-value="${value}"]`)
+      .first()
+      .getAttribute("data-on")
+      .catch(() => null);
+
+  const cycle = [];
+  for (const value of ["allow", "deny", "inherit", "allow"]) {
+    await page
+      .locator(`${row} [data-matrix-cell="content.pages.read"][data-matrix-value="${value}"]`)
+      .first()
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForTimeout(250);
+    cycle.push(`${value}:${(await cellOn(value)) === "true"}`);
+  }
+  note({ step: "cycle", cycle: cycle.join(" ") });
+  await shot(page, "page-iam-role-matrix");
+
+  // A diff preview, then the save.
+  await page.locator("[data-matrix-preview]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const diffVisible = (await page.locator("[data-matrix-diff]").count()) > 0;
+  const diffText = diffVisible
+    ? (await page.locator("[data-matrix-diff]").first().innerText().catch(() => "")).replace(/\s+/g, " ")
+    : "";
+  note({ step: "preview", visible: diffVisible, text: diffText.slice(0, 160) });
+
+  await page.locator("[data-matrix-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const notice = (await page.locator("[data-role-notice]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "save", notice: notice.slice(0, 160) });
+
+  // Reopen the screen: the saved cell must come back set.
+  await page.goto(`${URL_ADMIN}/settings/iam/roles/${roleId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-matrix-search]").first().fill("content.pages.read").catch(() => {});
+  await page.waitForTimeout(400);
+  const reopened = await cellOn("allow");
+  note({ step: "reopen", allowCellOn: reopened === "true" });
+
+  // The history tab carries the diff the save introduced.
+  await page.locator('[data-tab="history"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const versionRows = await page.locator("[data-role-version-row]").count();
+  const diffRows = await page.locator("[data-role-version-diff]").count();
+  const historyText = (await page.locator('[data-tab="history"]').first().innerText().catch(() => "")).slice(0, 60);
+  note({ step: "history", versions: versionRows, diffs: diffRows, label: historyText.replace(/\s+/g, " ") });
+  await shot(page, "page-iam-role-history");
+
+  // Members and inherited-by tabs answer with their own state.
+  await page.locator('[data-tab="members"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const memberRows = await page.locator("[data-role-member]").count();
+  await page.locator('[data-tab="inherited"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const childRows = await page.locator("[data-role-child]").count();
+  note({ step: "tabs", members: memberRows, children: childRows });
+
+  // The editor refuses an empty name in the field itself — before anything is sent, so the
+  // refusal never becomes a request (the server refuses the same shape; the API test pins it).
+  await page.locator("[data-tab=\"permissions\"]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.locator("[data-role-edit-open]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.locator("[data-role-edit-name]").first().fill("   ").catch(() => {});
+  await page.locator("[data-role-edit-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const fieldError = (await page.locator("[data-role-edit-error]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "edit-refused", refused: fieldError.length > 0, error: fieldError.slice(0, 120) });
+
+  await page.locator("[data-role-edit-name]").first().fill("QA Depth Role Renamed").catch(() => {});
+  await page.locator("[data-role-edit-priority]").first().fill("460").catch(() => {});
+  await page.locator("[data-role-edit-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const editedNotice = (await page.locator("[data-role-notice]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "edit-saved", notice: editedNotice.slice(0, 120) });
+
+  // Copy the role from the list, then delete the copy — the guarded path.
+  await page.goto(listUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.locator('[data-role-duplicate="qa-depth-role"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-role-duplicate-key]").first().fill("qa-depth-role-copy").catch(() => {});
+  await page.locator("[data-role-duplicate-name]").first().fill("QA Depth Role (copy)").catch(() => {});
+  await page.locator("[data-role-duplicate-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const copyUrl = page.url();
+  const copyAllowed = (await page.locator("[data-role-notice], [data-matrix-counts]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "duplicate", url: copyUrl, counts: copyAllowed.slice(0, 120) });
+
+  await page.goto(listUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.locator('[data-role-delete="qa-depth-role-copy"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator('[data-role-delete-confirm="qa-depth-role-copy"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const deleteNotice = (await page.locator("[data-role-notice]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  const copyGone = (await page.locator('[data-role-row="qa-depth-role-copy"]').count()) === 0;
+  note({ step: "delete-copy", gone: copyGone, notice: deleteNotice.slice(0, 120) });
+
+  const summary = { steps, roleId, copyGone };
+  report.iamRoles = summary;
+  log(`iam roles depth: ${JSON.stringify(steps)}`);
+  return summary;
+}
+
+/**
  * The depth pass of the results screen and the search settings (REQ-002, slice 3).
  *
  * Every step is a number, not an impression: the facet's own count before and after a click, the
@@ -2033,7 +2198,10 @@ async function main() {
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
-    { path: "/settings/search", name: "search-settings" },
+    { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/roles", name: "iam-roles" },
+    // The role screens (REQ-006, slice 1) — no untested screen: the list is walked here, and its
+    // depth pass below creates a role, drives the matrix and reads the history back.
+    { path: "/settings/iam/roles", name: "iam-roles" },
     // The analytics reports (REQ-007, slice 2): every screen of the section is walked, clicked and
     // measured, and the depth pass below reads the range, the comparison, a drawer and an export.
     { path: "/analytics", name: "analytics" },
@@ -2088,6 +2256,11 @@ async function main() {
   // database.
   report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
+  // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
+  // preview and save, reopen, and read the history tab back.
+  report.iamRoles = await runIamRolesDepth(page, report);
+  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
