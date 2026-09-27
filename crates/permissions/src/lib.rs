@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approvals;
 pub mod bindings;
 pub mod catalogue;
 pub mod error;
@@ -34,21 +35,25 @@ pub mod service_accounts;
 pub mod simulate;
 pub mod versions;
 
+pub use approvals::{
+    ApprovalDecision, MAX_GRANT_MINUTES, MIN_GRANT_MINUTES, NewPermissionRequest,
+    PermissionRequest, RequestFilter,
+};
 pub use catalogue::{CATALOGUE, PermissionDef, get as permission, is_known};
 pub use error::{PermissionsError, Result};
 pub use evaluate::{
-    Decision, DenyReason, EffectivePermissions, Grant, PolicyStamp, RoleGraph, Trace, Via, authorize,
-    authorize_subject, effective_permissions, effective_permissions_for, effective_permissions_in,
-    load_role_graph,
+    Decision, DenyReason, EffectivePermissions, Grant, PolicyStamp, RoleGraph, Trace, Via,
+    authorize, authorize_subject, effective_permissions, effective_permissions_for,
+    effective_permissions_in, load_role_graph,
 };
 pub use invariants::{InvariantRefusal, PRIVILEGED_ROLE_KEYS, check_binding_revocation};
 pub use matching::glob_matches;
-pub use policies::{PolicyDraft, PolicyRecord, PolicyVersionRecord};
 pub use model::{
     Effect, MAX_INHERITANCE_DEPTH, MAX_PRIORITY, MIN_PRIORITY, NewBinding, NewRole,
     NewSubjectBinding, ParentChange, PermissionChange, PermissionSummary, ResourceContext, Role,
     RoleBinding, RoleDiff, RolePermission, RolePermissionInput, RoleSaveOutcome, RoleUpdate,
     RoleVersion, Scope, Subject, validate_priority, validate_role_key, validate_role_name,
 };
+pub use policies::{PolicyDraft, PolicyRecord, PolicyVersionRecord};
 pub use seed::SeedReport;
 pub use simulate::{SimulationReport, SimulationStep, simulate};

@@ -107,6 +107,15 @@ pub enum PermissionsError {
     /// The role could not be found while checking a simulator query.
     #[error("the simulated action is not a known permission: {0}")]
     UnknownSimulatedAction(String),
+    /// No permission request carries this id.
+    #[error("permission request not found")]
+    RequestNotFound,
+    /// A decided request cannot be decided again.
+    #[error("this request has already been decided")]
+    RequestAlreadyDecided,
+    /// A request field is not usable (shape, range, unknown value).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 /// Result alias used across the permissions crate.
