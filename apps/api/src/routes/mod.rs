@@ -77,6 +77,7 @@ pub mod commands;
 pub mod content;
 pub mod health;
 pub mod iam;
+pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod onboarding;
@@ -110,8 +111,7 @@ pub fn router(state: AppState) -> Router {
     let role_versions =
         get(iam::list_role_versions).layer(guards::require(&state, "iam.roles.read"));
 
-    let role_members =
-        get(iam::list_role_members).layer(guards::require(&state, "iam.roles.read"));
+    let role_members = get(iam::list_role_members).layer(guards::require(&state, "iam.roles.read"));
 
     let role_duplicate =
         post(iam::duplicate_role).layer(guards::require(&state, "iam.roles.manage"));
@@ -122,6 +122,63 @@ pub fn router(state: AppState) -> Router {
     let bindings = get(iam::list_bindings)
         .layer(guards::require(&state, "iam.bindings.read"))
         .merge(post(iam::create_binding).layer(guards::require(&state, "iam.bindings.manage")));
+
+    let binding_detail =
+        delete(iam::delete_binding).layer(guards::require(&state, "iam.bindings.manage"));
+
+    // Subjects, scopes, groups, machine identities and the simulator (REQ-006, slice 2):
+    // reading a screen is its read key, every mutation its manage key, and the simulator asks
+    // with `iam.simulate` because it exposes the decision path.
+    let iam_users = get(iam_subjects::list_users)
+        .layer(guards::require(&state, "users.read"))
+        .merge(post(iam_subjects::create_user).layer(guards::require(&state, "users.create")));
+
+    let iam_user = get(iam_subjects::get_user)
+        .layer(guards::require(&state, "users.read"))
+        .merge(patch(iam_subjects::update_user).layer(guards::require(&state, "users.update")));
+
+    let iam_groups = get(iam_subjects::list_groups)
+        .layer(guards::require(&state, "iam.groups.read"))
+        .merge(
+            post(iam_subjects::create_group).layer(guards::require(&state, "iam.groups.manage")),
+        );
+
+    let iam_group = get(iam_subjects::get_group)
+        .layer(guards::require(&state, "iam.groups.read"))
+        .merge(
+            patch(iam_subjects::update_group).layer(guards::require(&state, "iam.groups.manage")),
+        )
+        .merge(
+            delete(iam_subjects::delete_group).layer(guards::require(&state, "iam.groups.manage")),
+        );
+
+    let iam_group_members =
+        put(iam_subjects::set_group_members).layer(guards::require(&state, "iam.groups.manage"));
+
+    let iam_service_accounts = get(iam_subjects::list_service_accounts)
+        .layer(guards::require(&state, "iam.serviceaccounts.read"))
+        .merge(
+            post(iam_subjects::create_service_account)
+                .layer(guards::require(&state, "iam.serviceaccounts.manage")),
+        );
+
+    let iam_service_account = get(iam_subjects::get_service_account)
+        .layer(guards::require(&state, "iam.serviceaccounts.read"))
+        .merge(
+            delete(iam_subjects::delete_service_account)
+                .layer(guards::require(&state, "iam.serviceaccounts.manage")),
+        );
+
+    let iam_service_account_keys = post(iam_subjects::issue_service_account_key)
+        .layer(guards::require(&state, "iam.serviceaccounts.manage"));
+
+    let iam_service_account_key = delete(iam_subjects::revoke_service_account_key)
+        .layer(guards::require(&state, "iam.serviceaccounts.manage"));
+
+    let iam_simulations = post(iam_subjects::run_simulation)
+        .layer(guards::require_or_machine(&state, "iam.simulate"));
+
+    let iam_overview = get(iam_subjects::overview).layer(guards::require(&state, "iam.roles.read"));
 
     // Tenancy: reading needs a read permission, every mutation its own key.
     let organizations = get(tenancy::list_organizations)
@@ -417,7 +474,10 @@ pub fn router(state: AppState) -> Router {
     // may look at the numbers is not the one who decides how long they live.
     let analytics_privacy = Router::new()
         .route("/analytics/purge", post(analytics::purge))
-        .route("/analytics/visitors/{hash}", delete(analytics::erase_visitor))
+        .route(
+            "/analytics/visitors/{hash}",
+            delete(analytics::erase_visitor),
+        )
         .route_layer(guards::require(&state, "analytics.settings.manage"));
 
     let analytics_collect = Router::new()
@@ -471,6 +531,21 @@ pub fn router(state: AppState) -> Router {
             put(iam::set_role_permissions).layer(guards::require(&state, "iam.roles.manage")),
         )
         .route("/iam/bindings", bindings)
+        .route("/iam/bindings/{id}", binding_detail)
+        .route("/iam/overview", iam_overview)
+        .route("/iam/users", iam_users)
+        .route("/iam/users/{id}", iam_user)
+        .route("/iam/groups", iam_groups)
+        .route("/iam/groups/{id}", iam_group)
+        .route("/iam/groups/{id}/members", iam_group_members)
+        .route("/iam/service-accounts", iam_service_accounts)
+        .route("/iam/service-accounts/{id}", iam_service_account)
+        .route("/iam/service-accounts/{id}/keys", iam_service_account_keys)
+        .route(
+            "/iam/service-accounts/{id}/keys/{key_id}",
+            iam_service_account_key,
+        )
+        .route("/iam/simulations", iam_simulations)
         .route(
             "/iam/effective-permissions",
             get(iam::effective_permissions),

@@ -18,6 +18,7 @@ use omnion_search::SearchError;
 use omnion_storage::StorageError;
 use omnion_workflows::WorkflowError;
 use serde::Serialize;
+use serde_json::Value;
 
 /// `true` when a database error means the dependency itself is unavailable (retryable).
 fn dependency_unavailable(error: &sqlx::Error) -> bool {
@@ -29,11 +30,15 @@ fn dependency_unavailable(error: &sqlx::Error) -> bool {
 
 /// Error response shape used across `/api/v1`:
 /// `{"error":{"code":"internal_error","message":"…"}}`.
+///
+/// A refusal that can explain itself carries `details` too — the permission, why it was refused
+/// and the role that decided it (docs/07-IAM.md §18: the answer names its source).
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -44,7 +49,15 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            details: None,
         }
+    }
+
+    /// Attach the structured explanation of a refusal.
+    #[must_use]
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     /// `400` — the request body or its parameters are unusable.
@@ -79,11 +92,13 @@ impl ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "dependency_unavailable",
                 message: format!("{dependency}: {message}"),
+                details: None,
             },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
                 message: other.to_string(),
+                details: None,
             },
         }
     }
@@ -395,6 +410,7 @@ impl From<PermissionsError> for ApiError {
                 status: StatusCode::FORBIDDEN,
                 code: "system_role",
                 message: "platform roles are managed by the platform".to_owned(),
+                details: None,
             },
             // REQ-006 role depth: the field-level refusals carry the field they belong to, so the
             // matrix screen can point at `inherits_role_id` instead of showing a generic message.
@@ -404,6 +420,7 @@ impl From<PermissionsError> for ApiError {
                 message:
                     "the role cannot inherit from itself or one of its own descendants (inherits_role_id)"
                         .to_owned(),
+                details: None,
             },
             PermissionsError::InheritanceDepthExceeded { max } => Self::bad_request(
                 "role_inheritance_depth",
@@ -415,6 +432,7 @@ impl From<PermissionsError> for ApiError {
                 message: format!(
                     "the role still carries {count} live binding(s); revoke them before deleting it"
                 ),
+                details: None,
             },
             PermissionsError::VersionConflict { expected, current } => Self {
                 status: StatusCode::CONFLICT,
@@ -422,6 +440,7 @@ impl From<PermissionsError> for ApiError {
                 message: format!(
                     "the role changed since it was read: expected version {expected}, current version {current}"
                 ),
+                details: None,
             },
             PermissionsError::InvalidEntries { unknown, duplicates } => {
                 let mut parts: Vec<String> = Vec::new();
@@ -436,6 +455,44 @@ impl From<PermissionsError> for ApiError {
                     format!("the permission set was refused — {}", parts.join("; ")),
                 )
             }
+            // Subjects and scopes (REQ-006, slice 2): the store's refusals map onto the surface
+            // the screens point at — a missing group is a 404, a taken name a 409, and the rest
+            // a field-level 400.
+            PermissionsError::GroupNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "group_not_found", "no such group")
+            }
+            PermissionsError::GroupNameTaken => Self::new(
+                StatusCode::CONFLICT,
+                "group_name_taken",
+                "a group with this name already exists in this organization",
+            ),
+            PermissionsError::ServiceAccountNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "service_account_not_found",
+                "no such service account",
+            ),
+            PermissionsError::ServiceAccountNameTaken => Self::new(
+                StatusCode::CONFLICT,
+                "service_account_name_taken",
+                "a service account with this name already exists in this organization",
+            ),
+            PermissionsError::InvalidMachineKey => Self::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_machine_key",
+                "this machine key is unknown, revoked or does not match its secret",
+            ),
+            PermissionsError::UnknownSimulatedAction(key) => Self::bad_request(
+                "unknown_action",
+                format!("{key:?} is not a known permission key"),
+            ),
+            PermissionsError::InvalidGroupName(name) => Self::bad_request(
+                "invalid_group_name",
+                format!("{name:?} is not a usable group name"),
+            ),
+            PermissionsError::InvalidServiceAccountName(name) => Self::bad_request(
+                "invalid_service_account_name",
+                format!("{name:?} is not a usable service-account name"),
+            ),
             // Everything else is a bad request: the caller handed in something the store
             // cannot accept (key shape, priority range, unknown permission, bad scope).
             other => Self::bad_request("invalid_request", other.to_string()),
@@ -700,6 +757,8 @@ struct ErrorBody {
 struct ErrorDetail {
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
 }
 
 impl IntoResponse for ApiError {
@@ -708,6 +767,7 @@ impl IntoResponse for ApiError {
             error: ErrorDetail {
                 code: self.code,
                 message: self.message,
+                details: self.details,
             },
         };
         (self.status, Json(body)).into_response()

@@ -72,3 +72,57 @@ impl FromRequestParts<AppState> for CurrentSession {
         Self::resolve(state, &parts.headers).await
     }
 }
+
+/// The caller of a route that accepts both a session and a machine key.
+///
+/// The guard (`crate::guards::require_or_machine`) has already authenticated the request and put
+/// one of the two principals into the extensions; this extractor only reads it back, so a handler
+/// never re-authenticates and a machine request never pretends to be a person.
+#[derive(Debug, Clone)]
+pub enum ApiCaller {
+    /// A signed-in session.
+    Session(CurrentSession),
+    /// A service account that presented a key.
+    Machine(crate::guards::MachinePrincipal),
+}
+
+impl ApiCaller {
+    /// The organization the caller works in (`None` = platform level).
+    #[must_use]
+    pub fn organization_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Session(session) => session.user.organization_id,
+            Self::Machine(machine) => Some(machine.organization_id),
+        }
+    }
+
+    /// Who to audit the action as (`None` for a machine: it has no account row).
+    #[must_use]
+    pub fn actor_user_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Session(session) => Some(session.user.id),
+            Self::Machine(_) => None,
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for ApiCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(session) = parts.extensions.get::<CurrentSession>() {
+            return Ok(Self::Session(session.clone()));
+        }
+        if let Some(machine) = parts.extensions.get::<crate::guards::MachinePrincipal>() {
+            return Ok(Self::Machine(machine.clone()));
+        }
+
+        Err(ApiError::unauthorized(
+            "unauthenticated",
+            "sign in to continue",
+        ))
+    }
+}

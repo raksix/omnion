@@ -13,16 +13,16 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use std::collections::BTreeMap;
 use omnion_audit::NewAuditEntry;
 use omnion_permissions::model::{
-    Effect, NewBinding, NewRole, ParentChange, PermissionSummary, Role, RolePermission,
-    RolePermissionInput, RoleUpdate,
+    Effect, NewRole, NewSubjectBinding, ParentChange, PermissionSummary, Role, RolePermission,
+    RolePermissionInput, RoleUpdate, Subject,
 };
 use omnion_permissions::{PermissionsError, Scope};
 use omnion_permissions::{bindings, catalogue, evaluate, roles as role_store, versions};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -123,15 +123,19 @@ pub struct RolesResponse {
 }
 
 /// Where a role applies, as returned to clients.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScopeBody {
-    /// `global`, `organization` or `site`.
+    /// `global`, `organization`, `site`, `department`, `module` or `resource`.
     #[serde(rename = "type")]
     pub scope_type: &'static str,
     /// Organization of the scope, when it has one.
     pub organization_id: Option<Uuid>,
     /// Site of the scope, when it is site scoped.
     pub site_id: Option<Uuid>,
+    /// Kind of resource (`path`), when the scope names one.
+    pub resource_type: Option<String>,
+    /// The resource pattern, department key or module key, when the scope names one.
+    pub resource_id: Option<String>,
 }
 
 impl From<Scope> for ScopeBody {
@@ -140,6 +144,8 @@ impl From<Scope> for ScopeBody {
             scope_type: scope.scope_type(),
             organization_id: scope.organization_id(),
             site_id: scope.site_id(),
+            resource_type: scope.resource_type().map(str::to_owned),
+            resource_id: scope.resource_id().map(str::to_owned),
         }
     }
 }
@@ -151,8 +157,12 @@ pub struct BindingBody {
     pub id: Uuid,
     /// Role that is assigned.
     pub role_id: Uuid,
-    /// Account that holds the role.
-    pub user_id: Uuid,
+    /// Who the role is bound to: `user`, `group` or `service_account`.
+    pub subject_type: String,
+    /// Id of the subject.
+    pub subject_id: Uuid,
+    /// Account that holds the role, when the subject is a person.
+    pub user_id: Option<Uuid>,
     /// Where the role applies.
     pub scope: ScopeBody,
     /// Who granted it (`null` = the platform).
@@ -165,6 +175,8 @@ pub struct BindingBody {
     pub revoked_at: Option<OffsetDateTime>,
     /// Whether the binding applies right now.
     pub active: bool,
+    /// Whether the binding carried a window that has run out (shown as expired, not deleted).
+    pub expired: bool,
     /// Creation timestamp, RFC 3339.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -172,15 +184,19 @@ pub struct BindingBody {
 
 impl From<&omnion_permissions::RoleBinding> for BindingBody {
     fn from(binding: &omnion_permissions::RoleBinding) -> Self {
+        let now = OffsetDateTime::now_utc();
         Self {
             id: binding.id,
             role_id: binding.role_id,
+            subject_type: binding.subject.subject_type().to_owned(),
+            subject_id: binding.subject.id(),
             user_id: binding.user_id,
-            scope: binding.scope.into(),
+            scope: binding.scope.clone().into(),
             granted_by: binding.granted_by,
             expires_at: binding.expires_at,
             revoked_at: binding.revoked_at,
-            active: binding.is_active_at(OffsetDateTime::now_utc()),
+            active: binding.is_active_at(now),
+            expired: binding.is_expired_at(now),
             created_at: binding.created_at,
         }
     }
@@ -189,8 +205,10 @@ impl From<&omnion_permissions::RoleBinding> for BindingBody {
 /// Response body of the binding endpoints.
 #[derive(Debug, Serialize)]
 pub struct BindingsResponse {
-    /// Account the bindings belong to.
-    pub user_id: Uuid,
+    /// Who the bindings speak about, when the request named a subject.
+    pub subject_type: Option<String>,
+    /// Id of the subject, when the request named one.
+    pub subject_id: Option<Uuid>,
     /// Role assignments, newest first.
     pub bindings: Vec<BindingBody>,
 }
@@ -363,11 +381,18 @@ pub struct SetRolePermissionsRequest {
 /// `POST /api/v1/iam/bindings`.
 #[derive(Debug, Deserialize)]
 pub struct CreateBindingRequest {
-    /// Account that receives the role.
-    pub user_id: Uuid,
+    /// Account that receives the role (the pre-subject shape; `subject_type` defaults to `user`).
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
+    /// Who receives the role: `user`, `group` or `service_account`.
+    #[serde(default)]
+    pub subject_type: Option<SubjectTypeBody>,
+    /// Id of the subject; defaults to `user_id`.
+    #[serde(default)]
+    pub subject_id: Option<Uuid>,
     /// Role to assign.
     pub role_id: Uuid,
-    /// `global`, `organization` or `site`.
+    /// `global`, `organization`, `site`, `department`, `module` or `resource`.
     pub scope_type: ScopeTypeBody,
     /// Organization of the scope.
     #[serde(default)]
@@ -375,9 +400,45 @@ pub struct CreateBindingRequest {
     /// Site of the scope.
     #[serde(default)]
     pub site_id: Option<Uuid>,
+    /// Department key, for a department scope.
+    #[serde(default)]
+    pub department: Option<String>,
+    /// Module key, for a module scope.
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Kind of resource (`path`), for a resource scope.
+    #[serde(default)]
+    pub resource_type: Option<String>,
+    /// The resource pattern, for a resource scope.
+    #[serde(default)]
+    pub resource_id: Option<String>,
     /// Optional expiry as an RFC 3339 timestamp (temporary roles).
     #[serde(default)]
     pub expires_at: Option<String>,
+}
+
+/// Who a binding attaches to, as it appears in JSON.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectTypeBody {
+    /// A person.
+    User,
+    /// A group (team).
+    Group,
+    /// A machine identity.
+    ServiceAccount,
+}
+
+impl SubjectTypeBody {
+    /// Value the API answers with.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Group => "group",
+            Self::ServiceAccount => "service_account",
+        }
+    }
 }
 
 /// Scope selector, as it appears in JSON.
@@ -390,6 +451,12 @@ pub enum ScopeTypeBody {
     Organization,
     /// One site.
     Site,
+    /// One department.
+    Department,
+    /// One module.
+    Module,
+    /// One resource (a path glob).
+    Resource,
 }
 
 /// Query parameters of `GET /api/v1/iam/bindings`.
@@ -398,6 +465,24 @@ pub struct BindingsQuery {
     /// Account to list; defaults to the caller.
     #[serde(default)]
     pub user_id: Option<Uuid>,
+    /// `user`, `group` or `service_account`.
+    #[serde(default)]
+    pub subject_type: Option<String>,
+    /// Id of the subject to list.
+    #[serde(default)]
+    pub subject_id: Option<Uuid>,
+    /// Only bindings carrying this role.
+    #[serde(default)]
+    pub role_id: Option<Uuid>,
+    /// Only bindings that apply right now.
+    #[serde(default)]
+    pub live: Option<bool>,
+    /// Organization filter (platform bindings are always included).
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+    /// Page size, 1..=500 (default 200).
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 /// Query parameters of `GET /api/v1/iam/effective-permissions`.
@@ -412,6 +497,9 @@ pub struct EffectivePermissionsQuery {
     /// Site scope override.
     #[serde(default)]
     pub site_id: Option<Uuid>,
+    /// Resource path the resolution should take into account (`/blog/hello`).
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// Query parameters of `GET /api/v1/iam/audit`.
@@ -583,11 +671,7 @@ impl From<&omnion_permissions::RoleDiff> for RoleDiffView {
                     to: change.to.map(Effect::as_str).unwrap_or("inherit"),
                 })
                 .collect(),
-            removed: diff
-                .removed
-                .iter()
-                .map(PermissionEntryView::from)
-                .collect(),
+            removed: diff.removed.iter().map(PermissionEntryView::from).collect(),
         }
     }
 }
@@ -874,8 +958,8 @@ pub async fn duplicate_role(
     ensure_same_organization(&current, source.organization_id)?;
 
     let organization_id = resolve_organization(&current, body.organization_id)?;
-    let role = role_store::duplicate_role(pool, role_id, organization_id, &body.key, &body.name)
-        .await?;
+    let role =
+        role_store::duplicate_role(pool, role_id, organization_id, &body.key, &body.name).await?;
 
     let entries = role_store::permission_entries(pool, &[role.id])
         .await?
@@ -936,7 +1020,11 @@ pub async fn list_role_versions(
             change: row.change.clone(),
             changed_by: row.changed_by,
             created_at: row.created_at,
-            permissions: row.entries().iter().map(PermissionEntryView::from).collect(),
+            permissions: row
+                .entries()
+                .iter()
+                .map(PermissionEntryView::from)
+                .collect(),
             diff: RoleDiffView::from(&diff),
             diff_total: diff.total(),
         });
@@ -974,7 +1062,10 @@ pub async fn preview_role_permissions(
             problems.push(format!("unknown permission key: {}", entry.key));
             continue;
         }
-        if validated.insert(entry.key.clone(), entry.effect.into()).is_some() {
+        if validated
+            .insert(entry.key.clone(), entry.effect.into())
+            .is_some()
+        {
             problems.push(format!("duplicate entry: {}", entry.key));
         }
     }
@@ -1074,15 +1165,17 @@ pub async fn set_role_permissions(
     }))
 }
 
-/// One member of a role — a person the role currently or formerly applied to.
+/// One member of a role — a subject the role currently or formerly applied to.
 #[derive(Debug, Serialize)]
 pub struct RoleMemberView {
-    /// The account.
-    pub user_id: Uuid,
-    /// Account e-mail.
-    pub email: String,
-    /// Display name.
-    pub display_name: String,
+    /// `user`, `group` or `service_account`.
+    pub subject_type: String,
+    /// Id of the subject.
+    pub subject_id: Uuid,
+    /// The account, when the subject is a person.
+    pub user_id: Option<Uuid>,
+    /// What to show: the account's e-mail, the group's or the identity's name.
+    pub label: String,
     /// Where the role applies.
     pub scope: ScopeBody,
     /// When it stops applying (temporary roles).
@@ -1093,6 +1186,8 @@ pub struct RoleMemberView {
     pub revoked_at: Option<OffsetDateTime>,
     /// Whether the binding applies right now.
     pub active: bool,
+    /// Whether the binding's window has run out (shown as expired, not deleted).
+    pub expired: bool,
     /// When it was granted.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -1121,23 +1216,31 @@ pub async fn list_role_members(
 
     #[derive(sqlx::FromRow)]
     struct MemberRow {
-        user_id: Uuid,
-        email: String,
-        display_name: String,
+        subject_type: String,
+        subject_id: Uuid,
+        user_id: Option<Uuid>,
+        label: String,
         scope_type: String,
         organization_id: Option<Uuid>,
         site_id: Option<Uuid>,
+        resource_type: Option<String>,
+        resource_id: Option<String>,
         expires_at: Option<OffsetDateTime>,
         revoked_at: Option<OffsetDateTime>,
         created_at: OffsetDateTime,
     }
 
     let rows: Vec<MemberRow> = sqlx::query_as(
-        "select b.user_id, u.email, u.display_name, b.scope_type, b.organization_id, b.site_id, \
-         b.expires_at, b.revoked_at, b.created_at \
-         from role_bindings b join users u on u.id = b.user_id \
+        "select b.subject_type, b.subject_id, b.user_id, \
+                coalesce(u.email, g.name, s.name, b.subject_id::text) as label, \
+                b.scope_type, b.organization_id, b.site_id, b.resource_type, b.resource_id, \
+                b.expires_at, b.revoked_at, b.created_at \
+         from role_bindings b \
+         left join users u on b.subject_type = 'user' and u.id = b.subject_id \
+         left join groups g on b.subject_type = 'group' and g.id = b.subject_id \
+         left join service_accounts s on b.subject_type = 'service_account' and s.id = b.subject_id \
          where b.role_id = $1 \
-         order by (b.revoked_at is null) desc, b.created_at desc",
+         order by (b.revoked_at is null) desc, b.created_at desc, b.id desc",
     )
     .bind(role_id)
     .fetch_all(pool)
@@ -1147,42 +1250,91 @@ pub async fn list_role_members(
     let now = OffsetDateTime::now_utc();
     let mut members = Vec::with_capacity(rows.len());
     for row in rows {
-        let scope = Scope::from_parts(&row.scope_type, row.organization_id, row.site_id)?;
+        let scope = Scope::from_parts(
+            &row.scope_type,
+            row.organization_id,
+            row.site_id,
+            row.resource_type.as_deref(),
+            row.resource_id.as_deref(),
+        )?;
         let active = row.revoked_at.is_none() && row.expires_at.is_none_or(|expires| expires > now);
+        let expired =
+            row.revoked_at.is_none() && row.expires_at.is_some_and(|expires| expires <= now);
         members.push(RoleMemberView {
+            subject_type: row.subject_type,
+            subject_id: row.subject_id,
             user_id: row.user_id,
-            email: row.email,
-            display_name: row.display_name,
+            label: row.label,
             scope: scope.into(),
             expires_at: row.expires_at,
             revoked_at: row.revoked_at,
             active,
+            expired,
             created_at: row.created_at,
         });
     }
 
-    Ok(Json(RoleMembersResponse {
-        role_id,
-        members,
-    }))
+    Ok(Json(RoleMembersResponse { role_id, members }))
 }
 
-/// List the role assignments of an account (the caller's own by default).
+/// List role assignments: the caller's own by default, any subject or role on request.
 pub async fn list_bindings(
     State(state): State<AppState>,
     current: CurrentSession,
     Query(query): Query<BindingsQuery>,
 ) -> Result<Json<BindingsResponse>, ApiError> {
-    let user_id = query.user_id.unwrap_or(current.user.id);
-    let bindings = bindings::list_for_user(state.db().pool(), user_id).await?;
+    let pool = state.db().pool();
+
+    // The pre-subject shape still works: `?user_id=` names a person.
+    let subject = match (&query.subject_type, query.subject_id, query.user_id) {
+        (None, None, Some(user_id)) => Some(Subject::User(user_id)),
+        (None, None, None) => Some(Subject::User(current.user.id)),
+        (Some(kind), Some(id), _) => Some(subject_from_parts(kind, id)?),
+        (Some(_), None, _) => {
+            return Err(ApiError::bad_request(
+                "invalid_subject",
+                "subject_id is required when subject_type is given",
+            ));
+        }
+        (None, Some(_id), _) => {
+            return Err(ApiError::bad_request(
+                "invalid_subject",
+                "subject_type is required when subject_id is given",
+            ));
+        }
+    };
+
+    let organization_id = match current.user.organization_id {
+        Some(own) => {
+            if let Some(requested) = query.organization_id
+                && requested != own
+            {
+                return Err(crate::scope::cross_organization());
+            }
+            Some(own)
+        }
+        None => query.organization_id,
+    };
+
+    let filter = bindings::BindingFilter {
+        organization_id,
+        subject,
+        role_id: query.role_id,
+        live_only: query.live.unwrap_or(false),
+        limit: query.limit.unwrap_or(200),
+    };
+    let rows = bindings::list(pool, &filter).await?;
 
     Ok(Json(BindingsResponse {
-        user_id,
-        bindings: bindings.iter().map(BindingBody::from).collect(),
+        subject_type: filter
+            .subject
+            .map(|subject| subject.subject_type().to_owned()),
+        subject_id: filter.subject.map(|subject| subject.id()),
+        bindings: rows.iter().map(BindingBody::from).collect(),
     }))
 }
 
-/// Assign a role to an account.
+/// Assign a role to a subject (person, group or machine identity).
 pub async fn create_binding(
     State(state): State<AppState>,
     current: CurrentSession,
@@ -1199,25 +1351,39 @@ pub async fn create_binding(
         None => None,
     };
 
-    let new = NewBinding {
+    let subject_kind = body
+        .subject_type
+        .map_or("user", |kind| kind.as_str())
+        .to_owned();
+    let subject_id = body
+        .subject_id
+        .or(body.user_id)
+        .ok_or_else(|| ApiError::bad_request("invalid_subject", "a binding needs its subject"))?;
+    let subject = subject_from_parts(&subject_kind, subject_id)?;
+
+    let new = NewSubjectBinding {
         role_id: body.role_id,
-        user_id: body.user_id,
+        subject,
         scope,
         granted_by: Some(current.user.id),
         expires_at,
     };
 
     let pool = state.db().pool();
-    bindings::validate(pool, &new).await?;
-    let binding = bindings::grant(pool, new).await?;
+    bindings::validate_subject(pool, &new).await?;
+    let binding = bindings::grant_subject(pool, new).await?;
 
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "iam.binding.granted")
-            .target("user", binding.user_id.to_string())
+            .target(
+                binding.subject.subject_type(),
+                binding.subject.id().to_string(),
+            )
             .metadata(json!({
                 "role_id": binding.role_id,
                 "scope": binding.scope.describe(),
+                "subject_type": binding.subject.subject_type(),
                 "expires_at": expires_at.map(|value| value.to_string()),
             }))
             .ip_address(address.as_text())
@@ -1226,6 +1392,96 @@ pub async fn create_binding(
     .await?;
 
     Ok((StatusCode::CREATED, Json(BindingBody::from(&binding))))
+}
+
+/// Revoke a role assignment.
+pub async fn delete_binding(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(binding_id): Path<Uuid>,
+) -> Result<Json<BindingBody>, ApiError> {
+    let pool = state.db().pool();
+    let bindings_list = bindings::list(
+        pool,
+        &bindings::BindingFilter {
+            organization_id: None,
+            subject: None,
+            role_id: None,
+            live_only: false,
+            limit: 500,
+        },
+    )
+    .await?;
+    let binding = bindings_list
+        .into_iter()
+        .find(|binding| binding.id == binding_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "binding_not_found",
+                "no such role assignment",
+            )
+        })?;
+
+    if current.user.organization_id.is_some() {
+        ensure_same_organization(&current, binding.scope.organization_id())?;
+    }
+
+    let revoked = bindings::revoke(pool, binding_id).await?;
+    if !revoked {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "binding_already_revoked",
+            "this role assignment was already revoked",
+        ));
+    }
+
+    let refreshed = bindings::list(
+        pool,
+        &bindings::BindingFilter {
+            organization_id: None,
+            subject: Some(binding.subject),
+            role_id: None,
+            live_only: false,
+            limit: 500,
+        },
+    )
+    .await?
+    .into_iter()
+    .find(|candidate| candidate.id == binding_id)
+    .unwrap_or(binding);
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.binding.revoked")
+            .target(
+                refreshed.subject.subject_type(),
+                refreshed.subject.id().to_string(),
+            )
+            .metadata(json!({
+                "role_id": refreshed.role_id,
+                "scope": refreshed.scope.describe(),
+            }))
+            .ip_address(address.as_text())
+            .organization(refreshed.scope.organization_id()),
+    )
+    .await?;
+
+    Ok(Json(BindingBody::from(&refreshed)))
+}
+
+/// Build a subject from its stored kind.
+fn subject_from_parts(kind: &str, id: Uuid) -> Result<Subject, ApiError> {
+    match kind {
+        "user" => Ok(Subject::User(id)),
+        "group" => Ok(Subject::Group(id)),
+        "service_account" => Ok(Subject::ServiceAccount(id)),
+        other => Err(ApiError::bad_request(
+            "invalid_subject",
+            format!("unknown subject type {other:?} — expected user, group or service_account"),
+        )),
+    }
 }
 
 /// Resolve the effective permission set of an account.
@@ -1271,7 +1527,13 @@ pub async fn effective_permissions(
         ensure_same_organization(&current, scope.organization_id())?;
     }
 
-    let effective = omnion_permissions::effective_permissions(pool, user_id, scope).await?;
+    let effective = omnion_permissions::effective_permissions_in(
+        pool,
+        user_id,
+        scope.clone(),
+        query.path.as_deref(),
+    )
+    .await?;
     let denied_keys: Vec<String> = effective.denials().keys().cloned().collect();
 
     let granted = effective
@@ -1339,7 +1601,7 @@ pub async fn list_audit(
 // ---------------------------------------------------------------------------------------------
 
 /// Write an audit row; a privileged action is not reported as successful without one.
-async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
+pub(crate) async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
     omnion_audit::record(state.db().pool(), entry).await?;
     Ok(())
 }
@@ -1364,6 +1626,78 @@ fn scope_from_request(body: &CreateBindingRequest) -> Result<Scope, ApiError> {
             Ok(Scope::Site {
                 organization_id: body.organization_id,
                 site_id,
+            })
+        }
+        ScopeTypeBody::Department => {
+            let organization_id = body.organization_id.ok_or_else(|| {
+                ApiError::bad_request(
+                    "invalid_scope",
+                    "organization_id is required for a department scope",
+                )
+            })?;
+            let department = body
+                .department
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_scope",
+                        "department is required for a department scope",
+                    )
+                })?;
+            Ok(Scope::Department {
+                organization_id,
+                department: department.to_owned(),
+            })
+        }
+        ScopeTypeBody::Module => {
+            if body.organization_id.is_none() && body.site_id.is_none() {
+                return Err(ApiError::bad_request(
+                    "invalid_scope",
+                    "a module scope needs an organization or a site",
+                ));
+            }
+            let module = body
+                .module
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request("invalid_scope", "module is required for a module scope")
+                })?;
+            Ok(Scope::Module {
+                organization_id: body.organization_id,
+                site_id: body.site_id,
+                module: module.to_owned(),
+            })
+        }
+        ScopeTypeBody::Resource => {
+            if body.organization_id.is_none() && body.site_id.is_none() {
+                return Err(ApiError::bad_request(
+                    "invalid_scope",
+                    "a resource scope needs an organization or a site",
+                ));
+            }
+            let resource_id = body
+                .resource_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_scope",
+                        "resource_id is required for a resource scope",
+                    )
+                })?;
+            Ok(Scope::Resource {
+                organization_id: body.organization_id,
+                site_id: body.site_id,
+                resource_type: body
+                    .resource_type
+                    .clone()
+                    .unwrap_or_else(|| "path".to_owned()),
+                resource_id: resource_id.to_owned(),
             })
         }
     }
@@ -1407,11 +1741,17 @@ mod tests {
         site_id: Option<Uuid>,
     ) -> CreateBindingRequest {
         CreateBindingRequest {
-            user_id: Uuid::nil(),
+            user_id: Some(Uuid::nil()),
+            subject_type: None,
+            subject_id: None,
             role_id: Uuid::nil(),
             scope_type,
             organization_id,
             site_id,
+            department: None,
+            module: None,
+            resource_type: None,
+            resource_id: None,
             expires_at: None,
         }
     }
