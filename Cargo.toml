@@ -43,6 +43,13 @@ argon2 = "0.5"
 rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
+
+# WebAuthn passkeys (crates/identity): the two signature families a credential can carry —
+# ES256 (P-256 ECDSA) and EdDSA (Ed25519). The COSE key and the ceremony blobs are read by the
+# crate's own small CBOR reader, so no general CBOR dependency is needed.
+p256 = "0.13"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # Object storage (crates/storage): the S3/MinIO client signs its own requests (SigV4) over a
 # plain HTTP client, so the media library needs no vendor SDK.

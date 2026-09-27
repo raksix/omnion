@@ -12,6 +12,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 time.workspace = true
+serde_json.workspace = true
 argon2.workspace = true
 rand.workspace = true
 sha2.workspace = true
@@ -23,3 +24,9 @@ tracing.workspace = true
 hmac = "0.12"
 sha1 = "0.10"
 subtle = "2"
+
+# WebAuthn (REQ-006, slice 3b): base64url for the ceremony's wire strings, and the two
+# signature families a passkey carries (ES256 via p256, EdDSA via ed25519-dalek).
+base64.workspace = true
+p256.workspace = true
+ed25519-dalek.workspace = true

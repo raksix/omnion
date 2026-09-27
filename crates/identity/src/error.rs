@@ -77,6 +77,9 @@ pub enum IdentityError {
     /// A factor field is not usable (kind, label, or a code that does not match).
     #[error("{0}")]
     InvalidFactor(String),
+    /// A WebAuthn ceremony was refused; the message names what did not hold.
+    #[error("{0}")]
+    WebAuthn(String),
 }
 
 /// Result alias used across the identity crate.

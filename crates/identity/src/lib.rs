@@ -24,6 +24,7 @@ pub mod signin;
 pub mod sites;
 pub mod totp;
 pub mod users;
+pub mod webauthn;
 
 pub use authentication::{AuthOutcome, authenticate};
 pub use error::{IdentityError, Result};
