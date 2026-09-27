@@ -37,6 +37,31 @@ pub enum PermissionsError {
     /// Inheritance chains must stay acyclic.
     #[error("role inheritance would create a cycle")]
     InheritanceCycle,
+    /// Inheritance chains may not grow beyond the documented depth.
+    #[error("role inheritance would exceed {max} levels")]
+    InheritanceDepthExceeded {
+        /// Longest accepted chain.
+        max: usize,
+    },
+    /// A role that still carries live bindings cannot be removed.
+    #[error("the role still carries {0} live binding(s)")]
+    RoleHasBindings(i64),
+    /// The role changed since the caller read it (the matrix save compares versions).
+    #[error("role version conflict: expected {expected}, current {current}")]
+    VersionConflict {
+        /// Version the caller worked from.
+        expected: i32,
+        /// Version the role carries now.
+        current: i32,
+    },
+    /// A permission set carries keys the catalogue does not know, duplicates, or both.
+    #[error("invalid permission entries: unknown {unknown:?}, duplicates {duplicates:?}")]
+    InvalidEntries {
+        /// Keys outside the catalogue.
+        unknown: Vec<String>,
+        /// Keys repeated inside one set.
+        duplicates: Vec<String>,
+    },
     /// A role can only inherit from a role of its own organization or a platform role.
     #[error("inherited role belongs to another organization")]
     CrossOrganizationInheritance,

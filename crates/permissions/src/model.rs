@@ -11,6 +11,10 @@ pub const MAX_PRIORITY: i32 = 1000;
 /// Lowest priority a role may carry.
 pub const MIN_PRIORITY: i32 = 0;
 
+/// Longest inheritance chain a role may sit in, counted in each direction (docs/07-IAM.md §4:
+/// "a single-parent chain, at most eight levels deep").
+pub const MAX_INHERITANCE_DEPTH: usize = 8;
+
 /// Longest accepted role key.
 const MAX_ROLE_KEY_LENGTH: usize = 64;
 
@@ -270,6 +274,134 @@ pub struct PermissionSummary {
     pub allowed: i64,
     /// Explicit denies.
     pub denied: i64,
+}
+
+/// One stored version of a role (docs/07-IAM.md §17).
+///
+/// A version is the role's own fields plus its permission set as they stood at one moment; the
+/// history tab reads consecutive versions and draws their diff.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RoleVersion {
+    /// Primary key.
+    pub id: Uuid,
+    /// The role this version belongs to.
+    pub role_id: Uuid,
+    /// One-based version number, counted per role.
+    pub version: i32,
+    /// Role name at this version.
+    pub name: String,
+    /// Role description at this version.
+    pub description: String,
+    /// Priority at this version.
+    pub priority: i32,
+    /// Parent link at this version.
+    pub inherits_role_id: Option<Uuid>,
+    /// Whether inheritance was on.
+    pub inherit_permissions: bool,
+    /// The permission set, as `[{"key": …, "effect": …}]`.
+    pub permissions: serde_json::Value,
+    /// What kind of change produced this version (`created`, `updated`, `permissions`, …).
+    pub change: String,
+    /// Who made the change (`None` = the platform or the seed).
+    pub changed_by: Option<Uuid>,
+    /// When the version was written.
+    pub created_at: OffsetDateTime,
+}
+
+impl RoleVersion {
+    /// The permission set parsed back into entries.
+    #[must_use]
+    pub fn entries(&self) -> Vec<RolePermission> {
+        self.permissions
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let key = item.get("key")?.as_str()?.to_owned();
+                        let effect = Effect::from_stored(item.get("effect")?.as_str()?).ok()?;
+                        Some(RolePermission { key, effect })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// One permission entry that moved between two versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionChange {
+    /// Permission key.
+    pub key: String,
+    /// Effect before the change.
+    pub from: Option<Effect>,
+    /// Effect after the change.
+    pub to: Option<Effect>,
+}
+
+/// What changed between two permission sets (the matrix's diff preview and the history tab).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleDiff {
+    /// Keys the newer set adds.
+    pub added: Vec<RolePermission>,
+    /// Keys whose effect flipped.
+    pub changed: Vec<PermissionChange>,
+    /// Keys the newer set drops.
+    pub removed: Vec<RolePermission>,
+}
+
+impl RoleDiff {
+    /// `true` when the two sets are equal.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    /// How many entries the diff touches.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.added.len() + self.changed.len() + self.removed.len()
+    }
+}
+
+/// How a role update changes the parent link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParentChange {
+    /// Leave the link alone.
+    #[default]
+    Keep,
+    /// Point the role at a new parent.
+    Set(Uuid),
+    /// Detach the role from its parent.
+    Clear,
+}
+
+/// A partial update of a role (the fields a caller left out are kept).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleUpdate {
+    /// New display name.
+    pub name: Option<String>,
+    /// New description.
+    pub description: Option<String>,
+    /// New priority.
+    pub priority: Option<i32>,
+    /// What to do with the parent link.
+    pub parent: ParentChange,
+    /// Whether inherited permissions apply.
+    pub inherit_permissions: Option<bool>,
+}
+
+/// The outcome of a matrix save: what the role holds now and how it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSaveOutcome {
+    /// The role after the save.
+    pub role: Role,
+    /// The permission set as written.
+    pub entries: Vec<RolePermission>,
+    /// The diff against what the role held before.
+    pub diff: RoleDiff,
+    /// The version number the save wrote.
+    pub version: i32,
 }
 
 /// Validate a role key: lowercase slug, digits and dashes (`marketing-manager`).

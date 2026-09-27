@@ -50,9 +50,12 @@ impl BindingRow {
 pub async fn grant(pool: &PgPool, new: NewBinding) -> Result<RoleBinding> {
     retire_expired(pool, &new).await?;
 
+    // The subject columns are written explicitly; `user_id` stays beside them for one release
+    // (expand-then-contract, 0011_iam_advanced.sql).
     let sql = format!(
-        "insert into role_bindings (role_id, user_id, scope_type, organization_id, site_id, \
-         granted_by, expires_at) values ($1, $2, $3, $4, $5, $6, $7) returning {BINDING_COLUMNS}"
+        "insert into role_bindings (role_id, user_id, subject_type, subject_id, scope_type, \
+         organization_id, site_id, granted_by, expires_at) \
+         values ($1, $2, 'user', $2, $3, $4, $5, $6, $7) returning {BINDING_COLUMNS}"
     );
 
     let row: BindingRow = sqlx::query_as(&sql)
@@ -169,6 +172,17 @@ pub async fn count_live_for_role(pool: &PgPool, role_id: Uuid) -> Result<i64> {
     .fetch_one(pool)
     .await?;
     Ok(count)
+}
+
+/// Every binding carrying a role — live ones first, then the ones that ran out.
+pub async fn list_for_role(pool: &PgPool, role_id: Uuid) -> Result<Vec<RoleBinding>> {
+    let sql = format!(
+        "select {BINDING_COLUMNS} from role_bindings where role_id = $1 \
+         order by (revoked_at is null) desc, created_at desc, id desc"
+    );
+
+    let rows: Vec<BindingRow> = sqlx::query_as(&sql).bind(role_id).fetch_all(pool).await?;
+    rows.into_iter().map(BindingRow::into_binding).collect()
 }
 
 /// Validate a binding before it is written: the role must exist and may only be used inside

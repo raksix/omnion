@@ -23,6 +23,7 @@ pub mod evaluate;
 pub mod model;
 pub mod roles;
 pub mod seed;
+pub mod versions;
 
 pub use catalogue::{CATALOGUE, PermissionDef, get as permission, is_known};
 pub use error::{PermissionsError, Result};
@@ -31,7 +32,8 @@ pub use evaluate::{
     effective_permissions,
 };
 pub use model::{
-    Effect, MAX_PRIORITY, MIN_PRIORITY, NewBinding, NewRole, PermissionSummary, Role, RoleBinding,
-    RolePermission, RolePermissionInput, Scope,
+    Effect, MAX_INHERITANCE_DEPTH, MAX_PRIORITY, MIN_PRIORITY, NewBinding, NewRole, ParentChange,
+    PermissionChange, PermissionSummary, Role, RoleBinding, RoleDiff, RolePermission,
+    RolePermissionInput, RoleSaveOutcome, RoleUpdate, RoleVersion, Scope,
 };
 pub use seed::SeedReport;

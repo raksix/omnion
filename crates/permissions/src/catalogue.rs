@@ -218,6 +218,99 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "iam",
         description: "Assign and revoke roles",
     },
+    // The rest of the IAM surface (docs/07-IAM.md, REQ-006): each family keeps read and manage
+    // apart, so an operator can be trusted to look at the people, the policies or the sessions
+    // without being able to change them.
+    PermissionDef {
+        key: "iam.groups.read",
+        category: "iam",
+        description: "Read groups and their members",
+    },
+    PermissionDef {
+        key: "iam.groups.manage",
+        category: "iam",
+        description: "Create groups and change their membership",
+    },
+    PermissionDef {
+        key: "iam.serviceaccounts.read",
+        category: "iam",
+        description: "Read machine identities and their keys",
+    },
+    PermissionDef {
+        key: "iam.serviceaccounts.manage",
+        category: "iam",
+        description: "Create service accounts and issue or revoke their keys",
+    },
+    PermissionDef {
+        key: "iam.policies.read",
+        category: "iam",
+        description: "Read ABAC policies and their versions",
+    },
+    PermissionDef {
+        key: "iam.policies.manage",
+        category: "iam",
+        description: "Create and change ABAC policies",
+    },
+    PermissionDef {
+        key: "iam.simulate",
+        category: "iam",
+        description: "Ask the permission simulator what a subject may do",
+    },
+    PermissionDef {
+        key: "iam.security.read",
+        category: "iam",
+        description: "Read the password, lockout, IP and session policy",
+    },
+    PermissionDef {
+        key: "iam.security.manage",
+        category: "iam",
+        description: "Change the password, lockout, IP and session policy",
+    },
+    PermissionDef {
+        key: "iam.sessions.read",
+        category: "iam",
+        description: "Read active sessions",
+    },
+    PermissionDef {
+        key: "iam.sessions.revoke",
+        category: "iam",
+        description: "End a signed-in session",
+    },
+    PermissionDef {
+        key: "iam.devices.read",
+        category: "iam",
+        description: "Read known devices",
+    },
+    PermissionDef {
+        key: "iam.devices.manage",
+        category: "iam",
+        description: "Set a device's trust window and forget devices",
+    },
+    PermissionDef {
+        key: "iam.providers.read",
+        category: "iam",
+        description: "Read the connected sign-in providers",
+    },
+    PermissionDef {
+        key: "iam.providers.manage",
+        category: "iam",
+        description: "Connect and change sign-in providers",
+    },
+    PermissionDef {
+        key: "iam.approvals.read",
+        category: "iam",
+        description: "Read permission requests",
+    },
+    PermissionDef {
+        key: "iam.approvals.decide",
+        category: "iam",
+        description: "Approve or reject permission requests",
+    },
+    PermissionDef {
+        key: "iam.provisioning.manage",
+        category: "iam",
+        description: "Issue provisioning tokens and run the sync",
+    },
     // Audit.
     PermissionDef {
         key: "audit.read",
