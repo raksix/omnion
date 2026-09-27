@@ -1431,3 +1431,49 @@
   idle/absolute lifetime from the policy row, lockout per account and per IP, IP lists, TOTP and
   passkey enrolment with step-up, recovery codes). The walkthrough's denial case should use an
   account with no bindings so the artifact shows a `DENIED` verdict card as well.
+
+## 2026-09-27 — REQ-006 slice 3a: the security policy, sessions, devices and TOTP
+
+- **The slice.** Migration `0017` adds `sessions.step_up_at`, a live-session index and
+  `mfa_challenges`. `crates/identity` gained five modules: `totp` (RFC 6238/4226 over HMAC-SHA1
+  with the RFC's own vectors, Base32, `otpauth://`), `secrets` (encrypt-then-MAC envelopes for
+  stored secrets, key from `OMNION_MFA_KEY`), `security` (the policy document, its ranges as
+  field-level refusals, a CIDR matcher), `devices` (fingerprint, first/last seen, trust window)
+  and `mfa` (two-step TOTP enrolment, ten single-use recovery codes hashed and consumed by a
+  conditional update). `signin` runs the order a sign-in should: address lists → lockout →
+  password → factor, with every attempt recorded in `sign_in_attempts`. Sessions now take idle,
+  absolute and concurrent lifetimes from the policy row — never from a constant.
+- **Dangerous operations demand a fresh step-up** (`POST /auth/step-up`: the caller's own
+  password or an enrolled code, ten minutes): resetting factors, removing a confirmed factor and
+  issuing a service-account key answer `403 step_up_required`, and the panel parks the refused
+  action behind a prompt that retries it. Forgetting a device also ends its live sessions.
+- **Panel**: `/settings/iam/security` (five policy tabs, ranges on the field, the diff a save
+  applied), `/settings/iam/sessions` (state badges from the resolver's own values, filters,
+  revoke, sign-out-all, cards below `lg`), `/settings/iam/devices` (trust window, forget) and the
+  user detail's **Second factors** tab (enrolment with the secret shown once, confirmation +
+  recovery codes, remove, reset).
+- **Proof.** `cargo test --workspace` → **614 tests, 0 failures (exit 0)**; identity's own suite grew to 52 (TOTP against the RFC 4226/6238 vectors, envelopes, CIDR matching, hashing). The slice walk
+  (`apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end`)
+  proves the whole slice over HTTP in 15.6s: the policy save with its diff, a range refusal and an
+  unusable network each naming their field, a lockout that triggers at the configured threshold
+  (the correct password is refused while locked), a denied address refused with the *correct*
+  password, an allowlist narrowing, the per-address failure count, the idle window proven twice
+  (refused at five minutes, accepted at two hours), a revoke that ends a session on its next
+  request, `sign-out-all`, the concurrent cap retiring the oldest, the device registry with its
+  trust window, TOTP enrolment + confirmation + a challenge a code completes, a recovery code
+  spent exactly once, `step_up_required` on MFA reset and key issuance, and the audit trail
+  carrying every one of those actions. `pnpm typecheck && pnpm build` → 2/2, the admin route
+  table lists the three new screens.
+- **QA pass** `qa-artifacts/20260927-055804`: **727 clicks, 750 screenshots, 0 high findings** (5 medium, all the carried-forward public renderer 404s), vision review 1 medium (the analytics realtime card's raw snapshot ids, pre-existing) and 0 vision failures. The new pass `iam-security-depth` recorded 14 steps, all of them green: policy refused in the field, saved with its diff, the address list refusing an unusable network, the session list with two rows and a real revoke, the filtered list, the device registry trusted and cleared, and the MFA enrolment dialog opened (secret + `otpauth://` shown) and cancelled.
+- **What the first pass found (fixed in this tick).** Two high findings, both mine: the policy
+  screen sent an invalid network to the API instead of refusing it on the field (now validated in
+  the browser too — the API's own refusal stays pinned by the integration walk), and a *platform*
+  account saw an empty session and device list because the screens defaulted to the first tenant
+  while those accounts carry no organization (both now default to "all organizations", with a
+  picker to narrow). The walkthrough's first run also showed the two list screens returning zero
+  rows for the same reason — that is how the defect was found.
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium).
+- Next: **REQ-006 slice 3b** — WebAuthn/passkeys (the ceremony: CBOR parsing, COSE key handling
+  and signature verification), then slice 4 (enterprise sign-in, SCIM, ABAC policy builder,
+  approvals, the safety invariants). Slice 3b needs a crypto dependency (`p256`/`ed25519-dalek` +
+  a CBOR reader) that the workspace does not carry yet.

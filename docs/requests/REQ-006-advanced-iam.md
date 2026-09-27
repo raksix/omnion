@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** in-progress — slices 1–2 shipped (role depth `c0ed83c…a13fa4b`, subjects/scopes/simulator `1817a2c…7e3190d`), slices 3–4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/auth`, `crates/permissions`)
+> **Status:** in-progress — slices 1–3a shipped (role depth, subjects/scopes/simulator, and the security policy / sessions / devices / TOTP half of slice 3); WebAuthn passkeys and slice 4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -172,8 +172,9 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 - [x] A service-account key authenticates a `/api/v1` request over Bearer and cannot start an interactive sign-in session. *(slice 2: `omsa_…` key → `200` on `/iam/simulations` with the machine as the default subject; `401 unauthorized` on a session-only route, `401` and no cookie on `/auth/login`, and `401 invalid_machine_key` the moment the key is revoked.)*
 - [x] The simulator’s verdict equals the guard’s verdict across a test matrix of ≥ 100 (subject, action, resource) cases. *(slice 2: three (subject, context) cases — a user at organization scope, the same user on a resource path and a service account — against the whole catalogue: 216 comparisons, each next to the guard's own `authorize_subject`.)*
 - [ ] Safety invariants hold: removing the last owner binding, or the caller’s own last privileged binding, is refused with a message naming the invariant.
-- [ ] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants.
-- [ ] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; TOTP and a passkey both enrol and verify; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once.
+- [x] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants. *(slice 3a: the same walk revokes one session and the next request answers `401`, `sign-out-all` ends both live sessions, the same untouched row is refused at a five-minute idle window and accepted once the policy says two hours (so it is the policy, not a constant), and the concurrent cap of two retires the oldest with `revoke_reason = 'concurrent_cap'`.)*
+- [x] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once. *(slice 3a: `apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end` — three failures lock the account at the threshold the policy names and the fourth answer is `account_locked`; the correct password is refused while locked; a denied address answers `address_blocked` for the correct password as well, an allowlist refuses an address outside it, and the fourth failure from one address is refused by the address count; TOTP enrols, confirmation issues ten recovery codes, a sign-in answers a challenge instead of a cookie, and a recovery code works exactly once; `reset-mfa` and key issuance both answer `403 step_up_required` until the caller proves identity again.)*
+- [ ] TOTP and a **passkey** both enrol and verify. *(slice 3a ships TOTP; WebAuthn/passkeys — the ceremony, CBOR parsing and signature verification — is the remaining piece of slice 3.)*
 - [ ] OIDC and SAML sign-in complete against a test provider with JIT provisioning and the mapped role; a SCIM create → update → deactivate round trip appears in the sync log.
 - [ ] An approved request grants the permission only inside its window and expires on its own; every role, binding, policy, session, device and approval change writes an audit entry; all routes answer 401/403/200 as documented; every screen has empty, loading and error states with zero high findings in the QA pass.
 
@@ -200,6 +201,57 @@ What the visual check should see: a matrix with a sticky category header, tri-st
 - **SSO, passkeys and event volume:** document the local `localhost` exception so QA can exercise WebAuthn (a test that silently skips is not evidence), and sample or aggregate `iam.policy_denied`/`iam.signin_failed` before they reach webhooks.
 
 ## Progress
+
+### Slice 3a — Sessions, devices, the security policy and TOTP (shipped)
+
+- **Migration `0017_iam_sessions_mfa.sql`**: `sessions.step_up_at`, a live-session index for the
+  list, and `mfa_challenges` (a sign-in whose account holds a factor is finished by a code that
+  consumes a short-lived challenge — the same table carries the step-up challenge). Additive;
+  every table the slice writes already existed in `0011`.
+- **`crates/identity` gained five modules.** `totp` implements RFC 6238/4226 over HMAC-SHA1 with
+  the RFC's own test vectors, plus Base32 and the `otpauth://` URI; `secrets` encrypts stored
+  secrets as encrypt-then-MAC envelopes (SHA-256 counter mode + HMAC-SHA256, key from
+  `OMNION_MFA_KEY`); `security` is the policy document with the table's ranges as field-level
+  refusals and a CIDR matcher for the address lists; `devices` fingerprints a user agent and
+  keeps first/last seen and the trust window; `mfa` enrols TOTP in two steps and issues ten
+  single-use recovery codes (hashed; consumed by a conditional update, so "exactly once" holds
+  even under a race).
+- **`signin` is the order of a sign-in**: the address lists and an existing lockout are checked
+  **before** the password, then the password, then a confirmed factor — every attempt lands in
+  `sign_in_attempts` with the word the reader sees (`failed`, `locked`, `blocked`, `mfa_required`,
+  `success`). Lockout has two dimensions: a per-account counter that sets `users.locked_until`
+  and a per-address count of recent failures, because an account lock alone lets one address
+  spray every account forever.
+- **Sessions take their lifetimes from the policy row, never from a constant**: the idle window
+  is enforced when a token is resolved (and the row reads back as `idle`), the absolute lifetime
+  is `sessions.absolute_expires_at`, and opening a session past the concurrent cap retires the
+  oldest one (`revoke_reason = 'concurrent_cap'`). Revoking by id and signing an account out
+  everywhere answer the ids they ended, and every one of them emits `iam.session_revoked`.
+- **Dangerous operations demand a fresh step-up** (`auth/step-up`: the caller's own password or
+  an enrolled code, ten minutes): resetting an account's factors, removing a confirmed factor and
+  issuing a service-account key answer `403 step_up_required` with the action named. Forgetting a
+  device also ends its live sessions.
+- **Panel**: `/settings/iam/security` (five policy tabs with the ranges on the field, a save that
+  answers the diff it applied), `/settings/iam/sessions` (state badges from the same values the
+  resolver reads, filters, revoke, sign-out-all, cards below `lg`), `/settings/iam/devices`
+  (trust window, forget) and the user detail's **Second factors** tab (enrolment with the secret
+  shown once, confirmation, recovery codes, remove, reset — all through the step-up dialog).
+- **Proof**: `cargo test --workspace` green — the slice walk
+  (`apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end`)
+  drives the whole slice over HTTP: a policy save with its diff, a range refusal and an unusable
+  network each naming their field, a lockout that triggers at exactly the configured threshold
+  and is recorded, a denied address refused before the password check (asserted with the *correct*
+  password), an allowlist narrowing, the per-address failure count, the idle window proven twice
+  (the same row refused at five minutes and accepted at two hours), a revoke that ends a session
+  on its next request, `sign-out-all`, the concurrent cap retiring the oldest, the device registry
+  with its trust window, TOTP enrolment + confirmation + a challenge that a code completes, a
+  recovery code that works exactly once, and step-up demanded for MFA reset and key issuance
+  (with the audit trail carrying every one of those actions). The walkthrough drives the same
+  screens in the browser (`scripts/qa/walkthrough.cjs`, pass `iam-security-depth`).
+- **Remaining in this slice**: WebAuthn/passkeys (the `webauthn` factor shape is in the table and
+  the API; the ceremony itself — CBOR parsing and signature verification — is the next step), and
+  the `mfa_required` policy flag is stored and surfaced but does not yet force enrolment at
+  sign-in.
 
 ### Slice 2 — Subjects, scopes and the simulator (shipped)
 
