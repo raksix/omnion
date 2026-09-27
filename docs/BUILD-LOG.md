@@ -1831,3 +1831,54 @@ consumers (`form.submitted` → contact + deal, `sales.quote.accepted` → deal 
 **Environment note.** `/mnt/apopic` is at 86% with 8.0 GB free; this writer reclaimed its own
 `target/debug/incremental` at the start of the tick. The seven writers' `target/` directories
 remain the pressure, and a shared `CARGO_TARGET_DIR` would remove it permanently.
+## 2026-09-27 — REQ-051 slice 3 unblocked: the "migration gap" was a misdiagnosis, and the walks it hid found two real bugs
+
+**What.** Slice 3's eight integration walks and its browser pass had never run. The previous tick
+recorded why as a gap in this branch's migration set and proposed a platform-wide renumber across
+five other writers' branches. That diagnosis was wrong. The walks now run, and they fail on two
+defects that a real database round trip is the only thing that can find.
+
+**The correction, because the reasoning matters more than the outcome.** `Migration(VersionMissing(19))`
+was read as "this branch's source is missing 0019". It is not: the message is raised when a version
+is **applied in the database and absent from the source**, which is a different condition and is
+invisible in `ls database/migrations`. The shared development database `omnion` — the default
+target of `OMNION_DATABASE_URL` — has 19 and 21 in its `_sqlx_migrations` ledger, applied by a run
+against files no branch carries today. Creating a throwaway database and pointing the suite there
+made all 29 walks execute, 24 passing immediately. The migration numbering is a real wart in the
+shared environment, but it is not this branch's blocker, and renumbering five branches would have
+fixed nothing.
+
+**What the runs then found.**
+
+1. **The amount never reached the column.** `create_deal` and `patch_deal` bind the normalised
+   money value as a Rust `String` into a `numeric` column. Postgres does not coerce a text
+   parameter into `numeric`, so every create was a 500 — and the board, the won flow and the lost
+   flow all sit on top of the create. The repair is a cast in the statement (`$9::numeric`, and a
+   `set_numeric!` variant of the existing `set!` macro for the update), not a float: the column is
+   the thing the forecast sums.
+2. **A close date could not be sent at all.** The request bodies took `expected_close_on` as a bare
+   `time::Date`, which serde reads as the crate's internal tuple. The `"2026-12-01"` that
+   `<input type="date">` produces — the only thing a browser can send — was a 422, so the entire
+   won/lost flow, which requires a close date, was unreachable from the panel. `modules/crm/src/dates.rs`
+   is the fix: a `YYYY-MM-DD` round trip, with a refusal that quotes what was sent and names the
+   format. The same gap was on the way out: `deal_ref` and the `crm.deal.won` payload are built
+   with `json!`, which never consults serde, so a `Date` in either reached the client and every
+   event subscriber as `[2026, 273]`.
+
+**Proof.** `cargo test -p omnion-module-crm` → **106 passed** (100 before, 6 new for the date
+format). `cargo test -p omnion-api --test crm` → **29 passed, 0 failed in 167 s** against a
+database created immediately beforehand — these are the walks that have never completed.
+`apps/admin` `tsc --noEmit` → 0 errors. Commit `b49aa3d`, pushed to `origin/wave4`.
+
+**What it cost to find, written down for the next writer.** Naming a serde `with` path *replaces*
+a field's whole deserializer, so a field-level `#[serde(default)]` beside it is silently discarded
+and an omitted date still fails with "missing field"; the `default` has to go on the containing
+struct, which then has to derive `Default`. And `visit_some`'s inner deserializer carries no
+`de::Error` bound in the trait, so a hand-written `Visitor` cannot build a custom message there —
+`Option::<String>::deserialize` plus a container `default` is the whole fix. Both cost compile
+cycles here for a conclusion that is now a comment at the point of use.
+
+**Next.** The QA browser pass on the w4 stack is the last gate for slice 3, and slice 3 closes only
+on it. Then slice 4: activities, the merged timeline, the read-only copilot, global search and the
+automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted` → deal won). The
+`crm_activities` table already exists in the migration and is still unused.

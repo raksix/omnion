@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — slices 1 and 2 shipped; slice 3 (deals + the pipeline board) shipped in `9909af9` with its integration walks written but not yet executed (the branch's migration set has a pre-existing gap — see the note at the foot of this file); slice 4 (activities, timeline, copilot, search, automations) is next · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
+> **Status:** in-progress — slices 1, 2 and 3 shipped; slice 3's integration walks now run and pass (29/29) after `b49aa3d` fixed a `numeric`/text bind and a date that no form could send, and the QA browser pass for it is the last gate before it closes; slice 4 (activities, timeline, copilot, search, automations) is next · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -136,14 +136,14 @@ Payloads carry ids and the changed field list only — never a rendered document
 
 - [x] Migration `0022_crm.sql` applies on a populated database without touching existing rows; `cargo test -p omnion-module-crm` is green (84 unit tests). (Renumbered from `0021`, which `0021_iam_sso.sql` on main took while this file was in flight; a migration number is global across branches.)
 - [x] Every `/api/v1/crm/*` route answers 401 unauthenticated, 403 with the permission missing, and 200 with it granted; a contact from another organization is invisible (404) — proved by `every_crm_route_is_permission_guarded` and `a_record_of_another_organization_is_invisible`.
-- [x] Creating, updating, archiving and merging a contact/company/deal writes an audit entry with actor, before/after diff and request id. (Contacts and companies proved in slice 2; the deal's `crm.deal.created` / `crm.deal.updated` / `crm.deal.archived` / `crm.deal.stage_changed` rows are asserted by the walks written in `9909af9` — **pending their first run**, see the note below.)
-- [ ] `crm.contact.created`, `crm.deal.stage_changed` and `crm.deal.won` appear in the event feed with the documented payload and reach a subscribed webhook endpoint. (The contact and company names land in the feed. `crm.deal.stage_changed` / `.won` / `.lost` are emitted with the documented payload and asserted by the slice-3 walks, which **have not run yet** — see the note below.)
+- [x] Creating, updating, archiving and merging a contact/company/deal writes an audit entry with actor, before/after diff and request id. (Contacts and companies proved in slice 2; the deal's `crm.deal.created` / `crm.deal.updated` / `crm.deal.archived` / `crm.deal.stage_changed` rows are asserted by the slice-3 walks, which now run: **29/29 passed** against a fresh database in `b49aa3d`.)
+- [x] `crm.contact.created`, `crm.deal.stage_changed` and `crm.deal.won` appear in the event feed with the documented payload and reach a subscribed webhook endpoint. (`the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event` and `a_stage_move_persists_reloads_and_emits_the_documented_event`, both in the 29/29 run. The walk also asserts the payload carries **no** deal title, and `b49aa3d` fixed `crm.deal.won`'s `close_on`, which `json!` was writing as a `[2026, 273]` tuple.)
 - [x] Contact list: search, owner, status, tag and date filters combine; sort persists in a saved view; column chooser survives reload — `the_contact_list_filters_sorts_and_totals` and `a_saved_view_is_the_query_it_stands_for`, with the screen in the walkthrough route list.
 - [x] Inline edit of owner/status/tags saves optimistically and rolls back with a visible error when the API rejects it — the screen sends the patch, restores the previous value and shows the refusal under the field.
 - [x] The API rejects a malformed e-mail and a duplicate e-mail (case-insensitive) with a field-level message in `error.details.field` — `the_contact_and_company_forms_refuse_what_they_name`.
 - [x] CSV import runs a dry run that shows row count, mapped columns and per-row errors before commit; commit writes only the valid rows — `an_import_previews_before_it_writes_and_then_writes_what_it_accepted`, and `an_export_is_the_lists_own_answer_and_imports_back` proves the export applies the same field hiding as the list and re-imports.
-- [x] Pipeline board drag moves a deal, persists the new stage, updates per-stage count/sum/weighted sum, and is reversible with `ctrl + ←/→`. The one statement that computes the count, the sum and the weighted sum is the board's own header query, and the keyboard path sends the **same** request the drag sends. *Unit-proved; the browser walk is written (`runCrmDealsDepth`) and awaits the migration gap below.*
-- [x] Moving a deal to `lost` requires a reason; moving to `won` records/confirms the close date and emits `crm.deal.won`. The rule is in the module (`resolve_move`) and in the schema's trigger, the dialog is required before the write, and leaving the lost column forgets the old reason. *Unit-proved; the walk is written and awaits the migration gap below.*
+- [x] Pipeline board drag moves a deal, persists the new stage, updates per-stage count/sum/weighted sum, and is reversible with `ctrl + ←/→`. The one statement that computes the count, the sum and the weighted sum is the board's own header query, and the keyboard path sends the **same** request the drag sends. *Proved by `a_new_deal_lands_on_the_first_open_stage_and_the_board_adds_up` and `moving_a_deal_to_the_stage_it_is_already_in_is_a_no_op` in the 29/29 run. The browser walk (`runCrmDealsDepth`) is registered in the route list.*
+- [x] Moving a deal to `lost` requires a reason; moving to `won` records/confirms the close date and emits `crm.deal.won`. The rule is in the module (`resolve_move`) and in the schema's trigger, the dialog is required before the write, and leaving the lost column forgets the old reason. *Proved by `the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event` in the 29/29 run. `b49aa3d` is what made this reachable at all: the close date was a 422 for every caller.*
 - [x] Visibility scoping works: a member with `own` sees only their records (enforced in SQL, a hidden record is a `404`), a team lead sees the group's, an unnarrowed account sees the organization's — `the_own_visibility_level_hides_a_colleagues_record`.
 - [x] A role without `crm.fields.sensitive.read` sees the flagged field hidden, at every depth of the custom object, in both the list and the detail — `the_flagged_fields_are_hidden_from_a_role_without_the_key`. (Export and import preview arrive with slice 2's CSV.)
 - [ ] Record timeline merges activities, stage changes and audit-worthy notes in one ordered stream with correct relative times.
@@ -176,37 +176,43 @@ What the visual check should see: a board with four stage columns, per-column co
 - Merge must be transactional and must move activities/deals, then archive the loser — never delete a record other rows point at.
 - Copilot output is untrusted text: render as plain text, never as HTML, and always show it as a draft.
 
-### Blocker (2026-09-27, slice 3) — the branch's migration set has a gap
+### The migration "blocker" was a misdiagnosis (2026-09-27, corrected in `b49aa3d`)
 
-`cargo test -p omnion-api --test crm` cannot reach a database: the fixture panics with
-`Migration(VersionMissing(19))` before any test body runs, so all 29 tests report FAILED in
-0.82 s. **This is not a defect in slice 3 and not a race** — it is this branch's migration
-directory being non-contiguous, and it predates this work.
+An earlier tick recorded that `cargo test -p omnion-api --test crm` could not run because this
+branch's migration set had a gap at 0019/0020, and it proposed a platform-wide renumber as the
+remedy. **That diagnosis was wrong, and acting on it would have touched five other writers' branches
+to fix nothing.** It is kept here because a confidently wrong blocker costs the next tick more
+than the bug it described.
 
-The numbers, from `git ls-tree origin/<branch> database/migrations/`:
+What the evidence actually was, and what it was read as:
 
-| branch | last migrations |
-|---|---|
-| `main` | …`0018_webauthn`, **`0021_iam_sso`** — 0019 and 0020 absent |
-| `wave2-cms` | …`0019_cms_blocks`, `0021_iam_sso` — 0020 absent |
-| `wave3-automation` | …`0020_automation_depth`, `0021…`, `0023…`, `0024…` — 0019 absent |
-| `wave4` (this branch) | …`0018_webauthn`, `0022_crm` — 0019, 0020, 0021 absent |
-| `wave5` | …`0019_organization_memberships` |
-| `wave6` | …`0019_secret_hierarchy`, `0021_iam_sso` — 0020 absent |
-| `wave7` | …`0021_iam_sso`, `0022_ai_provider_runtime` — 0019, 0020 absent |
+* The suite reported 29 FAILED in 0.99 s. That was read as "a fixture that never set up".
+* The fixture's panic was `Migration(VersionMissing(19))`, read as "this branch's set is not
+  contiguous".
+* The fix attempted was a merge of `main`, on the theory that it would supply 0021.
 
-sqlx requires a contiguous set: a branch holding `0022` without `0019` and `0020` reports the
-**missing** version, not the collision — which is why the error names 19 and never mentions
-22. Merging `main` into this branch would bring in `0021` and still leave the 0019/0020 gap, so
-the fix is not a merge. Two options, both the owner's call:
+What is true. The migration *directory* is non-contiguous, and that is real. But
+`Migration(VersionMissing(N))` is raised when a version is **applied in the database and absent
+from the source**, which is a different condition from "the source is missing a file". The shared
+development database `omnion` — the default target of `OMNION_DATABASE_URL` — has 19 and 21 in
+its `_sqlx_migrations` ledger, applied by a run against files no branch carries today. Pointing
+the suite at a database created a moment earlier makes all 29 walks run, and 5 of them fail on
+real defects.
 
-1. **Renumber onto the sequence each branch actually has** — awkward, because seven branches
-   hold disjoint slices and the merged set still needs 0019 and 0020 to exist exactly once.
-2. **Have one branch (naturally `main`) carry the two missing files** as empty additive
-   migrations, after which every branch merges cleanly and the QA stacks can migrate.
+So the migration numbering is a shared-environment wart, not this branch's blocker, and the
+correct response was to name the database the suite was talking to, not to renumber five branches.
 
-Until then the slice-3 **unit** gate is green (`cargo test -p omnion-module-crm` → 100 passed,
-`cargo test -p omnion-permissions` → 63 passed, `apps/admin` `tsc --noEmit` → 0 errors) and the
-eight integration walks and the browser depth pass are written but unexecuted. The next tick
-re-runs them the moment the set is contiguous, and the QA browser pass
-(`QA_STACK=w4 …`) runs on the close tick for the same reason.
+**What the runs then found** (all fixed in `b49aa3d`, walks now 29/29):
+
+1. `create_deal`/`patch_deal` bound a money `String` into a `numeric` column. Postgres will not
+   coerce it, so every create was a 500 and the board, won and lost flows all sat on top of it.
+2. `expected_close_on` was a bare `time::Date`, which `serde` reads as a tuple — so the
+   `"2026-12-01"` a browser's date input sends was a 422, and the won/lost flow was unreachable
+   from the panel. `modules/crm/src/dates.rs` is the `YYYY-MM-DD` round trip that fixes it, on the
+   request side and in the two hand-built `json!` payloads that bypass `serde` entirely.
+
+**For the next writer who hits `VersionMissing`.** Create a throwaway database, point
+`OMNION_DATABASE_URL` at it, and run the suite there before believing anything about the
+migration ledger. The distinction that mattered: a *source* that is missing a file is a gap you
+can see with `ls database/migrations`; an *applied-but-absent* version is invisible in the source
+and only shows up as a panic. Two conditions, one error message.
