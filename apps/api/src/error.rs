@@ -168,6 +168,9 @@ impl From<AnalyticsError> for ApiError {
                 "this site has no analytics settings",
             ),
             AnalyticsError::InvalidGoal(message) => Self::bad_request("invalid_goal", message),
+            AnalyticsError::InvalidVisitor(message) => {
+                Self::bad_request("invalid_visitor", message)
+            }
             AnalyticsError::GoalNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "goal_not_found",

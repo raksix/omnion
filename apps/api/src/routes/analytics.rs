@@ -36,6 +36,7 @@ use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_module_analytics::collect::{self, Beacon, RequestMeta};
 use omnion_module_analytics::goals::{self, Goal, GoalChanges, GoalPatch};
+use omnion_module_analytics::privacy::{self, ErasureOutcome, PurgeOutcome, PurgeRecord, StoredField};
 use omnion_module_analytics::realtime::{self, RealtimeSnapshot};
 use omnion_module_analytics::reports::{self, DateRange, Filters, Granularity, Report};
 use omnion_module_analytics::settings as store;
@@ -161,13 +162,40 @@ pub struct SiteQuery {
     pub site_id: Uuid,
 }
 
-/// The settings of one site, plus the defaults the screen's "restore defaults" fills in.
+/// The settings of one site, plus the defaults the screen's "restore defaults" fills in and the
+/// two pieces the data section of the screen needs (slice 4): the cutoff a purge would use right
+/// now, the last run, and the "what we store" table.
 #[derive(Debug, Serialize)]
 pub struct SettingsResponse {
     /// The stored configuration.
     pub settings: Settings,
     /// The platform's defaults, sent by the server so the screen never hard-codes them.
     pub defaults: SettingsChanges,
+    /// The cutoff `POST /analytics/purge` would use at this moment — the screen names it before
+    /// the button is pressed, so "run purge now" never surprises its operator.
+    #[serde(with = "time::serde::rfc3339")]
+    pub purge_cutoff: OffsetDateTime,
+    /// The most recent purge or erasure of this site, when there was one.
+    pub last_purge: Option<PurgeRecord>,
+    /// What the engine stores, column by column.
+    pub storage: Vec<StoredField>,
+}
+
+/// The whole settings payload of one site.
+async fn settings_payload(
+    state: &AppState,
+    site_id: Uuid,
+) -> Result<SettingsResponse, ApiError> {
+    let pool = state.db().pool();
+    let settings = store::ensure(pool, site_id).await?;
+
+    Ok(SettingsResponse {
+        defaults: SettingsChanges::defaults(),
+        purge_cutoff: privacy::cutoff_for(settings.retention_days, OffsetDateTime::now_utc()),
+        last_purge: privacy::last_purge(pool, site_id).await?,
+        storage: privacy::stored_fields(),
+        settings,
+    })
 }
 
 /// `GET /api/v1/analytics/settings` — how this site counts (docs/requests/REQ-007).
@@ -177,12 +205,8 @@ pub async fn get_settings(
     current: CurrentSession,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let site = site_in_scope(&state, &current, query.site_id).await?;
-    let settings = store::ensure(state.db().pool(), site.id).await?;
 
-    Ok(Json(SettingsResponse {
-        settings,
-        defaults: SettingsChanges::defaults(),
-    }))
+    Ok(Json(settings_payload(&state, site.id).await?))
 }
 
 /// `PUT /api/v1/analytics/settings` — replace the configuration in one write.
@@ -197,13 +221,90 @@ pub async fn put_settings(
     Json(changes): Json<SettingsChanges>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let site = site_in_scope(&state, &current, query.site_id).await?;
-    let settings =
-        store::update(state.db().pool(), site.id, &changes, Some(current.user.id)).await?;
+    store::update(state.db().pool(), site.id, &changes, Some(current.user.id)).await?;
 
-    Ok(Json(SettingsResponse {
-        settings,
-        defaults: SettingsChanges::defaults(),
-    }))
+    Ok(Json(settings_payload(&state, site.id).await?))
+}
+
+/// `POST /api/v1/analytics/purge` — run the retention purge now.
+///
+/// The audit row is written by the purge itself, inside the same transaction as the deletions;
+/// the platform event is the second half, so a subscriber learns what happened without reading
+/// the database. A bus that cannot record the fact is a warning, not a failed purge: the rows
+/// are gone, which is what the operator asked for.
+pub async fn purge(
+    State(state): State<AppState>,
+    Query(query): Query<SiteQuery>,
+    current: CurrentSession,
+) -> Result<Json<PurgeOutcome>, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let pool = state.db().pool();
+    let settings = store::ensure(pool, site.id).await?;
+    let outcome =
+        privacy::purge(pool, site.id, settings.retention_days, Some(current.user.id)).await?;
+
+    let emission = bus::emit(
+        pool,
+        NewEvent::new("analytics.retention_purged")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(serde_json::json!({
+                "purge_id": outcome.purge_id,
+                "kind": outcome.kind,
+                "cutoff": outcome.cutoff,
+                "rows_removed": outcome.rows_removed,
+                "visits": outcome.visits,
+                "pageviews": outcome.pageviews,
+                "events": outcome.events,
+                "goal_hits": outcome.goal_hits,
+            })),
+    )
+    .await;
+    if let Err(error) = emission {
+        tracing::warn!(site_id = %site.id, error = %error, "the purge event could not be recorded");
+    }
+
+    Ok(Json(outcome))
+}
+
+/// `DELETE /api/v1/analytics/visitors/{hash}` — erase every row of one visitor handle.
+///
+/// The handle is already a pseudonym (the daily-salted hash), never an address; the answer
+/// carries how many rows went, so an operator can tell "erased a visitor" from "that handle never
+/// existed here" without reading the database.
+pub async fn erase_visitor(
+    State(state): State<AppState>,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+    Query(query): Query<SiteQuery>,
+    current: CurrentSession,
+) -> Result<Json<ErasureOutcome>, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let pool = state.db().pool();
+    let outcome = privacy::erase_visitor(pool, site.id, &handle, Some(current.user.id)).await?;
+
+    let emission = bus::emit(
+        pool,
+        NewEvent::new("analytics.erasure_completed")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(serde_json::json!({
+                "purge_id": outcome.purge_id,
+                "visitor": outcome.visitor,
+                "rows_removed": outcome.rows_removed,
+                "visits": outcome.visits,
+                "pageviews": outcome.pageviews,
+                "events": outcome.events,
+                "goal_hits": outcome.goal_hits,
+            })),
+    )
+    .await;
+    if let Err(error) = emission {
+        tracing::warn!(site_id = %site.id, error = %error, "the erasure event could not be recorded");
+    }
+
+    Ok(Json(outcome))
 }
 
 /// `GET /api/v1/analytics/snippet` — what a site pastes into its pages.

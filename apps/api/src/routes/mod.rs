@@ -393,6 +393,14 @@ pub fn router(state: AppState) -> Router {
         .route("/analytics/goals/{id}", delete(analytics::goal_delete))
         .route_layer(guards::require(&state, "analytics.goals.manage"));
 
+    // The privacy operations (docs/requests/REQ-007, slice 4): running the retention purge and
+    // erasing one visitor change what is stored, which is the settings permission — a reader who
+    // may look at the numbers is not the one who decides how long they live.
+    let analytics_privacy = Router::new()
+        .route("/analytics/purge", post(analytics::purge))
+        .route("/analytics/visitors/{hash}", delete(analytics::erase_visitor))
+        .route_layer(guards::require(&state, "analytics.settings.manage"));
+
     let analytics_collect = Router::new()
         .route("/public/analytics/collect", post(analytics::collect))
         .layer(DefaultBodyLimit::max(
@@ -427,6 +435,7 @@ pub fn router(state: AppState) -> Router {
         .route("/analytics/export", analytics_export)
         .merge(analytics_goals_read)
         .merge(analytics_goals_write)
+        .merge(analytics_privacy)
         .merge(analytics_collect)
         .route(
             "/iam/permissions",
