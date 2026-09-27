@@ -39,6 +39,7 @@
 pub mod credentials;
 pub mod error;
 pub mod keyring;
+pub mod leases;
 pub mod redaction;
 pub mod store;
 pub mod validators;
