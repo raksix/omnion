@@ -216,9 +216,12 @@ pub(crate) async fn ensure_allow_entry(
     role_id: Uuid,
     permission_key: &str,
 ) -> Result<bool> {
-    let inserted = sqlx::query(
+    // A base role declares allow; a row left behind with another effect (an older seed, a manual
+    // edit) must not keep overriding it, so the conflict path repairs the effect.
+    let changed = sqlx::query(
         "insert into role_permissions (role_id, permission_key, effect) values ($1, $2, 'allow') \
-         on conflict (role_id, permission_key) do nothing",
+         on conflict (role_id, permission_key) do update set effect = 'allow' \
+         where role_permissions.effect <> 'allow'",
     )
     .bind(role_id)
     .bind(permission_key)
@@ -227,7 +230,26 @@ pub(crate) async fn ensure_allow_entry(
     .rows_affected()
         > 0;
 
-    Ok(inserted)
+    Ok(changed)
+}
+
+/// Drop every entry of a system role that the code no longer declares.
+///
+/// The base roles are owned by the platform: their permission list is defined in
+/// `seed.rs`, not edited by customers, so a key that disappeared from the code (or moved to a
+/// lower role) must not stay behind as a live grant. Returns how many rows went away.
+pub(crate) async fn prune_entries(pool: &PgPool, role_id: Uuid, keep: &[&str]) -> Result<u64> {
+    let keep: Vec<String> = keep.iter().map(|key| (*key).to_owned()).collect();
+    let removed = sqlx::query(
+        "delete from role_permissions where role_id = $1 and permission_key <> all($2)",
+    )
+    .bind(role_id)
+    .bind(&keep)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(removed)
 }
 
 /// Allow/deny counts for a set of roles.
@@ -295,7 +317,10 @@ pub(crate) async fn add_entry(
 ///
 /// Shared by the cycle check and the depth check: the walk needs the whole graph in memory, and
 /// a scope holds tens of roles, not thousands.
-async fn parent_links(pool: &PgPool, organization_id: Option<Uuid>) -> Result<BTreeMap<Uuid, Option<Uuid>>> {
+async fn parent_links(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<BTreeMap<Uuid, Option<Uuid>>> {
     let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "select id, inherits_role_id from roles \
          where organization_id is null or organization_id = $1",
@@ -394,7 +419,8 @@ pub async fn update_role(pool: &PgPool, role_id: Uuid, update: RoleUpdate) -> Re
             if !allowed {
                 return Err(PermissionsError::CrossOrganizationInheritance);
             }
-            let links = parent_links(pool, role.organization_id.or(parent_role.organization_id)).await?;
+            let links =
+                parent_links(pool, role.organization_id.or(parent_role.organization_id)).await?;
             validate_parent_change(&links, role_id, Some(new_parent))?;
             Some(new_parent)
         }
@@ -460,7 +486,8 @@ pub async fn duplicate_role(
     let source = find_role(pool, source_id)
         .await?
         .ok_or(PermissionsError::RoleNotFound)?;
-    let allowed = source.organization_id.is_none() || source.organization_id == Some(organization_id);
+    let allowed =
+        source.organization_id.is_none() || source.organization_id == Some(organization_id);
     if !allowed {
         return Err(PermissionsError::CrossOrganizationInheritance);
     }

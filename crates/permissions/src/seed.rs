@@ -6,9 +6,10 @@
 //! Everything here is idempotent, so it runs on every start.
 //!
 //! The base roles form a priority ladder without inheritance links; customers build
-//! inheritance chains on top of them (docs/07-IAM.md §4). Base roles keep their default
-//! permission sets once created — only the Owner role follows the catalogue, because it is
-//! the role that holds everything.
+//! inheritance chains on top of them (docs/07-IAM.md §4). The code owns a base role's
+//! permission set: on every boot each of them is reconciled with the keys it declares, so a
+//! key added to the catalogue later reaches the roles that ship it (and a key the code dropped
+//! stops being granted).
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -237,10 +238,16 @@ pub async fn seed_base_roles(pool: &PgPool) -> Result<(usize, bool)> {
             },
         };
 
+        // The code is the source of truth for a base role's permission set: a key added to the
+        // catalogue after an installation was seeded must reach the roles that declare it, and a
+        // key the code dropped must not stay behind as a live grant.
+        let mut gained = false;
+        for key in &keys {
+            gained |= roles::ensure_allow_entry(pool, role.id, key).await?;
+        }
+        roles::prune_entries(pool, role.id, &keys).await?;
         if base.key == "owner" {
-            for entry in CATALOGUE {
-                owner_gained |= roles::ensure_allow_entry(pool, role.id, entry.key).await?;
-            }
+            owner_gained |= gained;
         }
     }
 
