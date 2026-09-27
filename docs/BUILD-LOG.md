@@ -1256,3 +1256,53 @@
   and sampling half of the settings screen, the "what we store" table, `/analytics/settings`, and
   the `analytics.traffic_spike` / `analytics.retention_purged` / `analytics.erasure_completed`
   events.
+
+## REQ-007 slice 4 — privacy operations, the settings screen, the spike watch (2026-09-27)
+
+- **The privacy promises became database operations, in one readable file.**
+  `modules/analytics/src/privacy.rs` holds the retention purge (one site, whole days, the audit row
+  written inside the same transaction as the deletions, pageviews counted before the visit delete
+  would take them along), the visitor erasure (visits, pageviews, events and goal hits of one
+  handle — idempotent, because an erasure that fails on a retry is a compliance problem of its
+  own) and `STORED_FIELDS`, the "what we store" table the screen renders from the same source as
+  the schema. `detect_spike` and `spike_recorded` live beside them: the hour that just closed
+  against the trailing week's median, announced once, with the guard reading the events themselves
+  rather than a counter a restart would lose.
+- **The salts are the one shared table**, so the prune is the one statement not scoped by a site —
+  and it uses the *longest* retention any site still asks for, because one site's seven-day window
+  must never delete a salt another site's window still covers. A salt is only read while it is the
+  current day; the row is dead weight past every window.
+- **API and events.** `POST /analytics/purge` and `DELETE /analytics/visitors/{hash}` sit behind
+  `analytics.settings.manage` — the permission that decides how long data lives is not the one that
+  reads it — and both record their fact on the bus (`analytics.retention_purged`,
+  `analytics.erasure_completed`) with the audit id and the counts, never an address. The settings
+  payload grew `purge_cutoff`, `last_purge` and `storage`, so the screen never guesses any of the
+  three. The rollup worker announces `analytics.traffic_spike` once per completed hour.
+- **The screen** (`/analytics/settings`): tracking, privacy, exclusions with a glob preview that
+  reads each pattern back, the snippet with its site key and copy control, the data section — the
+  cutoff named *before* the purge runs, the erasure requiring the handle typed twice — and the
+  storage table. Field validation mirrors the server's of the same field. The section shell learned
+  a toolbar-less mode: a screen with no date range and nothing to export renders neither.
+- **The walkthrough learned `data-qa-guard`.** The generic click pass fills every field with a
+  sample value; on this screen a sample value in the erasure field would be a refused request (a
+  high finding), not a click. A screen now declares which controls its own depth pass drives, and
+  the pass skips them — recorded as `deferred-settings`.
+- **One finding, fixed in the tick.** The first pass flagged four `role="switch"` buttons with no
+  accessible name (the `<label for>` that names them visually does not name them to the harness);
+  `aria-label` closed it, and the pass was re-run to prove the fix rather than to claim it.
+- **Proof:** `cargo test --workspace --no-fail-fast` → **562 passed, 0 failed** (the new walks: a
+  purge that removes exactly the stale rows on both sides of a seven-day cutoff and leaves another
+  site alone, an erasure that removes five rows of one handle on its own site and zero of another's,
+  and both facts delivered to a real HTTP receiver; plus a flat-week fixture where forty visitors
+  against a median of five is a spike and an hour nobody spiked is not) · `cargo clippy
+  --workspace --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 ·
+  `bash scripts/qa/run.sh` → 436 clicks, 433 screenshots, **0 high findings**, **0 vision issues**
+  (`qa-artifacts/20260927-002830`). The settings pass on the populated QA database: tracking saved
+  and read back after a reload, a retention of 3 refused with the field named, the purge named its
+  cutoff (`2026-09-20`) and took the rows past it from 1 to 0, a real handle was erased with its
+  rows counted before (1) and after (0), and the storage table rendered ten rows with three
+  marked personal.
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium findings,
+  unchanged), and `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
+- Next: **REQ-006 (IAM)** — the next wave-1 item: user, role and permission screens plus sessions
+  and devices.

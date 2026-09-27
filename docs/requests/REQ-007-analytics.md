@@ -1,6 +1,6 @@
 # REQ-007 — Analytics
 
-> **Status:** in-progress (slices 1–3 shipped) · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
+> **Status:** done (e085129…16a600a) — all four slices shipped · **Captured:** 2026-09-25 · **Layer:** module (`modules/analytics`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -193,20 +193,40 @@ Migration `database/migrations/0012_analytics.sql` — append-only, commented in
   requests. A switched-off goal records no hits at all, and deleting a goal takes its steps and
   hits with it (both asserted in the same walk).
 - [x] Excluded paths and IPs produce no rows; changing the lists affects new hits only.
-- [ ] Retention purge deletes rows older than the cutoff for one site, writes `analytics_purges` with the removed count, and never touches another site.
-- [ ] `DELETE /analytics/visitors/{hash}` removes every visit, pageview, event and goal hit for that visitor and emits `analytics.erasure_completed`.
+- [x] Retention purge deletes rows older than the cutoff for one site, writes `analytics_purges` with the removed count, and never touches another site.
+  `…::the_purge_and_the_erasure_remove_exactly_their_rows_and_say_so` sets a seven-day retention,
+  seeds a thirty-day-old visit (with its pageview and its event) beside a two-day-old one on one
+  site and a thirty-day-old visit on another: after `POST /analytics/purge` the stale rows are gone,
+  the recent visit and the other site's visit are intact, the audit row carries `kind = retention`,
+  the cutoff and `rows_removed = 3`, and a salt four hundred days old is pruned with them. The QA
+  walkthrough repeats it on the populated QA database — the screen named the cutoff
+  (`2026-09-20`), the rows past it went from 1 to 0, and the screen's own answer read
+  "Removed 4 rows older than 2026-09-20 — 1 visits, 1 page views, 2 events, 0 goal hits."
+- [x] `DELETE /analytics/visitors/{hash}` removes every visit, pageview, event and goal hit for that visitor and emits `analytics.erasure_completed`.
+  The same walk seeds one handle on two sites (a visit with a second pageview, an event and a goal
+  hit on the first): the erasure answers `1 visit · 2 pageviews · 1 event · 1 goal hit`, the
+  handle's rows on its own site go to zero while the other site keeps its own, a second run answers
+  `rows_removed: 0` instead of failing (an erasure that fails on a retry is a compliance problem of
+  its own), a handle that is not a hash is a `400 invalid_visitor`, and the event reached a
+  subscribed endpoint over HTTP — the receiver captured `analytics.erasure_completed` with the
+  handle and the count. The walkthrough erases a real handle on the QA database and counts its rows
+  there before (1) and after (0).
 - [x] The collect endpoint answers 429 above the rate limit and stays responsive under a burst test
   (a full budget of beacons is served in-process before the 429; the limiter is per instance, see
   the slice log).
-- [ ] Permission guards answer 401/403/200 as documented and an organization cannot read another organization’s sites; all ten screens have empty, loading and error states with zero high findings and a clean mobile pass.
+- [x] Permission guards answer 401/403/200 as documented and an organization cannot read another organization’s sites; all ten screens have empty, loading and error states with zero high findings and a clean mobile pass.
   (The guards and the organization isolation are proven for the settings, snippet, all seven
   report endpoints, the goal CRUD, the funnel and both realtime routes: a member without
   `analytics.read` gets 403 on the goal list and the realtime snapshot, a reader without
   `analytics.goals.manage` gets 403 on create, another organization's reader gets 403, the
   platform Owner reads across, and a missing goal is a `404 goal_not_found` while an unknown
-  sort key or day is a `400 invalid_report_query`. The write half of the settings screen, the
-  retention purge and the visitor erasure land with slice 4, so the ten-screen half of this
-  line stays open.)
+  sort key or day is a `400 invalid_report_query`. Slice 4 added the write half: the purge and
+  the erasure answer `403` to a reader, a member and another organization's reader, `400
+  invalid_visitor` to a handle that is not a hash, and `200` to the manager — with the audit row
+  naming the actor. The screens half closed with the same tick: `/analytics/settings` joined the
+  walkthrough on desktop and on a 390 px viewport, and the pass reads all ten screens with 436
+  clicks, 433 screenshots, **0 high findings** and **0 vision issues**
+  (`qa-artifacts/20260927-002830`).)
 
 ### QA plan
 
@@ -421,3 +441,72 @@ Next: **slice 4** — the privacy operations (retention purge with its audit row
 exclusions and sampling in the screen, the "what we store" table and the `/analytics/settings`
 screen) and the events they emit (`analytics.traffic_spike`, `analytics.retention_purged`,
 `analytics.erasure_completed`).
+
+### Slice 4 — shipped (privacy operations)
+
+- **`modules/analytics/src/privacy.rs`** — the three promises in one file, so a reviewer reads them
+  together. The **retention purge** removes one site's rows past the cutoff (pageviews first, so
+  they can be counted, then events, then the visits they belonged to, then the site's goal hits)
+  and writes its `analytics_purges` row *inside the same transaction*: an audit trail that can be
+  missing while the rows are gone is not an audit trail. The cutoff is midnight (UTC) of the day
+  `retention_days` back — whole days, so two runs an hour apart agree on the window, and the screen
+  can name it before the button is pressed.
+- **The salts are the one shared table**, so the prune is the one statement not scoped by site: a
+  salt is only read while it is the current day (the collector hashes against *today's* salt), and
+  the purge removes only those past the **longest** retention any site still asks for — one site's
+  seven-day window can never delete a salt another site's window still covers.
+- **`erase_visitor`** removes every row a handle appears in — its visits (and their pageviews),
+  its events, its goal hits — and is idempotent by construction: the statements remove what is
+  there, so a second call removes nothing and still writes its audit row, because an erasure that
+  fails on a retry would be a compliance problem of its own. A handle that is not 64 lower-case
+  hexadecimal characters is a `400`, never an erasure of something else.
+- **`STORED_FIELDS`** is the "what we store" table the screen renders — one row per column family
+  with its purpose and whether it is personal data — living in the module, so the screen cannot
+  describe a different schema than the code runs. `purge_history`/`last_purge` read the audit
+  trail, and `detect_spike` answers the trailing-seven-day-median question in the same place.
+- **API** — `POST /analytics/purge` and `DELETE /analytics/visitors/{hash}` behind
+  `analytics.settings.manage` (the permission that decides how long data lives is not the one that
+  reads it); both answer with what they removed and both record their event on the bus. The
+  settings payload gained `purge_cutoff`, `last_purge` and `storage`, so the screen never guesses
+  any of the three.
+- **Events** — `analytics.retention_purged` and `analytics.erasure_completed` carry the audit id,
+  the counts and (for the erasure) the handle, which is already a pseudonym; `analytics.traffic_spike`
+  is announced by the **rollup worker**: the hour that just closed against the median of the seven
+  days before it, once per hour, with the guard reading the recorded events rather than a counter
+  that a restart would lose. A site is only asked once per completed hour, and a failing watch is a
+  warning that never stops the rollups.
+- **The screen** (`apps/admin/features/analytics/settings-view.tsx`, `/analytics/settings`):
+  tracking (enabled, mode, sample rate, bot filter), privacy (anonymize, DNT/GPC, retention),
+  exclusions with a live glob preview that reads each pattern back ("starts with", "ends with",
+  "exactly"), the snippet with its site key and a copy control, the data section (the cutoff named
+  before the purge, and the erasure requiring the handle typed twice) and the storage table. Field
+  validation mirrors the server's of the same field, so a refused value appears beside the input
+  that sent it. The section shell learned a **toolbar-less mode** for it: a screen with no date
+  range and nothing to export renders neither, and its keyboard keeps only the section navigation.
+
+Deviations and choices, for the reviewer:
+
+- The purge runs **on demand** (the audited `POST /analytics/purge`) and prunes raw rows, the
+  salts and the goal hits; the **rollups stay**, because they hold counts and no handle — that is
+  what "aggregated counts name nobody" means on the screen, and it is why the reports can still
+  say `exact: false` for a range older than the window.
+- The erasure answers `200` with `rows_removed: 0` when the handle has no rows here: idempotent on
+  purpose, and distinguishably different from "erased a visitor" without a second endpoint.
+- The walkthrough's own depth pass drives this screen, so its save, purge and erasure controls
+  carry `data-qa-guard` and the generic click pass skips them — a sample value in the erasure field
+  is a refused request (a finding), not a click, and the harness now says so out loud.
+
+Proof (this tick): `cargo test --workspace --no-fail-fast` → **562 passed, 0 failed** (analytics:
+52 module units — four of them the new cutoff, handle, storage-table and hour-label arithmetic —
+plus 13 integration walks, two of them new) · `cargo clippy --workspace --all-targets -- -D
+warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 · `bash scripts/qa/run.sh` → 436 clicks,
+433 screenshots, **0 high findings**, **0 vision issues** (`qa-artifacts/20260927-002830`; the 5
+medium findings are the public renderer's own icon 404s, carried forward unchanged). The
+walkthrough's settings pass: tracking saved and read back after a reload, a retention of 3 refused
+with the field named, the purge named its cutoff (`2026-09-20`) and took the QA database's old
+rows from 1 to 0, and a real handle was erased with its rows counted there before (1) and after
+(0). The one finding this slice introduced — four switches with no accessible name — was fixed in
+the same tick and the pass re-run to prove it.
+
+Next: **REQ-006 (IAM)** — the next wave-1 item: user/role/permission screens plus sessions and
+devices.
