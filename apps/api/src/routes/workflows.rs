@@ -671,6 +671,7 @@ mod tests {
             schedule: Some("0 3 * * *".to_owned()),
             trigger_event: None,
             conditions: serde_json::json!([]),
+            hook_token_hash: None,
             next_run_at: Some(OffsetDateTime::UNIX_EPOCH),
             steps: serde_json::json!([
                 { "name": "prepare", "kind": "task", "action": "noop", "params": {}, "max_attempts": 1 }

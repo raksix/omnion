@@ -19,6 +19,14 @@
 //! * [`model`] — a rule as the panel sees it: one event, its conditions and its actions;
 //! * [`condition`] — the closed comparison set a payload is tested against (no expression
 //!   language, no dynamic code — docs/09-N8N-TEARDOWN.md §13 lesson 14);
+//! * [`groups`] — those comparisons arranged into `all` / `any` trees (REQ-003 slice 1), with a
+//!   flat list still reading as one `all` group so every earlier rule keeps firing;
+//! * [`catalogue`] — the closed vocabulary the panel writes rules in: the event library with
+//!   its payload fields, the operators and their bounds, the action set and the trigger kinds;
+//! * [`hooks`] — the inbound-webhook trigger: an unguessable per-rule URL whose only credential
+//!   is a token stored as a hash;
+//! * [`testing`] — a dry run against a hand-written payload (`would_send`, no side effects) and
+//!   the one-shot listener that captures the next real event a rule matches.
 //! * [`binding`] — `{{event.field}}` placeholders in action parameters, resolved **when the run
 //!   is materialised**, so a stored step carries the values of the event that started it;
 //! * [`matcher`] — reading the bus from a durable cursor and starting one run per match;
@@ -33,11 +41,15 @@
 
 pub mod actions;
 pub mod binding;
+pub mod catalogue;
 pub mod condition;
 pub mod error;
+pub mod groups;
+pub mod hooks;
 pub mod mail;
 pub mod matcher;
 pub mod model;
+pub mod testing;
 
 pub use actions::AutomationActions;
 pub use binding::{resolve_params, validate_bindings};

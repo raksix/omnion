@@ -16,7 +16,6 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::condition::{self, Condition};
 use crate::error::{AutomationError, Result};
 
 /// Longest rule name.
@@ -42,10 +41,16 @@ pub struct AutomationRule {
     pub enabled: bool,
     /// Event the rule listens for.
     pub event: String,
-    /// Conditions the payload must satisfy, in order.
-    pub conditions: Vec<Condition>,
+    /// The condition tree as it is stored: a group object, or the v0 flat array.
+    pub stored_conditions: Value,
     /// Actions to run, in order.
     pub actions: Vec<StepDefinition>,
+    /// Whether the rule is triggered by its own inbound webhook URL.
+    pub hook_triggered: bool,
+    /// Whether that URL has been minted — the token exists. A webhook rule without a
+    /// token has a trigger the caller cannot yet call, which is a state the panel says out
+    /// loud instead of showing an empty box.
+    pub hook_configured: bool,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
     /// When it last fired.
@@ -59,8 +64,8 @@ pub struct AutomationRule {
 impl AutomationRule {
     /// Read a stored workflow as a rule; `None` when it is not an event-triggered workflow.
     ///
-    /// A row this layer wrote always reads back; a row a sibling tool wrote by hand is reported
-    /// as an error rather than presented half-parsed.
+    /// A row this layer wrote always reads back; a row a sibling tool wrote by hand is
+    /// reported as an error rather than presented half-parsed.
     pub fn from_workflow(workflow: &Workflow) -> Result<Option<Self>> {
         if workflow.trigger() != TriggerKind::Event {
             return Ok(None);
@@ -76,15 +81,13 @@ impl AutomationRule {
             )
         })?;
 
-        let conditions: Vec<Condition> = serde_json::from_value(workflow.conditions.clone())
-            .map_err(|err| {
-                AutomationError::invalid(
-                    "rule_unreadable",
-                    format!("the stored conditions are not readable: {err}"),
-                )
-            })?;
-
         let actions = workflow.definitions()?;
+
+        // Read the two hook facts before `event` moves into the struct: whether this rule is
+        // a webhook rule (it listens for the reserved hook event) and whether its URL has
+        // been minted. They are different questions and the panel asks them separately.
+        let hook_triggered = event == crate::catalogue::HOOK_EVENT;
+        let hook_configured = crate::hooks::has_token(workflow.hook_token_hash.as_deref());
 
         Ok(Some(Self {
             id: workflow.id,
@@ -94,8 +97,16 @@ impl AutomationRule {
             description: workflow.description.clone(),
             enabled: workflow.enabled,
             event,
-            conditions,
+            // The tree is kept as stored and read on demand: a rule written by v0 carries a
+            // flat array, and turning it into a group here would hide that from the audit
+            // trail and from the panel's diff.
+            stored_conditions: workflow.conditions.clone(),
             actions,
+            // A webhook rule is one that listens for the reserved hook event — that is what
+            // makes it a webhook rule. Whether its URL has been minted yet is a separate
+            // question the panel asks separately (`hook.configured`).
+            hook_triggered,
+            hook_configured,
             trigger_count: workflow.trigger_count,
             last_triggered_at: workflow.last_triggered_at,
             created_at: workflow.created_at,
@@ -103,9 +114,29 @@ impl AutomationRule {
         }))
     }
 
+    /// The conditions of this rule as a group tree.
+    ///
+    /// `None` when the stored value is unreadable — the matcher treats that as "does not
+    /// fire" rather than guessing, and the panel reports the reason.
+    #[must_use]
+    pub fn condition_group(&self) -> Option<crate::groups::ConditionGroup> {
+        crate::groups::read_tree(&self.stored_conditions).ok()
+    }
+
+    /// `true` when the rule's conditions hold against a payload.
+    #[must_use]
+    pub fn conditions_hold(&self, payload: &Value) -> bool {
+        crate::groups::stored_holds(&self.stored_conditions, payload)
+    }
+
     /// The definition to store for this rule.
     pub fn definition(&self) -> Result<WorkflowDefinition> {
-        build_definition(&self.event, &self.conditions, &self.actions)
+        build_definition(
+            &self.event,
+            &self.stored_conditions,
+            &self.actions,
+            self.hook_triggered,
+        )
     }
 }
 
@@ -122,10 +153,12 @@ pub struct NewRule {
     pub site_id: Option<Uuid>,
     /// Event the rule listens for.
     pub event: String,
-    /// Conditions the payload must satisfy.
-    pub conditions: Vec<Condition>,
+    /// The condition tree as the author sent it: a group object, or a flat array.
+    pub stored_conditions: Value,
     /// Actions to run.
     pub actions: Vec<StepDefinition>,
+    /// Whether the rule is triggered by its own inbound webhook URL.
+    pub hook_triggered: bool,
 }
 
 impl NewRule {
@@ -133,31 +166,42 @@ impl NewRule {
     pub fn definition(&self) -> Result<WorkflowDefinition> {
         validate_name(&self.name)?;
         validate_description(&self.description)?;
-        build_definition(&self.event, &self.conditions, &self.actions)
+        build_definition(
+            &self.event,
+            &self.stored_conditions,
+            &self.actions,
+            self.hook_triggered,
+        )
     }
 }
 
 /// Build the workflow definition of a rule.
 ///
-/// The layers check what they own: this layer checks the event name against the bus's own rule,
-/// the conditions and the bindings inside the action parameters; the engine checks the trigger
-/// shape, the action catalogue and the step limits.
+/// The layers check what they own: this layer checks the event name against the bus's rule,
+/// the condition tree and the bindings inside the action parameters; the engine checks the
+/// trigger shape, the action catalogue and the step limits.
 pub fn build_definition(
     event: &str,
-    conditions: &[Condition],
+    stored_conditions: &Value,
     actions: &[StepDefinition],
+    hook_triggered: bool,
 ) -> Result<WorkflowDefinition> {
-    let event = validate_event(event)?;
-    condition::validate(conditions)?;
+    let event = validate_event(event, hook_triggered)?;
+
+    // A rule with no conditions at all is stored as an empty `all` group rather than as
+    // `[]`: one stored shape for a new rule, and the v0 array still reads back as the same
+    // thing (migration 0019 widened the column's check for exactly this).
+    let group = if matches!(stored_conditions, Value::Array(items) if items.is_empty()) {
+        crate::groups::ConditionGroup::all(Vec::new())
+    } else {
+        crate::groups::validate_tree(stored_conditions)?
+    };
 
     for action in actions {
         crate::binding::validate_bindings(&action.params)?;
     }
 
-    let conditions = conditions
-        .iter()
-        .map(condition::to_json)
-        .collect::<Vec<Value>>();
+    let conditions = crate::groups::to_json(&group);
 
     let definition = WorkflowDefinition::new(Trigger::event(event), actions.to_vec())?
         .with_conditions(conditions);
@@ -167,8 +211,27 @@ pub fn build_definition(
 }
 
 /// Check an event name against the rule the bus itself records by.
-pub fn validate_event(raw: &str) -> Result<String> {
-    omnion_events::validation::validate_event_name(raw).map_err(|err| {
+///
+/// A hook-triggered rule listens for the reserved `automation.hook.received` name whatever
+/// the caller sent, and nothing else may claim it: the caller's body is the payload, and a
+/// module that starts emitting that name would collide with every hook rule.
+pub fn validate_event(raw: &str, hook_triggered: bool) -> Result<String> {
+    if hook_triggered {
+        return Ok(crate::catalogue::HOOK_EVENT.to_owned());
+    }
+
+    let event = raw.trim();
+    if event == crate::catalogue::HOOK_EVENT {
+        return Err(AutomationError::invalid(
+            "invalid_event",
+            format!(
+                "{} is reserved for inbound-webhook triggers; switch the trigger to a webhook",
+                crate::catalogue::HOOK_EVENT
+            ),
+        ));
+    }
+
+    omnion_events::validation::validate_event_name(event).map_err(|err| {
         AutomationError::invalid(
             "invalid_event",
             format!("this is not an event the platform can trigger on: {err}"),
@@ -209,7 +272,6 @@ pub fn validate_description(raw: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::condition::ConditionOperator;
     use serde_json::json;
 
     fn actions() -> Vec<StepDefinition> {
@@ -224,45 +286,111 @@ mod tests {
         )]
     }
 
+    fn one_condition() -> Value {
+        json!({ "all": [{ "field": "status", "operator": "equals", "value": "published" }] })
+    }
+
     #[test]
     fn a_rule_becomes_a_definition_the_engine_accepts() {
         // A comparison without its value is refused by this layer before the engine sees it.
         let broken = build_definition(
             "page.published",
-            &[Condition::presence("status", ConditionOperator::Equals)],
+            &json!({ "all": [{ "field": "status", "operator": "equals" }] }),
             &actions(),
+            false,
         );
         assert_eq!(broken.expect_err("no value").code(), "invalid_conditions");
 
-        let definition = build_definition(
-            "page.published",
-            &[Condition::compare(
-                "status",
-                ConditionOperator::Equals,
-                json!("published"),
-            )],
-            &actions(),
-        )
-        .expect("a complete rule is valid");
+        let definition = build_definition("page.published", &one_condition(), &actions(), false)
+            .expect("a complete rule is valid");
         assert_eq!(definition.trigger.kind, TriggerKind::Event);
         assert_eq!(definition.trigger.event.as_deref(), Some("page.published"));
-        assert_eq!(definition.conditions.len(), 1);
+        // The stored conditions are the one-key group object, not the v0 array.
+        let conditions = definition.conditions_json().expect("stores");
+        assert!(conditions["all"].is_array(), "{conditions}");
         assert_eq!(definition.steps.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_condition_list_is_stored_as_one_all_group() {
+        // Both the v0 `[]` and the panel's empty group mean the same thing, and both are
+        // stored the same way — one shape for a new rule, and the old array still reads.
+        for empty in [json!([]), json!({ "all": [] })] {
+            let definition =
+                build_definition("page.published", &empty, &actions(), false).expect("valid");
+            assert_eq!(
+                definition.conditions_json().expect("stores"),
+                json!({ "all": [] })
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_group_survives_the_round_trip_into_the_engine() {
+        let nested = json!({
+            "any": [
+                { "all": [
+                    { "field": "status", "operator": "equals", "value": "published" },
+                    { "field": "tags", "operator": "contains", "value": "news" }
+                ] },
+                { "field": "author.email", "operator": "ends_with", "value": "@example.com" }
+            ]
+        });
+        let definition = build_definition("page.published", &nested, &actions(), false)
+            .expect("a nested tree is valid");
+        assert_eq!(definition.conditions_json().expect("stores"), nested);
+    }
+
+    #[test]
+    fn a_tree_the_picker_could_not_lay_out_is_refused() {
+        let too_deep = json!({
+            "all": [{ "all": [{ "all": [{ "all": [{
+                "field": "status", "operator": "equals", "value": "published"
+            }] }] }] }]
+        });
+        assert_eq!(
+            build_definition("page.published", &too_deep, &actions(), false)
+                .expect_err("four levels")
+                .code(),
+            "invalid_conditions"
+        );
+
+        // A shape that is neither a list nor a group is not guessed at.
+        assert_eq!(
+            build_definition("page.published", &json!("status"), &actions(), false)
+                .expect_err("scalar")
+                .code(),
+            "rule_unreadable"
+        );
     }
 
     #[test]
     fn the_event_name_must_be_one_the_bus_could_record() {
         assert_eq!(
-            validate_event("page.published").expect("valid"),
+            validate_event("page.published", false).expect("valid"),
             "page.published"
         );
         for broken in ["PagePublished", "page", "", "page.published!"] {
             assert_eq!(
-                validate_event(broken).expect_err("refused").code(),
+                validate_event(broken, false).expect_err("refused").code(),
                 "invalid_event",
                 "{broken:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_hook_event_is_reserved_for_a_webhook_trigger() {
+        // A webhook rule always listens for the reserved name, whatever it was sent.
+        assert_eq!(
+            validate_event("page.published", true).expect("webhook"),
+            crate::catalogue::HOOK_EVENT
+        );
+        // …and nothing else may claim it, or a module emitting it would fire every hook.
+        let error =
+            validate_event(crate::catalogue::HOOK_EVENT, false).expect_err("reserved for hooks");
+        assert_eq!(error.code(), "invalid_event");
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[test]
@@ -297,14 +425,15 @@ mod tests {
             "comment_revision",
             json!({ "revision_id": "{{site.revision}}", "body": "hi" }),
         )];
-        let error =
-            build_definition("page.published", &[], &actions).expect_err("the namespace is wrong");
+        let error = build_definition("page.published", &json!([]), &actions, false)
+            .expect_err("the namespace is wrong");
         assert_eq!(error.code(), "invalid_binding");
     }
 
     #[test]
     fn a_rule_with_no_actions_is_refused_by_the_engine() {
-        let error = build_definition("page.published", &[], &[]).expect_err("no steps");
+        let error =
+            build_definition("page.published", &json!([]), &[], false).expect_err("no steps");
         assert_eq!(error.code(), "invalid_steps");
     }
 }

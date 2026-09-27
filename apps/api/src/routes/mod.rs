@@ -396,6 +396,13 @@ pub fn router(state: AppState) -> Router {
     // A published page points at its own assets, so the library's read side is public too.
     let public_media = get(media::public_media);
 
+    // Inbound automation webhooks (REQ-003 slice 1). This route carries **no** permission
+    // guard on purpose: the token in the path is the credential, and a session would defeat
+    // the point of a webhook. The handler's own discipline is what protects it — an
+    // unshaped token never reaches the database, every failure answers the same 404, the
+    // rule's name is never echoed back, and a per-rule rate window bounds the burst.
+    let hooks = post(automation::receive_hook);
+
     // Workflows: the definitions and their run history (docs/requests/REQ-003). Reading needs
     // `workflows.read`, writing a definition `workflows.manage`, and starting or cancelling a
     // run `workflows.run`; every handler applies the tenancy scope rule through the workflow's
@@ -476,10 +483,11 @@ pub fn router(state: AppState) -> Router {
 
     let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
-    // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
-    // read and write powers are the workflow keys the engine already defines — being allowed to
-    // define an automation and being allowed to run it are the same two powers a workflow
-    // carries. The handler checks the tenancy scope through the rule's organization.
+    // Automations (docs/requests/REQ-003, P13 + slice 1): a rule is an event-triggered
+    // workflow, so its read and write powers are the workflow keys the engine already
+    // defines — being allowed to define an automation and being allowed to run it are the
+    // same two powers a workflow carries. The handler checks the tenancy scope through the
+    // rule's organization.
     let automations = get(automation::list_automations)
         .layer(guards::require(&state, "workflows.read"))
         .merge(
@@ -498,6 +506,23 @@ pub fn router(state: AppState) -> Router {
             delete(automation::delete_automation)
                 .layer(guards::require(&state, "workflows.manage")),
         );
+
+    // Test fire: a dry run and a one-shot listener are the same power as running a rule —
+    // neither sends an e-mail, publishes a page or calls a URL, but both read the rule's own
+    // definition and its run history, so they are `workflows.run`.
+    let automation_test =
+        post(automation::test_automation).layer(guards::require(&state, "workflows.run"));
+
+    let automation_listen =
+        post(automation::listen_automation).layer(guards::require(&state, "workflows.run"));
+
+    let automation_tests =
+        get(automation::list_tests).layer(guards::require(&state, "workflows.read"));
+
+    // Minting a hook token rewrites the rule's trigger credential, which is the same write
+    // as changing the rule itself.
+    let automation_rotate_hook =
+        post(automation::rotate_hook).layer(guards::require(&state, "workflows.manage"));
 
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
@@ -775,6 +800,11 @@ pub fn router(state: AppState) -> Router {
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
         .route("/automations/{id}", automation_entry)
+        .route("/automations/{id}/test", automation_test)
+        .route("/automations/{id}/listen", automation_listen)
+        .route("/automations/{id}/tests", automation_tests)
+        .route("/automations/{id}/rotate-hook", automation_rotate_hook)
+        .route("/hooks/{token}", hooks)
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
             page_revision_comments,

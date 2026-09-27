@@ -32,7 +32,6 @@ use omnion_workflows::store::{self, WorkflowUpdate};
 use omnion_workflows::{TriggerKind, Workflow, WorkflowExecution, engine};
 
 use crate::binding::resolve_params;
-use crate::condition;
 use crate::error::Result;
 use crate::model::AutomationRule;
 
@@ -146,6 +145,8 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
     };
     // (workflow, run, steps) of every run this drain started, for the audit pass after commit.
     let mut started: Vec<(Workflow, WorkflowExecution, usize)> = Vec::new();
+    // (rule id, event id, event name, payload) of every armed listener to fill in.
+    let mut captured: Vec<(Uuid, i64, String, Value)> = Vec::new();
     // (workflow id, event id, reason) of every rule that could not be run.
     let mut failures: Vec<(Uuid, i64, String)> = Vec::new();
 
@@ -178,9 +179,23 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
                 }
             };
 
-            if !condition::all_hold(&rule.conditions, &event.payload) {
+            if !rule.conditions_hold(&event.payload) {
                 report.skipped += 1;
                 continue;
+            }
+
+            // A one-shot listener wants the payload of the first event that actually
+            // matched — the only honest answer to "what does this event really carry". It
+            // is collected here and written after the commit, for the same reason the audit
+            // rows are: the capture is a record of a run that happened, not a decision
+            // about whether it should.
+            if event.name == crate::catalogue::HOOK_EVENT {
+                captured.push((
+                    workflow.id,
+                    event.id,
+                    event.name.clone(),
+                    event.payload.clone(),
+                ));
             }
 
             let steps = match resolve_steps(&rule, &event.payload) {
@@ -236,6 +251,20 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
         }
         if let Err(err) = record_match(pool, workflow, execution).await {
             tracing::warn!(workflow_id = %workflow.id, error = %err, "the match audit row could not be written");
+        }
+    }
+
+    for (workflow_id, event_id, event_name, payload) in &captured {
+        match crate::testing::capture(pool, *workflow_id, *event_id, event_name, payload).await {
+            // `false` means the listener was already filled by an earlier event — the
+            // one-shot contract, not an error.
+            Ok(true) => {
+                tracing::info!(workflow_id = %workflow_id, event_id, "a listener captured an event");
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(workflow_id = %workflow_id, error = %err, "the listener could not be filled in");
+            }
         }
     }
 
@@ -320,7 +349,6 @@ pub fn update_from_rule(rule: &AutomationRule) -> Option<WorkflowUpdate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::condition::ConditionOperator;
     use serde_json::json;
 
     fn rule_with(actions: Vec<StepDefinition>) -> AutomationRule {
@@ -332,12 +360,16 @@ mod tests {
             description: String::new(),
             enabled: true,
             event: "page.published".to_owned(),
-            conditions: vec![crate::condition::Condition::compare(
-                "status",
-                ConditionOperator::Equals,
-                json!("published"),
-            )],
+            stored_conditions: json!({
+                "all": [{
+                    "field": "status",
+                    "operator": "equals",
+                    "value": "published"
+                }]
+            }),
             actions,
+            hook_triggered: false,
+            hook_configured: false,
             trigger_count: 0,
             last_triggered_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,

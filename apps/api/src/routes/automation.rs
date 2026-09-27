@@ -22,10 +22,9 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
-use omnion_automation::condition::ConditionOperator;
 use omnion_automation::matcher::update_from_rule;
 use omnion_automation::model::{validate_description, validate_name};
-use omnion_automation::{AutomationRule, Condition, NewRule};
+use omnion_automation::{AutomationRule, NewRule};
 use omnion_workflows::actions::{ACTIONS, ActionDef, HOST_ACTIONS};
 use omnion_workflows::definition::StepDefinition;
 use omnion_workflows::model::NewWorkflow;
@@ -40,13 +39,6 @@ use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::scope::{ensure_same_organization, resolve_organization};
 use crate::state::AppState;
-
-/// Event names the platform records today.
-///
-/// A rule may listen for any name the bus's rule accepts (a module that starts emitting a new
-/// event does not need this list updated); these are the ones whose payloads are documented, so
-/// the panel can offer them as a starting point.
-pub const KNOWN_EVENTS: [&str; 1] = ["page.published"];
 
 // ---------------------------------------------------------------------------------------------
 // Response bodies
@@ -67,10 +59,14 @@ pub struct AutomationBody {
     pub description: String,
     /// Whether the rule fires.
     pub enabled: bool,
-    /// Event the rule listens for.
+    /// Event the rule listens for — for a webhook trigger, the reserved hook event.
     pub event: String,
-    /// Conditions an event payload must satisfy.
-    pub conditions: Vec<Condition>,
+    /// How the rule starts: `event`, `schedule`, `manual` or `inbound_webhook`.
+    pub trigger: &'static str,
+    /// The condition tree as stored: a group object, or the flat array of an older rule.
+    pub conditions: Value,
+    /// How many comparisons the tree carries — what the editor's counter shows.
+    pub condition_count: usize,
     /// Actions to run, in order.
     pub actions: Value,
     /// How many runs the trigger has started.
@@ -84,11 +80,40 @@ pub struct AutomationBody {
     /// Last change.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// The hook surface of a webhook-triggered rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook: Option<HookBody>,
+}
+
+/// What a webhook-triggered rule's URL surface looks like from the outside.
+///
+/// The token is the only credential and it is **never** part of a read: `GET` on a rule
+/// reports that a hook exists, where to mint one and how many calls the current window has
+/// spent — never the URL itself. Minting is a separate, explicit `POST …/rotate-hook`,
+/// which is the only time a token appears in a response.
+#[derive(Debug, Serialize)]
+pub struct HookBody {
+    /// `true` when the rule has a live token.
+    pub configured: bool,
+    /// How many inbound calls the current rate window has spent.
+    pub window_used: i64,
+    /// The window's ceiling.
+    pub window_limit: i64,
+    /// When the window rolls over.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_resets_at: OffsetDateTime,
+    /// The path template the panel shows, with the token left out.
+    pub path_template: &'static str,
 }
 
 impl AutomationBody {
     /// Describe one rule.
-    fn build(rule: &AutomationRule, actions: Value) -> Self {
+    fn build(rule: &AutomationRule, actions: Value, hook: Option<HookBody>) -> Self {
+        let condition_count = rule
+            .condition_group()
+            .map(|group| group.comparison_count())
+            .unwrap_or_default();
+
         Self {
             id: rule.id,
             organization_id: rule.organization_id,
@@ -97,12 +122,19 @@ impl AutomationBody {
             description: rule.description.clone(),
             enabled: rule.enabled,
             event: rule.event.clone(),
-            conditions: rule.conditions.clone(),
+            trigger: if rule.hook_triggered {
+                "inbound_webhook"
+            } else {
+                "event"
+            },
+            conditions: rule.stored_conditions.clone(),
+            condition_count,
             actions,
             trigger_count: rule.trigger_count,
             last_triggered_at: rule.last_triggered_at,
             created_at: rule.created_at,
             updated_at: rule.updated_at,
+            hook,
         }
     }
 }
@@ -137,14 +169,28 @@ pub struct CatalogueOperator {
 /// The vocabulary a rule is written in.
 #[derive(Debug, Serialize)]
 pub struct CatalogueResponse {
-    /// Event names the platform documents today.
-    pub events: Vec<&'static str>,
+    /// The event library, with the payload fields each event carries.
+    pub events: Vec<&'static omnion_automation::catalogue::EventDef>,
     /// The closed comparison set.
     pub condition_operators: Vec<CatalogueOperator>,
     /// The closed action set.
     pub actions: Vec<CatalogueAction>,
+    /// How the rule starts.
+    pub trigger_kinds: Vec<&'static str>,
+    /// The condition group modes the editor offers.
+    pub group_modes: Vec<&'static str>,
+    /// How deep groups may nest.
+    pub max_group_depth: usize,
+    /// How many conditions and groups a rule may carry in total.
+    pub max_conditions: usize,
+    /// The event a webhook trigger listens for.
+    pub hook_event: &'static str,
+    /// The reserved hook name, as the bus records it.
+    pub hook_path_template: &'static str,
     /// How a payload field is named inside a condition or a binding.
     pub binding_syntax: &'static str,
+    /// An example of the payload an inbound call produces.
+    pub hook_sample: Value,
 }
 
 /// Build the catalogue of the closed vocabulary.
@@ -157,13 +203,10 @@ pub fn catalogue() -> CatalogueResponse {
     };
 
     CatalogueResponse {
-        events: KNOWN_EVENTS.to_vec(),
-        condition_operators: ConditionOperator::ALL
+        events: omnion_automation::catalogue::EVENTS.iter().collect(),
+        condition_operators: omnion_automation::groups::operators()
             .into_iter()
-            .map(|operator| CatalogueOperator {
-                key: operator.as_str(),
-                needs_value: operator.needs_value(),
-            })
+            .map(|(key, needs_value)| CatalogueOperator { key, needs_value })
             .collect(),
         actions: ACTIONS
             .iter()
@@ -174,7 +217,17 @@ pub fn catalogue() -> CatalogueResponse {
                     .map(|action| catalogue_action(action, true)),
             )
             .collect(),
+        trigger_kinds: omnion_automation::catalogue::TriggerKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect(),
+        group_modes: vec!["all", "any"],
+        max_group_depth: omnion_automation::groups::MAX_GROUP_DEPTH,
+        max_conditions: omnion_automation::groups::MAX_GROUP_NODES,
+        hook_event: omnion_automation::catalogue::HOOK_EVENT,
+        hook_path_template: "/api/v1/hooks/<token>",
         binding_syntax: "{{event.field}} — the field is read from the event payload",
+        hook_sample: omnion_automation::hooks::sample_payload(),
     }
 }
 
@@ -207,11 +260,16 @@ pub struct AutomationInput {
     /// Whether the rule fires straight away.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
-    /// Event the rule listens for.
+    /// Event the rule listens for. Ignored (and overwritten) for a webhook trigger, which
+    /// always listens for the reserved hook event.
     pub event: String,
-    /// Conditions an event payload must satisfy.
+    /// The condition tree: `{"all": [ … ]}` / `{"any": [ … ]}`, or the flat array of an
+    /// older rule, which reads as one `all` group.
+    #[serde(default = "empty_conditions")]
+    pub conditions: Value,
+    /// Whether the rule is triggered by its own inbound webhook URL.
     #[serde(default)]
-    pub conditions: Vec<Condition>,
+    pub hook_triggered: bool,
     /// Actions to run, in order.
     pub actions: Vec<StepDefinition>,
 }
@@ -219,6 +277,11 @@ pub struct AutomationInput {
 /// Serde default for [`AutomationInput::enabled`]: a new rule is armed.
 fn enabled_by_default() -> bool {
     true
+}
+
+/// Serde default for [`AutomationInput::conditions`]: a rule with no conditions.
+fn empty_conditions() -> Value {
+    Value::Array(Vec::new())
 }
 
 impl AutomationInput {
@@ -230,13 +293,14 @@ impl AutomationInput {
             enabled: self.enabled,
             site_id: self.site_id,
             event: self.event.clone(),
-            conditions: self.conditions.clone(),
+            stored_conditions: self.conditions.clone(),
             actions: self.actions.clone(),
+            hook_triggered: self.hook_triggered,
         };
 
         // The definition check is the full one: the event name against the bus's rule, the
-        // conditions and bindings against the layer's, and the trigger/actions/steps against the
-        // engine's. A definition the matcher could not run never reaches the store.
+        // condition tree and the bindings against the layer's, and the trigger/actions/steps
+        // against the engine's. A definition the matcher could not run never reaches the store.
         rule.definition()?;
 
         // The organization travels with the definition, not inside it; this only proves the
@@ -245,6 +309,78 @@ impl AutomationInput {
 
         Ok(rule)
     }
+}
+
+/// A test payload for a dry run.
+#[derive(Debug, Deserialize)]
+pub struct TestRequest {
+    /// The payload to evaluate the rule against.
+    pub payload: Value,
+}
+
+/// The answer of a dry run: what the rule would do, and what it did not do.
+#[derive(Debug, Serialize)]
+pub struct TestResponse {
+    /// The report, row by row.
+    pub report: omnion_automation::testing::DryRunReport,
+    /// The stored report, so the panel can re-read it after a reload.
+    pub recorded: TestEventBody,
+}
+
+/// One stored test or listener row, as the panel reads it.
+#[derive(Debug, Serialize)]
+pub struct TestEventBody {
+    /// Row id.
+    pub id: Uuid,
+    /// `test` or `listen`.
+    pub kind: String,
+    /// The payload the row carries — the hand-written one, or the captured one.
+    pub payload: Option<Value>,
+    /// Event id, when a listener captured one.
+    pub event_id: Option<i64>,
+    /// Event name, when a listener captured one.
+    pub event_name: Option<String>,
+    /// `true` while a listener waits for its next event.
+    pub armed: bool,
+    /// When the row was written.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// When a listener filled in.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub captured_at: Option<OffsetDateTime>,
+}
+
+impl From<&omnion_automation::testing::TestEvent> for TestEventBody {
+    fn from(row: &omnion_automation::testing::TestEvent) -> Self {
+        Self {
+            id: row.id,
+            kind: row.kind.clone(),
+            payload: row.payload.clone(),
+            event_id: row.event_id,
+            event_name: row.event_name.clone(),
+            armed: row.is_armed(),
+            created_at: row.created_at,
+            captured_at: row.captured_at,
+        }
+    }
+}
+
+/// The rows of a rule's test history, newest first.
+#[derive(Debug, Serialize)]
+pub struct TestListResponse {
+    /// The rows.
+    pub tests: Vec<TestEventBody>,
+}
+
+/// A newly minted hook token — the only response that ever carries one.
+#[derive(Debug, Serialize)]
+pub struct RotateHookResponse {
+    /// The URL to give the caller, token included.
+    pub url: String,
+    /// The token on its own, for a caller that builds the URL itself.
+    pub token: String,
+    /// The rule the URL belongs to.
+    pub automation_id: Uuid,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -281,10 +417,35 @@ pub async fn list_automations(
         let Some(rule) = AutomationRule::from_workflow(workflow)? else {
             continue;
         };
-        automations.push(AutomationBody::build(&rule, workflow.steps.clone()));
+        let hook = hook_body(state.db().pool(), &rule).await?;
+        automations.push(AutomationBody::build(&rule, workflow.steps.clone(), hook));
     }
 
     Ok(Json(AutomationListResponse { automations }))
+}
+
+/// The hook surface of a rule, or `None` for a rule that is not webhook-triggered.
+///
+/// Every rule that *has* a token is a webhook rule; a rule that declares a webhook trigger
+/// but has not minted a token yet still reports its surface, with `configured: false` — the
+/// panel then shows "your URL is not created yet" instead of pretending there is one.
+async fn hook_body(
+    pool: &sqlx::PgPool,
+    rule: &AutomationRule,
+) -> Result<Option<HookBody>, ApiError> {
+    if !rule.hook_triggered {
+        return Ok(None);
+    }
+
+    let (window_used, window_resets_at) =
+        omnion_automation::hooks::window_state(pool, rule.id).await?;
+    Ok(Some(HookBody {
+        configured: rule.hook_configured,
+        window_used,
+        window_limit: omnion_automation::hooks::DEFAULT_HOOK_LIMIT,
+        window_resets_at,
+        path_template: "/api/v1/hooks/<token>",
+    }))
 }
 
 /// `POST /api/v1/automations` — write one rule.
@@ -337,9 +498,10 @@ pub async fn create_automation(
     .await?;
 
     let stored = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
+    let hook = hook_body(state.db().pool(), &stored).await?;
     Ok((
         StatusCode::CREATED,
-        Json(AutomationBody::build(&stored, workflow.steps.clone())),
+        Json(AutomationBody::build(&stored, workflow.steps.clone(), hook)),
     ))
 }
 
@@ -351,7 +513,12 @@ pub async fn get_automation(
 ) -> Result<Json<AutomationBody>, ApiError> {
     let workflow = automation_in_scope(&state, &current, automation_id).await?;
     let rule = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
-    Ok(Json(AutomationBody::build(&rule, workflow.steps.clone())))
+    let hook = hook_body(state.db().pool(), &rule).await?;
+    Ok(Json(AutomationBody::build(
+        &rule,
+        workflow.steps.clone(),
+        hook,
+    )))
 }
 
 /// `PUT /api/v1/automations/{id}` — replace a rule.
@@ -386,8 +553,10 @@ pub async fn update_automation(
         description: rule.description.clone(),
         enabled: rule.enabled,
         event: rule.event.clone(),
-        conditions: rule.conditions.clone(),
+        stored_conditions: rule.stored_conditions.clone(),
         actions: rule.actions.clone(),
+        hook_triggered: rule.hook_triggered,
+        hook_configured: existing.hook_token_hash.is_some(),
         trigger_count: existing.trigger_count,
         last_triggered_at: existing.last_triggered_at,
         created_at: existing.created_at,
@@ -417,7 +586,222 @@ pub async fn update_automation(
 
     let stored = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
     let _ = definition;
-    Ok(Json(AutomationBody::build(&stored, workflow.steps.clone())))
+    let hook = hook_body(state.db().pool(), &stored).await?;
+    Ok(Json(AutomationBody::build(
+        &stored,
+        workflow.steps.clone(),
+        hook,
+    )))
+}
+
+/// `POST /api/v1/automations/{id}/test` — evaluate a hand-written payload, touch nothing.
+///
+/// The report is the whole answer: which conditions held against this payload, what each
+/// action *would* do, and `simulated: true` on every row. Nothing is sent, published or
+/// called — which is what makes it safe to press on a rule that is already armed.
+pub async fn test_automation(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(automation_id): Path<Uuid>,
+    address: ClientAddress,
+    Json(input): Json<TestRequest>,
+) -> Result<Json<TestResponse>, ApiError> {
+    let workflow = automation_in_scope(&state, &current, automation_id).await?;
+    let rule = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
+
+    omnion_automation::testing::validate_payload(&input.payload)?;
+
+    let report = omnion_automation::testing::dry_run(&rule, &input.payload);
+    let recorded = omnion_automation::testing::record_test(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.id,
+        &input.payload,
+        current.user.id,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "automation.tested")
+            .organization(workflow.organization_id)
+            .target("workflow", workflow.id.to_string())
+            .metadata(json!({
+                "would_run": report.would_run,
+                "actions": report.actions.len(),
+                "test_id": recorded.id,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(TestResponse {
+        report,
+        recorded: TestEventBody::from(&recorded),
+    }))
+}
+
+/// `POST /api/v1/automations/{id}/listen` — arm a one-shot listener for the next real event.
+///
+/// The row is written empty; the matcher fills it with the payload of the first event the
+/// rule actually matches. One shot, and one listener per rule: a second press replaces the
+/// first, so the panel never shows two armed rows and the matcher only has one to fill.
+pub async fn listen_automation(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(automation_id): Path<Uuid>,
+    address: ClientAddress,
+) -> Result<(StatusCode, Json<TestEventBody>), ApiError> {
+    let workflow = automation_in_scope(&state, &current, automation_id).await?;
+
+    let armed = omnion_automation::testing::arm_listener(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.id,
+        current.user.id,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "automation.listener_armed")
+            .organization(workflow.organization_id)
+            .target("workflow", workflow.id.to_string())
+            .metadata(json!({ "event": workflow.trigger_event, "test_id": armed.id }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(TestEventBody::from(&armed))))
+}
+
+/// `GET /api/v1/automations/{id}/tests` — the rule's test reports and captured payloads.
+pub async fn list_tests(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(automation_id): Path<Uuid>,
+) -> Result<Json<TestListResponse>, ApiError> {
+    let workflow = automation_in_scope(&state, &current, automation_id).await?;
+
+    let rows =
+        omnion_automation::testing::list_for_workflow(state.db().pool(), workflow.id, 20).await?;
+
+    Ok(Json(TestListResponse {
+        tests: rows.iter().map(TestEventBody::from).collect(),
+    }))
+}
+
+/// `POST /api/v1/automations/{id}/rotate-hook` — mint a fresh inbound-webhook token.
+///
+/// The only response in the surface that carries a token, and the reason is simple: the
+/// server keeps a hash, so a token that was never read is a token nobody knows. Rotation
+/// invalidates the previous URL immediately, which is the answer to "this URL leaked".
+///
+/// A rule that is not webhook-triggered is refused: minting a URL for an event rule would
+/// create a trigger that never fires, which is a dead feature rather than a mistake.
+pub async fn rotate_hook(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(automation_id): Path<Uuid>,
+    address: ClientAddress,
+) -> Result<(StatusCode, Json<RotateHookResponse>), ApiError> {
+    let workflow = automation_in_scope(&state, &current, automation_id).await?;
+
+    if !AutomationRule::from_workflow(&workflow)?
+        .ok_or_else(automation_not_found)?
+        .hook_triggered
+    {
+        return Err(ApiError::bad_request(
+            "not_a_webhook_trigger",
+            "this rule is not triggered by an inbound webhook; switch its trigger first",
+        ));
+    }
+
+    let issued = omnion_automation::hooks::issue_token();
+    omnion_automation::hooks::set_token(state.db().pool(), workflow.id, &issued.hash).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "automation.hook_rotated")
+            .organization(workflow.organization_id)
+            .target("workflow", workflow.id.to_string())
+            // The token itself is never audited: an audit row is read by more people than
+            // the URL, and the token is a credential.
+            .metadata(json!({ "event": workflow.trigger_event }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RotateHookResponse {
+            url: format!("/api/v1/hooks/{}", issued.token),
+            token: issued.token,
+            automation_id: workflow.id,
+        }),
+    ))
+}
+
+/// `POST /api/v1/hooks/{token}` — an inbound webhook call, answered without a session.
+///
+/// The token **is** the credential, and every way of failing answers `404` with the same
+/// body: an unknown token, a rotated one, a paused rule's, and a token that is not shaped
+/// like one. The caller learns nothing about which rules exist or whether this platform has
+/// hooks at all, and the rule's name is never echoed back — the only thing returned is the
+/// rule id, so a caller can correlate its own call with its own logs.
+///
+/// The call is recorded on the bus as `automation.hook.received`, and from there it is the
+/// same matcher, the same conditions and the same durable run as any other event. The rate
+/// window is checked *before* the event is written, so a caller over its allowance produces
+/// no events at all.
+pub async fn receive_hook(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    address: ClientAddress,
+    Json(body): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let Some(rule) = omnion_automation::hooks::find_rule(state.db().pool(), &token).await? else {
+        return Err(hook_not_found());
+    };
+
+    match omnion_automation::hooks::count_hit(
+        state.db().pool(),
+        rule.workflow_id,
+        omnion_automation::hooks::DEFAULT_HOOK_LIMIT,
+        OffsetDateTime::now_utc(),
+    )
+    .await?
+    {
+        omnion_automation::hooks::RateVerdict::Allowed { .. } => {}
+        omnion_automation::hooks::RateVerdict::Limited {
+            limit, resets_at, ..
+        } => {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "automation_hook_limited",
+                format!(
+                    "this webhook accepted {limit} calls in its window; the window resets at \
+                     {resets_at}"
+                ),
+            ));
+        }
+    }
+
+    let event_id = omnion_automation::hooks::record_call(
+        state.db().pool(),
+        &rule,
+        body,
+        "POST",
+        address.as_text().unwrap_or_default().as_str(),
+    )
+    .await?;
+
+    // `202`: the event is recorded and a run will be started by the matcher on its next
+    // tick. Answering `200` would claim the work already happened, which it has not.
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "automation_id": rule.workflow_id, "event_id": event_id })),
+    ))
 }
 
 /// `DELETE /api/v1/automations/{id}` — remove a rule and its run history.
@@ -497,14 +881,78 @@ fn automation_not_found() -> ApiError {
     )
 }
 
+/// The one answer every failed inbound call gets.
+///
+/// Unknown token, rotated token, paused rule and a token that is not shaped like one are
+/// deliberately indistinguishable: a hook URL is a credential, and an endpoint that says
+/// "this token existed but is paused" is an oracle for anyone probing one.
+fn hook_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "not_found", "not found")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+
+    /// A comparison inside an `all` group, as the panel sends it.
+    fn equals(field: &str, value: &str) -> Value {
+        json!({ "all": [{ "field": field, "operator": "equals", "value": value }] })
+    }
+
+    /// A rule that mails somebody, which is enough to make a dry run say something.
+    fn input() -> AutomationInput {
+        AutomationInput {
+            organization_id: None,
+            site_id: None,
+            name: "  Welcome the editor  ".to_owned(),
+            description: "  announces a publication  ".to_owned(),
+            enabled: true,
+            event: "page.published".to_owned(),
+            conditions: equals("status", "published"),
+            hook_triggered: false,
+            actions: vec![StepDefinition::task(
+                "tell the editor",
+                "send_email",
+                json!({
+                    "to": "editor@example.com",
+                    "subject": "Published: {{event.title}}",
+                    "body": "{{event.slug}} is live.",
+                }),
+            )],
+        }
+    }
 
     #[test]
     fn the_catalogue_lists_the_closed_vocabulary() {
         let catalogue = catalogue();
-        assert_eq!(catalogue.events, vec!["page.published"]);
+
+        // The event library carries its payload fields, which is what the condition and
+        // binding pickers offer — a rule cannot be written against a field the event lacks.
+        let names: Vec<&str> = catalogue.events.iter().map(|event| event.name).collect();
+        for name in [
+            "page.published",
+            "user.created",
+            "user.updated",
+            "media.created",
+            "media.deleted",
+            "workflow.execution.completed",
+            "ai.run.completed",
+        ] {
+            assert!(names.contains(&name), "{name} is documented");
+        }
+        let published = catalogue
+            .events
+            .iter()
+            .find(|event| event.name == "page.published")
+            .expect("page.published");
+        assert!(
+            published
+                .fields
+                .iter()
+                .any(|field| field.key == "revision_id")
+        );
+        assert!(!published.fields.is_empty());
 
         let operators: Vec<&str> = catalogue
             .condition_operators
@@ -554,55 +1002,62 @@ mod tests {
         for action in &catalogue.actions {
             assert!(!action.description.trim().is_empty(), "{}", action.key);
         }
+
+        // The editor's own bounds, and the webhook surface it needs to render.
+        assert_eq!(
+            catalogue.trigger_kinds,
+            vec!["event", "schedule", "manual", "inbound_webhook"]
+        );
+        assert_eq!(catalogue.group_modes, vec!["all", "any"]);
+        assert_eq!(catalogue.max_group_depth, 3);
+        assert!(catalogue.max_conditions >= 10);
+        assert_eq!(catalogue.hook_event, "automation.hook.received");
+        assert_eq!(catalogue.hook_path_template, "/api/v1/hooks/<token>");
+        assert!(catalogue.hook_sample["hook"]["body"].is_object());
         assert!(catalogue.binding_syntax.contains("{{event."));
     }
 
     #[test]
     fn a_request_becomes_a_checked_rule() {
-        let input = AutomationInput {
-            organization_id: None,
-            site_id: None,
-            name: "  Welcome the editor  ".to_owned(),
-            description: "  announces a publication  ".to_owned(),
-            enabled: true,
-            event: "page.published".to_owned(),
-            conditions: vec![Condition::compare(
-                "status",
-                ConditionOperator::Equals,
-                json!("published"),
-            )],
-            actions: vec![StepDefinition::task(
-                "tell the editor",
-                "send_email",
-                json!({
-                    "to": "editor@example.com",
-                    "subject": "Published: {{event.title}}",
-                    "body": "{{event.slug}} is live.",
-                }),
-            )],
-        };
-
-        let rule = input.rule(Uuid::nil()).expect("the rule is valid");
+        let rule = input().rule(Uuid::nil()).expect("the rule is valid");
         assert_eq!(rule.name, "Welcome the editor");
         assert_eq!(rule.description, "announces a publication");
-        assert_eq!(rule.conditions.len(), 1);
-        assert_eq!(rule.actions.len(), 1);
         assert!(rule.definition().is_ok());
+
+        // The stored conditions are the one-key group object, so a rule saved by this layer
+        // and a rule saved before it both read the same way.
+        let definition = rule.definition().expect("valid");
+        let conditions = definition.conditions_json().expect("stores");
+        assert!(conditions["all"].is_array(), "{conditions}");
+    }
+
+    #[test]
+    fn a_webhook_rule_ignores_the_event_it_was_sent() {
+        let mut request = input();
+        request.event = "page.published".to_owned();
+        request.hook_triggered = true;
+
+        let rule = request.rule(Uuid::nil()).expect("a webhook rule is valid");
+        let definition = rule.definition().expect("valid");
+        assert_eq!(
+            definition.trigger.event.as_deref(),
+            Some("automation.hook.received"),
+            "a webhook rule always listens for the reserved name"
+        );
     }
 
     #[test]
     fn a_rule_the_matcher_could_not_run_is_refused_when_it_is_written() {
-        let base = |event: &str, conditions: Vec<Condition>, actions: Vec<StepDefinition>| {
-            AutomationInput {
-                organization_id: None,
-                site_id: None,
-                name: "rule".to_owned(),
-                description: String::new(),
-                enabled: true,
-                event: event.to_owned(),
-                conditions,
-                actions,
-            }
+        let base = |event: &str, conditions: Value, actions: Vec<StepDefinition>| AutomationInput {
+            organization_id: None,
+            site_id: None,
+            name: "rule".to_owned(),
+            description: String::new(),
+            enabled: true,
+            event: event.to_owned(),
+            conditions,
+            hook_triggered: false,
+            actions,
         };
         let action = || {
             vec![StepDefinition::task(
@@ -613,25 +1068,39 @@ mod tests {
         };
 
         // An event the bus could never record.
-        let error = base("Page.Published", vec![], action())
+        let error = base("Page.Published", json!([]), action())
             .rule(Uuid::nil())
             .expect_err("event name");
         assert_eq!(error.code(), "invalid_event");
 
-        // A condition without its value.
+        // The reserved hook name, claimed by an event rule.
+        let error = base("automation.hook.received", json!([]), action())
+            .rule(Uuid::nil())
+            .expect_err("reserved");
+        assert_eq!(error.code(), "invalid_event");
+
+        // A comparison missing its value, and a group the panel could not lay out.
         let error = base(
             "page.published",
-            vec![Condition::presence("status", ConditionOperator::Equals)],
+            json!({ "all": [{ "field": "status", "operator": "equals" }] }),
             action(),
         )
         .rule(Uuid::nil())
         .expect_err("condition");
         assert_eq!(error.code(), "invalid_conditions");
 
+        let too_deep = json!({ "all": [{ "all": [{ "all": [{ "all": [{
+            "field": "status", "operator": "equals", "value": "published"
+        }] }] }] }] });
+        let error = base("page.published", too_deep, action())
+            .rule(Uuid::nil())
+            .expect_err("depth");
+        assert_eq!(error.code(), "invalid_conditions");
+
         // A binding that names something other than the event.
         let error = base(
             "page.published",
-            vec![],
+            json!([]),
             vec![StepDefinition::task(
                 "comment",
                 "comment_revision",
@@ -642,16 +1111,30 @@ mod tests {
         .expect_err("binding");
         assert_eq!(error.code(), "invalid_binding");
 
-        // A rule without actions.
-        let error = base("page.published", vec![], vec![])
+        // A rule without actions, and one with a blank name.
+        let error = base("page.published", json!([]), vec![])
             .rule(Uuid::nil())
             .expect_err("no actions");
         assert_eq!(error.code(), "invalid_steps");
 
-        // A blank name.
-        let mut named = base("page.published", vec![], action());
+        let mut named = base("page.published", json!([]), action());
         named.name = "   ".to_owned();
-        let error = named.rule(Uuid::nil()).expect_err("name");
-        assert_eq!(error.code(), "invalid_name");
+        assert_eq!(
+            named.rule(Uuid::nil()).expect_err("name").code(),
+            "invalid_name"
+        );
+    }
+
+    #[test]
+    fn a_failed_hook_call_answers_the_same_404_every_time() {
+        // One body for an unknown token, a rotated one, a paused rule's and a token that is
+        // not shaped like one — an endpoint that distinguishes them is an oracle.
+        let error = hook_not_found();
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.code(), "not_found");
+        // The body says nothing about rules, tokens or state: it is the same sentence a
+        // request to a path that does not exist gets.
+        let body = error.into_response();
+        assert_eq!(body.status(), StatusCode::NOT_FOUND);
     }
 }

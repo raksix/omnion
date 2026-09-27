@@ -198,8 +198,14 @@ pub struct Workflow {
     pub schedule: Option<String>,
     /// Event name when the trigger is an event.
     pub trigger_event: Option<String>,
-    /// Conditions an event trigger's payload must satisfy, as stored JSON array.
+    /// Conditions an event trigger's payload must satisfy, as stored JSON: an `all` / `any`
+    /// group tree, or the flat array every rule written before migration 0019 carries.
     pub conditions: serde_json::Value,
+    /// SHA-256 of an inbound-webhook trigger's token, when the rule has one.
+    ///
+    /// The token itself is never stored: it is shown once when it is minted, and only this
+    /// hash can match a call. The automation layer owns it (see `omnion-automation::hooks`).
+    pub hook_token_hash: Option<String>,
     /// Next time the scheduler should start this workflow.
     pub next_run_at: Option<OffsetDateTime>,
     /// Ordered step definitions, as stored JSON.
@@ -236,8 +242,8 @@ impl Workflow {
 
 /// Columns of `workflows`, in the order [`Workflow`] expects.
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
-     trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, last_triggered_at, \
-     trigger_count, created_by, created_at, updated_at";
+     trigger_kind, schedule, trigger_event, conditions, hook_token_hash, next_run_at, steps, \
+     last_triggered_at, trigger_count, created_by, created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]

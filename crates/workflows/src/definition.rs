@@ -337,10 +337,12 @@ impl StepDefinition {
 pub struct WorkflowDefinition {
     /// How the workflow starts.
     pub trigger: Trigger,
-    /// Conditions an event trigger's payload must satisfy, in order. Empty for the other
-    /// triggers — a manual run and a schedule have no payload to evaluate them against.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<Value>,
+    /// Conditions an event trigger's payload must satisfy, as stored JSON: an `all` / `any`
+    /// group tree, or the flat array every definition written before migration 0019 carries
+    /// (which reads as one `all` group). Empty for the other triggers — a manual run and a
+    /// schedule have no payload to evaluate conditions against.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub conditions: Value,
     /// Steps, in the order they run.
     pub steps: Vec<StepDefinition>,
 }
@@ -350,7 +352,7 @@ impl WorkflowDefinition {
     pub fn new(trigger: Trigger, steps: Vec<StepDefinition>) -> Result<Self> {
         let definition = Self {
             trigger,
-            conditions: Vec::new(),
+            conditions: Value::Array(Vec::new()),
             steps,
         };
         definition.validate()?;
@@ -359,7 +361,7 @@ impl WorkflowDefinition {
 
     /// Attach the conditions of an event trigger.
     #[must_use]
-    pub fn with_conditions(mut self, conditions: Vec<Value>) -> Self {
+    pub fn with_conditions(mut self, conditions: Value) -> Self {
         self.conditions = conditions;
         self
     }
@@ -397,21 +399,23 @@ impl WorkflowDefinition {
         Ok(())
     }
 
-    /// Conditions belong to an event trigger, and every condition is an object.
+    /// Conditions belong to an event trigger, and are a list of comparisons or a group tree.
     ///
-    /// What a condition *means* — which field, which operator — is the automation layer's rule
-    /// (`omnion-automation`), which validates the same list before it is stored; the engine
-    /// holds the shape, because it is what writes them into `workflows.conditions`.
+    /// What a condition *means* — which field, which operator, and how groups nest — is the
+    /// automation layer's rule (`omnion-automation::groups`), which validates the same value
+    /// before it is stored; the engine holds the *shape*, because it is what writes it into
+    /// `workflows.conditions`. Two shapes are accepted: the v0 array of comparisons, and the
+    /// `{"all": […]}` / `{"any": […]}` object the depth pass added (migration 0019).
     fn validate_conditions(&self) -> Result<()> {
-        if self.conditions.len() > MAX_CONDITIONS {
-            return Err(WorkflowError::invalid(
-                "invalid_conditions",
-                format!("a trigger carries at most {MAX_CONDITIONS} conditions"),
-            ));
-        }
-        if self.conditions.is_empty() {
+        let empty = match &self.conditions {
+            Value::Array(items) => items.is_empty(),
+            Value::Null => true,
+            _ => false,
+        };
+        if empty {
             return Ok(());
         }
+
         if self.trigger.kind != TriggerKind::Event {
             return Err(WorkflowError::invalid(
                 "invalid_conditions",
@@ -419,14 +423,30 @@ impl WorkflowDefinition {
                  payload to evaluate them against",
             ));
         }
-        for condition in &self.conditions {
-            if !condition.is_object() {
-                return Err(WorkflowError::invalid(
-                    "invalid_conditions",
-                    "every condition is a JSON object",
-                ));
+
+        let well_formed = match &self.conditions {
+            Value::Array(items) => items.iter().all(Value::is_object),
+            // A group is an object with exactly one of `all` / `any`, and its members are
+            // objects too — a comparison or a nested group.
+            Value::Object(map) => {
+                (map.contains_key("all") || map.contains_key("any"))
+                    && map.len() == 1
+                    && map
+                        .values()
+                        .next()
+                        .and_then(Value::as_array)
+                        .is_some_and(|nodes| nodes.iter().all(Value::is_object))
             }
+            _ => false,
+        };
+
+        if !well_formed {
+            return Err(WorkflowError::invalid(
+                "invalid_conditions",
+                "conditions are a list of objects, or one `all` / `any` group of them",
+            ));
         }
+
         Ok(())
     }
 
@@ -683,7 +703,7 @@ mod tests {
             vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
         )
         .expect("the trigger is valid")
-        .with_conditions(vec![condition.clone()]);
+        .with_conditions(serde_json::json!([condition.clone()]));
         definition
             .validate()
             .expect("a condition on an event trigger is valid");
@@ -692,13 +712,25 @@ mod tests {
             "status"
         );
 
+        // A group tree is the shape the depth pass added, and the engine holds it as-is.
+        let grouped = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect("the trigger is valid")
+        .with_conditions(serde_json::json!({ "any": [{ "all": [condition] }] }));
+        grouped
+            .validate()
+            .expect("a group on an event trigger is valid");
+        assert!(grouped.conditions_json().expect("stores")["any"].is_array());
+
         // The same condition on a manual workflow has nothing to evaluate it against.
         let manual = WorkflowDefinition::new(
             Trigger::manual(),
             vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
         )
         .expect("the trigger is valid")
-        .with_conditions(vec![condition.clone()]);
+        .with_conditions(serde_json::json!([condition.clone()]));
         assert_eq!(
             manual
                 .validate()
@@ -707,30 +739,27 @@ mod tests {
             "invalid_conditions"
         );
 
-        // The list is bounded and every entry is an object.
-        let many = WorkflowDefinition::new(
-            Trigger::event("page.published"),
-            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
-        )
-        .expect("the trigger is valid")
-        .with_conditions(vec![condition; MAX_CONDITIONS + 1]);
-        assert_eq!(
-            many.validate().expect_err("the cap holds").code(),
-            "invalid_conditions"
-        );
-
-        let not_an_object = WorkflowDefinition::new(
-            Trigger::event("page.published"),
-            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
-        )
-        .expect("the trigger is valid")
-        .with_conditions(vec![serde_json::json!("status")]);
-        assert_eq!(
-            not_an_object
-                .validate()
-                .expect_err("a condition is an object")
-                .code(),
-            "invalid_conditions"
-        );
+        // Shapes that are neither a list nor a one-key group are refused. The count cap now
+        // lives in the automation layer (a group tree is not a flat list of ten), so what
+        // the engine refuses is the *shape*.
+        for broken in [
+            serde_json::json!([serde_json::json!("status")]),
+            serde_json::json!({ "all": [condition.clone()], "any": [] }),
+            serde_json::json!({ "none": [condition.clone()] }),
+            serde_json::json!({ "all": "everything" }),
+            serde_json::json!(["nope"]),
+        ] {
+            let definition = WorkflowDefinition::new(
+                Trigger::event("page.published"),
+                vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+            )
+            .expect("the trigger is valid")
+            .with_conditions(broken.clone());
+            assert_eq!(
+                definition.validate().expect_err("refused").code(),
+                "invalid_conditions",
+                "{broken}"
+            );
+        }
     }
 }
