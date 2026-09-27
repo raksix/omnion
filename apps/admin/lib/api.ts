@@ -812,13 +812,67 @@ export type AiProvider = {
   id: string;
   name: string;
   protocol: string;
+  kind: AiProviderKind;
   base_url: string;
   has_api_key: boolean;
+  timeout_ms: number;
+  max_retries: number;
+  priority: number;
+  last_health: AiHealthStatus;
+  last_checked_at: string | null;
+  last_error: string | null;
   enabled: boolean;
   is_default: boolean;
   model_count: number;
   created_at: string;
   updated_at: string;
+};
+
+/** Where a provider lives: a hosted API, or one on the operator's own network. */
+export type AiProviderKind = "cloud" | "local";
+
+/** What the last health probe found. `unknown` means it has never been probed. */
+export type AiHealthStatus = "ok" | "degraded" | "down" | "unknown";
+
+/** One protocol the form offers, with the note the panel shows under the select. */
+export type AiProtocol = {
+  protocol: string;
+  note: string;
+  chat_path: string;
+  auth: string;
+};
+
+/** The numeric ranges the form validates against, from the same constants the API uses. */
+export type AiProtocolBounds = {
+  timeout_ms_min: number;
+  timeout_ms_max: number;
+  max_retries_max: number;
+  priority_min: number;
+  priority_max: number;
+};
+
+/** One step of the connection test. */
+export type AiTestStep = {
+  step: string;
+  label: string;
+  status: "pending" | "ok" | "failed" | "skipped";
+  latency_ms: number;
+  error?: string;
+  note?: string;
+};
+
+/** The whole connection test, as the panel renders it. */
+export type AiTestReport = {
+  provider_id: string;
+  provider_name: string;
+  protocol: string;
+  steps: AiTestStep[];
+  total_ms: number;
+  ok: boolean;
+  failing_step?: string;
+  model_count?: number;
+  known_models?: number;
+  summary: string;
 };
 
 /** One model of the registry, with the provider it belongs to. */
@@ -880,11 +934,32 @@ export async function fetchAiModels(): Promise<AiModel[]> {
   return body.models;
 }
 
+/** The protocols the provider form offers, and the ranges it validates against. */
+export async function fetchAiProtocols(): Promise<{
+  protocols: AiProtocol[];
+  bounds: AiProtocolBounds;
+}> {
+  return request<{ protocols: AiProtocol[]; bounds: AiProtocolBounds }>("/api/v1/ai/protocols");
+}
+
+/** Run the connection test against a stored provider, server-side. */
+export function testAiProvider(providerId: string): Promise<AiTestReport> {
+  return request<AiTestReport>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/test`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
 /** Connect a provider, optionally with the models it serves. */
 export function connectAiProvider(input: {
   name: string;
   baseUrl: string;
+  protocol?: string;
+  kind?: AiProviderKind;
   apiKey?: string;
+  timeoutMs?: number;
+  maxRetries?: number;
+  priority?: number;
   enabled?: boolean;
   isDefault?: boolean;
   models?: AiModelInput[];
@@ -894,7 +969,12 @@ export function connectAiProvider(input: {
     body: JSON.stringify({
       name: input.name,
       base_url: input.baseUrl,
+      protocol: input.protocol,
+      kind: input.kind,
       api_key: input.apiKey && input.apiKey.trim() ? input.apiKey.trim() : null,
+      timeout_ms: input.timeoutMs,
+      max_retries: input.maxRetries,
+      priority: input.priority,
       enabled: input.enabled ?? true,
       is_default: input.isDefault ?? false,
       models: input.models ?? [],
@@ -909,6 +989,10 @@ export function updateAiProvider(
     name?: string;
     baseUrl?: string;
     apiKey?: string | null;
+    kind?: AiProviderKind;
+    timeoutMs?: number;
+    maxRetries?: number;
+    priority?: number;
     enabled?: boolean;
     isDefault?: boolean;
   },
@@ -917,6 +1001,10 @@ export function updateAiProvider(
   if (changes.name !== undefined) body.name = changes.name;
   if (changes.baseUrl !== undefined) body.base_url = changes.baseUrl;
   if (changes.apiKey !== undefined) body.api_key = changes.apiKey;
+  if (changes.kind !== undefined) body.kind = changes.kind;
+  if (changes.timeoutMs !== undefined) body.timeout_ms = changes.timeoutMs;
+  if (changes.maxRetries !== undefined) body.max_retries = changes.maxRetries;
+  if (changes.priority !== undefined) body.priority = changes.priority;
   if (changes.enabled !== undefined) body.enabled = changes.enabled;
   if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
   return request<AiProvider>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}`, {

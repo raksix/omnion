@@ -13,22 +13,43 @@
  */
 import { useCallback, useEffect, useState } from "react";
 
-import { Download, Plus, Power, Send, Star, Trash2 } from "lucide-react";
+import {
+  CircleCheck,
+  CircleSlash,
+  Download,
+  Loader2,
+  Plus,
+  Power,
+  Send,
+  Star,
+  Stethoscope,
+  Trash2,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import {
   ApiError,
+  type AiHealthStatus,
   type AiModel,
+  type AiProtocol,
+  type AiProtocolBounds,
   type AiProvider,
+  type AiProviderKind,
+  type AiTestReport,
+  type AiTestStep,
   connectAiProvider,
   discoverAiProviderModels,
   fetchAiModels,
+  fetchAiProtocols,
   fetchAiProviders,
   removeAiProvider,
   replaceAiProviderModels,
   streamChat,
+  testAiProvider,
   updateAiModel,
   updateAiProvider,
 } from "@/lib/api";
@@ -47,6 +68,144 @@ function Flag({ label, on }: { label: string; on: boolean }) {
   );
 }
 
+/** Health dot + label: the pairing has to be readable without relying on colour alone. */
+function HealthDot({ status }: { status: AiHealthStatus }) {
+  const tone: Record<AiHealthStatus, string> = {
+    ok: "bg-positive",
+    degraded: "bg-caution",
+    down: "bg-danger",
+    unknown: "bg-quiet",
+  };
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[11.5px] text-muted">
+      <span
+        data-health-dot={status}
+        className={`size-2 shrink-0 rounded-full ${tone[status]}`}
+        aria-hidden
+      />
+      {status === "unknown" ? "Never probed" : status[0].toUpperCase() + status.slice(1)}
+    </span>
+  );
+}
+
+/** The five steps of the connection test, each with its own verdict. */
+function TestSteps({ steps }: { steps: AiTestStep[] }) {
+  const icon = (status: AiTestStep["status"]) => {
+    if (status === "ok") {
+      return <CircleCheck className="size-4 shrink-0 text-positive" aria-hidden />;
+    }
+    if (status === "failed") {
+      return <TriangleAlert className="size-4 shrink-0 text-danger" aria-hidden />;
+    }
+    if (status === "skipped") {
+      return <CircleSlash className="size-4 shrink-0 text-muted" aria-hidden />;
+    }
+    return <Loader2 className="size-4 shrink-0 animate-spin text-muted" aria-hidden />;
+  };
+
+  return (
+    <ul data-test-steps className="flex flex-col divide-y divide-[var(--color-line)] rounded-lg border border-line">
+      {steps.map((step) => (
+        <li key={step.step} data-test-step={step.step} className="flex flex-col gap-1 px-3 py-2.5">
+          <div className="flex items-center gap-2">
+            {icon(step.status)}
+            <span className="text-[12.5px] font-medium">{step.label}</span>
+            <span className="ml-auto text-[11.5px] text-muted">
+              {step.status === "skipped"
+                ? "not applicable"
+                : step.status === "pending"
+                  ? "not run"
+                  : `${step.latency_ms} ms`}
+            </span>
+          </div>
+          {step.error ? (
+            <p data-test-error={step.step} className="text-[11.5px] text-danger">
+              {step.error}
+            </p>
+          ) : null}
+          {step.note ? <p className="text-[11.5px] text-muted">{step.note}</p> : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** The connection-test modal: the five steps, the total, and the provider's own failure text. */
+function TestModal({
+  report,
+  running,
+  error,
+  onClose,
+}: {
+  report: AiTestReport | null;
+  running: boolean;
+  error: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Connection test"
+        data-test-modal
+        className="flex max-h-[90vh] w-full max-w-md flex-col gap-3 overflow-y-auto rounded-xl border border-line bg-surface p-4"
+      >
+        <header className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-[14px] font-semibold">Connection test</h2>
+            <p className="text-[12px] text-muted">
+              {report ? report.provider_name : "Dialing the provider…"}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close the connection test"
+            className="rounded-lg border border-line p-1.5 transition hover:bg-canvas"
+          >
+            <X className="size-3.5" aria-hidden />
+          </button>
+        </header>
+
+        {running ? (
+          <p className="flex items-center gap-2 text-[12.5px] text-muted">
+            <Loader2 className="size-3.5 animate-spin" aria-hidden />
+            Running the five steps against the stored connection…
+          </p>
+        ) : null}
+
+        {error ? (
+          <p
+            role="alert"
+            data-test-modal-error
+            className="rounded-lg border border-caution/40 bg-caution-soft px-3 py-2 text-[12.5px]"
+          >
+            {error}
+          </p>
+        ) : null}
+
+        {report ? (
+          <>
+            <p
+              data-test-summary
+              data-failing-step={report.failing_step ?? ""}
+              className="text-[12.5px]"
+            >
+              {report.summary}
+              <span className="text-muted">
+                {" "}
+                · {report.protocol} · {report.total_ms} ms in total
+              </span>
+            </p>
+            <TestSteps steps={report.steps} />
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /** The AI Hub screen. */
 export function AiView() {
   const searchParams = useSearchParams();
@@ -57,13 +216,37 @@ export function AiView() {
   const [busy, setBusy] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
 
-  // The connect form.
+  // The provider vocabulary the form is built from. A failed load must not silently leave the
+  // select empty, so the fallback below is the protocol the platform has always spoken.
+  const [protocols, setProtocols] = useState<AiProtocol[] | null>(null);
+  const [bounds, setBounds] = useState<AiProtocolBounds>({
+    timeout_ms_min: 1000,
+    timeout_ms_max: 120000,
+    max_retries_max: 5,
+    priority_min: 1,
+    priority_max: 1000,
+  });
+
+  // The connect form. `fieldError` keeps the API's own message under the field it belongs to,
+  // which is the difference between "it did not save" and "the timeout must be 1000–120000".
   const [showForm, setShowForm] = useState(false);
   const [name, setName] = useState("");
+  const [protocol, setProtocol] = useState("openai_compatible");
+  const [kind, setKind] = useState<AiProviderKind>("cloud");
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [timeoutMs, setTimeoutMs] = useState("30000");
+  const [maxRetries, setMaxRetries] = useState("1");
+  const [priority, setPriority] = useState("100");
   const [modelKeys, setModelKeys] = useState("");
   const [makeDefault, setMakeDefault] = useState(false);
+  const [fieldError, setFieldError] = useState<{ field: string; message: string } | null>(null);
+
+  // The connection test.
+  const [testing, setTesting] = useState<{ id: string; name: string } | null>(null);
+  const [testReport, setTestReport] = useState<AiTestReport | null>(null);
+  const [testRunning, setTestRunning] = useState(false);
+  const [testError, setTestError] = useState<string | null>(null);
 
   // The model editor of one provider.
   const [editing, setEditing] = useState<string | null>(null);
@@ -127,6 +310,21 @@ export function AiView() {
     [reload],
   );
 
+  /** Which form field an API refusal belongs to, from the wording of its message. */
+  const fieldOf = (message: string): string => {
+    const lowered = message.toLowerCase();
+    if (lowered.includes("protocol")) return "protocol";
+    if (lowered.includes("kind")) return "kind";
+    if (lowered.includes("base url") || lowered.includes("base_url")) return "baseUrl";
+    if (lowered.includes("timeout")) return "timeoutMs";
+    if (lowered.includes("retries")) return "maxRetries";
+    if (lowered.includes("priority")) return "priority";
+    return "name";
+  };
+
+  const fieldMessage = (field: string) =>
+    fieldError?.field === field ? fieldError.message : null;
+
   /** The models a textarea describes: one key per line. */
   const keysOf = (value: string): { key: string }[] =>
     value
@@ -136,23 +334,63 @@ export function AiView() {
       .map((key) => ({ key }));
 
   const connect = async () => {
-    await run(
-      () =>
-        connectAiProvider({
-          name,
-          baseUrl,
-          apiKey,
-          isDefault: makeDefault,
-          models: keysOf(modelKeys),
-        }),
-      `${name.trim()} connected.`,
-    );
-    setName("");
-    setBaseUrl("");
-    setApiKey("");
-    setModelKeys("");
-    setMakeDefault(false);
-    setShowForm(false);
+    setFieldError(null);
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await connectAiProvider({
+        name,
+        baseUrl,
+        protocol,
+        kind,
+        apiKey,
+        timeoutMs: Number(timeoutMs),
+        maxRetries: Number(maxRetries),
+        priority: Number(priority),
+        isDefault: makeDefault,
+        models: keysOf(modelKeys),
+      });
+      setNotice(`${name.trim()} connected. Test it to see the five steps.`);
+      setName("");
+      setBaseUrl("");
+      setApiKey("");
+      setModelKeys("");
+      setMakeDefault(false);
+      setShowForm(false);
+      reload();
+    } catch (cause: unknown) {
+      // The API answers which field it refused; that message belongs under that field.
+      const message =
+        cause instanceof ApiError ? cause.message : "The provider could not be connected.";
+      setFieldError({ field: fieldOf(message), message });
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runTest = async (id: string, providerName: string) => {
+    setTesting({ id, name: providerName });
+    setTestReport(null);
+    setTestError(null);
+    setTestRunning(true);
+    try {
+      setTestReport(await testAiProvider(id));
+      reload();
+    } catch (cause: unknown) {
+      setTestError(
+        cause instanceof ApiError ? cause.message : "The test could not be run.",
+      );
+    } finally {
+      setTestRunning(false);
+    }
+  };
+
+  const closeTest = () => {
+    setTesting(null);
+    setTestReport(null);
+    setTestError(null);
   };
 
   const send = async () => {
@@ -190,6 +428,18 @@ export function AiView() {
   };
 
   const enabledModels = (models ?? []).filter((model) => model.enabled);
+
+  // The select is driven by the API's own list; until it answers (or if it does not) the form
+  // still offers the protocol v0 shipped, so the screen is never a dead control.
+  const protocolOptions: AiProtocol[] = protocols ?? [
+    {
+      protocol: "openai_compatible",
+      note: "Chat completions with a bearer key; the default for local servers.",
+      chat_path: "/chat/completions",
+      auth: "Authorization: Bearer <key>",
+    },
+  ];
+  const selectedProtocol = protocolOptions.find((option) => option.protocol === protocol);
 
   return (
     <div className="flex flex-col gap-6">
@@ -243,8 +493,58 @@ export function AiView() {
                   onChange={(event) => setName(event.target.value)}
                   placeholder="e.g. Office AI"
                   required
+                  maxLength={64}
+                  data-provider-name
                   className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
                 />
+                {fieldMessage("name") ? (
+                  <span data-field-error="name" className="text-[11px] text-danger">
+                    {fieldMessage("name")}
+                  </span>
+                ) : null}
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium">Protocol</span>
+                <select
+                  value={protocol}
+                  onChange={(event) => setProtocol(event.target.value)}
+                  data-provider-protocol
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+                >
+                  {protocolOptions.map((option) => (
+                    <option key={option.protocol} value={option.protocol}>
+                      {option.protocol}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-[11px] text-muted">{selectedProtocol?.note}</span>
+                {fieldMessage("protocol") ? (
+                  <span data-field-error="protocol" className="text-[11px] text-danger">
+                    {fieldMessage("protocol")}
+                  </span>
+                ) : null}
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium">Kind</span>
+                <select
+                  value={kind}
+                  onChange={(event) => setKind(event.target.value as AiProviderKind)}
+                  data-provider-kind
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+                >
+                  <option value="cloud">Cloud</option>
+                  <option value="local">Local</option>
+                </select>
+                <span className="text-[11px] text-muted">
+                  {kind === "local"
+                    ? "Runs on a machine you control — no key is usually needed."
+                    : "A hosted API that authenticates with a key."}
+                </span>
+                {fieldMessage("kind") ? (
+                  <span data-field-error="kind" className="text-[11px] text-danger">
+                    {fieldMessage("kind")}
+                  </span>
+                ) : null}
               </label>
               <label className="flex flex-col gap-1">
                 <span className="text-[12px] font-medium">Base URL</span>
@@ -253,8 +553,14 @@ export function AiView() {
                   onChange={(event) => setBaseUrl(event.target.value)}
                   placeholder="https://api.example.com/v1"
                   required
+                  data-provider-url
                   className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 font-mono text-[12px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
                 />
+                {fieldMessage("baseUrl") ? (
+                  <span data-field-error="baseUrl" className="text-[11px] text-danger">
+                    {fieldMessage("baseUrl")}
+                  </span>
+                ) : null}
               </label>
               <label className="flex flex-col gap-1">
                 <span className="text-[12px] font-medium">API key</span>
@@ -264,6 +570,7 @@ export function AiView() {
                   type="password"
                   autoComplete="off"
                   placeholder="Leave empty for a local endpoint"
+                  data-provider-key
                   className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 font-mono text-[12px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
                 />
                 <span className="text-[11px] text-muted">
@@ -271,6 +578,71 @@ export function AiView() {
                 </span>
               </label>
               <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium">Timeout (ms)</span>
+                <input
+                  value={timeoutMs}
+                  onChange={(event) => setTimeoutMs(event.target.value)}
+                  type="number"
+                  inputMode="numeric"
+                  min={bounds.timeout_ms_min}
+                  max={bounds.timeout_ms_max}
+                  data-provider-timeout
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+                />
+                <span className="text-[11px] text-muted">
+                  {bounds.timeout_ms_min.toLocaleString("en-US")}–
+                  {bounds.timeout_ms_max.toLocaleString("en-US")} ms for one call.
+                </span>
+                {fieldMessage("timeoutMs") ? (
+                  <span data-field-error="timeoutMs" className="text-[11px] text-danger">
+                    {fieldMessage("timeoutMs")}
+                  </span>
+                ) : null}
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium">Max retries</span>
+                <input
+                  value={maxRetries}
+                  onChange={(event) => setMaxRetries(event.target.value)}
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={bounds.max_retries_max}
+                  data-provider-retries
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+                />
+                <span className="text-[11px] text-muted">
+                  0–{bounds.max_retries_max}, only before the first streamed byte.
+                </span>
+                {fieldMessage("maxRetries") ? (
+                  <span data-field-error="maxRetries" className="text-[11px] text-danger">
+                    {fieldMessage("maxRetries")}
+                  </span>
+                ) : null}
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium">Priority</span>
+                <input
+                  value={priority}
+                  onChange={(event) => setPriority(event.target.value)}
+                  type="number"
+                  inputMode="numeric"
+                  min={bounds.priority_min}
+                  max={bounds.priority_max}
+                  data-provider-priority
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
+                />
+                <span className="text-[11px] text-muted">
+                  {bounds.priority_min}–{bounds.priority_max}; lower is asked first when a call
+                  fails over.
+                </span>
+                {fieldMessage("priority") ? (
+                  <span data-field-error="priority" className="text-[11px] text-danger">
+                    {fieldMessage("priority")}
+                  </span>
+                ) : null}
+              </label>
+              <label className="flex flex-col gap-1 sm:col-span-2">
                 <span className="text-[12px] font-medium">Models</span>
                 <textarea
                   value={modelKeys}
@@ -337,13 +709,30 @@ export function AiView() {
                   >
                     {provider.enabled ? "Enabled" : "Disabled"}
                   </span>
+                  <span
+                    className="inline-flex items-center rounded-full bg-quiet-soft px-2 py-0.5 text-[10.5px] font-medium text-muted"
+                    data-provider-kind-badge={provider.name}
+                  >
+                    {provider.kind === "local" ? "Local" : "Cloud"}
+                  </span>
                   <span className="text-[11.5px] text-muted">
                     {provider.model_count} model{provider.model_count === 1 ? "" : "s"}
                   </span>
                   <span className="text-[11.5px] text-muted">
                     {provider.has_api_key ? "Key stored" : "No key"}
                   </span>
+                  <HealthDot status={provider.last_health} />
                   <span className="ml-auto flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={busy || testRunning}
+                      onClick={() => void runTest(provider.id, provider.name)}
+                      data-provider-test={provider.name}
+                      className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] transition hover:bg-canvas disabled:opacity-60"
+                    >
+                      <Stethoscope className="size-3" aria-hidden />
+                      Test
+                    </button>
                     <button
                       type="button"
                       disabled={busy}
@@ -420,6 +809,11 @@ export function AiView() {
                   </span>
                 </div>
                 <p className="font-mono text-[11.5px] break-all text-muted">{provider.base_url}</p>
+                {provider.last_error ? (
+                  <p data-provider-error={provider.name} className="text-[11.5px] text-danger">
+                    {provider.last_error}
+                  </p>
+                ) : null}
 
                 {editing === provider.id ? (
                   <div className="flex flex-col gap-2 rounded-lg border border-line bg-canvas p-3">
@@ -644,6 +1038,15 @@ export function AiView() {
           ) : null}
         </div>
       </section>
+
+      {testing ? (
+        <TestModal
+          report={testReport}
+          running={testRunning}
+          error={testError}
+          onClose={closeTest}
+        />
+      ) : null}
 
       <p className="text-[11.5px] text-muted">
         Connected {providers?.length ?? 0} provider{providers?.length === 1 ? "" : "s"} ·{" "}
