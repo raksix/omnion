@@ -23,6 +23,7 @@ use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -101,14 +102,19 @@ fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) 
 }
 
 fn test_storage() -> omnion_storage::Storage {
-    omnion_storage::Storage::memory().expect("in-memory storage must be available")
+    omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
+        .expect("the default storage configuration is valid")
 }
 
+/// Connect to the compose PostgreSQL; `None` means the stack is not running.
 async fn live_db(config: &Config) -> Option<Db> {
-    match Db::connect(config).await {
+    match Db::connect(&config.database).await {
         Ok(db) => Some(db),
         Err(error) => {
-            eprintln!("skipping the content block suite: database unavailable ({error})");
+            eprintln!(
+                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
+                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
+            );
             None
         }
     }
@@ -116,29 +122,19 @@ async fn live_db(config: &Config) -> Option<Db> {
 
 /// A state whose database has all migrations applied and the IAM seed loaded.
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().ok()?;
-    let storage = test_storage();
+    let config = Config::from_env().expect("environment must be valid");
     let db = live_db(&config).await?;
-    db.migrate().await.ok()?;
+    db.migrate().await.expect("migrations must apply");
 
-    let redis = match RedisClient::connect(&config).await {
-        Ok(redis) => redis,
-        Err(error) => {
-            eprintln!("skipping the content block suite: redis unavailable ({error})");
-            return None;
-        }
-    };
-
-    Some((
-        AppState::new(
-            db.clone(),
-            redis,
-            storage,
-            BuildInfo::from_env(),
-            config.clone(),
-        ),
-        db,
-    ))
+    let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
+    let state = AppState::new(
+        BuildInfo::new("omnion-api", "0.0.0-test"),
+        config,
+        db.clone(),
+        redis,
+        test_storage(),
+    );
+    Some((state, db))
 }
 
 /// A page, a site, an organization and the accounts that drive them.
@@ -147,6 +143,7 @@ struct Fixture {
     db: Db,
     org: Uuid,
     site: Uuid,
+    site_key: String,
     platform_email: String,
     editor_email: String,
     member_email: String,
@@ -170,11 +167,15 @@ impl Fixture {
             .await
             .expect("the organization must be created");
 
+        // A site key unique to this run: the public surface resolves a site by its *global*
+        // key, and the development database already carries a `main` from every other suite,
+        // so a fixture that used it would be refused as ambiguous.
         let site = Uuid::new_v4();
+        let site_key = format!("blk{}", &Uuid::new_v4().simple().to_string()[..8]);
         sqlx::query("insert into sites (id, organization_id, key, name) values ($1, $2, $3, $4)")
             .bind(site)
             .bind(org)
-            .bind("main")
+            .bind(&site_key)
             .bind("Block Site")
             .execute(db.pool())
             .await
@@ -237,6 +238,7 @@ impl Fixture {
             db,
             org,
             site,
+            site_key,
             platform_email,
             editor_email,
             member_email,
@@ -297,10 +299,14 @@ impl Fixture {
     }
 }
 
+/// Create one account and answer its id and email.
+///
+/// The id comes back from the insert, not from a value made up here: `users::create_user`
+/// mints its own primary key, and a binding made against a guessed id fails its foreign key
+/// with the least informative message the platform has.
 async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
-    let id = Uuid::new_v4();
     let email = format!("blk-{}@example.test", Uuid::new_v4().simple());
-    users::create_user(
+    let user = users::create_user(
         db.pool(),
         NewUser {
             email: email.clone(),
@@ -311,7 +317,7 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
     )
     .await
     .expect("the account must be created");
-    (id, email)
+    (user.id, email)
 }
 
 async fn login(state: &AppState, email: &str) -> String {
@@ -331,9 +337,19 @@ async fn login(state: &AppState, email: &str) -> String {
         response.status,
         response.body
     );
+    // The `Set-Cookie` header is `name=value; Path=/; HttpOnly; …`; only the value is the
+    // session token, and sending the attributes back would be a cookie no browser accepts.
     response
         .set_cookie
+        .as_deref()
         .expect("login must set the session cookie")
+        .split(';')
+        .next()
+        .expect("the cookie has a value")
+        .split_once('=')
+        .expect("the cookie is name=value")
+        .1
+        .to_owned()
 }
 
 /// One block entry with a fresh id, in the payload shape the editor sends.
@@ -527,10 +543,8 @@ async fn a_dry_run_reports_issues_without_writing_anything() {
             json!([block("image", json!({ "src": "/m/1", "alt": "  " }))]),
             "block_alt_missing",
         ),
-        (
-            json!([block("text", json!({ "text": "x" }),)]),
-            "block_payload_invalid",
-        ),
+        // A payload that is not an array at all is refused before it is walked.
+        (json!({ "not": "an array" }), "block_payload_invalid"),
     ];
     for (tree, expected) in cases {
         let response = call(
@@ -652,10 +666,37 @@ async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
         json!(2),
         "a block save appends a revision"
     );
+
+    // Every block and every id came back, and every prop the author wrote survived. The tree
+    // the API stores is the tree it was given *plus* the defaults the schema fills in — an
+    // absent optional prop is written as its default, so a later schema change is a no-op for
+    // content that never used the prop.
+    let stored = draft["blocks"].as_array().expect("blocks");
     assert_eq!(
-        draft["blocks"], one_of_each,
-        "the tree round-trips unchanged"
+        stored.len(),
+        16,
+        "one block of every type: {}",
+        draft["blocks"]
     );
+    for (index, expected) in one_of_each.as_array().expect("sent").iter().enumerate() {
+        assert_eq!(
+            stored[index]["id"], expected["id"],
+            "block {index} kept its id"
+        );
+        assert_eq!(stored[index]["type"], expected["type"]);
+        for (key, value) in expected["props"].as_object().expect("props") {
+            assert_eq!(
+                stored[index]["props"][key], *value,
+                "block {index} kept {key}"
+            );
+        }
+    }
+    // A default the author did not touch is written down rather than left absent.
+    assert_eq!(stored[0]["props"]["align"], json!("left"));
+    assert_eq!(stored[1]["props"]["align"], json!("left"));
+    assert_eq!(stored[2]["props"]["caption"], json!(""));
+    // And the container keeps its children.
+    assert_eq!(stored[6]["children"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         draft["body"],
         json!("The pre-block text."),
@@ -673,7 +714,7 @@ async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
         ),
     )
     .await;
-    assert_eq!(read.body["draft"]["blocks"], one_of_each);
+    assert_eq!(read.body["draft"]["blocks"], draft["blocks"]);
 
     // Publishing freezes that revision, and the public surface now carries the blocks.
     let published = call(
@@ -687,20 +728,20 @@ async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
     )
     .await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.body);
-    assert_eq!(published.body["published"]["blocks"], one_of_each);
+    assert_eq!(published.body["published"]["blocks"], draft["blocks"]);
 
     let public = call(
         &fixture.state,
         request(
             Method::GET,
-            "/api/v1/public/pages/every-type?site=main",
+            &format!("/api/v1/public/pages/every-type?site={}", fixture.site_key),
             None,
             None,
         ),
     )
     .await;
     assert_eq!(public.status, StatusCode::OK, "{}", public.body);
-    assert_eq!(public.body["revision"]["blocks"], one_of_each);
+    assert_eq!(public.body["revision"]["blocks"], draft["blocks"]);
     assert_eq!(
         public.body["revision"]["body"],
         json!("The pre-block text."),
@@ -733,7 +774,7 @@ async fn reordering_keeps_block_ids_and_duplicating_gives_the_copy_a_new_one() {
     )
     .await;
     assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
-    let original_ids: Vec<String> = [first, second, third]
+    let original_ids: Vec<String> = [&first, &second, &third]
         .iter()
         .map(|entry| entry["id"].as_str().expect("an id").to_owned())
         .collect();
@@ -940,10 +981,11 @@ async fn a_required_prop_stops_a_publish_but_not_a_draft_save() {
     .await;
     let revisions = history.body["revisions"].as_array().expect("revisions");
     assert_eq!(revisions.len(), 3);
-    assert_eq!(revisions[0]["blocks"], fixed);
+    assert_eq!(revisions[0]["blocks"], saved.body["draft"]["blocks"]);
     assert_eq!(
-        revisions[1]["blocks"], incomplete,
-        "the broken draft is still readable"
+        revisions[1]["blocks"].as_array().expect("blocks").len(),
+        2,
+        "the broken draft is still readable, image and all"
     );
     assert_eq!(
         revisions[2]["blocks"],
@@ -987,8 +1029,7 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
         .iter()
         .find(|row| row.get::<String, _>("name").as_str() == "content.blocks.updated")
         .expect("the block save must be recorded");
-    let payload: Value = serde_json::from_str(blocks_event.get::<String, _>("payload").as_str())
-        .expect("the payload must be JSON");
+    let payload: Value = blocks_event.get::<Value, _>("payload");
     assert_eq!(payload["block_count"], json!(5));
     assert!(
         payload.get("body").is_none(),
@@ -997,7 +1038,7 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
 
     // The audit trail says the same, from the same save.
     let audit = sqlx::query(
-        "select action, metadata from audit_entries \
+        "select action, metadata from audit_log \
          where target_id = $1 and action = 'page.updated'",
     )
     .bind(&page_id)
@@ -1005,8 +1046,7 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
     .await
     .expect("the audit trail must read");
     assert!(!audit.is_empty(), "the save writes an audit row");
-    let metadata: Value =
-        serde_json::from_str(audit[0].get::<String, _>("metadata").as_str()).expect("JSON");
+    let metadata: Value = audit[0].get::<Value, _>("metadata");
     assert_eq!(metadata["blocks_changed"], json!(true));
     assert_eq!(metadata["content_changed"], json!(true));
 
@@ -1022,7 +1062,9 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
     )
     .await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.body);
-    let event: Value = sqlx::query_scalar(
+    // The publication event carries the same count hint, so a downstream integration learns
+    // how much of the page changed without ever receiving its content.
+    let payload: Value = sqlx::query_scalar(
         "select payload from events where name = 'page.published' and organization_id = $1 \
          order by created_at desc limit 1",
     )
@@ -1030,8 +1072,8 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the publication must be recorded");
-    let payload: Value = serde_json::from_str(&event).expect("the payload must be JSON");
     assert_eq!(payload["block_count"], json!(5));
+    assert_eq!(payload["slug"], json!("events"));
 
     fixture.cleanup().await;
 }
@@ -1089,7 +1131,9 @@ async fn restoring_an_earlier_revision_brings_its_blocks_back_too() {
     )
     .await;
     assert_eq!(restored.status, StatusCode::CREATED, "{}", restored.body);
-    assert_eq!(restored.body["blocks"], original);
+    // The restored tree is the saved one — the defaults the schema filled in travel with it,
+    // because a restore brings back a revision exactly as it was written, not as it was typed.
+    assert_eq!(restored.body["blocks"], saved.body["draft"]["blocks"]);
     assert_eq!(restored.body["state"], json!("draft"));
     assert_eq!(restored.body["restored_from_id"], json!(original_revision));
 

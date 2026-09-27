@@ -730,6 +730,26 @@ impl BlockIssue {
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error.as_str()
     }
+
+    /// `true` when the payload cannot be *stored* at all, as opposed to being unfinished.
+    ///
+    /// The two are different problems and they are answered differently. A heading without its
+    /// text is an author mid-sentence: the draft saves, the editor shows the field, and the
+    /// publish is refused. A payload that is not an array, a block with no type, a tree four
+    /// levels deep or one naming a type this platform does not ship is not content at all —
+    /// storing it would put a row in the database that no renderer can draw and no later edit
+    /// can make sense of, so the save itself is refused.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self.code,
+            "block_payload_invalid"
+                | "block_props_invalid"
+                | "block_too_many"
+                | "block_too_deep"
+                | "block_unknown_type"
+        )
+    }
 }
 
 /// Sort errors before warnings so a client can render the blocking set first.
@@ -762,6 +782,18 @@ impl BlockValidationReport {
     #[must_use]
     pub fn first_error(&self) -> Option<&BlockIssue> {
         self.errors().next()
+    }
+
+    /// The issues that make the payload unstorable, as opposed to unfinished.
+    #[must_use]
+    pub fn fatal(&self) -> impl Iterator<Item = &BlockIssue> {
+        self.issues.iter().filter(|issue| issue.is_fatal())
+    }
+
+    /// The first issue that makes the payload unstorable, if any.
+    #[must_use]
+    pub fn first_fatal(&self) -> Option<&BlockIssue> {
+        self.fatal().next()
     }
 }
 
@@ -1468,6 +1500,31 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "block_too_many")
         );
+    }
+
+    #[test]
+    fn a_finished_problem_is_not_the_same_as_an_unstorable_payload() {
+        // The distinction the save path turns on: a heading with no text is an author
+        // mid-sentence and saves as a draft, while a payload nothing can render does not.
+        let unfinished = validate(&json!([block("heading", json!({ "level": "h2" }))]));
+        assert!(!unfinished.can_publish, "it cannot be published");
+        assert_eq!(
+            unfinished.first_error().map(|issue| issue.code),
+            Some("block_prop_required")
+        );
+        assert!(
+            unfinished.first_fatal().is_none(),
+            "an author mid-sentence is not an unstorable payload"
+        );
+
+        let unknown = validate(&json!([block("carousel", json!({}))]));
+        assert!(
+            unknown.first_fatal().is_some(),
+            "a type nothing renders cannot be stored"
+        );
+
+        let not_an_array = validate(&json!({ "blocks": [] }));
+        assert!(not_an_array.first_fatal().is_some());
     }
 
     #[test]

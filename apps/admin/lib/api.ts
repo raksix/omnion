@@ -5,6 +5,8 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  BlockRegistry,
+  BlockValidationResult,
   Media,
   OnboardingStatus,
   Organization,
@@ -251,6 +253,11 @@ export async function fetchPages(siteId: string, status?: string): Promise<Page[
   return body.pages;
 }
 
+/** One page with its working draft and the revision visitors see. */
+export function fetchPage(pageId: string): Promise<Page> {
+  return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`);
+}
+
 /** Create a page together with its first, draft revision. */
 export function createPage(input: {
   siteId: string;
@@ -274,16 +281,38 @@ export function createPage(input: {
 /** Edit a page: a content change appends the next draft revision, a slug rename does not. */
 export function updatePage(
   pageId: string,
-  changes: { slug?: string; title?: string; body?: string; summary?: string },
+  changes: {
+    slug?: string;
+    title?: string;
+    body?: string;
+    summary?: string;
+    blocks?: unknown[];
+  },
 ): Promise<Page> {
   const body: Record<string, unknown> = {};
   if (changes.slug !== undefined) body.slug = changes.slug;
   if (changes.title !== undefined) body.title = changes.title;
   if (changes.body !== undefined) body.body = changes.body;
   if (changes.summary !== undefined) body.summary = changes.summary;
+  if (changes.blocks !== undefined) body.blocks = changes.blocks;
   return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
+  });
+}
+
+// -- The block system (REQ-063) ---------------------------------------------------------------------
+
+/** The block registry: every type the platform ships, with its props schema. */
+export function fetchBlockRegistry(): Promise<BlockRegistry> {
+  return request<BlockRegistry>("/api/v1/blocks");
+}
+
+/** Validate a block tree without writing it — the editor's live validation. */
+export function validateBlocks(blocks: unknown[]): Promise<BlockValidationResult> {
+  return request<BlockValidationResult>("/api/v1/blocks/validate", {
+    method: "POST",
+    body: JSON.stringify({ blocks }),
   });
 }
 

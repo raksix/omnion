@@ -47,10 +47,28 @@ export type Revision = {
   title: string;
   body: string;
   summary: string | null;
+  /** The page's block tree as stored JSON (REQ-063); `[]` renders the body instead. */
+  blocks: unknown[];
   restored_from_id: string | null;
   created_at: string;
   published_at: string | null;
 };
+
+/**
+ * One block of a page (REQ-063).
+ *
+ * The platform's `@omnion/types` package is the single source of truth for these shapes and
+ * the renderer imports it directly; the panel re-exports the two it needs so its own screens
+ * have one import and the shapes can never drift between the two apps.
+ */
+export type {
+  BlockDefinition,
+  BlockIssue,
+  BlockPropSchema,
+  BlockRegistry,
+  BlockValidationResult,
+  ContentBlock,
+} from "@omnion/types";
 
 /** One page with its working draft and the revision visitors see (`GET /api/v1/pages`). */
 export type Page = {

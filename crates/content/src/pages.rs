@@ -185,13 +185,16 @@ pub async fn update_page(
         let blocks = match &changes.blocks {
             Some(payload) => {
                 let report = crate::blocks::validate(payload);
-                if let Some(issue) = report.first_error() {
+                // Only a payload the store cannot hold is refused here. An unfinished block —
+                // a heading with no text yet, an image with no alternative text — saves as a
+                // draft exactly like a half-written body does, because an author is allowed to
+                // be mid-sentence; `publish_page` is where such a page is turned away, and the
+                // editor shows the same issues live so the author never gets that far by
+                // accident.
+                if let Some(issue) = report.first_fatal() {
                     return Err(ContentError::InvalidBlock(format!(
-                        "the block tree has {} issue(s) that block a save; the first is {} at {}: {}",
-                        report.errors().count(),
-                        issue.code,
-                        issue.path,
-                        issue.message,
+                        "the block tree cannot be stored: {} at {}: {}",
+                        issue.code, issue.path, issue.message
                     )));
                 }
                 let mut parsed = crate::blocks::parse_blocks(payload)?;
