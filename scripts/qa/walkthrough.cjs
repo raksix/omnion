@@ -3951,6 +3951,63 @@ async function runBlockEditorDepth(page, report) {
   await shot(page, "page-block-editor-columns-three");
   note("built a nested columns layout");
 
+  // ---- Heading order and per-viewport visibility (REQ-063 slice 2) --------------------------
+  // Two accessibility rules, and both are worth driving by hand: a lint that only exists as a
+  // function nobody calls passes every test, and a "hidden on phones" control that is really a
+  // CSS class passes the screen the author is looking at.
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page
+    .locator("[data-block-insert-option=heading]")
+    .first()
+    .click({ timeout: 6000 })
+    .catch(() => {});
+  await page.waitForTimeout(1000);
+  // The fresh heading is selected as it lands, and its `level` is the second schema field.
+  await page.locator("#block-prop-text").first().fill("QA section heading").catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("#block-prop-level").first().selectOption("h1").catch(() => {});
+  await page.waitForTimeout(1200);
+  const warnings = Number(
+    (await page.locator("[data-block-status]").getAttribute("data-block-warnings").catch(() => "0")) || 0,
+  );
+  steps.outlineWarningShown = warnings > 0;
+  steps.outlineWarningText = (await page.locator("[data-block-issues] li").allInnerTexts().catch(() => []))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  // A heading-order warning must never stop a publish: it is advisory by construction.
+  steps.outlineWarningIsNotBlocking =
+    (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0" &&
+    !(await page.locator("[data-block-publish]").isDisabled());
+  await shot(page, "page-block-editor-heading-order");
+  note("provoked a heading-order warning");
+
+  // Fixing it is the second half of the criterion, and it must be a reorder rather than an edit.
+  await page.locator("#block-prop-level").first().selectOption("h2").catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.outlineWarningCleared = (
+    (await page.locator("[data-block-status]").getAttribute("data-block-warnings").catch(() => "0")) || "0"
+  ) === "0";
+  note("cleared the heading-order warning");
+
+  // The visibility control lives in the inspector's Visibility section, and its effect on the
+  // canvas is a badge — a setting that changes nothing on screen is a setting nobody can check.
+  const hideOn = page.locator("[data-block-hide-on]").first();
+  steps.visibilityControlPresent = (await hideOn.count()) > 0;
+  await hideOn.selectOption("mobile").catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.hiddenBadge = (await page.locator("[data-block-hidden-on=mobile]").count()) > 0;
+  steps.hiddenBadgeText = (
+    (await page.locator("[data-block-hidden-on=mobile]").first().innerText().catch(() => "")).replace(/\s+/g, " ").trim()
+  );
+  // `none` is stored as absence, so clearing the control leaves the block with no settings at all
+  // and the badge goes with it.
+  await hideOn.selectOption("none").catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.hiddenBadgeCleared = (await page.locator("[data-block-hidden-on]").count()) === 0;
+  await shot(page, "page-block-editor-visibility");
+  note("used the per-viewport visibility control");
+
   // ---- Save and publish ---------------------------------------------------------------------
   // The save is proven by the revision the server reports, not by the editor's own clock:
   // "Last saved" is printed from the page it loaded, so it is true the moment the screen opens
@@ -3988,6 +4045,14 @@ async function runBlockEditorDepth(page, report) {
   steps.publicRendered = rendered.includes("QA heading from the walkthrough");
   steps.publicHasSemanticFigure = (await page.locator("figure").count()) > 0;
   steps.publicHasImage = (await page.locator("img").count()) > 0;
+  // The semantic output the criterion asks for: the blocks that promise a heading really are
+  // one, and a list really is a list. A canvas that renders a heading as a bold <div> would
+  // pass a screenshot review and fail the person navigating the page.
+  const outline = await page
+    .locator("h1, h2, h3, h4, h5, h6, ul, ol, dl, figure")
+    .evaluateAll((nodes) => nodes.map((node) => node.tagName.toLowerCase()));
+  steps.semanticTags = [...new Set(outline)].sort();
+  steps.headingsAreReal = (outline.filter((tag) => /^h[1-6]$/.test(tag)).length ?? 0) > 0;
   await shot(page, "web-block-page-rendered");
   note("checked the public render");
 
