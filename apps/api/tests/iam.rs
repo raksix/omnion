@@ -1769,7 +1769,6 @@ async fn subjects_scopes_and_the_simulator_are_proven_end_to_end() {
         let member = scoped_id;
         let path = path.to_owned();
         let owner = owner.clone();
-        let organization_id = organization_id;
         async move {
             call(
                 &state,
