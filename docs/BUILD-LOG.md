@@ -1642,3 +1642,67 @@
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
+
+
+---
+
+## 2026-09-27 · REQ-051 slice 1 — the CRM data model and the contacts/companies API
+
+**What.** The relationship layer's foundation: seven tables (`crm_companies`, `crm_contacts`,
+`crm_pipelines`, `crm_pipeline_stages`, `crm_deals`, `crm_activities`, `crm_views`), the module
+crate behind them (`modules/crm` → `omnion-module-crm`), and the `/api/v1/crm/*` surface for the
+companies and contacts. The six permission keys of the `crm.*` family are catalogued and seeded,
+every mutation writes an audit row and emits the documented event, and the visibility level
+(`own` / `team` / `all`) is read from the caller's `department` bindings and **enforced in SQL**
+inside the module rather than in the UI.
+
+**Decisions worth stating.**
+
+- **The migration is `0021_crm.sql`, not the spec's `0011_crm.sql`.** A migration number is
+  global across every branch, not per request: `0011` was released by IAM (`0011_iam_advanced.sql`)
+  and the parallel writers took `0019` and `0020` while this slice was in progress. The file is
+  additive either way.
+- **Nothing is ever deleted.** `archived_at` is the only removal, and the merge moves what other
+  rows point at *before* it archives the loser — a failure halfway leaves a contact holding both
+  sets of data rather than an archived contact whose activities point at nothing.
+- **Field hiding drops the key, it does not grey it out.** `redact_custom` is recursive, so a
+  flagged key one level down is hidden too, and a list, a detail screen and a future export all
+  read the same function — only one code path can keep them in agreement.
+- **A record outside the caller's scope is `404`, never `403`**: a `403` would confirm that the
+  record exists in an organization the caller may not read.
+- **The audit and event payloads carry identifiers, not records.** A test asserts that a contact
+  payload has no `notes` and no `custom`, so a subscriber can never read a private note out of the
+  event feed.
+
+**Proof (Rust).** `cargo test --workspace` → **721 tests, 0 failures** (exit 0; +68 on this
+slice: 39 module units, 4 route units, and 15 integration walks in
+`apps/api/tests/crm.rs` + 10 new catalogue/seed units). The 15 walks drive the real router:
+every route answers `401` unauthenticated and `403` without the permission; a company, a contact
+on it, a patch, the archive and the merge each leave an audit row whose metadata is a JSON
+document carrying the changed field list and the before/after; `crm.contact.created` reaches the
+event feed scoped to the writing account's organization; a duplicate address is a `409` and a
+malformed one a `400` naming `details.field`; the list's filters combine, its cursor pages
+without repeating, and an unknown sort is refused with the columns named; a record of another
+organization is a `404` in the list, in a direct read and in a write; the `own` level hides a
+colleague's record while keeping the unassigned one; and the flagged custom values are gone for a
+role without `crm.fields.sensitive.read`, at every depth, in the list and in the detail.
+
+**Two defects the tests caught, both fixed in this slice.** (1) `Scope::visible_user_ids`
+returned the caller's team members for **every** level, so an `own` scope would have read a
+colleague's record — the kind of bug that passes a code review and leaks data. The levels are now
+ordered `Own < Team < All` and the helper narrows accordingly, with a unit test per level. (2)
+`CrmError::Invalid`'s `thiserror` message interpolated `{entity}` and `{field}` but dropped
+`{message}`, so a refusal printed `invalid contact.email` with no sentence — the form's field
+message would have been empty. Both are the kind of defect only a test that reads the *string*
+finds.
+
+**Next.** Slice 2 — the contact and company screens: the list with its filters, saved views,
+column chooser, inline edit with optimistic save and rollback, the create/edit form with the
+refusal rendered under the field, archive and merge, and CSV import (dry run + commit) and export.
+
+**Environment note (not a code defect).** `/mnt/apopic` reached 100% twice during this tick and
+`cargo` died with `Bus error` inside `ld` and `No space left on device` while writing `rmeta` —
+the seven parallel writers' `target/` directories together are ~19 GB on a 60 GB loop mount. This
+writer reclaimed only its own cache (`cargo clean -p omnion-api`, 6.6 GB) and rebuilt with
+`CARGO_BUILD_JOBS=2`. A shared `CARGO_TARGET_DIR` or a per-stack trim rule would remove the
+pressure permanently; it is the owner's call, not a code change.
