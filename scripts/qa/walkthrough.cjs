@@ -2501,6 +2501,11 @@ async function main() {
     { path: "/settings/iam/groups", name: "iam-groups" },
     { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
     { path: "/settings/iam/simulator", name: "iam-simulator" },
+    // The security, session and device screens (REQ-006, slice 3) — the depth pass below drives
+    // the policy fields, revokes a session and trusts a device.
+    { path: "/settings/iam/security", name: "iam-security" },
+    { path: "/settings/iam/sessions", name: "iam-sessions" },
+    { path: "/settings/iam/devices", name: "iam-devices" },
     // The role screens (REQ-006, slice 1) — no untested screen: the list is walked here, and its
     // depth pass below creates a role, drives the matrix and reads the history back.
     { path: "/settings/iam/roles", name: "iam-roles" },
@@ -2568,6 +2573,12 @@ async function main() {
   await runIamSubjectsDepth(page, report);
   log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
+  // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
+  // and a diff on save, the session list with a real revoke, the device registry and the MFA
+  // enrolment dialog.
+  await runIamSecurityDepth(page, report);
+  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -2588,7 +2599,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -2803,3 +2814,204 @@ main().catch(async (err) => {
   }
   process.exit(1);
 });
+
+/**
+ * The security-policy, session, device and second-factor pass (REQ-006, slice 3).
+ *
+ * Drives the whole slice through the panel: a policy save refused in the field it belongs to and
+ * accepted when the value is in range (with the diff it applied), an unusable network refused and
+ * a real one saved, the session list with a revoke that ends a real session (a second one opened
+ * for the owner, so the browser's own sign-in survives), the device registry with its trust
+ * window, and the MFA enrolment dialog opened and cancelled.
+ */
+async function runIamSecurityDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-security-depth", action: "iam", ...step });
+  };
+
+  // A second session for the owner, created from the walk itself (Node, not the page): the
+  // session list then holds a row that is not the browser's own, so the revoke below proves the
+  // screen without ending the walk's own sign-in. A sign-in from the page would replace the
+  // browser's cookie and make the walk sign itself out.
+  const extra = await fetch(`${URL_ADMIN}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: CREDS.email, password: CREDS.password }),
+  })
+    .then(async (response) => {
+      const body = await response.json().catch(() => null);
+      return { status: response.status, hasUser: Boolean(body && body.user) };
+    })
+    .catch(() => ({ status: 0, hasUser: false }));
+  note({ step: "second-session", ...extra });
+
+  // ---- The policy screen ---------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/settings/iam/security`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-policy-tab]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const tabs = await page.locator("[data-policy-tab]").count();
+  note({ step: "security-screen", tabs, hasSave: (await page.locator("[data-policy-save]").count()) > 0 });
+  await shot(page, "page-iam-security");
+
+  // A value outside the range is refused in the field it belongs to, not in a toast.
+  await page.locator('[data-policy-tab="lockout"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator('[data-policy-input="lockout_attempts"]').first().fill("2").catch(() => {});
+  await page.locator("[data-policy-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const rangeError = (
+    await page
+      .locator('[data-policy-field-error="lockout_attempts"]')
+      .first()
+      .innerText()
+      .catch(() => "")
+  ).replace(/\s+/g, " ");
+  note({
+    step: "policy-range-refused",
+    shown: rangeError.length > 0,
+    message: rangeError.slice(0, 90),
+  });
+  await shot(page, "page-iam-security-field-error");
+
+  // The same field with a value in range saves, and the diff says what moved.
+  await page.locator('[data-policy-input="lockout_attempts"]').first().fill("12").catch(() => {});
+  await page.locator("[data-policy-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForSelector("[data-policy-diff]", { timeout: 9000 }).catch(() => {});
+  const diffText = (await page.locator("[data-policy-diff]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({
+    step: "policy-saved",
+    hasDiff: /lockout_attempts/.test(diffText),
+    diff: diffText.slice(0, 120),
+  });
+  await shot(page, "page-iam-security-diff");
+
+  // An address the parser cannot read is refused with the list named.
+  await page.locator('[data-policy-tab="addresses"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator('[data-policy-input="ip_denylist"]').first().fill("not-a-network").catch(() => {});
+  await page.locator("[data-policy-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const listError = (
+    await page
+      .locator('[data-policy-field-error="ip_denylist"]')
+      .first()
+      .innerText()
+      .catch(() => "")
+  ).replace(/\s+/g, " ");
+  note({ step: "policy-cidr-refused", shown: listError.length > 0, message: listError.slice(0, 90) });
+  await shot(page, "page-iam-security-cidr-error");
+
+  // A real network saves …
+  await page.locator('[data-policy-input="ip_denylist"]').first().fill("203.0.113.0/24").catch(() => {});
+  await page.locator("[data-policy-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const savedNotice = (
+    await page.locator("[data-policy-notice]").first().innerText().catch(() => "")
+  ).replace(/\s+/g, " ");
+  note({ step: "policy-cidr-saved", notice: savedNotice.slice(0, 100) });
+
+  // … and the walk clears it again so nothing later in the run meets a refused address.
+  await page.locator('[data-policy-input="ip_denylist"]').first().fill("").catch(() => {});
+  await page.locator("[data-policy-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  await shot(page, "page-iam-security-addresses");
+
+  // ---- Sessions ------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/settings/iam/sessions`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("table [data-session-row]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const sessionRows = await page.locator("table [data-session-row]").count();
+  const liveBadges = await page.locator("table [data-session-row]").evaluateAll((nodes) =>
+    nodes.filter((node) => /this one/.test(node.innerText)).length,
+  );
+  note({ step: "sessions-list", rows: sessionRows, currentRows: liveBadges });
+  await shot(page, "page-iam-sessions");
+
+  // Revoking the row that is not the browser's own: the oldest sign-in is this walk, so the
+  // newest live row (the session opened above) is the one to end.
+  const revokeButtons = page.locator("table [data-session-revoke]");
+  const revokeCount = await revokeButtons.count();
+  if (revokeCount > 0) {
+    await revokeButtons.first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1300);
+    const revokeNotice = (
+      await page.locator("[data-sessions-notice]").first().innerText().catch(() => "")
+    ).replace(/\s+/g, " ");
+    note({ step: "session-revoked", notice: revokeNotice.slice(0, 110) });
+    await shot(page, "page-iam-sessions-revoked");
+  } else {
+    note({ step: "session-revoked", notice: "", skipped: "no revocable row" });
+  }
+
+  // The filters are real: a state filter narrows the list to the rows whose badge matches.
+  await page.locator("[data-session-state]").first().selectOption("live").catch(() => {});
+  await page.locator("[data-sessions-search]").first().fill("qa-owner").catch(() => {});
+  await page.locator('form button[type="submit"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1100);
+  const filteredRows = await page.locator("table [data-session-row]").count();
+  note({ step: "sessions-filtered", rows: filteredRows });
+  await page.locator("[data-sessions-search]").first().fill("").catch(() => {});
+  await page.locator("[data-session-state]").first().selectOption("").catch(() => {});
+  await page.locator('form button[type="submit"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  // ---- Devices -------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/settings/iam/devices`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-device-row]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const deviceRows = await page.locator("table [data-device-row]").count();
+  note({ step: "devices-list", rows: deviceRows });
+  await shot(page, "page-iam-devices");
+
+  const trustButton = page.locator("table [data-device-trust]").first();
+  if ((await trustButton.count()) > 0) {
+    await trustButton.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1300);
+    const trustText = (await page.locator("table [data-device-row]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+    note({ step: "device-trusted", shown: /trusted until/.test(trustText) });
+    await shot(page, "page-iam-devices-trusted");
+
+    // Clearing it again is the same control with 0 days: the badge goes back to "not trusted".
+    await page.locator("table [data-device-clear-trust]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1300);
+    const clearedText = (await page.locator("table [data-device-row]").first().innerText().catch(() => "")).replace(/\s+/g, " ");
+    note({ step: "device-trust-cleared", shown: /not trusted/.test(clearedText) });
+  } else {
+    note({ step: "device-trusted", shown: false, skipped: "no device row" });
+  }
+
+  // ---- The MFA enrolment dialog, opened and cancelled ----------------------------------
+  await page.goto(`${URL_ADMIN}/settings/iam/users`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page
+    .locator('[data-user-open="qa-subject@example.com"]')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForSelector("[data-user-detail-title]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator('[data-user-tab="factors"]').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const factorsEmpty = (await page.locator("[data-factors-empty]").count()) > 0;
+  await page.locator("[data-factor-enrol-start]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-factor-enrolment]", { timeout: 10000 }).catch(() => {});
+  const secret = (await page.locator("[data-factor-secret]").first().innerText().catch(() => "")).trim();
+  const uri = (await page.locator("[data-factor-uri]").first().innerText().catch(() => "")).trim();
+  note({
+    step: "mfa-enrolment-opened",
+    emptyBefore: factorsEmpty,
+    hasSecret: secret.length >= 16,
+    hasUri: /^otpauth:\/\/totp\//.test(uri),
+  });
+  await shot(page, "page-iam-user-factors");
+
+  await page.locator("[data-factor-enrol-cancel]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const stillOpen = await page.locator("[data-factor-enrolment]").count();
+  note({ step: "mfa-enrolment-cancelled", closed: stillOpen === 0 });
+
+  report.iamSecurity = { steps };
+  log(`iam security: ${JSON.stringify(steps)}`);
+}
