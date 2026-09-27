@@ -56,6 +56,12 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
                     tracing::warn!(error = %error, "the re-wrap tick failed");
                 }
             }
+            // The lease revocation runs on the same tick, and independently: a broken re-wrap
+            // must not stop a deploy from revoking the leases it invalidated, which is the
+            // whole point of the consumer rather than a call from the deploy handler.
+            if let Err(error) = revoke_leases_for_deploys(&state).await {
+                tracing::warn!(error = %error, "the deployment lease revocation failed");
+            }
         }
     })
 }
@@ -80,6 +86,129 @@ async fn tick(state: &AppState) -> Result<bool, omnion_secrets::SecretsError> {
         );
     }
     Ok(true)
+}
+
+/// The consumer's own name in `event_consumer_cursors`. It is the primary key of the cursor
+/// row, so it is a contract with the migration that seeded it, not a free-form label.
+const LEASE_REVOCATION_CONSUMER: &str = "secrets.lease_revocation";
+
+/// The event whose arrival revokes an environment's leases.
+const DEPLOYMENT_STARTED: &str = "deployment.started";
+
+/// How many events one tick reads. A deploy-heavy installation can emit a burst, and reading a
+/// bounded batch keeps the runner's tick time predictable — the next tick picks up the rest.
+const CONSUMER_BATCH: i64 = 100;
+
+/// Revoke the live leases of every environment a `deployment.started` event names.
+///
+/// This is the request's "consumed" event, and it is a consumer rather than a call from the
+/// deployment handler on purpose. The deployment centre belongs to REQ-024 and does not know
+/// that this request exists; if the revocation lived in the deploy handler, every future deploy
+/// path would have to remember to call it, and the one that forgot would be exactly the case
+/// the rule exists for — a redeploy running on the credential the operator just replaced.
+///
+/// Reading from a cursor instead of the whole stream means:
+///
+/// * a restart resumes where it left off rather than re-revoking everything;
+/// * a deploy recorded by another writer is honoured, because it is in the same `events`
+///   table;
+/// * the cursor moves only after the revocation succeeded, so a failed tick is retried rather
+///   than skipped.
+pub async fn revoke_leases_for_deploys(state: &AppState) -> Result<usize, omnion_secrets::SecretsError> {
+    let pool = state.db().pool();
+    // A database that predates this migration has no cursor table at all. That is not an
+    // error worth failing a tick over: the install simply has no deployment-driven revocation
+    // yet, and the next migration run creates the table.
+    let Ok(cursor) = sqlx::query_scalar::<_, i64>(
+        "select last_event_id from event_consumer_cursors where consumer = $1",
+    )
+    .bind(LEASE_REVOCATION_CONSUMER)
+    .fetch_optional(pool)
+    .await
+    else {
+        return Ok(0);
+    };
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+
+    let events: Vec<(i64, serde_json::Value)> = sqlx::query_as(
+        "select id, payload from events where id > $1 and name = $2 order by id limit $3",
+    )
+    .bind(cursor)
+    .bind(DEPLOYMENT_STARTED)
+    .bind(CONSUMER_BATCH)
+    .fetch_all(pool)
+    .await?;
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let mut revoked_total = 0;
+    for (event_id, payload) in events {
+        let Some(environment) = payload
+            .get("environment")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            // An event with no environment names nothing to revoke. The cursor still moves:
+            // a malformed event is not going to become a well-formed one by being read again.
+            advance(pool, event_id).await?;
+            continue;
+        };
+
+        let reason = format!("revoked automatically: a deployment started in {environment}");
+        match omnion_secrets::leases::revoke_environment_leases(pool, environment, &reason).await {
+            Ok(ids) => {
+                revoked_total += ids.len();
+                for lease_id in &ids {
+                    tracing::info!(
+                        %lease_id,
+                        environment,
+                        "lease revoked by a deployment"
+                    );
+                    // A denial would be wrong here: the leases were valid and the operator
+                    // replaced the credential underneath them. `secret.lease.revoked` says so
+                    // with the reason attached.
+                    let _ = omnion_audit::entries::record(
+                        pool,
+                        omnion_audit::NewAuditEntry::system("secret.lease.revoked")
+                            .target("lease", lease_id.to_string())
+                            .metadata(serde_json::json!({
+                                "reason": reason,
+                                "environment": environment,
+                                "event_id": event_id,
+                            })),
+                    )
+                    .await;
+                }
+                advance(pool, event_id).await?;
+            }
+            Err(error) => {
+                // The cursor stays where it is, so the next tick retries this event rather than
+                // stepping over a deployment whose leases were not revoked.
+                tracing::warn!(%error, event_id, environment, "a deployment did not revoke its leases");
+                break;
+            }
+        }
+    }
+    Ok(revoked_total)
+}
+
+/// Move the consumer's cursor past one event.
+async fn advance(
+    pool: &sqlx::PgPool,
+    event_id: i64,
+) -> Result<(), omnion_secrets::SecretsError> {
+    sqlx::query(
+        "update event_consumer_cursors set last_event_id = $2, processed = processed + 1,                 updated_at = now()          where consumer = $1 and last_event_id < $2",
+    )
+    .bind(LEASE_REVOCATION_CONSUMER)
+    .bind(event_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The finished jobs the screen's history strip reads, newest first.
