@@ -2317,3 +2317,808 @@ async fn subjects_scopes_and_the_simulator_are_proven_end_to_end() {
 
     fixture.cleanup().await;
 }
+
+/// Build a request from a specific address.
+///
+/// `ConnectInfo` is the extension `ClientAddress` reads, so an in-process test can put a session
+/// behind a real address and the policy's lists stop being untestable.
+fn request_from(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    ip: &str,
+) -> Request<Body> {
+    let mut request = request(method, uri, token, body);
+    let address: std::net::SocketAddr = format!("{ip}:40000").parse().expect("address parses");
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(address));
+    request
+}
+
+/// Sign in with an explicit password and address; the whole response, not just the cookie.
+async fn login_response(
+    state: &AppState,
+    email: &str,
+    password: &str,
+    ip: Option<&str>,
+) -> TestResponse {
+    let payload = Some(json!({ "email": email, "password": password }));
+    match ip {
+        Some(ip) => {
+            call(
+                state,
+                request_from(Method::POST, "/api/v1/auth/login", None, payload, ip),
+            )
+            .await
+        }
+        None => {
+            call(
+                state,
+                request(Method::POST, "/api/v1/auth/login", None, payload),
+            )
+            .await
+        }
+    }
+}
+
+/// The session cookie of a response, as the raw token.
+fn cookie_token(response: &TestResponse) -> String {
+    let cookie = response
+        .set_cookie
+        .clone()
+        .expect("the response must set the session cookie");
+    cookie
+        .split(';')
+        .next()
+        .expect("cookie has a value")
+        .split_once('=')
+        .expect("cookie is name=value")
+        .1
+        .to_owned()
+}
+
+/// REQ-006, slice 3: the security policy, sessions, devices and second factors.
+///
+/// The whole slice over HTTP: a policy save that moves the lockout threshold, a lockout that
+/// triggers exactly at it, an address the policy refuses before any password check, a session a
+/// revoke stops on the next request, `sign-out-all`, an idle lifetime that comes from the policy
+/// row, TOTP enrolment and confirmation with recovery codes used exactly once, step-up demanded
+/// for MFA reset and key issuance, and the device registry with its trust window.
+#[tokio::test]
+async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.owner_token().await;
+    let organization_id = fixture.organization_id.to_string();
+
+    // A lockout from another run must not decide this one: the addresses used here are drawn
+    // from a test-local range, per run.
+    let suffix = Uuid::new_v4().as_u128() % 200 + 1;
+    let allowed_ip = format!("198.51.100.{suffix}");
+    let blocked_ip = format!("203.0.113.{suffix}");
+
+    // ---- The policy ----------------------------------------------------------------
+    let policy = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(policy.status, StatusCode::OK, "{}", policy.body);
+    assert_eq!(policy.body["lockout_attempts"], 10, "{}", policy.body);
+    assert_eq!(policy.body["session_idle_minutes"], 120, "{}", policy.body);
+
+    // A save answers the diff it applied.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({
+                "lockout_attempts": 3,
+                "lockout_minutes": 15,
+                "session_idle_minutes": 5,
+                "session_concurrent_max": 2,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+    let changed: Vec<&str> = saved.body["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .filter_map(|change| change["field"].as_str())
+        .collect();
+    assert!(changed.contains(&"lockout_attempts"), "{changed:?}");
+    assert!(changed.contains(&"session_idle_minutes"), "{changed:?}");
+    assert_eq!(saved.body["before"]["lockout_attempts"], 10);
+    assert_eq!(saved.body["after"]["lockout_attempts"], 3);
+
+    // A field outside the range is refused with the field named, and nothing is written.
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({ "lockout_attempts": 2 })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.body["error"]["code"], "invalid_security_policy");
+    assert_eq!(refused.body["error"]["details"]["field"], "lockout_attempts");
+
+    // An unusable network is refused with the list named.
+    let bad_network = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({ "ip_denylist": ["not-a-network"] })),
+        ),
+    )
+    .await;
+    assert_eq!(bad_network.status, StatusCode::BAD_REQUEST, "{}", bad_network.body);
+    assert_eq!(
+        bad_network.body["error"]["details"]["field"],
+        "ip_denylist"
+    );
+
+    // ---- Lockout ------------------------------------------------------------------
+    let (locked_id, locked_email) = fixture.add_account(Some(fixture.organization_id)).await;
+    for attempt in 1..=2 {
+        let response =
+            login_response(&fixture.state, &locked_email, "definitely wrong", None).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt}: {}",
+            response.body
+        );
+    }
+    // The third failure reaches the threshold the policy names and locks the account.
+    let third = login_response(&fixture.state, &locked_email, "definitely wrong", None).await;
+    assert_eq!(third.status, StatusCode::FORBIDDEN, "{}", third.body);
+    assert_eq!(third.body["error"]["code"], "account_locked");
+
+    // The correct password does not unlock it: the lockout is checked before the password.
+    let correct_while_locked = login_response(&fixture.state, &locked_email, PASSWORD, None).await;
+    assert_eq!(correct_while_locked.status, StatusCode::FORBIDDEN);
+    assert_eq!(correct_while_locked.body["error"]["code"], "account_locked");
+
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "select outcome from sign_in_attempts where user_id = $1 order by created_at asc",
+    )
+    .bind(locked_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("attempts must be readable");
+    assert_eq!(
+        outcomes,
+        vec!["failed", "failed", "locked", "locked"],
+        "every attempt is recorded with the outcome the reader sees"
+    );
+
+    let locked_until: Option<OffsetDateTime> =
+        sqlx::query_scalar("select locked_until from users where id = $1")
+            .bind(locked_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the account must be readable");
+    assert!(
+        locked_until.is_some_and(|until| until > OffsetDateTime::now_utc()),
+        "the account carries its lockout end"
+    );
+
+    // ---- The address lists ---------------------------------------------------------
+    let denied = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({ "ip_denylist": [format!("{blocked_ip}/32")] })),
+        ),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::OK, "{}", denied.body);
+
+    // A refused address never reaches the password: the correct password answers the same
+    // refusal a wrong one does.
+    for password in [PASSWORD, "definitely wrong"] {
+        let response =
+            login_response(&fixture.state, &locked_email, password, Some(&blocked_ip)).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN, "{}", response.body);
+        assert_eq!(
+            response.body["error"]["code"], "address_blocked",
+            "{}",
+            response.body
+        );
+        assert_eq!(response.body["error"]["details"]["reason"], "denylist");
+    }
+
+    // An allowlist narrows the other way: an address outside it is refused too.
+    let narrowed = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({
+                "ip_denylist": [],
+                "ip_allowlist": [format!("{allowed_ip}/32")],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
+    let outside = login_response(&fixture.state, &locked_email, PASSWORD, Some(&blocked_ip)).await;
+    assert_eq!(outside.status, StatusCode::FORBIDDEN);
+    assert_eq!(outside.body["error"]["details"]["reason"], "allowlist");
+
+    // Put the lists back so the rest of the walk can sign in.
+    let cleared = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({ "ip_denylist": [], "ip_allowlist": [] })),
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.body);
+
+    // ---- The per-address failure count --------------------------------------------
+    let (sprayed_id, sprayed_email) = fixture.add_account(Some(fixture.organization_id)).await;
+    let _ = sprayed_id;
+    let spray_ip = format!("198.51.100.{suffix}");
+    let mut blocked_after = 0;
+    for attempt in 1..=4 {
+        let response =
+            login_response(&fixture.state, &sprayed_email, "wrong again", Some(&spray_ip)).await;
+        if response.body["error"]["code"] == "address_blocked" {
+            blocked_after = attempt;
+            assert_eq!(response.body["error"]["details"]["reason"], "address_failures");
+            break;
+        }
+    }
+    assert_eq!(
+        blocked_after, 4,
+        "the fourth failure from one address is refused by the address count"
+    );
+    let _ = sprayed_id;
+
+    // ---- Sessions: idle, revoke, sign-out-all, the concurrent cap ------------------
+    let (member_id, member_email) = fixture.add_account(Some(fixture.organization_id)).await;
+    let session = login_response(&fixture.state, &member_email, PASSWORD, None).await;
+    assert_eq!(session.status, StatusCode::OK, "{}", session.body);
+    let member_token = cookie_token(&session);
+    assert_eq!(
+        session.body["device"]["label"].as_str().is_some(),
+        true,
+        "a sign-in registers the device it came from: {}",
+        session.body
+    );
+
+    let me = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+
+    // The idle window is five minutes (the policy above): a session untouched for ten stops.
+    sqlx::query(
+        "update sessions set last_seen_at = now() - interval '10 minutes' where token_hash = $1",
+    )
+    .bind(omnion_identity::sessions::hash_token(&member_token))
+    .execute(fixture.db.pool())
+    .await
+    .expect("the session must be reachable");
+    let idled = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(
+        idled.status,
+        StatusCode::UNAUTHORIZED,
+        "a session untouched past the policy's idle window must stop working: {}",
+        idled.body
+    );
+
+    // The same row works again once the policy is back to two hours — so the refusal above was
+    // the policy's five minutes, not a constant somewhere.
+    let restored = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/security-policies?organization_id={organization_id}"),
+            Some(&owner),
+            Some(json!({ "session_idle_minutes": 120 })),
+        ),
+    )
+    .await;
+    assert_eq!(restored.status, StatusCode::OK, "{}", restored.body);
+    let survived = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(survived.status, StatusCode::OK, "{}", survived.body);
+
+    // The session list answers the state each row is in, and revoking one ends it.
+    let sessions = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/sessions?user_id={member_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sessions.status, StatusCode::OK, "{}", sessions.body);
+    let listed = sessions.body["sessions"].as_array().expect("sessions");
+    assert_eq!(listed.len(), 1, "{}", sessions.body);
+    assert_eq!(listed[0]["state"], "live", "{}", sessions.body);
+    let session_id = listed[0]["id"].as_str().expect("session id").to_owned();
+
+    let revoked = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/iam/sessions/{session_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{}", revoked.body);
+    assert_eq!(revoked.body["state"], "revoked", "{}", revoked.body);
+
+    let after_revoke = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(
+        after_revoke.status,
+        StatusCode::UNAUTHORIZED,
+        "a revoked session is refused on its very next request: {}",
+        after_revoke.body
+    );
+
+    // Two more sign-ins, and `sign-out-all` clears every one of them.
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let response = login_response(&fixture.state, &member_email, PASSWORD, None).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        tokens.push(cookie_token(&response));
+    }
+    let sign_out = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/users/{member_id}/sign-out-all"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sign_out.status, StatusCode::OK, "{}", sign_out.body);
+    assert_eq!(sign_out.body["revoked"], 2, "{}", sign_out.body);
+    for token in &tokens {
+        let response = call(
+            &fixture.state,
+            request(Method::GET, "/api/v1/me", Some(token), None),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{}", response.body);
+    }
+
+    // The concurrent cap is two (the policy above): the third sign-in retires the oldest.
+    let first = login_response(&fixture.state, &member_email, PASSWORD, None).await;
+    let first_token = cookie_token(&first);
+    let _second = login_response(&fixture.state, &member_email, PASSWORD, None).await;
+    let third = login_response(&fixture.state, &member_email, PASSWORD, None).await;
+    assert_eq!(third.status, StatusCode::OK, "{}", third.body);
+    let live: i64 = sqlx::query_scalar(
+        "select count(*) from sessions where user_id = $1 and revoked_at is null and expires_at > now()",
+    )
+    .bind(member_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("count");
+    assert_eq!(live, 2, "the cap keeps two live sessions");
+    let retired: Option<String> = sqlx::query_scalar(
+        "select revoke_reason from sessions where token_hash = $1 and revoked_at is not null",
+    )
+    .bind(omnion_identity::sessions::hash_token(&first_token))
+    .fetch_optional(fixture.db.pool())
+    .await
+    .expect("read");
+    assert_eq!(
+        retired.as_deref(),
+        Some("concurrent_cap"),
+        "the oldest session is the one that goes"
+    );
+
+    // ---- Devices ------------------------------------------------------------------
+    let devices = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/devices?user_id={member_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(devices.status, StatusCode::OK, "{}", devices.body);
+    let listed = devices.body["devices"].as_array().expect("devices");
+    assert!(!listed.is_empty(), "{}", devices.body);
+    let device_id = listed[0]["id"].as_str().expect("device id").to_owned();
+    assert!(
+        listed[0]["label"].as_str().is_some_and(|label| !label.is_empty()),
+        "{}",
+        devices.body
+    );
+
+    let trusted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/devices/{device_id}/trust"),
+            Some(&owner),
+            Some(json!({ "days": 7 })),
+        ),
+    )
+    .await;
+    assert_eq!(trusted.status, StatusCode::OK, "{}", trusted.body);
+    assert_eq!(trusted.body["trusted"], true, "{}", trusted.body);
+    assert!(trusted.body["trusted_until"].is_string(), "{}", trusted.body);
+
+    let forgotten = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/iam/devices/{device_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(forgotten.status, StatusCode::OK, "{}", forgotten.body);
+    assert_eq!(forgotten.body["revoked"], true, "{}", forgotten.body);
+
+    // ---- Second factors -----------------------------------------------------------
+    let (factor_user_id, factor_email) = fixture.add_account(Some(fixture.organization_id)).await;
+
+    // Without a step-up, the dangerous routes refuse — both of them.
+    let key_without_step_up = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/service-accounts",
+            Some(&owner),
+            Some(json!({
+                "name": format!("qa-stepup-{}", Uuid::new_v4().simple()),
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        key_without_step_up.status,
+        StatusCode::CREATED,
+        "creating an identity is not credential issuance: {}",
+        key_without_step_up.body
+    );
+    let account_id = key_without_step_up.body["id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+    let issue_without_step_up = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/service-accounts/{account_id}/keys"),
+            Some(&owner),
+            Some(json!({ "label": "ci" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        issue_without_step_up.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        issue_without_step_up.body
+    );
+    assert_eq!(
+        issue_without_step_up.body["error"]["code"],
+        "step_up_required"
+    );
+
+    let reset_without_step_up = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/users/{factor_user_id}/reset-mfa"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        reset_without_step_up.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        reset_without_step_up.body
+    );
+    assert_eq!(reset_without_step_up.body["error"]["code"], "step_up_required");
+
+    // The step-up itself: the caller's own password.
+    let stepped = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/step-up",
+            Some(&owner),
+            Some(json!({ "password": PASSWORD })),
+        ),
+    )
+    .await;
+    assert_eq!(stepped.status, StatusCode::OK, "{}", stepped.body);
+    assert_eq!(stepped.body["step_up"], true);
+
+    // A wrong password is refused, and refusing it does not mark the session.
+    let wrong_step_up = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/step-up",
+            Some(&owner),
+            Some(json!({ "password": "not the password" })),
+        ),
+    )
+    .await;
+    assert_eq!(wrong_step_up.status, StatusCode::UNAUTHORIZED, "{}", wrong_step_up.body);
+
+    // Now the same two routes work.
+    let issued = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/service-accounts/{account_id}/keys"),
+            Some(&owner),
+            Some(json!({ "label": "ci-after-step-up" })),
+        ),
+    )
+    .await;
+    assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
+    assert!(
+        issued.body["token"]
+            .as_str()
+            .is_some_and(|token| token.starts_with("omsa_")),
+        "{}",
+        issued.body
+    );
+
+    // TOTP enrolment: the secret is answered once, the code is the one the phone would show.
+    let enrolment = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/users/{factor_user_id}/mfa"),
+            Some(&owner),
+            Some(json!({ "label": "QA phone" })),
+        ),
+    )
+    .await;
+    assert_eq!(enrolment.status, StatusCode::OK, "{}", enrolment.body);
+    let secret_base32 = enrolment.body["secret"].as_str().expect("secret").to_owned();
+    let factor_id = enrolment.body["factor"]["id"]
+        .as_str()
+        .expect("factor id")
+        .to_owned();
+    assert!(
+        enrolment.body["otpauth_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("otpauth://totp/Omnion:")),
+        "{}",
+        enrolment.body
+    );
+
+    let secret = omnion_identity::totp::base32_decode(&secret_base32).expect("the secret decodes");
+    let code_of = |offset: i64| {
+        let now = OffsetDateTime::now_utc().unix_timestamp() + offset;
+        omnion_identity::totp::format_code(omnion_identity::totp::totp(&secret, now))
+    };
+
+    // A wrong code does not confirm.
+    let refused_code = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/users/{factor_user_id}/mfa/{factor_id}/confirm"),
+            Some(&owner),
+            Some(json!({ "code": "000000" })),
+        ),
+    )
+    .await;
+    assert_eq!(refused_code.status, StatusCode::BAD_REQUEST, "{}", refused_code.body);
+
+    let confirmed = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/users/{factor_user_id}/mfa/{factor_id}/confirm"),
+            Some(&owner),
+            Some(json!({ "code": code_of(0) })),
+        ),
+    )
+    .await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.body);
+    let recovery_codes: Vec<String> = confirmed.body["recovery_codes"]
+        .as_array()
+        .expect("recovery codes")
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(recovery_codes.len(), 10, "{}", confirmed.body);
+
+    // A sign-in now stops at the factor: a challenge, no cookie.
+    let challenged = login_response(&fixture.state, &factor_email, PASSWORD, None).await;
+    assert_eq!(challenged.status, StatusCode::OK, "{}", challenged.body);
+    assert_eq!(challenged.body["mfa_required"], true, "{}", challenged.body);
+    assert!(
+        challenged.set_cookie.is_none(),
+        "a half-finished sign-in must not hand out a session"
+    );
+    let challenge = challenged.body["challenge"]
+        .as_str()
+        .expect("challenge")
+        .to_owned();
+
+    // The code finishes the sign-in, and the session it starts is a full one.
+    let verified = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            None,
+            Some(json!({ "challenge": challenge, "code": code_of(30) })),
+        ),
+    )
+    .await;
+    assert_eq!(verified.status, StatusCode::OK, "{}", verified.body);
+    assert_eq!(verified.body["method"], "totp", "{}", verified.body);
+    let factor_token = cookie_token(&verified);
+    let me = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me", Some(&factor_token), None),
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.body["user"]["email"], factor_email, "{}", me.body);
+
+    // A recovery code works exactly once.
+    let challenged = login_response(&fixture.state, &factor_email, PASSWORD, None).await;
+    let challenge = challenged.body["challenge"]
+        .as_str()
+        .expect("challenge")
+        .to_owned();
+    let recovered = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            None,
+            Some(json!({ "challenge": challenge, "code": recovery_codes[0] })),
+        ),
+    )
+    .await;
+    assert_eq!(recovered.status, StatusCode::OK, "{}", recovered.body);
+    assert_eq!(recovered.body["method"], "recovery", "{}", recovered.body);
+    assert_eq!(recovered.body["recovery_codes_remaining"], 9);
+
+    let challenged = login_response(&fixture.state, &factor_email, PASSWORD, None).await;
+    let challenge = challenged.body["challenge"]
+        .as_str()
+        .expect("challenge")
+        .to_owned();
+    let reused = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/mfa/verify",
+            None,
+            Some(json!({ "challenge": challenge, "code": recovery_codes[0] })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reused.status,
+        StatusCode::BAD_REQUEST,
+        "a spent recovery code must not work twice: {}",
+        reused.body
+    );
+
+    // The factor list answers what the panel shows, and a reset clears it.
+    let factors = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/users/{factor_user_id}/mfa"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(factors.status, StatusCode::OK, "{}", factors.body);
+    assert_eq!(factors.body["confirmed"], 1, "{}", factors.body);
+    assert_eq!(factors.body["recovery_codes_remaining"], 9);
+
+    let reset = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/users/{factor_user_id}/reset-mfa"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(reset.status, StatusCode::OK, "{}", reset.body);
+    assert_eq!(reset.body["factors_revoked"], 1, "{}", reset.body);
+
+    // With the factor gone the same sign-in is a plain one again.
+    let plain = login_response(&fixture.state, &factor_email, PASSWORD, None).await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.body);
+    assert_eq!(plain.body["mfa_required"], Value::Null, "{}", plain.body);
+
+    // ---- Every change left an audit entry -----------------------------------------
+    let audit = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/iam/audit?limit=200",
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(audit.status, StatusCode::OK, "{}", audit.body);
+    let actions = keys_of(&audit.body, "entries", "action");
+    for expected in [
+        "iam.security_policy_updated",
+        "iam.session_revoked",
+        "iam.sign_out_all",
+        "iam.device_trusted",
+        "iam.device_forgotten",
+        "iam.mfa_enrolled",
+        "iam.mfa_reset",
+        "iam.step_up",
+        "iam.serviceaccount_key_issued",
+    ] {
+        assert!(
+            actions.contains(&expected.to_owned()),
+            "{expected} must be in the trail: {actions:?}"
+        );
+    }
+
+    fixture.cleanup().await;
+}
