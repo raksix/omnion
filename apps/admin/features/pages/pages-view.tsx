@@ -265,6 +265,7 @@ export function PagesView() {
 
       {editor ? (
         <form
+          data-page-form
           className="overflow-hidden rounded-xl border border-line bg-surface"
           onSubmit={(event) => {
             event.preventDefault();
@@ -338,6 +339,7 @@ export function PagesView() {
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="submit"
+                data-page-save
                 disabled={saving}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
               >

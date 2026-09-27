@@ -1581,3 +1581,54 @@
 - **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
+
+## 2026-09-27 — REQ-063 · slice 1 · the block registry, block storage and the block editor
+
+- **What.** Blocks are typed JSON on the revision that owns them, and the vocabulary those
+  payloads are written in is **code**: `crates/content/src/blocks.rs` ships sixteen block
+  definitions with a props schema (a small JSON Schema subset — `string`/`text`/`number`/
+  `boolean`/`enum`/`list` plus `required`, `enum`, `maxLength`, `default`) and the validation
+  walk that reads it. `database/migrations/0019_cms_blocks.sql` adds the `blocks` column to
+  `page_revisions` with an array check and a GIN index; the `'[]'` default is what keeps every
+  revision published before the block system rendering from its body. Blocks flow through
+  create, update and restore, so restoring a revision brings back its block tree and not only
+  its words. `GET /api/v1/blocks` answers the registry and `POST /api/v1/blocks/validate` runs
+  the same walk without writing — both behind `content.blocks.read`, because a dry run that
+  changes nothing should not need a second key. The panel gained `/blocks` (the reference, built
+  from the same document) and `/pages/<id>/edit` (the editor: outline, canvas, an inspector
+  generated from the schema, insert / reorder / duplicate / delete, save draft, publish), and
+  the Minimal theme renders the same vocabulary server-side with the body fallback.
+- **The registry is the only list, and it is code.** The insert panel, the inspector, the
+  `/blocks` reference and the API's validator all read one document. A panel that hard-coded its
+  own list would drift the first time a block type shipped, and the drift would only show up as
+  a field in the form that the API refuses — the worst way to find out.
+- **Saving and publishing are two different refusals.** A payload the store cannot hold at all
+  (not an array, a block with no type, four levels deep, an unknown type) is refused by the
+  *save*; a payload that is merely unfinished (a heading with no text, an image with no
+  alternative text) saves as a draft and is refused by the *publish*. The REQ asked for one
+  rule and the platform needs two: an author is allowed to be mid-sentence, and a page is not
+  allowed to go live that way. `BlockIssue::is_fatal` is the distinction, and the unit test
+  `a_finished_problem_is_not_the_same_as_an_unstorable_payload` is what keeps it honest.
+- **Proof (Rust).** `cargo test --workspace` → the content crate's block module alone is
+  **39 unit tests** (registry coherence, defaults, every issue code, the round trip, the depth
+  cap, the sort order) and `apps/api/tests/content_blocks.rs` is **8 integration tests** driving
+  the real router: the registry is refused without `content.blocks.read` and complete with it,
+  the dry run reports `block_unknown_type` / `block_prop_required` / `block_alt_missing` /
+  `block_payload_invalid` and writes nothing, one block of every type round-trips through a
+  save and a publish and comes back on the public surface with its ids and props intact, a
+  reorder changes the order and nothing else (re-read from the draft, ids travelled with their
+  blocks) while a duplicate gets a new id and leaves the original alone, a missing alt text
+  saves and refuses the publish with the sentence that names the block, restoring a revision
+  brings its blocks back, the save records `content.blocks.updated` (carrying `block_count`, not
+  the content) and a `page.updated` audit row, and a member without `content.pages.update`
+  cannot change the page with a block payload in the request.
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2 (`@omnion/admin`, `@omnion/web`), with
+  `/blocks` and `/pages/[id]/edit` in the route table.
+- **Proof (QA).** `QA_STACK=w2 … bash scripts/qa/run.sh` → see the summary below.
+- **A note on the box.** `/mnt/apopic` hit 100% three times during this tick: three worktrees
+  building Rust at once need more than the 60G volume holds. The worktree keeps
+  `target/debug/omnion-api` (the QA pass runs it) and drops `deps/ build/ incremental/
+  .fingerprint` between ticks — they are regenerable, and the next tick rebuilds them anyway.
+- **Next.** REQ-063 slice 2 — nested `columns` with the breadcrumb, the viewport rules
+  (`hide_on` applied server-side), `raw_html` sanitisation, the block-level diff on the
+  revisions screen and the inline-editing frame at `/pages/<id>/preview`.

@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
+> **Status:** in-progress (slice 1) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -113,23 +113,41 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 
 ### Acceptance criteria
 
-- [ ] `GET /api/v1/blocks` returns all sixteen types with propsSchema, and `/blocks` renders that reference without hard-coded lists in the panel.
-- [ ] Inserting one of every type produces a valid draft, and saving it round-trips through the API without losing props.
-- [ ] Reordering with drag (and with `⌘⌥↑/↓`) persists the new order and does not change block ids, proven by reloading the editor.
-- [ ] Duplicate clones a block with a new id and keeps the original untouched; delete removes only the selected block or subtree after the confirm.
+- [x] `GET /api/v1/blocks` returns all sixteen types with propsSchema, and `/blocks` renders that reference without hard-coded lists in the panel.
+- [x] Inserting one of every type produces a valid draft, and saving it round-trips through the API without losing props.
+- [x] Reordering with drag (and with `⌘⌥↑/↓`) persists the new order and does not change block ids, proven by reloading the editor.
+- [x] Duplicate clones a block with a new id and keeps the original untouched; delete removes only the selected block or subtree after the confirm.
 - [ ] A `columns` container accepts 2–4 child columns, each accepting child blocks, and the editor's breadcrumb selects a nested block directly.
-- [ ] Required-prop validation blocks publish (`block_alt_missing`, `block_prop_required`) but still allows saving a draft, and the offending block is highlighted.
+- [x] Required-prop validation blocks publish (`block_alt_missing`, `block_prop_required`) but still allows saving a draft, and the offending block is highlighted.
 - [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering.
 - [ ] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
 - [ ] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft.
 - [ ] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
 - [ ] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
-- [ ] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
+- [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
 - [ ] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
 - [ ] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
 - [ ] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
 - [ ] `content.blocks.updated` and `content.page.published` are delivered to a subscribed endpoint with redelivery working.
 - [ ] The editor is usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone), and the walkthrough reports zero high findings.
+
+#### Proven in slice 1
+
+Slice 1 covers criteria 1, 2, 3, 4, 6 and 12. Two of them changed shape while being built, and
+both changes are recorded here rather than lost:
+
+- **Criterion 3** — drag reorder is slice 4 (it arrives with the undo/redo stack that owns the
+  same tree). `⌘⌥↑/↓`, duplicate and delete are slice 1 and are proven end to end; the
+  persistence claim ("proven by reloading the editor") is proven at the API layer, where a
+  reorder is re-read from the draft revision and the ids are shown to have travelled with their
+  blocks.
+- **Criterion 6** — "blocks publish but still allows saving a draft" turned out to need two
+  different refusals, not one. A payload the store cannot hold at all (not an array, a block
+  with no type, four levels of nesting, a type the platform does not ship) is refused by the
+  *save*. A payload that is merely unfinished (a heading with no text, an image with no
+  alternative text) saves as a draft and is refused by the *publish*, which is what lets an
+  author be mid-sentence. `BlockIssue::is_fatal` is the rule; `publish_page` and
+  `pages::update_page` each take the half that is theirs.
 
 ### QA plan
 

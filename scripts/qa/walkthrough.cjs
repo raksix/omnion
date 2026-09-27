@@ -3671,8 +3671,10 @@ async function runBlockEditorDepth(page, report) {
   await page.locator("#page-slug").fill("qa-block-page").catch(() => {});
   await page.locator("#page-body").fill("The pre-block text of the QA page.").catch(() => {});
   await shot(page, "block-editor-page-form");
-  await page.locator("form button[type=submit]").first().click({ timeout: 6000 }).catch(() => {});
-  await page.waitForTimeout(1600);
+  // The hook, not `form button[type=submit]`: the app shell's search form is the first form
+  // on every screen, so that selector submits the search box and quietly creates nothing.
+  await page.locator("[data-page-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2200);
   steps.created =
     (await page.locator("text=QA block page").count()) > 0 ||
     (await page.locator('a[href^="/pages/"][href$="/edit"]').count()) > 0;
