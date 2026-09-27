@@ -13,6 +13,7 @@ pub mod comments;
 pub mod error;
 pub mod model;
 pub mod pages;
+pub mod sanitize;
 pub mod translations;
 pub mod validation;
 
@@ -32,5 +33,9 @@ pub use model::{
 pub use pages::{
     create_page, current_draft, delete_page, find_page, find_page_by_slug, find_revision,
     latest_revision, list_pages, list_revisions, publish_page, restore_revision, update_page,
+};
+pub use sanitize::{
+    ALLOWED_ATTRIBUTES, ALLOWED_TAGS, ALLOWED_URL_SCHEMES, SanitizeReport, allowed_embed_hosts,
+    embed_host_is_allowed, sanitize_html,
 };
 pub use translations::{revision_translations, set_revision_translation};
