@@ -1,3 +1,65 @@
+
+## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
+
+- **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
+  this process starts on a loopback port: a discovery document, a JWKS, an authorization endpoint
+  that answers `302` with a `Location`, a token endpoint that verifies the PKCE challenge itself and
+  spends a code exactly once, and a SAML endpoint that signs an assertion with both halves of the
+  XML-signature binding — all under one freshly generated 2048-bit RSA key.
+  `apps/api/tests/sso_live.rs` drives the **real router** against it: the browser is sent to the
+  provider's own endpoint, comes back with a code, the code is exchanged, the token is verified
+  against the *published* keys, the claim → role mapping attaches the role, JIT provisions the
+  account, and `GET /me` with the resulting cookie names the directory person. The same file does
+  SAML. Plus the fixes below.
+- **Why a stub and not more fixtures.** Every other proof of enterprise sign-in tested one layer:
+  a verifier against a synthetic token, a reader against a hand-built assertion, the HTTP layer
+  against refusals it triggers itself. None of them proved that a *browser* can complete a round
+  trip, because that needs a provider on the other end. The stub shares nothing with the code it
+  tests except the `rsa` crate, so agreement between the two sides is evidence rather than
+  tautology.
+- **Proof.** `cargo test --workspace --lib` → **598 unit tests, 0 failures**. `cargo test -p
+  omnion-api --test sso --test sso_live` → **3 walks, 0 failures**, all three in one database.
+  `pnpm typecheck` green. `cargo clippy --all-targets` adds no new warning.
+- **Four defects the walk found, and each is a thing no layer-by-layer test could see.**
+  **(1) Every SAML sign-in was broken.** The relay page posted the *return path* as `RelayState`
+  while the callback claims a **challenge** from `RelayState` — so the callback could never claim
+  one and every SAML sign-in ended in `invalid_state`. The page now carries the challenge `start`
+  issued (and HTML-escapes it, because the route is public and a `state` query is attacker-supplied
+  in the general case). **(2) `c_hash` was checked against the PKCE verifier's hash.** No provider
+  has ever seen the verifier, so a real directory could not satisfy that rule: it refused every
+  legitimate sign-in while proving nothing. It is now the real code hash (OIDC Core §3.1.3.6), and
+  a *missing* `c_hash` is not a refusal, because the claim is a RECOMMENDED and an optional claim
+  cannot be a mandatory rule. **(3) The SAML `test` button could never report success.** Its probe
+  was a self-closing `<saml:Assertion/>` that the reader never parses, and the verdict was
+  inferred from the error text — so every certificate read as broken. The certificate step is now
+  exposed on its own and the claim half is probed with a document the real reader accepts, which
+  also catches a typo in an attribute name before the first real assertion. **(4) The claim → role
+  mapping silently did nothing for every tenant.** It looked the role up with the tenant's
+  organization id, but the base roles are seeded at *platform* scope, so `editors` → `editor`
+  matched nothing and the person signed in with no role and no error — the worst possible outcome
+  for the feature whose whole point is the mapping. The lookup now falls back to the platform role,
+  the way the rest of the platform finds one.
+- **A test that only passes in one harness is a test that lies.** The walk's first version swept
+  `email like 'sso-live-%'` to clear leftovers from a crashed run. It passed in CI (one database
+  per job) and failed against a shared one, because it deleted a sibling suite's fixtures
+  mid-run. Every statement is now scoped to the walk's own organizations, and all three walks are
+  proven to pass together in one database.
+- **Owner action, still open: the disk.** `/mnt/apopic` (one 60 GB loop image shared by eight
+  worktrees' `target/`) hit **0 bytes free** twice during this tick and a link failed with
+  `No space left on device`. `target/debug/incremental` was cleared twice, and the **unclaimed**
+  `omnion-w4`/`w5`/`w7` worktree `target/` directories (12.6 GB of build artifacts, no wave owns
+  them, no `cargo` running) were removed. That returned 13 GB. **The unclaimed worktrees should be
+  pruned outright, or the box needs more room** — a link failure is a red build, and one will
+  happen again mid-tick.
+- **Owner action, still open: the shared dev database.** `omnion` has migration **19** applied from
+  a sibling branch that `main` does not have, so `db.migrate()` refuses with `VersionMissing(19)`
+  and every integration test that migrates fails there. CI is clean. This tick ran against a
+  dedicated `omnion_sso_live` database instead, which is the right shape for a local run and worth
+  making the default until the 0019 slot is reconciled.
+- **Next.** REQ-006 is **done** — every slice shipped and every acceptance box ticked. The next
+  REQ in wave 1 order is **REQ-010** (the enterprise file manager). This tick is not a close tick
+  in the QA-pass sense (no screen changed), so `scripts/qa/run.sh` was not run; the next tick that
+  lands a screen carries it.
 # Omnion — Build Log
 
 > Cross-tick memory for the **`omnion-build`** loop. Newest entries at the bottom. 3-5 lines
@@ -1860,4 +1922,63 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
   inconsistent row, which is exactly what they exist for.
 - **A session cookie is bound to one origin.** The panel talks to the API on :18085 while the
   browser is on :3105, so a curl-minted cookie must be injected into the browser context; logging
-  in through the form alone bounces back to `/login` in a scripted pass.
+  in through the form alone bounces back to `/login` in a scripted pass.## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
+
+- **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
+  that proves both. **`61ef619`** — `crates/identity/src/sso/provisioning.rs` (JIT: match on the
+  stored subject index first, the address second, `JIT_PASSWORD_MARKER` in place of a password,
+  and a *refusal* rather than a silent row when provisioning is off); the identity HTTP client
+  grows the two calls the `code` flow needs; `/api/v1/iam/providers` (list, connect, patch, remove,
+  `…/test` for the discovery check, `…/events` for the sign-in log); and `/api/v1/auth/sso`
+  (the public `providers` list, `start`, the generated SAML panel page, and the `callback` that
+  answers both a `code` query and a posted assertion). **`f599c3c`** — `/settings/iam/authentication`,
+  the nav entry, the API client and the `iam-authentication` pass in `scripts/qa/walkthrough.cjs`.
+  **`apps/api/tests/sso.rs`** — the integration walk.
+- **Proof.** `cargo test -p omnion-identity --lib` → **107 tests, 0 failures**. `cargo test -p
+  omnion-api --lib` → **97 tests, 0 failures**. `cargo test -p omnion-api --test sso` → **1 walk,
+  0 failures** over the real router: the management surface (401 without a session, an empty
+  organization listing no provider and three kinds), a provider created **switched off with JIT
+  off**, the secret answered as a *name* plus a boolean (`secret_present: false` for a variable
+  this process does not define) and no `client_secret` field anywhere in the payload, a bad
+  `secret_ref` refused with `details.field = secret_ref`, an unreadable role mapping refused at save
+  time, the discovery test answering `200 {status: "failed", detail: …}` for an unreachable host, a
+  disabled provider `404 provider_disabled` **and written to the sign-in log**, JIT refusing then
+  provisioning the same identity to `Created` with the marker in `password_hash` and the subject
+  indexed under `sso_subjects`, the second sign-in `Existing` on the same account, a deactivated
+  account staying deactivated, the event log readable over HTTP, removal taking the log with it
+  (`on delete cascade`), and an ambiguous host answered `501 organization_required` rather than
+  guessed.
+- **The two design decisions this tick actually settled.** (1) **A public sign-in has to resolve
+  its own organization.** My first version took "the installation's only organization", which is
+  right for a first-run install and *silently wrong* for a second tenant — a sign-in link for one
+  organization could complete against another. The walk caught it by creating a second organization.
+  It now follows the same rule the public content surface uses: the browser's own host answers for
+  its site, and a site belongs to an organization; several organizations and an unknown host is an
+  honest `501` naming the fix. (2) **A refusal is a fact, not a silence.** A disabled provider
+  refusing to start wrote nothing, so an operator who switched a provider off and then wondered
+  "is anybody still trying to sign in with it?" had no way to find out. `live_provider` now writes
+  the `auth_provider_events` row before refusing.
+- **Two test-authoring bugs the walk caught in itself, both worth naming.** A group claim is only
+  read when the provider *names* one, so a test provider with `group_claim: None` proved nothing
+  about groups — the fixture was wrong, not the code. And a test fixture that registers a globally
+  unique host has to clear a stale one first, or the second run fails on the first run's leftovers.
+- **The disk is still the constraint, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` (one 60 GB loop image shared by eight worktrees' `target/`) fell to **3.1 GB free**
+  during this tick. Reclamation stayed conservative and derived-only: `target/debug/{deps,
+  incremental,build}` in the **unclaimed** `omnion-w5` and `omnion-w7` worktrees, neither of which
+  had a live `cargo`/`rustc`; no source, no branch, no running process touched. That returned
+  17 GB. **Owner action:** the box needs more room, or the unclaimed `omnion-w4`…`omnion-w7`
+  worktrees should be pruned — no wave owns them yet.
+- **A note on where the walk runs.** The shared dev database `omnion` has migration **19** applied
+  from a sibling branch that `main` does not have, so `db.migrate()` refuses with
+  `VersionMissing(19)` and every integration test that migrates fails there. CI starts a clean
+  database and is unaffected. The walk was proven against a fresh `omnion_sso_test` database.
+  **Owner action:** either reconcile the 0019 slot between the waves, or point the local
+  integration runs at a per-branch database.
+- **Next.** The one thing the walk deliberately does not fake: a **full round trip against a live
+  OIDC/SAML provider**. That needs a local stub identity server the walk can point at — discovery
+  document, JWKS, token endpoint and a signed ID token for OIDC; a signed assertion with the
+  enveloped digest for SAML — so the `code` exchange, the RS256 verification, the PKCE binding and
+  the claim → role mapping are all proven end to end rather than one layer at a time. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.

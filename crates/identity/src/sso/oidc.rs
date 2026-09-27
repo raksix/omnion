@@ -325,14 +325,76 @@ impl HttpClient {
         let response = self
             .inner
             .get(url)
+            .header("accept", "application/json")
             .send()
             .await
             .map_err(|error| {
                 IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
             })?;
+        Self::read_json(response).await
+    }
+
+    /// Fetch a JSON document with a bearer credential — the userinfo endpoint of a provider that
+    /// sends no ID token.
+    pub async fn get_json_with_bearer(&self, url: &str, token: &str) -> Result<Value> {
+        let response = self
+            .inner
+            .get(url)
+            .header("accept", "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| {
+                IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
+            })?;
+        Self::read_json(response).await
+    }
+
+    /// Post a form and read the JSON answer — the `code` exchange of the OIDC/OAuth2 flows.
+    pub async fn post_form(&self, url: &str, form: &str) -> Result<Value> {
+        let response = self
+            .inner
+            .post(url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "application/json")
+            .body(form.to_owned())
+            .send()
+            .await
+            .map_err(|error| {
+                IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
+            })?;
+        Self::read_json(response).await
+    }
+
+    /// Post a form with a Basic credential — a confidential client at the token endpoint.
+    pub async fn post_form_with_basic(
+        &self,
+        url: &str,
+        form: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<Value> {
+        let credentials = base64_encode(format!("{client_id}:{client_secret}").as_bytes());
+        let response = self
+            .inner
+            .post(url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "application/json")
+            .header("authorization", format!("Basic {credentials}"))
+            .body(form.to_owned())
+            .send()
+            .await
+            .map_err(|error| {
+                IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
+            })?;
+        Self::read_json(response).await
+    }
+
+    /// The shared tail: a successful response becomes a size-capped JSON document.
+    async fn read_json(response: reqwest::Response) -> Result<Value> {
         if !response.status().is_success() {
             return Err(IdentityError::InvalidProvider(format!(
-                "the provider answered {} for {url}",
+                "the provider answered {} for the request",
                 response.status()
             )));
         }
@@ -347,10 +409,15 @@ impl HttpClient {
                 "the provider's document is implausibly large".into(),
             ));
         }
-        serde_json::from_slice(&bytes).map_err(|_| {
-            IdentityError::InvalidProvider("the provider's answer is not JSON".into())
-        })
+        serde_json::from_slice(&bytes)
+            .map_err(|_| IdentityError::InvalidProvider("the provider's answer is not JSON".into()))
     }
+}
+
+/// Standard base64 for the Basic credential.
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 impl Default for HttpClient {
@@ -513,6 +580,21 @@ pub fn verify_claims(
 #[must_use]
 pub fn pkce_challenge(verifier: &str) -> String {
     b64().encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// The `c_hash` of an authorization code (OIDC Core §3.1.3.6, "Code Hash").
+///
+/// The left-most half of the SHA-256 of the **code**, base64url without padding. It is a second,
+/// independent binding of an ID token to the code it was issued for — a token minted for somebody
+/// else's sign-in carries a different hash.
+///
+/// It is deliberately *not* a hash of the PKCE verifier, which is what this function was in an
+/// earlier revision: a real provider has never seen the verifier, so it could not compute that
+/// value, and a rule no provider can satisfy is a rule that refuses every real directory.
+#[must_use]
+pub fn code_hash(code: &str) -> String {
+    let digest = Sha256::digest(code.as_bytes());
+    b64().encode(&digest[..digest.len() / 2])
 }
 
 /// The kind a provider's row describes, as the flow needs it.
@@ -750,6 +832,21 @@ mod tests {
             pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn a_code_hash_is_the_left_half_of_the_codes_sha256() {
+        // OIDC Core §3.1.3.6: `c_hash` is the base64url-encoded **left-most half** of the code's
+        // SHA-256. The property is asserted rather than a remembered constant, because a constant
+        // copied from a document is exactly how a test ends up pinning the wrong half: the first
+        // version of this test expected the full-length digest of a code and failed.
+        let code = "Qcb0Orv1zh30vL1MPRsbm-diHiMwcLyZvn1arpZv-Jxf_11jnpEX3Tgfvk";
+        let hash = code_hash(code);
+        let digest = Sha256::digest(code.as_bytes());
+        assert_eq!(hash, b64().encode(&digest[..digest.len() / 2]));
+        assert_eq!(hash.len(), 22, "16 bytes of base64url is 22 characters, not 43");
+        assert_ne!(hash, pkce_challenge(code));
+        assert_ne!(code_hash("one-code"), code_hash("another-code"));
     }
 
     /// A real 2048-bit RSA key pair and a token signed with it, so the verifier is tested against

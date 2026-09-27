@@ -34,6 +34,12 @@ omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
 omnion-workflows = { path = "../../crates/workflows" }
 
+# Enterprise sign-in (REQ-006, slice 4b-2): the authorization URL is assembled with a real
+# URL parser (so a provider endpoint cannot smuggle a fragment or a second origin into it), and
+# the SAML response / Basic client credential travel as base64.
+url.workspace = true
+base64.workspace = true
+
 [dev-dependencies]
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
@@ -42,3 +48,13 @@ p256.workspace = true
 base64.workspace = true
 sha2 = "0.10"
 rand = "0.8"
+# The enterprise sign-in walk (tests/sso_live.rs) runs a *real* identity provider — a loopback
+# OIDC/SAML server it starts itself — so the round trip is proven over a socket with real RSA
+# signatures rather than against fixtures. `rsa` is already in the tree (the identity crate
+# verifies with it); signing with it is what makes the two sides independent.
+rsa.workspace = true
+time.workspace = true
+# The walk plays the *browser*: it fetches the authorization URL the platform redirected to and
+# posts the assertion back, so it needs an HTTP client of its own rather than the one the sign-in
+# path uses to talk to the provider.
+reqwest = { workspace = true, features = ["json"] }

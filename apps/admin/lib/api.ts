@@ -3413,4 +3413,152 @@ export function resolveSlot(
   return request<SlotResolution>(
     `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}/resolve/${encodeURIComponent(scopeId)}`,
   );
+/* ---------------------------------------------------------------------------------------------
+ * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
+ *
+ * A client secret never appears in any of these shapes: `secret_ref` is the *name* of the
+ * environment variable it lives in, and `secret_present` says whether this installation defines
+ * it. That is what lets the screen tell "not set up" from "broken" without the value ever
+ * crossing the wire.
+ * ------------------------------------------------------------------------------------------- */
+
+/** One connected sign-in provider. */
+export type IamAuthProvider = {
+  id: string;
+  organization_id: string;
+  slug: string;
+  kind: "oidc" | "oauth2" | "saml";
+  name: string;
+  config: Record<string, unknown>;
+  secret_ref: string | null;
+  secret_present: boolean;
+  scopes: string[];
+  group_claim: string | null;
+  default_role_id: string | null;
+  jit_enabled: boolean;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  sign_in_count: number;
+  last_sign_in_at: string | null;
+};
+
+/** One line of a provider's sign-in log. */
+export type IamProviderEvent = {
+  outcome: "success" | "provisioned" | "updated" | "refused" | "error";
+  reason: string | null;
+  external_subject: string | null;
+  user_id: string | null;
+  roles_applied: string;
+  ip_address: string | null;
+  created_at: string;
+};
+
+/** The answer of the discovery test — a failed test is a `200` with `status: "failed"`. */
+export type IamProviderTest = {
+  provider_id: string;
+  slug: string;
+  kind: "oidc" | "oauth2" | "saml";
+  status: "ok" | "failed";
+  detail: string;
+  endpoints?: Record<string, unknown> | null;
+  secret_present: boolean;
+};
+
+/** The provider list, with the kinds the form offers. */
+export function fetchIamProviders(
+  organizationId?: string | null,
+): Promise<{
+  organization_id: string;
+  providers: IamAuthProvider[];
+  kinds: { value: string; label: string; default_scopes: string[] }[];
+}> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request(`/api/v1/iam/providers${query}`);
+}
+
+/** Connect a provider. It is created switched off — `test` proves it, `enabled` publishes it. */
+export function createIamProvider(input: {
+  slug: string;
+  kind: string;
+  name: string;
+  config: Record<string, unknown>;
+  secretRef?: string | null;
+  scopes?: string[];
+  groupClaim?: string | null;
+  jitEnabled?: boolean;
+  organizationId?: string | null;
+}): Promise<IamAuthProvider> {
+  return request("/api/v1/iam/providers", {
+    method: "POST",
+    body: JSON.stringify({
+      slug: input.slug,
+      kind: input.kind,
+      name: input.name,
+      config: input.config,
+      ...(input.secretRef ? { secret_ref: input.secretRef } : {}),
+      ...(input.scopes?.length ? { scopes: input.scopes } : {}),
+      ...(input.groupClaim ? { group_claim: input.groupClaim } : {}),
+      ...(typeof input.jitEnabled === "boolean" ? { jit_enabled: input.jitEnabled } : {}),
+      ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+    }),
+  });
+}
+
+/** Change a provider. Only the fields present are changed. */
+export function updateIamProvider(
+  id: string,
+  input: {
+    name?: string;
+    config?: Record<string, unknown>;
+    secretRef?: string | null;
+    scopes?: string[];
+    groupClaim?: string | null;
+    jitEnabled?: boolean;
+    enabled?: boolean;
+  },
+): Promise<IamAuthProvider> {
+  return request(`/api/v1/iam/providers/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.config !== undefined ? { config: input.config } : {}),
+      ...(input.secretRef !== undefined ? { secret_ref: input.secretRef } : {}),
+      ...(input.scopes !== undefined ? { scopes: input.scopes } : {}),
+      ...(input.groupClaim !== undefined ? { group_claim: input.groupClaim } : {}),
+      ...(input.jitEnabled !== undefined ? { jit_enabled: input.jitEnabled } : {}),
+      ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+    }),
+  });
+}
+
+/** Remove a provider. Its challenges and its event log go with it. */
+export function deleteIamProvider(id: string): Promise<null> {
+  return request(`/api/v1/iam/providers/${id}`, { method: "DELETE" });
+}
+
+/** Ask the provider what it actually is. A broken provider is a result, not a transport error. */
+export function testIamProvider(id: string): Promise<IamProviderTest> {
+  return request(`/api/v1/iam/providers/${id}/test`, { method: "POST" });
+}
+
+/** A provider's sign-in log, newest first. */
+export function fetchIamProviderEvents(
+  id: string,
+  input: { organizationId?: string | null; limit?: number } = {},
+): Promise<{ provider_id: string; events: IamProviderEvent[] }> {
+  const params = new URLSearchParams();
+  if (input.organizationId) params.set("organization_id", input.organizationId);
+  if (input.limit) params.set("event_limit", String(input.limit));
+  const query = params.toString();
+  return request(`/api/v1/iam/providers/${id}/events${query ? `?${query}` : ""}`);
+}
+
+/** The providers a person may sign in with — the public list the sign-in screen renders. */
+export function fetchSsoProviders(): Promise<{
+  organization_id: string;
+  providers: { slug: string; name: string; kind: string; start_url: string }[];
+}> {
+  return request("/api/v1/auth/sso/providers");
+
 }

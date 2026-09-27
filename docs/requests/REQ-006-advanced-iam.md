@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** in-progress — slices 1–3b, 4a and 4b-1 shipped (role depth; subjects/scopes/simulator; security policy / sessions / devices / TOTP / WebAuthn passkeys; ABAC policies + the builder + the safety invariants; permission requests + approvals with their time-boxed grants, and SCIM 2.0 provisioning with its sync log); slice 4b-2 in progress — the enterprise sign-in **core** is shipped and pushed (`a40903a`: OIDC discovery + PKCE + RS256 verification, SAML 2.0 with both halves of the XML-signature binding, single-use challenges, claim → role mapping; 103 identity tests green) and the API, the `/settings/iam/authentication` screen, JIT provisioning and the QA pass are next
+> **Status:** done — slices 1–3b, 4a, 4b-1 and 4b-2 shipped (role depth; subjects/scopes/simulator; security policy / sessions / devices / TOTP / WebAuthn passkeys; ABAC policies + the builder + the safety invariants; permission requests + approvals with their time-boxed grants, and SCIM 2.0 provisioning with its sync log; enterprise sign-in). Slice 4b-2 closed with a **live** OIDC and SAML round trip: `87390ff` adds `apps/api/tests/support/stub_idp.rs` (a real loopback identity provider speaking both protocols with real RSA signatures) and `apps/api/tests/sso_live.rs`, which drives discovery, the authorization redirect, the code exchange, RS256 verification against the published keys, the claim → role mapping, JIT provisioning and the session cookie — plus three provider-side attacks that are refused
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -176,7 +176,7 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 - [x] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants. *(slice 3a: the same walk revokes one session and the next request answers `401`, `sign-out-all` ends both live sessions, the same untouched row is refused at a five-minute idle window and accepted once the policy says two hours (so it is the policy, not a constant), and the concurrent cap of two retires the oldest with `revoke_reason = 'concurrent_cap'`.)*
 - [x] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once. *(slice 3a: `apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end` — three failures lock the account at the threshold the policy names and the fourth answer is `account_locked`; the correct password is refused while locked; a denied address answers `address_blocked` for the correct password as well, an allowlist refuses an address outside it, and the fourth failure from one address is refused by the address count; TOTP enrols, confirmation issues ten recovery codes, a sign-in answers a challenge instead of a cookie, and a recovery code works exactly once; `reset-mfa` and key issuance both answer `403 step_up_required` until the caller proves identity again.)*
 - [x] TOTP and a **passkey** both enrol and verify. *(slice 3a ships TOTP; slice 3b ships WebAuthn: `crates/identity/src/webauthn/` parses the client data, the authenticator data and the CBOR attestation object, extracts the COSE key for **ES256** and **EdDSA**, verifies the signature over `authenticatorData || SHA-256(clientDataJSON)`, refuses a counter that does not move forward, and accepts the documented loopback origin so the QA stack can run a real ceremony. Proof: `cargo test --workspace` — the ceremony unit tests (both families plus every refusal) and `apps/api/tests/webauthn.rs::a_passkey_enrols_and_signs_in_end_to_end`, which registers a credential with a software authenticator, signs in with an assertion, proves the session carries `webauthn` in its auth methods, refuses a replayed counter and a foreign origin, demands a step-up to remove the factor and ends password-only again. Browser proof: the `iam-passkeys` pass of `scripts/qa/walkthrough.cjs` drives the panel with a Chrome virtual authenticator.)*
-- [ ] OIDC and SAML sign-in complete against a test provider with JIT provisioning and the mapped role. *(part 1 shipped in `a40903a`: the protocol layer is done and proved against real cryptography — RS256 verification against a generated 2048-bit key, the SAML signature checked in **both** directions (the declared `DigestValue` over the enveloped transform, so a tampered claim is refused, plus the RSA signature over `SignedInfo`), issuer/audience/window refusals, entity-declaration and unsigned responses refused, and the claim → role mapping read from arrays, space-delimited strings and nested arrays. The API routes, the panel screen and the JIT walk are next; the SCIM half was proven in 4b-1 with `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs` and the `iam-provisioning` pass.)* *(the SCIM half is proven — a create → patch → deactivate round trip over the real router, recorded in the sync log, `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs`, and driven in the browser by the `iam-provisioning` pass; SSO arrives with slice 4b-2.)*
+- [x] OIDC and SAML sign-in complete against a test provider with JIT provisioning and the mapped role. *(proved end to end in `b1e6d47` against a **live** identity provider: `apps/api/tests/support/stub_idp.rs` is a real OIDC + SAML server this process starts on a loopback port — discovery document, JWKS, authorization endpoint that redirects, token endpoint that checks PKCE itself, and a SAML endpoint that signs an assertion with both halves of the XML-signature binding — all with a freshly generated 2048-bit RSA key, so agreement between the two sides is evidence rather than tautology. `apps/api/tests/sso_live.rs` drives both protocols through the real router: the browser is sent to the provider's own authorization endpoint with `state` and PKCE, comes back with a code, the code is exchanged, the token is verified against the *published* keys, the claim → role mapping attaches the role, JIT provisions the account, and `GET /me` with the resulting cookie names the directory person. Three attacks come from the provider's side and are refused: a token minted for somebody else's `code` (a valid signature the stateless check alone would accept), a token signed by a key the JWKS does not publish, and a tampered assertion. The earlier layers are unchanged: the management surface, the secret-is-a-name rule, the discovery test, a disabled provider being unreachable *and* logged, the JIT refusals, `JIT_PASSWORD_MARKER`, the deactivated account and the removal cascade are all in `sso.rs`.*)
 - [x] An approved request grants the permission only inside its window and expires on its own; every role, binding, policy, session, device and approval change writes an audit entry; all routes answer 401/403/200 as documented; every screen has empty, loading and error states with zero high findings in the QA pass. *(slice 4b-1: `apps/api/tests/iam_approvals.rs::an_approved_request_grants_only_inside_its_window` moves a granted window into the past and watches the permission leave with nobody acting; the member cannot read the inbox, cannot decide and cannot read the user list after a refusal; the audit trail carries `iam.approval.requested` / `approved` / `rejected`; the walkthrough drives `iam-approvals` and `iam-provisioning` on desktop and mobile.)*
 
 ### QA plan
@@ -190,7 +190,7 @@ What the visual check should see: a matrix with a sticky category header, tri-st
 1. **Role depth.** Migration, role CRUD/duplicate/delete, matrix editor with tri-state and diff preview, inheritance + precedence resolution, role versions, catalogue additions, tests. Done when the matrix saves atomically, precedence and cycle tests pass, and the history tab shows a diff.
 2. **Subjects, scopes, simulator.** Users screen, bindings at every scope level with expiry, groups, service accounts + keys, effective permissions and the RBAC part of the simulator. Done when the simulator agrees with the API guard for every catalogue key across two subjects and a resource-scoped case.
 3. **Sessions, devices, MFA, security policy.** Session/device screens with revocation, idle/absolute lifetime, lockout, IP lists, TOTP + passkey enrolment and step-up. Done when a revoked session is rejected on the next request, lockout triggers at the configured threshold, and both factors enrol and verify in the QA stack.
-4. **Enterprise sign-in, provisioning, ABAC, approvals.** Split in three. **4a (shipped)** — the ABAC policy engine with its builder, dry run and versions, plus the permission safety invariants. **4b-1 (shipped)** — permission requests and approvals as time-boxed bindings, and SCIM 2.0 provisioning with its sync log. **4b-2 (pending)** — OIDC/OAuth2/SAML providers with JIT provisioning and claim → role mapping. The slice is done when SSO sign-in completes against a test provider, a SCIM round trip provisions a user, an approved request grants only inside its window, and the last-owner invariant blocks self-lockout.
+4. **Enterprise sign-in, provisioning, ABAC, approvals.** Split in three. **4a (shipped)** — the ABAC policy engine with its builder, dry run and versions, plus the permission safety invariants. **4b-1 (shipped)** — permission requests and approvals as time-boxed bindings, and SCIM 2.0 provisioning with its sync log. **4b-2 (shipped)** — OIDC/OAuth2/SAML providers with JIT provisioning and claim → role mapping. The slice is done when SSO sign-in completes against a test provider, a SCIM round trip provisions a user, an approved request grants only inside its window, and the last-owner invariant blocks self-lockout.
 
 ### Risks / notes
 
@@ -304,6 +304,47 @@ What the visual check should see: a matrix with a sticky category header, tri-st
   step, and removes it again (an account left with a passkey would break every later
   password-only sign-in the walk performs).
 - **Remaining in this slice**: nothing. `mfa_required` still needs enforcing at sign-in.
+
+### Slice 4b-2 — Enterprise sign-in (shipped)
+
+- **The protocol half** (`a40903a`): OIDC discovery + PKCE + RS256 against the provider's published
+  keys, SAML 2.0 with *both* halves of the XML-signature binding (the declared `DigestValue` over
+  the enveloped transform and the RSA signature over `SignedInfo`), single-use hashed challenges,
+  and the claim → role mapping reduced to one protocol-neutral `Identity`.
+- **The HTTP half** (`61ef619`, `f599c3c`): `/iam/providers` (connect, test, patch, remove, events)
+  with secrets by reference, the public `/auth/sso` round trip, JIT provisioning, and the
+  `/settings/iam/authentication` screen.
+- **The refusals** (`apps/api/tests/sso.rs`): the management surface over HTTP, the JIT walk, a
+  disabled provider that is unreachable *and* logged, a deactivated account that stays deactivated,
+  removal taking the sign-in log with it, and an ambiguous host answered `501` rather than guessed.
+- **The live round trip** (`87390ff`, `apps/api/tests/sso_live.rs` + `apps/api/tests/support/stub_idp.rs`):
+  the one thing the unit tests and the refusal walk could not prove — that a *browser* can be sent
+  to a provider, come back, and end up with a session here. The stub is a real server: discovery,
+  JWKS, an authorization endpoint that redirects with a `Location`, a token endpoint that checks
+  PKCE itself and spends a code once, and a SAML endpoint that signs an assertion. Both walks
+  assert the whole chain and then three attacks *from the provider's side* — a token minted for
+  somebody else's code, a token signed by an unpublished key, a tampered assertion.
+- **Four real defects the live walk found**, none of which any layer-by-layer test could see:
+  (1) **the SAML relay page posted the return path as `RelayState`** while the callback claims a
+  challenge from `RelayState`, so *every* SAML sign-in ended in `invalid_state`; the page now
+  carries the challenge and HTML-escapes it. (2) **`c_hash` was compared against the PKCE
+  verifier's hash** — a value no provider has ever seen, so a real directory could never satisfy
+  it; it is now the real code hash (OIDC Core §3.1.3.6), and a *missing* `c_hash` is not a refusal
+  because the claim is a RECOMMENDED. (3) **the SAML `test` button could never succeed**: its probe
+  document was a self-closing `<saml:Assertion/>` that the reader never parses, and the answer was
+  inferred from the error text, so every certificate read as broken; the certificate step is now
+  exposed on its own (`certificate_is_readable`) and the claim half is probed with a document the
+  real reader accepts. (4) **the claim → role mapping silently did nothing for every tenant**:
+  it looked the role up with the tenant's organization id, but the base roles are seeded at
+  *platform* scope, so `editors` → `editor` matched nothing and the person signed in with no role
+  and no error; the lookup now falls back to the platform role, the way the rest of the platform
+  finds one.
+- **Proof.** `cargo test --workspace --lib` → **598 unit tests, 0 failures** (112 in
+  `omnion-identity`, 100 in `omnion-api`). `cargo test -p omnion-api --test sso --test sso_live`
+  → **3 walks, 0 failures** over the real router, all three in one database. `pnpm typecheck`
+  green. `cargo clippy` adds no new warning.
+- **Remaining in this slice**: nothing. The panel screen and its QA pass shipped in `f599c3c`.
+
 
 ### Slice 4a — The ABAC policy engine, the builder and the safety invariants (shipped)
 
