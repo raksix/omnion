@@ -87,6 +87,7 @@ pub mod automation;
 pub mod commands;
 pub mod content;
 pub mod crm;
+pub mod crm_views;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -649,11 +650,41 @@ pub fn router(state: AppState) -> Router {
         .route("/crm/contacts/merge", post(crm::merge_contacts))
         .route_layer(guards::require(&state, "crm.contacts.merge"));
 
+    // Slice 2 adds what a *list* needs to be more than a table: saved views, the import and the
+    // export. Reading a view and running a dry run are reads (`crm.contacts.read`); saving a view,
+    // committing an import and downloading a file write, so they carry their own keys — a file
+    // the caller can download is a copy of the records, and a role that may not create contacts
+    // must not be able to create them one file at a time.
+    let crm_views_read = Router::new()
+        .route("/crm/views", get(crm_views::list_views))
+        .route("/crm/views/columns", get(crm_views::view_columns))
+        .route("/crm/contacts/export", get(crm_views::export_contacts))
+        .route("/crm/companies/export", get(crm_views::export_companies))
+        .route_layer(guards::require(&state, "crm.contacts.read"));
+
+    let crm_views_manage = Router::new()
+        .route("/crm/views", post(crm_views::create_view))
+        .route("/crm/views/{id}", delete(crm_views::delete_view))
+        .route_layer(guards::require(&state, "crm.views.manage"));
+
+    let crm_import = Router::new()
+        .route(
+            "/crm/contacts/import",
+            post(crm_views::import_contacts),
+        )
+        .layer(DefaultBodyLimit::max(
+            omnion_module_crm::csv::MAX_IMPORT_BYTES,
+        ))
+        .route_layer(guards::require(&state, "crm.contacts.import"));
+
     let crm = crm_read
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)
-        .merge(crm_merge);
+        .merge(crm_merge)
+        .merge(crm_views_read)
+        .merge(crm_views_manage)
+        .merge(crm_import);
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))

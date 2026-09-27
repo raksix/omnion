@@ -115,6 +115,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "crm.contacts.delete",
             "crm.contacts.merge",
             "crm.fields.sensitive.read",
+            "crm.views.manage",
+            "crm.contacts.import",
         ]),
     },
     BaseRole {

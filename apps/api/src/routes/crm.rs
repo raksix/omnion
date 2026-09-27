@@ -202,7 +202,7 @@ pub struct NewCompany {
 // ---------------------------------------------------------------------------------------------
 
 /// The organization this request works in.
-fn organization_of(current: &CurrentSession, requested: Option<Uuid>) -> Result<Uuid, ApiError> {
+pub(crate) fn organization_of(current: &CurrentSession, requested: Option<Uuid>) -> Result<Uuid, ApiError> {
     resolve_organization(current, requested)
 }
 
@@ -217,7 +217,7 @@ fn organization_of(current: &CurrentSession, requested: Option<Uuid>) -> Result<
 /// never narrowed sees the organization's CRM, which is exactly what its role's permission set
 /// says. When several bindings narrow the caller, the **tightest** level wins — a promise a
 /// person can rely on is the narrowest one they hold, never the widest.
-async fn visibility_of(state: &AppState, current: &CurrentSession) -> Visibility {
+pub(crate) async fn visibility_of(state: &AppState, current: &CurrentSession) -> Visibility {
     let Some(organization_id) = current.user.organization_id else {
         return Visibility::All;
     };
@@ -257,7 +257,7 @@ async fn visibility_of(state: &AppState, current: &CurrentSession) -> Visibility
 }
 
 /// The scope the module reads at: the organization, the caller, the level and the team.
-async fn scope_of(state: &AppState, current: &CurrentSession, organization_id: Uuid) -> Scope {
+pub(crate) async fn scope_of(state: &AppState, current: &CurrentSession, organization_id: Uuid) -> Scope {
     let visibility = visibility_of(state, current).await;
     let team_user_ids = if visibility == Visibility::Team {
         team_of(state, current, organization_id).await
@@ -269,7 +269,7 @@ async fn scope_of(state: &AppState, current: &CurrentSession, organization_id: U
 }
 
 /// Everyone who shares a group with the caller: the `team` level's people.
-async fn team_of(state: &AppState, current: &CurrentSession, organization_id: Uuid) -> Vec<Uuid> {
+pub(crate) async fn team_of(state: &AppState, current: &CurrentSession, organization_id: Uuid) -> Vec<Uuid> {
     #[derive(sqlx::FromRow)]
     struct Member {
         user_id: Uuid,
@@ -294,7 +294,7 @@ async fn team_of(state: &AppState, current: &CurrentSession, organization_id: Uu
 ///
 /// Resolved with the same authorizer the route guard uses, so a policy that denies the key has
 /// the same effect here as it does on the route itself.
-async fn may_read_sensitive(state: &AppState, current: &CurrentSession) -> bool {
+pub(crate) async fn may_read_sensitive(state: &AppState, current: &CurrentSession) -> bool {
     let Some(organization_id) = current.user.organization_id else {
         return true;
     };
@@ -311,7 +311,7 @@ async fn may_read_sensitive(state: &AppState, current: &CurrentSession) -> bool 
 }
 
 /// Record an event without letting a webhook problem fail the caller's request.
-async fn emit(state: &AppState, event: NewEvent) {
+pub(crate) async fn emit(state: &AppState, event: NewEvent) {
     if let Err(error) = bus::emit(state.db().pool(), event).await {
         tracing::warn!(error = %error, "the CRM event could not be recorded");
     }

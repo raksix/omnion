@@ -9,6 +9,10 @@
 //!   **visibility level**, which is enforced in SQL rather than in the UI.
 //! * [`model`] — the shared vocabulary: lifecycle statuses, tag and address shapes, and the
 //!   field-hiding rule a list, a detail screen and an export all read.
+//! * [`csv`] — the file a person imports and exports: the header mapping, the dry run that names
+//!   the line it refuses, and the writers whose output is the importer's own input.
+//! * [`views`] — the saved views: a filter, a column set and a sort stored as the query it
+//!   stands for, so a view never goes stale.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature the platform can carry behind the
 //! `crm.*` permission family, not infrastructure the core depends on. It talks to PostgreSQL and
@@ -17,9 +21,11 @@
 #![forbid(unsafe_code)]
 
 pub mod contacts;
+pub mod csv;
 pub mod error;
 pub mod model;
 pub mod query;
+pub mod views;
 
 pub use error::{CrmError, Result};
 pub use model::Visibility;

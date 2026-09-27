@@ -444,6 +444,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Read the CRM fields a role otherwise cannot see",
     },
+    // Slice 2's two keys. Both exist because both acts are a way to **copy** the records rather
+    // than work with them: a saved view hands the whole filtered set to whoever opens it next, and
+    // an import writes a whole file of contacts in one request. Separating them from `.read` and
+    // `.create` is what lets a role look at the CRM without being able to exfiltrate or bulk-load
+    // it — a distinction an audit can answer.
+    PermissionDef {
+        key: "crm.views.manage",
+        category: "crm",
+        description: "Create and delete saved CRM views (a view is shared with its organization)",
+        },
+    PermissionDef {
+        key: "crm.contacts.import",
+        category: "crm",
+        description: "Import contacts and companies from a CSV",
+    },
 ];
 
 /// Look a permission up by key.
