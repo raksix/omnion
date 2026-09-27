@@ -1275,6 +1275,8 @@ dependencies = [
  "omnion-workflows",
  "p256",
  "rand 0.8.8",
+ "reqwest",
+ "rsa",
  "serde",
  "serde_json",
  "sha2",

@@ -701,36 +701,46 @@ fn test_saml(provider: &AuthProvider, secret_present: bool) -> (&'static str, St
         );
     };
 
-    // A configuration is proven by building a *response* and asking the real verifier to read it:
-    // that exercises the same parser a real assertion goes through, so a certificate this
-    // platform cannot use fails here and not at the first sign-in.
+    let email_attribute = text("email_attribute").unwrap_or_else(|| "email".to_owned());
+    let group_attribute = text("group_attribute");
+    let display_name_attribute = text("display_name_attribute");
+
+    // A configuration is proved by asking the *real* parser whether the certificate is usable,
+    // not by a second implementation of the parse that could drift from it. The earlier version
+    // fed a probe response to `verify_response` and inferred the answer from the error text —
+    // and because the probe carried a self-closing `<saml:Assertion/>` (which the reader never
+    // parses at all), the button reported every certificate as broken and could never succeed.
+    if let Err(error) = omnion_identity::sso::saml::certificate_is_readable(&certificate) {
+        return (
+            "failed",
+            format!("the configured certificate could not be read: {error}"),
+            None,
+        );
+    }
+
+    // The attribute names are configuration too, and a typo in one is invisible until a real
+    // assertion arrives carrying no address the reader recognises. So the probe runs the whole
+    // reader over a document that has *every* attribute the configuration names — which is the
+    // last check that needs no signature, and it proves the wiring end to end.
+    let probe = omnion_identity::sso::saml::probe_document(
+        &issuer,
+        &audience,
+        &email_attribute,
+        group_attribute.as_deref(),
+        display_name_attribute.as_deref(),
+    );
     let config = omnion_identity::sso::saml::SamlConfig {
         issuer: issuer.clone(),
         audience: audience.clone(),
         certificate_pem: certificate,
-        email_attribute: text("email_attribute").unwrap_or_else(|| "email".to_owned()),
-        group_attribute: text("group_attribute"),
-        display_name_attribute: text("display_name_attribute"),
+        email_attribute,
+        group_attribute,
+        display_name_attribute,
     };
-    let probe = format!(
-        "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\">\
-         <saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\"/></samlp:Response>"
-    );
-    let parsed = omnion_identity::sso::saml::verify_response(&probe, &config);
-    let certificate_usable = match &parsed {
-        // The probe carries no signature, so the refusal names the *signature* check rather than
-        // the certificate. Anything else would be a real parse failure of the configuration.
-        Err(error) => {
-            let message = error.to_string();
-            !message.contains("not signed") && !message.contains("no assertion")
-        }
-        Ok(_) => true,
-    };
-
-    if !certificate_usable {
+    if let Err(error) = omnion_identity::sso::saml::probe_claims(&probe, &config) {
         return (
             "failed",
-            format!("the configured certificate could not be read: {}", describe(&parsed)),
+            format!("the assertion reader cannot read this configuration: {error}"),
             None,
         );
     }
@@ -746,14 +756,6 @@ fn test_saml(provider: &AuthProvider, secret_present: bool) -> (&'static str, St
         format!("the assertion reader accepts this configuration{note}"),
         Some(json!({ "issuer": issuer, "audience": audience })),
     )
-}
-
-/// The error text of a probe result, for the message.
-fn describe<T>(result: &Result<T, omnion_identity::IdentityError>) -> String {
-    match result {
-        Ok(_) => "it parsed".to_owned(),
-        Err(error) => error.to_string(),
-    }
 }
 
 /// The endpoints the panel shows next to a successful test.
