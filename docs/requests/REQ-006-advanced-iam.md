@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/auth`, `crates/permissions`)
+> **Status:** in-progress — slice 1 (role depth) shipped `c0ed83c…a13fa4b`, slices 2–4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/auth`, `crates/permissions`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -163,10 +163,10 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 
 ### Acceptance criteria
 
-- [ ] `0011_iam_advanced.sql` applies on a fresh and on a populated database; `cargo test --workspace` is green.
-- [ ] Precedence is proven: an explicit deny in one role beats an explicit allow in another; inherited allows apply unless denied; no binding means default deny.
-- [ ] An inheritance cycle (A → B → A) and self-inheritance are refused with a field-level error.
-- [ ] Matrix save is atomic: an unknown key, a duplicate entry or a stale version fails the whole save with a diff of what was rejected.
+- [x] `0011_iam_advanced.sql` applies on a fresh and on a populated database; `cargo test --workspace` is green. *(slice 1: applied to a scratch database and to the populated dev database — the `subject_id` backfill and the policy seed were read back; see BUILD-LOG 2026-09-27.)*
+- [x] Precedence is proven: an explicit deny in one role beats an explicit allow in another; inherited allows apply unless denied; no binding means default deny. *(slice 1: `apps/api/tests/iam.rs::role_depth_lifecycle_is_proven_end_to_end` — an unbound account is refused, the allowing binding admits it, the denying binding takes it away again; the resolver unit tests cover inheritance.)*
+- [x] An inheritance cycle (A → B → A) and self-inheritance are refused with a field-level error. *(slice 1: `409 role_inheritance_cycle`, message names `inherits_role_id`; the depth limit (8) answers `400 role_inheritance_depth`.)*
+- [x] Matrix save is atomic: an unknown key, a duplicate entry or a stale version fails the whole save with a diff of what was rejected. *(slice 1: `400 invalid_entries` naming the rejected keys, `409 role_version_conflict`, and the set on disk is provably unchanged after a refusal; a successful save returns the added/changed/removed diff and a version number.)*
 - [ ] A resource-scoped binding (`site` + `/blog/*`) allows a matching path and denies `/legal/…` with the decision source in the 403; a past `expires_at` stops counting without deleting the row (the members tab shows it as expired).
 - [ ] Group membership grants and revokes: adding a user to a group with an attached role changes the effective set on the next request; removal reverses it.
 - [ ] A service-account key authenticates a `/api/v1` request over Bearer and cannot start an interactive sign-in session.
@@ -198,3 +198,47 @@ What the visual check should see: a matrix with a sticky category header, tri-st
 - **Secrets by reference only:** provider credentials live behind `secret_ref` (environment or secret store, REQ-037), MFA secrets are stored encrypted, and codes are never logged.
 - **Provisioning tokens** are prefix + hash and rotatable; the sync log drops personal data on retention, and deactivation (not deletion) is the SCIM default.
 - **SSO, passkeys and event volume:** document the local `localhost` exception so QA can exercise WebAuthn (a test that silently skips is not evidence), and sample or aggregate `iam.policy_denied`/`iam.signin_failed` before they reach webhooks.
+
+## Progress
+
+### Slice 1 — Role depth (shipped)
+
+- **Migration `0011_iam_advanced.sql`** carries the whole request's data model (role versions,
+  devices, MFA factors and recovery codes, groups, service accounts and their keys, ABAC
+  policies and versions, security policy, sign-in attempts, providers, permission requests,
+  provisioning tokens and log), the `users`/`sessions` extensions and the expand-then-contract
+  move of `role_bindings` to subjects and the wider scope ladder. Verified twice: applied to a
+  scratch database (fresh) and to the populated development database (backfill + seed read
+  back).
+- **Role depth** (`crates/permissions`): `update_role`, `delete_role` (refusing a role with live
+  bindings), `duplicate_role`, `ancestors`/`children`, one validation function that refuses a
+  cycle and a chain past eight levels in either direction, and `replace_role_permissions` — the
+  atomic matrix save with `expected_version`, a diff and a recorded version. `crate::versions`
+  appends and reads `role_versions` and computes diffs (pure, unit-tested).
+- **API** (`/api/v1/iam/roles/*`): detail with entries, chain, children and member count;
+  `PATCH`, `DELETE`, `POST /duplicate`, `POST /preview`, `GET /versions` and `GET /members`;
+  the matrix save answers with the diff it applied. Errors carry field-level codes
+  (`role_inheritance_cycle`, `role_inheritance_depth`, `role_has_bindings`,
+  `role_version_conflict`, `invalid_entries`). The catalogue gained the IAM family the later
+  slices guard their routes with.
+- **Panel**: `/settings/iam/roles` (platform + custom roles, counts, create, open, duplicate,
+  two-step delete) and `/settings/iam/roles/{id}` (the matrix with tri-state cells, category
+  accordion, per-category counts and grant/deny/inherit-all, a filter, a diff preview, a sticky
+  Save/Discard footer, plus Members, Inherited by and History tabs where the history draws each
+  version's diff).
+- **Tenant scope on the list**: a role belongs to a tenant, so `GET /iam/roles` answers platform
+  roles plus one organization's — a tenant account always for its own, a platform account for
+  the tenant it names with `?organization_id=` (and the panel gives it a tenant picker). Without
+  that, a platform owner could create a role for a tenant and then not see it — the QA pass
+  caught exactly this.
+- **Refusals the reader sees, not round-trips**: the role editor refuses an empty name and a
+  priority outside `0–1000` in the field itself (the API refuses the same shapes, pinned by the
+  integration walk), so a mistyped form never becomes a `400` in the console.
+- **Proof**: `cargo test --workspace` green — the role-depth walk
+  (`apps/api/tests/iam.rs::role_depth_lifecycle_is_proven_end_to_end`) proves the lifecycle over
+  HTTP: create → set → duplicate → delete-while-unbound, the cycle/self/depth refusals, the
+  atomic refusal leaving the set untouched, the stale-version refusal, the history diffs and
+  precedence through the guard. The walkthrough drives the same path in the browser
+  (`scripts/qa/walkthrough.cjs`, pass `iam-roles-depth`).
+- **Next**: slice 2 — users screen, bindings at every scope level with expiry, groups, service
+  accounts and their keys, effective permissions and the RBAC simulator.

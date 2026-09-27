@@ -1306,3 +1306,63 @@
   unchanged), and `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
 - Next: **REQ-006 (IAM)** — the next wave-1 item: user, role and permission screens plus sessions
   and devices.
+
+## 2026-09-27 · REQ-006 slice 1 — role depth (migration 0011, the matrix, versions)
+
+- **The migration carries the whole request.** `database/migrations/0011_iam_advanced.sql` adds the
+  role side this slice uses (`role_versions`) and the rest of the model the later slices land on:
+  the `users`/`sessions` extensions, devices, MFA factors and recovery codes, groups, service
+  accounts and their keys, ABAC policies and versions, the security-policy document, sign-in
+  attempts, sign-in providers, permission requests, provisioning tokens and their log. The
+  `role_bindings` move to subjects and the wider scope ladder is expand-then-contract: the new
+  columns arrive beside `user_id`, are backfilled from it, and a `before insert` trigger fills
+  `subject_id` for writers that still insert the old shape. Verified twice — applied to a scratch
+  database (fresh) and to the populated development database (backfill + the policy seed read
+  back).
+- **Role depth in the crate.** `crates/permissions` gained `update_role`, `delete_role` (refusing
+  a role that still carries live bindings), `duplicate_role`, `ancestors`/`children`, one
+  validation function that refuses a cycle and a chain past eight levels in either direction
+  (called by both `create_role` and `update_role`), and `replace_role_permissions` — the atomic
+  matrix save with `expected_version`, the applied diff and a recorded version. The new
+  `versions` module appends and reads `role_versions` and computes diffs; the diff itself is pure
+  and unit-tested.
+- **The API** grew `/iam/roles/{id}` (detail with entries, chain, children, member count),
+  `PATCH`, `DELETE`, `POST /duplicate`, `POST /preview`, `GET /versions`, `GET /members`, and the
+  matrix save now answers with the diff it applied. Refusals carry field-level codes
+  (`role_inheritance_cycle`, `role_inheritance_depth`, `role_has_bindings`,
+  `role_version_conflict`, `invalid_entries`). The catalogue gained the IAM family the later
+  slices guard their routes with.
+- **The panel**: `/settings/iam/roles` and `/settings/iam/roles/{id}` — the tri-state matrix
+  (category accordion, per-category counts, grant/deny/inherit-all, filter, diff preview, sticky
+  Save/Discard) and the Members, Inherited by and History tabs, where each version shows its diff.
+  The navigation gained one entry, and the write controls declare `data-qa-guard` so the generic
+  click pass never fires them.
+- **Two defects the QA pass found that no unit test could.** (1) The role list answered platform
+  roles plus one organization's, but a platform account (the QA owner has no primary
+  organization) never named one — so a role the panel had just created for a tenant vanished from
+  its own list, and the create form posted without a tenant and answered `400`. `GET /iam/roles`
+  now takes `?organization_id=`, the panel gives platform accounts a tenant picker, and the
+  create/duplicate forms send it. (2) An empty name was refused by the server, which made every
+  mistyped save a `400` in the console: the editor now refuses it in the field (the API keeps and
+  proves its own refusal in the integration walk).
+- **One carried-forward fix**: the analytics settings storage table forced a 720px minimum inside
+  a 560px card, and the vision pass read the overflow as clipped text. `DataTable` now takes a
+  `minWidthClass`, the storage table fits its card, and a measurement proves it (table 558 ≤ panel
+  560, no clipped cells).
+- **Proof:** `cargo test --workspace --no-fail-fast` → **572 passed, 0 failed** across 48 suites
+  (exit 0; the new walk is `apps/api/tests/iam.rs::role_depth_lifecycle_is_proven_end_to_end` —
+  create → set → duplicate → delete-while-unbound, the cycle/self/depth refusals, the atomic
+  refusal that stores nothing, the stale-version conflict, the history diffs, precedence through
+  the guard, and the server's own refusal of an empty name) · `cargo clippy --workspace
+  --all-targets -- -D warnings` → clean · `pnpm typecheck && pnpm build` → 2/2 (the route table
+  lists both new screens) · `bash scripts/qa/run.sh` → **507 clicks, 493 screenshots, 0 high
+  findings**, 2 vision issues (both on the analytics charts, medium/low) —
+  `qa-artifacts/20260927-022655`. The depth pass in the browser: create (version 0) → the matrix
+  cell cycled allow → deny → inherit → allow → diff preview (`1 added`) → save (version 1) →
+  reload and the cell is still set → history shows the version with its diff → Members/Inherited
+  by → an empty name refused in the field → edit saved → duplicate (the copy opens with the set) →
+  the copy deleted with its notice.
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium findings,
+  unchanged).
+- Next: **REQ-006 slice 2** — the users screen, bindings at every scope level with expiry, groups,
+  service accounts and their keys, effective permissions and the RBAC simulator.
