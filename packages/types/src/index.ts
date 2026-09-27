@@ -61,8 +61,38 @@ export interface ContentBlock {
   type: string;
   /** The type's props, shaped by the registry's schema. */
   props: Record<string, unknown>;
+  /**
+   * Per-block settings — `hide_on`, `align`, `anchor`, `id`, `class`, `aria_label`.
+   *
+   * Separate from `props` because a prop is content the block's schema declares and a setting is
+   * how the author placed this block. A block with nothing set carries no `meta` key at all, so
+   * the ordinary block costs nothing in the stored payload.
+   */
+  meta?: BlockSettings;
   /** Child blocks, for container types only. */
   children?: ContentBlock[];
+}
+
+/** The viewports a block can be hidden from. */
+export type HideOn = "none" | "mobile" | "desktop";
+
+/** The viewports `HideOn` allows, in the order the inspector lists them. */
+export const HIDE_ON_VALUES: HideOn[] = ["none", "mobile", "desktop"];
+
+/** The per-block settings the platform reads. */
+export interface BlockSettings {
+  /** Viewport the block is hidden from. `none` — or no `meta` at all — shows it everywhere. */
+  hide_on?: HideOn;
+  /** Text alignment the block asks for. */
+  align?: string;
+  /** Anchor the renderer puts on the block, for a `#link` to reach it. */
+  anchor?: string;
+  /** DOM id, for a `#link` to reach the block directly. */
+  id?: string;
+  /** Extra class names the theme's stylesheet may key on. */
+  class?: string;
+  /** Accessible name for a block whose content is not its label. */
+  aria_label?: string;
 }
 
 /** What kind of value one block prop holds. */

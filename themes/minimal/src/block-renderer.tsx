@@ -43,6 +43,12 @@ function alignClass(block: ContentBlock): string {
  *
  * An unknown type renders a quiet notice instead of throwing: a payload written against a
  * newer registry must degrade to "one block is missing", never to a blank page.
+ *
+ * The tree that arrives is *already filtered* for the viewport: `GET /public/pages/{slug}`
+ * drops the blocks the author hid from this screen before it sends the payload. Nothing here
+ * hides anything with CSS, because a block that is merely invisible is still in the HTML the
+ * device downloads and still in the accessibility tree, which is not what "hidden on phones"
+ * means.
  */
 export function BlockTree({ blocks }: { blocks: ContentBlock[] }) {
   if (blocks.length === 0) {
@@ -57,9 +63,45 @@ export function BlockTree({ blocks }: { blocks: ContentBlock[] }) {
   );
 }
 
+/**
+ * The DOM attributes a block's own settings ask for.
+ *
+ * Only the *addressing* settings live here — `id` and `aria-label`. The class an author typed
+ * deliberately does not: a spread lands after the element's own `className`, so a `className` in
+ * the spread would replace the theme's layout classes instead of joining them, and an author who
+ * typed one class name the theme does not know would lose the layout the theme does. It is
+ * appended by [`blockClass`] instead.
+ */
+function blockAttributes(block: ContentBlock): Record<string, string> {
+  const attributes: Record<string, string> = {};
+  const meta = block.meta ?? {};
+  const id = typeof meta.id === "string" ? meta.id.trim() : "";
+  const anchor = typeof meta.anchor === "string" ? meta.anchor.trim() : "";
+  if (id || anchor) {
+    attributes.id = id || anchor;
+  }
+  if (typeof meta.aria_label === "string" && meta.aria_label.trim()) {
+    attributes["aria-label"] = meta.aria_label.trim();
+  }
+  return attributes;
+}
+
+/**
+ * The author's own class names, to append to a block's theme classes.
+ *
+ * A block's class is a hint the active theme may style, so it joins the theme's names rather
+ * than replacing them — and it is not a place to write arbitrary CSS, which the REQ keeps out of
+ * blocks on purpose (theme tokens own styling).
+ */
+function blockClass(block: ContentBlock): string {
+  const extra = typeof block.meta?.class === "string" ? block.meta.class.trim() : "";
+  return extra ? ` ${extra}` : "";
+}
+
 /** Render one block (and, for a container, its children). */
 export function Block({ block }: { block: ContentBlock }) {
   const align = alignClass(block);
+  const attributes = blockAttributes(block);
 
   switch (block.type) {
     case "heading": {
@@ -72,16 +114,20 @@ export function Block({ block }: { block: ContentBlock }) {
         | "h5"
         | "h6";
       return (
-        <Tag className={`mn-block mn-heading ${align}`}>{text(block, "text")}</Tag>
+        <Tag className={`mn-block mn-heading ${align}${blockClass(block)}`} {...attributes}>
+          {text(block, "text")}
+        </Tag>
       );
     }
     case "text":
       return (
-        <p className={`mn-block mn-paragraph ${align}`}>{text(block, "text")}</p>
+        <p className={`mn-block mn-paragraph ${align}${blockClass(block)}`} {...attributes}>
+          {text(block, "text")}
+        </p>
       );
     case "testimonial":
       return (
-        <figure className="mn-block mn-testimonial">
+        <figure className={`mn-block mn-testimonial${blockClass(block)}`} {...attributes}>
           <blockquote>{text(block, "quote")}</blockquote>
           <figcaption>
             {[text(block, "author"), text(block, "role")].filter(Boolean).join(", ")}
@@ -90,7 +136,7 @@ export function Block({ block }: { block: ContentBlock }) {
       );
     case "image":
       return (
-        <figure className="mn-block mn-figure">
+        <figure className={`mn-block mn-figure${blockClass(block)}`} {...attributes}>
           {/* The renderer serves the bytes itself: a public page must not depend on the panel
               session for its images, so a media id becomes the public path. */}
           <img
@@ -124,7 +170,7 @@ export function Block({ block }: { block: ContentBlock }) {
       );
     case "cta":
       return (
-        <section className="mn-block mn-cta">
+        <section className={`mn-block mn-cta${blockClass(block)}`} {...attributes}>
           <h2>{text(block, "title")}</h2>
           {text(block, "body") ? <p>{text(block, "body")}</p> : null}
           <a className="mn-cta-link" href={text(block, "href")}>
