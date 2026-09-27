@@ -459,6 +459,38 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Import contacts and companies from a CSV",
     },
+    // Slice 3's three keys. Deals are separated from contacts for the same reason the others
+    // are: a pipeline exposes an organization's commercial position — its total open value and
+    // its win rate are the two numbers a competitor most wants — so reading the board is its
+    // own decision rather than a side effect of being able to read a contact. Moving a card
+    // between columns is separate from editing it, and reshaping the pipeline itself (the
+    // stage editor) is the one change that retroactively rewrites everyone's history, so it
+    // gets a key of its own.
+    PermissionDef {
+        key: "crm.deals.read",
+        category: "crm",
+        description: "Read CRM deals, the pipeline board and the forecast",
+    },
+    PermissionDef {
+        key: "crm.deals.create",
+        category: "crm",
+        description: "Create CRM deals",
+    },
+    PermissionDef {
+        key: "crm.deals.update",
+        category: "crm",
+        description: "Edit CRM deals and move them between stages",
+    },
+    PermissionDef {
+        key: "crm.deals.delete",
+        category: "crm",
+        description: "Archive CRM deals",
+    },
+    PermissionDef {
+        key: "crm.pipelines.manage",
+        category: "crm",
+        description: "Create and reshape pipelines and their stages",
+    },
 ];
 
 /// Look a permission up by key.
@@ -665,6 +697,13 @@ mod tests {
             "crm.contacts.delete",
             "crm.contacts.merge",
             "crm.fields.sensitive.read",
+            "crm.views.manage",
+            "crm.contacts.import",
+            "crm.deals.read",
+            "crm.deals.create",
+            "crm.deals.update",
+            "crm.deals.delete",
+            "crm.pipelines.manage",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),

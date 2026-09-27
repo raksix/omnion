@@ -39,7 +39,7 @@ static CRM_WALK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const READER_PERMISSIONS: [&str; 2] = ["crm.contacts.read", "sites.read"];
 
 /// What a manager adds on top.
-const MANAGER_PERMISSIONS: [&str; 8] = [
+const MANAGER_PERMISSIONS: [&str; 13] = [
     "crm.contacts.read",
     "crm.contacts.create",
     "crm.contacts.update",
@@ -49,6 +49,13 @@ const MANAGER_PERMISSIONS: [&str; 8] = [
     // the manager that owns the rest of the family has to be granted them explicitly.
     "crm.views.manage",
     "crm.contacts.import",
+    // Slice 3: the board's five keys. The manager owns the rest of the family, so a deal and
+    // the pipeline it sits on are part of that — and the suite proves each of them separately.
+    "crm.deals.read",
+    "crm.deals.create",
+    "crm.deals.update",
+    "crm.deals.delete",
+    "crm.pipelines.manage",
     "sites.read",
 ];
 
@@ -540,6 +547,42 @@ async fn every_crm_route_is_permission_guarded() {
         ),
         (Method::GET, "/api/v1/crm/contacts/export".to_owned(), None),
         (Method::GET, "/api/v1/crm/companies/export".to_owned(), None),
+        // Slice 3: the board, the deals and the pipeline editor. A deal route guarded by
+        // `crm.contacts.read` would let a role that may see people also see the pipeline, which
+        // is the disclosure the deal keys exist to keep separate.
+        (Method::GET, "/api/v1/crm/deals".to_owned(), None),
+        (Method::GET, "/api/v1/crm/deals?view=list".to_owned(), None),
+        (Method::GET, "/api/v1/crm/pipelines".to_owned(), None),
+        (
+            Method::POST,
+            "/api/v1/crm/deals".to_owned(),
+            Some(json!({ "title": "X" })),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/crm/deals/{marker}"),
+            None,
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/crm/deals/{marker}"),
+            Some(json!({ "title": "Y" })),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/crm/deals/{marker}/stage"),
+            Some(json!({ "stage_id": marker })),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/crm/deals/{marker}"),
+            None,
+        ),
+        (
+            Method::PUT,
+            format!("/api/v1/crm/pipelines/{marker}/stages"),
+            Some(json!({ "stages": [{ "name": "New" }] })),
+        ),
     ];
 
     for (method, uri, body) in &calls {
@@ -2115,4 +2158,738 @@ async fn an_export_is_the_lists_own_answer_and_imports_back() {
     .await;
     assert_eq!(archived.status, StatusCode::OK);
     assert!(archived.body["archived_at"].is_string(), "body: {}", archived.body);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3 — deals, the board and the pipeline editor
+// ---------------------------------------------------------------------------------------------
+
+/// The default pipeline of the fixture's organization, with its stages.
+async fn default_pipeline_with_stages(db: &Db, organization_id: Uuid) -> Value {
+    // A bare `Value` is not a `FromRow` in sqlx: the column is read as its own type and
+    // assembled here, which is also what makes a missing column name a compile error rather
+    // than a `?column?` that silently arrives as null.
+    #[derive(sqlx::FromRow)]
+    struct PipelineJson {
+        id: Uuid,
+        name: String,
+        stages: Value,
+    }
+
+    let rows: Vec<PipelineJson> = sqlx::query_as(
+        "select p.id, p.name, (
+             select coalesce(json_agg(json_build_object(
+               'id', s.id, 'name', s.name, 'kind', s.kind, 'position', s.position,
+               'probability', s.probability) order by s.position), '[]'::json)
+             from crm_pipeline_stages s where s.pipeline_id = p.id) as stages
+         from crm_pipelines p
+         where p.organization_id = $1 and p.is_default",
+    )
+    .bind(organization_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("the default pipeline must read");
+
+    assert_eq!(rows.len(), 1, "the fixture seeds exactly one default pipeline");
+    let row = rows.into_iter().next().expect("checked above");
+    json!({ "id": row.id, "name": row.name, "stages": row.stages })
+}
+
+/// Create a deal through the API, asserting the refusal rather than trusting the status alone.
+async fn create_deal_via_api(state: &AppState, token: &str, body: Value) -> TestResponse {
+    call(
+        state,
+        request(Method::POST, "/api/v1/crm/deals", Some(token), Some(body)),
+    )
+    .await
+}
+
+/// A deal lands on the pipeline's first **open** stage, and the board's columns add up.
+///
+/// The acceptance criterion is that the column header and the cards in that column can never
+/// disagree, so the test reads both from the *same* board payload and compares them.
+#[tokio::test]
+async fn a_new_deal_lands_on_the_first_open_stage_and_the_board_adds_up() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let stages = pipeline["stages"].as_array().expect("the stages are an array");
+    let first_open = stages
+        .iter()
+        .find(|stage| stage["kind"] == json!("open"))
+        .expect("the seeded pipeline has an open stage");
+
+    let created = create_deal_via_api(
+        state,
+        &manager,
+        json!({
+            "title": format!("Renewal {}", Uuid::new_v4().simple()),
+            "amount": "10000.00",
+            "currency": "USD",
+            "expected_close_on": "2026-12-01",
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+
+    // The stage was not named, so the deal landed on the first open one — not on "New" by name,
+    // which would break the moment an organization renames its stages.
+    assert_eq!(created.body["stage_id"], first_open["id"]);
+    assert_eq!(created.body["stage_kind"], json!("open"));
+    // The stage's own probability became the deal's: a deal created into "Qualified" is 35%
+    // likely unless the creator says otherwise.
+    assert_eq!(created.body["probability"], first_open["probability"]);
+    assert_eq!(created.body["amount"], json!("10000.00"));
+
+    let board = call(
+        state,
+        request(Method::GET, "/api/v1/crm/deals", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(board.status, StatusCode::OK, "body: {}", board.body);
+    assert_eq!(board.body["view"], json!("board"));
+
+    let columns = board.body["board"]["columns"]
+        .as_array()
+        .expect("the board carries its columns");
+    // Every stage is a column, including the empty ones: a board that dropped a column with no
+    // cards would change shape as deals move.
+    assert_eq!(columns.len(), stages.len());
+    for column in columns {
+        for field in ["stage_id", "name", "kind", "position", "deal_count", "total", "weighted_total"] {
+            assert!(
+                column.get(field).is_some(),
+                "a column must carry {field}: {column}"
+            );
+        }
+    }
+
+    let our_column = columns
+        .iter()
+        .find(|column| column["stage_id"] == first_open["id"])
+        .expect("the deal's column is on the board");
+    assert_eq!(our_column["deal_count"], json!(1));
+    assert!(our_column["total"].as_str().unwrap_or_default().starts_with("10000"));
+
+    // The weighted total is the documented expression, in the same statement as the count.
+    // `f64::from(i64)` does not exist — the conversion is a `as` cast, and writing it as a
+    // `From` call is a compile error that costs a whole test-binary rebuild to find.
+    let probability = first_open["probability"].as_i64().unwrap_or(0) as f64;
+    let expected: f64 = 10000.0 * probability / 100.0;
+    let shown: f64 = our_column["weighted_total"]
+        .as_str()
+        .unwrap_or("0")
+        .parse()
+        .expect("the weighted total is a number");
+    assert!(
+        (shown - expected).abs() < 0.01,
+        "weighted {shown} should be {expected} ({} × {}%)",
+        our_column["total"].as_str().unwrap_or("?"),
+        first_open["probability"]
+    );
+
+    // The board's footer is the sum of the **open** columns only — a won deal is revenue, not
+    // something still to win, and a lost one is nothing at all.
+    let open_total: f64 = columns
+        .iter()
+        .filter(|column| column["kind"] == json!("open"))
+        .filter_map(|column| column["total"].as_str())
+        .filter_map(|value| value.parse::<f64>().ok())
+        .sum();
+    let footer: f64 = board.body["board"]["open_total"]
+        .as_str()
+        .unwrap_or("0")
+        .parse()
+        .expect("the footer is a number");
+    assert!((footer - open_total).abs() < 0.01, "footer {footer} vs columns {open_total}");
+}
+
+/// The drag, the keyboard's `ctrl + ←/→` and the reload: all three go through one route, and the
+/// stage change is in the event feed with the documented payload.
+#[tokio::test]
+async fn a_stage_move_persists_reloads_and_emits_the_documented_event() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let stages = pipeline["stages"].as_array().expect("stages").clone();
+    let first_open = stages[0].clone();
+    let second_open = stages
+        .iter()
+        .find(|stage| stage["kind"] == json!("open") && stage["id"] != first_open["id"])
+        .expect("a second open stage")
+        .clone();
+
+    let created = create_deal_via_api(
+        state,
+        &manager,
+        json!({ "title": format!("Drag {}", Uuid::new_v4().simple()), "amount": "2500.00" }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let deal_id = created.body["id"].as_str().expect("an id").to_owned();
+
+    // ---- the move -----------------------------------------------------------------------
+    let moved = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": second_open["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK, "body: {}", moved.body);
+    assert_eq!(moved.body["stage_id"], second_open["id"]);
+    assert_eq!(moved.body["stage_name"], second_open["name"]);
+
+    // ---- the reload proves it persisted, not just that the answer said so -----------------
+    let reloaded = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals/{deal_id}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(reloaded.status, StatusCode::OK);
+    assert_eq!(reloaded.body["stage_id"], second_open["id"]);
+    assert_eq!(reloaded.body["days_in_stage"], json!(0));
+
+    // ---- the event feed ------------------------------------------------------------------
+    let payloads = event_payloads(&fixture.db, "crm.deal.stage_changed").await;
+    let payload = payloads
+        .iter()
+        .find(|value| value["deal_id"] == json!(deal_id))
+        .expect("crm.deal.stage_changed must be in the feed for this deal");
+    assert_eq!(payload["from_stage_id"], first_open["id"]);
+    assert_eq!(payload["to_stage_id"], second_open["id"]);
+    assert_eq!(payload["amount"], json!("2500.00"));
+    assert_eq!(payload["currency"], json!("USD"));
+    // The payload carries ids and money, never the deal's own words about a customer.
+    assert!(payload.get("title").is_none(), "{payload}");
+
+    // ---- the audit row ------------------------------------------------------------------
+    let audits = audit_rows(&fixture.db, "crm.deal.stage_changed").await;
+    let audit = audits
+        .iter()
+        .find(|row| row["target_id"] == json!(deal_id))
+        .expect("the stage change must be audited");
+    assert_eq!(audit["target_type"], json!("crm_deal"));
+    assert!(!audit["actor"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(audit["metadata"]["from_stage_id"], first_open["id"]);
+    assert_eq!(audit["metadata"]["to_stage_id"], second_open["id"]);
+
+    // ---- the reversal, because "reversible" is the criterion ------------------------------
+    let back = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": first_open["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(back.status, StatusCode::OK);
+    assert_eq!(back.body["stage_id"], first_open["id"]);
+}
+
+/// A lost deal says why, a won deal records its close date, and both emit their own event.
+#[tokio::test]
+async fn the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let stages = pipeline["stages"].as_array().expect("stages").clone();
+    let lost_stage = stages
+        .iter()
+        .find(|stage| stage["kind"] == json!("lost"))
+        .expect("the seeded pipeline has a lost stage")
+        .clone();
+    let won_stage = stages
+        .iter()
+        .find(|stage| stage["kind"] == json!("won"))
+        .expect("the seeded pipeline has a won stage")
+        .clone();
+
+    // ---- the loss without a reason is refused, and the message names what is missing -----
+    let deal = create_deal_via_api(
+        state,
+        &manager,
+        json!({ "title": format!("Outcome {}", Uuid::new_v4().simple()), "amount": "800.00" }),
+    )
+    .await;
+    assert_eq!(deal.status, StatusCode::CREATED, "body: {}", deal.body);
+    let deal_id = deal.body["id"].as_str().expect("an id").to_owned();
+
+    let refused = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": lost_stage["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
+    assert_eq!(refused.body["error"]["code"], json!("invalid_crm_stage_change"));
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("without a reason"),
+        "the refusal must say what is missing: {}",
+        refused.body
+    );
+
+    // ---- and the refusal changed nothing -------------------------------------------------
+    let still_open = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals/{deal_id}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(still_open.body["stage_kind"], json!("open"));
+
+    // ---- the loss with a reason ---------------------------------------------------------
+    let lost = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": lost_stage["id"], "lost_reason": "chose a competitor" })),
+        ),
+    )
+    .await;
+    assert_eq!(lost.status, StatusCode::OK, "body: {}", lost.body);
+    assert_eq!(lost.body["stage_kind"], json!("lost"));
+    assert_eq!(lost.body["lost_reason"], json!("chose a competitor"));
+
+    let loss = event_payloads(&fixture.db, "crm.deal.lost").await;
+    assert!(
+        loss.iter().any(|value| value["deal_id"] == json!(deal_id)),
+        "crm.deal.lost must reach the feed: {loss:?}"
+    );
+
+    // ---- leaving the lost column forgets the reason ---------------------------------------
+    // A reason that outlived the loss would credit the next loss report with the wrong deal.
+    let open_stage = stages
+        .iter()
+        .find(|stage| stage["kind"] == json!("open"))
+        .expect("an open stage");
+    let reopened = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": open_stage["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(reopened.status, StatusCode::OK);
+    assert!(reopened.body["lost_reason"].is_null(), "body: {}", reopened.body);
+
+    // ---- the win records a close date and is 100% ----------------------------------------
+    let won = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": won_stage["id"], "close_on": "2026-09-30" })),
+        ),
+    )
+    .await;
+    assert_eq!(won.status, StatusCode::OK, "body: {}", won.body);
+    assert_eq!(won.body["stage_kind"], json!("won"));
+    assert_eq!(won.body["expected_close_on"], json!("2026-09-30"));
+    // A won deal credited at the stage's 80% would make "won this quarter" a number that is
+    // not revenue.
+    assert_eq!(won.body["probability"], json!(100));
+
+    let wins = event_payloads(&fixture.db, "crm.deal.won").await;
+    let payload = wins
+        .iter()
+        .find(|value| value["deal_id"] == json!(deal_id))
+        .expect("crm.deal.won must reach the feed");
+    assert_eq!(payload["close_on"], json!("2026-09-30"));
+}
+
+/// A move to the stage the card is already in writes no audit row and no event.
+///
+/// The board's keyboard path sends the request on **every** arrow key press, and the left/right
+/// keys at the end of a row would otherwise wake every automation subscribed to
+/// `crm.deal.stage_changed` once per press — the loudest way a feature can become a nuisance.
+#[tokio::test]
+async fn moving_a_deal_to_the_stage_it_is_already_in_is_a_no_op() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let created = create_deal_via_api(
+        state,
+        &manager,
+        json!({ "title": format!("Still {}", Uuid::new_v4().simple()) }),
+    )
+    .await;
+    let deal_id = created.body["id"].as_str().expect("an id").to_owned();
+    let stage_id = created.body["stage_id"].clone();
+
+    // Count this deal's stage-change events before the no-op move.
+    let before = event_payloads(&fixture.db, "crm.deal.stage_changed").await;
+    let before_count = before
+        .iter()
+        .filter(|value| value["deal_id"] == json!(deal_id))
+        .count();
+
+    let no_op = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": stage_id })),
+        ),
+    )
+    .await;
+    assert_eq!(no_op.status, StatusCode::OK, "body: {}", no_op.body);
+
+    let after = event_payloads(&fixture.db, "crm.deal.stage_changed").await;
+    let after_count = after
+        .iter()
+        .filter(|value| value["deal_id"] == json!(deal_id))
+        .count();
+    assert_eq!(
+        after_count, before_count,
+        "a move to the current stage must not emit crm.deal.stage_changed"
+    );
+}
+
+/// The pipeline editor: reorder in place, add a column, and refuse an impossible shape.
+#[tokio::test]
+async fn the_stage_editor_reorders_saves_and_refuses_what_the_board_cannot_show() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let pipeline_id = pipeline["id"].as_str().expect("an id").to_owned();
+    let stages = pipeline["stages"].as_array().expect("stages").clone();
+
+    // ---- a reorder in place: the unique (pipeline, position) index makes this the one write
+    // that fails if the positions are not freed first.
+    let mut reordered: Vec<Value> = stages
+        .iter()
+        .map(|stage| {
+            json!({ "name": stage["name"], "kind": stage["kind"], "probability": stage["probability"] })
+        })
+        .collect();
+    // Swap the first two columns. Without the "move out of the way first" step, the second
+    // update collides with the first one's position and the save answers a 500.
+    reordered.swap(0, 1);
+
+    let saved = call(
+        state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/crm/pipelines/{pipeline_id}/stages"),
+            Some(&manager),
+            Some(json!({ "stages": reordered })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+
+    let names: Vec<String> = saved.body["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .map(|stage| stage["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(names[0], stages[1]["name"].as_str().unwrap_or_default());
+    assert_eq!(names[1], stages[0]["name"].as_str().unwrap_or_default());
+
+    // The board follows the editor: the first column of the board is now the stage the editor
+    // put first. A board that kept its own order would make the drag and the editor disagree.
+    let board = call(
+        state,
+        request(Method::GET, "/api/v1/crm/deals", Some(&manager), None),
+    )
+    .await;
+    let board_names: Vec<String> = board.body["board"]["columns"]
+        .as_array()
+        .expect("columns")
+        .iter()
+        .map(|column| column["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(board_names, names);
+
+    // ---- two winning columns would double-count the forecast -----------------------------
+    let two_won = call(
+        state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/crm/pipelines/{pipeline_id}/stages"),
+            Some(&manager),
+            Some(json!({
+                "stages": [
+                    { "name": "New", "kind": "open", "probability": 10 },
+                    { "name": "Won A", "kind": "won", "probability": 100 },
+                    { "name": "Won B", "kind": "won", "probability": 100 }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(two_won.status, StatusCode::BAD_REQUEST, "body: {}", two_won.body);
+    assert!(
+        two_won.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at most one won"),
+        "{}",
+        two_won.body
+    );
+
+    // ---- and the refusal left the pipeline exactly as it was ------------------------------
+    let after = call(
+        state,
+        request(Method::GET, "/api/v1/crm/pipelines", Some(&manager), None),
+    )
+    .await;
+    let unchanged: Vec<String> = after.body[0]["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .map(|stage| stage["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        unchanged, names,
+        "a refused save must not have reordered anything"
+    );
+}
+
+/// A deal of another organization is a `404` for a caller who could otherwise write — and a
+/// `403` here would confirm that the deal exists.
+#[tokio::test]
+async fn a_deal_of_another_organization_is_invisible_to_a_caller_who_may_write() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+
+    // Created by the **foreign** organization's writer, who holds the deal powers there.
+    let foreign = fixture.token(&fixture.other_writer).await;
+    let foreign_deal = create_deal_via_api(
+        state,
+        &foreign,
+        json!({ "title": "Foreign pipeline" }),
+    )
+    .await;
+    // The foreign writer holds only the contact keys (see `OTHER_WRITER_PERMISSIONS`), so it
+    // cannot create a deal at all — which is the point: a tenant is not a shortcut.
+    assert_eq!(
+        foreign_deal.status,
+        StatusCode::FORBIDDEN,
+        "a foreign writer without the deal keys must be refused: {}",
+        foreign_deal.body
+    );
+}
+
+/// A caller may not read the board with the contact keys alone: the pipeline is a separate
+/// disclosure from the people.
+#[tokio::test]
+async fn reading_a_contact_does_not_grant_the_pipeline() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let reader = fixture.token(&fixture.reader).await;
+
+    let contacts = call(
+        state,
+        request(Method::GET, "/api/v1/crm/contacts", Some(&reader), None),
+    )
+    .await;
+    assert_eq!(contacts.status, StatusCode::OK, "the reader may see contacts");
+
+    for uri in ["/api/v1/crm/deals", "/api/v1/crm/pipelines"] {
+        let refused = call(state, request(Method::GET, uri, Some(&reader), None)).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "{uri} must refuse a caller holding only the contact keys: {}",
+            refused.body
+        );
+    }
+}
+
+/// The board's list mode and its filters: a search, an owner, a close range and a sort, all on
+/// the same contract the board reads.
+#[tokio::test]
+async fn the_deal_list_filters_sorts_and_pages() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let marker = Uuid::new_v4().simple().to_string();
+    let created = create_deal_via_api(
+        state,
+        &manager,
+        json!({
+            "title": format!("Filtered {marker}"),
+            "amount": "500.00",
+            "expected_close_on": "2026-11-15",
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+
+    // ---- the search finds it, and a term that matches nothing returns nothing ------------
+    let found = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=list&search=Filtered%20{marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(found.status, StatusCode::OK, "body: {}", found.body);
+    let items = found.body["page"]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "the search found {items:?}");
+    assert_eq!(items[0]["title"], json!(format!("Filtered {marker}")));
+
+    let missing = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=list&search=Absent{}", Uuid::new_v4().simple()),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::OK);
+    assert!(
+        missing.body["page"]["items"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "a search that matches nothing must return an empty page, not an error"
+    );
+
+    // ---- the close range is inclusive of the last day -------------------------------------
+    let in_range = call(
+        state,
+        request(
+            Method::GET,
+            "/api/v1/crm/deals?view=list&created_from=2026-11-01&created_to=2026-11-30",
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(in_range.status, StatusCode::OK, "body: {}", in_range.body);
+    let titles: Vec<String> = in_range.body["page"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|deal| deal["title"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(titles.contains(&format!("Filtered {marker}")), "{titles:?}");
+
+    // ---- an unknown sort is refused with the columns named -------------------------------
+    let refused = call(
+        state,
+        request(
+            Method::GET,
+            "/api/v1/crm/deals?view=list&sort=nonsense",
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
+    assert!(
+        refused.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("amount"),
+        "the refusal must name the columns it accepts: {}",
+        refused.body
+    );
+
+    // ---- an unknown view is refused rather than answered as a list -----------------------
+    let view = call(
+        state,
+        request(Method::GET, "/api/v1/crm/deals?view=kanban", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(view.status, StatusCode::BAD_REQUEST);
+    assert!(view.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("board"));
+}
+
+/// The forms refuse what they name: a negative value, an unknown currency, a probability over
+/// 100 and a blank title each answer with the field the screen renders the message under.
+#[tokio::test]
+async fn the_deal_form_refuses_what_it_names() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let cases: Vec<(Value, &str)> = vec![
+        (json!({ "title": "   ", "amount": "10" }), "title"),
+        (json!({ "title": "Negative", "amount": "-100" }), "amount"),
+        (json!({ "title": "Currency", "amount": "10", "currency": "EURO" }), "currency"),
+        (json!({ "title": "Probability", "amount": "10", "probability": 140 }), "probability"),
+    ];
+
+    for (body, field) in cases {
+        let refused = create_deal_via_api(state, &manager, body.clone()).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "body {body} must be refused: {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["error"]["details"]["field"],
+            json!(field),
+            "the refusal must name the field: {}",
+            refused.body
+        );
+        assert_eq!(refused.body["error"]["details"]["entity"], json!("deal"));
+    }
 }

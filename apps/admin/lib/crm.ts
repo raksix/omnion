@@ -469,3 +469,188 @@ export function saveDownload(blob: Blob, filename: string): void {
   anchor.remove();
   URL.revokeObjectURL(url);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Deals, the board and the pipeline editor (slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One column of the board: the stage plus its count, sum and weighted sum. */
+export type CrmStageTotals = {
+  stage_id: string;
+  name: string;
+  /** `open`, `won` or `lost`. */
+  kind: "open" | "won" | "lost";
+  position: number;
+  /** The stage's default probability for a deal entering it. */
+  probability: number;
+  deal_count: number;
+  /** Text, so a money value never loses precision on the way through JSON. */
+  total: string;
+  /** `amount × probability / 100`, in the same shape. */
+  weighted_total: string;
+};
+
+/** One stage of a pipeline, as the editor and the board both read it. */
+export type CrmPipelineStage = {
+  id: string;
+  organization_id: string;
+  pipeline_id: string;
+  name: string;
+  kind: "open" | "won" | "lost";
+  position: number;
+  probability: number;
+};
+
+/** A pipeline with its stages in board order. */
+export type CrmPipeline = {
+  id: string;
+  organization_id: string;
+  name: string;
+  is_default: boolean;
+  stages: CrmPipelineStage[];
+  created_at: string;
+};
+
+/** A deal, as a board card, a list row and a detail header. */
+export type CrmDeal = {
+  id: string;
+  organization_id: string;
+  pipeline_id: string;
+  stage_id: string;
+  stage_name: string;
+  stage_kind: "open" | "won" | "lost";
+  title: string;
+  company_id: string | null;
+  company_name: string | null;
+  contact_id: string | null;
+  contact_name: string | null;
+  owner_user_id: string | null;
+  owner_name: string | null;
+  amount: string;
+  currency: string;
+  probability: number | null;
+  expected_close_on: string | null;
+  source: string | null;
+  lost_reason: string | null;
+  stage_changed_at: string;
+  /** Whole days in the current stage, joined by the API. */
+  days_in_stage: number;
+  /** `true` past 30 days in one stage. */
+  stale: boolean;
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** The board in one request. */
+export type CrmBoard = {
+  pipeline: CrmPipeline;
+  /** Every stage, including the empty ones. */
+  columns: CrmStageTotals[];
+  deals: CrmDeal[];
+  /** The sum of the open columns. */
+  open_total: string;
+  /** The sum of the open columns, weighted by probability. */
+  weighted_forecast: string;
+};
+
+/** One row of the pipeline editor, as the form holds it while the set is being edited. */
+export type CrmStageInput = {
+  name: string;
+  kind: "open" | "won" | "lost";
+  probability: number;
+};
+
+/** The currencies the deal form offers — the API refuses anything else. */
+export const CRM_CURRENCIES = ["USD", "EUR", "GBP", "TRY", "CHF", "CAD", "AUD", "JPY"] as const;
+
+/**
+ * The board, or a page of deals.
+ *
+ * The default is the board because `/crm/deals` is the screen a person opens to see where the
+ * pipeline stands; the list is `?view=list` and is the one a saved view is stored against.
+ */
+export function fetchCrmDealsBoard(pipelineId?: string): Promise<{ view: string; board: CrmBoard }> {
+  const query = new URLSearchParams({ view: "board" });
+  if (pipelineId) query.set("pipeline_id", pipelineId);
+  return crmRequest(`/api/v1/crm/deals?${query.toString()}`);
+}
+
+/** A page of deals, with the same list contract the contacts list sends. */
+export function fetchCrmDeals(query: CrmListQuery = {}): Promise<{ view: string; page: CrmPage<CrmDeal> }> {
+  const search = new URLSearchParams();
+  search.set("view", "list");
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+  }
+  return crmRequest(`/api/v1/crm/deals?${search.toString()}`);
+}
+
+/** Every pipeline with its stages — the editor's and the board selector's one call. */
+export function fetchCrmPipelines(): Promise<CrmPipeline[]> {
+  return crmRequest("/api/v1/crm/pipelines");
+}
+
+/** What the create form sends. `amount` is text so the form sends what it displays. */
+export type CrmDealInput = {
+  title: string;
+  pipeline_id?: string;
+  stage_id?: string;
+  company_id?: string;
+  contact_id?: string;
+  amount?: string;
+  currency?: string;
+  probability?: number;
+  expected_close_on?: string;
+  source?: string;
+  lost_reason?: string;
+};
+
+/** A partial update; the stage moves through {@link moveCrmDealStage}, not here. */
+export type CrmDealPatch = Partial<Omit<CrmDealInput, "pipeline_id" | "stage_id">>;
+
+export function createCrmDeal(input: CrmDealInput): Promise<CrmDeal> {
+  return crmRequest("/api/v1/crm/deals", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function updateCrmDeal(id: string, changes: CrmDealPatch): Promise<CrmDeal> {
+  return crmRequest(`/api/v1/crm/deals/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+export function archiveCrmDeal(id: string): Promise<CrmDeal> {
+  return crmRequest(`/api/v1/crm/deals/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Move a deal to another stage — the drag and the keyboard's `ctrl + ←/→` are the same call.
+ *
+ * `lostReason` is required by the API when the target stage is a lost one, and `closeOn` is
+ * the confirmation for a won one; both are the dialogs, not a default this function could
+ * invent, which is why they are explicit rather than defaulted here.
+ */
+export function moveCrmDealStage(
+  id: string,
+  stageId: string,
+  extra: { lostReason?: string; closeOn?: string } = {},
+): Promise<CrmDeal> {
+  return crmRequest(`/api/v1/crm/deals/${id}/stage`, {
+    method: "POST",
+    body: JSON.stringify({ stage_id: stageId, ...extra }),
+  });
+}
+
+/**
+ * Save the whole ordered stage set.
+ *
+ * A `PUT` and not a `PATCH`: a drag reorder is the *set*, and a partial update of a set has no
+ * meaning — the position of a column is its index, so moving one is moving all of them.
+ */
+export function saveCrmPipelineStages(pipelineId: string, stages: CrmStageInput[]): Promise<CrmPipeline> {
+  return crmRequest(`/api/v1/crm/pipelines/${pipelineId}/stages`, {
+    method: "PUT",
+    body: JSON.stringify({ stages }),
+  });
+}

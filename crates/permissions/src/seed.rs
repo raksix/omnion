@@ -117,6 +117,11 @@ const BASE_ROLES: &[BaseRole] = &[
             "crm.fields.sensitive.read",
             "crm.views.manage",
             "crm.contacts.import",
+            "crm.deals.read",
+            "crm.deals.create",
+            "crm.deals.update",
+            "crm.deals.delete",
+            "crm.pipelines.manage",
         ]),
     },
     BaseRole {

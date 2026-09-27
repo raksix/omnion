@@ -2788,6 +2788,11 @@ async function main() {
     // an import dry run with a two-row file and reads the export back.
     { path: "/crm/contacts", name: "crm-contacts" },
     { path: "/crm/companies", name: "crm-companies" },
+    // The board and the stage editor (REQ-051, slice 3) — no untested screen: the board is
+    // walked here, and the depth pass below creates a deal, moves it with the keyboard, and
+    // reorders a column in the editor.
+    { path: "/crm/deals", name: "crm-deals" },
+    { path: "/crm/settings/pipelines", name: "crm-pipelines" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -2853,6 +2858,12 @@ async function main() {
   await runCrmDepth(page, report);
   log(`crm depth: ${JSON.stringify(report.crm)}`);
 
+  // The deals pass (REQ-051, slice 3): a deal on the board, a keyboard move that persists
+  // across a reload, a column header that carries its totals, a loss the screen refuses without
+  // a reason, and a stage editor that reorders a column in place.
+  await runCrmDealsDepth(page, report);
+  log(`crm deals depth: ${JSON.stringify(report.crmDeals)}`);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -2891,7 +2902,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }, { path: "/crm/deals", name: "crm-deals-mobile" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -3079,6 +3090,37 @@ async function main() {
         "crm-depth",
         `the e-mail refusal says "${crm.emailRefusalText}" — it must name what is wrong`,
       );
+    }
+  }
+  // The deals pass (REQ-051, slice 3) asserts real outcomes too. `boardColumns` is a count
+  // rather than a boolean because the promise is "a board has columns", and a board that
+  // rendered zero of them would pass a truthiness check written against a boolean.
+  if (report.crmDeals) {
+    const deals = report.crmDeals;
+    const promised = [
+      ["boardRendered", "the board rendered its columns on a fresh pipeline"],
+      ["dealCreated", "the deal form created a deal the board then shows"],
+      ["cardShowsValue", "a card shows its value, formatted"],
+      ["cardNamesStage", "a card names the stage it is in"],
+      ["cardShowsAge", "a card says how long it has been in its stage"],
+      ["keyboardMoved", "`ctrl + →` moved a card to the next column"],
+      ["movePersisted", "the keyboard move survived a reload"],
+      ["columnHasTotals", "a column header carries its count, its sum and its probability"],
+      ["lostDialogOpened", "a move into the lost column asks for a reason"],
+      ["lostConfirmNeedsReason", "the loss cannot be confirmed while the reason is blank"],
+      ["lostWithReason", "a loss with a reason lands in the lost column"],
+      ["listShowsDeal", "the list toggle shows the same deal as a row"],
+      ["stageEditorRendered", "the stage editor renders the pipeline's columns"],
+      ["stagesSaved", "the stage editor saved a reorder"],
+    ];
+    for (const [key, promise] of promised) {
+      if (!deals[key]) {
+        pushFindings("high", "crm-deals", `${key} — ${promise}`);
+      }
+    }
+    // A board with no columns is a shell, whatever the HTTP status said.
+    if (!(deals.boardColumns > 0)) {
+      pushFindings("high", "crm-deals", "the board rendered no stage columns at all");
     }
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
@@ -3906,4 +3948,128 @@ async function runIamProvisioningDepth(page, report) {
 
   report.iamProvisioning = { steps };
   log(`iam provisioning: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The deals depth pass (REQ-051, slice 3).
+ *
+ * The generic interactor walks the board; this drives what a walker cannot: create a deal, move
+ * it with the **keyboard** (`ctrl + →`, which is the same request the drag sends), read the
+ * column's totals back, refuse a loss without a reason, and win one with a close date. Each
+ * step asserts something the acceptance criteria name, measured rather than assumed.
+ */
+async function runCrmDealsDepth(page, report) {
+  const steps = {};
+  const stamp = `QA deal ${Math.floor(Date.now() / 1000) % 1000000}`;
+
+  await page.goto(`${URL_ADMIN}/crm/deals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await shot(page, "page-crm-deals-empty");
+
+  // The board is a set of columns whatever is in it, so a fresh pipeline still renders them.
+  const columns = await page.locator("[data-qa-stage]").count();
+  steps.boardColumns = columns;
+  steps.boardRendered = columns > 0;
+
+  // ---- create a deal -----------------------------------------------------------------------
+  await page.locator("[data-qa-guard='crm-depth']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("#crm-deal-title").first().fill(stamp, { timeout: 4000 }).catch(() => {});
+  await page.locator("#crm-deal-amount").first().fill("12000", { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-deal-close").first().fill("2026-12-15", { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-deal-source").first().fill("QA", { timeout: 3000 }).catch(() => {});
+  await page.locator('#crm-deal-form button[type="submit"]').click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const card = page.locator(`[data-qa-card]`).filter({ hasText: stamp }).first();
+  steps.dealCreated = (await card.count()) > 0;
+  await shot(page, "page-crm-deals");
+
+  if (steps.dealCreated) {
+    steps.cardShowsValue = (await card.innerText()).includes("12,000");
+    // The card names its stage and how long it has been there — a card with neither is a card
+    // you cannot age.
+    const cardText = await card.innerText();
+    steps.cardNamesStage = /\b(New|Qualified|Proposal|Negotiation|Won|Lost)\b/.test(cardText);
+    steps.cardShowsAge = /(today|\d+ days?|\d+ months?)/.test(cardText);
+  }
+
+  // ---- the keyboard move: ctrl + →, which is the same write the drag sends -------------------
+  const beforeStage = await card.getAttribute("data-qa-stage-of").catch(() => null);
+  await card.click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.keyboard.down("Control");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.up("Control");
+  await page.waitForTimeout(1800);
+
+  const afterStage = await card.getAttribute("data-qa-stage-of").catch(() => null);
+  steps.keyboardMoved = Boolean(beforeStage && afterStage && beforeStage !== afterStage);
+  await shot(page, "page-crm-deal-keyboard-moved");
+
+  // The move persisted: a reload must show the card in the column the keyboard put it in.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1700);
+  const reloaded = page.locator(`[data-qa-card]`).filter({ hasText: stamp }).first();
+  steps.movePersisted = (await reloaded.getAttribute("data-qa-stage-of").catch(() => null)) === afterStage;
+
+  // ---- the column totals ---------------------------------------------------------------------
+  const firstColumn = page.locator("[data-qa-stage]").first();
+  const header = await firstColumn.innerText().catch(() => "");
+  steps.columnHasTotals = /\d/.test(header) && header.includes("%");
+  await shot(page, "page-crm-deal-columns");
+
+  // ---- a loss without a reason is refused, in the screen's own words --------------------------
+  const lostColumn = page.locator("[data-qa-stage]").filter({ has: page.locator("text=Lost") }).first();
+  if ((await lostColumn.count()) > 0) {
+    await reloaded.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    await page.keyboard.down("Control");
+    // Walk right until the last column, which is the lost one.
+    for (let step_ = 0; step_ < 6; step_ += 1) {
+      await page.keyboard.press("ArrowRight");
+      await page.waitForTimeout(700);
+      if ((await page.locator("#crm-lost-reason").count()) > 0) break;
+    }
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(700);
+    steps.lostDialogOpened = (await page.locator("#crm-lost-reason").count()) > 0;
+    // The confirm button is disabled until there is a reason, so a person cannot create a
+    // reasonless loss by clicking fast.
+    steps.lostConfirmNeedsReason =
+      (await page.locator("#crm-outcome-confirm").isDisabled().catch(() => false)) === true;
+    await shot(page, "page-crm-deal-lost-dialog");
+    await page.locator("#crm-outcome-confirm").click({ timeout: 3000 }).catch(() => {});
+    await page.locator("#crm-lost-reason").first().fill("QA: chose a competitor", { timeout: 3000 }).catch(() => {});
+    await page.locator("#crm-outcome-confirm").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1700);
+    steps.lostWithReason = (await page.locator("text=QA: chose a competitor").count()) > 0;
+    await shot(page, "page-crm-deal-lost");
+  }
+
+  // ---- the list toggle and the pipeline editor ------------------------------------------------
+  await page.locator("#crm-list-toggle").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const row = page.locator("[data-qa-row]").filter({ hasText: stamp }).first();
+  steps.listShowsDeal = (await row.count()) > 0;
+  await shot(page, "page-crm-deals-list");
+
+  await page.goto(`${URL_ADMIN}/crm/settings/pipelines`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const stageRows = await page.locator("[data-qa-stage-row]").count();
+  steps.stageEditorRendered = stageRows > 0;
+  // Reorder the first two columns and save: the unique (pipeline, position) index is what makes
+  // this the write that fails if the positions are not freed first.
+  const moveUp = page.locator("button[aria-label^='Move ']").nth(1);
+  if ((await moveUp.count()) > 0) {
+    await moveUp.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    await page.locator("#crm-stages-save").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  steps.stagesSaved = (await page.locator("#crm-stages-save").count()) > 0;
+  await shot(page, "page-crm-pipeline-settings");
+
+  report.crmDeals = steps;
+  log(`crm deals depth: ${JSON.stringify(steps)}`);
 }

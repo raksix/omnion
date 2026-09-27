@@ -87,6 +87,7 @@ pub mod automation;
 pub mod commands;
 pub mod content;
 pub mod crm;
+pub mod crm_deals;
 pub mod crm_views;
 pub mod health;
 pub mod iam;
@@ -677,6 +678,40 @@ pub fn router(state: AppState) -> Router {
         ))
         .route_layer(guards::require(&state, "crm.contacts.import"));
 
+    // Slice 3: the board. Deals carry keys of their own rather than reusing the contact family,
+    // because a pipeline is a *different* disclosure — its open value and win rate describe the
+    // business, not the people. Reading the board and its stages is `crm.deals.read`; creating,
+    // editing, moving and archiving are the three separate writes; and reshaping the pipeline
+    // itself is `crm.pipelines.manage`, because the stage editor retroactively changes what
+    // every past deal's stage meant.
+    let crm_deals_read = Router::new()
+        .route("/crm/deals", get(crm_deals::list_deals))
+        .route("/crm/deals/{id}", get(crm_deals::get_deal))
+        .route("/crm/pipelines", get(crm_deals::list_pipelines))
+        .route_layer(guards::require(&state, "crm.deals.read"));
+
+    let crm_deals_create = Router::new()
+        .route("/crm/deals", post(crm_deals::create_deal))
+        .route_layer(guards::require(&state, "crm.deals.create"));
+
+    let crm_deals_update = Router::new()
+        .route("/crm/deals/{id}", patch(crm_deals::update_deal))
+        // The stage move is the drag and the keyboard's `ctrl + ←/→`: one route, one write, one
+        // event, so a card cannot be moved by the mouse and by the keyboard down different paths.
+        .route("/crm/deals/{id}/stage", post(crm_deals::move_deal_stage))
+        .route_layer(guards::require(&state, "crm.deals.update"));
+
+    let crm_deals_archive = Router::new()
+        .route("/crm/deals/{id}", delete(crm_deals::archive_deal))
+        .route_layer(guards::require(&state, "crm.deals.delete"));
+
+    let crm_pipelines_manage = Router::new()
+        .route(
+            "/crm/pipelines/{id}/stages",
+            put(crm_deals::save_pipeline_stages),
+        )
+        .route_layer(guards::require(&state, "crm.pipelines.manage"));
+
     let crm = crm_read
         .merge(crm_create)
         .merge(crm_update)
@@ -684,7 +719,12 @@ pub fn router(state: AppState) -> Router {
         .merge(crm_merge)
         .merge(crm_views_read)
         .merge(crm_views_manage)
-        .merge(crm_import);
+        .merge(crm_import)
+        .merge(crm_deals_read)
+        .merge(crm_deals_create)
+        .merge(crm_deals_update)
+        .merge(crm_deals_archive)
+        .merge(crm_pipelines_manage);
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))

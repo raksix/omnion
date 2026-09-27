@@ -127,8 +127,15 @@ type CrmShellProps = {
   title: string;
   /** One line about what the screen is for. */
   description: string;
-  /** Which list's state the toolbar holds. */
-  entity: "contacts" | "companies";
+  /**
+   * Which list's state the toolbar holds.
+   *
+   * A closed set, and it is what decides which filters the toolbar draws: a deal has a stage, a
+   * probability and a close date, and none of the contact-only filters (`tag`, `archived`, the
+   * lifecycle `status`) mean anything for it. Rendering them greyed out would be a control that
+   * looks real and does nothing.
+   */
+  entity: "contacts" | "companies" | "deals";
   /** The columns the entity may show, read from the API. */
   availableColumns: string[];
   /** The lifecycle statuses the entity has, read from the API. */
@@ -416,6 +423,7 @@ export function CrmShell(props: CrmShellProps) {
               </select>
             </label>
 
+            {entity === "deals" ? null : (
             <label className="flex items-center gap-1.5">
               <span className="sr-only">Filter by status</span>
               <select
@@ -432,7 +440,10 @@ export function CrmShell(props: CrmShellProps) {
                 ))}
               </select>
             </label>
+            )}
 
+            {entity === "deals" ? null : (
+            <>
             <label className="flex items-center gap-1.5">
               <span className="sr-only">Filter by tag</span>
               <input
@@ -441,7 +452,7 @@ export function CrmShell(props: CrmShellProps) {
                 value={tag}
                 placeholder="Tag"
                 onChange={(event) => setParam("tag", event.target.value || null)}
-                className="w-24 rounded-lg border border-line bg-canvas px-2 py-1.5 text-[12px] outline-none transition focus:border-accent"
+                className="w-24 rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12px] outline-none transition focus:border-accent"
               />
             </label>
 
@@ -455,6 +466,8 @@ export function CrmShell(props: CrmShellProps) {
               />
               Archived
             </label>
+            </>
+            )}
 
             <div className="relative">
               <button
@@ -506,7 +519,7 @@ export function CrmShell(props: CrmShellProps) {
               onClick={requestCreate}
               className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong"
             >
-              New {entity === "contacts" ? "contact" : "company"}
+              New {entity === "contacts" ? "contact" : entity === "companies" ? "company" : "deal"}
             </button>
           </div>
         </div>
@@ -532,7 +545,7 @@ export function CrmShell(props: CrmShellProps) {
         <div className="flex items-center justify-between border-t border-line px-4 py-2.5">
           <span className="text-[11.5px] text-muted">
             {total} {entity}
-            {total === 1 ? "" : "s"} match
+            {total === 1 || entity === "deals" ? "" : "s"} match
           </span>
           {nextCursor ? (
             <button
