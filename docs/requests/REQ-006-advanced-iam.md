@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** in-progress — slice 1 (role depth) shipped `c0ed83c…a13fa4b`, slices 2–4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/auth`, `crates/permissions`)
+> **Status:** in-progress — slices 1–2 shipped (role depth `c0ed83c…a13fa4b`, subjects/scopes/simulator `1817a2c…7e3190d`), slices 3–4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/auth`, `crates/permissions`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -167,10 +167,10 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 - [x] Precedence is proven: an explicit deny in one role beats an explicit allow in another; inherited allows apply unless denied; no binding means default deny. *(slice 1: `apps/api/tests/iam.rs::role_depth_lifecycle_is_proven_end_to_end` — an unbound account is refused, the allowing binding admits it, the denying binding takes it away again; the resolver unit tests cover inheritance.)*
 - [x] An inheritance cycle (A → B → A) and self-inheritance are refused with a field-level error. *(slice 1: `409 role_inheritance_cycle`, message names `inherits_role_id`; the depth limit (8) answers `400 role_inheritance_depth`.)*
 - [x] Matrix save is atomic: an unknown key, a duplicate entry or a stale version fails the whole save with a diff of what was rejected. *(slice 1: `400 invalid_entries` naming the rejected keys, `409 role_version_conflict`, and the set on disk is provably unchanged after a refusal; a successful save returns the added/changed/removed diff and a version number.)*
-- [ ] A resource-scoped binding (`site` + `/blog/*`) allows a matching path and denies `/legal/…` with the decision source in the 403; a past `expires_at` stops counting without deleting the row (the members tab shows it as expired).
-- [ ] Group membership grants and revokes: adding a user to a group with an attached role changes the effective set on the next request; removal reverses it.
-- [ ] A service-account key authenticates a `/api/v1` request over Bearer and cannot start an interactive sign-in session.
-- [ ] The simulator’s verdict equals the guard’s verdict across a test matrix of ≥ 100 (subject, action, resource) cases.
+- [x] A resource-scoped binding (`site` + `/blog/*`) allows a matching path and denies `/legal/…` with the decision source in the 403; a past `expires_at` stops counting without deleting the row (the members tab shows it as expired). *(slice 2: a `resource` binding on `/blog/*` allows `/blog/hello-world` and refuses `/legal/terms` — the simulator reports the binding as `out_of_scope` and the guard's `403 permission_denied` carries `details.{permission,reason,source,context}`; an expired binding answers `expired`, grants nothing and stays listed in the members tab.)*
+- [x] Group membership grants and revokes: adding a user to a group with an attached role changes the effective set on the next request; removal reverses it. *(slice 2: the walk creates a group, binds the Member role to it, sees the permission arrive for the member over HTTP, clears the membership and sees it leave.)*
+- [x] A service-account key authenticates a `/api/v1` request over Bearer and cannot start an interactive sign-in session. *(slice 2: `omsa_…` key → `200` on `/iam/simulations` with the machine as the default subject; `401 unauthorized` on a session-only route, `401` and no cookie on `/auth/login`, and `401 invalid_machine_key` the moment the key is revoked.)*
+- [x] The simulator’s verdict equals the guard’s verdict across a test matrix of ≥ 100 (subject, action, resource) cases. *(slice 2: three (subject, context) cases — a user at organization scope, the same user on a resource path and a service account — against the whole catalogue: 216 comparisons, each next to the guard's own `authorize_subject`.)*
 - [ ] Safety invariants hold: removing the last owner binding, or the caller’s own last privileged binding, is refused with a message naming the invariant.
 - [ ] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants.
 - [ ] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; TOTP and a passkey both enrol and verify; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once.
@@ -200,6 +200,50 @@ What the visual check should see: a matrix with a sticky category header, tri-st
 - **SSO, passkeys and event volume:** document the local `localhost` exception so QA can exercise WebAuthn (a test that silently skips is not evidence), and sample or aggregate `iam.policy_denied`/`iam.signin_failed` before they reach webhooks.
 
 ## Progress
+
+### Slice 2 — Subjects, scopes and the simulator (shipped)
+
+- **Migration `0016_iam_subjects.sql`** completes the expand-then-contract move: `user_id` becomes
+  optional, the backfill trigger only fires while a writer still speaks `user_id`, and liveness is
+  re-keyed on the subject (plus the resource a binding names) — so `/blog/*` and `/legal/*` can
+  both carry a binding. Additive: applied to the populated development database and to the QA
+  database, and the unit suite re-applies migrations from scratch.
+- **The subject model** (`crates/permissions/src/model.rs`): `Subject::{User, Group,
+  ServiceAccount}` with `describe()`; the scope ladder `Global → Organization → Site →
+  Department → Module → Resource`; `ResourceContext` carries the organization, site, department,
+  module and path a question is asked in; `matching.rs` turns a binding's resource glob
+  (`/blog/*`, `/blog/**`, exact paths) into a matcher and reports what it matched.
+- **Groups and service accounts** (`groups.rs`, `service_accounts.rs`): membership is a row, not a
+  second role table; a group binding applies to every member, and a machine identity holds keys
+  (prefix + hash, secret returned exactly once, revocable per key).
+- **The simulator** (`simulate.rs`): one function answers `allowed` / `explicit_deny` /
+  `missing_permission` with the deciding role, the `via` and a step list where every binding is
+  reported as `active`, `out_of_scope`, `expired` or `revoked` — the same resolution the guard
+  runs, so the two cannot drift.
+- **API**: `/api/v1/iam/{users,groups,service-accounts,simulations,effective-permissions}`,
+  bindings that accept a subject and any scope from the ladder with `expires_at`, and the
+  simulator route guarded by `require_or_machine` so a service-account key authenticates over
+  `Bearer` while an interactive sign-in stays impossible for a key.
+- **Refusals explain themselves**: every `403 permission_denied` carries `details` — the
+  permission, the `reason` (`missing_permission` / `explicit_deny`), the `source` role when one
+  refused it, the context and how many bindings were consulted (docs/07-IAM.md §18). The verdict
+  in the body is the verdict the simulator shows.
+- **Seeding is a reconciliation, not a one-off insert**: every base role now tracks the catalogue
+  on boot — a key added after an installation was seeded reaches the roles that declare it, a row
+  that lost its effect is repaired, and a key the code dropped is pruned. Before this, an
+  existing deployment's Administrator silently missed every key added later (measured: 32 of 72).
+- **Panel**: `/settings/iam` (overview), `/settings/iam/users` + `/settings/iam/users/{id}`,
+  `/settings/iam/groups`, `/settings/iam/service-accounts` (key shown once, revoke per key) and
+  `/settings/iam/simulator` (subject picker, resource path, verdict card with the step list).
+- **Proof**: `cargo test --workspace` green — the slice-2 walk
+  (`apps/api/tests/iam.rs::subjects_scopes_and_the_simulator_are_proven_end_to_end`) proves group
+  membership granting and revoking over HTTP, resource-scoped bindings with an expiry that stops
+  counting without deleting the row, a machine key authenticating a `/api/v1` request and failing
+  to start a session, the 403 that names its decision source, the seeding reconciliation, and a
+  simulator-vs-guard matrix of ≥ 200 (subject, action, resource) cases. The walkthrough drives the
+  same screens in the browser (`scripts/qa/walkthrough.cjs`, pass `iam-subjects`).
+- **Next**: slice 3 — sessions, devices, MFA and the security policy (idle/absolute lifetime,
+  lockout, IP lists, TOTP + passkey, step-up).
 
 ### Slice 1 — Role depth (shipped)
 

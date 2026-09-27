@@ -581,6 +581,11 @@ Explicit deny from role "Content Reviewer"
 
 This solves real problems in complex enterprise permission setups.
 
+The same verdict travels with a live refusal: every `403 permission_denied` from `/api/v1` carries
+`details` — the `permission` it asked about, the `reason` (`missing_permission` or `explicit_deny`),
+the `source` role when one refused it, and the context the question was asked in. A support call
+starts from the body of the refusal, not from a reproduction.
+
 ## 19. Role audit history
 
 The role itself is versioned:

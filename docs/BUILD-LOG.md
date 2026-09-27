@@ -1366,3 +1366,68 @@
   unchanged).
 - Next: **REQ-006 slice 2** — the users screen, bindings at every scope level with expiry, groups,
   service accounts and their keys, effective permissions and the RBAC simulator.
+
+## 2026-09-27 · REQ-006 slice 2 — subjects, scopes and the simulator
+
+- **A binding belongs to a subject now, not to an account.** `Subject::{User, Group,
+  ServiceAccount}` plus the whole scope ladder (global → organization → site → department → module →
+  resource) and `ResourceContext`, which carries the organization, site, department, module and
+  path a question is asked in. `matching.rs` turns a binding's resource glob (`/blog/*`) into a
+  matcher; `groups.rs` keeps membership a row rather than a second role table;
+  `service_accounts.rs` issues keys as prefix + hash (secret returned once, revocable per key).
+  Migration `0016_iam_subjects.sql` completes the expand-then-contract move: `user_id` becomes
+  optional and liveness is re-keyed on the subject plus the resource the binding names, so
+  `/blog/*` and `/legal/*` can both carry a binding.
+- **Seeding was an insert, and an insert is not a reconciliation.** Only the Owner role followed
+  the catalogue (`seed.rs` even documented it as policy), so a key added after an installation was
+  seeded never reached the role that declares it: measured on the development database,
+  Administrator held **32 of 72** keys while Owner held all of them. The symptom is not a hole, it
+  is an unexplainable `403` — the same role works in a fresh QA database and refuses in production.
+  Every base role is reconciled on boot now: declared keys are inserted, a row whose effect drifted
+  is repaired to allow, and a key the code dropped is pruned. `seed::ensure` is called on every
+  write path in the test walk to prove it, against the count `report.permissions` reports.
+- **The refusal names its decision source.** A `403 permission_denied` carries `details`: the
+  permission, the `reason` (`missing_permission` / `explicit_deny`), the `source` role with its
+  `via`, the context and how many bindings were consulted. The verdict comes from `simulate.rs` —
+  the *same* resolution the simulator screen shows and the REQ demands one decision path — so the
+  body and the panel cannot drift.
+- **A machine identity is a caller, with its own ladder.** `require_or_machine` lets a route accept
+  a session cookie or a service-account key: the cookie wins (a signed-in person is never mistaken
+  for a machine), a key authenticates over `Bearer` only where the route opts in, and a key can
+  never start a session. `api.rs` resolves both to `ApiCaller`, so a handler reads one value.
+- **Panel.** `/settings/iam` (overview with accounts, expiring bindings, recent activity),
+  `/settings/iam/users` (filters, create, detail with bindings and groups), `/settings/iam/groups`
+  (directory plus members panel), `/settings/iam/service-accounts` (create, key shown once, revoke)
+  and `/settings/iam/simulator` (subject, resource path, action → verdict card with every binding
+  it consulted, decisive first).
+- **Proof.** `cargo test --workspace --no-fail-fast` → **589 passed, 0 failed** across 48 suites
+  (exit 0) · `cargo clippy --workspace --all-targets -- -D warnings` → clean · `cargo fmt --check`
+  → clean · `pnpm typecheck && pnpm build` → 2/2, the admin route table lists all eight identity
+  screens · `bash scripts/qa/run.sh` → **612 clicks, 628 screenshots, 0 high findings**, 5 medium
+  (all carried forward: the public renderer's icon 404s), 3 vision issues (1 medium + 2 low, both
+  on the analytics realtime card's raw snapshot ids — pre-existing) — `qa-artifacts/20260927-041657`.
+- **The browser pass drives the slice, not just the routes.** `iam-subjects` in
+  `scripts/qa/walkthrough.cjs`: overview cards (6) → create `qa-subject@example.com` → open the
+  account → attach the role at organization scope → effective permissions (72 granted) → a
+  resource binding on `/blog/*` → simulator `ALLOWED` with its source → `/blog/hello-world`
+  `ALLOWED` vs `/legal/terms` `DENIED` with one `out_of_scope` binding → groups panel with one
+  member and one role → service account with its key shown once (`omsa_…`) → revoke → the role's
+  members tab answers with 3 subject rows.
+- **The first pass's high finding was the harness, and it is fixed.** The wizard clicked a button
+  that was still working ("Creating…"), which submitted a step twice; the platform refused the
+  duplicate — correctly — and that refusal landed while the next step's form was being filled, so
+  the organization POST went out with an empty name. The walkthrough waits the busy state out now
+  (`5d1a376`), and `--only=wizard` re-checks the flow on its own: on a freshly reset database it
+  reports `WIZARD_ONBOARDING_FAILURES=0`. The second full pass confirms it (3 console errors, 2
+  failed requests — the carried-forward 404s only).
+- **Two small defects the pass caught in this slice, fixed and re-measured on the live panel:**
+  the three user-list filters had no accessible name (`85cfa84` → `aria-label`s; re-check reports
+  zero unlabelled inputs) and the groups row's delete control was a 12px grey glyph the vision
+  review read as a smudge (`9155b0d` → caution colour, 14px icon, `aria-label` "Delete QA Team";
+  re-check: 32×24 button, `rgb(138,93,22)`).
+- Carried forward, not caused by this slice: the public renderer's icon 404s (5 medium), the
+  analytics realtime card's raw snapshot ids (1 medium + 2 low vision).
+- Next: **REQ-006 slice 3** — sessions, devices, MFA and the security policy (revoke + sign-out-all,
+  idle/absolute lifetime from the policy row, lockout per account and per IP, IP lists, TOTP and
+  passkey enrolment with step-up, recovery codes). The walkthrough's denial case should use an
+  account with no bindings so the artifact shows a `DENIED` verdict card as well.
