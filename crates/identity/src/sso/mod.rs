@@ -18,8 +18,10 @@ pub mod challenges;
 pub mod claims;
 pub mod oidc;
 pub mod providers;
+pub mod provisioning;
 pub mod saml;
 
 pub use challenges::{CHALLENGE_TTL_MINUTES, IssuedChallenge, SsoChallenge, hash_state};
 pub use claims::{Identity, RoleMapping, identity_from_claims, resolve_roles};
 pub use providers::{AuthProvider, NewProvider, ProviderChanges, ProviderKind};
+pub use provisioning::{ProvisionOutcome, Provisioned, provision as provision_account};

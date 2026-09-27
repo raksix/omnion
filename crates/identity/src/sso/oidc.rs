@@ -325,14 +325,76 @@ impl HttpClient {
         let response = self
             .inner
             .get(url)
+            .header("accept", "application/json")
             .send()
             .await
             .map_err(|error| {
                 IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
             })?;
+        Self::read_json(response).await
+    }
+
+    /// Fetch a JSON document with a bearer credential — the userinfo endpoint of a provider that
+    /// sends no ID token.
+    pub async fn get_json_with_bearer(&self, url: &str, token: &str) -> Result<Value> {
+        let response = self
+            .inner
+            .get(url)
+            .header("accept", "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| {
+                IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
+            })?;
+        Self::read_json(response).await
+    }
+
+    /// Post a form and read the JSON answer — the `code` exchange of the OIDC/OAuth2 flows.
+    pub async fn post_form(&self, url: &str, form: &str) -> Result<Value> {
+        let response = self
+            .inner
+            .post(url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "application/json")
+            .body(form.to_owned())
+            .send()
+            .await
+            .map_err(|error| {
+                IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
+            })?;
+        Self::read_json(response).await
+    }
+
+    /// Post a form with a Basic credential — a confidential client at the token endpoint.
+    pub async fn post_form_with_basic(
+        &self,
+        url: &str,
+        form: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<Value> {
+        let credentials = base64_encode(format!("{client_id}:{client_secret}").as_bytes());
+        let response = self
+            .inner
+            .post(url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "application/json")
+            .header("authorization", format!("Basic {credentials}"))
+            .body(form.to_owned())
+            .send()
+            .await
+            .map_err(|error| {
+                IdentityError::InvalidProvider(format!("the provider did not answer: {error}"))
+            })?;
+        Self::read_json(response).await
+    }
+
+    /// The shared tail: a successful response becomes a size-capped JSON document.
+    async fn read_json(response: reqwest::Response) -> Result<Value> {
         if !response.status().is_success() {
             return Err(IdentityError::InvalidProvider(format!(
-                "the provider answered {} for {url}",
+                "the provider answered {} for the request",
                 response.status()
             )));
         }
@@ -347,10 +409,15 @@ impl HttpClient {
                 "the provider's document is implausibly large".into(),
             ));
         }
-        serde_json::from_slice(&bytes).map_err(|_| {
-            IdentityError::InvalidProvider("the provider's answer is not JSON".into())
-        })
+        serde_json::from_slice(&bytes)
+            .map_err(|_| IdentityError::InvalidProvider("the provider's answer is not JSON".into()))
     }
+}
+
+/// Standard base64 for the Basic credential.
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 impl Default for HttpClient {

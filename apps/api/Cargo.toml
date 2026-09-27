@@ -33,6 +33,12 @@ omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
 omnion-workflows = { path = "../../crates/workflows" }
 
+# Enterprise sign-in (REQ-006, slice 4b-2): the authorization URL is assembled with a real
+# URL parser (so a provider endpoint cannot smuggle a fragment or a second origin into it), and
+# the SAML response / Basic client credential travel as base64.
+url.workspace = true
+base64.workspace = true
+
 [dev-dependencies]
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
