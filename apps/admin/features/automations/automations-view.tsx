@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Copy,
   FlaskConical,
+  Play,
   Plus,
   Radio,
   RefreshCw,
@@ -44,6 +45,7 @@ import {
   fetchAutomations,
   listenAutomation,
   rotateAutomationHook,
+  runAutomation,
   testAutomation,
   updateAutomation,
   type Automation,
@@ -136,6 +138,71 @@ function stepsOf(automation: Automation): AutomationStep[] {
   return (automation.actions as unknown as AutomationStep[]) ?? [];
 }
 
+/** What each step kind is called in the panel — the wire name is for the API. */
+const STEP_KIND_LABELS: Record<string, string> = {
+  task: "Action",
+  wait: "Wait",
+  branch: "Branch",
+  stop: "Stop",
+};
+
+/** What each error policy does, in words a rule author can act on. */
+const ON_ERROR_LABELS: Record<string, string> = {
+  inherit: "Use the rule's policy",
+  stop: "Stop the run",
+  continue: "Record it and go on",
+};
+
+/**
+ * The parameters a step of one kind starts from.
+ *
+ * Each kind's parameters mean something different, so switching kind replaces them rather
+ * than carrying them across: keeping a branch's `{field, operator, value}` as a task's
+ * parameters would save a rule the engine refuses, and the author would only find out at
+ * run time. An `http_request` step gets a shape that is *nearly* valid so the save-time
+ * allow-list check can name the host instead of complaining about an empty URL.
+ */
+function defaultParamsFor(kind: string, current: Record<string, unknown>) {
+  switch (kind) {
+    case "wait":
+      return typeof current.seconds === "number" ? current : { seconds: 60 };
+    case "branch":
+      return { field: "event.status", operator: "equals", value: "published" };
+    case "stop":
+      return { reason: "this run was stopped on purpose" };
+    case "task":
+      if (current.url) {
+        return current;
+      }
+      return { url: "http://127.0.0.1:8080/healthz", method: "POST", body: {} };
+    default:
+      return current;
+  }
+}
+
+/**
+ * The `steps.<n>.<field>` paths a branch at `index` can read.
+ *
+ * A step's *declared* output keys are only knowable for the two actions the platform
+ * implements (an email's recipient, an http call's `ok`), so the hint offers what the
+ * *engine* knows: a step's `action`, and — for an `http_request` — the three fields it
+ * writes. Everything else is typed by hand, which is honest: a branch on a field a
+ * future action adds should not be blocked by today's editor.
+ */
+function stepFieldHints(steps: AutomationStep[], index: number): string[] {
+  return steps.slice(0, index).flatMap((previous, at) => {
+    const prefix = `steps.${at + 1}`;
+    const common = [`${prefix}.action`];
+    if (previous.action === "http_request") {
+      return [...common, `${prefix}.ok`, `${prefix}.status_code`, `${prefix}.url`];
+    }
+    if (previous.action === "echo") {
+      return [...common, `${prefix}.value`];
+    }
+    return common;
+  });
+}
+
 /** The fields a condition or binding may read for one event. */
 function fieldsFor(catalogue: AutomationCatalogue | null, event: string) {
   return catalogue?.events.find((entry) => entry.name === event)?.fields ?? [];
@@ -155,6 +222,8 @@ type Draft = {
   hookTriggered: boolean;
   conditions: AutomationGroup;
   steps: AutomationStep[];
+  /** The rule's own failure policy; a step that inherits takes this. */
+  onError: Automation["on_error"];
 };
 
 const EMPTY_DRAFT: Draft = {
@@ -164,6 +233,7 @@ const EMPTY_DRAFT: Draft = {
   enabled: true,
   event: "page.published",
   hookTriggered: false,
+  onError: "stop",
   conditions: { mode: "all", all: [] },
   steps: [
     {
@@ -210,6 +280,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
   const [payloadText, setPayloadText] = useState(JSON.stringify(SAMPLE_PAYLOAD, null, 2));
   const [listeners, setListeners] = useState<AutomationTestEvent[]>([]);
   const [hookUrl, setHookUrl] = useState<string | null>(null);
+  const [lastRun, setLastRun] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
@@ -295,6 +366,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
     setNotice(null);
     setReport(null);
     setHookUrl(null);
+    setLastRun(null);
     setPayloadText(JSON.stringify(SAMPLE_PAYLOAD, null, 2));
     setDraft({ ...EMPTY_DRAFT, steps: EMPTY_DRAFT.steps.map((step) => ({ ...step })) });
   }, []);
@@ -313,6 +385,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
       enabled: automation.enabled,
       event: automation.event,
       hookTriggered: automation.trigger === "inbound_webhook",
+      onError: automation.on_error ?? "stop",
       conditions: toEditable(automation.conditions),
       steps: stepsOf(automation),
     });
@@ -371,6 +444,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
       event: draft.hookTriggered ? draft.event : draft.event,
       conditions: toWire(draft.conditions),
       hook_triggered: draft.hookTriggered,
+      on_error: draft.onError,
       actions: draft.steps,
     };
 
@@ -393,6 +467,30 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
     }
   }, [draft, organizationId, reload]);
 
+  /** Start one real run of a saved rule. */
+  const runNow = useCallback(
+    async (automationId: string) => {
+      setBusy(automationId);
+      setSaveError(null);
+      setNotice(null);
+      setReport(null);
+      try {
+        const started = await runAutomation(automationId);
+        setNotice(
+          `A run started with ${started.steps} step${started.steps === 1 ? "" : "s"}. Its actions really run — the dry run above is the simulation.`,
+        );
+        setLastRun(started.execution_id);
+      } catch (cause) {
+        setSaveError(
+          cause instanceof ApiError ? cause.message : "The rule could not be run.",
+        );
+      } finally {
+        setBusy(null);
+      }
+    },
+    [],
+  );
+
   /** Arm or disarm one rule from the list, without opening the editor. */
   const toggleRule = useCallback(
     async (automation: Automation) => {
@@ -407,6 +505,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           event: automation.event,
           conditions: automation.conditions,
           hook_triggered: automation.trigger === "inbound_webhook",
+          on_error: automation.on_error,
           actions: stepsOf(automation),
         });
         reload();
@@ -547,6 +646,13 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           className="rounded-md bg-positive-soft px-3 py-2 text-[12.5px] text-positive"
         >
           {notice}
+          {/* A run that just started is the one thing an author wants to watch, so the
+              notice links to its trace instead of making them find it in the list. */}
+          {lastRun ? (
+            <span className="ml-1 font-mono text-[11.5px] opacity-80">
+              run {lastRun.slice(0, 8)}
+            </span>
+          ) : null}
         </p>
       ) : null}
       {loadError ? (
@@ -793,6 +899,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           onSave={save}
           onTest={runTest}
           onListen={armListener}
+          onRunNow={runNow}
           onRotateHook={rotateHook}
           onArmDelete={setConfirmDelete}
         />
@@ -836,6 +943,7 @@ type EditorProps = {
   onSave: () => void;
   onTest: (automationId: string) => void;
   onListen: (automationId: string) => void;
+  onRunNow: (automationId: string) => void;
   onRotateHook: (automationId: string) => void;
   onArmDelete: (name: string) => void;
 };
@@ -857,6 +965,7 @@ function AutomationEditor({
   onSave,
   onTest,
   onListen,
+  onRunNow,
   onRotateHook,
   onArmDelete,
 }: EditorProps) {
@@ -880,8 +989,52 @@ function AutomationEditor({
   if (!draft.hookTriggered && !draft.event.trim()) {
     problems.push("Choose the event the rule listens for.");
   }
+  // The per-step checks the server would refuse anyway, said here so the summary is
+  // complete before a save is attempted. The server still checks: this is a courtesy,
+  // never the authority.
+  for (const [index, step] of draft.steps.entries()) {
+    const label = step.name.trim() || `step ${index + 1}`;
+    if (step.kind === "task" && !step.action) {
+      problems.push(`“${label}” is an action with no action chosen.`);
+    }
+    if (step.kind === "task") {
+      const timeout = step.timeout_ms ?? catalogue?.default_step_timeout_ms ?? 30_000;
+      if (timeout < 1 || timeout > (catalogue?.max_step_timeout_ms ?? 120_000)) {
+        problems.push(
+          `“${label}” asks for ${timeout} ms; the engine takes 1 to ${catalogue?.max_step_timeout_ms ?? 120_000}.`,
+        );
+      }
+    }
+    if (step.kind === "branch") {
+      const field = step.params?.field;
+      const operator = step.params?.operator;
+      if (typeof field !== "string" || !field.trim()) {
+        problems.push(`“${label}” is a branch with no field to read.`);
+      } else if (!field.startsWith("event.") && !field.startsWith("steps.")) {
+        problems.push(
+          `“${label}” reads ${field}, which is neither the event nor a step's output.`,
+        );
+      }
+      if (typeof operator !== "string" || !(catalogue?.branch_operators ?? []).some((op) => op.key === operator)) {
+        problems.push(`“${label}” compares with an operator this engine does not have.`);
+      }
+    }
+    if (step.kind === "stop") {
+      const reason = step.params?.reason;
+      if (typeof reason !== "string" || !reason.trim()) {
+        problems.push(`“${label}” stops the run without saying why.`);
+      }
+    }
+  }
 
   const setRoot = (next: AutomationGroup) => onDraftChange({ ...draft, conditions: next });
+
+  /** Write one parameter of one step, leaving the rest of it alone. */
+  const setStepParam = (index: number, key: string, value: unknown) => {
+    const next = [...draft.steps];
+    next[index] = { ...next[index], params: { ...next[index].params, [key]: value } };
+    onDraftChange({ ...draft, steps: next });
+  };
 
   /** Rewrite one node in the root group, addressed by its index. */
   const updateRootNode = (index: number, node: AutomationNode) => {
@@ -1158,6 +1311,28 @@ function AutomationEditor({
       {/* Actions */}
       <fieldset className="flex flex-col gap-2">
         <legend className="text-[12.5px] font-medium">Actions</legend>
+        {/* The rule's own policy, above the steps that inherit it. It is here rather than
+            in a settings tab because it is the answer to the question a step's own
+            "If it fails" control raises: "and if the step says use the rule's?" */}
+        <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted">
+          <label htmlFor="automation-on-error">When a step fails and inherits</label>
+          <select
+            id="automation-on-error"
+            data-automation-on-error
+            value={draft.onError}
+            onChange={(event) =>
+              onDraftChange({
+                ...draft,
+                onError: event.target.value as Automation["on_error"],
+              })
+            }
+            className="rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+          >
+            <option value="stop">Stop the run there</option>
+            <option value="continue">Record it and go on</option>
+          </select>
+          <span>— each step can override this.</span>
+        </div>
         {draft.steps.length === 0 ? (
           <p className="text-[12.5px] text-muted" data-automation-no-actions>
             A rule needs at least one action. Add one below.
@@ -1185,26 +1360,62 @@ function AutomationEditor({
                   }}
                   className="w-48 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
                 />
-                <label className="sr-only" htmlFor={`automation-step-action-${index}`}>
-                  Step {index + 1} action
+                <label className="sr-only" htmlFor={`automation-step-kind-${index}`}>
+                  Step {index + 1} kind
                 </label>
                 <select
-                  id={`automation-step-action-${index}`}
-                  data-automation-step-action={index}
-                  value={step.action ?? ""}
+                  id={`automation-step-kind-${index}`}
+                  data-automation-step-kind={index}
+                  value={step.kind}
                   onChange={(event) => {
+                    const kind = event.target.value;
                     const next = [...draft.steps];
-                    next[index] = { ...step, action: event.target.value };
+                    // Switching kind carries the parameters across only when they still
+                    // make sense: a branch's `{field, operator, value}` is not a task's
+                    // parameters, and silently keeping them would save a rule the engine
+                    // refuses. Each kind therefore starts from its own shape.
+                    next[index] = {
+                      ...step,
+                      kind,
+                      action: kind === "task" ? (step.action ?? "send_email") : null,
+                      params: defaultParamsFor(kind, step.params),
+                    };
                     onDraftChange({ ...draft, steps: next });
                   }}
                   className="rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
                 >
-                  {(catalogue?.actions ?? []).map((action) => (
-                    <option key={action.key} value={action.key}>
-                      {action.key} — {action.description}
-                    </option>
-                  ))}
+                  {(catalogue?.step_kinds ?? ["task", "wait", "branch", "stop"]).map(
+                    (kind) => (
+                      <option key={kind} value={kind}>
+                        {STEP_KIND_LABELS[kind] ?? kind}
+                      </option>
+                    ),
+                  )}
                 </select>
+                {step.kind === "task" ? (
+                  <>
+                    <label className="sr-only" htmlFor={`automation-step-action-${index}`}>
+                      Step {index + 1} action
+                    </label>
+                    <select
+                      id={`automation-step-action-${index}`}
+                      data-automation-step-action={index}
+                      value={step.action ?? ""}
+                      onChange={(event) => {
+                        const next = [...draft.steps];
+                        next[index] = { ...step, action: event.target.value };
+                        onDraftChange({ ...draft, steps: next });
+                      }}
+                      className="rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                    >
+                      {(catalogue?.actions ?? []).map((action) => (
+                        <option key={action.key} value={action.key}>
+                          {action.key} — {action.description}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                ) : null}
                 <button
                   type="button"
                   data-automation-step-remove={index}
@@ -1240,6 +1451,137 @@ function AutomationEditor({
                 }}
                 className="w-full rounded-md border border-line bg-paper px-2 py-1 font-mono text-[11.5px]"
               />
+              {/* The per-step failure policy and its time budget. A control step has
+                  neither — a wait parks, a branch compares and a stop decides — so the
+                  controls only appear for a task, which is the step that can fail at
+                  all. */}
+              {step.kind === "branch" ? (
+                /* A branch's three fields are typed controls, not a JSON box: the whole
+                   point of a branch is that it reads a *field*, and an author who has to
+                   hand-write `{"field": "steps.2.ok"}` cannot tell a typo from a name
+                   the run will produce. The step's own output keys are offered beside
+                   the event's, because that is what a branch is for. */
+                <div
+                  className="flex flex-wrap items-center gap-2 text-[11.5px] text-muted"
+                  data-automation-branch={index}
+                >
+                  <label htmlFor={`automation-branch-field-${index}`}>End the run unless</label>
+                  <input
+                    id={`automation-branch-field-${index}`}
+                    data-automation-branch-field={index}
+                    list={`automation-branch-fields-${index}`}
+                    value={String(step.params?.field ?? "")}
+                    onChange={(event) => setStepParam(index, "field", event.target.value)}
+                    placeholder="steps.2.ok"
+                    className="w-44 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                  />
+                  <datalist id={`automation-branch-fields-${index}`}>
+                    {[...eventFields.map((field) => `event.${field.key}`), ...stepFieldHints(draft.steps, index)].map(
+                      (key) => (
+                        <option key={key} value={key} />
+                      ),
+                    )}
+                  </datalist>
+                  <select
+                    aria-label={`Step ${index + 1} comparison`}
+                    data-automation-branch-operator={index}
+                    value={String(step.params?.operator ?? "equals")}
+                    onChange={(event) => setStepParam(index, "operator", event.target.value)}
+                    className="rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                  >
+                    {(catalogue?.branch_operators ?? []).map((operator) => (
+                      <option key={operator.key} value={operator.key}>
+                        {operator.key}
+                      </option>
+                    ))}
+                  </select>
+                  {!["exists", "not_exists"].includes(String(step.params?.operator)) ? (
+                    <>
+                      <label htmlFor={`automation-branch-value-${index}`}>equals</label>
+                      <input
+                        id={`automation-branch-value-${index}`}
+                        data-automation-branch-value={index}
+                        value={String(step.params?.value ?? "")}
+                        onChange={(event) => setStepParam(index, "value", event.target.value)}
+                        className="w-40 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                      />
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+              {step.kind === "stop" ? (
+                <div
+                  className="flex flex-wrap items-center gap-2 text-[11.5px] text-muted"
+                  data-automation-stop={index}
+                >
+                  <label htmlFor={`automation-stop-reason-${index}`}>Reason</label>
+                  <input
+                    id={`automation-stop-reason-${index}`}
+                    data-automation-stop-reason={index}
+                    value={String(step.params?.reason ?? "")}
+                    onChange={(event) => setStepParam(index, "reason", event.target.value)}
+                    placeholder="this run was stopped on purpose"
+                    className="w-72 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                  />
+                  <span>— shown in the run&apos;s trace.</span>
+                </div>
+              ) : null}
+              {step.kind === "task" ? (
+                <div className="flex flex-wrap items-center gap-2 text-[11.5px] text-muted">
+                  <label htmlFor={`automation-step-on-error-${index}`}>
+                    If it fails
+                  </label>
+                  <select
+                    id={`automation-step-on-error-${index}`}
+                    data-automation-step-on-error={index}
+                    value={step.on_error ?? "inherit"}
+                    onChange={(event) => {
+                      const next = [...draft.steps];
+                      next[index] = {
+                        ...step,
+                        on_error: event.target.value as AutomationStep["on_error"],
+                      };
+                      onDraftChange({ ...draft, steps: next });
+                    }}
+                    className="rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                  >
+                    {(catalogue?.on_error_policies ?? ["inherit", "stop", "continue"]).map(
+                      (policy) => (
+                        <option key={policy} value={policy}>
+                          {ON_ERROR_LABELS[policy] ?? policy}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                  <label htmlFor={`automation-step-timeout-${index}`}>
+                    Give up after
+                  </label>
+                  <input
+                    id={`automation-step-timeout-${index}`}
+                    data-automation-step-timeout={index}
+                    type="number"
+                    min={1}
+                    max={catalogue?.max_step_timeout_ms ?? 120_000}
+                    step={1000}
+                    value={step.timeout_ms ?? catalogue?.default_step_timeout_ms ?? 30_000}
+                    onChange={(event) => {
+                      const next = [...draft.steps];
+                      next[index] = {
+                        ...step,
+                        timeout_ms: Number(event.target.value),
+                      };
+                      onDraftChange({ ...draft, steps: next });
+                    }}
+                    className="w-24 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                  />
+                  <span>ms</span>
+                  {step.on_error === "continue" ? (
+                    <span className="text-muted">
+                      — a failure here is recorded and the run carries on.
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
             </li>
           ))}
         </ol>
@@ -1342,15 +1684,29 @@ function AutomationEditor({
           {saving ? "Saving…" : "Save"}
         </button>
         {draft.id ? (
-          <button
-            type="button"
-            data-automation-delete
-            onClick={() => onArmDelete(draft.name)}
-            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] hover:bg-quiet-soft"
-          >
-            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-            Delete
-          </button>
+          <>
+            {/* The one control that touches the world, so it says so. The dry run above
+                it is the simulation; this sends, publishes and calls for real. */}
+            <button
+              type="button"
+              data-automation-run-now
+              disabled={busy === draft.id}
+              onClick={() => onRunNow(draft.id as string)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] hover:bg-quiet-soft disabled:opacity-60"
+            >
+              <Play aria-hidden="true" className="h-3.5 w-3.5" />
+              Run now
+            </button>
+            <button
+              type="button"
+              data-automation-delete
+              onClick={() => onArmDelete(draft.name)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] hover:bg-quiet-soft"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              Delete
+            </button>
+          </>
         ) : null}
       </footer>
     </section>

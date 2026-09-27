@@ -3212,6 +3212,97 @@ export type AutomationCatalogue = {
   binding_syntax: string;
   /** An example of the payload an inbound call produces. */
   hook_sample: Record<string, unknown>;
+  /** The operators a `branch` step offers — the same nine the conditions use. */
+  branch_operators: AutomationOperator[];
+  /** The step kinds a definition may carry. */
+  step_kinds: string[];
+  /** What a step's own failure may do; `inherit` takes the rule's policy. */
+  on_error_policies: AutomationStepOnError[];
+  /** The longest a step may block, in milliseconds, and the default. */
+  max_step_timeout_ms: number;
+  default_step_timeout_ms: number;
+  /** The methods an outbound call may use. */
+  outbound_methods: string[];
+  /** How many rules deep a `run_workflow` chain may go. */
+  max_chain_depth: number;
+};
+
+/** One run of a rule, as the run detail reads it. */
+export type AutomationExecution = {
+  /** Run id. */
+  id: string;
+  /** Rule the run belongs to. */
+  workflow_id: string;
+  /** `running`, `completed`, `failed` or `cancelled`. */
+  status: string;
+  /** How the run started. */
+  trigger_kind: string;
+  /** When it started. */
+  started_at: string;
+  /** When it finished, if it has. */
+  finished_at: string | null;
+  /** The failing step's message, when the run failed. */
+  error: string | null;
+};
+
+/** One step of a run's trace. */
+export type AutomationRunStep = {
+  /** 1-based position. */
+  step_no: number;
+  /** Step name. */
+  name: string;
+  /** `task`, `wait`, `branch` or `stop`. */
+  kind: string;
+  /** Action key of a task step. */
+  action: string | null;
+  /** `pending`, `running`, `waiting`, `succeeded`, `failed` or `cancelled`. */
+  status: string;
+  /** Attempts made so far. */
+  attempts: number;
+  /** Attempts allowed in total. */
+  max_attempts: number;
+  /** What this step's own failure does. */
+  on_error: string;
+  /** How long this step may block, in milliseconds. */
+  timeout_ms: number;
+  /** `true` when the run deliberately outlived this step's failure. */
+  ignored: boolean;
+  /** The step's output, when it succeeded. */
+  output: Record<string, unknown> | null;
+  /** The last failure's message. */
+  error: string | null;
+};
+
+/** The run detail: the run, its steps and the payload it started from. */
+export type AutomationRunDetail = AutomationExecution & {
+  /** Steps, in order. */
+  steps: AutomationRunStep[];
+  /** The event payload the run started from. */
+  event_payload?: Record<string, unknown>;
+  /** `true` when this run offers Retry. */
+  can_retry: boolean;
+  /** `true` when this run is still going. */
+  can_cancel: boolean;
+};
+
+/** What "Run now" started. */
+export type AutomationRunStarted = {
+  /** The run that started. */
+  execution_id: string;
+  /** The rule it belongs to. */
+  workflow_id: string;
+  /** How many steps it carries. */
+  steps: number;
+};
+
+/** What a retry or a resume re-queued. */
+export type AutomationRetryResult = {
+  /** The run that was re-opened. */
+  execution_id: string;
+  /** The step the operator pointed at. */
+  step_no: number;
+  /** How many steps went back on the queue. */
+  requeued: number;
 };
 
 /** One comparison inside a condition group. */
@@ -3275,6 +3366,8 @@ export type Automation = {
   condition_count: number;
   /** Actions to run, in order. */
   actions: AutomationNode[];
+  /** The rule's own error policy; a step that inherits takes this. */
+  on_error: AutomationOnError;
   /** How many runs the trigger has started. */
   trigger_count: number;
   /** When the rule last fired. */
@@ -3287,16 +3380,26 @@ export type Automation = {
   hook?: AutomationHook;
 };
 
+/** What a step's own failure does; `inherit` takes the rule's policy. */
+export type AutomationStepOnError = "inherit" | "stop" | "continue";
+
+/** The rule's own error policy. A rule may not choose `inherit` — that is a step's. */
+export type AutomationOnError = "stop" | "continue";
+
 /** One step of a rule's action list. */
 export type AutomationStep = {
   /** Display name; unique within the rule. */
   name: string;
-  /** `task` or `wait`. */
+  /** `task`, `wait`, `branch` or `stop`. */
   kind: string;
   /** Action key of a task step. */
   action?: string | null;
   /** Action parameters. */
   params: Record<string, unknown>;
+  /** What this step's own failure does. */
+  on_error?: AutomationStepOnError;
+  /** How long this step may block, in milliseconds. */
+  timeout_ms?: number;
   /** Attempts allowed in total. */
   max_attempts: number;
 };
@@ -3405,8 +3508,14 @@ export function fetchAutomation(automationId: string): Promise<Automation> {
   return request<Automation>(`/api/v1/automations/${automationId}`);
 }
 
-/** Write a rule. */
-export function createAutomation(input: {
+/**
+ * A rule to write.
+ *
+ * One shape for both `createAutomation` and `updateAutomation`, so a field added here
+ * cannot reach one and miss the other — which is how a rule's error policy ends up
+ * quietly resetting to the default every time somebody toggles a rule.
+ */
+export type AutomationInput = {
   organization_id?: string | null;
   site_id?: string | null;
   name: string;
@@ -3415,8 +3524,13 @@ export function createAutomation(input: {
   event: string;
   conditions?: unknown;
   hook_triggered?: boolean;
+  /** The rule's own failure policy; a step that inherits takes this. */
+  on_error?: AutomationOnError;
   actions: AutomationStep[];
-}): Promise<Automation> {
+};
+
+/** Write a rule. */
+export function createAutomation(input: AutomationInput): Promise<Automation> {
   return request<Automation>("/api/v1/automations", {
     method: "POST",
     body: JSON.stringify(input),
@@ -3426,17 +3540,7 @@ export function createAutomation(input: {
 /** Replace a rule. */
 export function updateAutomation(
   automationId: string,
-  input: {
-    organization_id?: string | null;
-    site_id?: string | null;
-    name: string;
-    description?: string;
-    enabled?: boolean;
-    event: string;
-    conditions?: unknown;
-    hook_triggered?: boolean;
-    actions: AutomationStep[];
-  },
+  input: AutomationInput,
 ): Promise<Automation> {
   return request<Automation>(`/api/v1/automations/${automationId}`, {
     method: "PUT",
@@ -3474,4 +3578,52 @@ export function rotateAutomationHook(automationId: string): Promise<AutomationHo
   return request<AutomationHookToken>(`/api/v1/automations/${automationId}/rotate-hook`, {
     method: "POST",
   });
+}
+
+/**
+ * Start one run now, in the real world.
+ *
+ * This is the one automations control that sends, publishes and calls for real — the
+ * dry run beside it is the simulation, and this is not. The response is the run, so the
+ * panel can link straight to its trace.
+ */
+export function runAutomation(automationId: string): Promise<AutomationRunStarted> {
+  return request<AutomationRunStarted>(`/api/v1/automations/${automationId}/run`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** One run with its step trace. */
+export function fetchAutomationRun(executionId: string): Promise<AutomationRunDetail> {
+  return request<AutomationRunDetail>(`/api/v1/workflow-executions/${executionId}`);
+}
+
+/**
+ * Try a failed run again from one step.
+ *
+ * The chosen step **and everything after it** go back on the queue: re-running only the
+ * failed step would let a run whose middle failed march on to completion, which is not
+ * what "try that again" means to anybody reading a trace. The steps that already
+ * succeeded are left exactly as they are.
+ */
+export function retryAutomationStep(
+  executionId: string,
+  stepNo: number,
+): Promise<AutomationRetryResult> {
+  return request<AutomationRetryResult>(
+    `/api/v1/workflow-executions/${executionId}/retry-step`,
+    { method: "POST", body: JSON.stringify({ step_no: stepNo }) },
+  );
+}
+
+/** The same write as {@link retryAutomationStep}, named for what the button says. */
+export function resumeAutomationFrom(
+  executionId: string,
+  stepNo: number,
+): Promise<AutomationRetryResult> {
+  return request<AutomationRetryResult>(
+    `/api/v1/workflow-executions/${executionId}/resume-from`,
+    { method: "POST", body: JSON.stringify({ step_no: stepNo }) },
+  );
 }
