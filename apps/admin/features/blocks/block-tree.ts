@@ -256,6 +256,113 @@ function replaceSiblings(
   }));
 }
 
+/** Fewest and most columns a Columns block holds. Mirrors the server's `MIN_COLUMNS`/`MAX_COLUMNS`. */
+export const MIN_COLUMNS = 2;
+export const MAX_COLUMNS = 4;
+
+/**
+ * Insert a Columns block with the column wrappers it needs, then leave the author inside the
+ * first one.
+ *
+ * A Columns block whose children are plain blocks is not a layout, it is a list that happens to
+ * be indented — "two of these side by side" is only expressible if each column is its own node
+ * that holds blocks. So the editor builds the structure the validator requires instead of
+ * letting the author create an invalid payload and discovering it at publish time.
+ */
+export function insertColumns(
+  blocks: ContentBlock[],
+  path: number[],
+  definition: BlockDefinition,
+  wanted = MIN_COLUMNS,
+): { blocks: ContentBlock[]; path: number[] } {
+  const count = Math.min(MAX_COLUMNS, Math.max(MIN_COLUMNS, wanted));
+  const columns: ContentBlock[] = Array.from({ length: count }, () => ({
+    id: newBlockId(),
+    type: "column",
+    props: { align: "left" },
+    children: [],
+  }));
+  // `newBlock` already builds the schema defaults (and an empty `children` for a container);
+  // the wrappers replace that empty list, so the only prop this sets is the count the layout
+  // and the validator both read.
+  const block = newBlock(definition);
+  block.props.columns = count;
+  block.children = columns;
+  const index = path.length === 0 ? blocks.length : path[path.length - 1] + 1;
+  return {
+    blocks: insertAfter(blocks, path, block),
+    path: [...path.slice(0, -1), index, 0],
+  };
+}
+
+/**
+ * Add a column to a Columns block.
+ *
+ * The new column is empty on purpose: a column with nothing in it is a gap the author can drop a
+ * block into, and a column that copied the last one would silently duplicate content. The
+ * `columns` prop moves with it, because that prop is the layout the renderer reads and a
+ * disagreement between the two is the exact bug the validator would then report.
+ */
+export function addColumn(
+  blocks: ContentBlock[],
+  path: number[],
+): ContentBlock[] {
+  const container = blockAt(blocks, path);
+  if (!container || container.type !== "columns") {
+    return blocks;
+  }
+  if ((container.children?.length ?? 0) >= MAX_COLUMNS) {
+    return blocks;
+  }
+  const column: ContentBlock = { id: newBlockId(), type: "column", props: { align: "left" }, children: [] };
+  return updateBlock(blocks, path, (block) => ({
+    ...block,
+    props: { ...block.props, columns: (block.children?.length ?? 0) + 1 },
+    children: [...(block.children ?? []), column],
+  }));
+}
+
+/**
+ * Remove a column from a Columns block, taking the blocks inside it with it.
+ *
+ * The REQ says two to four columns, so a Columns block never goes below two: the second-to-last
+ * column is not removable and the control says so instead of returning a tree the API would
+ * refuse. Content is never silently relocated — a column with blocks in it is a deliberate
+ * deletion, and the confirm in the editor is where that decision belongs.
+ */
+export function removeColumn(
+  blocks: ContentBlock[],
+  path: number[],
+  columnIndex: number,
+): ContentBlock[] {
+  const container = blockAt(blocks, path);
+  if (!container || container.type !== "columns") {
+    return blocks;
+  }
+  const count = container.children?.length ?? 0;
+  if (count <= MIN_COLUMNS || columnIndex < 0 || columnIndex >= count) {
+    return blocks;
+  }
+  const children = (container.children ?? []).filter((_, index) => index !== columnIndex);
+  return updateBlock(blocks, path, (block) => ({
+    ...block,
+    props: { ...block.props, columns: children.length },
+    children,
+  }));
+}
+
+/** The blocks inside one column of a Columns block, for the editor's per-column drop target. */
+export function columnBlocks(
+  blocks: ContentBlock[],
+  columnsPath: number[],
+): ContentBlock[][] {
+  const container = blockAt(blocks, columnsPath);
+  if (!container?.children) {
+    return [];
+  }
+  return container.children.map((column) => column.children ?? []);
+}
+
 /** The breadcrumb a selection produces: the chain of types down to the selected block. */
 export function breadcrumb(
   registry: BlockRegistry,
@@ -271,7 +378,13 @@ export function breadcrumb(
     }
     const definition = registry.blocks.find((entry) => entry.key === block.type);
     trail.push({
-      label: definition?.label ?? block.type,
+      // A type name alone is not a position: four columns all read "Column", and a trail that
+      // says Column / Column / Text cannot tell the author which of the four they are in — which
+      // is the whole reason the breadcrumb exists. Numbering the siblings does.
+      label:
+        block.type === "column"
+          ? `Column ${path[depth] + 1}`
+          : (definition?.label ?? block.type),
       path: path.slice(0, depth + 1),
     });
     nodes = block.children ?? [];
