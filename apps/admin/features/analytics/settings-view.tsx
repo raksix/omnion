@@ -965,6 +965,7 @@ export function AnalyticsSettingsView() {
             columns={storageColumns}
             rows={data.storage}
             rowKey={(row) => `${row.table}:${row.column}`}
+            minWidthClass="min-w-full"
           />
         </Panel>
       </div>

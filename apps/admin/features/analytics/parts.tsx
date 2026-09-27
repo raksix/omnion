@@ -545,6 +545,7 @@ export function DataTable<Row>({
   onRowClick,
   rowKey,
   footer,
+  minWidthClass = "min-w-[720px]",
 }: {
   columns: Column<Row>[];
   rows: Row[];
@@ -554,13 +555,22 @@ export function DataTable<Row>({
   onRowClick?: (row: Row) => void;
   rowKey: (row: Row) => string;
   footer?: ReactNode;
+  /**
+   * Minimum table width on wide screens. The default keeps the section's multi-column reports
+   * readable; a small table inside a narrow card passes `min-w-full` so its text wraps in the
+   * card instead of scrolling out of sight (the vision pass read the overflow as clipped text).
+   */
+  minWidthClass?: string;
 }) {
   const sortable = columns.filter((column) => column.sortable && onSort);
   const wide = useWideScreen();
 
   return wide ? (
     <div className="min-w-0 overflow-x-auto">
-      <table data-analytics-table className="w-full min-w-[720px] border-collapse text-[12.5px]">
+      <table
+        data-analytics-table
+        className={`w-full ${minWidthClass} border-collapse text-[12.5px]`}
+      >
         <thead>
           <tr className="border-b border-line text-left text-[11.5px] tracking-wide text-muted uppercase">
             {columns.map((column) => {
