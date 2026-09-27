@@ -2526,6 +2526,10 @@ async function main() {
     // The ABAC policy builder (REQ-006, slice 4a) — the depth pass below drives the rows, the
     // dry run, a save with its version history and a removal.
     { path: "/settings/iam/policies", name: "iam-policies" },
+    // The permission-request inbox and the SCIM provisioning screen (REQ-006, slice 4b) — the
+    // depth passes below ask, approve, refuse, mint a token and drive a real SCIM round trip.
+    { path: "/settings/iam/approvals", name: "iam-approvals" },
+    { path: "/settings/iam/provisioning", name: "iam-provisioning" },
     // The security, session and device screens (REQ-006, slice 3) — the depth pass below drives
     // the policy fields, revokes a session and trusts a device.
     { path: "/settings/iam/security", name: "iam-security" },
@@ -2624,6 +2628,18 @@ async function main() {
   await runPasskeysDepth(page, report);
   log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
+  // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
+  // refusals of the ask form. It runs after the count-sensitive passes because an approval adds a
+  // time-boxed binding (and the generated grant role) to the organization.
+  await runIamApprovalsDepth(page, report);
+  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
+
+  // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
+  // round trip through the real endpoint from this browser, read the sync log back, revoke the
+  // token and prove it is refused afterwards.
+  await runIamProvisioningDepth(page, report);
+  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
+
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
   const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
@@ -2633,7 +2649,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -3361,4 +3377,255 @@ async function runPasskeysDepth(page, report) {
 
   report.passkeys = { steps };
   log(`passkeys: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The permission-request pass (REQ-006, slice 4b).
+ *
+ * Drives the inbox the way an administrator would: asks for a permission, approves it with a
+ * window and reads the moment it ends back from the row, refuses a second request, and checks
+ * the tab counts. The window itself is proven in `apps/api/tests/iam_approvals.rs`, which grants
+ * a window of minutes, watches the permission arrive and watches it leave — the browser pass
+ * proves the screen a person actually uses.
+ *
+ * The permission it asks for is `iam.provisioning.manage`, which no other pass reads, so the
+ * temporary grant cannot move any other verdict. The pass runs after every count-sensitive pass
+ * in `main` for the same reason.
+ */
+async function runIamApprovalsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-approvals-depth", action: "iam", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/iam/approvals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-approvals-view]", { timeout: 20000 }).catch(() => {});
+  // A platform account names its organization first (the picker selects the first one on load);
+  // an organization account never renders it.
+  await page.waitForSelector("[data-approvals-organization]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const before = await page.locator("[data-approval-row]").count();
+  await shot(page, "page-iam-approvals");
+
+  // ---- Ask for a permission --------------------------------------------------------------
+  await page.locator("[data-request-new]").first().click({ timeout: 6000 }).catch(() => {});
+  await page
+    .locator("[data-request-permission]")
+    .first()
+    .fill("iam.provisioning.manage")
+    .catch(() => {});
+  await page
+    .locator("[data-request-justification]")
+    .first()
+    .fill("QA walkthrough: prove the window works")
+    .catch(() => {});
+  await page.locator("[data-request-submit]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-approvals-notice]", { timeout: 12000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const pendingRows = await page.locator('[data-approval-row][data-approval-status="pending"]').count();
+  note({ step: "request-created", pendingRows, before });
+  await shot(page, "page-iam-approvals-requested");
+
+  // ---- Approve it with a 30-minute window -------------------------------------------------
+  await page.locator("[data-approval-approve]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-approval-dialog='approve']", { timeout: 12000 }).catch(() => {});
+  await page.locator("[data-approval-window-select]").first().selectOption("30").catch(() => {});
+  await page
+    .locator("[data-approval-note]")
+    .first()
+    .fill("QA walkthrough approval")
+    .catch(() => {});
+  await page.locator("[data-approval-decide-confirm]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  await page.locator("[data-approval-tab='approved']").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const approvedRows = await page.locator('[data-approval-row][data-approval-status="approved"]').count();
+  const windowChip = await page
+    .locator("[data-approval-window]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({ step: "approved", approvedRows, windowChip: windowChip.trim() });
+  await shot(page, "page-iam-approvals-approved");
+
+  // ---- A refusal, with the note the approver left -----------------------------------------
+  await page.locator("[data-approval-tab='pending']").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator("[data-request-new]").first().click({ timeout: 4000 }).catch(() => {});
+  await page
+    .locator("[data-request-permission]")
+    .first()
+    .fill("iam.policies.read")
+    .catch(() => {});
+  await page.locator("[data-request-submit]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  await page.locator("[data-approval-reject]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-approval-dialog='reject']", { timeout: 12000 }).catch(() => {});
+  await page
+    .locator("[data-approval-note]")
+    .first()
+    .fill("Not needed for this window")
+    .catch(() => {});
+  await page.locator("[data-approval-decide-confirm]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  await page.locator("[data-approval-tab='rejected']").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const rejectedRows = await page.locator('[data-approval-row][data-approval-status="rejected"]').count();
+  note({ step: "rejected", rejectedRows });
+  await shot(page, "page-iam-approvals-rejected");
+
+  // ---- A refusal the field can explain ----------------------------------------------------
+  await page.locator("[data-approval-tab='all']").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.locator("[data-request-new]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.locator("[data-request-permission]").first().fill("not.a.permission").catch(() => {});
+  // The `400` this submit provokes is the assertion below (the sentence names the unknown key),
+  // so it is registered as deliberate rather than reported as a defect.
+  expectRefusal(
+    "/api/v1/iam/requests",
+    "the ask form refuses a permission key outside the catalogue — the message is asserted",
+  );
+  await page.locator("[data-request-submit]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-approvals-error]", { timeout: 12000 }).catch(() => {});
+  const refusal = (await page
+    .locator("[data-approvals-error]")
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  note({ step: "unknown-permission-refused", refusal });
+  await shot(page, "page-iam-approvals-refusal");
+
+  report.iamApprovals = { steps };
+  log(`iam approvals: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The SCIM provisioning pass (REQ-006, slice 4b).
+ *
+ * Mints a token on the provisioning screen, uses it **from the browser** against the real SCIM
+ * endpoint (create → deactivate round trip), reads the sync log the endpoint wrote, then revokes
+ * the token and proves a revoked token is refused. Nothing here is simulated: the token is the
+ * one the screen minted, and the log lines are the ones the API wrote.
+ */
+async function runIamProvisioningDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-provisioning-depth", action: "iam", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/iam/provisioning`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-provisioning-view]", { timeout: 20000 }).catch(() => {});
+  await page.waitForSelector("[data-provisioning-organization]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const beforeTokens = await page.locator("[data-token-row]").count();
+  await shot(page, "page-iam-provisioning");
+
+  // ---- Mint a token; the secret is shown once --------------------------------------------
+  const stamp = Date.now().toString().slice(-6);
+  await page.locator("[data-token-name]").first().fill(`QA walkthrough ${stamp}`).catch(() => {});
+  await page.locator("[data-token-mint]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-token-secret]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const secret = (await page.locator("[data-token-secret] code").first().innerText().catch(() => "")).trim();
+  const afterTokens = await page.locator("[data-token-row]").count();
+  note({ step: "token-minted", beforeTokens, afterTokens, secretShown: secret.startsWith("omsc_") });
+  await shot(page, "page-iam-provisioning-token");
+
+  // ---- Use it against the real SCIM endpoint ----------------------------------------------
+  const scim = await page.evaluate(async ({ token, stamp: localStamp }) => {
+    const call = async (method, path, body) => {
+      const response = await fetch(`/api/v1/scim/v2${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      return { status: response.status, payload };
+    };
+
+    const email = `scim-qa-${localStamp}@omnion.test`;
+    const created = await call("POST", "/Users", {
+      schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      userName: email,
+      displayName: "SCIM QA",
+      externalId: `qa-${localStamp}`,
+      active: true,
+    });
+    const id = created.payload?.id ?? null;
+
+    const patched = id
+      ? await call("PATCH", `/Users/${id}`, {
+          schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+          Operations: [{ op: "replace", path: "active", value: false }],
+        })
+      : { status: 0, payload: null };
+
+    const filtered = await call("GET", `/Users?filter=userName eq "${email}"`);
+
+    return {
+      email,
+      createdStatus: created.status,
+      createdActive: created.payload?.active ?? null,
+      patchedStatus: patched.status,
+      patchedActive: patched.payload?.active ?? null,
+      listed: filtered.payload?.totalResults ?? null,
+    };
+  }, { token: secret, stamp });
+
+  note({ step: "scim-round-trip", ...scim });
+  await page.waitForTimeout(400);
+
+  // ---- The sync log the endpoint wrote -----------------------------------------------------
+  await page.locator("[data-provisioning-reload]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const logRows = await page.locator("[data-sync-log-row]").count();
+  const createdRows = await page.locator('[data-sync-log-row][data-sync-outcome="created"]').count();
+  const deactivatedRows = await page.locator('[data-sync-log-row][data-sync-outcome="deactivated"]').count();
+  const firstDetail = (await page
+    .locator("[data-sync-log-row]")
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  note({ step: "sync-log", logRows, createdRows, deactivatedRows, firstDetail: firstDetail.slice(0, 120) });
+  await shot(page, "page-iam-provisioning-log");
+
+  // ---- Revoke, and prove the token is refused afterwards -----------------------------------
+  // The list is newest-first, so the token this pass minted is the first row.
+  await page.locator("[data-token-revoke]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-token-revoke-confirm]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const revoked = await page.locator('[data-token-row][data-token-revoked="true"]').count();
+
+  // The `401` the next call provokes is the assertion (a revoked token is refused), so it is
+  // registered as deliberate rather than reported as a defect.
+  expectRefusal(
+    "/api/v1/scim/v2/Users",
+    "the revoked provisioning token is refused on its next call — that refusal is the assertion",
+  );
+  const afterRevoke = await page.evaluate(async ({ token }) => {
+    const response = await fetch("/api/v1/scim/v2/Users", {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+    });
+    return { status: response.status, scimType: (await response.json().catch(() => ({}))).detail ?? null };
+  }, { token: secret });
+
+  note({ step: "revoked", revoked, afterRevokeStatus: afterRevoke.status });
+  await shot(page, "page-iam-provisioning-revoked");
+
+  report.iamProvisioning = { steps };
+  log(`iam provisioning: ${JSON.stringify(steps)}`);
 }
