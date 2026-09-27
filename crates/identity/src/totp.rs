@@ -194,11 +194,7 @@ mod tests {
             520_489,
         ];
         for (counter, code) in expected.iter().enumerate() {
-            assert_eq!(
-                hotp(RFC_SECRET, counter as u64),
-                *code,
-                "counter {counter}"
-            );
+            assert_eq!(hotp(RFC_SECRET, counter as u64), *code, "counter {counter}");
         }
     }
 
@@ -208,12 +204,12 @@ mod tests {
         // vectors are checked against a code computed from the same counter — the property the
         // RFC pins is the counter, not the truncation, and hotp above proves the truncation.
         let window = [
-            (59_i64, 942_870_82_u64),
-            (1_111_111_109, 708_180_4),
-            (1_111_111_111, 1_405_047_1),
-            (1_234_567_890, 890_059_24),
-            (2_000_000_000, 692_790_37),
-            (20_000_000_000, 653_531_30),
+            (59_i64, 94_287_082_u64),
+            (1_111_111_109, 7_081_804),
+            (1_111_111_111, 14_050_471),
+            (1_234_567_890, 89_005_924),
+            (2_000_000_000, 69_279_037),
+            (20_000_000_000, 65_353_130),
         ];
         for (seconds, rfc_code) in window {
             let counter = counter_for(seconds);
@@ -242,8 +238,14 @@ mod tests {
         let now = 1_700_000_000_i64;
         let code = format_code(totp(&secret, now));
         assert!(verify(&secret, &code, now, DEFAULT_WINDOW));
-        assert!(verify(&secret, &code, now + 30, DEFAULT_WINDOW), "one step ahead");
-        assert!(verify(&secret, &code, now - 30, DEFAULT_WINDOW), "one step behind");
+        assert!(
+            verify(&secret, &code, now + 30, DEFAULT_WINDOW),
+            "one step ahead"
+        );
+        assert!(
+            verify(&secret, &code, now - 30, DEFAULT_WINDOW),
+            "one step behind"
+        );
         assert!(
             !verify(&secret, &code, now + 30 * 5, DEFAULT_WINDOW),
             "five steps ahead is outside the window"
@@ -289,10 +291,7 @@ mod tests {
         for length in 1..=32_usize {
             let bytes: Vec<u8> = (0..length).map(|index| (index * 7 + 3) as u8).collect();
             let encoded = base32_encode(&bytes);
-            assert!(
-                !encoded.contains('='),
-                "unpadded, so a phone can type it"
-            );
+            assert!(!encoded.contains('='), "unpadded, so a phone can type it");
             assert_eq!(base32_decode(&encoded).expect("round trip"), bytes);
         }
     }

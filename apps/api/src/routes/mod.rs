@@ -194,36 +194,35 @@ pub fn router(state: AppState) -> Router {
     let iam_sessions =
         get(iam_security::list_sessions).layer(guards::require(&state, "iam.sessions.read"));
 
-    let iam_session = delete(iam_security::revoke_session)
-        .layer(guards::require(&state, "iam.sessions.revoke"));
+    let iam_session =
+        delete(iam_security::revoke_session).layer(guards::require(&state, "iam.sessions.revoke"));
 
-    let iam_sign_out_all = post(iam_security::sign_out_all)
-        .layer(guards::require(&state, "iam.sessions.revoke"));
+    let iam_sign_out_all =
+        post(iam_security::sign_out_all).layer(guards::require(&state, "iam.sessions.revoke"));
 
     let iam_devices =
         get(iam_security::list_devices).layer(guards::require(&state, "iam.devices.read"));
 
-    let iam_device_trust = post(iam_security::trust_device)
-        .layer(guards::require(&state, "iam.devices.manage"));
+    let iam_device_trust =
+        post(iam_security::trust_device).layer(guards::require(&state, "iam.devices.manage"));
 
-    let iam_device = delete(iam_security::forget_device)
-        .layer(guards::require(&state, "iam.devices.manage"));
+    let iam_device =
+        delete(iam_security::forget_device).layer(guards::require(&state, "iam.devices.manage"));
 
     // A factor belongs to an account, so the routes read with `users.read` and write with
     // `users.update` — the same keys that guard editing the account itself.
-    let iam_user_mfa =
-        get(iam_security::list_factors).layer(guards::require(&state, "users.read")).merge(
-            post(iam_security::enroll_totp).layer(guards::require(&state, "users.update")),
-        );
+    let iam_user_mfa = get(iam_security::list_factors)
+        .layer(guards::require(&state, "users.read"))
+        .merge(post(iam_security::enroll_totp).layer(guards::require(&state, "users.update")));
 
-    let iam_user_mfa_confirm = post(iam_security::confirm_totp)
-        .layer(guards::require(&state, "users.update"));
+    let iam_user_mfa_confirm =
+        post(iam_security::confirm_totp).layer(guards::require(&state, "users.update"));
 
-    let iam_user_mfa_reset = post(iam_security::reset_mfa)
-        .layer(guards::require(&state, "users.update"));
+    let iam_user_mfa_reset =
+        post(iam_security::reset_mfa).layer(guards::require(&state, "users.update"));
 
-    let iam_user_factor = delete(iam_security::revoke_factor)
-        .layer(guards::require(&state, "users.update"));
+    let iam_user_factor =
+        delete(iam_security::revoke_factor).layer(guards::require(&state, "users.update"));
 
     // The second factor of a sign-in is a public route (the sign-in is half done; there is no
     // session yet), and the step-up route needs the session it is improving.
@@ -606,7 +605,10 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/devices/{id}/trust", iam_device_trust)
         .route("/iam/devices/{id}", iam_device)
         .route("/iam/users/{id}/mfa", iam_user_mfa)
-        .route("/iam/users/{id}/mfa/{factor_id}/confirm", iam_user_mfa_confirm)
+        .route(
+            "/iam/users/{id}/mfa/{factor_id}/confirm",
+            iam_user_mfa_confirm,
+        )
         .route("/iam/users/{id}/mfa/{factor_id}", iam_user_factor)
         .route("/iam/users/{id}/reset-mfa", iam_user_mfa_reset)
         .route(

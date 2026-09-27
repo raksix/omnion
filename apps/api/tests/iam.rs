@@ -2456,7 +2456,10 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
     assert_eq!(refused.body["error"]["code"], "invalid_security_policy");
-    assert_eq!(refused.body["error"]["details"]["field"], "lockout_attempts");
+    assert_eq!(
+        refused.body["error"]["details"]["field"],
+        "lockout_attempts"
+    );
 
     // An unusable network is refused with the list named.
     let bad_network = call(
@@ -2469,11 +2472,13 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(bad_network.status, StatusCode::BAD_REQUEST, "{}", bad_network.body);
     assert_eq!(
-        bad_network.body["error"]["details"]["field"],
-        "ip_denylist"
+        bad_network.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_network.body
     );
+    assert_eq!(bad_network.body["error"]["details"]["field"], "ip_denylist");
 
     // ---- Lockout ------------------------------------------------------------------
     let (locked_id, locked_email) = fixture.add_account(Some(fixture.organization_id)).await;
@@ -2586,11 +2591,19 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
     let spray_ip = format!("198.51.100.{suffix}");
     let mut blocked_after = 0;
     for attempt in 1..=4 {
-        let response =
-            login_response(&fixture.state, &sprayed_email, "wrong again", Some(&spray_ip)).await;
+        let response = login_response(
+            &fixture.state,
+            &sprayed_email,
+            "wrong again",
+            Some(&spray_ip),
+        )
+        .await;
         if response.body["error"]["code"] == "address_blocked" {
             blocked_after = attempt;
-            assert_eq!(response.body["error"]["details"]["reason"], "address_failures");
+            assert_eq!(
+                response.body["error"]["details"]["reason"],
+                "address_failures"
+            );
             break;
         }
     }
@@ -2605,9 +2618,8 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
     let session = login_response(&fixture.state, &member_email, PASSWORD, None).await;
     assert_eq!(session.status, StatusCode::OK, "{}", session.body);
     let member_token = cookie_token(&session);
-    assert_eq!(
+    assert!(
         session.body["device"]["label"].as_str().is_some(),
-        true,
         "a sign-in registers the device it came from: {}",
         session.body
     );
@@ -2726,7 +2738,12 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
             request(Method::GET, "/api/v1/me", Some(token), None),
         )
         .await;
-        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{}", response.body);
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "{}",
+            response.body
+        );
     }
 
     // The concurrent cap is two (the policy above): the third sign-in retires the oldest.
@@ -2772,7 +2789,9 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
     assert!(!listed.is_empty(), "{}", devices.body);
     let device_id = listed[0]["id"].as_str().expect("device id").to_owned();
     assert!(
-        listed[0]["label"].as_str().is_some_and(|label| !label.is_empty()),
+        listed[0]["label"]
+            .as_str()
+            .is_some_and(|label| !label.is_empty()),
         "{}",
         devices.body
     );
@@ -2789,7 +2808,11 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
     .await;
     assert_eq!(trusted.status, StatusCode::OK, "{}", trusted.body);
     assert_eq!(trusted.body["trusted"], true, "{}", trusted.body);
-    assert!(trusted.body["trusted_until"].is_string(), "{}", trusted.body);
+    assert!(
+        trusted.body["trusted_until"].is_string(),
+        "{}",
+        trusted.body
+    );
 
     let forgotten = call(
         &fixture.state,
@@ -2868,7 +2891,10 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
         "{}",
         reset_without_step_up.body
     );
-    assert_eq!(reset_without_step_up.body["error"]["code"], "step_up_required");
+    assert_eq!(
+        reset_without_step_up.body["error"]["code"],
+        "step_up_required"
+    );
 
     // The step-up itself: the caller's own password.
     let stepped = call(
@@ -2895,7 +2921,12 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(wrong_step_up.status, StatusCode::UNAUTHORIZED, "{}", wrong_step_up.body);
+    assert_eq!(
+        wrong_step_up.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        wrong_step_up.body
+    );
 
     // Now the same two routes work.
     let issued = call(
@@ -2929,7 +2960,10 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
     )
     .await;
     assert_eq!(enrolment.status, StatusCode::OK, "{}", enrolment.body);
-    let secret_base32 = enrolment.body["secret"].as_str().expect("secret").to_owned();
+    let secret_base32 = enrolment.body["secret"]
+        .as_str()
+        .expect("secret")
+        .to_owned();
     let factor_id = enrolment.body["factor"]["id"]
         .as_str()
         .expect("factor id")
@@ -2959,7 +2993,12 @@ async fn sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(refused_code.status, StatusCode::BAD_REQUEST, "{}", refused_code.body);
+    assert_eq!(
+        refused_code.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused_code.body
+    );
 
     let confirmed = call(
         &fixture.state,

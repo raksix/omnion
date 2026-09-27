@@ -381,17 +381,11 @@ pub fn step_up_is_fresh(session: &Session, now: OffsetDateTime, window_minutes: 
 
 /// The state a reader sees for a session.
 #[must_use]
-pub fn state_of(
-    session: &SessionView,
-    now: OffsetDateTime,
-    idle_minutes: i32,
-) -> &'static str {
+pub fn state_of(session: &SessionView, now: OffsetDateTime, idle_minutes: i32) -> &'static str {
     if session.revoked_at.is_some() {
         return "revoked";
     }
-    if session.expires_at <= now
-        || session.absolute_expires_at.is_some_and(|end| end <= now)
-    {
+    if session.expires_at <= now || session.absolute_expires_at.is_some_and(|end| end <= now) {
         return "expired";
     }
     let idle_since = session.last_seen_at.unwrap_or(session.created_at);
@@ -590,18 +584,38 @@ mod tests {
     #[test]
     fn the_state_a_reader_sees_follows_the_policy() {
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(100);
-        let live = view(now, Some(now - time::Duration::minutes(5)), now + time::Duration::days(1), None);
+        let live = view(
+            now,
+            Some(now - time::Duration::minutes(5)),
+            now + time::Duration::days(1),
+            None,
+        );
         assert_eq!(state_of(&live, now, 120), "live");
 
         // Idle: untouched past the window while the row is still live.
-        let idle = view(now - time::Duration::days(1), Some(now - time::Duration::hours(3)), now + time::Duration::days(1), None);
+        let idle = view(
+            now - time::Duration::days(1),
+            Some(now - time::Duration::hours(3)),
+            now + time::Duration::days(1),
+            None,
+        );
         assert_eq!(state_of(&idle, now, 120), "idle");
 
         // A session never touched falls back to its creation time.
-        let never_touched = view(now - time::Duration::hours(4), None, now + time::Duration::days(1), None);
+        let never_touched = view(
+            now - time::Duration::hours(4),
+            None,
+            now + time::Duration::days(1),
+            None,
+        );
         assert_eq!(state_of(&never_touched, now, 120), "idle");
 
-        let expired = view(now - time::Duration::days(2), None, now - time::Duration::days(1), None);
+        let expired = view(
+            now - time::Duration::days(2),
+            None,
+            now - time::Duration::days(1),
+            None,
+        );
         assert_eq!(state_of(&expired, now, 120), "expired");
 
         let revoked = view(now, Some(now), now + time::Duration::days(1), Some(now));

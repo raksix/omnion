@@ -77,11 +77,13 @@ impl FromRequestParts<AppState> for CurrentSession {
 ///
 /// The guard (`crate::guards::require_or_machine`) has already authenticated the request and put
 /// one of the two principals into the extensions; this extractor only reads it back, so a handler
-/// never re-authenticates and a machine request never pretends to be a person.
+/// never re-authenticates and a machine request never pretends to be a person. The session is
+/// boxed for the same reason as in `Caller`: it is the large variant, and this value is built
+/// once per request.
 #[derive(Debug, Clone)]
 pub enum ApiCaller {
     /// A signed-in session.
-    Session(CurrentSession),
+    Session(Box<CurrentSession>),
     /// A service account that presented a key.
     Machine(crate::guards::MachinePrincipal),
 }
@@ -114,7 +116,7 @@ impl FromRequestParts<AppState> for ApiCaller {
         _state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         if let Some(session) = parts.extensions.get::<CurrentSession>() {
-            return Ok(Self::Session(session.clone()));
+            return Ok(Self::Session(Box::new(session.clone())));
         }
         if let Some(machine) = parts.extensions.get::<crate::guards::MachinePrincipal>() {
             return Ok(Self::Machine(machine.clone()));

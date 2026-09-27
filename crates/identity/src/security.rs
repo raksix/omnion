@@ -145,10 +145,7 @@ const POLICY_COLUMNS: &str = "organization_id, password_min_length, password_req
      mfa_required, updated_by, updated_at";
 
 /// Read the policy of an organization, or `None` when the row does not exist yet.
-pub async fn get_policy(
-    pool: &PgPool,
-    organization_id: Uuid,
-) -> Result<Option<SecurityPolicy>> {
+pub async fn get_policy(pool: &PgPool, organization_id: Uuid) -> Result<Option<SecurityPolicy>> {
     let policy: Option<SecurityPolicy> = sqlx::query_as(&format!(
         "select {POLICY_COLUMNS} from security_policies where organization_id = $1"
     ))
@@ -168,10 +165,12 @@ pub async fn ensure_policy(pool: &PgPool, organization_id: Uuid) -> Result<Secur
         return Ok(policy);
     }
 
-    sqlx::query("insert into security_policies (organization_id) values ($1) on conflict do nothing")
-        .bind(organization_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "insert into security_policies (organization_id) values ($1) on conflict do nothing",
+    )
+    .bind(organization_id)
+    .execute(pool)
+    .await?;
 
     get_policy(pool, organization_id)
         .await?
@@ -333,12 +332,7 @@ pub fn validate_patch(patch: &PolicyPatch) -> Result<()> {
         4,
     )?;
     range(patch.password_history, "password_history", 0, 24)?;
-    range(
-        patch.password_expiry_days,
-        "password_expiry_days",
-        0,
-        730,
-    )?;
+    range(patch.password_expiry_days, "password_expiry_days", 0, 730)?;
     range(patch.lockout_attempts, "lockout_attempts", 3, 50)?;
     range(patch.lockout_minutes, "lockout_minutes", 1, 1440)?;
     range(
@@ -347,12 +341,7 @@ pub fn validate_patch(patch: &PolicyPatch) -> Result<()> {
         5,
         10_080,
     )?;
-    range(
-        patch.session_absolute_days,
-        "session_absolute_days",
-        1,
-        365,
-    )?;
+    range(patch.session_absolute_days, "session_absolute_days", 1, 365)?;
     range(
         patch.session_concurrent_max,
         "session_concurrent_max",
@@ -618,7 +607,13 @@ mod tests {
         // Families never match.
         assert!(!v6.contains(&"10.0.0.1".parse().expect("ip")));
 
-        for bad in ["", "not-an-ip", "10.0.0.0/33", "2001:db8::/129", "10.0.0.0/x"] {
+        for bad in [
+            "",
+            "not-an-ip",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/x",
+        ] {
             assert!(Cidr::parse(bad).is_err(), "{bad:?} must be refused");
         }
     }

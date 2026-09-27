@@ -262,14 +262,11 @@ impl From<IdentityError> for ApiError {
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
-            IdentityError::InvalidPolicy { field, message } => Self::bad_request(
-                "invalid_security_policy",
-                format!("{field} {message}"),
-            )
-            .with_details(serde_json::json!({ "field": field })),
-            IdentityError::InvalidNetwork(message) => {
-                Self::bad_request("invalid_network", message)
+            IdentityError::InvalidPolicy { field, message } => {
+                Self::bad_request("invalid_security_policy", format!("{field} {message}"))
+                    .with_details(serde_json::json!({ "field": field }))
             }
+            IdentityError::InvalidNetwork(message) => Self::bad_request("invalid_network", message),
             IdentityError::FactorNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "factor_not_found",

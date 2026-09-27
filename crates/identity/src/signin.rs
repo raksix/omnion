@@ -184,7 +184,9 @@ pub async fn sign_in(
                 &AttemptRecord {
                     email: attempt_email,
                     user_id: account.as_ref().map(|account| account.user.id),
-                    organization_id: account.as_ref().and_then(|account| account.organization_id()),
+                    organization_id: account
+                        .as_ref()
+                        .and_then(|account| account.organization_id()),
                     ip: ip.map(str::to_owned),
                     user_agent: user_agent.map(str::to_owned),
                     outcome: "blocked",
@@ -205,7 +207,9 @@ pub async fn sign_in(
                 &AttemptRecord {
                     email: attempt_email,
                     user_id: account.as_ref().map(|account| account.user.id),
-                    organization_id: account.as_ref().and_then(|account| account.organization_id()),
+                    organization_id: account
+                        .as_ref()
+                        .and_then(|account| account.organization_id()),
                     ip: Some(ip.to_owned()),
                     user_agent: user_agent.map(str::to_owned),
                     outcome: "blocked",
@@ -307,7 +311,8 @@ pub async fn sign_in(
     clear_failures(pool, account.user.id).await?;
 
     if mfa::has_confirmed_factor(pool, account.user.id).await? {
-        let challenge = create_challenge(pool, account.user.id, PURPOSE_LOGIN, ip, user_agent).await?;
+        let challenge =
+            create_challenge(pool, account.user.id, PURPOSE_LOGIN, ip, user_agent).await?;
         record_attempt(
             pool,
             &AttemptRecord {
@@ -450,11 +455,7 @@ pub async fn create_challenge(
 }
 
 /// Consume a challenge and answer whose it was, or `None` when it is not usable.
-pub async fn consume_challenge(
-    pool: &PgPool,
-    token: &str,
-    purpose: &str,
-) -> Result<Option<Uuid>> {
+pub async fn consume_challenge(pool: &PgPool, token: &str, purpose: &str) -> Result<Option<Uuid>> {
     let token_hash = sessions::hash_token(token);
     let user_id: Option<Uuid> = sqlx::query_scalar(
         "update mfa_challenges set consumed_at = now() \

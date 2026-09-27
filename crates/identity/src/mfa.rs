@@ -186,10 +186,9 @@ pub async fn confirm_totp(
         .as_deref()
         .ok_or(IdentityError::Crypto)?;
     let secret = secret_box.decrypt(ciphertext)?;
-    let secret = totp::base32_decode(
-        std::str::from_utf8(&secret).map_err(|_| IdentityError::Crypto)?,
-    )
-    .ok_or(IdentityError::Crypto)?;
+    let secret =
+        totp::base32_decode(std::str::from_utf8(&secret).map_err(|_| IdentityError::Crypto)?)
+            .ok_or(IdentityError::Crypto)?;
 
     if !totp::verify(&secret, code, unix_seconds, totp::DEFAULT_WINDOW) {
         return Err(IdentityError::InvalidFactor(
@@ -197,12 +196,10 @@ pub async fn confirm_totp(
         ));
     }
 
-    sqlx::query(
-        "update mfa_factors set confirmed_at = now(), last_used_at = now() where id = $1",
-    )
-    .bind(factor_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("update mfa_factors set confirmed_at = now(), last_used_at = now() where id = $1")
+        .bind(factor_id)
+        .execute(pool)
+        .await?;
 
     // Recovery codes are re-issued on every confirmation: the old set belongs to the state the
     // account is leaving, and keeping both would mean two live sets.

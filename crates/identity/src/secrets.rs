@@ -250,6 +250,9 @@ mod tests {
         // The process environment is shared across tests in a binary; only assert the shape.
         let boxed = SecretBox::from_env();
         let envelope = boxed.encrypt(b"value");
-        assert_eq!(boxed.decrypt(&envelope).expect("decrypts"), b"value".to_vec());
+        assert_eq!(
+            boxed.decrypt(&envelope).expect("decrypts"),
+            b"value".to_vec()
+        );
     }
 }

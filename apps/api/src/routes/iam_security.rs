@@ -24,7 +24,7 @@ use omnion_identity::mfa;
 use omnion_identity::password::verify_password;
 use omnion_identity::secrets::SecretBox;
 use omnion_identity::security::{self, PolicyChange, PolicyPatch, SecurityPolicy};
-use omnion_identity::sessions::{self, SessionFilter, SessionView, STEP_UP_WINDOW_MINUTES};
+use omnion_identity::sessions::{self, STEP_UP_WINDOW_MINUTES, SessionFilter, SessionView};
 use omnion_identity::users;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -402,8 +402,8 @@ pub async fn list_sessions(
         include_inactive: query.include_inactive.unwrap_or(false),
     };
 
-    let idle_minutes = sessions::idle_minutes_for_organization(state.db().pool(), organization_id)
-        .await?;
+    let idle_minutes =
+        sessions::idle_minutes_for_organization(state.db().pool(), organization_id).await?;
     let now = OffsetDateTime::now_utc();
     let rows = sessions::list_sessions(state.db().pool(), &filter).await?;
 
@@ -655,7 +655,9 @@ pub struct DeviceBody {
 
 impl From<omnion_identity::devices::DeviceView> for DeviceBody {
     fn from(view: omnion_identity::devices::DeviceView) -> Self {
-        let trusted = view.trusted_until.is_some_and(|until| until > OffsetDateTime::now_utc());
+        let trusted = view
+            .trusted_until
+            .is_some_and(|until| until > OffsetDateTime::now_utc());
         Self {
             id: view.id,
             user_id: view.user_id,
@@ -749,11 +751,7 @@ pub async fn trust_device(
     let device = omnion_identity::devices::find(state.db().pool(), device_id)
         .await?
         .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "no such device",
-            )
+            ApiError::new(StatusCode::NOT_FOUND, "device_not_found", "no such device")
         })?;
     let owner_organization = organization_of(&state, device.user_id).await?;
     ensure_same_organization(&current, owner_organization)?;
@@ -766,9 +764,7 @@ pub async fn trust_device(
                 "days must be between 0 and 3650",
             ));
         }
-        (Some(days), _) => Some(
-            OffsetDateTime::now_utc() + time::Duration::days(i64::from(days)),
-        ),
+        (Some(days), _) => Some(OffsetDateTime::now_utc() + time::Duration::days(i64::from(days))),
         (None, Some(text)) => Some(OffsetDateTime::parse(text, &Rfc3339).map_err(|_| {
             ApiError::bad_request(
                 "invalid_trust_window",
@@ -791,11 +787,7 @@ pub async fn trust_device(
     let updated = omnion_identity::devices::set_trust(state.db().pool(), device_id, trusted_until)
         .await?
         .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "no such device",
-            )
+            ApiError::new(StatusCode::NOT_FOUND, "device_not_found", "no such device")
         })?;
 
     record(
@@ -803,7 +795,9 @@ pub async fn trust_device(
         NewAuditEntry::by_user(current.user.id, "iam.device_trusted")
             .organization(current.user.organization_id)
             .target("device", updated.id.to_string())
-            .metadata(json!({ "trusted_until": updated.trusted_until.map(|value| value.to_string()) })),
+            .metadata(
+                json!({ "trusted_until": updated.trusted_until.map(|value| value.to_string()) }),
+            ),
     )
     .await?;
 
@@ -820,11 +814,7 @@ pub async fn trust_device(
         .into_iter()
         .find(|candidate| candidate.id == updated.id)
         .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "no such device",
-            )
+            ApiError::new(StatusCode::NOT_FOUND, "device_not_found", "no such device")
         })?;
 
     Ok(Json(DeviceBody::from(view)))
@@ -839,11 +829,7 @@ pub async fn forget_device(
     let device = omnion_identity::devices::find(state.db().pool(), device_id)
         .await?
         .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "no such device",
-            )
+            ApiError::new(StatusCode::NOT_FOUND, "device_not_found", "no such device")
         })?;
     let owner_organization = organization_of(&state, device.user_id).await?;
     ensure_same_organization(&current, owner_organization)?;
@@ -851,11 +837,7 @@ pub async fn forget_device(
     let forgotten = omnion_identity::devices::forget(state.db().pool(), device_id)
         .await?
         .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "no such device",
-            )
+            ApiError::new(StatusCode::NOT_FOUND, "device_not_found", "no such device")
         })?;
 
     // A forgotten device must not keep a live session: "forget" means the device has to sign in
@@ -908,11 +890,7 @@ pub async fn forget_device(
         .into_iter()
         .find(|candidate| candidate.id == forgotten.id)
         .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "no such device",
-            )
+            ApiError::new(StatusCode::NOT_FOUND, "device_not_found", "no such device")
         })?;
 
     Ok(Json(DeviceBody::from(view)))
@@ -1055,13 +1033,7 @@ pub async fn enroll_totp(
     target_account(&state, &current, user_id).await?;
     let account = users::find_by_id(state.db().pool(), user_id)
         .await?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "user_not_found",
-                "no such account",
-            )
-        })?;
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "user_not_found", "no such account"))?;
 
     let secret_box = SecretBox::from_env();
     let enrollment = mfa::enroll_totp(
@@ -1121,7 +1093,9 @@ pub async fn confirm_totp(
         NewAuditEntry::by_user(current.user.id, "iam.mfa_enrolled")
             .organization(current.user.organization_id)
             .target("user", user_id.to_string())
-            .metadata(json!({ "factor_id": factor_id, "kind": "totp", "recovery_codes": codes.len() })),
+            .metadata(
+                json!({ "factor_id": factor_id, "kind": "totp", "recovery_codes": codes.len() }),
+            ),
     )
     .await?;
 
@@ -1208,7 +1182,9 @@ pub async fn reset_mfa(
     )
     .await?;
 
-    Ok(Json(json!({ "user_id": user_id, "factors_revoked": revoked })))
+    Ok(Json(
+        json!({ "user_id": user_id, "factors_revoked": revoked }),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1351,8 +1327,9 @@ pub async fn verify_mfa_login(
         ));
     };
 
-    let policy = omnion_identity::signin::session_policy_for(state.db().pool(), user.organization_id)
-        .await?;
+    let policy =
+        omnion_identity::signin::session_policy_for(state.db().pool(), user.organization_id)
+            .await?;
     let device = omnion_identity::devices::upsert(
         state.db().pool(),
         user.id,

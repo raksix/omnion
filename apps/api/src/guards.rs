@@ -151,7 +151,7 @@ where
         Box::pin(async move {
             match check_kind(&state, &headers, permission, kind).await {
                 Ok(Caller::Session(session)) => {
-                    request.extensions_mut().insert(session);
+                    request.extensions_mut().insert(*session);
                     inner.call(request).await
                 }
                 Ok(Caller::Machine(machine)) => {
@@ -165,10 +165,14 @@ where
 }
 
 /// Who called a guarded route.
+///
+/// The session is boxed: it carries the account and its methods, and a `Caller` is built once
+/// per request and immediately taken apart, so the enum stays small without an extra allocation
+/// per request mattering.
 #[derive(Debug, Clone)]
 pub enum Caller {
     /// A signed-in session.
-    Session(CurrentSession),
+    Session(Box<CurrentSession>),
     /// A service account that presented a key.
     Machine(MachinePrincipal),
 }
@@ -183,7 +187,7 @@ pub async fn check(
     permission: &str,
 ) -> Result<CurrentSession, ApiError> {
     match check_kind(state, headers, permission, GuardKind::Session).await? {
-        Caller::Session(session) => Ok(session),
+        Caller::Session(session) => Ok(*session),
         // Unreachable: a session-only guard never resolves a machine.
         Caller::Machine(_) => Err(ApiError::unauthorized(
             "unauthenticated",
@@ -206,7 +210,7 @@ pub async fn check_kind(
         let scope = scope_of(&session.user);
         let context = ResourceContext::from_scope(scope.clone());
         return match authorize(state.db().pool(), session.user.id, scope, permission).await? {
-            Decision::Allowed(_) => Ok(Caller::Session(session)),
+            Decision::Allowed(_) => Ok(Caller::Session(Box::new(session))),
             Decision::Denied { reason, source } => {
                 tracing::debug!(
                     permission,

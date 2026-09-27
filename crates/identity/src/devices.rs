@@ -299,8 +299,9 @@ mod tests {
         assert_eq!(browser, "Edge");
         assert_eq!(label, "Edge on Windows");
 
-        let (_, platform, browser) =
-            describe(Some("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari/604.1"));
+        let (_, platform, browser) = describe(Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari/604.1",
+        ));
         assert_eq!(platform, "iOS");
         assert_eq!(browser, "Safari");
 
