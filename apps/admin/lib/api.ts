@@ -47,7 +47,14 @@ export class ApiError extends Error {
   }
 }
 
-type ErrorBody = {
+/**
+ * The JSON body an API refusal carries.
+ *
+ * Exported because a module client (`lib/crm.ts`) has to read the same shape when it turns a
+ * non-2xx answer into the same `ApiError` — a second, subtly different error shape is how a
+ * `details.field` silently stops reaching the form.
+ */
+export type ErrorBody = {
   error?: {
     code?: string;
     message?: string;

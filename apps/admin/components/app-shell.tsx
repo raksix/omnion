@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
+import { BarChart3, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Users, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -19,6 +19,7 @@ const NAV = [
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
+  { href: "/crm/contacts", label: "CRM", icon: Users },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
