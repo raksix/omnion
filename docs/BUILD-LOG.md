@@ -1642,3 +1642,53 @@
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
+
+### Wave 5 · REQ-005 slice 1 — organization memberships, invitations and the switcher
+
+- **What.** The tenant layer becomes first class. A user belonged to exactly one organization
+  through `users.organization_id`, with no membership row, no way to invite anybody and no way
+  to hold a second tenant. Migration `0019` adds `organization_members` (status + a primary flag)
+  and `organization_invitations` (a hashed, single-use token with an expiry) and backfills one
+  primary membership per existing account with `on conflict do nothing`.
+  `crates/identity::memberships` carries the queries; every refusal is a typed `IdentityError`,
+  and an invalid token answers identically for unknown, revoked and used so a public link cannot
+  be used to discover a tenant. The API adds the member and invitation routes, the public preview
+  and acceptance, and the switcher's two `/me` routes — deliberately unguarded, because the
+  caller's binding lives in the organization they are leaving, so a permission guard would make
+  the second switch unreachable; the membership check inside the handler is the real
+  authorization. The panel gets `/organizations`, `/organizations/[id]`, the public
+  `/invite/[token]` page and the header switcher.
+- **Proof (Rust).** `cargo test -p omnion-api --test tenancy_members` → **7 passed** over the real
+  router: the invited address signs up, joins and lands in the organization; a used, expired and
+  revoked token each answer with their own reason; an existing member and a pending address are
+  both refused by name; the switcher moves the session and the data follows; a member of one
+  tenant cannot read another tenant's members; the backfill gives every home organization one
+  primary membership; a suspended member and a last primary are refused with their reason.
+  `cargo test -p omnion-identity` → **75 passed**. `cargo test -p omnion-api --test onboarding`
+  → **4 passed**. `pnpm typecheck && pnpm build` → exit 0, both apps.
+- **Proof (QA).** `QA_STACK=w5 … bash scripts/qa/run.sh` → 30 pages, 890 clicks, 76 fills, 926
+  screenshots. The new screens are clean: `/organizations` reports no overflow, no low contrast,
+  no unlabeled inputs, no duplicate ids, one `h1`, and the depth pass reads the empty search
+  state, refuses an unusable address in the field (`Enter a valid e-mail address — name@example.com`),
+  creates a real invitation, refuses the duplicate by name
+  (`this address already has a pending invitation in this organization`) and revokes it.
+- **The pass found two real defects, and both are fixed.** It reported `memberRows: 0` on the
+  only organization on the installation. Root cause: the first-run owner is platform-level by
+  design (`users.organization_id` stays null), so migration 0019's backfill skipped it and the
+  installation ended up with a tenant nobody belonged to. Creating the first organization now
+  writes the creator's primary membership, and the first-run test asserts it. It also reported a
+  400 on "Create organization": the form derived its slug from the raw name, so "QA sample" went
+  to the API and took a refusal the reader could not have predicted — it now normalizes to the
+  server's own rule, refuses an unusable slug in the field and shows the derived slug instead of
+  deriving it silently. Both fixes are in `b347de6`.
+- **The host, not the tree.** Three QA passes in a row died with `Page crashed` and the build
+  failed twice with `linking with cc failed` / `No space left on device`. The volume was at
+  literally 4K free: seven writers hold 1–17G of cargo targets each on one 60G `/mnt/apopic`.
+  Nothing in another writer's tree was touched; the reclaim was caches (`.next`, `target/debug/
+  incremental`, `target/debug/deps` of this worktree) plus `.npm`/`apt`/journal on `/`. A pass
+  that survives also needs the load to dip: with the load average above ~20 Chromium's renderer
+  is killed, and with `MemAvailable` above 8G the same pass completes end to end. A useful
+  habit for the next writer: watch `df` before a long build rather than after it fails.
+- **Next.** REQ-005 slice **2** — departments and scoped roles: `departments` and
+  `department_members`, `role_bindings` at department scope, the member drawer with binding
+  management and the Departments tab.
