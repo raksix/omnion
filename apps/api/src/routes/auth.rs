@@ -151,6 +151,49 @@ pub async fn login(
         }
     };
 
+    start_session(
+        &state,
+        &user,
+        user_agent,
+        ip_address,
+        vec!["password".to_owned()],
+    )
+    .await
+}
+
+/// End the current session. Idempotent: a request without a session is still a success.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(token) = cookies::session_token(&headers) {
+        let revoked = sessions::revoke_session(state.db().pool(), &token).await?;
+        tracing::info!(revoked, "session revoked");
+    }
+
+    let secure = !state.config().env.is_development();
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookies::cleared_session_cookie(secure))
+            .expect("cleared cookie is valid header text"),
+    );
+    Ok(response)
+}
+
+/// Start a session for an account and answer with the cookie.
+///
+/// This is the shared tail of every sign-in path: the password alone, and the passkey that
+/// finishes one (`auth/webauthn/authenticate/complete`). The session it creates is a full one —
+/// device, policy lifetimes, auth methods — so a passkey sign-in is indistinguishable from a
+/// password sign-in except by the methods it records.
+pub(crate) async fn start_session(
+    state: &AppState,
+    user: &omnion_identity::User,
+    user_agent: Option<String>,
+    ip_address: Option<String>,
+    auth_methods: Vec<String>,
+) -> Result<Response, ApiError> {
     let policy = signin::session_policy_for(state.db().pool(), user.organization_id).await?;
     let trust_days = match user.organization_id {
         Some(organization_id) => {
@@ -175,10 +218,10 @@ pub async fn login(
         state.db().pool(),
         user.id,
         NewSession {
-            user_agent: user_agent.clone(),
-            ip_address: ip_address.clone(),
+            user_agent,
+            ip_address,
             device_id: Some(device.id),
-            auth_methods: vec!["password".to_owned()],
+            auth_methods,
         },
         policy,
     )
@@ -190,7 +233,7 @@ pub async fn login(
     let cookie = cookies::session_cookie(&token, sessions::SESSION_TTL_SECONDS, secure);
 
     let mut response = Json(LoginResponse {
-        user: UserBody::from(&user),
+        user: UserBody::from(user),
         device: DeviceBody {
             id: device.id,
             label: device.label,
@@ -206,26 +249,6 @@ pub async fn login(
     response.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("session cookie is valid header text"),
-    );
-    Ok(response)
-}
-
-/// End the current session. Idempotent: a request without a session is still a success.
-pub async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    if let Some(token) = cookies::session_token(&headers) {
-        let revoked = sessions::revoke_session(state.db().pool(), &token).await?;
-        tracing::info!(revoked, "session revoked");
-    }
-
-    let secure = !state.config().env.is_development();
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&cookies::cleared_session_cookie(secure))
-            .expect("cleared cookie is valid header text"),
     );
     Ok(response)
 }

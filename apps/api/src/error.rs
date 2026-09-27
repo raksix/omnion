@@ -275,6 +275,11 @@ impl From<IdentityError> for ApiError {
             IdentityError::InvalidFactor(message) => {
                 Self::bad_request("invalid_factor_code", message)
             }
+            // A refused ceremony (REQ-006, slice 3b): the message names the one check that did
+            // not hold, and the panel shows it next to the passkey step.
+            IdentityError::WebAuthn(message) => {
+                Self::bad_request("webauthn_refused", message)
+            }
             // An envelope that cannot be read is never the caller's fault: either the key this
             // installation uses changed, or the value was tampered with. Both are for the
             // operator, and the message says which knob to look at.

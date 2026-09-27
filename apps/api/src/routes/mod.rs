@@ -87,6 +87,7 @@ pub mod readyz;
 pub mod search;
 pub mod tenancy;
 pub mod webhooks;
+pub mod webauthn;
 pub mod workflows;
 
 use axum::Router;
@@ -228,6 +229,16 @@ pub fn router(state: AppState) -> Router {
     // session yet), and the step-up route needs the session it is improving.
     let auth_mfa_verify = post(iam_security::verify_mfa_login);
     let auth_step_up = post(iam_security::step_up);
+
+    // Passkeys (REQ-006, slice 3b): enrolment runs behind the caller's own session (a passkey
+    // belongs to the account at the keyboard), and the sign-in half sits beside `auth/mfa/verify`
+    // — a half-finished sign-in that a verified assertion turns into a session.
+    let webauthn_passkeys = get(webauthn::list_passkeys);
+    let webauthn_passkey = delete(webauthn::revoke_passkey);
+    let webauthn_register_begin = post(webauthn::register_begin);
+    let webauthn_register_complete = post(webauthn::register_complete);
+    let auth_webauthn_begin = post(webauthn::authenticate_begin);
+    let auth_webauthn_complete = post(webauthn::authenticate_complete);
 
     // Tenancy: reading needs a read permission, every mutation its own key.
     let organizations = get(tenancy::list_organizations)
@@ -540,6 +551,15 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/mfa/verify", auth_mfa_verify)
         .route("/auth/step-up", auth_step_up)
+        .route("/auth/webauthn/passkeys", webauthn_passkeys)
+        .route("/auth/webauthn/passkeys/{factor_id}", webauthn_passkey)
+        .route("/auth/webauthn/register/begin", webauthn_register_begin)
+        .route("/auth/webauthn/register/complete", webauthn_register_complete)
+        .route("/auth/webauthn/authenticate/begin", auth_webauthn_begin)
+        .route(
+            "/auth/webauthn/authenticate/complete",
+            auth_webauthn_complete,
+        )
         .route("/me", get(me::me))
         .route("/search", search_route)
         .route("/search/suggest", search_suggest)

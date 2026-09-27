@@ -34,3 +34,9 @@ omnion-workflows = { path = "../../crates/workflows" }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
+# signs the ceremony's own message, so the verification runs exactly as it does in production.
+p256.workspace = true
+base64.workspace = true
+sha2 = "0.10"
+rand = "0.8"
