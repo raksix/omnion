@@ -1810,3 +1810,24 @@ QA_STACK=w6 … bash scripts/qa/run.sh                        → see below
   100% to 71% mid-tick when a sibling loop ran its own reclamation. This worktree's `target/` is
   a symlink into `/dev/shm`, so a full volume cannot corrupt *this* build — that one decision
   (taken earlier) is what kept the gates runnable through the incident.
+
+### Two environment findings from the QA pass
+
+- **The concurrency slot deadlocked every pass (fixed here, `0f50e80`).** `run.sh` takes its slot
+  through `$(… | tail -n 1)`, and the background holder that keeps the place alive inherited that
+  pipe. The substitution therefore waited for an EOF the holder would never send: the pass hung
+  silently with only `place taken` in the log. Worse, two places whose owner had died stayed taken
+  until `WAIT+900`, so later passes were queued out with no way to recover. The holder now runs
+  with stdout closed and a dead owner's place is reclaimed at once. Proof: with both places
+  occupied (one live, one dead) the script returns a pid in **0.2 s** instead of hanging.
+- **The walkthrough has no role, so no permission-guarded screen is actually exercised.** A fresh
+  QA database has **zero rows in `role_bindings`** (verified: `select count(*)` → 0) while the
+  catalogue holds all 8 `secrets.*` keys. The walkthrough signs in as the account the wizard
+  creates, and that account carries no role, so `/secrets/credentials` and `/secrets/slots`
+  correctly render `this action requires the "secrets.read" permission`. The denial is *correct
+  behaviour* — the screens refused exactly what they should — but it means the populated table,
+  the editor drawer and the validator chip have **not** been seen in a browser yet, and this tick
+  does not claim otherwise. The same cause explains the `console-error` shots that also appear on
+  `ai`, `analytics` and the `iam-*` screens: it is one harness gap, not per-screen defects.
+  **Owner action:** the QA pass needs to bind the owner role after the wizard (`seed::bind_owner`
+  is what the API integration tests use) before any permission-guarded screen counts as proven.
