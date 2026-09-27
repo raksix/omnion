@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** in-progress (slice 3 · `8ecfba0`, `0cb9920`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** in-progress (slice 3 · `8ecfba0`, `0cb9920`, `59cc837`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
