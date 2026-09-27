@@ -20,6 +20,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::extract::Path;
 use axum::routing::{get as route_get, post as route_post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
@@ -39,9 +40,15 @@ use uuid::Uuid;
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
-/// A running mock provider: its base URL and the task that serves it.
+/// A running mock provider: its base URLs (one per protocol shape) and the task serving them.
+///
+/// It answers the OpenAI-compatible, the messages and the generateContent shapes from one
+/// process, so the platform's three adapters are proven against a real socket rather than
+/// against a fixture — and a dead port (`:1`) stands in for an endpoint that is simply not there.
 struct MockProvider {
     base_url: String,
+    /// A second prefix of the same mock, serving Gemini's own model-list shape.
+    gemini_base_url: String,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -55,7 +62,13 @@ impl MockProvider {
 
         let app = Router::new()
             .route("/v1/models", route_get(mock_models))
-            .route("/v1/chat/completions", route_post(mock_chat));
+            .route("/gemini/v1/models", route_get(mock_gemini_models))
+            .route("/gemini/v1/models/{op}", route_post(mock_generate))
+            .route("/v1/chat/completions", route_post(mock_chat))
+            .route("/v1/messages", route_post(mock_messages))
+            // axum allows one parameter per path segment, so the mock takes the whole
+            // `{model}:generateContent` tail — the platform sends exactly that.
+            .route("/v1/models/{op}", route_post(mock_generate));
 
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -63,9 +76,109 @@ impl MockProvider {
 
         Self {
             base_url: format!("http://{address}/v1"),
+            gemini_base_url: format!("http://{address}/gemini/v1"),
             task,
         }
     }
+
+    /// A base URL nothing is listening on.
+    fn dead_base_url() -> String {
+        "http://127.0.0.1:1/v1".to_owned()
+    }
+}
+
+/// `POST /v1/messages` — the messages protocol, streamed or whole.
+async fn mock_messages(Json(body): Json<Value>) -> Response {
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    if body["messages"].as_array().is_none_or(|turns| turns.is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "messages must not be empty" } })),
+        )
+            .into_response();
+    }
+
+    if body["stream"].as_bool().unwrap_or(false) {
+        let mut sse = String::new();
+        sse.push_str(&format!(
+            "event: message_start\ndata: {}\n\n",
+            json!({ "type": "message_start", "message": { "usage": { "input_tokens": 6 } } })
+        ));
+        sse.push_str(&format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({ "type": "content_block_delta", "delta": { "type": "text_delta", "text": "Hello from messages." } })
+        ));
+        sse.push_str(&format!(
+            "event: message_delta\ndata: {}\n\n",
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 5 },
+            })
+        ));
+        sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            sse,
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "id": "msg_mock",
+        "model": model,
+        "content": [{ "type": "text", "text": "Hello from messages." }],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 6, "output_tokens": 5 },
+    }))
+    .into_response()
+}
+
+/// `POST /v1/models/{model}:generateContent` — the generateContent shape.
+async fn mock_generate(Path(op): Path<String>, Json(body): Json<Value>) -> Response {
+    let streaming = op.ends_with(":streamGenerateContent");
+
+    if body["contents"].as_array().is_none_or(|turns| turns.is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "contents must not be empty" } })),
+        )
+            .into_response();
+    }
+
+    let answer = json!({
+        "candidates": [{
+            "content": { "parts": [{ "text": "Hello from Gemini." }] },
+            "finishReason": "STOP",
+        }],
+        "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7 },
+    });
+
+    // The platform always asks for a stream, so the mock answers the streaming operation: the
+    // same chunk shape, then a final chunk carrying the finish reason and the usage.
+    if streaming {
+        let mut sse = String::new();
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "candidates": [{ "content": { "parts": [{ "text": "Hello from Gemini." }] } }] })
+        ));
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }],
+                "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7 },
+            })
+        ));
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            sse,
+        )
+            .into_response();
+    }
+
+    Json(answer).into_response()
 }
 
 impl Drop for MockProvider {
@@ -79,6 +192,19 @@ async fn mock_models() -> Json<Value> {
     Json(json!({
         "object": "list",
         "data": [{ "id": "mock-small" }, { "id": "mock-large" }]
+    }))
+}
+
+/// `GET /v1/models` on a Gemini-shaped provider: the same call, the other list shape.
+///
+/// The mock routes by method above, so this handler is bound to its own path and the Gemini
+/// provider in the suite is pointed at it — the shape difference is the point being proven.
+async fn mock_gemini_models() -> Json<Value> {
+    Json(json!({
+        "models": [
+            { "name": "models/gemini-1.5-pro" },
+            { "name": "models/gemini-1.5-flash" },
+        ]
     }))
 }
 
@@ -730,6 +856,509 @@ async fn the_chat_asks_for_the_ai_chat_permission() {
         .expect("the member must read")
         .expect("the member exists");
     assert_eq!(member.status, "active");
+
+    harness.dispose().await;
+}
+
+
+/// REQ-097 slice 1 over the real router: the protocol list, the three adapters, and the
+/// connection test — green against a live endpoint, and naming the step against a dead one.
+#[tokio::test]
+async fn the_three_protocols_connect_test_and_stream_through_one_normalised_shape() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let token = token_of(&owner);
+
+    // The form's vocabulary: three protocols, and the bounds the same constants enforce.
+    let protocols = harness.call(get("/api/v1/ai/protocols", Some(&token))).await;
+    assert_eq!(protocols.status, StatusCode::OK, "{:?}", protocols.body);
+    let keys: Vec<&str> = protocols.body["protocols"]
+        .as_array()
+        .expect("a protocol list")
+        .iter()
+        .map(|entry| entry["protocol"].as_str().expect("a key"))
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["openai_compatible", "anthropic_messages", "google_gemini"]
+    );
+    assert_eq!(protocols.body["bounds"]["timeout_ms_min"], 1000);
+    assert_eq!(protocols.body["bounds"]["timeout_ms_max"], 120000);
+    assert_eq!(protocols.body["bounds"]["max_retries_max"], 5);
+
+    // A protocol outside the three is refused, and the refusal names the supported values.
+    let refused = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({ "name": "Robot", "protocol": "grpc", "base_url": mock.base_url }),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
+    assert_eq!(refused.body["error"]["code"], "invalid_provider");
+    let message = refused.body["error"]["message"].as_str().unwrap_or_default();
+    for supported in ["openai_compatible", "anthropic_messages", "google_gemini"] {
+        assert!(message.contains(supported), "the refusal names {supported}: {message}");
+    }
+
+    // Each protocol connects, keeps its kind, and starts with an unknown health verdict.
+    for (protocol, kind, base_url, model_key, expected_answer) in [
+        (
+            "openai_compatible",
+            "local",
+            mock.base_url.as_str(),
+            "mock-small",
+            "Hello from the mock",
+        ),
+        (
+            "anthropic_messages",
+            "cloud",
+            mock.base_url.as_str(),
+            "mock-large",
+            "Hello from messages.",
+        ),
+        // Gemini's own list shape is served from the same mock under a second prefix, so the
+        // adapter's `models/`-stripping is proven against a real body rather than a fixture.
+        (
+            "google_gemini",
+            "cloud",
+            mock.gemini_base_url.as_str(),
+            "gemini-1.5-pro",
+            "Hello from Gemini.",
+        ),
+    ] {
+        let created = harness
+            .call(post(
+                "/api/v1/ai/providers",
+                json!({
+                    "name": format!("Provider {protocol}"),
+                    "protocol": protocol,
+                    "kind": kind,
+                    "base_url": base_url,
+                    "timeout_ms": 20000,
+                    "max_retries": 2,
+                    "priority": 50,
+                    "models": [model_key],
+                }),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{protocol}: {:?}", created.body);
+        assert_eq!(created.body["protocol"], protocol);
+        assert_eq!(created.body["kind"], kind);
+        assert_eq!(created.body["last_health"], "unknown");
+        assert_eq!(created.body["timeout_ms"], 20000);
+        assert_eq!(created.body["max_retries"], 2);
+        assert_eq!(created.body["priority"], 50);
+        assert!(created.body.get("api_key").is_none(), "{protocol}: the key never comes back");
+
+        // The connection test: five steps, every applicable one green, on a live endpoint.
+        let provider_id = created.body["id"].as_str().expect("an id");
+        let tested = harness
+            .call(post(
+                &format!("/api/v1/ai/providers/{provider_id}/test"),
+                json!({}),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(tested.status, StatusCode::OK, "{protocol}: {}", tested.text);
+        assert_eq!(tested.body["ok"], true, "{protocol}: {}", tested.text);
+        let steps = tested.body["steps"].as_array().expect("steps");
+        assert_eq!(steps.len(), 5, "{protocol}: the five steps are always reported");
+        for step in steps {
+            // A plain-http local endpoint has no certificate to check, so that step is skipped —
+            // and it says so rather than ticking itself green. Every other step must be `ok`.
+            if step["step"] == "tls" && step["status"] == "skipped" {
+                assert_eq!(step["note"], "the endpoint is plain http", "{protocol}");
+                continue;
+            }
+            assert_eq!(step["status"], "ok", "{protocol}: {}", step);
+        }
+
+        assert!(tested.body["total_ms"].as_i64().is_some());
+        assert_eq!(tested.body["protocol"], protocol);
+
+        // And a streamed answer through the same adapter reaches the panel in one shape.
+        let streamed = harness
+            .call(post(
+                "/api/v1/ai/chat",
+                chat(Some(&format!("Provider {protocol}/{model_key}"))),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(streamed.status, StatusCode::OK, "{protocol}: {}", streamed.text);
+        let events = sse_events(&streamed.text);
+        assert_eq!(events[0].0, "start", "{protocol}: the start frame comes first");
+        assert_eq!(
+            events[0].1["protocol"], protocol,
+            "{protocol}: the start frame names the protocol it spoke"
+        );
+        let answer = streamed_answer(&events);
+        assert!(
+            answer.contains(expected_answer),
+            "{protocol}: the answer came through the adapter, got: {answer}"
+        );
+        let done = events
+            .iter()
+            .find(|(name, _)| name == "done")
+            .expect("a done frame");
+        assert!(
+            done.1["usage"].is_null() || done.1["usage"]["total_tokens"].is_number(),
+            "{protocol}: usage is reported or honestly null, never invented: {}",
+            done.1
+        );
+    }
+
+    harness.dispose().await;
+}
+
+/// The connection test against an endpoint that is not there names the step and stops there.
+#[tokio::test]
+async fn the_connection_test_names_the_failing_step_of_a_dead_endpoint() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let token = token_of(&owner);
+
+    let created = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Local Ollama",
+                "protocol": "openai_compatible",
+                "kind": "local",
+                "base_url": MockProvider::dead_base_url(),
+            }),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let provider_id = created.body["id"].as_str().expect("an id");
+
+    let tested = harness
+        .call(
+            post(
+                &format!("/api/v1/ai/providers/{provider_id}/test"),
+                json!({}),
+                Some(&token),
+            ),
+        )
+        .await;
+    assert_eq!(tested.status, StatusCode::OK, "a failing test is a report, not an HTTP failure");
+    assert_eq!(tested.body["ok"], false);
+    assert_eq!(tested.body["failing_step"], "resolve");
+    let steps = tested.body["steps"].as_array().expect("steps");
+    assert_eq!(steps[0]["status"], "failed");
+    assert!(
+        steps[0]["error"].as_str().unwrap_or_default().len() > 0,
+        "the failing step carries its own reason"
+    );
+    // Nothing after the first failure claims a verdict.
+    for step in steps.iter().skip(1) {
+        assert_eq!(step["status"], "pending", "{}", step);
+    }
+
+    // The verdict is stored, so the list shows a provider that failed its test.
+    let listed = harness
+        .call(get("/api/v1/ai/providers", Some(&token)))
+        .await;
+    let row = listed.body["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["name"] == "Local Ollama")
+        .expect("the provider");
+    assert_eq!(row["last_health"], "down");
+    assert!(row["last_error"].as_str().is_some_and(|text| !text.is_empty()));
+    assert!(row["last_checked_at"].as_str().is_some());
+
+    // And the failure is audited under its own event.
+    let audit = harness
+        .call(get("/api/v1/iam/audit", Some(&token)))
+        .await;
+    assert_eq!(audit.status, StatusCode::OK, "{}", audit.text);
+    let actions: Vec<&str> = audit.body["entries"]
+        .as_array()
+        .expect("audit entries")
+        .iter()
+        .filter_map(|entry| entry["action"].as_str())
+        .collect();
+    assert!(
+        actions.contains(&"ai.provider.test_failed"),
+        "a failed test is audited under its own event: {actions:?}"
+    );
+
+    harness.dispose().await;
+}
+
+/// A provider pointed at a platform metadata endpoint is refused before a socket is opened.
+#[tokio::test]
+async fn a_metadata_endpoint_is_never_dialled() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let token = token_of(&owner);
+
+    let created = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Cloud metadata",
+                "kind": "cloud",
+                "base_url": "http://169.254.169.254/latest/meta-data",
+            }),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let provider_id = created.body["id"].as_str().expect("an id");
+
+    let tested = harness
+        .call(
+            post(
+                &format!("/api/v1/ai/providers/{provider_id}/test"),
+                json!({}),
+                Some(&token),
+            ),
+        )
+        .await;
+    assert_eq!(tested.body["ok"], false);
+    assert_eq!(tested.body["failing_step"], "resolve");
+    assert!(
+        tested.body["steps"][0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("metadata endpoint"),
+        "{}",
+        tested.body["steps"][0]["error"]
+    );
+
+    harness.dispose().await;
+}
+
+/// The connection test is a `manage` power, and the numeric bounds are enforced where the form
+/// validates them.
+#[tokio::test]
+async fn the_runtime_columns_and_the_test_permission_are_enforced() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let owner_token = token_of(&owner);
+    let (member_id, member_token) = account(
+        &harness,
+        &format!("member-{}@omnion.test", Uuid::new_v4().simple()),
+    )
+    .await;
+    let member_role = role_store::find_role_by_key(harness.db.pool(), None, "member")
+        .await
+        .expect("the member role must be readable")
+        .expect("the member role exists");
+    bindings::grant_if_missing(
+        harness.db.pool(),
+        NewBinding {
+            role_id: member_role.id,
+            user_id: member_id,
+            scope: Scope::Global,
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the member binding must be written");
+
+    // Every numeric bound is refused with the same code the form reads.
+    for (field, value) in [
+        ("timeout_ms", 10),
+        ("timeout_ms", 200_000),
+        ("max_retries", -1),
+        ("max_retries", 9),
+        ("priority", 0),
+        ("priority", 5000),
+    ] {
+        let refused = harness
+            .call(
+                post(
+                    "/api/v1/ai/providers",
+                    json!({
+                        "name": format!("Bounds {field} {value}"),
+                        "base_url": mock.base_url,
+                        field: value,
+                    }),
+                    Some(&owner_token),
+                ),
+            )
+            .await;
+        assert_eq!(
+            refused.status, StatusCode::BAD_REQUEST,
+            "{field}={value}: {:?}",
+            refused.body
+        );
+        assert_eq!(refused.body["error"]["code"], "invalid_provider");
+    }
+
+    let bad_kind = harness
+        .call(
+            post(
+                "/api/v1/ai/providers",
+                json!({ "name": "Odd kind", "kind": "on-premises", "base_url": mock.base_url }),
+                Some(&owner_token),
+            ),
+        )
+        .await;
+    assert_eq!(bad_kind.status, StatusCode::BAD_REQUEST);
+    assert!(
+        bad_kind.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cloud, local"),
+        "{:?}",
+        bad_kind.body
+    );
+
+    // A valid provider, then the test: the owner may run it, a member may not.
+    let created = harness
+        .call(
+            post(
+                "/api/v1/ai/providers",
+                json!({
+                    "name": "Local",
+                    "kind": "local",
+                    "base_url": mock.base_url,
+                    "timeout_ms": 5000,
+                    "max_retries": 0,
+                    "priority": 10,
+                    "models": ["mock-small"],
+                }),
+                Some(&owner_token),
+            ),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let provider_id = created.body["id"].as_str().expect("an id").to_owned();
+
+    let denied = harness
+        .call(
+            post(
+                &format!("/api/v1/ai/providers/{provider_id}/test"),
+                json!({}),
+                Some(&member_token),
+            ),
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{:?}", denied.body);
+    assert_eq!(denied.body["error"]["code"], "permission_denied");
+
+    // An update carries the runtime columns through, and each is validated in place.
+    let updated = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/providers/{provider_id}"),
+            Some(&owner_token),
+            Some(json!({
+                "kind": "cloud",
+                "timeout_ms": 45000,
+                "max_retries": 3,
+                "priority": 20,
+            })),
+        ))
+        .await;
+    assert_eq!(updated.status, StatusCode::OK, "{:?}", updated.body);
+    assert_eq!(updated.body["kind"], "cloud");
+    assert_eq!(updated.body["timeout_ms"], 45000);
+    assert_eq!(updated.body["max_retries"], 3);
+    assert_eq!(updated.body["priority"], 20);
+
+    // The failover chain is the enabled providers in priority order, ties broken by name.
+    let second = harness
+        .call(
+            post(
+                "/api/v1/ai/providers",
+                json!({
+                    "name": "Aaa local",
+                    "base_url": mock.base_url,
+                    "priority": 20,
+                    "models": ["mock-small"],
+                }),
+                Some(&owner_token),
+            ),
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{:?}", second.body);
+    let chain = omnion_ai_hub::failover_chain(harness.db.pool())
+        .await
+        .expect("the chain reads");
+    assert_eq!(
+        chain
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Aaa local", "Local"],
+        "a shared priority is broken by the name, so the order is total"
+    );
+
+    // An unknown provider id is a 404, never a 403 and never another installation's row.
+    let unknown = harness
+        .call(
+            post(
+                &format!("/api/v1/ai/providers/{}/test", Uuid::new_v4()),
+                json!({}),
+                Some(&owner_token),
+            ),
+        )
+        .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{:?}", unknown.body);
+    assert_eq!(unknown.body["error"]["code"], "provider_not_found");
 
     harness.dispose().await;
 }
