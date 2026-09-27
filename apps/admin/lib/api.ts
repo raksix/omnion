@@ -3141,3 +3141,337 @@ export function fetchIamProvisioningLog(input: {
   const query = params.toString();
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Automations (docs/requests/REQ-003) — trigger → condition → action
+// ---------------------------------------------------------------------------------------------
+
+/** One payload field of a documented event, as the condition picker offers it. */
+export type AutomationEventField = {
+  /** The field as it appears in the payload, dotted for nesting. */
+  key: string;
+  /** `string`, `number`, `boolean`, `array` or `object`. */
+  kind: string;
+  /** What the field holds, in product language. */
+  label: string;
+};
+
+/** One event of the library. */
+export type AutomationEvent = {
+  /** Event name as the bus records it. */
+  name: string;
+  /** What happened, in product language. */
+  description: string;
+  /** The group the picker files it under. */
+  group: string;
+  /** The payload fields a condition or binding may read. */
+  fields: AutomationEventField[];
+  /** `true` when the event belongs to a site. */
+  site_scoped: boolean;
+};
+
+/** One operator of the closed comparison set. */
+export type AutomationOperator = {
+  /** Stable operator key. */
+  key: string;
+  /** `false` for the two existence operators, which take no value. */
+  needs_value: boolean;
+};
+
+/** One action of the closed action set. */
+export type AutomationAction = {
+  /** Stable action key. */
+  key: string;
+  /** What it does, in product language. */
+  description: string;
+  /** `true` when the action touches the world rather than the run only. */
+  host: boolean;
+};
+
+/** The closed vocabulary a rule is written in. */
+export type AutomationCatalogue = {
+  /** The event library, with the payload fields each event carries. */
+  events: AutomationEvent[];
+  /** The closed comparison set. */
+  condition_operators: AutomationOperator[];
+  /** The closed action set. */
+  actions: AutomationAction[];
+  /** How the rule starts. */
+  trigger_kinds: string[];
+  /** The condition group modes the editor offers. */
+  group_modes: string[];
+  /** How deep groups may nest. */
+  max_group_depth: number;
+  /** How many conditions and groups a rule may carry in total. */
+  max_conditions: number;
+  /** The event a webhook trigger listens for. */
+  hook_event: string;
+  /** The hook path with the token left out. */
+  hook_path_template: string;
+  /** How a payload field is named inside a condition or a binding. */
+  binding_syntax: string;
+  /** An example of the payload an inbound call produces. */
+  hook_sample: Record<string, unknown>;
+};
+
+/** One comparison inside a condition group. */
+export type AutomationCondition = {
+  /** Field path into the event payload. */
+  field: string;
+  /** How the field is compared. */
+  operator: string;
+  /** Value to compare with; absent for the two existence operators. */
+  value?: unknown;
+};
+
+/** One member of a condition group: a comparison or a nested group. */
+export type AutomationNode = AutomationCondition | AutomationGroup;
+
+/** A group of condition nodes. */
+export type AutomationGroup = {
+  /** `all` (every member holds) or `any` (one member holds). */
+  mode?: "all" | "any";
+  all?: AutomationNode[];
+  any?: AutomationNode[];
+  /** Members of a nested group, when the panel holds the flat editing shape. */
+  nodes?: AutomationNode[];
+};
+
+/** The hook surface of a webhook-triggered rule. */
+export type AutomationHook = {
+  /** `true` once a token has been minted. */
+  configured: boolean;
+  /** How many calls the current window has spent. */
+  window_used: number;
+  /** The window's ceiling. */
+  window_limit: number;
+  /** When the window rolls over. */
+  window_resets_at: string;
+  /** The path template, with the token left out. */
+  path_template: string;
+};
+
+/** One automation rule. */
+export type Automation = {
+  /** Rule id. */
+  id: string;
+  /** Organization that owns the rule. */
+  organization_id: string;
+  /** Site the rule is bound to, when it is. */
+  site_id: string | null;
+  /** Display name. */
+  name: string;
+  /** Free-form description. */
+  description: string;
+  /** Whether the rule fires. */
+  enabled: boolean;
+  /** Event the rule listens for. */
+  event: string;
+  /** How the rule starts: `event` or `inbound_webhook`. */
+  trigger: string;
+  /** The condition tree as stored. */
+  conditions: AutomationGroup | AutomationCondition[];
+  /** How many comparisons the tree carries. */
+  condition_count: number;
+  /** Actions to run, in order. */
+  actions: AutomationNode[];
+  /** How many runs the trigger has started. */
+  trigger_count: number;
+  /** When the rule last fired. */
+  last_triggered_at: string | null;
+  /** Creation time. */
+  created_at: string;
+  /** Last change. */
+  updated_at: string;
+  /** The hook surface, for a webhook-triggered rule. */
+  hook?: AutomationHook;
+};
+
+/** One step of a rule's action list. */
+export type AutomationStep = {
+  /** Display name; unique within the rule. */
+  name: string;
+  /** `task` or `wait`. */
+  kind: string;
+  /** Action key of a task step. */
+  action?: string | null;
+  /** Action parameters. */
+  params: Record<string, unknown>;
+  /** Attempts allowed in total. */
+  max_attempts: number;
+};
+
+/** The condition report of a dry run: one row, answered. */
+export type AutomationConditionReport = {
+  /** The comparison as the author wrote it. */
+  condition: AutomationCondition;
+  /** `true` when the payload satisfied it. */
+  holds: boolean;
+  /** The payload's value for the field, when it had one. */
+  found?: unknown;
+};
+
+/** One group of a dry-run report. */
+export type AutomationGroupReport = {
+  /** `all` or `any`. */
+  mode: string;
+  /** What the group answered. */
+  holds: boolean;
+  /** The members, in order. */
+  nodes: Array<AutomationConditionReport | AutomationGroupReport>;
+};
+
+/** What one action of a dry run would have done. */
+export type AutomationActionReport = {
+  /** Step name, so the report lines up with the editor. */
+  name: string;
+  /** The action key. */
+  action: string;
+  /** `true` when the action touches the world. */
+  host: boolean;
+  /** `would_send`, `would_call`… — what the step would do. */
+  outcome: string;
+  /** The parameters after the payload was resolved into them. */
+  params: Record<string, unknown>;
+  /** A readable one-line summary, when the action has one. */
+  summary?: string;
+};
+
+/** The whole dry-run report. */
+export type AutomationDryRun = {
+  /** `true` when the conditions held and the actions would have run. */
+  would_run: boolean;
+  /** Why the rule would not run, when it would not. */
+  reason: string | null;
+  /** The condition tree, answered row by row. */
+  conditions: AutomationGroupReport;
+  /** The actions, in order. */
+  actions: AutomationActionReport[];
+  /** Nothing in this report was sent, published or called. */
+  simulated: boolean;
+};
+
+/** One stored test report or captured payload. */
+export type AutomationTestEvent = {
+  /** Row id. */
+  id: string;
+  /** `test` or `listen`. */
+  kind: string;
+  /** The payload the row carries. */
+  payload: Record<string, unknown> | null;
+  /** Event id, when a listener captured one. */
+  event_id: number | null;
+  /** Event name, when a listener captured one. */
+  event_name: string | null;
+  /** `true` while a listener waits for its next event. */
+  armed: boolean;
+  /** When the row was written. */
+  created_at: string;
+  /** When a listener filled in. */
+  captured_at: string | null;
+};
+
+/** The answer of a dry run. */
+export type AutomationTestResult = {
+  /** The report, row by row. */
+  report: AutomationDryRun;
+  /** The stored report. */
+  recorded: AutomationTestEvent;
+};
+
+/** A newly minted hook token — the only response that carries one. */
+export type AutomationHookToken = {
+  /** The URL to give the caller, token included. */
+  url: string;
+  /** The token on its own. */
+  token: string;
+  /** The rule the URL belongs to. */
+  automation_id: string;
+};
+
+/** The rule list. */
+export function fetchAutomations(organizationId?: string): Promise<{ automations: Automation[] }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<{ automations: Automation[] }>(`/api/v1/automations${query}`);
+}
+
+/** The closed vocabulary a rule is written in. */
+export function fetchAutomationCatalogue(): Promise<AutomationCatalogue> {
+  return request<AutomationCatalogue>("/api/v1/automations/catalogue");
+}
+
+/** One rule. */
+export function fetchAutomation(automationId: string): Promise<Automation> {
+  return request<Automation>(`/api/v1/automations/${automationId}`);
+}
+
+/** Write a rule. */
+export function createAutomation(input: {
+  organization_id?: string | null;
+  site_id?: string | null;
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  event: string;
+  conditions?: unknown;
+  hook_triggered?: boolean;
+  actions: AutomationStep[];
+}): Promise<Automation> {
+  return request<Automation>("/api/v1/automations", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Replace a rule. */
+export function updateAutomation(
+  automationId: string,
+  input: {
+    organization_id?: string | null;
+    site_id?: string | null;
+    name: string;
+    description?: string;
+    enabled?: boolean;
+    event: string;
+    conditions?: unknown;
+    hook_triggered?: boolean;
+    actions: AutomationStep[];
+  },
+): Promise<Automation> {
+  return request<Automation>(`/api/v1/automations/${automationId}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove a rule and its run history. */
+export function deleteAutomation(automationId: string): Promise<null> {
+  return request<null>(`/api/v1/automations/${automationId}`, { method: "DELETE" });
+}
+
+/** Evaluate a hand-written payload against a rule without touching anything. */
+export function testAutomation(automationId: string, payload: unknown): Promise<AutomationTestResult> {
+  return request<AutomationTestResult>(`/api/v1/automations/${automationId}/test`, {
+    method: "POST",
+    body: JSON.stringify({ payload }),
+  });
+}
+
+/** Arm a one-shot listener for a rule's next real event. */
+export function listenAutomation(automationId: string): Promise<AutomationTestEvent> {
+  return request<AutomationTestEvent>(`/api/v1/automations/${automationId}/listen`, {
+    method: "POST",
+  });
+}
+
+/** A rule's test reports and captured payloads, newest first. */
+export function fetchAutomationTests(automationId: string): Promise<{ tests: AutomationTestEvent[] }> {
+  return request<{ tests: AutomationTestEvent[] }>(`/api/v1/automations/${automationId}/tests`);
+}
+
+/** Mint a fresh inbound-webhook token; the response is the only place one appears. */
+export function rotateAutomationHook(automationId: string): Promise<AutomationHookToken> {
+  return request<AutomationHookToken>(`/api/v1/automations/${automationId}/rotate-hook`, {
+    method: "POST",
+  });
+}
