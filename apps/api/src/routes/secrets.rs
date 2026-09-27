@@ -154,7 +154,11 @@ impl From<RewrapJob> for RewrapJobView {
 ///
 /// A missing operator key is a `503`, not a `500`: the request is correct, the *installation* is
 /// not configured, and an operator reading the response learns exactly which variables to set.
-fn map_error(error: omnion_secrets::SecretsError) -> ApiError {
+///
+/// Slice 2 reuses this so a failure from the credential or slot store is rendered the same way
+/// wherever it happens, and only refines one case — a self-referencing slot fallback becomes a
+/// `409`, because "the fallback is the primary" is a conflict with the row, not a bad request.
+pub(crate) fn map_error(error: omnion_secrets::SecretsError) -> ApiError {
     let status = match &error {
         omnion_secrets::SecretsError::OperatorKeyMissing => StatusCode::SERVICE_UNAVAILABLE,
         omnion_secrets::SecretsError::NoActiveKey | omnion_secrets::SecretsError::NotFound(_) => {

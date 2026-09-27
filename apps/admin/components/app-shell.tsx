@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, KeyRound,
+import { BarChart3, BadgeCheck, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, LayoutDashboard, LockKeyhole, LogOut, Menu, Network, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, KeyRound,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
@@ -35,7 +35,9 @@ const NAV = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
-  { href: "/secrets/root-key", label: "Secrets", icon: KeyRound },
+  { href: "/secrets/root-key", label: "Key ring", icon: KeyRound },
+  { href: "/secrets/credentials", label: "Credentials", icon: BadgeCheck },
+  { href: "/secrets/slots", label: "Credential slots", icon: Network },
 ] as const;
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against

@@ -3229,3 +3229,188 @@ export function resumeRewrapJob(id: string): Promise<RewrapJob> {
     { method: "POST" },
   );
 }
+
+/* ---------------------------------------------------------------------------------------
+ * Typed credential profiles and credential slots (REQ-125, slice 2).
+ *
+ * Nothing in this block can hold a secret value: the API's serializers have no such field, and
+ * these types mirror them exactly. A credential is an address (`id`) plus metadata; the value
+ * travels only through a lease, which is slice 3's job.
+ * ---------------------------------------------------------------------------------------- */
+
+/** One typed credential profile, as `/secrets/credentials` returns it. */
+export type Credential = {
+  id: string;
+  name: string;
+  kind: string;
+  kind_description: string;
+  offline_checkable: boolean;
+  fields: Record<string, unknown>;
+  field_pairs: [string, string][];
+  validation_state: "unknown" | "valid" | "invalid" | "stale";
+  validation_message: string;
+  validation_checked_at: string | null;
+  validation_interval_days: number;
+  next_validation_at: string | null;
+  provider: "local" | "file" | "env";
+  provider_locator: string | null;
+  read_only: boolean;
+  version: number;
+  created_at: string;
+  slots: string[];
+};
+
+/** One kind, as the create wizard offers it. The panel builds its picker from this. */
+export type CredentialKindOption = {
+  kind: string;
+  description: string;
+  fields: string[];
+  offline: boolean;
+};
+
+/** Everything the credentials screen needs in one read. */
+export type CredentialsResponse = {
+  credentials: Credential[];
+  kinds: CredentialKindOption[];
+  total: number;
+  valid: number;
+  invalid: number;
+  unknown: number;
+};
+
+/** The verdict of one validator run. */
+export type ValidationResult = {
+  id: string;
+  validation_state: string;
+  validation_message: string;
+  checked_at: string;
+  valid: boolean;
+};
+
+/** One slot assignment row. */
+export type CredentialSlot = {
+  id: string;
+  scope_type: string;
+  scope_id: string;
+  slot: string;
+  description: string;
+  consumers: string;
+  primary_secret_id: string | null;
+  primary_name: string | null;
+  primary_version: number | null;
+  fallback_secret_id: string | null;
+  fallback_name: string | null;
+  fallback_version: number | null;
+  last_resolved_by: string | null;
+  last_resolved_at: string | null;
+  empty_reason: string;
+};
+
+/** One catalogue entry for the slot picker. */
+export type SlotDef = { slot: string; description: string; consumers: string };
+
+/** A credential a slot can be pointed at. */
+export type AssignableCredential = {
+  id: string;
+  name: string;
+  kind: string;
+  read_only: boolean;
+  provider: string;
+};
+
+/** Everything the slot screen needs in one read. */
+export type SlotsResponse = {
+  slots: CredentialSlot[];
+  catalog: SlotDef[];
+  assignable: AssignableCredential[];
+  assigned: number;
+};
+
+/** What a slot resolves to — metadata only, exactly like the API. */
+export type SlotResolution = {
+  scope_type: string;
+  scope_id: string;
+  slot: string;
+  secret_id: string;
+  name: string;
+  version: number;
+  fell_back: boolean;
+  summary: string;
+};
+
+/** Read the typed credentials, the kinds and the counters. */
+export function fetchCredentials(): Promise<CredentialsResponse> {
+  return request<CredentialsResponse>("/api/v1/secrets/credentials");
+}
+
+/** One profile with its detail field list. */
+export function fetchCredential(id: string): Promise<Credential> {
+  return request<Credential>(`/api/v1/secrets/credentials/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Pin a secret to a kind and record its non-secret fields.
+ *
+ * The API refuses a field that carries the value, so this never has to worry about one leaking:
+ * there is no place to put it that survives the request.
+ */
+export function attachCredentialProfile(
+  id: string,
+  kind: string,
+  fields: Record<string, string>,
+): Promise<Credential> {
+  return request<Credential>(`/api/v1/secrets/${encodeURIComponent(id)}/credential`, {
+    method: "POST",
+    body: JSON.stringify({ kind, fields }),
+  });
+}
+
+/** Run the kind validator now. A failure comes back as a chip, not an error. */
+export function validateCredential(id: string): Promise<ValidationResult> {
+  return request<ValidationResult>(`/api/v1/secrets/${encodeURIComponent(id)}/validate`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** Read the slot matrix, the catalogue and the assignable credentials. */
+export function fetchSlots(): Promise<SlotsResponse> {
+  return request<SlotsResponse>("/api/v1/credential-slots");
+}
+
+/**
+ * Assign a primary and an optional fallback, or clear the assignment with a null primary.
+ *
+ * A self-referencing fallback comes back as `409 credential_slot_self_reference`, which the
+ * editor renders inline next to the fallback picker rather than as a page-level error.
+ */
+export function assignSlot(
+  scopeType: string,
+  slot: string,
+  scopeId: string,
+  primarySecretId: string | null,
+  fallbackSecretId: string | null,
+): Promise<CredentialSlot> {
+  return request<CredentialSlot>(
+    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        scope_id: scopeId,
+        primary_secret_id: primarySecretId,
+        fallback_secret_id: fallbackSecretId,
+      }),
+    },
+  );
+}
+
+/** Ask what a consumer would resolve. Metadata only — the route exists to show the fallback. */
+export function resolveSlot(
+  scopeType: string,
+  slot: string,
+  scopeId: string,
+): Promise<SlotResolution> {
+  return request<SlotResolution>(
+    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}/resolve/${encodeURIComponent(scopeId)}`,
+  );
+}

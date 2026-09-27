@@ -90,6 +90,7 @@ pub mod readyz;
 pub mod scim;
 pub mod search;
 pub mod secrets;
+pub mod secrets_credentials;
 pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
@@ -629,6 +630,46 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "secrets.root.manage"));
 
+    // Typed credential profiles and the slots consumers resolve through (docs/requests/REQ-125,
+    // slice 2). Reading them is `secrets.read`; typing a secret and running a validator is
+    // `secrets.manage`; changing an assignment is `secrets.assign`, kept separate from both
+    // because a slot swap silently changes what a running production workload is using.
+    let secrets_credentials_read = Router::new()
+        .route(
+            "/secrets/credentials",
+            get(secrets_credentials::read_credentials),
+        )
+        .route(
+            "/secrets/credentials/{id}",
+            get(secrets_credentials::read_credential),
+        )
+        .route("/credential-slots", get(secrets_credentials::read_slots))
+        .route(
+            "/credential-slots/{scope}/{slot}/resolve/{scope_id}",
+            get(secrets_credentials::resolve_slot_route),
+        )
+        .route_layer(guards::require(&state, "secrets.read"));
+
+    let secrets_credentials_write = Router::new()
+        .route(
+            "/secrets/{id}/credential",
+            post(secrets_credentials::attach_credential_profile),
+        )
+        .route(
+            "/secrets/{id}/validate",
+            post(secrets_credentials::validate_credential),
+        )
+        .route_layer(guards::require(&state, "secrets.manage"));
+
+    // The assignment write carries its own permission: `secrets.assign`, deliberately not the
+    // read permission, because a slot swap silently changes what a running workload is using.
+    let secrets_slot_assign = Router::new()
+        .route(
+            "/credential-slots/{scope}/{slot}",
+            put(secrets_credentials::put_slot),
+        )
+        .route_layer(guards::require(&state, "secrets.assign"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -659,6 +700,9 @@ pub fn router(state: AppState) -> Router {
         .route("/search/recent", search_recent)
         .merge(secrets_root_key)
         .merge(secrets_rotation)
+        .merge(secrets_credentials_read)
+        .merge(secrets_credentials_write)
+        .merge(secrets_slot_assign)
         .route("/commands", commands_route)
         .route("/commands/{id}/run", command_run)
         .route("/command-center/context", command_context)

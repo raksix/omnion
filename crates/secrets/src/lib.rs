@@ -36,12 +36,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod credentials;
 pub mod error;
 pub mod keyring;
 pub mod redaction;
 pub mod store;
 pub mod validators;
 
+pub use credentials::{
+    CredentialRow, Resolution, SCOPES, SLOTS, SecretOwner, SlotRow, assign_slot, attach_profile,
+    check_scope_and_slot, find_credential, find_secret_owner, find_slot, list_credentials,
+    list_slots, parse_kind, record_validation, resolve_slot, sanitize_fields, slot_catalog,
+};
 pub use error::{Result, SecretsError};
 pub use keyring::{
     KEY_ENCRYPTION_ENV, KEY_ENCRYPTION_FILE_ENV, KeyRing, KeyStatus, OperatorKey, RootKey,

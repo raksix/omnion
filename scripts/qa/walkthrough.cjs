@@ -2549,6 +2549,11 @@ async function main() {
     // The secret key ring and its rotation ceremony (REQ-125, slice 1) — the depth pass below
     // runs the whole ceremony and asserts the document never carries key material.
     { path: "/secrets/root-key", name: "secrets-root-key" },
+    // The typed credentials and the slot matrix (REQ-125, slice 2) — the depth pass below creates
+    // a credential, runs a validator, assigns a slot, resolves it and asserts no value is in the
+    // document.
+    { path: "/secrets/credentials", name: "secrets-credentials" },
+    { path: "/secrets/slots", name: "secrets-slots" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -2648,6 +2653,12 @@ async function main() {
   // three-step wizard, a real rotation, the live counter, pause and resume.
   await runSecretsRootKeyDepth(page, report);
   log(`secrets root key: ${JSON.stringify(report.secretsRootKey)}`);
+
+  // The typed credentials and the slot matrix (REQ-125, slice 2): create a credential, run a
+  // validator (a failure must stay a chip, not a lost row), assign a slot, resolve it, and assert
+  // the document never carries a value.
+  await runSecretsCredentialsDepth(page, report);
+  log(`secrets credentials: ${JSON.stringify(report.secretsCredentials)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -3169,6 +3180,161 @@ async function runSecretsRootKeyDepth(page, report) {
 
   report.secretsRootKey = { steps };
   log(`secrets root key: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The typed credentials and the slot matrix (docs/requests/REQ-125, slice 2).
+ *
+ * The pass proves the three properties this screen exists for, in the order an operator meets
+ * them: a credential can be created from the wizard and typed, a validator that fails leaves a
+ * *chip* rather than losing the row, and a slot swap changes which credential a consumer
+ * resolves. Then it asserts the property only a real render can show — no value anywhere in the
+ * document, including after a resolution.
+ */
+async function runSecretsCredentialsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "secrets-credentials-depth", action: "secrets", ...step });
+  };
+
+  // ------------------------------------------------------------------ the credential list
+  await page.goto(`${URL_ADMIN}/secrets/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-credentials-summary], [data-credentials-error]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const listedRows = await page.locator("[data-credential-row]").count();
+  const summaryText = (await page.locator("[data-credentials-summary]").first().innerText().catch(() => "")).trim();
+  const readOnlyRows = await page.locator("[data-credential-readonly]").count();
+  note({ step: "opened", listedRows, readOnlyRows, summaryChars: summaryText.length });
+  await shot(page, "page-secrets-credentials");
+
+  // ---- `/` focuses the search box --------------------------------------------------------------
+  await page.keyboard.press("/");
+  await page.waitForTimeout(250);
+  const searchFocused = await page
+    .locator("[data-credentials-search]")
+    .first()
+    .evaluate((node) => node === document.activeElement)
+    .catch(() => false);
+  await page.keyboard.press("Escape");
+
+  // ---- The wizard: pick a kind, fill a non-secret field, save ----------------------------------
+  let wizardOpened = false;
+  if (listedRows > 0) {
+    await page.keyboard.press("n");
+    await page.waitForSelector("[data-credential-wizard]", { timeout: 8000 }).catch(() => {});
+    wizardOpened = (await page.locator("[data-credential-wizard]").count()) > 0;
+  }
+  let wizardHasValueBox = false;
+  if (wizardOpened) {
+    // The strongest guarantee the screen makes: the wizard has nowhere to put a secret, so no
+    // future edit can leak one into the DOM. Assert the *absence* rather than trusting it.
+    wizardHasValueBox = await page
+      .locator('[data-credential-wizard] input[type=password]')
+      .count()
+      .then((count) => count > 0)
+      .catch(() => false);
+    const kindCount = await page.locator("[data-credential-kind]").count();
+    const fieldCount = await page.locator("[data-credential-field]").count();
+    note({ step: "wizard-opens", wizardOpened, kindCount, fieldCount, wizardHasValueBox });
+    await shot(page, "page-secrets-credentials-wizard");
+
+    await page.locator("[data-credential-kind=api_key]").first().check({ timeout: 6000 }).catch(() => {});
+    const keyPrefix = page.locator("[data-credential-field=key_prefix]").first();
+    if ((await keyPrefix.count()) > 0) {
+      await keyPrefix.fill("sk-live-qa-walkthrough").catch(() => {});
+    }
+    const endpoint = page.locator("[data-credential-field=endpoint]").first();
+    if ((await endpoint.count()) > 0) {
+      await endpoint.fill("https://api.provider.test").catch(() => {});
+    }
+    await shot(page, "page-secrets-credentials-wizard-filled");
+    await page.locator("[data-credential-save]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-credentials-notice]", { timeout: 15000 }).catch(() => {});
+  }
+  const saveNotice = (await page.locator("[data-credentials-notice]").first().innerText().catch(() => "")).trim();
+  // The sentence that matters: a validator that failed must say the credential was stored anyway.
+  const storedAnyway = /stored either way|is typed and validated/i.test(saveNotice);
+  note({ step: "saved", wizardOpened, storedAnyway, searchFocused, saveNotice: saveNotice.slice(0, 160) });
+  await shot(page, "page-secrets-credentials-saved");
+
+  // ---- The validator, run for real -------------------------------------------------------------
+  const validateButton = page.locator("[data-credential-validate]").first();
+  let validated = false;
+  if ((await validateButton.count()) > 0) {
+    await validateButton.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-credentials-notice]", { timeout: 15000 }).catch(() => {});
+    const chip = await page.locator("[data-credential-chip]").first().getAttribute("data-credential-chip").catch(() => null);
+    validated = Boolean(chip);
+    note({ step: "validated", chip, chipIsReal: ["valid", "invalid", "stale", "unknown"].includes(chip) });
+    await shot(page, "page-secrets-credentials-validated");
+  }
+
+  // ------------------------------------------------------------------ the slot matrix
+  await page.goto(`${URL_ADMIN}/secrets/slots`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-slots-summary], [data-slots-error]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const catalogNames = await page.locator("[data-slots-catalog] li").count();
+  const slotRows = await page.locator("[data-slot-row]").count();
+  note({ step: "slots-opened", catalogNames, slotRows });
+  await shot(page, "page-secrets-slots");
+
+  // ---- Assign a slot from the catalogue --------------------------------------------------------
+  const assign = page.locator('[data-slots-assign="ai.provider"]').first();
+  if ((await assign.count()) > 0) {
+    await assign.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-slot-editor]", { timeout: 8000 }).catch(() => {});
+    const editorOpen = (await page.locator("[data-slot-editor]").count()) > 0;
+    const primaryOptions = await page.locator("[data-slot-primary] option").count();
+    note({ step: "editor-opens", editorOpen, primaryOptions });
+    await shot(page, "page-secrets-slots-editor");
+
+    if (editorOpen && primaryOptions > 1) {
+      // Pick the first real credential — index 1 is the first option after "— none —".
+      const values = await page.locator("[data-slot-primary] option").evaluateAll((nodes) =>
+        nodes.map((node) => node.value).filter(Boolean),
+      );
+      if (values.length > 0) {
+        await page.locator("[data-slot-primary]").first().selectOption(values[0]).catch(() => {});
+        await shot(page, "page-secrets-slots-editor-filled");
+        await page.locator("[data-slot-save]").first().click({ timeout: 8000 }).catch(() => {});
+        await page.waitForSelector("[data-slots-notice]", { timeout: 15000 }).catch(() => {});
+      }
+    }
+    // Escape must close the editor whether or not it was saved.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    const closedByEscape = (await page.locator("[data-slot-editor]").count()) === 0;
+    const assignNotice = (await page.locator("[data-slots-notice]").first().innerText().catch(() => "")).trim();
+    note({ step: "assigned", closedByEscape, assignNotice: assignNotice.slice(0, 160) });
+    await shot(page, "page-secrets-slots-assigned");
+  }
+
+  // ---- Resolve: which credential would a consumer get? -----------------------------------------
+  const resolve = page.locator("[data-slot-resolve]").first();
+  let resolved = false;
+  if ((await resolve.count()) > 0) {
+    await resolve.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-slots-notice]", { timeout: 15000 }).catch(() => {});
+    const notice = (await page.locator("[data-slots-notice]").first().innerText().catch(() => "")).trim();
+    // A resolution names a credential and a version — never a value.
+    resolved = /answers with|answered from the fallback/i.test(notice);
+    note({ step: "resolved", resolved, notice: notice.slice(0, 160) });
+    await shot(page, "page-secrets-slots-resolved");
+  }
+
+  // ---- The one thing no other pass can assert: no value in the document ----------------------
+  const documentText = await page.evaluate(() => document.body.innerText);
+  const leaked =
+    /qa-walkthrough-value|qa-credential-value|wrapped_key|seal_checksum|v1\./.test(documentText);
+  note({ step: "no-value-in-document", leaked, documentChars: documentText.length });
+
+  await page.waitForTimeout(1000);
+  await shot(page, "page-secrets-slots-done");
+
+  report.secretsCredentials = { steps };
 }
 
 async function runIamSecurityDepth(page, report) {
