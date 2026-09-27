@@ -231,12 +231,16 @@ pub struct Contact {
     /// Free-text note.
     pub notes: String,
     /// Last activity.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_activity_at: Option<OffsetDateTime>,
     /// When it was archived.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub archived_at: Option<OffsetDateTime>,
     /// When it was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it last changed.
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -268,10 +272,13 @@ pub struct Company {
     /// Free-text note.
     pub notes: String,
     /// When it was archived.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub archived_at: Option<OffsetDateTime>,
     /// When it was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it last changed.
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -919,7 +926,19 @@ pub async fn list_contacts(
     // Keyset paging: the cursor pins the *sort key* of the last row, not an offset, so archiving
     // a row between two pages cannot make the second page skip or repeat one. The id is the
     // tiebreaker, without which two rows sharing a timestamp can bounce a cursor forever.
-    if query.cursor_id()?.is_some() {
+    //
+    // The emitted predicate is
+    //
+    // ```sql
+    // and (<sort>, c.id) < (select <sort>, c.id from crm_contacts c where c.id = $1)
+    // ```
+    //
+    // and both halves matter. The subquery needs the `where c.id = …` or it returns a **set** and
+    // the row comparison silently degrades; and its opening paren has to sit before the *inner*
+    // select — a `>` followed by `(select <sort> , c.id) from …` closes the subquery on the first
+    // `)` and leaves a bare `from` for the parser, which reports "syntax error at or near from" and
+    // the list answers a 500 on its second page.
+    if let Some(cursor_id) = query.cursor_id()? {
         builder
             .push(" and (")
             .push(sort)
@@ -927,7 +946,9 @@ pub async fn list_contacts(
             .push(if desc { "<" } else { ">" })
             .push(" (select ")
             .push(sort)
-            .push(" , c.id) from crm_contacts c");
+            .push(" , c.id from crm_contacts c where c.id = ")
+            .push_bind(cursor_id)
+            .push(")");
     }
 
     builder
@@ -1044,6 +1065,11 @@ pub async fn get_company(
         .ok_or(CrmError::NotFound("company"))?;
 
     // One statement for both rollups, so the header and the totals cannot come from two moments.
+    //
+    // Every subquery carries an explicit alias. A scalar subquery without one comes back as
+    // `?column?`, so `FromRow` cannot find `contact_count` and the detail screen answers a
+    // **500** on a perfectly good record — the failure looks like a missing migration column
+    // when it is really an unlabelled projection.
     #[derive(sqlx::FromRow)]
     struct Rollup {
         contact_count: i64,
@@ -1054,13 +1080,13 @@ pub async fn get_company(
 
     let rollup: Rollup = sqlx::query_as(
         "select \
-           (select count(*) from crm_contacts c where c.company_id = $1 and c.archived_at is null), \
+           (select count(*) from crm_contacts c where c.company_id = $1 and c.archived_at is null) as contact_count, \
            (select count(*) from crm_deals d where d.company_id = $1 and d.archived_at is null \
-              and exists (select 1 from crm_pipeline_stages s where s.id = d.stage_id and s.kind = 'open')), \
+              and exists (select 1 from crm_pipeline_stages s where s.id = d.stage_id and s.kind = 'open')) as open_deal_count, \
            (select coalesce(sum(d.amount), 0)::text from crm_deals d where d.company_id = $1 \
               and d.archived_at is null \
-              and exists (select 1 from crm_pipeline_stages s where s.id = d.stage_id and s.kind = 'open')), \
-           (select max(a.occurred_at) from crm_activities a where a.company_id = $1)",
+              and exists (select 1 from crm_pipeline_stages s where s.id = d.stage_id and s.kind = 'open')) as pipeline_value, \
+           (select max(a.occurred_at) from crm_activities a where a.company_id = $1) as last_activity_at",
     )
     .bind(company.id)
     .fetch_one(pool)
