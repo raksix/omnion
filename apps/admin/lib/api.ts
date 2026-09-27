@@ -234,6 +234,37 @@ export async function fetchOrganizations(): Promise<Organization[]> {
   return body.organizations;
 }
 
+/** One tenant in full. */
+export function fetchOrganization(organizationId: string): Promise<Organization> {
+  return request<Organization>(`/api/v1/organizations/${encodeURIComponent(organizationId)}`);
+}
+
+/** Open a new tenant — `POST /api/v1/organizations` (platform accounts only). */
+export function createOrganization(input: { name: string; slug: string }): Promise<Organization> {
+  return request<Organization>("/api/v1/organizations", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Change a tenant (name, status) — `PATCH /api/v1/organizations/{id}`. */
+export function updateOrganization(
+  organizationId: string,
+  changes: { name?: string; status?: string },
+): Promise<Organization> {
+  return request<Organization>(`/api/v1/organizations/${encodeURIComponent(organizationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** Delete a tenant that owns no sites — `DELETE /api/v1/organizations/{id}`. */
+export async function deleteOrganization(organizationId: string): Promise<void> {
+  await request(`/api/v1/organizations/${encodeURIComponent(organizationId)}`, {
+    method: "DELETE",
+  });
+}
+
 /** The sites the account may see, optionally narrowed to one tenant. */
 export async function fetchSites(organizationId?: string): Promise<Site[]> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
@@ -3140,4 +3171,175 @@ export function fetchIamProvisioningLog(input: {
   if (input.limit) params.set("limit", String(input.limit));
   const query = params.toString();
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Organization memberships, invitations and the switcher (REQ-005, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** A role chip: which role, and what it is called. */
+export type MemberRole = {
+  id: string;
+  key: string;
+  name: string;
+};
+
+/** One row of the Members tab. */
+export type OrganizationMember = {
+  id: string;
+  user_id: string;
+  display_name: string;
+  email: string;
+  user_status: string;
+  status: string;
+  is_primary: boolean;
+  joined_at: string | null;
+  last_active_at: string | null;
+  roles: MemberRole[];
+};
+
+/** One invitation row. */
+export type OrganizationInvitation = {
+  id: string;
+  email: string;
+  role_id: string | null;
+  role_name: string | null;
+  invited_by: string | null;
+  invited_by_name: string | null;
+  status: string;
+  message: string;
+  expires_at: string;
+  accepted_by: string | null;
+  accepted_at: string | null;
+  created_at: string;
+};
+
+/** An invitation with the token that was created with it — returned exactly once. */
+export type CreatedOrganizationInvitation = {
+  invitation: OrganizationInvitation;
+  token: string;
+  accept_url: string;
+};
+
+/** One membership of the signed-in account. */
+export type AccountOrganization = {
+  organization_id: string;
+  name: string;
+  slug: string;
+  organization_status: string;
+  membership_status: string;
+  is_primary: boolean;
+  roles: MemberRole[];
+};
+
+/** The members of one organization. */
+export async function fetchOrganizationMembers(
+  organizationId: string,
+): Promise<{ organization_id: string; members: OrganizationMember[] }> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/members`);
+}
+
+/** Add an account to an organization. */
+export async function addOrganizationMember(
+  organizationId: string,
+  input: { user_id: string; status?: string; is_primary?: boolean },
+): Promise<OrganizationMember> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/members`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Change a membership's status, or promote/demote it as the account's home. */
+export async function updateOrganizationMember(
+  organizationId: string,
+  userId: string,
+  input: { status?: string; is_primary?: boolean },
+): Promise<OrganizationMember> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** Remove an account from an organization. */
+export async function removeOrganizationMember(
+  organizationId: string,
+  userId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The invitations of one organization. */
+export async function fetchOrganizationInvitations(
+  organizationId: string,
+): Promise<{ organization_id: string; invitations: OrganizationInvitation[] }> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations`);
+}
+
+/** Invite an address into an organization. */
+export async function createOrganizationInvitation(
+  organizationId: string,
+  input: { email: string; role_id?: string | null; message?: string },
+): Promise<CreatedOrganizationInvitation> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Revoke a pending invitation. */
+export async function revokeOrganizationInvitation(
+  organizationId: string,
+  invitationId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/${encodeURIComponent(invitationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The public preview of an invitation link. */
+export async function fetchInvitationPreview(token: string): Promise<{
+  organization_name: string;
+  organization_slug: string;
+  invited_by_name: string | null;
+  role_name: string | null;
+  email_masked: string;
+  expires_at: string;
+  usable: boolean;
+}> {
+  return request(`/api/v1/invitations/${encodeURIComponent(token)}`);
+}
+
+/** Accept an invitation — signed in, or with a new account in the same request. */
+export async function acceptInvitation(
+  token: string,
+  input: { display_name?: string; password?: string },
+): Promise<{ organization_id: string; organization_name: string; user_id: string }> {
+  return request(`/api/v1/invitations/${encodeURIComponent(token)}/accept`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The caller's own organizations — the switcher's list. */
+export async function fetchMyOrganizations(): Promise<{
+  current_organization_id: string | null;
+  organizations: AccountOrganization[];
+}> {
+  return request("/api/v1/me/organizations");
+}
+
+/** Switch the session's organization. */
+export async function switchOrganization(
+  organizationId: string,
+): Promise<{ organization_id: string; name: string }> {
+  return request("/api/v1/me/organization", {
+    method: "POST",
+    body: JSON.stringify({ organization_id: organizationId }),
+  });
 }

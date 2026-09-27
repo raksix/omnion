@@ -90,6 +90,7 @@ pub mod readyz;
 pub mod scim;
 pub mod search;
 pub mod tenancy;
+pub mod tenancy_members;
 pub mod webauthn;
 pub mod webhooks;
 pub mod workflows;
@@ -100,6 +101,10 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::guards;
 use crate::state::AppState;
+
+/// Body cap of the public invitation routes (REQ-005): a preview sends nothing and an
+/// acceptance carries a display name and a password, so a few kilobytes is generous.
+const INVITATION_BODY_LIMIT: usize = 16 * 1024;
 
 /// Build the application router around the shared [`AppState`].
 pub fn router(state: AppState) -> Router {
@@ -306,6 +311,56 @@ pub fn router(state: AppState) -> Router {
             post(tenancy::create_organization)
                 .layer(guards::require(&state, "organizations.manage")),
         );
+
+    // The tenant's own people (REQ-005, slice 1): memberships and invitations of one
+    // organization, plus the public invitation routes and the switcher's two session-scoped
+    // routes under `/me`. Reads need `organizations.read`, writes `organizations.manage`; the
+    // public invitation preview carries no guard because the token is its own credential, so
+    // it is rate-limited and answers uninformatively instead.
+    let organization_members = get(tenancy_members::list_members)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            post(tenancy_members::add_member)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization_member = patch(tenancy_members::update_member)
+        .layer(guards::require(&state, "organizations.manage"))
+        .merge(
+            delete(tenancy_members::remove_member)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization_invitations = get(tenancy_members::list_invitations)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            post(tenancy_members::create_invitation)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization_invitation = delete(tenancy_members::revoke_invitation)
+        .layer(guards::require(&state, "organizations.manage"));
+
+    // The switcher's two routes are session-scoped by design (the request's own table says
+    // "session only"): they only ever return the caller's own memberships and switch to one
+    // they already hold. A permission guard here would be a dead end - the caller's role
+    // binding lives in the organization they are leaving, so the second switch would answer
+    // `403` and the panel could never come back. The membership check inside the handler is
+    // the real authorization: a caller with no membership in the named tenant is refused.
+    let my_organizations = get(tenancy_members::my_organizations);
+
+    let switch_organization = post(tenancy_members::switch_organization);
+
+    // The public invitation routes carry no permission guard — the token is the credential —
+    // so they get their own small body cap (a preview sends nothing, an acceptance carries a
+    // name and a password) instead of the router-wide limit.
+    let invitation_preview = Router::new()
+        .route("/invitations/{token}", get(tenancy_members::preview_invitation))
+        .route(
+            "/invitations/{token}/accept",
+            post(tenancy_members::accept_invitation),
+        )
+        .layer(DefaultBodyLimit::max(INVITATION_BODY_LIMIT));
 
     let organization = get(tenancy::get_organization)
         .layer(guards::require(&state, "organizations.read"))
@@ -649,6 +704,7 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_goals_write)
         .merge(analytics_privacy)
         .merge(analytics_collect)
+        .merge(invitation_preview)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
@@ -717,8 +773,23 @@ pub fn router(state: AppState) -> Router {
             "/iam/audit",
             get(iam::list_audit).layer(guards::require(&state, "audit.read")),
         )
+        .route("/me/organizations", my_organizations)
+        .route("/me/organization", switch_organization)
         .route("/organizations", organizations)
         .route("/organizations/{id}", organization)
+        .route("/organizations/{id}/members", organization_members)
+        .route(
+            "/organizations/{id}/members/{user_id}",
+            organization_member,
+        )
+        .route(
+            "/organizations/{id}/invitations",
+            organization_invitations,
+        )
+        .route(
+            "/organizations/{id}/invitations/{invitation_id}",
+            organization_invitation,
+        )
         .route("/sites", sites)
         .route("/sites/{id}", site)
         .route("/sites/{id}/domains", domains)

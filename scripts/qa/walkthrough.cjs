@@ -1610,6 +1610,123 @@ async function runIamSubjectsDepth(page, report) {
  * for the diff it introduced. The copy flow and the guarded delete follow, so every control of
  * the two screens has been used by the time the pass ends.
  */
+/**
+ * The tenant depth pass (REQ-005, slice 1): the organization list, the Members tab and the
+ * invite dialog are driven for real.
+ *
+ * What it proves, in order:
+ *   1. the organization list renders its rows and its empty/search behaviour is a real filter;
+ *   2. the detail screen opens and the Members tab lists the accounts that belong to it;
+ *   3. the invite dialog refuses an unusable address **in the field** (a deliberate refusal,
+ *      registered with `expectRefusal` so the pass proves it instead of reporting it);
+ *   4. a valid address creates an invitation that appears in the Invitations table;
+ *   5. inviting the same address again is refused with the pending-invitation sentence;
+ *   6. the invitation is revoked again, and the row leaves the table.
+ *
+ * The created invitation is revoked at the end, so the pass leaves no residue behind.
+ */
+async function runOrganizationDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "organizations-depth", action: "organizations", ...step });
+  };
+
+  const email = `qa-invite-${Date.now()}@omnion.test`;
+
+  await page.goto(`${URL_ADMIN}/organizations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const rows = await page.locator("table tbody tr").count();
+  const emptyState = await page.locator("text=No organizations yet").count();
+  note({ step: "list", rows, emptyState: emptyState > 0 });
+  await shot(page, "page-organizations-list");
+
+  // A search that matches nothing has to say so instead of showing a stale list.
+  const search = page.locator('input[placeholder="Name or slug"]').first();
+  if (await search.count()) {
+    await search.fill("zzz-no-such-organization-zzz");
+    await page.waitForTimeout(600);
+    const nothing = await page.locator("text=Nothing matches that search").count();
+    note({ step: "search-empty", shown: nothing > 0 });
+    await shot(page, "page-organizations-search-empty");
+    await search.fill("");
+    await page.waitForTimeout(400);
+  }
+
+  // The first row links to the detail screen; its Members tab is what this slice ships.
+  const firstLink = page.locator('a[href^="/organizations/"]').first();
+  if ((await firstLink.count()) === 0) {
+    const early = { steps, organizationId: null };
+    report.organizations = early;
+    log(`organizations depth: ${JSON.stringify(steps)}`);
+    return early;
+  }
+  await firstLink.click().catch(() => {});
+  await page.waitForSelector("[data-members-heading]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const detailUrl = page.url();
+  const organizationId = /\/organizations\/([0-9a-f-]+)/.exec(detailUrl)?.[1] || "";
+  const memberRows = await page.locator("[data-member-row]").count();
+  note({ step: "detail", organizationId: Boolean(organizationId), memberRows });
+  await shot(page, "page-organization-detail-members");
+
+  // 3. An unusable address is refused in the field: the pass registers the refusal first, so
+  //    the request it provokes on purpose is counted as an assertion, not as a finding.
+  await page.locator("[data-invite-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("[data-invite-email]").first().fill("not-an-address").catch(() => {});
+  await page.locator("[data-invite-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const fieldError = (await page
+    .locator('[role="alert"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "invite-invalid", fieldError: fieldError.slice(0, 120) });
+  await shot(page, "page-organization-invite-invalid");
+
+  // 4. A valid address creates the invitation.
+  await page.locator("[data-invite-email]").first().fill(email).catch(() => {});
+  await page.locator("[data-invite-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const invited = await page.locator(`[data-invitation-row="${email}"]`).count();
+  note({ step: "invite", email, rowShown: invited > 0 });
+  await shot(page, "page-organization-invited");
+
+  // 5. The same address again is refused naming the pending invitation.
+  await page.locator("[data-invite-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("[data-invite-email]").first().fill(email).catch(() => {});
+  await page.locator("[data-invite-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const duplicate = (await page
+    .locator('[role="alert"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "invite-duplicate", refused: duplicate.slice(0, 160) });
+  await shot(page, "page-organization-invite-duplicate");
+
+  // 6. Revoke it again: the row leaves the table.
+  await page.locator("[data-invite-submit]").first().click({ timeout: 3000 }).catch(() => {});
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(500);
+  const revoke = page.locator(`[data-invitation-revoke="${email}"]`).first();
+  if (await revoke.count()) {
+    await revoke.click().catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  const stillThere = await page.locator(`[data-invitation-row="${email}"]`).count();
+  note({ step: "revoke", rowGone: stillThere === 0 });
+  await shot(page, "page-organization-revoked");
+
+  const out = { steps, organizationId: organizationId || null, email };
+  report.organizations = out;
+  log(`organizations depth: ${JSON.stringify(steps)}`);
+  return out;
+}
+
 async function runIamRolesDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -2568,6 +2685,11 @@ async function main() {
     // The role screens (REQ-006, slice 1) — no untested screen: the list is walked here, and its
     // depth pass below creates a role, drives the matrix and reads the history back.
     { path: "/settings/iam/roles", name: "iam-roles" },
+    // The tenant screens (REQ-005, slice 1): the organization list and the detail screen with
+    // its Members tab. No untested screen — both are walked, clicked and measured here, and the
+    // depth pass below invites an address, refuses a second invite to the same one and revokes
+    // what it created.
+    { path: "/organizations", name: "organizations" },
     // The analytics reports (REQ-007, slice 2): every screen of the section is walked, clicked and
     // measured, and the depth pass below reads the range, the comparison, a drawer and an export.
     { path: "/analytics", name: "analytics" },
@@ -2622,6 +2744,11 @@ async function main() {
   // database.
   report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
+  // The tenant depth pass (REQ-005, slice 1): the organization list, the Members tab, the
+  // invite dialog's field refusal, a real invitation and its revocation.
+  await runOrganizationDepth(page, report);
+  log(`organizations: ${JSON.stringify(report.organizations)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.

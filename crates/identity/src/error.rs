@@ -3,6 +3,8 @@
 //! Like the core, this crate never decides HTTP status codes: it returns [`IdentityError`]
 //! and the API layer maps it onto the HTTP surface (`apps/api/src/error.rs`).
 
+use crate::memberships::Invitation;
+
 /// Errors returned by the identity store.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -39,6 +41,34 @@ pub enum IdentityError {
     /// An organization field is not usable (slug shape, blank name, unknown status).
     #[error("invalid organization: {0}")]
     InvalidOrganization(String),
+    /// A membership field is not usable (unknown status).
+    #[error("invalid membership: {0}")]
+    InvalidMembership(String),
+    /// The account already belongs to this organization.
+    #[error("this account is already a member of the organization")]
+    MemberAlreadyPresent,
+    /// No membership carries this (organization, account) pair.
+    #[error("this account is not a member of the organization")]
+    MemberNotFound,
+    /// An invitation field is not usable (message length, shape).
+    #[error("invalid invitation: {0}")]
+    InvalidInvitation(String),
+    /// No invitation carries this token.
+    #[error("this invitation link is not valid")]
+    InvitationNotFound,
+    /// The token was already accepted; an invitation is single-use.
+    #[error("this invitation has already been accepted")]
+    InvitationAlreadyUsed,
+    /// The token was revoked before it was used.
+    #[error("this invitation was revoked")]
+    InvitationRevoked,
+    /// The token is past its expiry.
+    #[error("this invitation has expired")]
+    InvitationExpired,
+    /// The address already holds a live invitation in this organization; the row is carried so
+    /// the API can name the existing invitation instead of mailing the address twice.
+    #[error("this address already has a pending invitation")]
+    InvitationAlreadyPending(Invitation),
     /// The site key is already taken inside the organization.
     #[error("site key is already taken in this organization")]
     SiteKeyTaken,

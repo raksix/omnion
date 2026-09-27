@@ -255,10 +255,47 @@ impl From<IdentityError> for ApiError {
                 "domain_not_found",
                 "no such domain on this site",
             ),
-            // Shape problems the store refuses (slug, key, status, host) are the caller's.
+            // Shape problems the store refuses (slug, key, status, host, address) are the
+            // caller's: the field is what they have to fix, so this is a 400.
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
-            | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
+            | IdentityError::InvalidHost(message)
+            | IdentityError::InvalidEmail(message) => Self::bad_request("invalid_request", message),
+            // Memberships and invitations (REQ-005, slice 1). Every refusal names what
+            // happened, because the panel has to tell a reader apart from an organization
+            // account that simply does not exist — except a token that is not valid, which
+            // answers the same way for unknown, revoked and used, so the public link cannot be
+            // used to discover an organization.
+            IdentityError::InvalidMembership(message) | IdentityError::InvalidInvitation(message) => {
+                Self::bad_request("invalid_request", message)
+            }
+            IdentityError::MemberAlreadyPresent => Self::new(
+                StatusCode::CONFLICT,
+                "already_member",
+                "this account is already a member of the organization",
+            ),
+            IdentityError::MemberNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "member_not_found",
+                "this account is not a member of the organization",
+            ),
+            IdentityError::InvitationNotFound
+            | IdentityError::InvitationAlreadyUsed
+            | IdentityError::InvitationRevoked => Self::new(
+                StatusCode::NOT_FOUND,
+                "invitation_not_found",
+                "this invitation link is not valid",
+            ),
+            IdentityError::InvitationExpired => Self::new(
+                StatusCode::GONE,
+                "invitation_expired",
+                "this invitation has expired — ask for a new one",
+            ),
+            IdentityError::InvitationAlreadyPending(_) => Self::new(
+                StatusCode::CONFLICT,
+                "invitation_already_pending",
+                "this address already has a pending invitation in this organization",
+            ),
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
