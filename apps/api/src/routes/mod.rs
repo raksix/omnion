@@ -77,6 +77,7 @@ pub mod commands;
 pub mod content;
 pub mod health;
 pub mod iam;
+pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
@@ -179,6 +180,55 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require_or_machine(&state, "iam.simulate"));
 
     let iam_overview = get(iam_subjects::overview).layer(guards::require(&state, "iam.roles.read"));
+
+    // Security policy, sessions, devices and second factors (REQ-006, slice 3). Reading a list
+    // needs its read key; every mutation carries its own, and the dangerous ones (resetting
+    // factors, revoking sessions) additionally demand a fresh step-up inside the handler.
+    let iam_security_policy = get(iam_security::get_security_policy)
+        .layer(guards::require(&state, "iam.security.read"))
+        .merge(
+            put(iam_security::update_security_policy)
+                .layer(guards::require(&state, "iam.security.manage")),
+        );
+
+    let iam_sessions =
+        get(iam_security::list_sessions).layer(guards::require(&state, "iam.sessions.read"));
+
+    let iam_session = delete(iam_security::revoke_session)
+        .layer(guards::require(&state, "iam.sessions.revoke"));
+
+    let iam_sign_out_all = post(iam_security::sign_out_all)
+        .layer(guards::require(&state, "iam.sessions.revoke"));
+
+    let iam_devices =
+        get(iam_security::list_devices).layer(guards::require(&state, "iam.devices.read"));
+
+    let iam_device_trust = post(iam_security::trust_device)
+        .layer(guards::require(&state, "iam.devices.manage"));
+
+    let iam_device = delete(iam_security::forget_device)
+        .layer(guards::require(&state, "iam.devices.manage"));
+
+    // A factor belongs to an account, so the routes read with `users.read` and write with
+    // `users.update` — the same keys that guard editing the account itself.
+    let iam_user_mfa =
+        get(iam_security::list_factors).layer(guards::require(&state, "users.read")).merge(
+            post(iam_security::enroll_totp).layer(guards::require(&state, "users.update")),
+        );
+
+    let iam_user_mfa_confirm = post(iam_security::confirm_totp)
+        .layer(guards::require(&state, "users.update"));
+
+    let iam_user_mfa_reset = post(iam_security::reset_mfa)
+        .layer(guards::require(&state, "users.update"));
+
+    let iam_user_factor = delete(iam_security::revoke_factor)
+        .layer(guards::require(&state, "users.update"));
+
+    // The second factor of a sign-in is a public route (the sign-in is half done; there is no
+    // session yet), and the step-up route needs the session it is improving.
+    let auth_mfa_verify = post(iam_security::verify_mfa_login);
+    let auth_step_up = post(iam_security::step_up);
 
     // Tenancy: reading needs a read permission, every mutation its own key.
     let organizations = get(tenancy::list_organizations)
@@ -489,6 +539,8 @@ pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/mfa/verify", auth_mfa_verify)
+        .route("/auth/step-up", auth_step_up)
         .route("/me", get(me::me))
         .route("/search", search_route)
         .route("/search/suggest", search_suggest)
@@ -546,6 +598,17 @@ pub fn router(state: AppState) -> Router {
             iam_service_account_key,
         )
         .route("/iam/simulations", iam_simulations)
+        .route("/iam/security-policies", iam_security_policy)
+        .route("/iam/sessions", iam_sessions)
+        .route("/iam/sessions/{id}", iam_session)
+        .route("/iam/users/{id}/sign-out-all", iam_sign_out_all)
+        .route("/iam/devices", iam_devices)
+        .route("/iam/devices/{id}/trust", iam_device_trust)
+        .route("/iam/devices/{id}", iam_device)
+        .route("/iam/users/{id}/mfa", iam_user_mfa)
+        .route("/iam/users/{id}/mfa/{factor_id}/confirm", iam_user_mfa_confirm)
+        .route("/iam/users/{id}/mfa/{factor_id}", iam_user_factor)
+        .route("/iam/users/{id}/reset-mfa", iam_user_mfa_reset)
         .route(
             "/iam/effective-permissions",
             get(iam::effective_permissions),

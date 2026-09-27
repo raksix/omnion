@@ -259,6 +259,33 @@ impl From<IdentityError> for ApiError {
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
             | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
+            // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
+            // refused by a range check names the control the reader has to fix, so the panel can
+            // point at the field instead of printing a sentence.
+            IdentityError::InvalidPolicy { field, message } => Self::bad_request(
+                "invalid_security_policy",
+                format!("{field} {message}"),
+            )
+            .with_details(serde_json::json!({ "field": field })),
+            IdentityError::InvalidNetwork(message) => {
+                Self::bad_request("invalid_network", message)
+            }
+            IdentityError::FactorNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "factor_not_found",
+                "this account has no such second factor",
+            ),
+            IdentityError::InvalidFactor(message) => {
+                Self::bad_request("invalid_factor_code", message)
+            }
+            // An envelope that cannot be read is never the caller's fault: either the key this
+            // installation uses changed, or the value was tampered with. Both are for the
+            // operator, and the message says which knob to look at.
+            IdentityError::Crypto => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "secret_unreadable",
+                "the stored secret could not be read — check the key this installation uses",
+            ),
             other => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

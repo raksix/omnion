@@ -1265,6 +1265,11 @@ pub async fn issue_service_account_key(
         .ok_or(PermissionsError::ServiceAccountNotFound)?;
     ensure_same_organization(&current, Some(account.organization_id))?;
 
+    // A key is a long-lived credential, so issuing one is a dangerous operation: the session
+    // must have proved identity again first (REQ-006 slice 3). The check sits after the
+    // tenancy rule so a cross-tenant attempt is still the refusal it was.
+    crate::routes::iam_security::require_step_up(&current, "service_account_key_issue")?;
+
     let expires_at = match body.expires_at.as_deref() {
         Some(value) => Some(OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
             ApiError::bad_request("invalid_expiry", "expires_at must be an RFC 3339 timestamp")

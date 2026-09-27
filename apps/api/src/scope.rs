@@ -87,6 +87,12 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 expires_at: OffsetDateTime::UNIX_EPOCH,
                 last_seen_at: None,
+                absolute_expires_at: None,
+                device_id: None,
+                auth_methods: Vec::new(),
+                revoked_at: None,
+                revoke_reason: None,
+                step_up_at: None,
             },
             token: "token".to_owned(),
         }
