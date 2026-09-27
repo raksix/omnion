@@ -1709,3 +1709,45 @@
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
+
+## 2026-09-27 — REQ-063 slice 2 (1/4) · `raw_html` sanitisation, and making a QA pass survivable
+
+- **What shipped.** `crates/content/src/sanitize.rs` is the sanitiser REQ-063 names as the
+  security surface of the block editor. It is an allow-list scanner, not an escaping pass: a tag
+  or attribute that is not on the list is **removed**, so `<script>`, `<style>`, `<iframe>`,
+  `<form>`, every `on*` handler and a `javascript:`/`data:` target are gone, and the content of a
+  removed container goes with it (a stripped `<script>` must not leave its source behind as page
+  text). `SanitizeReport` names every removed tag and attribute so the editor can tell the author
+  what their paste lost, and it is stable for identical input. `embed_host_is_allowed` ships
+  alongside it with an **empty** allow-list: no host is framed until an operator names one.
+  `blocks::sanitize_tree` walks a payload on the way *into* storage — `update_page` calls it — so
+  a stored value is already safe and a theme override, a cache, an export or a future renderer
+  cannot resurrect markup that was only stripped for the one page that happened to draw it.
+- **Proof (rust).** `cargo test -p omnion-content --lib` → **66 passed / 0 failed** (22 sanitiser
+  tests, 4 tree-sanitiser tests, 40 pre-existing). Built with `CARGO_TARGET_DIR` on tmpfs: the
+  shared volume was at 0 bytes and the crate could not even write a fingerprint.
+- **Three defects the tests found, all of which would have shipped silently.** (1) Spreading the
+  JPEG `quality` option into a PNG screenshot is a hard throw from Playwright, and the walkthrough
+  reported it as "Target page, context or browser has been closed" — it killed passes for *every*
+  writer (`996ed04`). (2) A void-element list holding only the allow-listed members meant removing
+  a `<form>` scanned forward for a `</input>` that never arrives and swallowed the rest of the
+  document — a sanitiser bug that reads as content loss. (3) Emitting the attribute separator only
+  between attributes, not after the tag name, produced `<ahref="/x">`: an unknown element that
+  renders as nothing at all.
+- **The volume.** `/mnt/apopic` (60G) is shared by seven worktrees and reached **0 bytes free**
+  twice this tick. A QA pass writes ~1.6G of screenshots into it, so it was never going to finish.
+  Three changes, all in `scripts/qa/`: the pass **degrades** to viewport JPEG shots instead of
+  refusing when the volume is tight (`2c04f81`, `cacca79`); the artifacts can be written to another
+  filesystem with `QA_OUT_ROOT`, and run on `/dev/shm` the pass has 32G and no longer races six
+  other writers' Rust builds (`41f5530`); and `vision-review.cjs` detects a JPEG under a `.png`
+  name, because a JPEG announced as PNG is a decode failure, not a finding.
+- **QA state.** Two passes ran on the tmpfs and both got past the point where the volume used to
+  kill them — 14 screens deep, through `/blocks`, `/pages` and the IAM group — before the browser
+  page itself crashed at `iam-simulator` ("Page crashed"), which is a box resource event on a
+  container running seven Next dev servers and several JVMs, not a finding from this change.
+  **The acceptance gate is still open**: no full pass has yet completed with zero high findings,
+  and the new screen work in the rest of slice 2 is not started. Reporting slice 1 as proven on a
+  probe would repeat exactly the mistake the previous tick logged.
+- **Next.** The rest of slice 2: nested `columns` with breadcrumb selection, `hide_on` applied
+  server-side, heading-order linting surfaced as block warnings, the block-level diff on
+  `/pages/<id>/revisions` and the inline-editing frame at `/pages/<id>/preview`.

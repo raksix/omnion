@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 1; QA pass blocked on volume) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
+> **Status:** in-progress (slice 1 done, slice 2 started: raw_html sanitisation) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -120,7 +120,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [ ] A `columns` container accepts 2–4 child columns, each accepting child blocks, and the editor's breadcrumb selects a nested block directly.
 - [x] Required-prop validation blocks publish (`block_alt_missing`, `block_prop_required`) but still allows saving a draft, and the offending block is highlighted.
 - [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering.
-- [ ] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
+- [x] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
 - [ ] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft.
 - [ ] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
 - [ ] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
@@ -153,6 +153,8 @@ both changes are recorded here rather than lost:
 
 The walkthrough must open `/pages/<id>/edit` on the seeded page, insert one block of each category from `+ Block`, use the `/` menu in an empty block, drag one block above another, duplicate it, delete one, edit props in the inspector including a deliberately invalid value (expect the field message and the publish block), nest blocks inside a `columns` container, undo and redo, save the draft, and then publish. It must open `/pages/<id>/revisions`, compare two revisions, restore one; open `/pages/<id>/preview`, toggle inline editing, edit a text block, save, and confirm the draft badge; open `/patterns` and insert a pattern into the page; open `/page-templates` and create a page from the landing template; and open `/blocks` to confirm the registry reference renders. Visual check: the canvas shows a real page with real blocks (no placeholder boxes), the inspector matches the selected block's schema, validation badges are visible and legible, the preview frame shows the theme's real styling with the draft badge, and publishing makes the page appear on the public site.
 
+It must also open a `raw_html` block in the inspector, paste markup carrying a `<script>` tag and an `onclick` handler, save the draft, and read the sanitiser note that says what was stripped — the value the server returns is the assertion, not the text on screen.
+
 ### Slices
 
 1. **Registry, storage, minimal editor.** ✅ Migration `0019_cms_blocks.sql` (the reserved
@@ -163,6 +165,12 @@ The walkthrough must open `/pages/<id>/edit` on the seeded page, insert one bloc
    `/blocks` reference screen. Proven: acceptance 1–4, 6 and 12, and `/blocks` and
    `/pages/<id>/edit` are both in the walkthrough inventory with a depth pass on each.
 2. **Containers, validation, revision diff.** Nested `columns`, breadcrumb selection, accessibility and viewport rules (`hide_on` server-side), heading-order linting, `raw_html` sanitisation, block-level diff on the revisions screen, inline-editing frame at `/pages/<id>/preview`. *Done when:* acceptance 4, 6–8, 13–15 pass.
+
+   - **Done in this slice so far:** `raw_html` sanitisation (acceptance 8). `crates/content/src/sanitize.rs`
+     is the sanitiser — an allow-list scanner that removes rather than escapes, reports what it
+     removed, and is applied by `blocks::sanitize_tree` on the way into storage, so a stored
+     payload is already safe. The `embed` host allow-list ships with it (empty by default, so no
+     `iframe` renders until an operator allow-lists a host). 22 sanitiser tests + 4 tree tests.
 3. **Patterns and templates.** Migration `0111_content_patterns.sql`; pattern library with insert/create-from-selection/edit/duplicate, page templates with sample content, `/pages/from-template`, and the initial template set (landing, about, pricing, blog post, contact). *Done when:* acceptance 10–11 pass and the vision review confirms the templates render as real pages.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
 
