@@ -2158,6 +2158,207 @@ async function runAnalyticsDepth(page, report) {
  * The goal is named per run so a second pass on the same database does not collide with the name
  * the first one created — and so the funnel the pass reads is its own, not a leftover.
  */
+/**
+ * The CRM depth pass (REQ-051, slice 2).
+ *
+ * The generic interactor walks the two list screens; this drives the flows a walker cannot:
+ * create a company, create a contact on it, change a cell inline, save a view, run an import dry
+ * run with a two-row file where the second row is invalid, and read the export back. Each step
+ * asserts something the acceptance criteria name, and every one of them is measured rather than
+ * assumed — a screen that answers 200 while rendering nothing has to fail this pass.
+ */
+async function runCrmDepth(page, report) {
+  const steps = {};
+  const stamp = `QA ${Math.floor(Date.now() / 1000) % 1000000}`;
+  const companyName = `${stamp} Industries`;
+  const contactName = `${stamp} Person`;
+
+  // ---- the companies screen: create, then read the rollups back -----------------------------
+  await page.goto(`${URL_ADMIN}/crm/companies`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("#crm-companies-create, [data-qa-guard='crm-depth']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("#crm-company-name").first().fill(companyName, { timeout: 4000 }).catch(() => {});
+  await page.locator("#crm-company-domain").first().fill("qa.example", { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-company-industry").first().fill("Research", { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-company-tags").first().fill("qa, emea", { timeout: 3000 }).catch(() => {});
+  await page.locator('#crm-company-form button[type="submit"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.companyCreated = (await page.locator(`text=${companyName}`).count()) > 0;
+  steps.companyNotice = await page
+    .locator("p")
+    .filter({ hasText: /created|updated|refused/ })
+    .first()
+    .innerText()
+    .catch(() => "");
+  await shot(page, "page-crm-company-created");
+
+  // The refusal path: a duplicate name is a 409 and the screen says so instead of pretending.
+  await page.locator("[data-qa-guard='crm-depth']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("#crm-company-name").first().fill(companyName, { timeout: 3000 }).catch(() => {});
+  await page.locator('#crm-company-form button[type="submit"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.duplicateRefused = /already carries this name|taken|conflict/i.test(
+    (await page.locator("body").innerText().catch(() => "")) || "",
+  );
+  // Close the form so the list below is readable.
+  await page.locator('[aria-label="Close the company form"]').click({ timeout: 3000 }).catch(() => {});
+
+  // ---- the contacts screen: create one on that company ---------------------------------------
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.contactsEmptyState = (await page.locator("text=No contacts yet").count()) > 0;
+  await shot(page, "page-crm-contacts-empty");
+
+  await page.locator("[data-qa-guard='crm-depth']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("#crm-first-name").first().fill(contactName, { timeout: 4000 }).catch(() => {});
+  await page.locator("#crm-last-name").first().fill("Tester", { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-email").first().fill("not-an-address", { timeout: 3000 }).catch(() => {});
+  await page.locator('#crm-contact-form button[type="submit"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  // A malformed address is refused by the API and the message lands under the e-mail field.
+  steps.emailRefusal = (await page.locator("#crm-email-error").count()) > 0;
+  steps.emailRefusalText = await page
+    .locator("#crm-email-error")
+    .first()
+    .innerText()
+    .catch(() => "");
+
+  await page.locator("#crm-email").first().fill(`qa-${Date.now().toString(36)}@example.com`, { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-phone").first().fill("+90 555 000 0000", { timeout: 3000 }).catch(() => {});
+  // The company picker holds the company the previous step created.
+  const companyOptions = await page.locator("#crm-company option").count();
+  steps.companyOptions = companyOptions;
+  if (companyOptions > 1) {
+    await page.locator("#crm-company").first().selectOption({ index: 1 }, { timeout: 3000 }).catch(() => {});
+  }
+  await page.locator("#crm-tags").first().fill("qa, vip", { timeout: 3000 }).catch(() => {});
+  await page.locator('#crm-contact-form button[type="submit"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.contactCreated = (await page.locator(`text=${contactName}`).count()) > 0;
+  await shot(page, "page-crm-contact-created");
+
+  // ---- the keyboard: `/` focuses the search, `?` shows the sheet ----------------------------
+  await page.locator("body").click({ position: { x: 5, y: 400 } }).catch(() => {});
+  await page.keyboard.press("/").catch(() => {});
+  await page.waitForTimeout(250);
+  steps.slashFocusesSearch =
+    (await page.evaluate(() => document.activeElement?.getAttribute("id") || "")) ===
+    "crm-search-contacts";
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.keyboard.press("?").catch(() => {});
+  await page.waitForTimeout(300);
+  steps.shortcutSheet = (await page.locator("text=Show or hide this sheet").count()) > 0;
+  await shot(page, "page-crm-shortcuts");
+  await page.keyboard.press("?").catch(() => {});
+
+  // ---- inline edit: the status cell saves optimistically and survives a reload ---------------
+  const statusCell = page.locator("select[id^='crm-row-status-']").first();
+  if (await statusCell.count()) {
+    await statusCell.selectOption("customer", { timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.inlineStatus = await statusCell.inputValue().catch(() => "");
+    steps.inlineNotice = /updated/i.test(
+      (await page.locator("p").filter({ hasText: /updated|refused/ }).first().innerText().catch(() => "")) || "",
+    );
+  }
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.inlinePersisted =
+    (await page.locator("select[id^='crm-row-status-']").first().inputValue().catch(() => "")) ===
+    "customer";
+  await shot(page, "page-crm-contacts-populated");
+
+  // ---- a saved view, then the column chooser -------------------------------------------------
+  await page.locator("#crm-view-name").first().fill(`${stamp} view`, { timeout: 3000 }).catch(() => {});
+  await page.locator("#crm-save-view").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.viewSaved = (await page.locator(`button:has-text("${stamp} view")`).count()) > 0;
+  await shot(page, "page-crm-view-saved");
+
+  await page.locator("#crm-columns-contacts").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.columnChooser = (await page.locator("text=The chooser travels in the URL").count()) > 0;
+  await shot(page, "page-crm-columns");
+  await page.locator("#crm-columns-contacts").click({ timeout: 3000 }).catch(() => {});
+
+  // ---- the filter, as a URL ------------------------------------------------------------------
+  await page.locator("#crm-status-contacts").first().selectOption("customer", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.filteredUrl = page.url().includes("status=customer");
+  steps.filteredRows = await page.locator("tbody tr").count();
+  await page.locator("#crm-status-contacts").first().selectOption("", { timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // ---- the import: a dry run with one good row and one refused ------------------------------
+  const csv = [
+    "First Name,Surname,E-Mail,Company Name,Tags",
+    `Imported,One,imported-${Date.now().toString(36)}@example.com,${companyName},"qa, imported"`,
+    `Imported,Two,not-an-address,,qa`,
+  ].join("\n");
+  steps.importCsv = csv;
+
+  await page.locator("#crm-import").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  // The file input is set through DataTransfer: Playwright's setInputFiles needs a real path, and
+  // the pass should not depend on writing a temp file for one screen.
+  await page
+    .locator("#crm-import-file")
+    .setInputFiles({
+      name: "qa-contacts.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from(csv, "utf-8"),
+    })
+    .catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("#crm-import-dry-run").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const importText = (await page.locator("#crm-contact-form ~ *, body").first().innerText().catch(() => "")) || "";
+  steps.dryRunSummary = (await page
+    .locator("p")
+    .filter({ hasText: /ready|refused/ })
+    .last()
+    .innerText()
+    .catch(() => "")) || importText.slice(0, 200);
+  steps.dryRunMapped = (await page.locator("text=/first_name ← column/").count()) > 0;
+  steps.dryRunErrors = (await page.locator("td:has-text('not an e-mail address')").count()) > 0 ||
+    (await page.locator("text=that is not an e-mail address").count()) > 0;
+  await shot(page, "page-crm-import-dry-run");
+
+  // The commit writes exactly what the preview accepted: one row, one refusal.
+  await page.locator("#crm-import-commit").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2600);
+  steps.importNotice = (await page
+    .locator("p")
+    .filter({ hasText: /imported|refused/ })
+    .first()
+    .innerText()
+    .catch(() => "")) || "";
+  steps.importedOne = /1 contact imported/.test(steps.importNotice);
+  await shot(page, "page-crm-import-committed");
+
+  // ---- the export: the file is the list's own answer ------------------------------------------
+  const exported = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/crm/contacts/export?status=customer", {
+      credentials: "same-origin",
+      headers: { accept: "text/csv" },
+    });
+    return {
+      status: response.status,
+      type: response.headers.get("content-type") || "",
+      rows: response.headers.get("x-export-rows") || "",
+      body: (await response.text()).slice(0, 200),
+    };
+  });
+  steps.export = exported;
+  steps.exportIsCsv = exported.type.includes("text/csv") && exported.body.startsWith("first_name,");
+
+  report.crm = steps;
+  log(`crm depth: ${JSON.stringify(steps)}`);
+}
+
 async function runGoalAndRealtimeDepth(page, report) {
   const steps = {};
   const name = `QA funnel ${Math.floor(Date.now() / 1000) % 1000000}`;
@@ -2582,6 +2783,11 @@ async function main() {
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
+    // The CRM list screens (REQ-051, slice 2) — no untested screen: both are walked here, and the
+    // depth pass below creates a company and a contact, edits a cell inline, saves a view, runs
+    // an import dry run with a two-row file and reads the export back.
+    { path: "/crm/contacts", name: "crm-contacts" },
+    { path: "/crm/companies", name: "crm-companies" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -2641,6 +2847,12 @@ async function main() {
   await runIamSecurityDepth(page, report);
   log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
+  // The CRM pass (REQ-051, slice 2): a company, a contact on it, an inline edit that survives a
+  // reload, a saved view, a column chooser, a filter that is a URL, an import dry run with one
+  // refused row and a CSV export read back from the API.
+  await runCrmDepth(page, report);
+  log(`crm depth: ${JSON.stringify(report.crm)}`);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -2679,7 +2891,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -2830,6 +3042,44 @@ async function main() {
       "click-error",
       `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${c.reason || ""} ${(c.errors || []).join(" | ")}`.slice(0, 240),
     );
+  }
+  // The CRM depth pass (REQ-051, slice 2) asserts real outcomes, so a screen that answers 200
+  // while rendering nothing has to fail the pass rather than quietly contribute a screenshot.
+  // Each entry is what the acceptance criteria name, checked by name so a failure says which
+  // promise broke rather than only that "the pass failed".
+  if (report.crm) {
+    const crm = report.crm;
+    const promised = [
+      ["companyCreated", "the company form created a company the list then shows"],
+      ["duplicateRefused", "a duplicate company name is refused with a message, not a silent success"],
+      ["contactCreated", "the contact form created a contact the list then shows"],
+      ["emailRefusal", "a malformed e-mail renders its refusal under the e-mail field"],
+      ["slashFocusesSearch", "`/` focuses the list's search field"],
+      ["shortcutSheet", "`?` opens the shortcut sheet"],
+      ["inlineStatus", "the inline status cell saved the new value"],
+      ["inlinePersisted", "the inline edit survives a reload"],
+      ["viewSaved", "a saved view appears as a chip the list can apply"],
+      ["columnChooser", "the column chooser opens and explains itself"],
+      ["filteredUrl", "a filter is a URL a person can share"],
+      ["dryRunMapped", "the import dry run reports which column fed which field"],
+      ["dryRunErrors", "the import dry run names the row it refuses and why"],
+      ["importedOne", "the import commit wrote exactly the rows the preview accepted"],
+      ["exportIsCsv", "the export is a CSV the importer accepts"],
+    ];
+    for (const [key, promise] of promised) {
+      if (!crm[key]) {
+        pushFindings("high", "crm-depth", `${key} — ${promise}`);
+      }
+    }
+    // The screen must show the real refusal sentence, not just an error region: a form that
+    // renders a field in red with no sentence has not told the person anything.
+    if (crm.emailRefusal && !/e-mail address/i.test(crm.emailRefusalText || "")) {
+      pushFindings(
+        "medium",
+        "crm-depth",
+        `the e-mail refusal says "${crm.emailRefusalText}" — it must name what is wrong`,
+      );
+    }
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
   if (report.web && !report.web.error) {
