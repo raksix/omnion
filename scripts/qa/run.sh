@@ -13,7 +13,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-OUT="$ROOT/qa-artifacts/$TS"
+OUT_ROOT="$ROOT/qa-artifacts"
+OUT="$OUT_ROOT/$TS"
 mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
@@ -49,18 +50,31 @@ wait_http() { # url, seconds
   return 1
 }
 
-# A pass writes close to a thousand screenshots. Running out of space twenty minutes in deletes
-# the artifact directory out from under the harness, and the failure then names a missing file
-# instead of the disk — so the check happens here, where the message can be acted on.
-AVAIL_KB="$(df -Pk "$(dirname "$OUT")" | awk 'NR==2 {print $4}')"
-AVAIL_MB=$((AVAIL_KB / 1024))
-if [ "$AVAIL_MB" -lt "${QA_MIN_FREE_MB:-6000}" ]; then
-  echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; a pass needs about ${QA_MIN_FREE_MB:-6000}MB." >&2
-  echo "[qa] free a worktree's target/ (regenerable) and re-run." >&2
+# A pass writes gigabytes of screenshots and six writers share this volume, so the two things
+# that go wrong are "the last pass's artifacts are still here" and "there is no room". Prune
+# first, then check: a full disk is often recoverable by pruning alone, and a check that runs
+# first would refuse a pass that had just made room for itself.
+KEEP="${QA_KEEP_PASSES:-2}"
+if [ "$KEEP" -gt 0 ] 2>/dev/null; then
+  while read -r old; do
+    [ -n "$old" ] || continue
+    case "$old" in "$TS") continue ;; esac
+    step "pruning the artifacts of $old"
+    rm -rf "$OUT_ROOT/$old"
+  done <<< "$(ls -1t "$OUT_ROOT" 2>/dev/null | tail -n +$((KEEP + 1)))"
+fi
+
+# Running out of space twenty minutes in deletes the artifact directory out from under the
+# harness, and the failure then names a missing file instead of the disk — so the check happens
+# here, where the message can still be acted on.
+AVAIL_MB=$(( $(df -Pk "$OUT_ROOT" | awk 'NR==2 {print $4}') / 1024 ))
+NEED_MB="${QA_MIN_FREE_MB:-6000}"
+if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
+  echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; a pass needs about ${NEED_MB}MB." >&2
+  echo "[qa] free a worktree's target/ (regenerable) or lower QA_KEEP_PASSES, and re-run." >&2
   exit 1
 fi
 step "free space: ${AVAIL_MB}MB"
-
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
