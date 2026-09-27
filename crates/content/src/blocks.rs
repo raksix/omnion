@@ -30,7 +30,7 @@ use crate::error::{ContentError, Result};
 /// an older registry is still understood as long as its types and props still exist. The
 /// version travels with the registry response so a future renderer can tell a new block type
 /// from a misspelled one.
-pub const REGISTRY_VERSION: &str = "1";
+pub const REGISTRY_VERSION: &str = "2";
 
 /// Deepest nesting the editor allows. Three levels is the mitigation the REQ names for
 /// "nested editing is where builders get confusing": a page can hold a section that holds a
@@ -50,6 +50,15 @@ pub const MAX_TEXT_LENGTH: usize = 16 * 1024;
 /// Longest a block tree may serialize to (1 MiB) — the same bound the plain body carries, so
 /// a blocks payload can never be larger than the text it replaces.
 pub const MAX_BLOCKS_BYTES: usize = 1024 * 1024;
+
+/// Fewest and most columns a `columns` block holds (REQ-063: "2–4 child columns").
+///
+/// The `columns` prop is the author's *intent* and the child wrappers are the *structure*; the
+/// validator reports the two disagreeing, and the editor keeps them in step as the author
+/// changes the count.
+pub const MIN_COLUMNS: usize = 2;
+/// Most columns a `columns` block holds.
+pub const MAX_COLUMNS: usize = 4;
 
 // ---------------------------------------------------------------------------------------------
 // The registry document
@@ -278,6 +287,7 @@ impl BlockDefinition {
             "category": self.category,
             "description": self.description,
             "container": self.container,
+            "structure_only": is_structure_only(self.key),
             "semantic": self.semantic,
             "viewport_aware": true,
             "props": self.props.iter().map(PropDef::to_schema).collect::<Vec<_>>(),
@@ -391,6 +401,19 @@ pub const REGISTRY: &[BlockDefinition] = &[
         ],
         container: true,
         semantic: "section",
+    },
+    // A `columns` block holds columns, not blocks: the wrapper is what makes "two blocks, side
+    // by side" expressible. It is not in the insert panel — the editor only offers it as the
+    // child a `columns` block creates — but it IS in the registry, because a payload that stores
+    // it must be validated, rendered and diffed like every other type.
+    BlockDefinition {
+        key: "column",
+        label: "Column",
+        category: "layout",
+        description: "One column of a Columns block.",
+        props: &[PropDef::choice("align", "Alignment", ALIGNMENTS, "left")],
+        container: true,
+        semantic: "div",
     },
     BlockDefinition {
         key: "cta",
@@ -521,6 +544,17 @@ pub fn definition(key: &str) -> Option<&'static BlockDefinition> {
 #[must_use]
 pub fn is_known(key: &str) -> bool {
     definition(key).is_some()
+}
+
+/// Types the editor never offers in its insert panel.
+///
+/// A container that exists only as the *child* of another container — `column` is one — has to
+/// be in the registry (a stored payload carries it, so it must validate, render and diff like
+/// every other type) but not in the insert list: an author who drops a `column` at the top level
+/// gets a block the renderer cannot place. It is still documented on `/blocks`.
+#[must_use]
+pub fn is_structure_only(key: &str) -> bool {
+    key == "column"
 }
 
 /// The whole registry as the API answers with it: the version, the categories and every
@@ -862,7 +896,7 @@ pub fn validate(value: &Value) -> BlockValidationReport {
     let mut previous_level: Option<u8> = None;
     for (index, block) in blocks.iter().enumerate() {
         total += count_blocks(block, 1);
-        validate_block(block, index, 1, &mut issues, &mut previous_level);
+        validate_block(block, index, 1, &mut issues, &mut previous_level, None);
     }
 
     let issues = ordered(issues);
@@ -876,12 +910,17 @@ pub fn validate(value: &Value) -> BlockValidationReport {
 }
 
 /// Validate one block and, for a container, its children.
+///
+/// `parent` is the type key of the block above it, or `None` at the top level. A rule that is
+/// about *where* a block may sit (a Column only inside a Columns block) cannot be answered
+/// without it.
 fn validate_block(
     block: &Block,
     index: usize,
     depth: usize,
     issues: &mut Vec<BlockIssue>,
     previous_heading: &mut Option<u8>,
+    parent: Option<&'static str>,
 ) {
     let Some(entry) = definition(&block.kind) else {
         issues.push(BlockIssue::new(
@@ -930,8 +969,83 @@ fn validate_block(
         return;
     }
 
+    check_container_rules(block, entry, index, parent, issues);
+
     for (child_index, child) in block.children.iter().enumerate() {
-        validate_block(child, child_index, depth + 1, issues, previous_heading);
+        validate_block(
+            child,
+            child_index,
+            depth + 1,
+            issues,
+            previous_heading,
+            Some(entry.key),
+        );
+    }
+}
+
+/// The container rules the REQ states: a `columns` block holds two to four `column` children,
+/// and a `column` exists nowhere but inside a `columns` block.
+///
+/// They live in the validator rather than in the editor because a payload reaches storage from
+/// a template, a pattern, an import and a second browser session — the editor is only one of the
+/// four ways in, and the rule has to hold for all of them.
+fn check_container_rules(
+    block: &Block,
+    entry: &'static BlockDefinition,
+    index: usize,
+    parent: Option<&'static str>,
+    issues: &mut Vec<BlockIssue>,
+) {
+    match entry.key {
+        "columns" => {
+            let count = block.children.len();
+            if count < MIN_COLUMNS || count > MAX_COLUMNS {
+                issues.push(BlockIssue::new(
+                    block,
+                    format!("[{index}].children"),
+                    "block_column_count",
+                    format!(
+                        "a Columns block holds {MIN_COLUMNS} to {MAX_COLUMNS} columns, this one holds {count}"
+                    ),
+                    Severity::Error,
+                ));
+            }
+            for (column_index, child) in block.children.iter().enumerate() {
+                if child.kind != "column" {
+                    issues.push(BlockIssue::new(
+                        child,
+                        format!("[{index}].children[{column_index}].type"),
+                        "block_child_not_allowed",
+                        format!(
+                            "a Columns block holds Column blocks, not {} blocks",
+                            child.kind
+                        ),
+                        Severity::Error,
+                    ));
+                }
+            }
+        }
+        "column" => {
+            if parent != Some("columns") {
+                issues.push(BlockIssue::new(
+                    block,
+                    format!("[{index}].type"),
+                    "block_column_orphan",
+                    "a Column only renders inside a Columns block; drop it in one or delete it",
+                    Severity::Error,
+                ));
+            }
+            if block.children.is_empty() {
+                issues.push(BlockIssue::new(
+                    block,
+                    format!("[{index}].children"),
+                    "block_column_empty",
+                    "an empty Column renders as a gap; delete it or add a block to it",
+                    Severity::Warning,
+                ));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1307,12 +1421,15 @@ mod tests {
         assert!(sanitize_tree(&mut parsed).is_empty());
     }
 
+    /// Sixteen types the REQ names, plus `column` — the structure-only wrapper that makes "two
+    /// of these side by side" expressible. The REQ's own words are "2–4 child columns, each
+    /// accepting child blocks", and a child column has to be a node for that sentence to hold.
     #[test]
-    fn the_registry_ships_the_sixteen_documented_types() {
+    fn the_registry_ships_the_sixteen_documented_types_plus_the_column_wrapper() {
         assert_eq!(
             REGISTRY.len(),
-            16,
-            "REQ-063 §Scope names sixteen block types"
+            17,
+            "REQ-063 §Scope names sixteen block types; slice 2 adds the Column wrapper"
         );
         let keys: Vec<&str> = REGISTRY.iter().map(|entry| entry.key).collect();
         for expected in [
@@ -1381,20 +1498,41 @@ mod tests {
     }
 
     #[test]
-    fn only_columns_is_a_container_in_slice_one() {
+    fn columns_and_column_are_the_only_containers() {
         let containers: Vec<&str> = REGISTRY
             .iter()
             .filter(|entry| entry.container)
             .map(|entry| entry.key)
             .collect();
-        assert_eq!(containers, vec!["columns"]);
+        assert_eq!(containers, vec!["columns", "column"]);
+    }
+
+    /// A block the author never picks still has to be a first-class registry entry: the payload
+    /// stores it, the renderer places it and the diff reads it. What it must not be is an insert
+    /// choice, because there is nowhere outside a Columns block to put one.
+    #[test]
+    fn a_column_is_registered_but_never_offered_for_insert() {
+        assert!(is_known("column"));
+        assert!(is_structure_only("column"));
+        assert!(!is_structure_only("columns"));
+
+        let document = registry_document();
+        let column = document["blocks"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|entry| entry["key"] == "column")
+            .expect("column is registered");
+        assert_eq!(column["structure_only"], json!(true));
+        assert_eq!(column["container"], json!(true));
     }
 
     #[test]
     fn the_registry_document_carries_the_schemas() {
         let document = registry_document();
         assert_eq!(document["version"], json!(REGISTRY_VERSION));
-        assert_eq!(document["blocks"].as_array().map(Vec::len), Some(16));
+        // Sixteen author-facing types plus `column`, the structure-only wrapper.
+        assert_eq!(document["blocks"].as_array().map(Vec::len), Some(17));
         let heading = document["blocks"]
             .as_array()
             .expect("array")
@@ -1430,15 +1568,25 @@ mod tests {
                 "type": "columns",
                 "props": { "columns": 2 },
                 "children": [
-                    block("text", json!({ "text": "Left" })),
-                    block("text", json!({ "text": "Right" }))
+                    {
+                        "id": Uuid::new_v4().to_string(),
+                        "type": "column",
+                        "props": { "align": "left" },
+                        "children": [block("text", json!({ "text": "Left" }))]
+                    },
+                    {
+                        "id": Uuid::new_v4().to_string(),
+                        "type": "column",
+                        "props": { "align": "left" },
+                        "children": [block("text", json!({ "text": "Right" }))]
+                    }
                 ]
             }
         ]));
         assert!(report.can_publish, "issues: {:?}", report.issues);
         assert_eq!(
-            report.block_count, 5,
-            "top level plus nested blocks are counted"
+            report.block_count, 7,
+            "top level, the column wrappers and the blocks inside them are counted"
         );
         assert!(report.issues.is_empty());
     }
@@ -1711,5 +1859,129 @@ mod tests {
             json!("keep me"),
             "a prop the registry does not know yet is not thrown away"
         );
+    }
+
+    /// A `column` wrapper holding `children`, as the editor builds it.
+    fn column(children: Vec<Value>) -> Value {
+        let mut value = block("column", json!({}));
+        value["children"] = Value::Array(children);
+        value
+    }
+
+    /// A `columns` block whose prop count matches the wrappers it holds.
+    fn columns(extra: Vec<Value>) -> Value {
+        let count = 2 + extra.len();
+        let mut children = vec![column(vec![block(
+            "text",
+            json!({ "text": "left" }),
+        )])];
+        children.push(column(vec![block(
+            "text",
+            json!({ "text": "right" }),
+        )]));
+        for child in extra {
+            children.push(column(vec![child]));
+        }
+        let mut value = block("columns", json!({ "columns": count, "gap": "normal" }));
+        value["children"] = Value::Array(children);
+        value
+    }
+
+    #[test]
+    fn two_and_four_columns_are_accepted() {
+        for extra in [0usize, 1, 2] {
+            let filler = block("text", json!({ "text": "extra" }));
+            let report = validate(&json!([columns(vec![filler; extra])]));
+            assert!(
+                report.can_publish,
+                "{}-column layout must publish: {:?}",
+                2 + extra,
+                report.issues
+            );
+        }
+    }
+
+    #[test]
+    fn a_columns_block_with_one_column_is_refused() {
+        let mut value = block("columns", json!({ "columns": 1 }));
+        value["children"] = json!([column(vec![block(
+            "text",
+            json!({ "text": "lonely" }),
+        )])]);
+        let report = validate(&json!([value]));
+        assert!(!report.can_publish);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "block_column_count"));
+    }
+
+    #[test]
+    fn a_columns_block_with_five_columns_is_refused() {
+        let mut value = block("columns", json!({ "columns": 5 }));
+        value["children"] = json!((0..5)
+            .map(|_| column(vec![block("text", json!({ "text": "x" }))]))
+            .collect::<Vec<_>>());
+        let report = validate(&json!([value]));
+        assert!(!report.can_publish);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "block_column_count"));
+    }
+
+    /// The rule that needs the parent threaded through: a Column is only meaningful inside a
+    /// Columns block, and the walk can only answer that if it knows what it walked out of.
+    #[test]
+    fn a_column_at_the_top_level_is_refused() {
+        let report = validate(&json!([column(vec![block(
+            "text",
+            json!({ "text": "x" }),
+        )])]));
+        assert!(!report.can_publish);
+        let orphan = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "block_column_orphan")
+            .expect("a stray column is reported");
+        assert_eq!(orphan.severity, "error");
+    }
+
+    /// An empty column is a gap, not a broken page: the payload still renders, so this is a
+    /// warning the author sees, not an error that blocks a publish.
+    #[test]
+    fn an_empty_column_warns_without_blocking() {
+        let mut value = block("columns", json!({ "columns": 2 }));
+        value["children"] = json!([
+            column(vec![block("text", json!({ "text": "left" }))]),
+            column(vec![]),
+        ]);
+        let report = validate(&json!([value]));
+        assert!(report.can_publish);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "block_column_empty"));
+    }
+
+    /// Slice 1 let a `columns` block hold blocks directly. A draft saved then still loads and
+    /// still renders — the renderer draws a column per child either way — but the author is told,
+    /// once, exactly what to do: the payload has to become two to four Column wrappers. Naming
+    /// each offending child is what makes that fixable in the editor instead of guessable.
+    #[test]
+    fn a_legacy_columns_payload_is_reported_with_both_children_named() {
+        let mut value = block("columns", json!({ "columns": 2 }));
+        value["children"] = json!([
+            block("text", json!({ "text": "left" })),
+            block("text", json!({ "text": "right" })),
+        ]);
+        let report = validate(&json!([value]));
+        assert!(!report.can_publish);
+        let wrong = report
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "block_child_not_allowed")
+            .count();
+        assert_eq!(wrong, 2, "both direct children are named");
     }
 }
