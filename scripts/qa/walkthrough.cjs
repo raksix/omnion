@@ -578,6 +578,9 @@ async function interact(page, pageName, report) {
           label,
           href: el.getAttribute("href") || "",
           disabled: Boolean(el.disabled),
+          // A screen can declare a control its own depth pass drives: the generic fill/click
+          // pass must not fire a write or an irreversible operation with a sample value.
+          guard: el.getAttribute("data-qa-guard") || "",
         };
       });
     }, MAX_PER_PAGE);
@@ -617,6 +620,13 @@ async function interact(page, pageName, report) {
     }
     if (/\bsign out\b/i.test(meta.label)) {
       record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signout" });
+      continue;
+    }
+    if (meta.guard) {
+      // The control belongs to the screen's own pass (the analytics settings screen writes and
+      // runs the purge and the erasure there): filling it with a sample value would be a
+      // refused request here, not a click.
+      record({ page: pageName, i, ...meta, action: "skip", outcome: `deferred-${meta.guard}` });
       continue;
     }
     if (meta.href && /^(mailto:|tel:|javascript:)/i.test(meta.href)) {
@@ -1796,6 +1806,183 @@ async function runGoalAndRealtimeDepth(page, report) {
   return steps;
 }
 
+/**
+ * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
+ * the two irreversible operations, each proven against the QA database rather than against the
+ * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
+ * promise has a floor for, refused on screen; a purge that removes the rows past a seven-day
+ * window on the populated QA database; and a visitor handle whose rows are counted before and
+ * after its erasure.
+ */
+async function runAnalyticsSettingsDepth(page, report) {
+  const steps = {};
+  const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  const switchState = async (name) =>
+    (await page
+      .locator(`[data-analytics-settings-switch="${name}"]`)
+      .first()
+      .getAttribute("aria-checked")
+      .catch(() => "")) || "";
+  const toggle = async (name) => {
+    await page
+      .locator(`[data-analytics-settings-switch="${name}"]`)
+      .first()
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  };
+  const save = async () => {
+    await page.locator("[data-analytics-settings-save]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  };
+  const oldRows = (cutoffDate) =>
+    Number(
+      qaSql(
+        `select count(*) from analytics_visits where site_id = '${site}' and started_at < '${cutoffDate}T00:00:00Z'`,
+      ),
+    );
+
+  await page.goto(`${URL_ADMIN}/analytics/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.loaded = (await page.locator("[data-analytics-settings-form]").count()) > 0;
+  steps.storageRows = await page
+    .locator('[data-analytics-panel="settings-storage"] [data-analytics-row]')
+    .count();
+  steps.personalRows = await page
+    .locator('[data-analytics-panel="settings-storage"] span:text-is("Personal")')
+    .count();
+  steps.snippet = (await page.locator("[data-analytics-snippet]").first().innerText().catch(() => ""))
+    .trim()
+    .slice(0, 120);
+  steps.copyControl = (await page.locator("[data-analytics-snippet-copy]").count()) > 0;
+  await shot(page, "page-analytics-settings");
+
+  // Tracking off, saved, reloaded: the switch the server stored, not the one the screen showed.
+  steps.trackingBefore = await switchState("tracking_enabled");
+  await toggle("tracking_enabled");
+  steps.dirtyEnabledSave = await page
+    .locator("[data-analytics-settings-save]")
+    .first()
+    .isEnabled()
+    .catch(() => false);
+  await save();
+  steps.savedNote = (
+    await page.locator("[data-analytics-settings-saved]").first().innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 60);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.trackingAfterReload = await switchState("tracking_enabled");
+  await toggle("tracking_enabled");
+  await save();
+  steps.trackingRestored = await switchState("tracking_enabled");
+
+  // A retention value below the floor is refused with the field named, and never sent.
+  await page.locator("[data-analytics-settings-retention]").first().fill("3", { timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  steps.retentionError = (await page.locator('[data-analytics-settings-error="retention_days"]').count()) > 0;
+  await page.locator("[data-analytics-settings-retention]").first().fill("7", { timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await save();
+  steps.retentionSaved = (
+    await page.locator("[data-analytics-settings-retention]").first().inputValue().catch(() => "")
+  ).trim();
+
+  // The exclusion lists, with the glob preview reading them back before they are stored.
+  await page
+    .locator("[data-analytics-settings-paths]")
+    .first()
+    .fill("/qa/private/*\n*.pdf", { timeout: 3000 })
+    .catch(() => {});
+  await page.waitForTimeout(300);
+  steps.pathPreview = await page.locator("[data-analytics-path-preview] li").count();
+  await save();
+  steps.exclusionsSaved = (
+    await page.locator("[data-analytics-settings-paths]").first().inputValue().catch(() => "")
+  )
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean).length;
+
+  // The purge: the screen names the cutoff before the button runs, and the database proves the
+  // rows past it are gone.
+  const cutoffText = (
+    await page.locator("[data-analytics-purge-cutoff]").first().innerText().catch(() => "")
+  ).trim();
+  steps.purgeCutoff = cutoffText;
+  const cutoffDate = (cutoffText.match(/\d{4}-\d{2}-\d{2}/) || [""])[0];
+  steps.purgeOldRowsBefore = cutoffDate ? oldRows(cutoffDate) : null;
+  await page.locator("[data-analytics-purge-run]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.purgeResult = (
+    await page.locator("[data-analytics-purge-result]").first().innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  steps.purgeOldRowsAfter = cutoffDate ? oldRows(cutoffDate) : null;
+  steps.lastPurge = (
+    await page.locator("[data-analytics-last-purge]").first().innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+
+  // The erasure: a handle that exists on the populated QA database, erased from the screen and
+  // counted again in the database.
+  let victim = "";
+  try {
+    victim = qaSql(
+      `select visitor_hash from analytics_visits where site_id = '${site}' order by id desc limit 1`,
+    ).trim();
+  } catch (err) {
+    steps.erasePickError = String(err).slice(0, 120);
+  }
+  steps.eraseHandle = victim ? `${victim.slice(0, 8)}…` : "";
+  steps.eraseRowsBefore = victim
+    ? Number(
+        qaSql(
+          `select count(*) from analytics_visits where site_id = '${site}' and visitor_hash = '${victim}'`,
+        ),
+      )
+    : null;
+  if (victim) {
+    await page.locator("[data-analytics-erase-handle]").first().fill(victim, { timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-analytics-erase-confirm]").first().fill(victim, { timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    steps.eraseUnlocked = await page
+      .locator("[data-analytics-erase-run]")
+      .first()
+      .isEnabled()
+      .catch(() => false);
+    await page.locator("[data-analytics-erase-run]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.eraseResult = (
+      await page.locator("[data-analytics-erase-result]").first().innerText().catch(() => "")
+    )
+      .trim()
+      .replace(/\s+/g, " ")
+      .slice(0, 160);
+    steps.eraseRowsAfter = Number(
+      qaSql(
+        `select count(*) from analytics_visits where site_id = '${site}' and visitor_hash = '${victim}'`,
+      ),
+    );
+    await shot(page, "analytics-settings-erased");
+  }
+
+  // Leave the QA site on the platform's own default, so the rest of the pass reads it as a
+  // fresh installation would.
+  await page.locator("[data-analytics-settings-retention]").first().fill("180", { timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(200);
+  await save();
+
+  return steps;
+}
+
 // ---------------------------------------------------------------- run
 
 async function main() {
@@ -1856,9 +2043,11 @@ async function main() {
     { path: "/analytics/events", name: "analytics-events" },
     { path: "/analytics/downloads", name: "analytics-downloads" },
     { path: "/analytics/forms", name: "analytics-forms" },
-    // Goals, funnels and realtime (REQ-007, slice 3).
+    // Goals, funnels and realtime (REQ-007, slice 3), and the settings screen of slice 4 — the
+    // section's own write surface, whose depth pass below drives it.
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
+    { path: "/analytics/settings", name: "analytics-settings" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -1894,6 +2083,12 @@ async function main() {
   report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
   log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
+  // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
+  // retention value, the exclusions' preview, a purge and an erasure proven against the QA
+  // database.
+  report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -1914,7 +2109,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
