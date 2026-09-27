@@ -122,6 +122,11 @@ function expectRefusal(match, reason) {
 }
 
 const netFailures = [];
+// A refusal a pass is *proving* — the allow-list refusing a host, the editor refusing an
+// empty name. It is counted separately so a pass that demonstrates a 400 is not reported as
+// a pass that caused one.
+const netExpected = [];
+let expectingRefusal = null;
 /** Requests the browser itself cancelled (navigation) — counted, never findings. */
 const netAborted = [];
 const dialogs = [];
@@ -158,7 +163,15 @@ function attach(page, phase) {
     netFailures.push({ phase, url: req.url().slice(0, 200), error });
   });
   page.on("response", (res) => {
-    if (res.status() >= 400) netFailures.push({ phase, url: res.url().slice(0, 200), status: res.status() });
+    if (res.status() < 400) {
+      return;
+    }
+    const entry = { phase, url: res.url().slice(0, 200), status: res.status() };
+    if (expectingRefusal && res.url().includes(expectingRefusal)) {
+      netExpected.push(entry);
+      return;
+    }
+    netFailures.push(entry);
   });
   page.on("dialog", async (d) => {
     dialogs.push({ phase, type: d.type(), message: d.message().slice(0, 200) });
@@ -2518,7 +2531,7 @@ async function main() {
     await DEPTH_PASSES[only](page, report);
     fs.writeFileSync(
       path.join(OUT, "summary.json"),
-      JSON.stringify({ only, ...report, netFailures, onboardingFailures: netFailures.filter((f) => String(f.url || "").includes("/onboarding/")) }, null, 2),
+      JSON.stringify({ only, ...report, netFailures, netExpected, onboardingFailures: netFailures.filter((f) => String(f.url || "").includes("/onboarding/")) }, null, 2),
     );
     console.log(`ONLY_PASS=${only} NET_FAILURES=${netFailures.length}`);
     for (const line of report.steps.filter((step) => String(step.page || "").includes(only.replace(/Depth$/, "")))) {
@@ -3919,6 +3932,220 @@ async function runAutomationsDepth(page, report) {
 }
 
 /**
+ * The automations **slice 2** pass: the action library's outbound half, the branch and stop
+ * steps, the per-step failure policy, and Run now.
+ *
+ * Every control this pass touches is one slice 2 added, and every refusal it asserts is one
+ * the server must make — an `http_request` to a host outside the allow-list has to be
+ * refused *at save time naming the host*, which is only provable by pressing Save and
+ * reading what came back.
+ */
+async function runAutomationsActionsDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    log(`automations-actions: ${JSON.stringify(entry)}`);
+  };
+
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  // A fresh rule, so the pass does not depend on what another pass left behind.
+  const ruleName = `QA action rule ${Date.now().toString(36)}`;
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  // The name goes in first: Save is disabled while any problem is open, and a nameless
+  // rule is one — so a pass that fills it last can never reach the save it is proving.
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.waitForTimeout(300);
+  const editorOpen = (await page.locator("[data-automation-editor]").count()) > 0;
+  note({ step: "editor", editorOpen, ruleName });
+  await shot(page, "page-automations-actions-editor");
+
+  // The rule's own failure policy, above the steps that inherit it.
+  const policySelect = page.locator("[data-automation-on-error]").first();
+  const policyVisible = (await policySelect.count()) > 0;
+  if (policyVisible) {
+    await policySelect.selectOption("continue").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  note({ step: "rule-policy", policyVisible });
+
+  // Switch the first step to a Branch. The action picker must disappear — a branch names a
+  // comparison, not an action — and the typed branch controls must appear.
+  const kindSelect = page.locator("[data-automation-step-kind='0']").first();
+  const kindVisible = (await kindSelect.count()) > 0;
+  if (kindVisible) {
+    await kindSelect.selectOption("branch").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const branchVisible = (await page.locator("[data-automation-branch='0']").count()) > 0;
+  const actionHiddenOnBranch =
+    (await page.locator("[data-automation-step-action='0']").count()) === 0;
+  note({ step: "branch", kindVisible, branchVisible, actionHiddenOnBranch });
+
+  // A branch on something no run can read must be reported in the summary, not saved.
+  if (branchVisible) {
+    await page.locator("[data-automation-branch-field='0']").first().fill("nonsense").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const problemsShown = (await page.locator("[data-automation-problems]").count()) > 0;
+  const problemsText = problemsShown
+    ? (await page.locator("[data-automation-problems]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saveDisabled = await page
+    .locator("[data-automation-save]")
+    .first()
+    .evaluate((node) => node.disabled)
+    .catch(() => null);
+  note({
+    step: "branch-validation",
+    problemsShown,
+    saveDisabled,
+    namedTheField: problemsText.includes("nonsense"),
+  });
+  await shot(page, "page-automations-actions-branch-problem");
+
+  // Fix the field, switch to Stop, and check its reason control.
+  if (branchVisible) {
+    await page
+      .locator("[data-automation-branch-field='0']")
+      .first()
+      .fill("event.status")
+      .catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const problemsAfterFix = (await page.locator("[data-automation-problems]").count()) > 0
+    ? (await page.locator("[data-automation-problems]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const branchCleared = (await page.locator("[data-automation-problems]").count()) === 0;
+  if (kindVisible) {
+    await kindSelect.selectOption("stop").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const stopVisible = (await page.locator("[data-automation-stop='0']").count()) > 0;
+  if (stopVisible) {
+    await page
+      .locator("[data-automation-stop-reason='0']")
+      .first()
+      .fill("the QA pass stopped this run on purpose")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  note({ step: "stop", branchCleared, stopVisible, problemsAfterFix });
+  await shot(page, "page-automations-actions-stop");
+
+  // An http_request to a host the installation does not allow: refused at save, naming it.
+  if (kindVisible) {
+    await kindSelect.selectOption("task").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const actionSelect = page.locator("[data-automation-step-action='0']").first();
+  if ((await actionSelect.count()) > 0) {
+    await actionSelect.selectOption("http_request").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const paramsBox = page.locator("[data-automation-step-params='0']").first();
+  if ((await paramsBox.count()) > 0) {
+    await paramsBox.fill(JSON.stringify({ url: "http://blocked.invalid/hook", method: "POST" }, null, 2)).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await page.locator("[data-automation-step-name='0']").first().fill("call a blocked host").catch(() => {});
+  await page.waitForTimeout(300);
+  // The refusal is the point of this step, so the window it lands in is declared: an
+  // unexpected 400 on any other URL is still a finding.
+  expectingRefusal = "/api/v1/automations";
+  await page.locator("[data-automation-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const refusedStatus = netExpected.length > 0 ? netExpected[netExpected.length - 1].status : null;
+  expectingRefusal = null;
+
+  const saveError = (await page.locator("[data-automation-save-error]").count()) > 0;
+  const saveErrorText = saveError
+    ? (await page.locator("[data-automation-save-error]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  note({
+    step: "host-allow-list",
+    saveError,
+    refusedStatus,
+    namedTheHost: saveErrorText.includes("blocked.invalid"),
+    saidWhatToDo: /not a host|add .* to the automation settings/.test(saveErrorText),
+  });
+  await shot(page, "page-automations-actions-host-refused");
+
+  // A task step's own failure policy and budget, back on a task step. `transient` is the
+  // action that exercises both — it is the engine's own always-eventually-succeeds step — and
+  // it needs `fail_times`, which the server refuses without: the pass fills it rather than
+  // working around the refusal, because a rule that cannot be saved is not the thing under test.
+  if ((await actionSelect.count()) > 0) {
+    await actionSelect.selectOption("transient").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  if ((await paramsBox.count()) > 0) {
+    await paramsBox.fill(JSON.stringify({ fail_times: 1 }, null, 2)).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  const onErrorVisible = (await page.locator("[data-automation-step-on-error='0']").count()) > 0;
+  const timeoutVisible = (await page.locator("[data-automation-step-timeout='0']").count()) > 0;
+  if (onErrorVisible) {
+    await page.locator("[data-automation-step-on-error='0']").first().selectOption("continue").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  if (timeoutVisible) {
+    await page.locator("[data-automation-step-timeout='0']").first().fill("5000").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  note({ step: "step-policy", onErrorVisible, timeoutVisible });
+  await shot(page, "page-automations-actions-step-policy");
+
+  // Save for real this time, then Run now on the saved rule.
+  await page.locator("[data-automation-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const saveBlocked = (await page.locator("[data-automation-save-error]").count()) > 0;
+  const saveBlockedText = saveBlocked
+    ? (await page.locator("[data-automation-save-error]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saved = !saveBlocked && (await page.locator("[data-automation-notice]").count()) > 0;
+
+  await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .click({ timeout: 8000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+  const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
+  let ranNotice = null;
+  if (runNowVisible) {
+    await page.locator("[data-automation-run-now]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    const notices = page.locator("[data-automation-notice]");
+    ranNotice = (await notices.count()) > 0 ? (await notices.first().innerText()).replace(/\s+/g, " ") : null;
+  }
+  // Read the policy back on the rule this pass wrote, after the save-and-reopen round trip:
+  // the round trip is what a whole-rule rewrite could quietly drop.
+  const policyKept = await page
+    .locator("[data-automation-on-error]")
+    .first()
+    .evaluate((node) => node.value)
+    .catch(() => null);
+
+  note({
+    step: "run-now",
+    saved,
+    saveBlocked,
+    saveBlockedText,
+    policyKept,
+    runNowVisible,
+    ranNotice,
+    saysItIsReal: /really run/.test(ranNotice || ""),
+  });
+  await shot(page, "page-automations-actions-run-now");
+
+  report.automationsActions = { steps };
+  log(`automations-actions: ${JSON.stringify(steps)}`);
+}
+
+/**
  * The depth passes that `--only=<name>` can run on their own.
  *
  * The key is the pass's own name minus the `Depth` suffix (`automations` for
@@ -3928,6 +4155,7 @@ async function runAutomationsDepth(page, report) {
  */
 const DEPTH_PASSES = {
   automations: (page, report) => runAutomationsDepth(page, report),
+  automationsactions: (page, report) => runAutomationsActionsDepth(page, report),
   analytics: (page, report) => runAnalyticsDepth(page, report),
   search: (page, report) => runSearchDepth(page, report),
   iamroles: (page, report) => runIamRolesDepth(page, report),

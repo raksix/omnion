@@ -69,6 +69,8 @@ pub struct AutomationBody {
     pub condition_count: usize,
     /// Actions to run, in order.
     pub actions: Value,
+    /// The rule's own failure policy; a step that inherits takes this.
+    pub on_error: &'static str,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
     /// When the rule last fired.
@@ -130,6 +132,7 @@ impl AutomationBody {
             conditions: rule.stored_conditions.clone(),
             condition_count,
             actions,
+            on_error: rule.on_error.as_str(),
             trigger_count: rule.trigger_count,
             last_triggered_at: rule.last_triggered_at,
             created_at: rule.created_at,
@@ -1391,6 +1394,27 @@ mod tests {
         let definition = rule.definition().expect("valid");
         let conditions = definition.conditions_json().expect("stores");
         assert!(conditions["all"].is_array(), "{conditions}");
+    }
+
+    #[test]
+    fn a_rules_own_policy_travels_with_it_in_both_directions() {
+        // The body has to carry it: a rule saved with `continue` and read back as `stop`
+        // would let the editor reset the policy on the next whole-rule write, and the panel
+        // would show a lie in the meantime.
+        let rule = input().rule(Uuid::nil()).expect("the rule is valid");
+        assert_eq!(
+            rule.on_error,
+            omnion_workflows::OnError::Stop,
+            "the default"
+        );
+
+        let mut continuing = input();
+        continuing.on_error = RuleOnError::Continue;
+        assert_eq!(
+            continuing.rule(Uuid::nil()).expect("valid").on_error,
+            omnion_workflows::OnError::Continue,
+            "and it survives the round trip into the rule the store writes"
+        );
     }
 
     #[test]

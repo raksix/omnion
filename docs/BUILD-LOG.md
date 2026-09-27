@@ -1718,3 +1718,76 @@
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
+
+## 2026-09-27 — REQ-003 slice 2 · the action library's outbound half, and the error paths (omnion-wave3)
+
+- **What.** The engine can now be *told* to branch and to stop, and a step can say what its
+  own failure does. `workflow_steps.kind` widens to `('task','wait','branch','stop')`; a
+  `branch` reads `event.<field>` or `steps.<n>.<field>` through the same nine operators the
+  conditions use (`crates/workflows/src/branch.rs`), and **a field nothing produced fails
+  the branch** rather than reading as "keep going" — that is the one answer that hides a
+  broken definition. A `stop` ends the run with a reason the trace shows. Per-step
+  `on_error` (`inherit`/`stop`/`continue`) takes the rule's own policy, read at run time; a
+  failure the run outlives keeps its `failed` row and an `ignored` flag, so the trace is
+  honest while the run can still settle as completed. `timeout_ms` is a per-attempt budget
+  the runner refuses to wait past. The action library grows the three actions that leave the
+  process — `http_request` (host allow-list + `x-omnion-signature` HMAC, `x-omnion-timestamp`
+  and `x-omnion-run` as the idempotency key), `publish_page` and `run_workflow` (chain depth
+  3) — plus `POST /automations/{id}/run` and the `retry-step` / `resume-from` endpoints.
+  Panel: the step **kind** picker, typed branch and stop controls, the per-step policy and
+  budget, the rule's own policy, and **Run now**. Migration `0023_automation_actions`.
+- **Proof (Rust).** `cargo test --workspace --lib --bins` → **602 tests, 0 failures** across
+  18 crates (omnion-api 86 · omnion-automation 82 · omnion-workflows 48 — of which 30 are
+  new: the branch comparison's nine operators, its two absence operators, the unreadable-
+  field refusal, the allow-list's suffix and lookalike cases, the signature's canonical
+  string, the header a rule may not forge, the URL that tries to smuggle a host).
+  `apps/api/tests/automation_actions.rs` → **6 integration walks, 0 failures**, each on a
+  throwaway database with an HTTP sink and an SMTP sink the suite starts itself: a
+  disallowed host refused at write time naming the host (and the sink sees nothing), a
+  delivered call whose signature re-derives from the rule's key and fails for every other
+  key/timestamp/method/path/body, a branch that ends the run and a stop that says why, an
+  ignored failure that completes beside an inherited one that does not, a timeout naming its
+  limit, and a retry that does **not** re-send the earlier e-mail.
+- **Two defects the walk found, both real, both fixed here.** (1) **`on_error: stop` did
+  not stop.** The engine failed the step and left the following steps `pending`, so the next
+  tick claimed step N+1 and the run carried on — the failure surfaced only in the summary,
+  which is precisely what the policy exists to prevent. A run that stops on a failure now
+  closes the steps after it, exactly as a branch does. (2) **A branch could not be stored.**
+  `workflow_steps_action_shape` requires a branch to carry an action, and a definition the
+  panel writes carries none (`{"kind": "branch", "params": {…}}`); the store now derives a
+  control step's action from its kind. Also: `event_payload` is coalesced to JSON null in the
+  column list, because sqlx decodes a *column* into `Value` and a SQL NULL is not JSON null —
+  without it a manual run's branch failed with a decode error instead of evaluating.
+- **A word the request used that this slice does not ship, on purpose.** The spec says a
+  failing step "routes to a **failure branch**". What ships is the per-step `on_error`
+  (`stop` closes the tail, `continue` outlives it); a *named* failure branch is REQ-004's
+  node graph, and this request's own "Out" section reserves the canvas for it. The
+  alternative — a second, linear mini-graph beside the linear editor — would be the two
+  definitions of a rule the "Out" section exists to prevent.
+- **Proof (QA).** `QA_STACK=w3 … bash scripts/qa/run.sh` on the private stack
+  (ports 18082/3102/3202, database `omnion_qa_w3`, pm2 `omnion-qa-*-w3`), plus the new
+  `--only=automationsactions` depth pass (registered in `DEPTH_PASSES`, so it can be run on
+  its own — a full pass on a box that also hosts two other writers' stacks is twenty minutes
+  of browser and dies of OOM half way through). The new pass walks all eight of slice 2's
+  controls: the rule's failure policy, the step-kind picker (**and that the action picker
+  disappears on a branch**), a branch on a field no run can read (refused in the summary with
+  Save disabled), the stop's reason, an `http_request` to a host outside the allow-list
+  (**refused at save time, `400`, naming the host and what an administrator has to do**), the
+  per-step policy and budget, the save, and **Run now** — whose notice says in words that the
+  actions really run where the dry run is the simulation.
+  **`NET_FAILURES=0`, `VISION_ISSUES=0`, `VISION_HIGH=0`** over 7 screenshots. The slice-1
+  automations pass re-run on the same stack is also `NET_FAILURES=0` — no regression.
+- **A third real bug, found by the QA pass and not by any test.** `AutomationBody` never
+  gained an `on_error` field, so a rule saved with `continue` read back as `stop`: the editor
+  showed a lie, and the *next whole-rule write* (arm/disarm, rename) would have written that
+  lie back. The walkthrough caught it by reading the policy back after a save-and-reopen round
+  trip; the unit test added with the fix pins both directions.
+- **A note on the pass's own numbers.** A pass that *proves* a refusal must be able to say
+  so, or its 400 counts as a defect: `expectingRefusal` is a declared window (the response
+  listeners record into `netExpected` instead of `netFailures` while it is open, and an
+  unexpected 400 on any other URL is still a finding). The first run reported
+  `NET_FAILURES=1` for exactly this reason and the fix is a harness change, not a suppression.
+- **Next.** Slice 3 — approvals and run-as authority: `wait_for_approval`,
+  `workflow_approvals`, the `workflows.approve` key, the pending panel, single-use decision
+  tokens, and `automation.rule.permission_revoked` (the permission-revoked path is the
+  request's own "write it first" note, so it goes in before the approval inbox does).

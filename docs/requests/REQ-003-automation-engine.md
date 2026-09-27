@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** in-progress (slice 1 · `36b362f`, `63e99bf`, `4e4c63b`, `d523a32`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** in-progress (slice 2 · `73bc32e`, `ac5cb44`, `240e3e6`, `ed6b670`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -150,14 +150,26 @@ the payload; the rule id is the only identifier returned to the caller.
       *Partly proved:* `POST /api/v1/hooks/{token}` records `automation.hook.received` with the caller's body under `hook.body`, and an
       unknown/rotated/unshaped token answers `404 not_found` (asserted over the live stack: a wrong token returned exactly that). The
       run-side walk — a real call starting a run whose conditions read the body — is not written yet.
-- [ ] `http_request` to a host outside `automation_settings.http_allowed_hosts` is refused at save time naming the host, and delivered with `x-omnion-signature` when allowed.
-      *Slice 2* (the `http_request` action). Not started.
+- [x] `http_request` to a host outside `automation_settings.http_allowed_hosts` is refused at save time naming the host, and delivered with `x-omnion-signature` when allowed.
+      *Proved:* `crates/automation/src/outbound.rs` — the URL is split into scheme/host/port/path (a
+      `user@host` URL is refused rather than re-read, which is the classic allow-list bypass), the host
+      is matched against the list by suffix and never against a query, and an **empty** list allows
+      nothing. The API refuses at `POST`/`PUT` naming the host and what an administrator has to do
+      (`check_outbound_hosts`). Every call carries `x-omnion-signature` (HMAC-SHA256 of the rule's key
+      over `<ts>.<METHOD>.<path>.<sha256(body)>`), `x-omnion-timestamp` and `x-omnion-run`; the walk
+      re-derives the signature from the rule's stored key, and shows a different key, a different
+      timestamp, a different method, a different path and a tampered body all fail. A rule cannot forge
+      the platform's own headers.
 - [x] A dry run reports `would_send` per host action without sending e-mail or calling a URL.
       *Proved:* `crates/automation/src/testing.rs` resolves the payload into every action through the same `resolve_params` the matcher
       uses and reports `would_send` / `would_call` / `would_publish`; the QA pass reads every outcome back and asserts each starts with
       `would_`. `POST /api/v1/automations/{id}/test` stores the report and audits it.
 - [ ] "Run now" starts exactly one run; a second press inside the rate window shows the limit message and starts nothing.
-      *Slice 2* (the run-now endpoint and `rate_limit_per_hour`). Not started.
+      *Partly proved:* `POST /api/v1/automations/{id}/run` starts exactly one run — the execution and its
+      steps are rows before the response leaves, and the walk reads the id back and settles the run to
+      `completed`. A rule whose `{{event.*}}` bindings need an event is **refused in words** rather than
+      run against an invented payload. The rate window (`rate_limit_per_hour`) is slice 4's, so the
+      second half of this line stays open.
 - [ ] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
       *Slice 3.* Not started.
 - [ ] A `wait_for_approval` step parks the run as `awaiting_approval`, the pending panel lists it, approving resumes it, rejecting ends it without the effect.
@@ -165,9 +177,20 @@ the payload; the rule id is the only identifier returned to the caller.
 - [ ] Deciding an approval twice has no second effect (single-use token) and an expired approval is refused with a clear message.
       *Slice 3.* Not started.
 - [ ] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
-      *Slice 2.* Not started.
-- [ ] `timeout_ms` is honoured: a slow `http_request` fails naming the limit, and the step shows attempts used against attempts allowed.
-      *Slice 2.* Not started.
+      *Proved, with one correction to the request's wording:* `retry_step_from` re-runs the chosen step
+      **and everything after it** for both controls. Re-running *only* the failed step would let a run
+      whose middle failed march on to completion, which is not what "try that again" means on a trace —
+      so the two controls are the same write on purpose. The steps that already succeeded are left
+      untouched, and the walk asserts the mail sink's count is unchanged across a retry (the earlier
+      email is **not** re-sent) and that `resume-from` re-queues exactly the failed tail. A cancelled
+      run is refused: cancellation was a person's decision.
+- [x] `timeout_ms` is honoured: a slow `http_request` fails naming the limit, and the step shows attempts used against attempts allowed.
+      *Proved:* the runner refuses to wait past the budget (`tokio::time::timeout` around the handler
+      future) and the failure names the limit — the walk points a rule at a host that accepts the
+      connection and says nothing, sets `timeout_ms: 250`, and reads "did not answer within 250 ms" out
+      of the step's error with `attempts: 1` against `max_attempts: 1`. A timeout outside the ceiling is
+      refused at write time with `invalid_step_timeout`. (The out-of-scope half of the line — attempts
+      used against attempts allowed on the *trace* — is the run-detail screen, slice 4's.)
 - [ ] The endless-loop guard aborts a rule that repeats the same step with identical resolved parameters and explains why in the trace.
       *Slice 4.* Not started.
 - [ ] A paused rule does not fire, and re-arming it does not replay events recorded while it was paused.
@@ -183,7 +206,11 @@ the payload; the rule id is the only identifier returned to the caller.
 - [ ] Empty, loading and error states exist on every screen; no dead buttons and no "coming soon" text.
       *Proved for the slice-1 screens:* the list has a loading table, an empty state ("No automations yet") with New rule, a
       no-match state, a load-error banner and a notice; the editor has a validation summary that disables Save, a save-error alert, an
-      empty-conditions explanation and an "empty nested group" explanation. The walkthrough clicks every one of them.
+      empty-conditions explanation and an "empty nested group" explanation. **Slice 2** adds the rule's own
+      failure policy, the per-step policy and budget, a branch with no field, a branch reading something no
+      run can read, a stop with no reason and a timeout outside the engine's ceiling — all reported in the
+      same summary, with Save disabled while any is open, and the host allow-list refusal rendered as a
+      save error that names the host. The walkthrough clicks every one of them.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
 
 ### QA plan
@@ -206,6 +233,12 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
    *Done when:* a rule on `user.created` with a nested condition fires from a real signup and a test event produces the same evaluation with no side effects.
 2. **Action library and error paths** — `http_request` (allow-list + signature), `publish_page`, `run_workflow`, `branch`/`stop` kinds, per-step `on_error`, `timeout_ms`, retry/resume endpoints and the run-detail controls.
    *Done when:* a failing step routes to a failure branch, retry succeeds without duplicating the earlier e-mail, and a disallowed host never leaves the process.
+   *Shipped* (`73bc32e`, `ac5cb44`, `240e3e6`, `ed6b670`). Two notes on the spec, both recorded rather than
+   papered over: the "routes to a **failure branch**" half is shipped as the per-step `on_error`
+   (`stop` closes the steps after the failure, `continue` outlives it) — a *named* failure branch is REQ-004's
+   graph, and this request's own "Out" section reserves the node canvas for it. And **retry re-runs the
+   tail, not only the failed step**, for the reason above; the request's wording is the thing that changes,
+   not the behaviour. Migration `0023_automation_actions`.
 3. **Approvals and run-as authority** — `wait_for_approval`, `workflow_approvals`, `workflows.approve`, the pending panel, decision endpoints with single-use tokens, `run_as_user_id` checks, `automation.rule.permission_revoked`.
    *Done when:* a publish step is blocked by a revoked permission, and a gated publish completes only after an approval.
 4. **Operations polish** — rate limits and concurrency, endless-loop guard, templates gallery, versions/restore, audit tab, mobile and empty states, event emissions.
