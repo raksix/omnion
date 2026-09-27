@@ -73,6 +73,10 @@ fi
 SHOT_MODE="${QA_SHOT_MODE:-full}"
 AVAIL_MB=$(( $(df -Pk "$OUT_ROOT" | awk 'NR==2 {print $4}') / 1024 ))
 NEED_MB="${QA_MIN_FREE_MB:-6000}"
+# Viewport JPEG shots are roughly a tenth of a full-page PNG each, so the room a pass needs is a
+# property of the shot mode, not a constant: asking for the full-pass figure before deciding to
+# downgrade is what refused passes that would have fitted comfortably.
+[ "$SHOT_MODE" = "viewport" ] && NEED_MB="${QA_MIN_FREE_MB_VIEWPORT:-700}"
 if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
   case "$SHOT_MODE" in
     full)
@@ -80,6 +84,12 @@ if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
       # smaller and still visit every screen and click every control.
       SHOT_MODE=viewport
       step "only ${AVAIL_MB}MB free (wanted ${NEED_MB}); dropping to viewport-sized shots"
+      NEED_MB="${QA_MIN_FREE_MB_VIEWPORT:-700}"
+      if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
+        echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; even a viewport pass needs about ${NEED_MB}MB." >&2
+        echo "[qa] free a worktree's target/ (regenerable) or lower QA_KEEP_PASSES, and re-run." >&2
+        exit 1
+      fi
       ;;
     viewport)
       echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; even a viewport pass needs about ${NEED_MB}MB." >&2
