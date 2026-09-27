@@ -98,6 +98,11 @@ export interface BlockDefinition {
   description: string;
   /** `true` when the block holds child blocks. */
   container: boolean;
+  /**
+   * `true` when the block exists only as another block's child and the insert panel must not
+   * offer it — `column` is one. It is still registered, validated, rendered and diffed.
+   */
+  structure_only: boolean;
   /** HTML element the renderer emits. */
   semantic: string;
   /** `true` when the block can be hidden per viewport. */
