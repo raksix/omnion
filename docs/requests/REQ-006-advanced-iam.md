@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** in-progress — slices 1–3b and 4a shipped (role depth; subjects/scopes/simulator; security policy / sessions / devices / TOTP / WebAuthn passkeys; ABAC policies + the builder + the safety invariants); slice 4b pending (enterprise sign-in, SCIM and approvals) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`, `crates/policy-engine`)
+> **Status:** in-progress — slices 1–3b, 4a and 4b-1 shipped (role depth; subjects/scopes/simulator; security policy / sessions / devices / TOTP / WebAuthn passkeys; ABAC policies + the builder + the safety invariants; permission requests + approvals with their time-boxed grants, and SCIM 2.0 provisioning with its sync log); slice 4b-2 pending (enterprise sign-in: OIDC/OAuth2/SAML providers with JIT provisioning and claim → role mapping) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`, `crates/policy-engine`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -176,8 +176,8 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 - [x] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants. *(slice 3a: the same walk revokes one session and the next request answers `401`, `sign-out-all` ends both live sessions, the same untouched row is refused at a five-minute idle window and accepted once the policy says two hours (so it is the policy, not a constant), and the concurrent cap of two retires the oldest with `revoke_reason = 'concurrent_cap'`.)*
 - [x] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once. *(slice 3a: `apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end` — three failures lock the account at the threshold the policy names and the fourth answer is `account_locked`; the correct password is refused while locked; a denied address answers `address_blocked` for the correct password as well, an allowlist refuses an address outside it, and the fourth failure from one address is refused by the address count; TOTP enrols, confirmation issues ten recovery codes, a sign-in answers a challenge instead of a cookie, and a recovery code works exactly once; `reset-mfa` and key issuance both answer `403 step_up_required` until the caller proves identity again.)*
 - [x] TOTP and a **passkey** both enrol and verify. *(slice 3a ships TOTP; slice 3b ships WebAuthn: `crates/identity/src/webauthn/` parses the client data, the authenticator data and the CBOR attestation object, extracts the COSE key for **ES256** and **EdDSA**, verifies the signature over `authenticatorData || SHA-256(clientDataJSON)`, refuses a counter that does not move forward, and accepts the documented loopback origin so the QA stack can run a real ceremony. Proof: `cargo test --workspace` — the ceremony unit tests (both families plus every refusal) and `apps/api/tests/webauthn.rs::a_passkey_enrols_and_signs_in_end_to_end`, which registers a credential with a software authenticator, signs in with an assertion, proves the session carries `webauthn` in its auth methods, refuses a replayed counter and a foreign origin, demands a step-up to remove the factor and ends password-only again. Browser proof: the `iam-passkeys` pass of `scripts/qa/walkthrough.cjs` drives the panel with a Chrome virtual authenticator.)*
-- [ ] OIDC and SAML sign-in complete against a test provider with JIT provisioning and the mapped role; a SCIM create → update → deactivate round trip appears in the sync log.
-- [ ] An approved request grants the permission only inside its window and expires on its own; every role, binding, policy, session, device and approval change writes an audit entry; all routes answer 401/403/200 as documented; every screen has empty, loading and error states with zero high findings in the QA pass.
+- [ ] OIDC and SAML sign-in complete against a test provider with JIT provisioning and the mapped role. *(the SCIM half is proven — a create → patch → deactivate round trip over the real router, recorded in the sync log, `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs`, and driven in the browser by the `iam-provisioning` pass; SSO arrives with slice 4b-2.)*
+- [x] An approved request grants the permission only inside its window and expires on its own; every role, binding, policy, session, device and approval change writes an audit entry; all routes answer 401/403/200 as documented; every screen has empty, loading and error states with zero high findings in the QA pass. *(slice 4b-1: `apps/api/tests/iam_approvals.rs::an_approved_request_grants_only_inside_its_window` moves a granted window into the past and watches the permission leave with nobody acting; the member cannot read the inbox, cannot decide and cannot read the user list after a refusal; the audit trail carries `iam.approval.requested` / `approved` / `rejected`; the walkthrough drives `iam-approvals` and `iam-provisioning` on desktop and mobile.)*
 
 ### QA plan
 
@@ -190,7 +190,7 @@ What the visual check should see: a matrix with a sticky category header, tri-st
 1. **Role depth.** Migration, role CRUD/duplicate/delete, matrix editor with tri-state and diff preview, inheritance + precedence resolution, role versions, catalogue additions, tests. Done when the matrix saves atomically, precedence and cycle tests pass, and the history tab shows a diff.
 2. **Subjects, scopes, simulator.** Users screen, bindings at every scope level with expiry, groups, service accounts + keys, effective permissions and the RBAC part of the simulator. Done when the simulator agrees with the API guard for every catalogue key across two subjects and a resource-scoped case.
 3. **Sessions, devices, MFA, security policy.** Session/device screens with revocation, idle/absolute lifetime, lockout, IP lists, TOTP + passkey enrolment and step-up. Done when a revoked session is rejected on the next request, lockout triggers at the configured threshold, and both factors enrol and verify in the QA stack.
-4. **Enterprise sign-in, provisioning, ABAC, approvals.** Split in two. **4a (shipped)** — the ABAC policy engine with its builder, dry run and versions, plus the permission safety invariants. **4b (pending)** — OIDC/OAuth2/SAML providers with JIT provisioning and claim → role mapping, SCIM 2.0 provisioning with its sync log, and permission requests and approvals as time-boxed bindings. The slice is done when SSO sign-in completes against a test provider, a SCIM round trip provisions a user, an approved request grants only inside its window, and the last-owner invariant blocks self-lockout.
+4. **Enterprise sign-in, provisioning, ABAC, approvals.** Split in three. **4a (shipped)** — the ABAC policy engine with its builder, dry run and versions, plus the permission safety invariants. **4b-1 (shipped)** — permission requests and approvals as time-boxed bindings, and SCIM 2.0 provisioning with its sync log. **4b-2 (pending)** — OIDC/OAuth2/SAML providers with JIT provisioning and claim → role mapping. The slice is done when SSO sign-in completes against a test provider, a SCIM round trip provisions a user, an approved request grants only inside its window, and the last-owner invariant blocks self-lockout.
 
 ### Risks / notes
 
@@ -378,7 +378,59 @@ What the visual check should see: a matrix with a sticky category header, tri-st
   for an out-of-range priority without a single failed request. The route is walked on desktop and
   mobile, so no screen of this slice is untested.
 - **Remaining in this slice**: nothing. Slice 4b carries enterprise sign-in (OIDC/OAuth2/SAML),
-  SCIM 2.0 provisioning and permission requests/approvals.
+  SCIM 2.0 provisioning and permission requests/approvals. It is split in two: **4b-1** (shipped)
+  is permission requests + approvals and SCIM 2.0 provisioning; **4b-2** (pending) is enterprise
+  sign-in.
+
+### Slice 4b-1 — Permission requests, approvals and SCIM provisioning (shipped)
+
+- **Where**: `crates/permissions/src/approvals.rs` (requests, the decision, the generated grant
+  role), `crates/identity/src/provisioning.rs` (tokens + sync log), `apps/api/src/routes/`
+  `iam_approvals.rs` and `iam_provisioning.rs` (the panel's API) and `scim.rs` (the SCIM 2.0
+  surface). No migration: the tables shipped with `0011_iam_advanced.sql`
+  (`permission_requests`, `provisioning_tokens`, `provisioning_log`, `auth_providers`), and this
+  slice is the first thing to read or write them.
+- **An approval is a binding, not a flag.** A request carries a permission key and an optional
+  resource pattern; an approval requires a window (5 … 43200 minutes) and produces a real
+  time-boxed binding: a generated role per (organization, permission key) — `grant-users-read`
+  for `users.read`, priority 100, exactly one `allow` entry — bound to the requester until
+  `expires_at`. The resolver stops counting it on its own, the list route retires the lapsed row
+  as `expired`, and nothing has to sweep or remember anything. The two writes (the binding, the
+  decision) commit in one transaction, so an approval can never exist without its grant.
+- **Asking is open, deciding is not.** `POST /iam/requests` needs only a signed-in session —
+  the person who cannot do something is exactly the person who must be able to ask — while the
+  inbox needs `iam.approvals.read` and a decision needs `iam.approvals.decide`. A decided request
+  answers `409 request_already_decided`; the window is refused in the field
+  (`invalid_request: the window must be between 5 and 43200 minutes`); an unknown key never
+  becomes a pending row.
+- **SCIM 2.0** (`/api/v1/scim/v2`): `Users` and `Groups` with `ListResponse` envelopes, a small
+  explicit filter surface (`userName` / `externalId` / `displayName` with `eq`, refused with
+  `invalidFilter` otherwise), `PatchOp` with `Operations` (`replace`, `add`, `remove`), and
+  `DELETE` meaning **deactivate** — the SCIM default, because a directory sync never means
+  "delete this person's history". `ServiceProviderConfig` and `Schemas` answer without a token; a
+  session cookie is not a token and is refused, so the surface cannot be driven from a browser
+  tab that happens to be signed in.
+- **Tokens are minted once and hashed**: `omsc_<prefix>_<secret>`, the secret returned exactly
+  once, the stored value a SHA-256 hex digest compared in constant time; `last_used_at` moves on
+  every call, and revocation takes effect on the next request. Every write lands in
+  `provisioning_log` with its action and outcome (ids and outcomes, never payloads).
+- **Panel**: `/settings/iam/approvals` (tabs with counts, the ask form, approve with a window or
+  refuse with a note, the requester's own requests) and `/settings/iam/provisioning` (tokens with
+  the secret shown once and revoke-armed-again, the sync log, and the note that DELETE
+  deactivates). Both name the organization for a platform account, the same pattern the policies
+  screen already uses.
+- **Proof (Rust).** `cargo test --workspace` → green, including
+  `apps/api/tests/iam_approvals.rs::an_approved_request_grants_only_inside_its_window` (a member
+  is refused, asks, cannot decide, is granted a 30-minute window that really grants, loses it the
+  moment the window passes without anybody acting, reads `expired`, is refused a second time, and
+  the audit trail carries requested/approved/rejected) and
+  `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs` (mint → create → filter →
+  patch → deactivate over the real router with a real token, the secret never in the database,
+  the log carrying each outcome, and a revoked token refused on its next call).
+- **Proof (web).** `pnpm typecheck && pnpm build` green with both routes in the table.
+- **Remaining in this slice**: nothing. Slice 4b-2 carries enterprise sign-in (OIDC/OAuth2/SAML
+  providers with JIT provisioning and claim → role mapping).
+
 
 ### Slice 2 — Subjects, scopes and the simulator (shipped)
 
