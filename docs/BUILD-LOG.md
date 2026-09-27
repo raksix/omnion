@@ -1874,3 +1874,67 @@
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-27 — REQ-063 slice 2 (2/4) · nested columns, and the `Column` block
+
+- **What shipped.** Acceptance 4 — "a `columns` container accepts 2–4 child columns, each
+  accepting child blocks, and the editor's breadcrumb selects a nested block directly" — as a
+  seventeenth registry entry, `column`. The REQ's sentence is only satisfiable if a child column
+  is a *node*: a `columns` block whose children are content blocks can express a list that
+  happens to be indented, never "these two, side by side". The wrapper is marked
+  `structure_only`, so it is stored, validated, rendered, diffed and documented on `/blocks`
+  while the insert panel refuses to offer it — an author who dropped one at the top level would
+  get a block the renderer cannot place.
+
+  Three rules live in the **validator**, not the editor, because a payload reaches storage from
+  a template, a pattern, an import and a second browser session, and only one of those four is
+  the editor:
+
+  | code | rule | severity |
+  |---|---|---|
+  | `block_column_count` | a Columns block holds 2–4 column wrappers | error |
+  | `block_child_not_allowed` | those children are Column blocks, not content blocks | error |
+  | `block_column_orphan` | a Column outside a Columns block renders nowhere | error |
+  | `block_column_empty` | a Column with nothing in it is a gap | **warning** |
+
+  The orphan rule is the one that cannot be answered by looking at a block alone, so
+  `validate_block` now carries `parent: Option<&'static str>` down the walk. The empty column is
+  deliberately a warning: it renders as a gap, so the page still publishes, and an author who
+  drops a block in later should not have been blocked.
+
+  **The editor builds the structure rather than reporting it.** Inserting *Columns* creates the
+  wrappers and leaves the author inside the first one. `Add column` / `Remove column` move the
+  `columns` prop with the structure, because the renderer reads the prop and the validator
+  checks the children — the two disagreeing is the exact bug that would be reported. Removing a
+  column that holds blocks asks first and says how many go with it. The breadcrumb numbers its
+  columns (`Column 2 / Text`): four crumbs all reading "Column" cannot say which one the author
+  is in, and saying it is the whole reason the breadcrumb exists.
+
+  Slice 1 let a `columns` block hold blocks directly, and that payload still **renders** — the
+  theme draws a child that is not a wrapper as a cell of its own. The new rule is therefore an
+  error the author can fix in the editor, not a page that disappears.
+
+- **Proof.**
+  - `cargo test -p omnion-content --quiet` → **73 passed, 0 failed** (8 new: 2–4 accepted, 1 and
+    5 refused, orphan refused, empty warns without blocking, legacy payload names both children,
+    the container set, the structure-only registration).
+  - `pnpm typecheck` → **2/2 successful**, 0 errors (`@omnion/admin`, `@omnion/web`).
+  - `node --check scripts/qa/walkthrough.cjs` → clean; the new step asserts the wrappers, the
+    insert-inside-a-column, the breadcrumb and the count-follows-the-structure, and checks the
+    page still has zero blocking issues afterwards.
+  - A QA browser pass is **not** claimed this tick: the box is out of memory for full-page
+    screenshots (recorded in the previous entry). The tick is not a REQ close, so the gate that
+    requires one is not due — but the new walkthrough step is written and has not yet been run in
+    a browser, and the REQ says so.
+
+- **Merge first.** `origin/main` had moved 7 commits into this wave branch, all of them IAM
+  (`sso.rs`, the sign-in screen) plus the QA slot lock. Four files conflicted. `app-shell.tsx` was
+  two independent icon imports → the union. `run.sh` and `walkthrough.cjs` were two independent
+  additions (space management vs. slot locking; the block editor pass vs. the sign-in pass) →
+  both kept, slot before space so the prune cannot race a pass that is already writing.
+  `BUILD-LOG.md` is the append-only file both sides append to → both entries kept in document
+  order. Upstream had also committed four zero-byte `.hermes-tmp*` editor artifacts; they are
+  gone and ignored.
+
+- **Next.** Slice 2 (3/4): heading-order linting, `hide_on` server-side, the block-level revision
+  diff and the inline-editing frame. Then slice 3 (patterns and templates).
