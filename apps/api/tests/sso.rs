@@ -113,12 +113,7 @@ fn header_value(response: &axum::response::Response, name: header::HeaderName) -
 
 /// Build a request; a credential that looks like `omnion_session=…` becomes the session cookie
 /// and anything else becomes a bearer token.
-fn request(
-    method: Method,
-    uri: &str,
-    session: Option<&str>,
-    body: Option<Value>,
-) -> Request<Body> {
+fn request(method: Method, uri: &str, session: Option<&str>, body: Option<Value>) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(credential) = session {
         builder = if credential.starts_with("omnion_session=") {
@@ -298,25 +293,27 @@ impl Fixture {
             .execute(self.db.pool())
             .await
             .expect("provider cleanup must run");
+        sqlx::query("delete from users where organization_id = $1 and email like 'sso-subject-%'")
+            .bind(self.organization_id)
+            .execute(self.db.pool())
+            .await
+            .expect("provisioned account cleanup must run");
         sqlx::query(
-            "delete from users where organization_id = $1 and email like 'sso-subject-%'",
+            "delete from role_bindings where user_id in \
+                     (select id from users where organization_id = $1)",
         )
         .bind(self.organization_id)
         .execute(self.db.pool())
         .await
-        .expect("provisioned account cleanup must run");
-        sqlx::query("delete from role_bindings where user_id in \
-                     (select id from users where organization_id = $1)")
-            .bind(self.organization_id)
-            .execute(self.db.pool())
-            .await
-            .expect("binding cleanup must run");
-        sqlx::query("delete from site_domains where site_id in \
-                     (select id from sites where organization_id = $1)")
-            .bind(self.organization_id)
-            .execute(self.db.pool())
-            .await
-            .expect("domain cleanup must run");
+        .expect("binding cleanup must run");
+        sqlx::query(
+            "delete from site_domains where site_id in \
+                     (select id from sites where organization_id = $1)",
+        )
+        .bind(self.organization_id)
+        .execute(self.db.pool())
+        .await
+        .expect("domain cleanup must run");
         sqlx::query("delete from sites where organization_id = $1")
             .bind(self.organization_id)
             .execute(self.db.pool())
@@ -467,7 +464,10 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert_eq!(bad_reference.status, StatusCode::BAD_REQUEST);
-    assert_eq!(bad_reference.body["error"]["code"], json!("invalid_request"));
+    assert_eq!(
+        bad_reference.body["error"]["code"],
+        json!("invalid_request")
+    );
     assert_eq!(
         bad_reference.body["error"]["details"]["field"],
         json!("secret_ref"),
@@ -515,11 +515,14 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         test.body
     );
     assert_eq!(
-        test.body["status"], json!("failed"),
+        test.body["status"],
+        json!("failed"),
         "the host in the fixture does not resolve, so the test must say so"
     );
     assert!(
-        test.body["detail"].as_str().is_some_and(|text| text.len() > 20),
+        test.body["detail"]
+            .as_str()
+            .is_some_and(|text| text.len() > 20),
         "the detail has to explain itself: {}",
         test.body
     );
@@ -537,15 +540,28 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert_eq!(start_disabled.status, StatusCode::NOT_FOUND);
-    assert_eq!(start_disabled.body["error"]["code"], json!("provider_disabled"));
+    assert_eq!(
+        start_disabled.body["error"]["code"],
+        json!("provider_disabled")
+    );
 
     // The public list is the sign-in screen's data: a disabled provider is not in it.
     let public = call(
         &fixture.state,
-        public_request(Method::GET, "/api/v1/auth/sso/providers", &fixture.host, None),
+        public_request(
+            Method::GET,
+            "/api/v1/auth/sso/providers",
+            &fixture.host,
+            None,
+        ),
     )
     .await;
-    assert_eq!(public.status, StatusCode::OK, "public list: {}", public.body);
+    assert_eq!(
+        public.status,
+        StatusCode::OK,
+        "public list: {}",
+        public.body
+    );
     assert_eq!(
         public.body["providers"].as_array().map(Vec::len),
         Some(0),
@@ -566,16 +582,16 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         email: subject_email.clone(),
         display_name: Some("Directory Person".into()),
         groups: vec!["editors".into()],
-        attributes: json!({ "sub": "00uqa" }).as_object().cloned().unwrap_or_default(),
+        attributes: json!({ "sub": "00uqa" })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
     };
 
     // JIT is off: the sign-in is refused, and no account is created.
-    let refused = omnion_identity::sso::provisioning::provision(
-        fixture.db.pool(),
-        &provider,
-        &identity,
-    )
-    .await;
+    let refused =
+        omnion_identity::sso::provisioning::provision(fixture.db.pool(), &provider, &identity)
+            .await;
     assert!(
         refused.is_err(),
         "a provider without JIT must refuse an unknown subject rather than create a row"
@@ -604,13 +620,10 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         .expect("the provider must be readable")
         .expect("the provider exists");
 
-    let provisioned = omnion_identity::sso::provisioning::provision(
-        fixture.db.pool(),
-        &provider,
-        &identity,
-    )
-    .await
-    .expect("JIT provisions the first sign-in");
+    let provisioned =
+        omnion_identity::sso::provisioning::provision(fixture.db.pool(), &provider, &identity)
+            .await
+            .expect("JIT provisions the first sign-in");
     assert_eq!(
         provisioned.outcome,
         omnion_identity::sso::ProvisionOutcome::Created
@@ -649,16 +662,16 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the attribute must be readable");
-    assert!(indexed, "the subject id is indexed against the provider slug");
+    assert!(
+        indexed,
+        "the subject id is indexed against the provider slug"
+    );
 
     // Signing in again finds the same account — no second row, no second binding.
-    let again = omnion_identity::sso::provisioning::provision(
-        fixture.db.pool(),
-        &provider,
-        &identity,
-    )
-    .await
-    .expect("a known subject is signed into, not reprovisioned");
+    let again =
+        omnion_identity::sso::provisioning::provision(fixture.db.pool(), &provider, &identity)
+            .await
+            .expect("a known subject is signed into, not reprovisioned");
     assert_eq!(
         again.outcome,
         omnion_identity::sso::ProvisionOutcome::Existing
@@ -683,13 +696,10 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     // Re-provisioning still finds the account (it is `Existing`), and the callback refuses it on
     // `is_active` before opening a session — a provider sign-in never undoes an administrator's
     // decision.
-    let after_disable = omnion_identity::sso::provisioning::provision(
-        fixture.db.pool(),
-        &provider,
-        &identity,
-    )
-    .await
-    .expect("the account is still found");
+    let after_disable =
+        omnion_identity::sso::provisioning::provision(fixture.db.pool(), &provider, &identity)
+            .await
+            .expect("the account is still found");
     assert!(!after_disable.user.is_active());
     users::set_status(fixture.db.pool(), user.id, "active")
         .await
@@ -760,14 +770,16 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         .expect("the count must run");
     assert_eq!(gone, 0, "the provider row is gone");
 
-    let orphaned: i64 = sqlx::query_scalar(
-        "select count(*) from auth_provider_events where provider_id = $1",
-    )
-    .bind(provider_id)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the count must run");
-    assert_eq!(orphaned, 0, "its sign-in log goes with it (on delete cascade)");
+    let orphaned: i64 =
+        sqlx::query_scalar("select count(*) from auth_provider_events where provider_id = $1")
+            .bind(provider_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must run");
+    assert_eq!(
+        orphaned, 0,
+        "its sign-in log goes with it (on delete cascade)"
+    );
 
     let start_gone = call(
         &fixture.state,
@@ -780,7 +792,10 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert_eq!(start_gone.status, StatusCode::NOT_FOUND);
-    assert_eq!(start_gone.body["error"]["code"], json!("provider_not_found"));
+    assert_eq!(
+        start_gone.body["error"]["code"],
+        json!("provider_not_found")
+    );
 
     // ---- 13. An ambiguous public sign-in is refused rather than guessed ---------------------
     // The database holds several organizations at this point, so a host that belongs to none of
@@ -802,12 +817,20 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         "an unresolvable host is an honest refusal: {}",
         ambiguous.body
     );
-    assert_eq!(ambiguous.body["error"]["code"], json!("organization_required"));
+    assert_eq!(
+        ambiguous.body["error"]["code"],
+        json!("organization_required")
+    );
 
     // The resolved host still works, so the refusal is about the host and not about the route.
     let resolvable = call(
         &fixture.state,
-        public_request(Method::GET, "/api/v1/auth/sso/providers", &fixture.host, None),
+        public_request(
+            Method::GET,
+            "/api/v1/auth/sso/providers",
+            &fixture.host,
+            None,
+        ),
     )
     .await;
     assert_eq!(
@@ -857,19 +880,25 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert!(
-        matches!(
-            redirect.status,
-            StatusCode::FOUND | StatusCode::BAD_GATEWAY
-        ),
+        matches!(redirect.status, StatusCode::FOUND | StatusCode::BAD_GATEWAY),
         "a provider that cannot be discovered answers a refusal, never a redirect to nowhere: {}",
         redirect.body
     );
     if let Some(location) = redirect.location.as_deref() {
         // Only reached when the discovery document *was* readable (a local stub in a future
         // extension of this walk); then the URL must carry our own parameters.
-        assert!(location.contains("client_id=omnion-workspace"), "{location}");
-        assert!(location.contains("state="), "the challenge must ride the URL: {location}");
-        assert!(location.contains("code_challenge="), "PKCE must ride it too: {location}");
+        assert!(
+            location.contains("client_id=omnion-workspace"),
+            "{location}"
+        );
+        assert!(
+            location.contains("state="),
+            "the challenge must ride the URL: {location}"
+        );
+        assert!(
+            location.contains("code_challenge="),
+            "PKCE must ride it too: {location}"
+        );
     }
 
     // A `return_to` outside the known panel paths is dropped rather than followed: the callback

@@ -29,13 +29,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
+use omnion_identity::security;
 use omnion_identity::sso::challenges::{self, SsoChallenge};
 use omnion_identity::sso::claims::{self, Identity};
 use omnion_identity::sso::oidc::{self, Discovery, HttpClient, MetadataCache, VerifiedAssertion};
 use omnion_identity::sso::providers::{self, AuthProvider, ProviderKind};
-use omnion_identity::sso::saml::{self, SamlConfig};
 use omnion_identity::sso::provisioning::{self, ProvisionOutcome};
-use omnion_identity::security;
+use omnion_identity::sso::saml::{self, SamlConfig};
 use omnion_permissions::bindings;
 use omnion_permissions::model::Scope;
 use omnion_permissions::roles as role_store;
@@ -256,10 +256,7 @@ pub async fn start(
 /// Both values are HTML-escaped before they are written into the document. A `state` this server
 /// issued is base64url, but a `return_to` is operator- and browser-supplied, and neither is
 /// allowed to close the attribute it sits in.
-pub async fn saml_page(
-    Path(slug): Path<String>,
-    Query(query): Query<SamlPageQuery>,
-) -> Response {
+pub async fn saml_page(Path(slug): Path<String>, Query(query): Query<SamlPageQuery>) -> Response {
     // The relay page is reached from `start`, which already put the challenge in the URL. The
     // `return_to` is *not* read here on purpose: the page is a transport for the challenge, and
     // the panel path the callback honours is the one on the challenge row, read back when it is
@@ -440,7 +437,8 @@ pub async fn saml_callback(
         issuer: config_text(&provider, "issuer").unwrap_or_default(),
         audience: config_text(&provider, "audience").unwrap_or_default(),
         certificate_pem: config_text(&provider, "certificate_pem").unwrap_or_default(),
-        email_attribute: config_text(&provider, "email_attribute").unwrap_or_else(|| "email".into()),
+        email_attribute: config_text(&provider, "email_attribute")
+            .unwrap_or_else(|| "email".into()),
         group_attribute: config_text(&provider, "group_attribute"),
         display_name_attribute: config_text(&provider, "display_name_attribute"),
     };
@@ -552,7 +550,12 @@ async fn finish_sign_in(
     // The IP policy is the organization's, and a provider sign-in is a sign-in: a denied address
     // stays denied however the identity was proved.
     if let Some(organization_id) = user.organization_id
-        && let IpVerdict::Denied { reason, rule } = address_verdict(pool, organization_id, ip_address.as_deref().unwrap_or_default()).await?
+        && let IpVerdict::Denied { reason, rule } = address_verdict(
+            pool,
+            organization_id,
+            ip_address.as_deref().unwrap_or_default(),
+        )
+        .await?
     {
         log_event(
             pool,
@@ -574,7 +577,8 @@ async fn finish_sign_in(
     }
 
     provisioning::touch_account(pool, user.id, provider, &identity).await?;
-    let roles = apply_mapped_roles(pool, provider, &identity, user.organization_id, user.id).await?;
+    let roles =
+        apply_mapped_roles(pool, provider, &identity, user.organization_id, user.id).await?;
 
     log_event(
         pool,
@@ -668,10 +672,7 @@ async fn resolve_code_flow(
     // An implicit flow posts the token itself, so the code exchange is skipped — but the
     // signature and every registered claim are checked exactly the same way, and PKCE does not
     // apply because there was no code to bind it to.
-    let verified = if let Some(token) = query
-        .id_token
-        .as_deref()
-        .filter(|value| !value.is_empty())
+    let verified = if let Some(token) = query.id_token.as_deref().filter(|value| !value.is_empty())
         && query.code.is_empty()
     {
         // An implicit flow has no code, so there is no code binding to check at all.
@@ -701,7 +702,8 @@ async fn resolve_code_flow(
         // A generic OAuth2 provider may send no ID token; the userinfo endpoint is then the
         // identity, and it is read with the access token rather than the (absent) ID token.
         if verified.claims.get("sub").is_none()
-            && let (Some(access), Some(userinfo)) = (access_token, discovery.userinfo_endpoint.as_ref())
+            && let (Some(access), Some(userinfo)) =
+                (access_token, discovery.userinfo_endpoint.as_ref())
         {
             return fetch_userinfo(userinfo, &access).await;
         }
@@ -723,14 +725,13 @@ async fn exchange_code(
     challenge: &SsoChallenge,
 ) -> Result<Value, ApiError> {
     let client_id = client_id(provider)?;
-    let secret = provisioning::resolve_client_secret(provider)
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "provider_misconfigured",
-                error.to_string(),
-            )
-        })?;
+    let secret = provisioning::resolve_client_secret(provider).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "provider_misconfigured",
+            error.to_string(),
+        )
+    })?;
 
     let mut form = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={client_id}",
@@ -747,7 +748,11 @@ async fn exchange_code(
                 .post_form_with_basic(&discovery.token_endpoint, &form, &client_id, secret)
                 .await
         }
-        None => http_client().post_form(&discovery.token_endpoint, &form).await,
+        None => {
+            http_client()
+                .post_form(&discovery.token_endpoint, &form)
+                .await
+        }
     };
     answer.map_err(|error| {
         ApiError::new(
@@ -905,7 +910,9 @@ fn identity_from_verified(
 }
 
 /// The claim reduction of [`identity_from_verified`] without a provider row.
-fn identity_from_claims_only(verified: VerifiedAssertion) -> Result<Identity, omnion_identity::IdentityError> {
+fn identity_from_claims_only(
+    verified: VerifiedAssertion,
+) -> Result<Identity, omnion_identity::IdentityError> {
     claims::identity_from_claims(&verified.claims, None, None)
 }
 
@@ -1026,16 +1033,12 @@ async fn grant(
 /// What it must never do is *guess*: with several organizations and no way to tell them apart, a
 /// guess would let a sign-in link for one tenant complete against another. So the answer is an
 /// honest `501` naming the fix (register a domain), not a coin toss.
-async fn organization_for_request(
-    pool: &PgPool,
-    headers: &HeaderMap,
-) -> Result<Uuid, ApiError> {
-    let organizations = sqlx::query_scalar::<_, Uuid>(
-        "select id from organizations order by created_at limit 2",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|error| ApiError::from(omnion_identity::IdentityError::Database(error)))?;
+async fn organization_for_request(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    let organizations =
+        sqlx::query_scalar::<_, Uuid>("select id from organizations order by created_at limit 2")
+            .fetch_all(pool)
+            .await
+            .map_err(|error| ApiError::from(omnion_identity::IdentityError::Database(error)))?;
 
     match organizations.as_slice() {
         [only] => Ok(*only),
@@ -1158,17 +1161,17 @@ async fn discovery_for(provider: &AuthProvider) -> Result<Discovery, ApiError> {
 
     let document = match config_text(provider, "issuer") {
         Some(issuer) => {
-            let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
-            http_client()
-                .get_json(&url)
-                .await
-                .map_err(|error| {
-                    ApiError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "provider_unreachable",
-                        format!("the provider's discovery document is not readable: {error}"),
-                    )
-                })?
+            let url = format!(
+                "{}/.well-known/openid-configuration",
+                issuer.trim_end_matches('/')
+            );
+            http_client().get_json(&url).await.map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_unreachable",
+                    format!("the provider's discovery document is not readable: {error}"),
+                )
+            })?
         }
         // A provider that publishes no discovery document still has endpoints; they are entered
         // explicitly, so the "document" is assembled from the row rather than fetched.
@@ -1517,7 +1520,11 @@ mod tests {
         let mut row = provider(ProviderKind::Oidc);
         assert_eq!(
             effective_scopes(&row),
-            vec!["openid".to_owned(), "profile".to_owned(), "email".to_owned()]
+            vec![
+                "openid".to_owned(),
+                "profile".to_owned(),
+                "email".to_owned()
+            ]
         );
         row.scopes = vec!["openid".into(), "groups".into()];
         assert_eq!(effective_scopes(&row), row.scopes);
@@ -1533,7 +1540,10 @@ mod tests {
 
     #[test]
     fn escaping_covers_everything_that_can_end_an_attribute() {
-        assert_eq!(html_escape(r#"a"b'c<d>e&f"#), "a&quot;b&#39;c&lt;d&gt;e&amp;f");
+        assert_eq!(
+            html_escape(r#"a"b'c<d>e&f"#),
+            "a&quot;b&#39;c&lt;d&gt;e&amp;f"
+        );
         // A state we issued is base64url and passes through untouched — escaping a value that
         // cannot contain a dangerous character must not corrupt it either.
         assert_eq!(html_escape("aB3-_xyz"), "aB3-_xyz");
@@ -1557,7 +1567,10 @@ mod tests {
         let page = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(page.contains(r#"value="the-challenge""#), "{page}");
         assert!(!page.contains(r#"value="/media""#), "{page}");
-        assert!(page.contains(r#"action="/api/v1/auth/sso/okta/callback""#), "{page}");
+        assert!(
+            page.contains(r#"action="/api/v1/auth/sso/okta/callback""#),
+            "{page}"
+        );
     }
 
     #[tokio::test]
