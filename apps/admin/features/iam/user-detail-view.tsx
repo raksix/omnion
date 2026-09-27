@@ -16,6 +16,8 @@ import Link from "next/link";
 import { useSession } from "@/lib/session";
 import {
   ApiError,
+  beginPasskeyRegistration,
+  completePasskeyRegistration,
   confirmIamTotp,
   createIamBinding,
   enrollIamTotp,
@@ -23,11 +25,13 @@ import {
   fetchIamBindings,
   fetchIamFactors,
   fetchIamUser,
+  fetchPasskeys,
   fetchRoles,
   fetchSites,
   resetIamMfa,
   revokeIamBinding,
   revokeIamFactor,
+  revokePasskey,
   updateIamUser,
   type IamBinding,
   type IamEffectivePermissions,
@@ -36,6 +40,7 @@ import {
   type IamRole,
   type IamUserDetail,
 } from "@/lib/api";
+import { ceremonyMessage, createPasskey, passkeysSupported } from "@/lib/webauthn";
 import { StepUpPrompt } from "@/features/iam/step-up-prompt";
 import type { Site } from "@/lib/types";
 
@@ -98,6 +103,10 @@ export function UserDetailView({ userId }: { userId: string }) {
   const [confirmCode, setConfirmCode] = useState("");
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [factorBusy, setFactorBusy] = useState(false);
+  // Passkeys (REQ-006, slice 3b) — enrolment only ever happens for the account at the keyboard.
+  const [passkeys, setPasskeys] = useState<IamFactor[] | null>(null);
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
+  const isSelf = user?.id === userId;
   // A refused dangerous action, parked until a step-up lets it run again.
   const [pendingAction, setPendingAction] = useState<{
     label: string;
@@ -151,12 +160,62 @@ export function UserDetailView({ userId }: { userId: string }) {
           : { code: "unknown_error", message: "The second factors could not be read." },
       );
     }
-  }, [userId]);
+    // A passkey is the caller's own credential: the list is read from the self-service route,
+    // and only for the account that is signed in.
+    if (user?.id === userId) {
+      try {
+        setPasskeys((await fetchPasskeys()).passkeys);
+      } catch {
+        setPasskeys([]);
+      }
+    }
+  }, [userId, user?.id]);
 
   useEffect(() => {
     if (tab !== "factors") return;
     void loadFactors();
   }, [tab, loadFactors]);
+
+  /** Enrol a passkey on this device: the browser runs the ceremony, the API verifies it. */
+  const enrolPasskey = async () => {
+    setPasskeyBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const options = await beginPasskeyRegistration(factorLabel || "Passkey");
+      const credential = await createPasskey(options);
+      const body = await completePasskeyRegistration({
+        challenge: options.challenge,
+        label: factorLabel || "Passkey",
+        credential,
+      });
+      setNotice(
+        `The passkey is enrolled (${body.algorithm}). Sign-ins now ask for it — or for a code — before they open a session.`,
+      );
+      await loadFactors();
+    } catch (cause) {
+      setError({
+        code: cause instanceof ApiError ? cause.code : "passkey_failed",
+        message:
+          cause instanceof ApiError ? cause.message : ceremonyMessage(cause),
+      });
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  /** Remove one of the caller's own passkeys (a step-up is demanded, like every factor). */
+  const removePasskey = async (passkey: IamFactor) => {
+    setPasskeyBusy(true);
+    setError(null);
+    setNotice(null);
+    await withStepUp(`Remove the passkey "${passkey.label}"`, async () => {
+      await revokePasskey(passkey.id);
+      setNotice(`The passkey "${passkey.label}" was removed.`);
+      await loadFactors();
+    });
+    setPasskeyBusy(false);
+  };
 
   /**
    * Run a dangerous action; when the API answers `step_up_required`, park it and ask for a fresh
@@ -933,6 +992,82 @@ export function UserDetailView({ userId }: { userId: string }) {
               </table>
             </div>
           ) : null}
+
+          {/* Passkeys: a credential the browser holds, verified by its own signature. */}
+          <section
+            data-passkeys
+            aria-label="Passkeys"
+            className="flex flex-col gap-3 rounded-xl border border-line bg-surface p-4"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="max-w-xl">
+                <h2 className="text-[13px] font-medium text-ink">Passkeys (WebAuthn)</h2>
+                <p className="text-[12px] text-muted">
+                  {isSelf
+                    ? "A passkey lives in this device's authenticator (Windows Hello, Touch ID, a security key). The browser signs a challenge and this installation verifies the signature — no shared secret ever reaches the server."
+                    : "A passkey belongs to the account at the keyboard, so only the account holder can enrol one. As an administrator you can remove one, or reset every factor."}
+                </p>
+              </div>
+              {isSelf ? (
+                <button
+                  type="button"
+                  disabled={passkeyBusy || !passkeysSupported()}
+                  data-passkey-enrol
+                  onClick={() => void enrolPasskey()}
+                  className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-accent-soft disabled:text-accent-strong"
+                >
+                  <Fingerprint className="size-3.5" aria-hidden />
+                  {passkeyBusy ? "Waiting for the authenticator…" : "Add a passkey"}
+                </button>
+              ) : null}
+            </div>
+
+            {isSelf && !passkeysSupported() ? (
+              <p data-passkey-unsupported className="text-[12px] text-caution">
+                This browser cannot run a passkey ceremony.
+              </p>
+            ) : null}
+
+            {passkeys && passkeys.length === 0 ? (
+              <p data-passkeys-empty className="text-[12.5px] text-muted">
+                No passkey on this account yet.
+              </p>
+            ) : null}
+
+            {passkeys && passkeys.length > 0 ? (
+              <ul className="flex flex-col gap-1.5">
+                {passkeys.map((passkey) => (
+                  <li
+                    key={passkey.id}
+                    data-passkey-row={passkey.id}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line bg-panel px-3 py-2"
+                  >
+                    <span className="flex flex-col">
+                      <span className="text-[12.5px] text-ink">{passkey.label}</span>
+                      <span className="text-[11.5px] text-muted">
+                        added {new Date(passkey.created_at).toLocaleString()} · last used{" "}
+                        {passkey.last_used_at
+                          ? new Date(passkey.last_used_at).toLocaleString()
+                          : "never"}
+                      </span>
+                    </span>
+                    {isSelf ? (
+                      <button
+                        type="button"
+                        disabled={passkeyBusy}
+                        data-passkey-remove={passkey.id}
+                        data-qa-guard="passkey-remove"
+                        onClick={() => void removePasskey(passkey)}
+                        className="rounded-lg border border-line px-2 py-1 text-[11.5px] text-caution transition hover:bg-surface"
+                      >
+                        Remove
+                      </button>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
         </section>
       ) : null}
 

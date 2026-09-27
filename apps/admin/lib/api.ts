@@ -100,13 +100,34 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
-/** Sign in; the API answers with the account and the session cookie. */
-export async function login(email: string, password: string): Promise<User> {
-  const body = await request<{ user: User }>("/api/v1/auth/login", {
+/** What a password check answered: a session, or the second factor it still needs. */
+export type LoginOutcome =
+  | { status: "signed-in"; user: User }
+  | { status: "mfa-required"; challenge: string; expiresInMinutes: number };
+
+/** Sign in with email and password; an account with a confirmed factor answers a challenge. */
+export async function login(email: string, password: string): Promise<LoginOutcome> {
+  const body = await request<{
+    user?: User;
+    mfa_required?: boolean;
+    challenge?: string;
+    expires_in_minutes?: number;
+  }>("/api/v1/auth/login", {
     method: "POST",
     body: JSON.stringify({ email, password }),
   });
-  return body.user;
+
+  if (body.mfa_required && body.challenge) {
+    return {
+      status: "mfa-required",
+      challenge: body.challenge,
+      expiresInMinutes: body.expires_in_minutes ?? 5,
+    };
+  }
+  if (!body.user) {
+    throw new ApiError(502, "unexpected_response", "The API answered without an account.");
+  }
+  return { status: "signed-in", user: body.user };
 }
 
 /** End the session. Safe to call without one. */
@@ -2668,6 +2689,116 @@ export function revokeIamFactor(
 export function resetIamMfa(userId: string): Promise<{ user_id: string; factors_revoked: number }> {
   return request(`/api/v1/iam/users/${encodeURIComponent(userId)}/reset-mfa`, {
     method: "POST",
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Passkeys (REQ-006, slice 3b)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A credential the browser built. The client data travels as the JSON text the ceremony signs
+ * (that is the exact string the server hashes), while every binary part travels base64url —
+ * which is how `apps/admin/lib/webauthn.ts` serialises a `PublicKeyCredential`.
+ */
+export type PasskeyCredential = {
+  id: string;
+  client_data_json: string;
+  attestation_object?: string;
+  authenticator_data?: string;
+  signature?: string;
+  transports?: string[];
+};
+
+/** The options a registration ceremony needs (`navigator.credentials.create`). */
+export type PasskeyCreationOptions = {
+  challenge: string;
+  rp: { id: string; name: string };
+  user: { id: string; name: string; displayName: string };
+  pubKeyCredParams: { type: string; alg: number }[];
+  timeout: number;
+  attestation: string;
+  authenticatorSelection: Record<string, string>;
+  excludeCredentials: { type: string; id: string }[];
+};
+
+/** The options an assertion ceremony needs (`navigator.credentials.get`). */
+export type PasskeyRequestOptions = {
+  challenge: string;
+  rpId: string;
+  allowCredentials: { type: string; id: string; transports?: string[] }[];
+  timeout: number;
+  userVerification: string;
+};
+
+/** List the signed-in account's own passkeys. */
+export function fetchPasskeys(): Promise<{ passkeys: IamFactor[] }> {
+  return request("/api/v1/auth/webauthn/passkeys");
+}
+
+/** Start a registration ceremony for the signed-in account. */
+export function beginPasskeyRegistration(label?: string): Promise<PasskeyCreationOptions> {
+  return request("/api/v1/auth/webauthn/register/begin", {
+    method: "POST",
+    body: JSON.stringify({ label: label ?? "" }),
+  });
+}
+
+/** Finish a registration ceremony; the passkey is stored confirmed. */
+export function completePasskeyRegistration(input: {
+  challenge: string;
+  label?: string;
+  credential: PasskeyCredential;
+}): Promise<{ factor: IamFactor; algorithm: string; passkeys: number }> {
+  return request("/api/v1/auth/webauthn/register/complete", {
+    method: "POST",
+    body: JSON.stringify({
+      challenge: input.challenge,
+      label: input.label ?? "",
+      credential: input.credential,
+    }),
+  });
+}
+
+/** Remove one of the signed-in account's passkeys (needs a fresh step-up). */
+export function revokePasskey(factorId: string): Promise<{ factor_id: string; revoked: boolean }> {
+  return request(`/api/v1/auth/webauthn/passkeys/${encodeURIComponent(factorId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Finish a half-done sign-in with a code (TOTP or a recovery code). */
+export function verifyMfaChallenge(
+  challenge: string,
+  code: string,
+): Promise<{ user: User; method: string; recovery_codes_remaining: number }> {
+  return request("/api/v1/auth/mfa/verify", {
+    method: "POST",
+    body: JSON.stringify({ challenge, code }),
+  });
+}
+
+/** Ask for the assertion options a passkey sign-in needs. */
+export function beginPasskeySignIn(challenge: string): Promise<PasskeyRequestOptions> {
+  return request("/api/v1/auth/webauthn/authenticate/begin", {
+    method: "POST",
+    body: JSON.stringify({ challenge }),
+  });
+}
+
+/** Finish the sign-in with a passkey assertion; the session cookie comes back with it. */
+export function completePasskeySignIn(input: {
+  challenge: string;
+  ceremonyChallenge: string;
+  credential: PasskeyCredential;
+}): Promise<{ user: User; device: unknown; expires_in: number }> {
+  return request("/api/v1/auth/webauthn/authenticate/complete", {
+    method: "POST",
+    body: JSON.stringify({
+      challenge: input.challenge,
+      ceremony_challenge: input.ceremonyChallenge,
+      credential: input.credential,
+    }),
   });
 }
 
