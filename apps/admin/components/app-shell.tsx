@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, FileText, Globe, Images, LayoutDashboard, LogOut, Menu, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { BarChart3, FileText, Globe, Images, LayoutDashboard, LogOut, Menu, ShieldCheck, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -21,6 +21,7 @@ const NAV = [
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
+  { href: "/settings/iam/roles", label: "Roles & access", icon: ShieldCheck },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
 ] as const;
 

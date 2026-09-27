@@ -1659,3 +1659,219 @@ export function eraseAnalyticsVisitor(
     { method: "DELETE" },
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// IAM: role depth (docs/requests/REQ-006, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** A role as the panel reads it. */
+export type IamRole = {
+  id: string;
+  /** `null` for a platform role. */
+  organization_id: string | null;
+  key: string;
+  name: string;
+  description: string;
+  priority: number;
+  inherits_role_id: string | null;
+  inherit_permissions: boolean;
+  is_system: boolean;
+  allowed_permissions: number;
+  denied_permissions: number;
+  created_at: string;
+};
+
+/** One entry of a role's own permission set. */
+export type IamPermissionEntry = {
+  key: string;
+  effect: "allow" | "deny";
+};
+
+/** One catalogue entry — the vocabulary the matrix draws. */
+export type IamPermissionDef = {
+  key: string;
+  category: string;
+  description: string;
+};
+
+/** A role as a chain or member list refers to it. */
+export type IamRoleRef = {
+  id: string;
+  key: string;
+  name: string;
+  priority: number;
+  is_system: boolean;
+};
+
+/** What a save (or a preview) changes. */
+export type IamDiff = {
+  added: IamPermissionEntry[];
+  changed: { key: string; from: string; to: string }[];
+  removed: IamPermissionEntry[];
+};
+
+/** `GET /api/v1/iam/roles/{id}`. */
+export type IamRoleDetail = {
+  role: IamRole;
+  permissions: IamPermissionEntry[];
+  chain: IamRoleRef[];
+  inherited_by: IamRoleRef[];
+  member_count: number;
+  version: number;
+};
+
+/** One version of a role, with the diff against the version before it. */
+export type IamRoleVersion = {
+  version: number;
+  name: string;
+  description: string;
+  priority: number;
+  change: string;
+  changed_by: string | null;
+  created_at: string;
+  permissions: IamPermissionEntry[];
+  diff: IamDiff;
+  diff_total: number;
+};
+
+/**
+ * The roles visible to the account: platform roles plus one organization's own.
+ *
+ * A tenant account always answers for its own organization; a platform account names the
+ * tenant with `organizationId`.
+ */
+export async function fetchRoles(organizationId?: string | null): Promise<IamRole[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<{ roles: IamRole[] }>(`/api/v1/iam/roles${query}`);
+  return body.roles;
+}
+
+/** One role in full: its entries, its chain, its members and its latest version. */
+export function fetchRole(roleId: string): Promise<IamRoleDetail> {
+  return request<IamRoleDetail>(`/api/v1/iam/roles/${encodeURIComponent(roleId)}`);
+}
+
+/** The permission catalogue the matrix is drawn from. */
+export async function fetchPermissionCatalogue(): Promise<IamPermissionDef[]> {
+  const body = await request<{ permissions: IamPermissionDef[] }>("/api/v1/iam/permissions");
+  return body.permissions;
+}
+
+/** Create a custom role. */
+export function createIamRole(input: {
+  key: string;
+  name: string;
+  description?: string;
+  priority?: number;
+  inheritsRoleId?: string | null;
+  /** Required from a platform account (no primary organization). */
+  organizationId?: string | null;
+}): Promise<IamRole> {
+  return request<IamRole>("/api/v1/iam/roles", {
+    method: "POST",
+    body: JSON.stringify({
+      key: input.key,
+      name: input.name,
+      description: input.description ?? "",
+      priority: input.priority,
+      inherits_role_id: input.inheritsRoleId ?? null,
+      organization_id: input.organizationId ?? null,
+    }),
+  });
+}
+
+/** Change a role's fields and its parent link. */
+export function updateIamRole(
+  roleId: string,
+  changes: {
+    name?: string;
+    description?: string;
+    priority?: number;
+    inheritPermissions?: boolean;
+    inheritsRoleId?: string | null;
+  },
+): Promise<IamRole> {
+  const body: Record<string, unknown> = {};
+  if (changes.name !== undefined) body.name = changes.name;
+  if (changes.description !== undefined) body.description = changes.description;
+  if (changes.priority !== undefined) body.priority = changes.priority;
+  if (changes.inheritPermissions !== undefined) body.inherit_permissions = changes.inheritPermissions;
+  if (changes.inheritsRoleId === null) body.detach_parent = true;
+  else if (changes.inheritsRoleId !== undefined) body.inherits_role_id = changes.inheritsRoleId;
+  return request<IamRole>(`/api/v1/iam/roles/${encodeURIComponent(roleId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Remove a custom role (refused while it carries live bindings). */
+export async function deleteIamRole(roleId: string): Promise<void> {
+  await request<null>(`/api/v1/iam/roles/${encodeURIComponent(roleId)}`, { method: "DELETE" });
+}
+
+/** Clone a role — the way an organization customises a platform role. */
+export function duplicateIamRole(
+  roleId: string,
+  input: { key: string; name: string; organizationId?: string | null },
+): Promise<IamRole> {
+  return request<IamRole>(`/api/v1/iam/roles/${encodeURIComponent(roleId)}/duplicate`, {
+    method: "POST",
+    body: JSON.stringify({
+      key: input.key,
+      name: input.name,
+      organization_id: input.organizationId ?? null,
+    }),
+  });
+}
+
+/** What saving a set would change, without writing anything. */
+export function previewRolePermissions(
+  roleId: string,
+  permissions: IamPermissionEntry[],
+): Promise<{ diff: IamDiff; problems: string[]; version: number; unchanged: boolean }> {
+  return request(`/api/v1/iam/roles/${encodeURIComponent(roleId)}/preview`, {
+    method: "POST",
+    body: JSON.stringify({ permissions }),
+  });
+}
+
+/** Save the matrix (atomic: a stale version or an unknown key refuses the whole set). */
+export function saveRolePermissions(
+  roleId: string,
+  permissions: IamPermissionEntry[],
+  expectedVersion: number,
+): Promise<{ role: IamRole; permissions: IamPermissionEntry[]; diff: IamDiff; version: number }> {
+  return request(`/api/v1/iam/roles/${encodeURIComponent(roleId)}/permissions`, {
+    method: "PUT",
+    body: JSON.stringify({ permissions, expected_version: expectedVersion }),
+  });
+}
+
+/** The role's version history, newest first, each with its diff. */
+export async function fetchRoleVersions(roleId: string): Promise<IamRoleVersion[]> {
+  const body = await request<{ role_id: string; versions: IamRoleVersion[] }>(
+    `/api/v1/iam/roles/${encodeURIComponent(roleId)}/versions`,
+  );
+  return body.versions;
+}
+
+/** One member of a role — a person the role currently or formerly applied to. */
+export type IamRoleMember = {
+  user_id: string;
+  email: string;
+  display_name: string;
+  scope: { type: string; organization_id: string | null; site_id: string | null };
+  expires_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+  created_at: string;
+};
+
+/** `GET /api/v1/iam/roles/{id}/members` — who carries the role. */
+export function fetchRoleMembers(
+  roleId: string,
+): Promise<{ role_id: string; members: IamRoleMember[] }> {
+  return request<{ role_id: string; members: IamRoleMember[] }>(
+    `/api/v1/iam/roles/${encodeURIComponent(roleId)}/members`,
+  );
+}
