@@ -77,6 +77,7 @@ pub mod commands;
 pub mod content;
 pub mod health;
 pub mod iam;
+pub mod iam_policy;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
@@ -181,6 +182,30 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require_or_machine(&state, "iam.simulate"));
 
     let iam_overview = get(iam_subjects::overview).layer(guards::require(&state, "iam.roles.read"));
+
+    // ABAC policies (REQ-006, slice 4a): the list, the builder's save and the dry run. Reading a
+    // policy and testing one touch nothing (`iam.policies.read`); saving and removing do
+    // (`iam.policies.manage`).
+    let iam_policies = get(iam_policy::list_policies)
+        .layer(guards::require(&state, "iam.policies.read"))
+        .merge(
+            post(iam_policy::create_policy).layer(guards::require(&state, "iam.policies.manage")),
+        );
+
+    let iam_policy = get(iam_policy::get_policy)
+        .layer(guards::require(&state, "iam.policies.read"))
+        .merge(
+            put(iam_policy::update_policy).layer(guards::require(&state, "iam.policies.manage")),
+        )
+        .merge(
+            delete(iam_policy::delete_policy).layer(guards::require(&state, "iam.policies.manage")),
+        );
+
+    let iam_policy_versions =
+        get(iam_policy::list_policy_versions).layer(guards::require(&state, "iam.policies.read"));
+
+    let iam_policy_test =
+        post(iam_policy::test_policy).layer(guards::require(&state, "iam.policies.read"));
 
     // Security policy, sessions, devices and second factors (REQ-006, slice 3). Reading a list
     // needs its read key; every mutation carries its own, and the dangerous ones (resetting
@@ -617,6 +642,10 @@ pub fn router(state: AppState) -> Router {
             iam_service_account_key,
         )
         .route("/iam/simulations", iam_simulations)
+        .route("/iam/policies", iam_policies)
+        .route("/iam/policies/{id}", iam_policy)
+        .route("/iam/policies/{id}/versions", iam_policy_versions)
+        .route("/iam/policies/{id}/test", iam_policy_test)
         .route("/iam/security-policies", iam_security_policy)
         .route("/iam/sessions", iam_sessions)
         .route("/iam/sessions/{id}", iam_session)

@@ -301,6 +301,11 @@ async fn explain_denial(
             "role_key": source.role_key,
             "role_name": source.role_name,
             "via": source.via,
+            "policy": source.policy.map(|policy| json!({
+                "policy_id": policy.policy_id,
+                "policy_name": policy.policy_name,
+                "priority": policy.priority,
+            })),
         })),
         "context": json!({
             "organization_id": context.organization_id,

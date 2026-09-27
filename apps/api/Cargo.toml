@@ -28,6 +28,7 @@ omnion-media = { path = "../../crates/media" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
 omnion-permissions = { path = "../../crates/permissions" }
+omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
 omnion-workflows = { path = "../../crates/workflows" }

@@ -1455,7 +1455,22 @@ pub async fn run_simulation(
             "role_name": source.role_name,
             "role_priority": source.role_priority,
             "via": source.via,
+            "policy": source.policy.as_ref().map(|policy| json!({
+                "policy_id": policy.policy_id,
+                "policy_name": policy.policy_name,
+                "priority": policy.priority,
+            })),
         })),
+        "policies": report.policies.iter().map(|policy| json!({
+            "policy_id": policy.policy_id,
+            "policy_name": policy.policy_name,
+            "effect": policy.effect,
+            "priority": policy.priority,
+            "enabled": policy.enabled,
+            "targeted": policy.targeted,
+            "satisfied": policy.satisfied,
+            "applies": policy.applies,
+        })).collect::<Vec<_>>(),
         "chain": report.steps.iter().map(|step| json!({
             "binding_id": step.binding_id,
             "role_id": step.role_id,

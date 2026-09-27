@@ -514,6 +514,15 @@ impl From<PermissionsError> for ApiError {
                 "unknown_action",
                 format!("{key:?} is not a known permission key"),
             ),
+            // The ABAC policy surface (REQ-006, slice 4a): a missing row is a 404, a policy the
+            // engine cannot read (unknown operator, empty target, blank name) a 400 that repeats
+            // the sentence the validator wrote.
+            PermissionsError::PolicyNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "policy_not_found", "no such policy")
+            }
+            PermissionsError::InvalidPolicy(message) => {
+                Self::bad_request("invalid_policy", message)
+            }
             PermissionsError::InvalidGroupName(name) => Self::bad_request(
                 "invalid_group_name",
                 format!("{name:?} is not a usable group name"),

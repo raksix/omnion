@@ -1428,6 +1428,19 @@ pub async fn delete_binding(
         ensure_same_organization(&current, binding.scope.organization_id())?;
     }
 
+    // The safety invariants (docs/07-IAM.md §19, REQ-006 slice 4a): an organization keeps at
+    // least one live owner or administrator binding, and nobody removes their own last
+    // privileged binding. A refused change leaves the store untouched.
+    if let Some(refusal) =
+        omnion_permissions::check_binding_revocation(pool, binding_id, current.user.id).await?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            refusal.code,
+            refusal.message,
+        ));
+    }
+
     let revoked = bindings::revoke(pool, binding_id).await?;
     if !revoked {
         return Err(ApiError::new(
@@ -1728,6 +1741,7 @@ fn via_name(via: evaluate::Via) -> &'static str {
         evaluate::Via::InheritedAllow => "inherited_allow",
         evaluate::Via::ExplicitDeny => "explicit_deny",
         evaluate::Via::InheritedDeny => "inherited_deny",
+        evaluate::Via::Policy => "policy",
     }
 }
 
