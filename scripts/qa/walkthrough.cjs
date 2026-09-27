@@ -99,6 +99,28 @@ function record(entry) {
 // ---------------------------------------------------------------- browser
 
 const consoleLog = [];
+/**
+ * Refusals a pass provokes on purpose — a step-up gate in front of a dangerous action, for
+ * instance. They are assertions the pass makes (it proves the prompt appeared and the retry
+ * succeeded), not defects, so a pass registers one immediately before the act with
+ * `expectRefusal` and the roll-up reports what it swallowed as `expectedRefusals` instead of a
+ * finding. An allowance is single-use and indexed, so it can only excuse an entry that arrived
+ * after it was registered.
+ */
+const expectedRefusals = [];
+
+/** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
+function expectRefusal(match, reason) {
+  expectedRefusals.push({
+    match,
+    reason,
+    consoleFrom: consoleLog.length,
+    netFrom: netFailures.length,
+    claimedConsole: false,
+    claimedNet: false,
+  });
+}
+
 const netFailures = [];
 /** Requests the browser itself cancelled (navigation) — counted, never findings. */
 const netAborted = [];
@@ -2718,11 +2740,35 @@ async function main() {
     if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
     if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
   }
-  for (const f of consoleLog.filter((c) => c.type !== "warning")) {
+  const refusedOnPurpose = [];
+  for (const [index, f] of consoleLog.entries()) {
+    if (f.type === "warning") continue;
+    // A console line names the status, not the URL: the allowance for one is the window it was
+    // registered in, so only a line that arrived after the pass announced the act can be excused.
+    const deliberate = /status of 40[13]/.test(f.text)
+      ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
+      : null;
+    if (deliberate) {
+      deliberate.claimedConsole = true;
+      refusedOnPurpose.push({ kind: "console", detail: `${f.phase} ${f.text.slice(0, 120)}`, reason: deliberate.reason });
+      continue;
+    }
     const isWeb = f.phase === "web";
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
   }
-  for (const n of netFailures) {
+  for (const [index, n] of netFailures.entries()) {
+    const deliberate = expectedRefusals.find(
+      (entry) =>
+        !entry.claimedNet &&
+        index >= entry.netFrom &&
+        String(n.url || "").includes(entry.match) &&
+        [401, 403].includes(n.status),
+    );
+    if (deliberate) {
+      deliberate.claimedNet = true;
+      refusedOnPurpose.push({ kind: "request", status: n.status, url: n.url, reason: deliberate.reason });
+      continue;
+    }
     const isWeb = n.phase === "web";
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-request" : "request-failed", `${n.phase} ${n.status || "net"} ${n.url} ${n.error || ""}`);
   }
@@ -2766,6 +2812,7 @@ async function main() {
     },
     bySeverity,
     findings,
+    expectedRefusals: refusedOnPurpose,
     shots,
     consoleLog,
     netFailures,
@@ -2794,6 +2841,12 @@ async function main() {
   for (const p of report.pages) {
     const d = p.diagnostics;
     md.push(`- **${p.name}** — overflow: ${d.horizontalOverflow ? "YES" : "no"} · offscreen: ${d.offscreen.length} · broken images: ${d.brokenImages.length} · low contrast: ${d.lowContrast.length} · unlabeled inputs: ${d.unlabeledInputs.length} · duplicate ids: ${d.duplicateIds.length} · h1: ${d.h1Count}`);
+  }
+  md.push("");
+  md.push(`## Refusals provoked on purpose — ${refusedOnPurpose.length}`);
+  md.push("");
+  for (const r of refusedOnPurpose) {
+    md.push(`- ${r.kind} ${r.status || ""} ${r.url || ""} — ${r.reason}`);
   }
   md.push("");
   md.push("## Interaction outcomes");
@@ -3146,6 +3199,15 @@ async function runPasskeysDepth(page, report) {
   await page.waitForSelector("[data-user-detail-title]", { timeout: 20000 }).catch(() => {});
   await page.locator('[data-user-tab="factors"]').first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForSelector("[data-passkey-remove]", { timeout: 25000 }).catch(() => {});
+  // Removing a confirmed factor is refused once on purpose — the session carries no fresh
+  // step-up — and the prompt proves the caller and retries the same action. That refusal is the
+  // assertion below (`stepUpShown` plus a row that is gone), so it is registered as deliberate
+  // rather than reported as a defect.
+  expectRefusal(
+    "/api/v1/auth/webauthn/passkeys/",
+    "step-up gate on a confirmed factor removal: the panel asked for a fresh proof and retried",
+  );
+  note({ step: "step-up-gate-registered", allowances: expectedRefusals.length });
   await page.locator("[data-passkey-remove]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForSelector("[data-step-up]", { timeout: 12000 }).catch(() => {});
   const stepUpShown = (await page.locator("[data-step-up]").count()) > 0;
