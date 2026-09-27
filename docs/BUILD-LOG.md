@@ -1581,3 +1581,51 @@
 - **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
+
+## 2026-09-27 — REQ-003 slice 1 · trigger and condition depth (omnion-wave3)
+
+- **What.** The automation layer could only say "every comparison holds". This slice gives it
+  `all`/`any` groups (`crates/automation/src/groups.rs`, depth ≤3, ≤24 nodes, a bare v0 array still
+  reads as one `all`), an **event library with the payload fields each event carries**
+  (`catalogue.rs` — that field list is what the condition and binding pickers offer, so a rule
+  cannot be written against a field the event lacks), the **inbound-webhook trigger** (`hooks.rs`:
+  token shown once, stored as a SHA-256 hash, every failure the same 404, the rate window keyed by
+  the rule so a rotation keeps the allowance), and **test fire** (`testing.rs`: a dry run that
+  resolves the payload through the same `resolve_params` the matcher uses and reports `would_send`,
+  plus a one-shot listener the matcher fills with the payload that actually arrived).
+  Engine-side: `WorkflowDefinition::conditions` widens from `Vec<Value>` to the stored JSON value
+  and its check accepts both shapes. API: `…/{id}/test`, `/listen`, `/tests`, `/rotate-hook` and
+  the public `POST /api/v1/hooks/{token}`. Panel: `/automations` (list, filters, editor, test fire,
+  cards below `md`). Migration `0020_automation_depth`.
+- **Proof (Rust).** `cargo test -p omnion-automation -p omnion-workflows` → **113 tests, 0 failures**
+  (72 automation, of which 30 are new: the group tree's evaluation, round trip, depth cap, size cap
+  and the three unreadable shapes; the event library; the hook token's mint/hash/shape; the dry run's
+  four reports) and `cargo test -p omnion-api --lib` → **86, 0 failures**. A wrong hook token over the
+  live stack answers `404 {"code":"not_found","message":"not found"}` — indistinguishable from a path
+  that does not exist, which is the point.
+- **Proof (web).** `pnpm typecheck && pnpm build` → 2/2, `/automations` in the admin route table.
+- **Proof (QA).** `QA_STACK=w3 … bash scripts/qa/run.sh` — the pass is recorded below; the
+  automations depth pass creates a rule from the empty state, refuses it while it has no name, nests
+  a group, saves, runs a test event and asserts every outcome starts with `would_`, refuses a
+  payload that does not parse, arms a listener, mints a webhook URL (`omhook_` + 40 chars) and
+  deletes the rule by typing its name. `/automations` is in both the desktop and the mobile lists.
+- **Two defects found and fixed in this tick.** (1) **Migration number collision.** Wave 2 claimed
+  `0019_cms_blocks.sql` in its own branch while this slice was being written; two different 0019s make
+  sqlx refuse the whole set ("migration 19 was previously applied but has been modified") and the QA
+  stack cannot start at all. Renumbered to `0020` — the next free slot — and the code comments that
+  name the migration follow it. (2) **The one-shot listener was gated on the hook event**, which made
+  "Listen for a real event" a dead control on every *event* rule — the only kind an author is likely
+  to have open when they press it. It now records the payload for any event that passed the
+  conditions and resolved its steps, and the capture sits after both checks so it reports the payload
+  a real run would have used.
+- **Also learned here (worth keeping).** `scripts/qa/run.sh` only sets the API's environment on the
+  **first** `pm2 start`; a later `pm2 restart` keeps whatever the process already had, so a stack
+  whose `OMNION_DATABASE_URL` was empty at first start falls back to the shared development database
+  and fights the other writers over the migration table. Symptom: `_sqlx_migrations` looks empty in
+  the QA database while the error names a migration that is not in it. Fix: `pm2 delete` the one named
+  process and start it with the full environment. The run also crashed once mid-walkthrough
+  (`Target page … has been closed`) with three writers on the box — a browser OOM under load, not a
+  product defect; the re-run is the one recorded.
+- **Next.** REQ-003 slice 2 — the action library and error paths: `http_request` (host allow-list,
+  HMAC signature), `publish_page`, `run_workflow`, `branch`/`stop`, per-step `on_error`, `timeout_ms`,
+  and the run-detail controls with retry and resume-from.
