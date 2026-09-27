@@ -80,6 +80,12 @@ pub enum IdentityError {
     /// A WebAuthn ceremony was refused; the message names what did not hold.
     #[error("{0}")]
     WebAuthn(String),
+    /// A provisioning token or sync-log entry is not usable (shape or unknown value).
+    #[error("{0}")]
+    InvalidProvisioning(String),
+    /// An account status is not one the schema allows.
+    #[error("{0}")]
+    InvalidUser(String),
 }
 
 /// Result alias used across the identity crate.

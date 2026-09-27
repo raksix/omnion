@@ -152,6 +152,26 @@ pub async fn create_user(pool: &PgPool, new: NewUser) -> Result<User> {
         .map_err(map_insert_error)
 }
 
+/// Set an account's status (`active`, `invited` or `disabled`) and answer the updated row.
+///
+/// `None` means no such account. The status decides `is_active`, which every sign-in path
+/// already reads, so a deactivation takes effect on the next request without touching sessions.
+pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<User>> {
+    if !matches!(status, "active" | "invited" | "disabled") {
+        return Err(IdentityError::InvalidUser(format!(
+            "unknown account status `{status}`"
+        )));
+    }
+
+    let sql = format!("update users set status = $2 where id = $1 returning {USER_COLUMNS}");
+    sqlx::query_as::<_, User>(&sql)
+        .bind(id)
+        .bind(status)
+        .fetch_optional(pool)
+        .await
+        .map_err(IdentityError::from)
+}
+
 /// Look an account up by email address.
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
     let email = normalize_email(email)?;

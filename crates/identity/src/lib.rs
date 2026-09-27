@@ -17,6 +17,7 @@ pub mod error;
 pub mod mfa;
 pub mod organizations;
 pub mod password;
+pub mod provisioning;
 pub mod secrets;
 pub mod security;
 pub mod sessions;
@@ -49,5 +50,5 @@ pub use sites::{
 };
 pub use users::{
     BootstrapOutcome, NewUser, User, bootstrap_first_admin, count_users, create_user,
-    earliest_active, find_by_id, find_credentials, has_any, normalize_email,
+    earliest_active, find_by_id, find_credentials, has_any, normalize_email, set_status,
 };
