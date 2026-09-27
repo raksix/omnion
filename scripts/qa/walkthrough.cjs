@@ -2523,6 +2523,9 @@ async function main() {
     { path: "/settings/iam/groups", name: "iam-groups" },
     { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
     { path: "/settings/iam/simulator", name: "iam-simulator" },
+    // The ABAC policy builder (REQ-006, slice 4a) — the depth pass below drives the rows, the
+    // dry run, a save with its version history and a removal.
+    { path: "/settings/iam/policies", name: "iam-policies" },
     // The security, session and device screens (REQ-006, slice 3) — the depth pass below drives
     // the policy fields, revokes a session and trusts a device.
     { path: "/settings/iam/security", name: "iam-security" },
@@ -2593,6 +2596,9 @@ async function main() {
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
   await runIamSubjectsDepth(page, report);
+
+  // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
+  report.iamPolicies = await runIamPoliciesDepth(page, report);
   log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
@@ -2627,7 +2633,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -2883,6 +2889,125 @@ main().catch(async (err) => {
  * for the owner, so the browser's own sign-in survives), the device registry with its trust
  * window, and the MFA enrolment dialog opened and cancelled.
  */
+/**
+ * The ABAC policies pass (REQ-006, slice 4a).
+ *
+ * Drives the builder from the rows the way an administrator would: name, effect, priority, a
+ * target permission and one condition row; the dry run (which highlights the leaves that
+ * matched), the save with its version history, and the removal. The policy targets
+ * `iam.provisioning.manage`, which no other screen exercises, so the moment it exists cannot
+ * change any other pass's verdict.
+ */
+async function runIamPoliciesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-policies-depth", action: "iam", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/iam/policies`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-policies-view]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const before = await page.locator("[data-policy-row]").count();
+  await shot(page, "page-iam-policies");
+
+  // ---- Create from the builder ---------------------------------------------------------------
+  await page.locator("[data-policy-new]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-policy-name]").first().fill("QA walkthrough policy").catch(() => {});
+  await page.locator("[data-policy-effect]").first().selectOption("deny").catch(() => {});
+  await page.locator("[data-policy-priority]").first().fill("640").catch(() => {});
+  await page
+    .locator("[data-policy-target-input]")
+    .first()
+    .fill("iam.provisioning.manage")
+    .catch(() => {});
+  await page.locator("[data-policy-target-add]").first().click({ timeout: 4000 }).catch(() => {});
+  const targetChips = await page.locator("[data-policy-target]").count();
+
+  const rowSelector = "[data-condition-row]";
+  const rowId = await page
+    .locator(rowSelector)
+    .first()
+    .getAttribute("data-condition-row")
+    .catch(() => null);
+  if (rowId) {
+    await page.locator(`[data-condition-attribute="${rowId}"]`).fill("action").catch(() => {});
+    await page.locator(`[data-condition-operator="${rowId}"]`).selectOption("==").catch(() => {});
+    await page
+      .locator(`[data-condition-value="${rowId}"]`)
+      .fill("iam.provisioning.manage")
+      .catch(() => {});
+  }
+  note({
+    step: "builder-filled",
+    targetChips,
+    conditionRows: await page.locator(rowSelector).count(),
+  });
+  await shot(page, "page-iam-policy-editor");
+
+  // ---- The dry run ---------------------------------------------------------------------------
+  await page
+    .locator("[data-test-permission]")
+    .first()
+    .fill("iam.provisioning.manage")
+    .catch(() => {});
+  await page.locator("[data-test-run]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-test-result]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const verdict = (await page.locator("[data-test-verdict]").first().innerText().catch(() => "")).trim();
+  const applies = await page.locator('[data-test-verdict][data-test-applies="true"]').count();
+  const matchedLeaves = await page.locator('[data-test-leaf][data-leaf-satisfied="true"]').count();
+  const unmatchedLeaves = await page.locator('[data-test-leaf][data-leaf-satisfied="false"]').count();
+  note({ step: "dry-run", verdict, applies: applies > 0, matchedLeaves, unmatchedLeaves });
+  await shot(page, "page-iam-policy-test");
+
+  // ---- Save, then read the history back ------------------------------------------------------
+  await page.locator("[data-policy-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const afterRows = await page.locator("[data-policy-row]").count();
+  const savedRows = await page.locator('[data-policy-row][data-policy-effect="deny"]').count();
+
+  await page.locator("[data-policy-history-toggle]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForSelector("[data-policy-versions]", { timeout: 12000 }).catch(() => {});
+  const versionRows = await page.locator("[data-policy-version]").count();
+  note({ step: "saved", before, afterRows, savedRows, versionRows });
+  await shot(page, "page-iam-policy-history");
+
+  // ---- Remove it again (the first press arms the button) -------------------------------------
+  await page.locator("[data-policy-delete]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const armed = (await page
+    .locator("[data-policy-delete]")
+    .first()
+    .innerText()
+    .catch(() => "")).includes("Confirm");
+  await page.locator("[data-policy-delete]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const remaining = await page.locator("[data-policy-row]").count();
+  note({ step: "delete", armed, remaining, backToStart: remaining === before });
+  await shot(page, "page-iam-policies-clean");
+
+  // ---- A refusal the reader can act on -------------------------------------------------------
+  // The field itself refuses the shape, so a mistyped form never becomes a 400 in the console
+  // (the API's own refusals — unknown target, unknown operator, out-of-range priority — are
+  // pinned by the Rust walk in `apps/api/tests/iam_policy.rs`).
+  await page.locator("[data-policy-new]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.locator("[data-policy-name]").first().fill("QA invalid policy").catch(() => {});
+  await page.locator("[data-policy-priority]").first().fill("1200").catch(() => {});
+  await page.locator("[data-policy-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForSelector("[data-policy-draft-problem]", { timeout: 8000 }).catch(() => {});
+  const refusal = (await page
+    .locator("[data-policy-draft-problem]")
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  note({ step: "invalid-priority-refused-in-field", refusal });
+  await shot(page, "page-iam-policy-refusal");
+
+  report.iamPolicies = { steps };
+  log(`iam policies: ${JSON.stringify(steps)}`);
+}
+
 async function runIamSecurityDepth(page, report) {
   const steps = [];
   const note = (step) => {
