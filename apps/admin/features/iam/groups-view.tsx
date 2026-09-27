@@ -407,10 +407,12 @@ export function GroupsView() {
                           <button
                             type="button"
                             data-group-delete={group.slug}
+                            aria-label={`Delete ${group.name}`}
+                            title="Delete group"
                             onClick={() => setConfirmDelete(group.id)}
-                            className="rounded-lg border border-line px-2 py-1 text-[12px] transition hover:bg-quiet-soft"
+                            className="flex items-center rounded-lg border border-line px-2 py-1 text-caution transition hover:bg-danger-soft"
                           >
-                            <Trash2 className="size-3" aria-hidden />
+                            <Trash2 className="size-3.5" aria-hidden />
                           </button>
                         </span>
                       )}
