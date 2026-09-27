@@ -14,10 +14,11 @@ use omnion_api::state::AppState;
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
-use omnion_permissions::model::{NewBinding, Scope};
-use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_permissions::model::{NewBinding, ResourceContext, Scope, Subject};
+use omnion_permissions::{authorize_subject, bindings, roles as role_store, seed};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -1026,7 +1027,10 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     )
     .await;
     assert_eq!(alpha.status, StatusCode::CREATED, "{}", alpha.body);
-    let alpha_id = alpha.body["id"].as_str().expect("a role carries an id").to_owned();
+    let alpha_id = alpha.body["id"]
+        .as_str()
+        .expect("a role carries an id")
+        .to_owned();
 
     let saved = call(
         &fixture.state,
@@ -1039,13 +1043,25 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     )
     .await;
     assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
-    assert_eq!(saved.body["version"], 1, "the first save is version 1: {}", saved.body);
-    assert_eq!(saved.body["diff"]["added"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        saved.body["version"], 1,
+        "the first save is version 1: {}",
+        saved.body
+    );
+    assert_eq!(
+        saved.body["diff"]["added"].as_array().map(Vec::len),
+        Some(1)
+    );
 
     // The detail carries the entries, the version and the member count.
     let detail = call(
         &fixture.state,
-        request(Method::GET, &format!("/api/v1/iam/roles/{alpha_id}"), Some(&owner), None),
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            None,
+        ),
     )
     .await;
     assert_eq!(detail.status, StatusCode::OK, "{}", detail.body);
@@ -1053,7 +1069,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     assert_eq!(detail.body["version"], 1);
     assert_eq!(detail.body["member_count"], 0);
     let entries = keys_of(&detail.body, "permissions", "key");
-    assert_eq!(entries, vec!["iam.roles.read".to_owned()], "{}", detail.body);
+    assert_eq!(
+        entries,
+        vec!["iam.roles.read".to_owned()],
+        "{}",
+        detail.body
+    );
 
     // A second role that denies the same key; it inherits the first one.
     let beta = call(
@@ -1089,17 +1110,31 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     // The detail of the child shows its chain.
     let beta_detail = call(
         &fixture.state,
-        request(Method::GET, &format!("/api/v1/iam/roles/{beta_id}"), Some(&owner), None),
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{beta_id}"),
+            Some(&owner),
+            None,
+        ),
     )
     .await;
-    assert_eq!(beta_detail.body["chain"][0]["key"], "depth-alpha", "{}", beta_detail.body);
+    assert_eq!(
+        beta_detail.body["chain"][0]["key"], "depth-alpha",
+        "{}",
+        beta_detail.body
+    );
     assert_eq!(
         beta_detail.body["inherited_by"].as_array().map(Vec::len),
         Some(0)
     );
     let alpha_children = call(
         &fixture.state,
-        request(Method::GET, &format!("/api/v1/iam/roles/{alpha_id}"), Some(&owner), None),
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            None,
+        ),
     )
     .await;
     assert_eq!(alpha_children.body["inherited_by"][0]["key"], "depth-beta");
@@ -1136,7 +1171,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(self_parent.status, StatusCode::CONFLICT, "{}", self_parent.body);
+    assert_eq!(
+        self_parent.status,
+        StatusCode::CONFLICT,
+        "{}",
+        self_parent.body
+    );
     assert_eq!(self_parent.body["error"]["code"], "role_inheritance_cycle");
 
     // The chain stops at eight ancestors: nine roles are a ladder, ten are refused.
@@ -1177,7 +1217,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(too_deep.status, StatusCode::BAD_REQUEST, "{}", too_deep.body);
+    assert_eq!(
+        too_deep.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        too_deep.body
+    );
     assert_eq!(too_deep.body["error"]["code"], "role_inheritance_depth");
 
     // Precedence, through the guard: no binding → no read; an allow → read; a deny → no read.
@@ -1204,7 +1249,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(allow_binding.status, StatusCode::CREATED, "{}", allow_binding.body);
+    assert_eq!(
+        allow_binding.status,
+        StatusCode::CREATED,
+        "{}",
+        allow_binding.body
+    );
 
     let allowed = call(
         &fixture.state,
@@ -1243,7 +1293,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(deny_binding.status, StatusCode::CREATED, "{}", deny_binding.body);
+    assert_eq!(
+        deny_binding.status,
+        StatusCode::CREATED,
+        "{}",
+        deny_binding.body
+    );
 
     let denied_again = call(
         &fixture.state,
@@ -1276,7 +1331,11 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     .await;
     assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
     let problems = preview.body["problems"].as_array().expect("problems").len();
-    assert!(problems >= 2, "unknown key and duplicate entry: {}", preview.body);
+    assert!(
+        problems >= 2,
+        "unknown key and duplicate entry: {}",
+        preview.body
+    );
 
     // The atomic refusal: an unknown key or a duplicate fails the whole set — nothing is stored.
     let refused = call(
@@ -1297,7 +1356,9 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
     assert_eq!(refused.body["error"]["code"], "invalid_entries");
-    let refused_message = refused.body["error"]["message"].as_str().unwrap_or_default();
+    let refused_message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
         refused_message.contains("nope.nope") && refused_message.contains("content.pages.read"),
         "the refusal names what it rejected: {refused_message}"
@@ -1305,7 +1366,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
 
     let after_refusal = call(
         &fixture.state,
-        request(Method::GET, &format!("/api/v1/iam/roles/{alpha_id}"), Some(&owner), None),
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{alpha_id}"),
+            Some(&owner),
+            None,
+        ),
     )
     .await;
     assert_eq!(
@@ -1350,7 +1416,10 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     .await;
     assert_eq!(fresh.status, StatusCode::OK, "{}", fresh.body);
     assert_eq!(fresh.body["version"], 2);
-    assert_eq!(fresh.body["diff"]["added"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        fresh.body["diff"]["added"].as_array().map(Vec::len),
+        Some(1)
+    );
 
     // The history shows both versions, each with the diff it introduced.
     let history = call(
@@ -1370,7 +1439,10 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
     assert_eq!(versions[0]["diff_total"], 1);
     assert_eq!(versions[0]["diff"]["added"][0]["key"], "content.pages.read");
     assert_eq!(versions[1]["version"], 1);
-    assert_eq!(versions[1]["diff_total"], 1, "the first version adds its whole set");
+    assert_eq!(
+        versions[1]["diff_total"], 1,
+        "the first version adds its whole set"
+    );
 
     // A field change is a version too.
     let renamed = call(
@@ -1410,7 +1482,12 @@ async fn role_depth_lifecycle_is_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(nameless.status, StatusCode::BAD_REQUEST, "{}", nameless.body);
+    assert_eq!(
+        nameless.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        nameless.body
+    );
     assert_eq!(nameless.body["error"]["code"], "invalid_request");
 
     // Duplicate: the copy carries the set and starts its own history.
@@ -1490,4 +1567,754 @@ async fn fixture_token(fixture: &Fixture, user_id: Uuid) -> String {
         .await
         .expect("the account must exist");
     login(&fixture.state, &email).await
+}
+
+/// Build a request that authenticates with a machine key instead of a cookie.
+fn bearer_request(method: Method, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+
+    match body {
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .expect("request must build"),
+        None => builder.body(Body::empty()).expect("request must build"),
+    }
+}
+
+/// REQ-006, slice 2: subjects, scopes, groups, machine identities and the simulator.
+///
+/// The walk proves the slice over HTTP the way the panel drives it: a group grants through its
+/// membership and takes it away again, a path-scoped binding allows `/blog/…` and denies
+/// `/legal/…`, an expired temporary role stops counting without being deleted, a machine key
+/// authenticates a `/api/v1` request over `Bearer` (and only that), and the simulator's verdict
+/// equals the guard's across the whole catalogue.
+#[tokio::test]
+async fn subjects_scopes_and_the_simulator_are_proven_end_to_end() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.owner_token().await;
+    let organization_id = fixture.organization_id;
+    let (member_id, member_email) = fixture.add_account(Some(organization_id)).await;
+    let (scoped_id, _scoped_email) = fixture.add_account(Some(organization_id)).await;
+    let member_token = login(&fixture.state, &member_email).await;
+    let member_role = fixture.system_role("member").await.to_string();
+    let editor_role = fixture.system_role("editor").await.to_string();
+    let administrator_role = fixture.system_role("administrator").await.to_string();
+
+    // --- A group grants through its membership ------------------------------------------------
+    let group = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/groups",
+            Some(&owner),
+            Some(json!({ "name": "QA Team", "description": "walk", "organization_id": organization_id })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        group.status,
+        StatusCode::CREATED,
+        "group body: {}",
+        group.body
+    );
+    let group_id = group.body["id"].as_str().expect("group id").to_owned();
+
+    let membership = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/groups/{group_id}/members"),
+            Some(&owner),
+            Some(json!({ "user_ids": [member_id] })),
+        ),
+    )
+    .await;
+    assert_eq!(membership.status, StatusCode::OK, "{}", membership.body);
+    assert_eq!(membership.body["member_count"], 1);
+
+    let binding = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "group",
+                "subject_id": group_id,
+                "role_id": member_role,
+                "scope_type": "organization",
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        binding.status,
+        StatusCode::CREATED,
+        "binding body: {}",
+        binding.body
+    );
+    assert_eq!(binding.body["subject_type"], "group");
+    assert_eq!(binding.body["subject_id"], group_id.as_str());
+    assert!(
+        binding.body["user_id"].is_null(),
+        "a group binding has no account column"
+    );
+
+    // The member holds the role through the group, and the simulator agrees.
+    let effective = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/effective-permissions?user_id={member_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(effective.status, StatusCode::OK, "{}", effective.body);
+    assert!(
+        entry_for(&effective.body, "granted", "content.pages.read").is_some(),
+        "the group binding must grant: {}",
+        effective.body
+    );
+
+    let allowed = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/simulations",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "user",
+                "subject_id": member_id,
+                "permission": "content.pages.read",
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::OK, "{}", allowed.body);
+    assert_eq!(allowed.body["allowed"], true, "{}", allowed.body);
+    assert_eq!(allowed.body["reason"], "allowed");
+    assert_eq!(allowed.body["source"]["role_key"], "member");
+    assert!(
+        allowed.body["chain"]
+            .as_array()
+            .is_some_and(|chain| !chain.is_empty()),
+        "the chain must list the bindings considered"
+    );
+
+    // Removing the member reverses it on the next request.
+    let cleared = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/groups/{group_id}/members"),
+            Some(&owner),
+            Some(json!({ "user_ids": [] })),
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.body);
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/simulations",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "user",
+                "subject_id": member_id,
+                "permission": "content.pages.read",
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.body["allowed"], false, "{}", refused.body);
+    assert_eq!(refused.body["reason"], "missing_permission");
+
+    // --- A resource-scoped binding matches the path it names ----------------------------------
+    let scoped = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "user",
+                "subject_id": scoped_id,
+                "role_id": member_role,
+                "scope_type": "resource",
+                "organization_id": organization_id,
+                "resource_type": "path",
+                "resource_id": "/blog/*",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(scoped.status, StatusCode::CREATED, "{}", scoped.body);
+    assert_eq!(scoped.body["scope"]["type"], "resource");
+    assert_eq!(scoped.body["scope"]["resource_id"], "/blog/*");
+
+    let simulate = |path: &str| {
+        let state = fixture.state.clone();
+        let member = scoped_id;
+        let path = path.to_owned();
+        let owner = owner.clone();
+        let organization_id = organization_id;
+        async move {
+            call(
+                &state,
+                request(
+                    Method::POST,
+                    "/api/v1/iam/simulations",
+                    Some(&owner),
+                    Some(json!({
+                        "subject_type": "user",
+                        "subject_id": member,
+                        "permission": "content.pages.read",
+                        "organization_id": organization_id,
+                        "path": path,
+                    })),
+                ),
+            )
+            .await
+        }
+    };
+
+    let blog = simulate("/blog/hello-world").await;
+    assert_eq!(
+        blog.body["allowed"], true,
+        "a matching path is allowed: {}",
+        blog.body
+    );
+    let legal = simulate("/legal/terms").await;
+    assert_eq!(
+        legal.body["allowed"], false,
+        "another path is not: {}",
+        legal.body
+    );
+    assert!(
+        legal.body["chain"]
+            .as_array()
+            .expect("chain")
+            .iter()
+            .any(|step| step["state"] == "out_of_scope"),
+        "the chain must say why the row did not count: {}",
+        legal.body
+    );
+
+    // The effective set answers with the same reading: with the path it grants, without it not.
+    let granted_on_blog = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/iam/effective-permissions?user_id={scoped_id}&path=%2Fblog%2Fhello-world"
+            ),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        entry_for(&granted_on_blog.body, "granted", "content.pages.read").is_some(),
+        "{}",
+        granted_on_blog.body
+    );
+    let granted_on_legal = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/effective-permissions?user_id={scoped_id}&path=%2Flegal%2Fterms"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        entry_for(&granted_on_legal.body, "granted", "content.pages.read").is_none(),
+        "the path-scoped row must not grant elsewhere: {}",
+        granted_on_legal.body
+    );
+
+    // --- A temporary role that ran out stops counting without being deleted -------------------
+    let past = (OffsetDateTime::now_utc() - time::Duration::hours(1))
+        .format(&Rfc3339)
+        .expect("format");
+    let temporary = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "user",
+                "subject_id": scoped_id,
+                "role_id": editor_role,
+                "scope_type": "organization",
+                "organization_id": organization_id,
+                "expires_at": past,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(temporary.status, StatusCode::CREATED, "{}", temporary.body);
+    assert_eq!(temporary.body["active"], false);
+    assert_eq!(temporary.body["expired"], true);
+
+    let expired_verdict = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/simulations",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "user",
+                "subject_id": scoped_id,
+                "permission": "content.pages.create",
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        expired_verdict.body["allowed"], false,
+        "an expired binding must not grant: {}",
+        expired_verdict.body
+    );
+
+    let members = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/roles/{editor_role}/members"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    let expired_row = members.body["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .find(|row| row["subject_id"] == scoped_id.to_string())
+        .expect("the expired binding is still listed");
+    assert_eq!(expired_row["expired"], true);
+    assert!(
+        expired_row["revoked_at"].is_null(),
+        "the row is kept, not deleted"
+    );
+
+    // --- A machine identity authenticates over Bearer and only over Bearer --------------------
+    // The boot seed keeps a base role in sync with the catalogue, so the Administrator really does
+    // hold every key (a deployment seeded before IAM grew must not silently lose them).
+    let report = omnion_permissions::seed::ensure(fixture.db.pool())
+        .await
+        .expect("the boot seed must run");
+    assert!(
+        report.permissions >= 70,
+        "catalogue: {}",
+        report.permissions
+    );
+    let administrator_keys: i64 = sqlx::query_scalar(
+        "select count(*) from role_permissions rp \
+         join roles r on r.id = rp.role_id \
+         where r.key = 'administrator' and r.organization_id is null and rp.effect = 'allow'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("count");
+    assert_eq!(
+        administrator_keys, report.permissions as i64,
+        "the Administrator role holds the whole catalogue after seeding"
+    );
+
+    // A key the code does not declare does not stay behind as a live grant, and a row that lost its
+    // effect is repaired: seeding is a reconciliation, not a one-off insert.
+    let admin_role: Uuid = sqlx::query_scalar(
+        "select id from roles where key = 'administrator' and organization_id is null",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("administrator role");
+    let editor_role_id: Uuid =
+        sqlx::query_scalar("select id from roles where key = 'editor' and organization_id is null")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("editor role");
+
+    sqlx::query(
+        "insert into role_permissions (role_id, permission_key, effect) values ($1, 'iam.roles.manage', 'allow') \
+         on conflict (role_id, permission_key) do update set effect = 'allow'",
+    )
+    .bind(editor_role_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("seed a stray grant");
+    sqlx::query(
+        "insert into role_permissions (role_id, permission_key, effect) values ($1, 'iam.simulate', 'deny') \
+         on conflict (role_id, permission_key) do update set effect = 'deny'",
+    )
+    .bind(admin_role)
+    .execute(fixture.db.pool())
+    .await
+    .expect("seed a stale deny");
+
+    omnion_permissions::seed::ensure(fixture.db.pool())
+        .await
+        .expect("re-seed");
+
+    let stray: bool = sqlx::query_scalar(
+        "select exists (select 1 from role_permissions where role_id = $1 and permission_key = 'iam.roles.manage')",
+    )
+    .bind(editor_role_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("check");
+    assert!(!stray, "seeding prunes a grant the code does not declare");
+
+    let repaired: bool = sqlx::query_scalar(
+        "select exists (select 1 from role_permissions where role_id = $1 and permission_key = 'iam.simulate' and effect = 'allow')",
+    )
+    .bind(admin_role)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("check");
+    assert!(repaired, "seeding repairs the effect of a declared key");
+
+    let account = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/service-accounts",
+            Some(&owner),
+            Some(json!({
+                "name": "qa-runner",
+                "description": "walk",
+                "organization_id": organization_id,
+                "key_label": "ci",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(account.status, StatusCode::CREATED, "{}", account.body);
+    let account_id = account.body["id"].as_str().expect("account id").to_owned();
+    let token = account.body["key"]
+        .as_str()
+        .expect("the key is returned once")
+        .to_owned();
+    assert!(token.starts_with("omsa_"), "token shape: {token}");
+
+    // The identity carries the administrator role, so it may ask the simulator (that route needs
+    // `iam.simulate`) — and the same question answers ALLOWED for it.
+    let attach = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "service_account",
+                "subject_id": account_id,
+                "role_id": administrator_role,
+                "scope_type": "organization",
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(attach.status, StatusCode::CREATED, "{}", attach.body);
+
+    let machine = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/iam/simulations",
+            &token,
+            Some(json!({ "permission": "content.pages.read" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        machine.status,
+        StatusCode::OK,
+        "a machine key authenticates a /api/v1 request over Bearer: {}",
+        machine.body
+    );
+    assert_eq!(machine.body["allowed"], true, "{}", machine.body);
+    assert_eq!(
+        machine.body["subject"],
+        format!("service_account:{account_id}"),
+        "the default subject is the machine itself"
+    );
+
+    // The session surface refuses it, and it cannot sign anybody in.
+    let session_only = call(
+        &fixture.state,
+        bearer_request(Method::GET, "/api/v1/iam/users", &token, None),
+    )
+    .await;
+    assert_eq!(
+        session_only.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        session_only.body
+    );
+    let sign_in = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/auth/login",
+            &token,
+            Some(json!({ "email": "nobody@omnion.test", "password": PASSWORD })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        sign_in.status,
+        StatusCode::UNAUTHORIZED,
+        "a machine key buys no session: {}",
+        sign_in.body
+    );
+    assert!(sign_in.set_cookie.is_none(), "no cookie is issued");
+
+    // The secret is never readable again; the prefix stays.
+    let read_back = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/service-accounts/{account_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(read_back.status, StatusCode::OK, "{}", read_back.body);
+    assert!(
+        !read_back.body.to_string().contains(&token),
+        "the token must not be stored or returned again"
+    );
+    let key_id = read_back.body["keys"][0]["id"]
+        .as_str()
+        .expect("key id")
+        .to_owned();
+
+    // Revoked, the key is refused on the next request.
+    let revoked = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/iam/service-accounts/{account_id}/keys/{key_id}"),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{}", revoked.body);
+    let after_revoke = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/iam/simulations",
+            &token,
+            Some(json!({ "permission": "content.pages.read" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        after_revoke.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        after_revoke.body
+    );
+    assert_eq!(after_revoke.body["error"]["code"], "invalid_machine_key");
+
+    // --- The simulator agrees with the guard, across the whole catalogue ----------------------
+    let catalogue = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/iam/permissions", Some(&owner), None),
+    )
+    .await;
+    let keys = keys_of(&catalogue.body, "permissions", "key");
+    assert!(keys.len() >= 70, "catalogue size: {}", keys.len());
+
+    let account_uuid = Uuid::parse_str(&account_id).expect("account uuid");
+    let cases: Vec<(Subject, ResourceContext)> = vec![
+        (
+            Subject::User(scoped_id),
+            ResourceContext {
+                organization_id: Some(organization_id),
+                ..ResourceContext::default()
+            },
+        ),
+        (
+            Subject::User(scoped_id),
+            ResourceContext {
+                organization_id: Some(organization_id),
+                path: Some("/blog/hello-world".to_owned()),
+                ..ResourceContext::default()
+            },
+        ),
+        (
+            Subject::ServiceAccount(account_uuid),
+            ResourceContext {
+                organization_id: Some(organization_id),
+                ..ResourceContext::default()
+            },
+        ),
+    ];
+
+    let mut compared = 0_usize;
+    for (subject, context) in &cases {
+        for key in &keys {
+            let simulated = call(
+                &fixture.state,
+                request(
+                    Method::POST,
+                    "/api/v1/iam/simulations",
+                    Some(&owner),
+                    Some(json!({
+                        "subject_type": match subject {
+                            Subject::User(_) => "user",
+                            Subject::Group(_) => "group",
+                            Subject::ServiceAccount(_) => "service_account",
+                        },
+                        "subject_id": subject.id(),
+                        "permission": key,
+                        "organization_id": context.organization_id,
+                        "path": context.path,
+                    })),
+                ),
+            )
+            .await;
+            assert_eq!(simulated.status, StatusCode::OK, "{}", simulated.body);
+
+            // The guard's own decision function — the one `guards::check` calls.
+            let decision = authorize_subject(fixture.db.pool(), *subject, context, key)
+                .await
+                .expect("the decision path must answer");
+            let guard_allows = matches!(decision, omnion_permissions::Decision::Allowed(_));
+
+            assert_eq!(
+                simulated.body["allowed"], guard_allows,
+                "the simulator and the guard must agree on {key} for {subject:?} in {context:?}"
+            );
+            compared += 1;
+        }
+    }
+    assert!(
+        compared >= 200,
+        "the matrix must cover the catalogue: {compared}"
+    );
+
+    // --- A refusal names its decision source (docs/07-IAM.md §18) ------------------------------
+    // Nothing grants it: the 403 says which permission, and says no role refused it.
+    let missing = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/iam/users", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::FORBIDDEN, "{}", missing.body);
+    assert_eq!(missing.body["error"]["code"], "permission_denied");
+    assert_eq!(missing.body["error"]["details"]["permission"], "users.read");
+    assert_eq!(
+        missing.body["error"]["details"]["reason"],
+        "missing_permission"
+    );
+    assert!(
+        missing.body["error"]["details"]["source"].is_null(),
+        "no role refused it: {}",
+        missing.body
+    );
+
+    // A role that refuses a key outranks the allow it inherits, and the refusal names that role.
+    let watcher_key = format!("watcher-{}", Uuid::new_v4().simple());
+    let watcher = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/roles",
+            Some(&owner),
+            Some(json!({
+                "key": watcher_key,
+                "name": "Read Watcher",
+                "organization_id": organization_id,
+                "inherits_role_id": editor_role,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(watcher.status, StatusCode::CREATED, "{}", watcher.body);
+    let watcher_role_id = watcher.body["id"].as_str().expect("role id").to_owned();
+
+    let denied = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/iam/roles/{watcher_role_id}/permissions"),
+            Some(&owner),
+            Some(json!({ "permissions": [{ "key": "content.pages.read", "effect": "deny" }] })),
+        ),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::OK, "{}", denied.body);
+
+    let watcher_bound = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/bindings",
+            Some(&owner),
+            Some(json!({
+                "subject_type": "user",
+                "subject_id": member_id,
+                "role_id": watcher_role_id,
+                "scope_type": "organization",
+                "organization_id": organization_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        watcher_bound.status,
+        StatusCode::CREATED,
+        "{}",
+        watcher_bound.body
+    );
+
+    let refused = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/pages", Some(&member_token), None),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    assert_eq!(refused.body["error"]["details"]["reason"], "explicit_deny");
+    assert_eq!(
+        refused.body["error"]["details"]["source"]["role_key"],
+        watcher_key.as_str(),
+        "the refusal names the role that decided it: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["details"]["source"]["via"],
+        "explicit_deny"
+    );
+    assert!(
+        refused.body["error"]["details"]["counted"]
+            .as_u64()
+            .is_some_and(|counted| counted >= 1),
+        "the refusal reports what it consulted: {}",
+        refused.body
+    );
+
+    fixture.cleanup().await;
 }
