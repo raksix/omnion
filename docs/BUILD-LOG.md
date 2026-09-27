@@ -1791,3 +1791,87 @@
   `workflow_approvals`, the `workflows.approve` key, the pending panel, single-use decision
   tokens, and `automation.rule.permission_revoked` (the permission-revoked path is the
   request's own "write it first" note, so it goes in before the approval inbox does).
+
+## 2026-09-27 · wave3 · REQ-003 slice 3 — approvals and run-as authority (`8ecfba0`, `0cb9920`)
+
+- **What.** A `wait_for_approval` step, the queue that lists what is waiting, and the decision
+  that releases or ends it — plus the run-as authority the whole thing is built on, written
+  **first** as the request asks. A gate is a *suspend*, not an action, so the engine owns it
+  beside the wait it already had: a new `approval` step kind, a `workflow_approvals` table, and a
+  run status (`awaiting_approval`) that is **open but not claimable**. That distinction is the
+  feature: the claim query's `e.status = 'running'` filter is what makes it impossible for
+  anything behind a pending decision to progress — not the gate, and not the effect the gate was
+  there to hold back. A rule, meanwhile, carries no authority of its own: `run_as_user_id` names
+  an account, `None` follows the author, and a *deleted* author resolves to **nobody** rather
+  than to any fallback, because a deleted account's authority is not a permission anybody holds.
+  `workflows.approve` is a fourth key rather than a variant of `workflows.run`, so the person who
+  writes a rule is not the person who waves through everything it parks. Panel: the pending
+  panel above the table, the run-as picker, and a gate step's three typed controls. Migration
+  `0024_automation_approvals`.
+- **Proof (Rust).** `cargo test --workspace --lib --bins` → **622 tests, 0 failures** across 19
+  crates (omnion-workflows 62 of which 12 are new: the token's alphabet and hash, the gate
+  parameters and their four refusals, the deadline boundary, the parked-run/terminal-run
+  distinction, the row's own `expired`/`params` reads; omnion-automation 87 of which 5 are new in
+  `authority`; omnion-api 90 of which 3 are new for the approvals surface).
+  `apps/api/tests/automation_approvals.rs` → **4 integration walks, 0 failures**, each on a
+  throwaway database: a gate that parks and holds, an approve/release and a reject/end, a
+  double decision and a forged token and an expired gate, and the authority walk (publish with the
+  permission, publish again without it, then a deleted author).
+- **Four real defects, all found by the walks and fixed here — none by a unit test.**
+  (1) **A rejected gate left the run parked forever.** The ending reused
+  `settle_execution_as`, which guards on `status = 'running'`, and a rejection happens while the
+  run is `awaiting_approval` — so the write matched zero rows and the run sat there with a gate
+  that said "rejected" and a trace that never ended. It now settles from `awaiting_approval` and
+  falls back for the other cases. (2) **The trace lost the refusal**: the steps after the gate
+  were closed *after* the gate's own row, so the generic "the run ended before this step"
+  overwrote "rejected by an approver". The order is now the helper first, the gate's reason
+  second. (3) **An expired gate could not be recorded**: `decided_shape` required `decided_by`
+  whenever `decided_at` was set, so the sweeper's own write failed its own constraint. "When" and
+  "by whom" are separate facts, and an expiry is decided by nobody. (4)
+  **`workflow_executions.approval_id` was described in the migration header and never created**,
+  so every run read failed on a fresh database with "column does not exist" — the same
+  "previously applied but modified" shape the ledger records for a renumbered migration, reached
+  the other way round. It is added *after* the table it references, because a forward reference
+  produces a failure that reads like a typo rather than an ordering mistake.
+- **Two decisions the spec does not settle, taken and recorded rather than papered over.**
+  *The decision token is optional in the body.* The request's risk note calls an approval link a
+  credential and says it is "delivered to a panel page that posts the token in the body" — and a
+  token that were *mandatory* would mean the pending panel can decide nothing, because a queue
+  read must never mint a credential. So the authority to open a gate is the session's
+  `workflows.approve` (the route guard), and the token is the second factor a notification
+  carries (checked when it is sent, so a forwarded link for another gate decides nothing).
+  *An expired gate is decided as a rejection* rather than a third state: "nobody answered" and
+  "no" are one answer, and a third state would need a third ending and a third colour in the run
+  history for a single fact. The sweep records the decision; the engine ends the run.
+- **Proof (QA).** `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202 bash
+  scripts/qa/run.sh --only=automationsapprovals` on the private stack (ports 18082/3102/3202,
+  database `omnion_qa_w3`, pm2 `omnion-qa-*-w3`), with the new depth pass registered in
+  `DEPTH_PASSES` so it can be run on its own. The pass clicks every control this slice added and
+  reads three back rather than eyeballing them: the run-as picker's default and the sentence under
+  it (which must say the permissions are checked *when a step runs*), the gate step's three
+  controls with the action picker **gone** on a gate, and — through a save-and-reopen round trip —
+  that the gate's parameters survive a whole-rule write. It also asserts the panel's *absent*
+  state, which is the one that is easy to leave broken.
+  **`ONLY_PASS=automationsapprovals`, `NET_FAILURES=0`**; every step read back what it asserted:
+  the gate's permission, message and lifetime (`24`) all survived a whole-rule write, the invalid
+  permission was reported in the summary with Save disabled, and the pending panel is absent when
+  nothing waits.
+  **One honest limitation of the pass, recorded rather than hidden.** `run.sh` does not forward
+  `--only` to the walkthrough, so the first attempt ran the **full** inventory (twenty minutes of
+  browser beside two other writers' stacks) and was killed at the 1500 s cap before reaching any
+  depth pass — which is the ledger's lesson, repeated: a pass that dies half way through proves
+  nothing about the pass it never reached, and the depth pass is run *directly* with
+  `NODE_PATH=/root/test-hermes/node_modules`. A second finding from the full run: the QA database
+  holds exactly one account, so the run-as picker shows one option and says so in words ("Accounts
+  cannot be listed here, so the rule follows its author") — which is the honest state for a
+  platform account with no organization, not a dead control.
+  **A vision note that was checked and dismissed.** The first vision read reported a black rounded
+  rectangle overlapping the "No conditions" text under **Conditions**. A crop, and then the same
+  question asked of an artifact from an *earlier* tick, both identify it as the pre-existing "All"
+  group selector sitting above the sentence — not an overlay, and not something this slice
+  introduced. Recorded because a vision finding that is *wrong* is worth as much as one that is
+  right: the check is what turned "a new defect" into "not mine".
+- **Next.** Slice 4 — operations polish: `rate_limit_per_hour` and the concurrency policy
+  (`queue` | `skip`) enforced *in the transaction that starts a run*, the endless-loop guard, the
+  six templates gallery, versions/restore, the audit tab, and the event emissions
+  (`workflow.step.retrying` / `.failed`, `automation.rule.limit_reached`).

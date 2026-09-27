@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** in-progress (slice 2 · `73bc32e`, `ac5cb44`, `240e3e6`, `ed6b670`, `eef966a`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** in-progress (slice 3 · `8ecfba0`, `0cb9920`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -170,12 +170,37 @@ the payload; the rule id is the only identifier returned to the caller.
       `completed`. A rule whose `{{event.*}}` bindings need an event is **refused in words** rather than
       run against an invented payload. The rate window (`rate_limit_per_hour`) is slice 4's, so the
       second half of this line stays open.
-- [ ] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
-      *Slice 3.* Not started.
-- [ ] A `wait_for_approval` step parks the run as `awaiting_approval`, the pending panel lists it, approving resumes it, rejecting ends it without the effect.
-      *Slice 3.* Not started.
-- [ ] Deciding an approval twice has no second effect (single-use token) and an expired approval is refused with a clear message.
-      *Slice 3.* Not started.
+- [x] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
+      *Proved:* `crates/automation/src/authority.rs` — `workflows.run_as_user_id` names the account, `None`
+      follows the author, and **a deleted author resolves to nobody** rather than to any fallback
+      (the walk deletes the author and asserts the run refuses rather than falling back to the
+      account that pressed *Run now*). `authorise_action` runs *before* any parameter is read and
+      before the world is touched, and the refusal is a message the engine's `stop` policy ends the
+      run on — not a retry. `permission_for` is a closed `match`, so an action with no entry cannot
+      run at all. The walk publishes with the permission present (`completed`), removes it from the
+      role, publishes again (`failed`), and reads `automation.rule.permission_revoked`,
+      `content.pages.publish` and "run-as" out of the step's error — then asserts the event is on
+      the bus.
+- [x] A `wait_for_approval` step parks the run as `awaiting_approval`, the pending panel lists it, approving resumes it, rejecting ends it without the effect.
+      *Proved:* the run status is `awaiting_approval` — open, and **not claimable** — and the claim
+      query's `e.status = 'running'` filter is the whole protection. The walk drives the engine hard
+      and asserts the run is still parked, the gate step is `waiting` and the step behind it is
+      `pending`; the queue lists it with its step name, permission, message and deadline, and
+      **carries no token**. Approving releases the run (`running`), the gate succeeds with the
+      decider's id on its output, and the step behind it runs. Rejecting ends the run as
+      `cancelled`, the gate's row says `rejected by an approver`, and the step behind it says it
+      was never reached. The author is `403` on both the read and the decision — reading the queue
+      *is* the deciding power.
+- [x] Deciding an approval twice has no second effect (single-use token) and an expired approval is refused with a clear message.
+      *Proved:* the decision is one `update … where decision is null`, so a second press matches zero
+      rows and is answered `200` with the decision the gate already has — the walk presses *approve*
+      then *reject* and reads `approved` back, then counts exactly one decided row with one decider
+      and one timestamp. A wrong token and a wrong id both answer `404 approval_not_found`
+      (three shapes tried, including an empty one), and the gate is still waiting afterwards. An
+      expired gate answers `400 approval_expired` naming the next step, and the sweeper closes it —
+      `approvals_expired: 1` — after which the **engine** ends the run, not the sweep. The token is
+      optional in the body by design: the authority is the session's `workflows.approve`, and the
+      token is the second factor a notification carries.
 - [ ] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
       *Proved, with one correction to the request's wording:* `retry_step_from` re-runs the chosen step
       **and everything after it** for both controls. Re-running *only* the failed step would let a run
@@ -204,6 +229,13 @@ the payload; the rule id is the only identifier returned to the caller.
 - [ ] All six templates load, validate and save without edits beyond their missing credentials.
       *Slice 4* (the templates gallery). Not started.
 - [ ] Empty, loading and error states exist on every screen; no dead buttons and no "coming soon" text.
+      **Slice 3** adds the pending panel (visually distinct from the table, Approve/Reject, both
+      disabled once the gate has expired), the run-as picker with the account list and the
+      sentence the **API** resolved rather than one guessed from the picker, the permissions the
+      rule's actions need, and a gate step's three typed controls. A gate with a permission that is
+      not a key, no message, or a lifetime outside 1–720 h is reported in the same summary with Save
+      disabled. The pending panel's *absent* state is asserted too: a panel that renders an empty box
+      reads as a failure and one that never renders reads as a missing feature.
       *Proved for the slice-1 screens:* the list has a loading table, an empty state ("No automations yet") with New rule, a
       no-match state, a load-error banner and a notice; the editor has a validation summary that disables Save, a save-error alert, an
       empty-conditions explanation and an "empty nested group" explanation. **Slice 2** adds the rule's own
@@ -241,6 +273,20 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
    not the behaviour. Migration `0023_automation_actions`.
 3. **Approvals and run-as authority** — `wait_for_approval`, `workflow_approvals`, `workflows.approve`, the pending panel, decision endpoints with single-use tokens, `run_as_user_id` checks, `automation.rule.permission_revoked`.
    *Done when:* a publish step is blocked by a revoked permission, and a gated publish completes only after an approval.
+   *Shipped* (`8ecfba0`, `0cb9920`). Both halves proved by `apps/api/tests/automation_approvals.rs`
+   (4 walks) and by the `automationsapprovals` QA pass. Migration `0024_automation_approvals`.
+   Two notes on the spec, both recorded rather than papered over:
+   * **The decision token is optional in the body.** The request's risk note says approval links are
+     credentials and are "delivered to a panel page that posts the token in the body" — and a token
+     that is *mandatory* would mean the pending panel can decide nothing, because a queue read must
+     never mint a credential. The split is therefore: the **authority** to open a gate is the
+     session's `workflows.approve` (checked by the route guard), and the **token** is the second
+     factor a notification carries (checked when it is sent). A forwarded link whose token belongs
+     to another gate decides nothing.
+   * **An expired gate is decided as a rejection**, not as a third state. "Nobody answered" and "no"
+     are the same answer, and a third state would need a third ending and a third colour in the run
+     history for what is one fact — *it did not go ahead*. The sweep records the decision; the
+     engine's next claim ends the run, so the clock and the state machine stay separate.
 4. **Operations polish** — rate limits and concurrency, endless-loop guard, templates gallery, versions/restore, audit tab, mobile and empty states, event emissions.
    *Done when:* the six templates run green on the QA database and the limit and loop guards each have a test that fails when the guard is removed.
 

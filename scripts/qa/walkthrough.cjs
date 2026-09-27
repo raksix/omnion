@@ -4146,6 +4146,229 @@ async function runAutomationsActionsDepth(page, report) {
 }
 
 /**
+ * The slice-3 pass: the approval gate and the run-as authority (REQ-003).
+ *
+ * Every control this slice added is clicked, and the two that *prove* something are
+ * read back rather than eyeballed:
+ *
+ *  * the run-as picker, and the sentence under it — the panel must show what the
+ *    **API** resolved, not what the picker happens to hold;
+ *  * a gate step's three controls, with a message the decider would read and a permission
+ *    that is a real key; a gate with an empty permission is reported in the problems
+ *    summary *before* a save is attempted, with Save disabled;
+ *  * the step-kind picker grows `approval`, and the action picker must disappear on it —
+ *    a gate names no action, and a picker that still offered one would let an author save
+ *    a definition the engine refuses;
+ *  * the pending panel: when a gate is waiting it is drawn above the table with an Approve
+ *    and a Reject, and when nothing waits it is not drawn at all. "Not drawn" is the state
+ *    that is easy to leave broken, so it is asserted rather than assumed.
+ */
+async function runAutomationsApprovalsDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    log(`automations-approvals: ${JSON.stringify(entry)}`);
+  };
+
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // A fresh rule, so the pass does not depend on what another pass left behind.
+  const ruleName = `QA gate rule ${Date.now().toString(36)}`;
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  // The name first: Save is disabled while any problem is open, and a nameless rule is one.
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // --- the run-as picker -------------------------------------------------------------------
+  const runAs = page.locator("[data-automation-run-as]").first();
+  const runAsVisible = (await runAs.count()) > 0;
+  const runAsDefault = runAsVisible
+    ? await runAs.evaluate((node) => node.value).catch(() => null)
+    : null;
+  const helpVisible = (await page.locator("[data-automation-run-as-help]").count()) > 0;
+  const helpText = helpVisible
+    ? (await page.locator("[data-automation-run-as-help]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  note({
+    step: "run-as",
+    runAsVisible,
+    runAsDefault,
+    helpVisible,
+    saysWhenItIsChecked: /step runs|when each step runs/i.test(helpText),
+    helpText,
+  });
+  await shot(page, "page-automations-approvals-run-as");
+
+  // The picker must offer more than one choice on a seeded stack — a picker with only the
+  // default is a *read-only* control wearing a select's clothes, and an author cannot hand a
+  // rule to a service account through it.
+  const runAsOptions = runAsVisible
+    ? await runAs.evaluate((node) => node.options.length).catch(() => 0)
+    : 0;
+  note({ step: "run-as-choices", runAsOptions, hasMoreThanTheDefault: runAsOptions > 1 });
+
+  // --- the gate step ----------------------------------------------------------------------
+  const kindSelect = page.locator("[data-automation-step-kind='0']").first();
+  const kindVisible = (await kindSelect.count()) > 0;
+  const kindHasApproval = kindVisible
+    ? await kindSelect
+        .evaluate((node) => Array.from(node.options).some((option) => option.value === "approval"))
+        .catch(() => false)
+    : false;
+  if (kindVisible) {
+    await kindSelect.selectOption("approval").catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  const gateVisible = (await page.locator("[data-automation-approval-step='0']").count()) > 0;
+  // A gate names no action: the action picker must be gone, exactly as it is on a branch.
+  const actionHiddenOnGate =
+    (await page.locator("[data-automation-step-action='0']").count()) === 0;
+  const permissionVisible = (await page.locator("[data-automation-approval-permission='0']").count()) > 0;
+  const messageVisible = (await page.locator("[data-automation-approval-message='0']").count()) > 0;
+  const ttlVisible = (await page.locator("[data-automation-approval-ttl='0']").count()) > 0;
+  note({
+    step: "gate-step",
+    kindVisible,
+    kindHasApproval,
+    gateVisible,
+    actionHiddenOnGate,
+    permissionVisible,
+    messageVisible,
+    ttlVisible,
+  });
+  await shot(page, "page-automations-approvals-gate-step");
+
+  // A gate with an unusable permission is reported before a save, with Save disabled. The
+  // panel owns this check; the server refuses it too, but an author who only learns on save
+  // cannot fix the rule in one pass.
+  if (permissionVisible) {
+    await page
+      .locator("[data-automation-approval-permission='0']")
+      .first()
+      .fill("not a permission")
+      .catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const problemsShown = (await page.locator("[data-automation-problems]").count()) > 0;
+  const problemsText = problemsShown
+    ? (await page.locator("[data-automation-problems]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saveDisabled = await page
+    .locator("[data-automation-save]")
+    .first()
+    .evaluate((node) => node.disabled)
+    .catch(() => null);
+  note({
+    step: "gate-validation",
+    problemsShown,
+    saveDisabled,
+    namedThePermission: /not a permission/.test(problemsText),
+    problemsText,
+  });
+  await shot(page, "page-automations-approvals-gate-problem");
+
+  // Fix it, add a message and a bounded lifetime, and the summary must clear.
+  if (permissionVisible) {
+    await page
+      .locator("[data-automation-approval-permission='0']")
+      .first()
+      .fill("workflows.approve")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  if (messageVisible) {
+    await page
+      .locator("[data-automation-approval-message='0']")
+      .first()
+      .fill("the QA pass asks: publish this?")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  if (ttlVisible) {
+    await page.locator("[data-automation-approval-ttl='0']").first().fill("24").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await page.locator("[data-automation-step-name='0']").first().fill("wait for a person").catch(() => {});
+  await page.waitForTimeout(300);
+  const problemsCleared = (await page.locator("[data-automation-problems]").count()) === 0;
+  const saveEnabledAfterFix = problemsCleared
+    ? await page
+        .locator("[data-automation-save]")
+        .first()
+        .evaluate((node) => !node.disabled)
+        .catch(() => false)
+    : false;
+  note({ step: "gate-fixed", problemsCleared, saveEnabledAfterFix });
+  await shot(page, "page-automations-approvals-gate-fixed");
+
+  // --- save, then read the rule back ------------------------------------------------------
+  await page.locator("[data-automation-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const saveBlocked = (await page.locator("[data-automation-save-error]").count()) > 0;
+  const saveBlockedText = saveBlocked
+    ? (await page.locator("[data-automation-save-error]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saved = !saveBlocked && (await page.locator("[data-automation-notice]").count()) > 0;
+
+  await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .click({ timeout: 8000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+  // The round trip is the assertion: a whole-rule write that dropped the gate's parameters
+  // would save a rule the engine cannot run, and only a save-and-reopen catches it.
+  const gateSurvived = (await page.locator("[data-automation-approval-step='0']").count()) > 0;
+  const permissionKept = gateSurvived
+    ? await page
+        .locator("[data-automation-approval-permission='0']")
+        .first()
+        .evaluate((node) => node.value)
+        .catch(() => null)
+    : null;
+  const messageKept = gateSurvived
+    ? await page
+        .locator("[data-automation-approval-message='0']")
+        .first()
+        .evaluate((node) => node.value)
+        .catch(() => null)
+    : null;
+  const ttlKept = gateSurvived
+    ? await page
+        .locator("[data-automation-approval-ttl='0']")
+        .first()
+        .evaluate((node) => node.value)
+        .catch(() => null)
+    : null;
+  note({
+    step: "round-trip",
+    saved,
+    saveBlocked,
+    saveBlockedText,
+    gateSurvived,
+    permissionKept,
+    messageKept,
+    ttlKept,
+  });
+  await shot(page, "page-automations-approvals-round-trip");
+
+  // --- the pending panel ------------------------------------------------------------------
+  // Nothing is waiting on this pass's rule, so the panel must NOT be drawn. The "empty"
+  // state is the one that is easy to leave broken, because a panel that renders an empty
+  // box reads as a failure and a panel that never renders reads as a missing feature.
+  const panelAbsent = (await page.locator("[data-automation-approvals]").count()) === 0;
+  const errorAbsent = (await page.locator("[data-automation-approvals-error]").count()) === 0;
+  note({ step: "panel-empty", panelAbsent, errorAbsent });
+  await shot(page, "page-automations-approvals-panel-empty");
+
+  report.automationsApprovals = { steps };
+  log(`automations-approvals: ${JSON.stringify(steps)}`);
+}
+
+/**
  * The depth passes that `--only=<name>` can run on their own.
  *
  * The key is the pass's own name minus the `Depth` suffix (`automations` for
@@ -4156,6 +4379,7 @@ async function runAutomationsActionsDepth(page, report) {
 const DEPTH_PASSES = {
   automations: (page, report) => runAutomationsDepth(page, report),
   automationsactions: (page, report) => runAutomationsActionsDepth(page, report),
+  automationsapprovals: (page, report) => runAutomationsApprovalsDepth(page, report),
   analytics: (page, report) => runAnalyticsDepth(page, report),
   search: (page, report) => runSearchDepth(page, report),
   iamroles: (page, report) => runIamRolesDepth(page, report),
