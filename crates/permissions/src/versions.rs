@@ -13,9 +13,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::model::{
-    Effect, PermissionChange, Role, RoleDiff, RolePermission, RoleVersion,
-};
+use crate::model::{Effect, PermissionChange, Role, RoleDiff, RolePermission, RoleVersion};
 
 /// Column list for every version query, so the row shape stays in one place.
 const VERSION_COLUMNS: &str = "id, role_id, version, name, description, priority, \
@@ -82,9 +80,7 @@ pub async fn record(
     let permissions = serde_json::Value::Array(
         entries
             .iter()
-            .map(|entry| {
-                serde_json::json!({ "key": entry.key, "effect": entry.effect.as_str() })
-            })
+            .map(|entry| serde_json::json!({ "key": entry.key, "effect": entry.effect.as_str() }))
             .collect(),
     );
 
@@ -241,11 +237,7 @@ mod tests {
     #[test]
     fn consecutive_versions_diff_like_their_sets() {
         let role_id = Uuid::new_v4();
-        let first = version(
-            role_id,
-            1,
-            &[entry("content.pages.read", Effect::Allow)],
-        );
+        let first = version(role_id, 1, &[entry("content.pages.read", Effect::Allow)]);
         let second = version(
             role_id,
             2,

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::bindings;
 use crate::error::Result;
-use crate::model::{Effect, RoleAssignment, Scope};
+use crate::model::{Effect, ResourceContext, RoleAssignment, Scope, Subject};
 use crate::roles;
 
 /// How a permission reached the principal.
@@ -235,6 +235,54 @@ impl RoleGraph {
         self.roles.is_empty()
     }
 
+    /// Trace how a bound role speaks about one key — the simulator's explanation chain.
+    ///
+    /// Returns `None` when the role (and its ancestors) say nothing about the key. The walk is
+    /// the same walk [`Self::effective`] takes, so a trace can never disagree with the verdict.
+    #[must_use]
+    pub fn trace(&self, role_id: Uuid, key: &str) -> Option<Trace> {
+        let bound = self.roles.get(&role_id)?;
+
+        let mut visited: BTreeSet<Uuid> = BTreeSet::new();
+        let mut cursor = Some(bound);
+        let mut inherited = false;
+        let mut inherited_from: Option<(Uuid, String)> = None;
+
+        while let Some(assignment) = cursor {
+            if !visited.insert(assignment.role.id) {
+                break;
+            }
+
+            if let Some(effect) = assignment.entry(key) {
+                return Some(Trace {
+                    role_id: assignment.role.id,
+                    role_key: assignment.role.key.clone(),
+                    role_name: assignment.role.name.clone(),
+                    effect,
+                    via: match (effect, inherited) {
+                        (Effect::Allow, false) => Via::ExplicitAllow,
+                        (Effect::Allow, true) => Via::InheritedAllow,
+                        (Effect::Deny, false) => Via::ExplicitDeny,
+                        (Effect::Deny, true) => Via::InheritedDeny,
+                    },
+                    inherited_from,
+                });
+            }
+
+            let parent = assignment
+                .role
+                .inherits_role_id
+                .filter(|_| assignment.role.inherit_permissions);
+            if inherited_from.is_none() {
+                inherited_from = Some((assignment.role.id, assignment.role.key.clone()));
+            }
+            inherited = true;
+            cursor = parent.and_then(|id| self.roles.get(&id));
+        }
+
+        None
+    }
+
     /// Resolve the permissions of a principal bound to `bound_role_ids`.
     ///
     /// Every bound role contributes its own entries as explicit decisions and walks its
@@ -281,6 +329,23 @@ impl RoleGraph {
     }
 }
 
+/// How one bound role answers for one permission key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trace {
+    /// The role that carries the entry (an ancestor when the effect was inherited).
+    pub role_id: Uuid,
+    /// Its key.
+    pub role_key: String,
+    /// Its name.
+    pub role_name: String,
+    /// The effect it carries.
+    pub effect: Effect,
+    /// How it reached the principal.
+    pub via: Via,
+    /// The bound role the walk started at, when the effect was inherited.
+    pub inherited_from: Option<(Uuid, String)>,
+}
+
 /// Load the roles of a scope (platform roles plus the organization's own) with their entries.
 pub async fn load_role_graph(pool: &PgPool, organization_id: Option<Uuid>) -> Result<RoleGraph> {
     let roles = roles::list_roles(pool, organization_id).await?;
@@ -293,23 +358,61 @@ pub async fn load_role_graph(pool: &PgPool, organization_id: Option<Uuid>) -> Re
     })))
 }
 
-/// The permissions a principal holds in one scope.
-pub async fn effective_permissions(
+/// The permissions a subject holds in one context.
+///
+/// This is the single resolution the whole platform asks: the guard, the effective-permissions
+/// screen and the simulator all call it, so no two callers can disagree. A person's set includes
+/// the bindings of every group they belong to; a group's and a machine identity's set is their
+/// own.
+pub async fn effective_permissions_for(
     pool: &PgPool,
-    user_id: Uuid,
-    scope: Scope,
+    subject: Subject,
+    context: &ResourceContext,
 ) -> Result<EffectivePermissions> {
-    let bindings = bindings::active_for_scope(pool, user_id, scope).await?;
-    let graph = load_role_graph(pool, scope.organization_id()).await?;
+    let bindings = bindings::active_for_context(pool, subject, context).await?;
+    let graph = load_role_graph(pool, context.organization_id).await?;
     let bound: Vec<Uuid> = bindings.iter().map(|binding| binding.role_id).collect();
 
     Ok(graph.effective(&bound))
 }
 
-/// Decide whether a principal holds one permission in one scope.
-pub async fn authorize(pool: &PgPool, user_id: Uuid, scope: Scope, key: &str) -> Result<Decision> {
-    let effective = effective_permissions(pool, user_id, scope).await?;
+/// The permissions an account holds in one scope (the pre-context shape every caller speaks).
+pub async fn effective_permissions(
+    pool: &PgPool,
+    user_id: Uuid,
+    scope: Scope,
+) -> Result<EffectivePermissions> {
+    let context = ResourceContext::from_scope(scope);
+    effective_permissions_for(pool, Subject::User(user_id), &context).await
+}
+
+/// The permissions an account holds in a context that names a resource path.
+pub async fn effective_permissions_in(
+    pool: &PgPool,
+    user_id: Uuid,
+    scope: Scope,
+    path: Option<&str>,
+) -> Result<EffectivePermissions> {
+    let mut context = ResourceContext::from_scope(scope);
+    context.path = path.map(str::to_owned);
+    effective_permissions_for(pool, Subject::User(user_id), &context).await
+}
+
+/// Decide whether a subject holds one permission in one context.
+pub async fn authorize_subject(
+    pool: &PgPool,
+    subject: Subject,
+    context: &ResourceContext,
+    key: &str,
+) -> Result<Decision> {
+    let effective = effective_permissions_for(pool, subject, context).await?;
     Ok(effective.decision(key))
+}
+
+/// Decide whether an account holds one permission in one scope.
+pub async fn authorize(pool: &PgPool, user_id: Uuid, scope: Scope, key: &str) -> Result<Decision> {
+    let context = ResourceContext::from_scope(scope);
+    authorize_subject(pool, Subject::User(user_id), &context, key).await
 }
 
 #[cfg(test)]

@@ -77,6 +77,30 @@ pub enum PermissionsError {
     /// The account already holds this role at this scope.
     #[error("the role is already assigned at this scope")]
     AlreadyBound,
+    /// No group carries this id.
+    #[error("group not found")]
+    GroupNotFound,
+    /// The group name is empty or too long.
+    #[error("invalid group name: {0}")]
+    InvalidGroupName(String),
+    /// A group with this name already exists in the organization.
+    #[error("a group with this name already exists")]
+    GroupNameTaken,
+    /// No service account carries this id.
+    #[error("service account not found")]
+    ServiceAccountNotFound,
+    /// The service-account name is empty or too long.
+    #[error("invalid service account name: {0}")]
+    InvalidServiceAccountName(String),
+    /// A service account with this name already exists in the organization.
+    #[error("a service account with this name already exists")]
+    ServiceAccountNameTaken,
+    /// The machine key does not exist, is revoked, or does not match its secret.
+    #[error("invalid machine key")]
+    InvalidMachineKey,
+    /// The role could not be found while checking a simulator query.
+    #[error("the simulated action is not a known permission: {0}")]
+    UnknownSimulatedAction(String),
 }
 
 /// Result alias used across the permissions crate.

@@ -20,20 +20,28 @@ pub mod bindings;
 pub mod catalogue;
 pub mod error;
 pub mod evaluate;
+pub mod groups;
+pub mod matching;
 pub mod model;
 pub mod roles;
 pub mod seed;
+pub mod service_accounts;
+pub mod simulate;
 pub mod versions;
 
 pub use catalogue::{CATALOGUE, PermissionDef, get as permission, is_known};
 pub use error::{PermissionsError, Result};
 pub use evaluate::{
-    Decision, DenyReason, EffectivePermissions, Grant, RoleGraph, Via, authorize,
-    effective_permissions,
+    Decision, DenyReason, EffectivePermissions, Grant, RoleGraph, Trace, Via, authorize,
+    authorize_subject, effective_permissions, effective_permissions_for, effective_permissions_in,
+    load_role_graph,
 };
+pub use matching::glob_matches;
 pub use model::{
-    Effect, MAX_INHERITANCE_DEPTH, MAX_PRIORITY, MIN_PRIORITY, NewBinding, NewRole, ParentChange,
-    PermissionChange, PermissionSummary, Role, RoleBinding, RoleDiff, RolePermission,
-    RolePermissionInput, RoleSaveOutcome, RoleUpdate, RoleVersion, Scope,
+    Effect, MAX_INHERITANCE_DEPTH, MAX_PRIORITY, MIN_PRIORITY, NewBinding, NewRole,
+    NewSubjectBinding, ParentChange, PermissionChange, PermissionSummary, ResourceContext, Role,
+    RoleBinding, RoleDiff, RolePermission, RolePermissionInput, RoleSaveOutcome, RoleUpdate,
+    RoleVersion, Scope, Subject, validate_priority, validate_role_key, validate_role_name,
 };
 pub use seed::SeedReport;
+pub use simulate::{SimulationReport, SimulationStep, simulate};

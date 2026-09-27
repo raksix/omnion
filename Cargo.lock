@@ -1293,7 +1293,10 @@ dependencies = [
 name = "omnion-permissions"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "rand 0.8.8",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "time",
