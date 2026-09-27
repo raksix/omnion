@@ -44,7 +44,13 @@ export function InsertPanel({ registry, onPick, onClose }: InsertPanelProps) {
 
   const grouped = useMemo(() => {
     const needle = query.trim().toLowerCase();
+    // A structure-only block (`column`) is in the registry because a stored payload carries it,
+    // but it is never a choice: there is nowhere outside a Columns block to put one, and an
+    // author who could insert it would only discover that at publish time.
     const matches = registry.blocks.filter((entry) => {
+      if (entry.structure_only) {
+        return false;
+      }
       if (needle === "") {
         return true;
       }
@@ -172,6 +178,8 @@ export function BlockInspector({
               ) : null}
               <button
                 type="button"
+                data-block-crumb
+                data-block-crumb-path={crumb.path.join("-")}
                 onClick={() => onCrumb(crumb.path)}
                 className="rounded px-1 text-muted transition hover:text-ink"
               >

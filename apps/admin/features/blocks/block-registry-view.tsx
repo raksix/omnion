@@ -154,6 +154,14 @@ export function BlockRegistryView() {
                               container
                             </span>
                           ) : null}
+                          {entry.structure_only ? (
+                            // The reference has to explain the one type the insert panel hides,
+                            // or a reader who finds `column` in a payload and not in the panel
+                            // has no way to know whether it is a bug.
+                            <span className="rounded-full bg-quiet-soft px-1.5 py-0.5 text-[10.5px] text-muted">
+                              not in the insert panel
+                            </span>
+                          ) : null}
                         </span>
                         <span className="text-[12px] text-muted">{entry.description}</span>
                       </span>
