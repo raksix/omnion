@@ -462,7 +462,7 @@ fn read_name(chars: &[char], from: usize) -> Option<(String, usize)> {
     if end == from {
         return None;
     }
-    (Some((chars[from..end].iter().collect(), end)))
+    Some((chars[from..end].iter().collect(), end))
 }
 
 /// Read a whole tag's attributes, returning them, whether it closes itself, and the index after.
