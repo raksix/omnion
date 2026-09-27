@@ -1,4 +1,4 @@
--- Omnion · 0019 · automation depth: inbound hooks, condition groups, test events
+-- Omnion · 0020 · automation depth: inbound hooks, condition groups, test events
 --
 -- Slice 1 of the automation depth pass (docs/requests/REQ-003). v0 of the layer
 -- (migration 0010) stored one event name and a flat list of comparisons per rule;

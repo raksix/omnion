@@ -3,7 +3,7 @@
 //! v0 of the layer evaluated a **flat** list — every comparison had to hold, or the rule
 //! did not fire. That is one shape of the same idea, and it stays: a bare array of
 //! comparisons reads as `{"all": [ … ]}`, so every rule written before the depth pass
-//! keeps firing exactly as it did (migration `0019` widens the column's check constraint
+//! keeps firing exactly as it did (migration `0020` widens the column's check constraint
 //! rather than replacing the data).
 //!
 //! The group tree is what a rule with a real decision in it needs:

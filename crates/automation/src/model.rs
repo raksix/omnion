@@ -190,7 +190,7 @@ pub fn build_definition(
 
     // A rule with no conditions at all is stored as an empty `all` group rather than as
     // `[]`: one stored shape for a new rule, and the v0 array still reads back as the same
-    // thing (migration 0019 widened the column's check for exactly this).
+    // thing (migration 0020 widened the column's check for exactly this).
     let group = if matches!(stored_conditions, Value::Array(items) if items.is_empty()) {
         crate::groups::ConditionGroup::all(Vec::new())
     } else {

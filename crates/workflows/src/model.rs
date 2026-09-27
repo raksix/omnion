@@ -199,7 +199,7 @@ pub struct Workflow {
     /// Event name when the trigger is an event.
     pub trigger_event: Option<String>,
     /// Conditions an event trigger's payload must satisfy, as stored JSON: an `all` / `any`
-    /// group tree, or the flat array every rule written before migration 0019 carries.
+    /// group tree, or the flat array every rule written before migration 0020 carries.
     pub conditions: serde_json::Value,
     /// SHA-256 of an inbound-webhook trigger's token, when the rule has one.
     ///

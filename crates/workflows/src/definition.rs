@@ -338,7 +338,7 @@ pub struct WorkflowDefinition {
     /// How the workflow starts.
     pub trigger: Trigger,
     /// Conditions an event trigger's payload must satisfy, as stored JSON: an `all` / `any`
-    /// group tree, or the flat array every definition written before migration 0019 carries
+    /// group tree, or the flat array every definition written before migration 0020 carries
     /// (which reads as one `all` group). Empty for the other triggers — a manual run and a
     /// schedule have no payload to evaluate conditions against.
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -405,7 +405,7 @@ impl WorkflowDefinition {
     /// automation layer's rule (`omnion-automation::groups`), which validates the same value
     /// before it is stored; the engine holds the *shape*, because it is what writes it into
     /// `workflows.conditions`. Two shapes are accepted: the v0 array of comparisons, and the
-    /// `{"all": […]}` / `{"any": […]}` object the depth pass added (migration 0019).
+    /// `{"all": […]}` / `{"any": […]}` object the depth pass added (migration 0020).
     fn validate_conditions(&self) -> Result<()> {
         let empty = match &self.conditions {
             Value::Array(items) => items.is_empty(),
