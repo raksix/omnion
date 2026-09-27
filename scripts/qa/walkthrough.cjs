@@ -132,12 +132,17 @@ const shots = [];
 // to it when the volume is tight) keeps the pass: every screen is still visited and every control
 // still clicked, the shots are just the visible frame instead of the whole scrolled page.
 const SHOT_MODE = process.env.QA_SHOT_MODE === "viewport" ? "viewport" : "full";
-const SHOT_OPTS = SHOT_MODE === "viewport" ? { type: "jpeg", quality: 72 } : {};
 
 async function shot(page, name, { full = true } = {}) {
   const file = path.join(SHOTS, `${name}.png`);
+  // The quality option belongs to the JPEG format only: handing it to a PNG screenshot is a
+  // hard error from the browser, so the two shapes are built separately rather than spread.
+  const options =
+    SHOT_MODE === "viewport"
+      ? { path: file, fullPage: false, timeout: 15000, type: "jpeg", quality: 72 }
+      : { path: file, fullPage: full, timeout: 15000 };
   try {
-    await page.screenshot({ path: file, fullPage: full && SHOT_MODE === "full", timeout: 15000, ...SHOT_OPTS });
+    await page.screenshot(options);
     shots.push({ name, file, url: page.url(), bytes: fs.statSync(file).size });
   } catch (err) {
     log(`screenshot failed for ${name}: ${err.message}`);
