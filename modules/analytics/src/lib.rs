@@ -29,6 +29,7 @@ pub mod collect;
 pub mod error;
 pub mod goals;
 pub mod model;
+pub mod privacy;
 pub mod realtime;
 pub mod reports;
 pub mod rollup;

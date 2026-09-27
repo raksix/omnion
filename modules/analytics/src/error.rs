@@ -32,6 +32,9 @@ pub enum AnalyticsError {
     /// The goal does not exist in this site.
     #[error("this site has no such goal")]
     GoalNotFound,
+    /// The visitor handle of an erasure is not a hash of the documented shape.
+    #[error("invalid visitor handle: {0}")]
+    InvalidVisitor(String),
     /// Another goal of the site already carries the name.
     #[error("another goal of this site carries this name")]
     GoalNameTaken,
