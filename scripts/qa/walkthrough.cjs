@@ -747,8 +747,18 @@ async function interact(page, pageName, report) {
 
     const after = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     let outcome = "ok";
-    if (clickError) outcome = "click-error";
-    else if (after.url !== before.url) outcome = "navigated";
+    if (clickError) {
+      // The inventory can be read from one document and the click run against the next one — a
+      // link in the same row navigates, and the control the walker wanted no longer exists on the
+      // page that is actually open. A click with no target on the open page is the harness racing
+      // itself (like an aborted request): counted, never a finding. A target that is still there
+      // and still cannot be clicked is a real defect and stays a `click-error`.
+      const stillThere = await page
+        .locator(`[data-qa-idx="${i}"]`)
+        .count()
+        .catch(() => 1);
+      outcome = stillThere === 0 ? "navigated-away" : "click-error";
+    } else if (after.url !== before.url) outcome = "navigated";
     else if (after.dialogs > before.dialogs) outcome = "dialog";
     else if (after.console > before.console) outcome = "console-error";
     else if (after.net > before.net) outcome = "request-failed";
