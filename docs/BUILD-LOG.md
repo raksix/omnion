@@ -1777,3 +1777,57 @@ commit` failing outright with `No space left on device`, and once with cargo dyi
 `ld`. The seven writers' `target/` directories are now ~24 GB on a 60 GB mount. This writer
 reclaimed only its own `target/debug/incremental` (2.4 GB). A shared `CARGO_TARGET_DIR` or a
 per-stack trim rule would remove the pressure permanently; it is the owner's call.
+
+## 2026-09-27 — REQ-051 slice 3: deals, the pipeline board, the stage editor
+
+**What.** The relationship layer's third slice. `modules/crm/src/deals.rs` (1,765 lines) holds
+the rules; `apps/api/src/routes/crm_deals.rs` is the thin HTTP layer; the panel gets
+`/crm/deals` (board + list toggle) and `/crm/settings/pipelines` (the stage editor); five
+permission keys are registered; the walkthrough gained two routes and a depth pass.
+
+**Proof.** `cargo test -p omnion-module-crm` → **100 passed** (84 from slice 2 plus 16 new).
+`cargo test -p omnion-permissions` → **63 passed** (the catalogue's `crm` family test now
+asserts all thirteen keys). `apps/admin` `tsc --noEmit` → **0 errors**. Commit `9909af9`, pushed
+to `origin/wave4`, tree clean.
+
+**The blocker, stated plainly.** `cargo test -p omnion-api --test crm` cannot run: the fixture
+panics with `Migration(VersionMissing(19))`, so all 29 tests FAIL in 0.82 s before any test
+body executes. This branch's migration directory is non-contiguous — it holds `0022_crm.sql`
+without `0019`, `0020` or `0021` — and **the same gap exists on `main`**, so it predates this
+work and is not caused by it. sqlx reports the missing version rather than the collision,
+which is why the message names 19 and never 22. Merging `main` would supply `0021` and leave
+0019/0020 still missing, so the fix is not a merge. The full table of what each of the seven
+branches holds, and the two options, are in `docs/requests/REQ-051-crm.md` under "Blocker".
+The owner's call: either renumber onto each branch's real sequence, or have `main` carry the
+two missing files as empty additive migrations so every branch converges.
+
+**What that costs this tick.** The eight integration walks in `apps/api/tests/crm.rs` and the
+browser pass `runCrmDealsDepth` in `scripts/qa/walkthrough.cjs` are **written and unexecuted**.
+The QA browser pass was therefore not run either, which means slice 3 is not closed and REQ-051
+stays `in-progress` — deliberately, because the rule is that a REQ closes on a QA pass and not
+on unit tests alone.
+
+**Three decisions worth writing down.**
+
+1. **The no-op move emits nothing.** The keyboard path fires on *every* arrow press, and at the
+   edge of a row `←` or `→` re-sends the current stage. Emitting `crm.deal.stage_changed` for
+   that would wake every subscribed automation once per keypress — the loudest possible way for
+   a feature to become a nuisance. The route compares the stage before and after and stays
+   silent when they match; the walk asserts the event count is unchanged.
+2. **A won deal is 100%, whatever the stage's default says.** A pipeline author who set the won
+   column to 80% would otherwise have "won this quarter" credit four fifths of a deal that is
+   already, by definition, won. The move sets `probability = 100` alongside the close date, and
+   `validate_stage` forces 100 on the won column itself.
+3. **A board reads in one statement per column.** The count, the sum and the weighted sum come
+   from one `left join` whose `on` clause carries the *visibility* filter — in `where` instead,
+   a caller narrowed to `own` would lose the empty columns entirely and the board would change
+   shape depending on who was looking at it.
+
+**Next.** Re-run `cargo test -p omnion-api --test crm` the moment the migration set is
+contiguous, then the QA browser pass on the w4 stack, then close slice 3. After that, slice 4:
+activities, the merged timeline, the read-only copilot, global search and the automation
+consumers (`form.submitted` → contact + deal, `sales.quote.accepted` → deal won).
+
+**Environment note.** `/mnt/apopic` is at 86% with 8.0 GB free; this writer reclaimed its own
+`target/debug/incremental` at the start of the tick. The seven writers' `target/` directories
+remain the pressure, and a shared `CARGO_TARGET_DIR` would remove it permanently.
