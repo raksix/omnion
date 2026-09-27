@@ -143,8 +143,57 @@ function CanvasBlock({
   // A container is its own block *and* the frame its children are drawn in. Rendering only the
   // container's props would leave an empty box on the canvas, which is the placeholder the
   // REQ's "no placeholder boxes" rule is about.
+  //
+  // A `columns` block is the one container whose children are *not* content: each is a `column`
+  // wrapper, and the blocks live one level deeper. Drawing the wrappers as a flat row of blocks
+  // is exactly the "the canvas lies about the layout" bug, so the column frame gets its own
+  // branch: a grid of per-column slots, each labelled and each with a drop target.
   const frame =
-    definition?.container && block.children ? (
+    block.type === "columns" && block.children ? (
+      <div
+        data-block-columns
+        data-block-column-count={block.children.length}
+        className="mt-2 flex flex-col gap-2"
+      >
+        {block.children.map((column, columnIndex) => (
+          <div
+            key={column.id}
+            data-block-column
+            data-block-column-index={columnIndex}
+            className="rounded-md border border-dashed border-line p-1.5"
+          >
+            <p className="mb-1 px-1 text-[10.5px] tracking-wide text-muted uppercase">
+              Column {columnIndex + 1}
+            </p>
+            {column.children && column.children.length > 0 ? (
+              <div className="flex flex-col gap-1.5">
+                {column.children.map((child, childIndex) => (
+                  <CanvasBlock
+                    key={child.id}
+                    registry={registry}
+                    block={child}
+                    path={[...path, columnIndex, childIndex]}
+                    mode={mode}
+                    selected={selected}
+                    issues={issues}
+                    onSelect={onSelect}
+                  />
+                ))}
+              </div>
+            ) : (
+              <button
+                type="button"
+                data-block-column-empty={columnIndex}
+                onClick={() => onSelect?.([...path, columnIndex])}
+                className="w-full cursor-pointer rounded border border-dashed border-line px-2 py-3 text-center text-[11.5px] text-muted transition hover:border-accent/50 hover:text-ink"
+              >
+                Empty — select this column, then use + Block
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    ) : definition?.container && block.children ? (
       <div
         className={`mt-2 grid gap-2 ${
           (block.children?.length ?? 0) > 2 ? "sm:grid-cols-3" : "sm:grid-cols-2"
@@ -403,12 +452,26 @@ function renderProps(kind: string, block: ContentBlock) {
           · up to {typeof props.limit === "number" ? props.limit : 3}
         </section>
       );
-    case "columns":
+    case "columns": {
       // The container's own line; its children are drawn in the frame beside it, so a
       // `columns` block reads as the columns an author actually put in it.
+      const count = (block.children ?? []).length;
+      const filled = (block.children ?? []).filter((column) => (column.children ?? []).length > 0)
+        .length;
       return (
         <p className="text-[12px] text-muted">
-          Columns container · {text("columns") || 2} columns
+          {count} columns · {filled} filled
+        </p>
+      );
+    }
+    case "column":
+      // A column is a slot, not content: on the canvas its own line says how much is in it, and
+      // the blocks themselves are drawn by the Columns frame around it.
+      return (
+        <p className="text-[12px] text-muted">
+          {(block.children ?? []).length === 0
+            ? "Empty column"
+            : `${(block.children ?? []).length} block${(block.children ?? []).length === 1 ? "" : "s"}`}
         </p>
       );
     default:
