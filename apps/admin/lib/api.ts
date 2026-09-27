@@ -3413,6 +3413,8 @@ export function resolveSlot(
   return request<SlotResolution>(
     `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}/resolve/${encodeURIComponent(scopeId)}`,
   );
+}
+
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
  *
@@ -3561,4 +3563,189 @@ export function fetchSsoProviders(): Promise<{
 }> {
   return request("/api/v1/auth/sso/providers");
 
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Credential leases and deployment keys (REQ-125, slice 3; docs/requests/REQ-125).
+ *
+ * Two bindings in this block carry a sensitive-looking field, and the difference matters:
+ *
+ * - `issueLease` returns a **lease token**, which is an opaque handle. It is not a secret value
+ *   and the API never makes it one — the issuing handler does not open the envelope at all.
+ * - `createDeploymentKey` returns the key **value**, exactly once, in the same shape the gateway
+ *   keys use (REQ-040). The row keeps a hash; nothing else can ever read it back.
+ *
+ * There is deliberately no `redeemLease` binding here. Redemption is a loopback helper path
+ * authenticated by a machine identity, not something a browser session may do — so the panel
+ * cannot call it even if a future bug wanted to.
+ */
+
+/** One lease, as `/secret-leases` returns it. No token, no value. */
+export type SecretLease = {
+  id: string;
+  secret_id: string;
+  name: string;
+  consumer: string;
+  environment: string;
+  state: "live" | "spent" | "expired" | "revoked" | string;
+  max_uses: number;
+  uses: number;
+  expires_in_seconds: number;
+  expires_at: string;
+  issued_at: string;
+  revoked_at: string | null;
+  revoke_reason: string | null;
+  last_redeemed_at: string | null;
+  last_address: string | null;
+  deployment_key_id: string | null;
+  version: number;
+};
+
+/** The leases screen in one read, with the counters and the filter values. */
+export type LeasesResponse = {
+  leases: SecretLease[];
+  total: number;
+  live: number;
+  spent: number;
+  revoked: number;
+  environments: string[];
+};
+
+/** A freshly issued lease: the row plus the one-time token. */
+export type IssuedLease = SecretLease & {
+  token: string;
+  expires_in_seconds: number;
+};
+
+/** One deployment key. Metadata only — no field of this shape can hold the value. */
+export type DeploymentKey = {
+  id: string;
+  name: string;
+  environment: string;
+  scopes: string[];
+  state: "active" | "revoked" | "expired" | string;
+  expires_at: string;
+  expires_in_seconds: number;
+  uses: number;
+  last_used_at: string | null;
+  allowed_ips: string[];
+  key_prefix: string;
+  fingerprint: string;
+  created_at: string;
+  revoked_at: string | null;
+  revoke_reason: string | null;
+  deletable: boolean;
+};
+
+/** The deployment keys screen in one read. */
+export type DeploymentKeysResponse = {
+  keys: DeploymentKey[];
+  total: number;
+  active: number;
+  expired: number;
+  revoked: number;
+  header: string;
+  guidance: string;
+};
+
+/** A minted key: the row plus the value, shown once. */
+export type CreatedDeploymentKey = DeploymentKey & { value: string; header: string };
+
+/** One presentation of a deployment key, in the use log. */
+export type DeploymentKeyUse = {
+  action: "lease" | "denied" | "revoke" | string;
+  lease_id: string | null;
+  identity: string;
+  address: string | null;
+  result: string;
+  created_at: string;
+};
+
+/** Read the leases, live first. */
+export function fetchSecretLeases(): Promise<LeasesResponse> {
+  return request<LeasesResponse>("/api/v1/secret-leases");
+}
+
+/**
+ * Issue a lease to a consumer.
+ *
+ * The answer carries an opaque token, not a value: the issuing path never opens the envelope.
+ * TTL and use cap are clamped by the API, so the panel sends what the operator asked for and
+ * renders what came back rather than pre-validating a window the server owns.
+ */
+export function issueLease(
+  secretId: string,
+  input: { consumer: string; environment?: string; ttlSeconds?: number; maxUses?: number },
+): Promise<IssuedLease> {
+  return request<IssuedLease>(`/api/v1/secrets/${encodeURIComponent(secretId)}/lease`, {
+    method: "POST",
+    body: JSON.stringify({
+      consumer: input.consumer,
+      environment: input.environment,
+      ttl_seconds: input.ttlSeconds,
+      max_uses: input.maxUses,
+    }),
+  });
+}
+
+/** Revoke a lease with a reason. A revoke is a fact, so the reason is not optional in the UI. */
+export function revokeLease(id: string, reason: string): Promise<SecretLease> {
+  return request<SecretLease>(`/api/v1/secret-leases/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** Read the deployment keys. */
+export function fetchDeploymentKeys(): Promise<DeploymentKeysResponse> {
+  return request<DeploymentKeysResponse>("/api/v1/deployment-keys");
+}
+
+/**
+ * Mint a scoped, expiring machine credential. The value is in the response and nowhere else.
+ *
+ * `expiresAt` is required by the API on purpose — a deployment key that never expires is a
+ * liability — so the type makes it non-optional and the drawer has to ask for a date.
+ */
+export function createDeploymentKey(input: {
+  name: string;
+  environment: string;
+  scopes: string[];
+  expiresAt: string;
+  allowedIps?: string | null;
+}): Promise<CreatedDeploymentKey> {
+  return request<CreatedDeploymentKey>("/api/v1/deployment-keys", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      environment: input.environment,
+      scopes: input.scopes,
+      expires_at: input.expiresAt,
+      allowed_ips: input.allowedIps ?? null,
+    }),
+  });
+}
+
+/** Revoke a key immediately. Revoking also revokes the leases it minted. */
+export function revokeDeploymentKey(id: string, reason: string): Promise<DeploymentKey> {
+  return request<DeploymentKey>(`/api/v1/deployment-keys/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** Delete a revoked key's record. A live key is refused, so this never removes a working key. */
+export function deleteDeploymentKey(id: string): Promise<{ deleted: boolean }> {
+  return request<{ deleted: boolean }>(
+    `/api/v1/deployment-keys/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The use log: which pipeline presented the key, from where, for which lease, with what result. */
+export function fetchDeploymentKeyUses(
+  id: string,
+  limit = 50,
+): Promise<{ key_id: string; uses: DeploymentKeyUse[] }> {
+  return request(`/api/v1/deployment-keys/${encodeURIComponent(id)}/uses?limit=${limit}`);
 }

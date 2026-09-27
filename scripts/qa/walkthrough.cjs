@@ -2554,6 +2554,10 @@ async function main() {
     // document.
     { path: "/secrets/credentials", name: "secrets-credentials" },
     { path: "/secrets/slots", name: "secrets-slots" },
+    // The leases and the deployment keys (REQ-125, slice 3) — the depth pass below mints a
+    // key, revokes a lease and asserts the document never carries the value shown once.
+    { path: "/secrets/leases", name: "secrets-leases" },
+    { path: "/secrets/deploy-keys", name: "secrets-deploy-keys" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -2662,6 +2666,7 @@ async function main() {
   // validator (a failure must stay a chip, not a lost row), assign a slot, resolve it, and assert
   // the document never carries a value.
   await runSecretsCredentialsDepth(page, report);
+  await runSecretsLeasesDepth(page, report);
   log(`secrets credentials: ${JSON.stringify(report.secretsCredentials)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -3346,6 +3351,222 @@ async function runSecretsCredentialsDepth(page, report) {
   await shot(page, "page-secrets-slots-done");
 
   report.secretsCredentials = { steps };
+}
+
+/**
+ * REQ-125 slice 3 — leases and deployment keys.
+ *
+ * Two screens whose whole value is a property a screenshot cannot show, so the pass is built
+ * around driving the real controls and then reading the document:
+ *
+ * - the revoke dialog refuses to submit without a reason, and the reason is what the next
+ *   operator reads — so a bare click must produce a message rather than a revoke;
+ * - a lease row shows a *reason* when it is dead, because a lease that silently stopped working is
+ *   the failure mode that makes people disable the feature;
+ * - the mint drawer requires an expiry and an explicit scope, and the one-time value panel is the
+ *   only place a deployment key value ever appears;
+ * - and the strongest assertion, which no unit test can make: after the value has been shown once,
+ *   **the document carries neither the value nor any token**.
+ */
+async function runSecretsLeasesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "secrets-leases-depth", action: "secrets", ...step });
+  };
+
+  // ------------------------------------------------------------------------- the lease list
+  await page.goto(`${URL_ADMIN}/secrets/leases`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-leases-summary], [data-leases-error]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const leaseRows = await page.locator("[data-lease-row]").count();
+  const summary = (
+    await page.locator("[data-leases-summary]").first().innerText().catch(() => "")
+  ).trim();
+  note({ step: "opened", leaseRows, summaryChars: summary.length });
+  await shot(page, "page-secrets-leases");
+
+  // ---- `/` focuses the search box -------------------------------------------------------------
+  await page.keyboard.press("/");
+  await page.waitForTimeout(250);
+  const searchFocused = await page
+    .locator("[data-leases-search]")
+    .first()
+    .evaluate((node) => node === document.activeElement)
+    .catch(() => false);
+  await page.keyboard.press("Escape");
+  note({ step: "search-shortcut", searchFocused });
+
+  // ---- The revoke dialog demands a reason -----------------------------------------------------
+  const revokeButton = page.locator("[data-lease-revoke]").first();
+  let revokeNeedsReason = false;
+  let revokedNotice = "";
+  if ((await revokeButton.count()) > 0) {
+    await revokeButton.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-lease-dialog]", { timeout: 8000 }).catch(() => {});
+    const opened = (await page.locator("[data-lease-dialog]").count()) > 0;
+    if (opened) {
+      await shot(page, "page-secrets-leases-revoke");
+      // Submitting with no reason must be refused in the dialog, not accepted with a blank one.
+      await page.locator("[data-lease-revoke-confirm]").first().click({ timeout: 6000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      const message = (
+        await page.locator("[data-lease-dialog-error]").first().innerText().catch(() => "")
+      ).trim();
+      revokeNeedsReason = /reason/i.test(message);
+      note({ step: "revoke-needs-reason", revokeNeedsReason, message: message.slice(0, 120) });
+      await shot(page, "page-secrets-leases-revoke-reason-required");
+
+      await page.locator("[data-lease-reason-input]").first().fill("qa walkthrough — lease retired").catch(() => {});
+      await page.locator("[data-lease-revoke-confirm]").first().click({ timeout: 6000 }).catch(() => {});
+      await page.waitForSelector("[data-leases-notice]", { timeout: 15000 }).catch(() => {});
+      revokedNotice = (await page.locator("[data-leases-notice]").first().innerText().catch(() => "")).trim();
+      await shot(page, "page-secrets-leases-revoked");
+    }
+    note({ step: "revoke-dialog-opens", opened });
+  } else {
+    note({ step: "revoke-dialog-opens", opened: false, reason: "no live lease to revoke" });
+  }
+  note({ step: "revoked", notice: revokedNotice.slice(0, 160) });
+
+  // ---- A dead lease shows why it is dead ------------------------------------------------------
+  const reasons = await page.locator("[data-lease-reason]").allInnerTexts().catch(() => []);
+  note({ step: "reasons-shown", count: reasons.length, sample: (reasons[0] ?? "").slice(0, 120) });
+
+  // ---- The live-only filter -------------------------------------------------------------------
+  await page.locator("[data-leases-filter]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const liveOnly = await page.locator('[data-lease-state="live"]').count();
+  const nonLiveVisible = await page
+    .locator('[data-lease-row]')
+    .evaluateAll((nodes) => nodes.filter((node) => node.dataset.leaseState !== "live").length)
+    .catch(() => -1);
+  note({ step: "live-filter", liveOnly, nonLiveVisible });
+  await page.locator("[data-leases-filter]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // -------------------------------------------------------------------- the deployment keys
+  await page.goto(`${URL_ADMIN}/secrets/deploy-keys`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-deploykeys-summary], [data-deploykeys-error]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const keyRows = await page.locator("[data-deploykey-row]").count();
+  const keySummary = (
+    await page.locator("[data-deploykeys-summary]").first().innerText().catch(() => "")
+  ).trim();
+  note({ step: "keys-opened", keyRows, summaryChars: keySummary.length });
+  await shot(page, "page-secrets-deploy-keys");
+
+  // ---- `n` opens the mint drawer ---------------------------------------------------------------
+  await page.keyboard.press("n");
+  await page.waitForSelector("[data-deploykey-drawer]", { timeout: 8000 }).catch(() => {});
+  const drawerOpen = (await page.locator("[data-deploykey-drawer]").count()) > 0;
+  note({ step: "mint-drawer-opens", drawerOpen });
+  await shot(page, "page-secrets-deploy-keys-drawer");
+
+  // A key with no name is refused where the field is, not as a page-level error.
+  if (drawerOpen) {
+    await page.locator("[data-deploykey-save]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    const nameError = (
+      await page.locator("[data-deploykey-drawer-error]").first().innerText().catch(() => "")
+    ).trim();
+    note({ step: "mint-needs-name", shown: /name/i.test(nameError), message: nameError.slice(0, 120) });
+    await shot(page, "page-secrets-deploy-keys-name-required");
+
+    // The expiry is required: clear it and the same refusal must come back.
+    await page.locator("[data-deploykey-name]").first().fill(`qa-walk-${Date.now()}`).catch(() => {});
+    await page.locator("[data-deploykey-expiry]").first().fill("").catch(() => {});
+    await page.locator("[data-deploykey-save]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    const expiryError = (
+      await page.locator("[data-deploykey-drawer-error]").first().innerText().catch(() => "")
+    ).trim();
+    note({ step: "mint-needs-expiry", shown: /expire/i.test(expiryError), message: expiryError.slice(0, 120) });
+    await shot(page, "page-secrets-deploy-keys-expiry-required");
+
+    // Mint it properly, and the value appears exactly once.
+    await page.locator("[data-deploykey-expiry]").first().fill("2099-12-31").catch(() => {});
+    await page.locator("[data-deploykey-save]").first().click({ timeout: 20000 }).catch(() => {});
+    await page.waitForSelector("[data-deploykey-minted]", { timeout: 25000 }).catch(() => {});
+    const minted = (await page.locator("[data-deploykey-minted]").count()) > 0;
+    const shownValue = (await page.locator("[data-deploykey-value]").first().innerText().catch(() => "")).trim();
+    note({ step: "minted", minted, valuePrefix: shownValue.slice(0, 8), valueChars: shownValue.length });
+    await shot(page, "page-secrets-deploy-keys-minted");
+
+    // The copy button is a real control, not decoration.
+    if (minted) {
+      await page.locator("[data-deploykey-copy]").first().click({ timeout: 6000 }).catch(() => {});
+      await page.waitForTimeout(400);
+      const copied = /copied/i.test(
+        await page.locator("[data-deploykey-copy]").first().innerText().catch(() => ""),
+      );
+      note({ step: "copied", copied });
+    }
+    await page.locator("[data-deploykey-minted-done]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+
+  // ---- The use log ------------------------------------------------------------------------------
+  const useLogButton = page.locator("[data-deploykey-uses]").first();
+  if ((await useLogButton.count()) > 0) {
+    await useLogButton.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-deploykey-log]", { timeout: 12000 }).catch(() => {});
+    const logOpen = (await page.locator("[data-deploykey-log]").count()) > 0;
+    const useRows = await page.locator("[data-deploykey-use]").count();
+    const emptyLog = (await page.locator("[data-deploykey-log-empty]").count()) > 0;
+    note({ step: "use-log", logOpen, useRows, emptyLog });
+    await shot(page, "page-secrets-deploy-keys-uses");
+    if (logOpen) await page.keyboard.press("Escape");
+  }
+
+  // ---- Revoke the key the walk just minted, so the pass leaves nothing running ------------------
+  await page.waitForTimeout(500);
+  const revokeKey = page.locator("[data-deploykey-revoke]").first();
+  if ((await revokeKey.count()) > 0) {
+    await revokeKey.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-deploykey-dialog]", { timeout: 8000 }).catch(() => {});
+    const opened = (await page.locator("[data-deploykey-dialog]").count()) > 0;
+    let needsReason = false;
+    if (opened) {
+      await page.locator("[data-deploykey-act-confirm]").first().click({ timeout: 6000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      const message = (
+        await page.locator("[data-deploykey-dialog-error]").first().innerText().catch(() => "")
+      ).trim();
+      needsReason = /reason/i.test(message);
+      await page
+        .locator("[data-deploykey-reason-input]")
+        .first()
+        .fill("qa walkthrough — key retired")
+        .catch(() => {});
+      await page.locator("[data-deploykey-act-confirm]").first().click({ timeout: 15000 }).catch(() => {});
+      await page.waitForSelector("[data-deploykeys-notice]", { timeout: 20000 }).catch(() => {});
+      await shot(page, "page-secrets-deploy-keys-revoked");
+    }
+    const notice = (await page.locator("[data-deploykeys-notice]").first().innerText().catch(() => "")).trim();
+    note({ step: "key-revoked", opened, needsReason, notice: notice.slice(0, 160) });
+  }
+
+  // ---- The assertion only a render can make -----------------------------------------------------
+  // The mint panel showed a deployment key value a moment ago. Nothing anywhere on either screen
+  // may still carry it, a lease token, or any credential value.
+  const documentText = await page.evaluate(() => document.body.innerText);
+  const leaked =
+    /omdk_|qa-lease-value|qa-credential-value|qa-walkthrough-value|wrapped_key|seal_checksum/.test(
+      documentText,
+    );
+  note({ step: "no-value-in-document", leaked, documentChars: documentText.length });
+
+  await page.waitForTimeout(800);
+  await shot(page, "page-secrets-deploy-keys-done");
+
+  report.secretsLeases = { steps };
 }
 
 async function runIamSecurityDepth(page, report) {
