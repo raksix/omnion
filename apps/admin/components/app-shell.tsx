@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, FileText, Globe, Images, LayoutDashboard, LogOut, Menu, ShieldCheck, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { BarChart3, Bot, FileText, Globe, Images, LayoutDashboard, LogOut, Menu, Scale, ShieldCheck, SlidersHorizontal, Sparkles, UserCog, UsersRound, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -21,9 +21,29 @@ const NAV = [
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
-  { href: "/settings/iam/roles", label: "Roles & access", icon: ShieldCheck },
+  { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
+  { href: "/settings/iam/users", label: "Users", icon: UserCog },
+  { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
+  { href: "/settings/iam/service-accounts", label: "Service accounts", icon: Bot },
+  { href: "/settings/iam/simulator", label: "Simulator", icon: Scale },
+  { href: "/settings/iam/roles", label: "Roles", icon: ShieldCheck },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
 ] as const;
+
+/// Screens whose own path also prefixes their children (`/settings/iam` against
+/// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
+const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam"]);
+
+/** `true` when a navigation entry belongs to the screen that is open. */
+function isActive(href: string, pathname: string): boolean {
+  if (href === "/") {
+    return pathname === "/";
+  }
+  if (EXACT_MATCH_ONLY.has(href)) {
+    return pathname === href;
+  }
+  return pathname.startsWith(href);
+}
 
 function initials(value: string): string {
   const parts = value
@@ -77,7 +97,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
 
       <nav aria-label="Sections" className="flex flex-col gap-1">
         {NAV.map((item) => {
-          const active = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
+          const active = isActive(item.href, pathname);
           const Icon = item.icon;
           return (
             <Link

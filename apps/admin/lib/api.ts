@@ -1855,15 +1855,17 @@ export async function fetchRoleVersions(roleId: string): Promise<IamRoleVersion[
   return body.versions;
 }
 
-/** One member of a role — a person the role currently or formerly applied to. */
+/** One member of a role — a person, a group or a machine identity. */
 export type IamRoleMember = {
-  user_id: string;
-  email: string;
-  display_name: string;
-  scope: { type: string; organization_id: string | null; site_id: string | null };
+  subject_type: "user" | "group" | "service_account";
+  subject_id: string;
+  user_id: string | null;
+  label: string;
+  scope: IamScope;
   expires_at: string | null;
   revoked_at: string | null;
   active: boolean;
+  expired: boolean;
   created_at: string;
 };
 
@@ -1874,4 +1876,550 @@ export function fetchRoleMembers(
   return request<{ role_id: string; members: IamRoleMember[] }>(
     `/api/v1/iam/roles/${encodeURIComponent(roleId)}/members`,
   );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Subjects, scopes and the simulator (REQ-006, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** Where a binding applies. */
+export type IamScope = {
+  type: "global" | "organization" | "site" | "department" | "module" | "resource";
+  organization_id: string | null;
+  site_id: string | null;
+  resource_type: string | null;
+  resource_id: string | null;
+};
+
+/** One role binding, for any kind of subject. */
+export type IamBinding = {
+  id: string;
+  role_id: string;
+  subject_type: "user" | "group" | "service_account";
+  subject_id: string;
+  user_id: string | null;
+  scope: IamScope;
+  granted_by: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+  expired: boolean;
+  created_at: string;
+};
+
+/** One role chip on a user row. */
+export type IamRoleChip = {
+  role_id: string;
+  key: string;
+  name: string;
+  scope: IamScope;
+  via: "direct" | "group";
+  expires_at: string | null;
+};
+
+/** One account on the user list. */
+export type IamUserRow = {
+  id: string;
+  email: string;
+  display_name: string;
+  status: string;
+  organization_id: string | null;
+  mfa_enforced: boolean;
+  last_sign_in_at: string | null;
+  failed_sign_in_count: number;
+  locked_until: string | null;
+  attributes: Record<string, unknown>;
+  created_at: string;
+  roles: IamRoleChip[];
+  group_count: number;
+};
+
+/** Filters of the user list. */
+export type IamUserQuery = {
+  search?: string;
+  status?: string;
+  organizationId?: string | null;
+  mfa?: boolean;
+  roleId?: string;
+};
+
+/** `GET /api/v1/iam/users`. */
+export function fetchIamUsers(
+  query: IamUserQuery = {},
+): Promise<{ users: IamUserRow[]; total: number }> {
+  const params = new URLSearchParams();
+  if (query.search) params.set("search", query.search);
+  if (query.status) params.set("status", query.status);
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  if (query.mfa !== undefined) params.set("mfa", String(query.mfa));
+  if (query.roleId) params.set("role_id", query.roleId);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request<{ users: IamUserRow[]; total: number }>(`/api/v1/iam/users${suffix}`);
+}
+
+/** `POST /api/v1/iam/users` — create an account (invited, or with a password). */
+export function createIamUser(input: {
+  email: string;
+  displayName: string;
+  organizationId?: string | null;
+  password?: string;
+  roleId?: string;
+  roleScopeType?: "global" | "organization";
+  expiresAt?: string;
+}): Promise<{ id: string; email: string; status: string; organization_id: string | null }> {
+  return request("/api/v1/iam/users", {
+    method: "POST",
+    body: JSON.stringify({
+      email: input.email,
+      display_name: input.displayName,
+      organization_id: input.organizationId ?? null,
+      ...(input.password ? { password: input.password } : {}),
+      ...(input.roleId ? { role_id: input.roleId } : {}),
+      ...(input.roleScopeType ? { role_scope_type: input.roleScopeType } : {}),
+      ...(input.expiresAt ? { expires_at: input.expiresAt } : {}),
+    }),
+  });
+}
+
+/** The detail of one account: profile, bindings and groups. */
+export type IamUserDetail = {
+  user: {
+    id: string;
+    email: string;
+    display_name: string;
+    status: string;
+    organization_id: string | null;
+    mfa_enforced: boolean;
+    attributes: Record<string, unknown>;
+    created_at: string;
+  };
+  bindings: IamBinding[];
+  groups: { id: string; name: string; slug: string }[];
+};
+
+/** `GET /api/v1/iam/users/{id}`. */
+export function fetchIamUser(userId: string): Promise<IamUserDetail> {
+  return request<IamUserDetail>(`/api/v1/iam/users/${encodeURIComponent(userId)}`);
+}
+
+/** `PATCH /api/v1/iam/users/{id}` — profile, status, MFA requirement, attributes. */
+export function updateIamUser(
+  userId: string,
+  input: {
+    displayName?: string;
+    status?: string;
+    mfaEnforced?: boolean;
+    attributes?: Record<string, unknown>;
+  },
+): Promise<Record<string, unknown>> {
+  return request(`/api/v1/iam/users/${encodeURIComponent(userId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      ...(input.displayName !== undefined ? { display_name: input.displayName } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      ...(input.mfaEnforced !== undefined ? { mfa_enforced: input.mfaEnforced } : {}),
+      ...(input.attributes !== undefined ? { attributes: input.attributes } : {}),
+    }),
+  });
+}
+
+/** The resolved permission set of one account. */
+export type IamEffectivePermissions = {
+  user_id: string;
+  scope: IamScope;
+  granted: {
+    key: string;
+    source: { role_id: string; role_key: string; role_name: string; role_priority: number; via: string };
+  }[];
+  denied: {
+    key: string;
+    source: { role_id: string; role_key: string; role_name: string; role_priority: number; via: string };
+  }[];
+  granted_count: number;
+};
+
+/** Resolve one account's effective permissions, optionally in a resource context. */
+export function fetchEffectivePermissions(input: {
+  userId?: string;
+  organizationId?: string | null;
+  siteId?: string | null;
+  path?: string;
+}): Promise<IamEffectivePermissions> {
+  const params = new URLSearchParams();
+  if (input.userId) params.set("user_id", input.userId);
+  if (input.organizationId) params.set("organization_id", input.organizationId);
+  if (input.siteId) params.set("site_id", input.siteId);
+  if (input.path) params.set("path", input.path);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request<IamEffectivePermissions>(`/api/v1/iam/effective-permissions${suffix}`);
+}
+
+/** `GET /api/v1/iam/bindings` — role assignments of any subject. */
+export function fetchIamBindings(query: {
+  subjectType?: string;
+  subjectId?: string;
+  roleId?: string;
+  live?: boolean;
+  organizationId?: string | null;
+}): Promise<{ subject_type: string | null; subject_id: string | null; bindings: IamBinding[] }> {
+  const params = new URLSearchParams();
+  if (query.subjectType) params.set("subject_type", query.subjectType);
+  if (query.subjectId) params.set("subject_id", query.subjectId);
+  if (query.roleId) params.set("role_id", query.roleId);
+  if (query.live !== undefined) params.set("live", String(query.live));
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request(`/api/v1/iam/bindings${suffix}`);
+}
+
+/** `POST /api/v1/iam/bindings` — attach a role to any subject at any scope. */
+export function createIamBinding(input: {
+  subjectType: "user" | "group" | "service_account";
+  subjectId: string;
+  roleId: string;
+  scopeType: IamScope["type"];
+  organizationId?: string | null;
+  siteId?: string | null;
+  department?: string;
+  module?: string;
+  resourceType?: string;
+  resourceId?: string;
+  expiresAt?: string;
+}): Promise<IamBinding> {
+  return request<IamBinding>("/api/v1/iam/bindings", {
+    method: "POST",
+    body: JSON.stringify({
+      subject_type: input.subjectType,
+      subject_id: input.subjectId,
+      role_id: input.roleId,
+      scope_type: input.scopeType,
+      organization_id: input.organizationId ?? null,
+      site_id: input.siteId ?? null,
+      ...(input.department ? { department: input.department } : {}),
+      ...(input.module ? { module: input.module } : {}),
+      ...(input.resourceType ? { resource_type: input.resourceType } : {}),
+      ...(input.resourceId ? { resource_id: input.resourceId } : {}),
+      ...(input.expiresAt ? { expires_at: input.expiresAt } : {}),
+    }),
+  });
+}
+
+/** `DELETE /api/v1/iam/bindings/{id}` — revoke a role assignment. */
+export function revokeIamBinding(bindingId: string): Promise<IamBinding> {
+  return request<IamBinding>(`/api/v1/iam/bindings/${encodeURIComponent(bindingId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** One group on the list. */
+export type IamGroup = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  organization_id: string;
+  member_count: number;
+  role_count: number;
+  created_at: string;
+};
+
+/** `GET /api/v1/iam/groups`. */
+export async function fetchIamGroups(organizationId?: string | null): Promise<IamGroup[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<{ groups: IamGroup[]; organization_id: string }>(
+    `/api/v1/iam/groups${query}`,
+  );
+  return body.groups;
+}
+
+/** `POST /api/v1/iam/groups`. */
+export function createIamGroup(input: {
+  name: string;
+  description?: string;
+  organizationId?: string | null;
+}): Promise<{ id: string; name: string; slug: string }> {
+  return request("/api/v1/iam/groups", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      description: input.description ?? "",
+      organization_id: input.organizationId ?? null,
+    }),
+  });
+}
+
+/** One membership row of a group. */
+export type IamGroupMember = {
+  user_id: string;
+  email: string;
+  display_name: string;
+  status: string;
+  joined_at: string;
+};
+
+/** One group in full: its members and the roles attached to it. */
+export type IamGroupDetail = {
+  group: { id: string; name: string; slug: string; description: string; organization_id: string };
+  members: IamGroupMember[];
+  roles: { binding_id: string; role_id: string; scope: IamScope; expires_at: string | null }[];
+};
+
+/** `GET /api/v1/iam/groups/{id}`. */
+export function fetchIamGroup(groupId: string): Promise<IamGroupDetail> {
+  return request<IamGroupDetail>(`/api/v1/iam/groups/${encodeURIComponent(groupId)}`);
+}
+
+/** `PATCH /api/v1/iam/groups/{id}`. */
+export function updateIamGroup(
+  groupId: string,
+  input: { name?: string; description?: string },
+): Promise<{ id: string; name: string; slug: string; description: string }> {
+  return request(`/api/v1/iam/groups/${encodeURIComponent(groupId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.description !== undefined ? { description: input.description } : {}),
+    }),
+  });
+}
+
+/** `DELETE /api/v1/iam/groups/{id}`. */
+export function deleteIamGroup(groupId: string): Promise<{ deleted: boolean }> {
+  return request(`/api/v1/iam/groups/${encodeURIComponent(groupId)}`, { method: "DELETE" });
+}
+
+/** `PUT /api/v1/iam/groups/{id}/members` — replace the membership. */
+export function setIamGroupMembers(
+  groupId: string,
+  userIds: string[],
+): Promise<{ group_id: string; member_count: number }> {
+  return request(`/api/v1/iam/groups/${encodeURIComponent(groupId)}/members`, {
+    method: "PUT",
+    body: JSON.stringify({ user_ids: userIds }),
+  });
+}
+
+/** One machine identity on the list. */
+export type IamServiceAccount = {
+  id: string;
+  name: string;
+  description: string;
+  prefix: string;
+  organization_id: string;
+  active: boolean;
+  last_used_at: string | null;
+  active_keys: number;
+  role_count: number;
+  created_at: string;
+};
+
+/** `GET /api/v1/iam/service-accounts`. */
+export async function fetchIamServiceAccounts(
+  organizationId?: string | null,
+): Promise<IamServiceAccount[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<{ service_accounts: IamServiceAccount[]; organization_id: string }>(
+    `/api/v1/iam/service-accounts${query}`,
+  );
+  return body.service_accounts;
+}
+
+/** `POST /api/v1/iam/service-accounts` — the key, when asked for, is shown once. */
+export function createIamServiceAccount(input: {
+  name: string;
+  description?: string;
+  organizationId?: string | null;
+  keyLabel?: string;
+}): Promise<{
+  id: string;
+  name: string;
+  prefix: string;
+  organization_id: string;
+  key: string | null;
+}> {
+  return request("/api/v1/iam/service-accounts", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      description: input.description ?? "",
+      organization_id: input.organizationId ?? null,
+      ...(input.keyLabel ? { key_label: input.keyLabel } : {}),
+    }),
+  });
+}
+
+/** One key of a machine identity. */
+export type IamServiceAccountKey = {
+  id: string;
+  prefix: string;
+  label: string;
+  active: boolean;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+};
+
+/** One machine identity in full: its keys and its roles. */
+export type IamServiceAccountDetail = {
+  account: {
+    id: string;
+    name: string;
+    description: string;
+    prefix: string;
+    organization_id: string;
+    active: boolean;
+    last_used_at: string | null;
+  };
+  keys: IamServiceAccountKey[];
+  roles: IamBinding[];
+};
+
+/** `GET /api/v1/iam/service-accounts/{id}`. */
+export function fetchIamServiceAccount(accountId: string): Promise<IamServiceAccountDetail> {
+  return request<IamServiceAccountDetail>(
+    `/api/v1/iam/service-accounts/${encodeURIComponent(accountId)}`,
+  );
+}
+
+/** `DELETE /api/v1/iam/service-accounts/{id}`. */
+export function deleteIamServiceAccount(accountId: string): Promise<{ deleted: boolean }> {
+  return request(`/api/v1/iam/service-accounts/${encodeURIComponent(accountId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** `POST /api/v1/iam/service-accounts/{id}/keys` — the token comes back exactly once. */
+export function issueIamServiceAccountKey(
+  accountId: string,
+  input: { label?: string; expiresAt?: string } = {},
+): Promise<{
+  id: string;
+  prefix: string;
+  label: string;
+  token: string;
+  expires_at: string | null;
+}> {
+  return request(`/api/v1/iam/service-accounts/${encodeURIComponent(accountId)}/keys`, {
+    method: "POST",
+    body: JSON.stringify({
+      label: input.label ?? "",
+      ...(input.expiresAt ? { expires_at: input.expiresAt } : {}),
+    }),
+  });
+}
+
+/** `DELETE /api/v1/iam/service-accounts/{id}/keys/{keyId}`. */
+export function revokeIamServiceAccountKey(
+  accountId: string,
+  keyId: string,
+): Promise<{ revoked: boolean }> {
+  return request(
+    `/api/v1/iam/service-accounts/${encodeURIComponent(accountId)}/keys/${encodeURIComponent(keyId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One step of a simulator answer. */
+export type IamSimulationStep = {
+  binding_id: string;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  role_priority: number;
+  subject: string;
+  scope: string;
+  state: "active" | "expired" | "revoked" | "out_of_scope";
+  counts: boolean;
+  effect: "allow" | "deny" | null;
+  via: string | null;
+  inherited_from: string | null;
+};
+
+/** The verdict of one simulator query, with the chain that produced it. */
+export type IamSimulationReport = {
+  allowed: boolean;
+  reason: string;
+  subject: string;
+  permission: string;
+  context: {
+    organization_id: string | null;
+    site_id: string | null;
+    department: string | null;
+    module: string | null;
+    path: string | null;
+  };
+  source: {
+    role_id: string;
+    role_key: string;
+    role_name: string;
+    role_priority: number;
+    via: string;
+  } | null;
+  chain: IamSimulationStep[];
+  considered: number;
+  counted: number;
+  note: string;
+};
+
+/** `POST /api/v1/iam/simulations`. */
+export function runIamSimulation(input: {
+  subjectType: "user" | "group" | "service_account";
+  subjectId: string;
+  permission: string;
+  organizationId?: string | null;
+  siteId?: string | null;
+  department?: string;
+  module?: string;
+  path?: string;
+}): Promise<IamSimulationReport> {
+  return request<IamSimulationReport>("/api/v1/iam/simulations", {
+    method: "POST",
+    body: JSON.stringify({
+      subject_type: input.subjectType,
+      subject_id: input.subjectId,
+      permission: input.permission,
+      ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+      ...(input.siteId ? { site_id: input.siteId } : {}),
+      ...(input.department ? { department: input.department } : {}),
+      ...(input.module ? { module: input.module } : {}),
+      ...(input.path ? { path: input.path } : {}),
+    }),
+  });
+}
+
+/** The IAM overview: what exists, what runs out soon, what happened last. */
+export type IamOverview = {
+  organization_id: string | null;
+  counts: {
+    users: number;
+    roles: number;
+    groups: number;
+    service_accounts: number;
+    live_bindings: number;
+    expiring_soon: number;
+  };
+  expiring: {
+    binding_id: string;
+    role_id: string;
+    role_key: string | null;
+    role_name: string | null;
+    subject: string;
+    scope: string;
+    expires_at: string | null;
+  }[];
+  recent: {
+    id: number;
+    action: string;
+    actor_user_id: string | null;
+    target_type: string | null;
+    target_id: string | null;
+    created_at: string;
+  }[];
+};
+
+/** `GET /api/v1/iam/overview`. */
+export function fetchIamOverview(organizationId?: string | null): Promise<IamOverview> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<IamOverview>(`/api/v1/iam/overview${query}`);
 }

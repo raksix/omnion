@@ -781,13 +781,20 @@ export function RoleDetailView({ roleId }: { roleId: string }) {
                 </thead>
                 <tbody>
                   {members.map((member) => (
-                    <tr key={`${member.user_id}-${member.created_at}`} data-role-member={member.email} className="border-t border-line">
+                    <tr key={`${member.subject_type}-${member.subject_id}-${member.created_at}`} data-role-member={member.label} className="border-t border-line">
                       <td className="px-3 py-2.5">
-                        <p className="text-[13px] font-medium text-ink">{member.display_name || member.email}</p>
-                        <p className="text-[11.5px] text-muted">{member.email}</p>
+                        <p className="text-[13px] font-medium text-ink">{member.label}</p>
+                        <p className="text-[11.5px] text-muted">
+                          {member.subject_type === "group"
+                            ? "group"
+                            : member.subject_type === "service_account"
+                              ? "service account"
+                              : "account"}
+                        </p>
                       </td>
                       <td className="px-3 py-2.5 font-mono text-[11.5px] text-muted">
                         {member.scope.type}
+                        {member.scope.resource_id ? ` · ${member.scope.resource_id}` : ""}
                         {member.scope.site_id ? ` · ${member.scope.site_id.slice(0, 8)}…` : ""}
                       </td>
                       <td className="px-3 py-2.5 text-[12px] text-muted">
