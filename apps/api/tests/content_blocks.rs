@@ -357,6 +357,21 @@ fn block(kind: &str, props: Value) -> Value {
     json!({ "id": Uuid::new_v4().to_string(), "type": kind, "props": props })
 }
 
+/// One `column` wrapper holding a block or two, in the shape slice 2 made required.
+///
+/// A Columns block holds columns, not content: "two of these side by side" is only expressible
+/// if each column is its own node. Every fixture below that builds a container has to go through
+/// this helper, or it writes a payload the validator refuses and the test fails for a reason
+/// that has nothing to do with what it was written to prove.
+fn column(blocks: Vec<Value>) -> Value {
+    json!({
+        "id": Uuid::new_v4().to_string(),
+        "type": "column",
+        "props": { "align": "left" },
+        "children": blocks
+    })
+}
+
 /// A small page's worth of blocks: a heading, a text and a two-column container.
 fn sample_tree() -> Value {
     json!([
@@ -367,8 +382,8 @@ fn sample_tree() -> Value {
             "type": "columns",
             "props": { "columns": 2 },
             "children": [
-                block("text", json!({ "text": "Left column." })),
-                block("text", json!({ "text": "Right column." }))
+                column(vec![block("text", json!({ "text": "Left column." }))]),
+                column(vec![block("text", json!({ "text": "Right column." }))])
             ]
         }
     ])
@@ -417,7 +432,10 @@ async fn the_block_registry_is_read_only_and_permission_gated() {
     )
     .await;
     assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
-    assert_eq!(listed.body["version"], json!("1"));
+    // "2" is the version that added the `column` wrapper. The panel compares against it to tell
+    // a new block type from a misspelled one, so the assertion is on the value, not on "it is
+    // a string" — a version that never moves is a version nothing reads.
+    assert_eq!(listed.body["version"], json!("2"));
     let categories: Vec<&str> = listed.body["categories"]
         .as_array()
         .expect("categories")
@@ -427,11 +445,23 @@ async fn the_block_registry_is_read_only_and_permission_gated() {
     assert!(categories.contains(&"text") && categories.contains(&"layout"));
 
     let blocks = listed.body["blocks"].as_array().expect("blocks");
+    // Seventeen, not the sixteen §Scope named: slice 2 added `column`, the wrapper a Columns
+    // block holds. The count is asserted as a number so that adding an eighteenth type without
+    // updating this line is a failure rather than a silently longer registry.
     assert_eq!(
         blocks.len(),
-        16,
-        "REQ-063 §Scope names sixteen block types: {}",
+        17,
+        "sixteen block types plus the column wrapper: {}",
         blocks.len()
+    );
+    let column_entry = blocks
+        .iter()
+        .find(|entry| entry["key"] == json!("column"))
+        .expect("the column wrapper is registered");
+    assert_eq!(
+        column_entry["structure_only"],
+        json!(true),
+        "a block that only exists inside another container is not offered as an insert choice"
     );
 
     let mut keys: Vec<&str> = blocks
@@ -444,6 +474,7 @@ async fn the_block_registry_is_read_only_and_permission_gated() {
         vec![
             "blog_list",
             "card_grid",
+            "column",
             "columns",
             "cta",
             "embed",
@@ -489,13 +520,16 @@ async fn the_block_registry_is_read_only_and_permission_gated() {
         }
     }
 
-    // A container says so, and only the container does.
-    let containers: Vec<&str> = blocks
+    // A container says so, and only a container does. `column` is one as well as `columns`:
+    // a wrapper that held no blocks would not be a layout, it would be an empty box. Sorted
+    // because the registry's declaration order is a presentation choice, not a contract.
+    let mut containers: Vec<&str> = blocks
         .iter()
         .filter(|entry| entry["container"] == json!(true))
         .filter_map(|entry| entry["key"].as_str())
         .collect();
-    assert_eq!(containers, vec!["columns"]);
+    containers.sort_unstable();
+    assert_eq!(containers, vec!["column", "columns"]);
 
     fixture.cleanup().await;
 }
@@ -520,10 +554,13 @@ async fn a_dry_run_reports_issues_without_writing_anything() {
     .await;
     assert_eq!(clean.status, StatusCode::OK, "{}", clean.body);
     assert_eq!(clean.body["can_publish"], json!(true));
+    // Six, not five: the container's two children are `column` wrappers, and the text inside
+    // them is one level deeper than slice 1 had it. A count that stops including a block type
+    // the platform just gained is a count the editor's bottom bar can no longer trust.
     assert_eq!(
         clean.body["block_count"],
-        json!(5),
-        "nested blocks are counted"
+        json!(7),
+        "nested blocks are counted, wrappers included"
     );
     assert_eq!(
         clean.body["issues"].as_array().map(Vec::len),
@@ -622,7 +659,10 @@ async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
             "id": Uuid::new_v4().to_string(),
             "type": "columns",
             "props": { "columns": 2, "gap": "normal" },
-            "children": [block("text", json!({ "text": "In a column." }))]
+            "children": [
+                column(vec![block("text", json!({ "text": "In a column." }))]),
+                column(vec![block("text", json!({ "text": "In the other column." }))])
+            ]
         },
         block("card_grid", json!({ "items": ["One|First|", "Two|Second|"], "columns": 2 })),
         block("pricing_table", json!({ "plans": ["Starter|0|One thing"], "note": "No card needed" })),
@@ -695,8 +735,15 @@ async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
     assert_eq!(stored[0]["props"]["align"], json!("left"));
     assert_eq!(stored[1]["props"]["align"], json!("left"));
     assert_eq!(stored[2]["props"]["caption"], json!(""));
-    // And the container keeps its children.
-    assert_eq!(stored[6]["children"].as_array().map(Vec::len), Some(1));
+    // And the container keeps its two column wrappers, each with its own block inside.
+    assert_eq!(stored[6]["children"].as_array().map(Vec::len), Some(2));
+    assert_eq!(stored[6]["children"][0]["type"], json!("column"));
+    assert_eq!(
+        stored[6]["children"][0]["children"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
     assert_eq!(
         draft["body"],
         json!("The pre-block text."),
@@ -1030,7 +1077,10 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
         .find(|row| row.get::<String, _>("name").as_str() == "content.blocks.updated")
         .expect("the block save must be recorded");
     let payload: Value = blocks_event.get::<Value, _>("payload");
-    assert_eq!(payload["block_count"], json!(5));
+    // Seven, because the count an event carries is the same count the validator reports and the
+    // tree has gained two wrappers. A count that quietly excludes a block type the platform
+    // ships is a hint a downstream integration would act on incorrectly.
+    assert_eq!(payload["block_count"], json!(7));
     assert!(
         payload.get("body").is_none(),
         "the event never carries the content"
@@ -1072,7 +1122,11 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the publication must be recorded");
-    assert_eq!(payload["block_count"], json!(5));
+    assert_eq!(
+        payload["block_count"],
+        json!(7),
+        "the publication hint counts the same tree the draft event did"
+    );
     assert_eq!(payload["slug"], json!("events"));
 
     fixture.cleanup().await;
@@ -1181,6 +1235,251 @@ async fn a_blocks_only_save_from_a_member_without_the_key_is_refused() {
     .await;
     assert_eq!(read.body["draft"]["blocks"], json!([]));
     assert_eq!(read.body["draft"]["revision_no"], json!(1));
+
+    fixture.cleanup().await;
+}
+
+/// REQ-063, slice 2: "blocks marked `hide_on: mobile` are absent from the mobile render
+/// (server-side), not merely CSS-hidden".
+///
+/// The claim has three parts and each needs its own assertion, because a CSS-only
+/// implementation passes none of them: the desktop render still has the block, the mobile render
+/// does not have it *anywhere* in its payload, and a block hidden the other way round is still
+/// there for a phone. The test reads the API rather than the HTML because the API is what decides.
+#[tokio::test]
+async fn a_block_hidden_on_phones_is_absent_from_the_mobile_render() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "viewport").await;
+
+    let mut wide_only = block("text", json!({ "text": "Wide-only line" }));
+    wide_only["meta"] = json!({ "hide_on": "mobile" });
+    let mut phone_only = block("text", json!({ "text": "Phone-only line" }));
+    phone_only["meta"] = json!({ "hide_on": "desktop" });
+    let everywhere = block("text", json!({ "text": "Every line" }));
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [wide_only, phone_only, everywhere] })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+    // The setting is stored exactly as the author wrote it, and `none` is nowhere in the payload:
+    // the editor writes absence for "everywhere", so an ordinary page carries no settings at all.
+    let stored = saved.body["draft"]["blocks"].clone();
+    assert_eq!(stored[0]["meta"]["hide_on"], json!("mobile"));
+    assert_eq!(stored[2].get("meta"), None, "an unset block stores no meta");
+
+    let published = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/publish"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(published.status, StatusCode::OK, "{}", published.body);
+
+    let public = |viewport: Option<&'static str>| {
+        let query = match viewport {
+            Some(value) => format!("?site={}&viewport={value}", fixture.site_key),
+            None => format!("?site={}", fixture.site_key),
+        };
+        format!("/api/v1/public/pages/viewport{query}")
+    };
+    let texts = |body: &Value| -> Vec<String> {
+        body["revision"]["blocks"]
+            .as_array()
+            .expect("the blocks are an array")
+            .iter()
+            .map(|entry| entry["props"]["text"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+
+    // The default (and the desktop) render carries the blocks that are not hidden from it — which
+    // is NOT all three: the phone-only block is `hide_on: desktop`, so a wide screen must not get
+    // it either. Asserting "three" here would have tested a filter that hides nothing.
+    let desktop = call(
+        &fixture.state,
+        request(Method::GET, &public(None), None, None),
+    )
+    .await;
+    assert_eq!(desktop.status, StatusCode::OK, "{}", desktop.body);
+    assert_eq!(
+        texts(&desktop.body),
+        vec!["Wide-only line", "Every line"],
+        "the wide render drops the block hidden from desktops"
+    );
+
+    // The phone render is a *different payload*, not the same page with a class on one block.
+    let mobile = call(
+        &fixture.state,
+        request(Method::GET, &public(Some("mobile")), None, None),
+    )
+    .await;
+    assert_eq!(mobile.status, StatusCode::OK, "{}", mobile.body);
+    assert_eq!(
+        texts(&mobile.body),
+        vec!["Phone-only line", "Every line"],
+        "the phone render must not carry the block hidden from phones"
+    );
+    assert!(
+        !mobile.body.to_string().contains("Wide-only line"),
+        "the hidden block must not survive anywhere in the phone payload"
+    );
+
+    // A word the platform does not recognise is the wide render, not a 400: the query addresses a
+    // display choice, and a renderer that sends a bad one must still get a working page.
+    let nonsense = call(
+        &fixture.state,
+        request(Method::GET, &public(Some("tablet")), None, None),
+    )
+    .await;
+    assert_eq!(nonsense.status, StatusCode::OK, "{}", nonsense.body);
+    assert_eq!(
+        texts(&nonsense.body),
+        vec!["Wide-only line", "Every line"],
+        "an unreadable viewport word is the wide render, not a filter of its own"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A `hide_on` value outside the closed list is refused at the *save*, not at the publish.
+///
+/// A setting the platform cannot read is worse than no setting: the author believes a block is
+/// hidden from phones while it renders on every phone in the country. It is an error rather than
+/// a warning because nothing in a published page should be able to contradict what it says.
+#[tokio::test]
+async fn a_hide_on_value_outside_the_list_cannot_be_saved() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "bad-viewport").await;
+
+    let mut block_value = block("text", json!({ "text": "Asked for a tablet" }));
+    block_value["meta"] = json!({ "hide_on": "tablet" });
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [block_value] })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        saved.status, StatusCode::BAD_REQUEST,
+        "an unreadable viewport must not be stored: {}",
+        saved.body
+    );
+
+    // The dry run names the setting, so the inspector can put the message under the control.
+    let dry = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/blocks/validate",
+            Some(&editor),
+            Some(json!({ "blocks": [{ "id": "9f5b0e0a-2c2f-4a3f-9a3a-0a1b2c3d4e5f", "type": "text", "props": { "text": "x" }, "meta": { "hide_on": "tablet" } }] })),
+        ),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.body);
+    let issue = dry.body["issues"]
+        .as_array()
+        .expect("an array of issues")
+        .iter()
+        .find(|entry| entry["code"] == json!("block_meta_invalid"))
+        .expect("the setting is named");
+    assert_eq!(issue["severity"], json!("error"));
+    assert!(
+        issue["path"].as_str().expect("a path").contains("meta.hide_on"),
+        "the path has to name the setting: {issue}"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// The heading-order rule the REQ names: an `h2` before the page's `h1` warns, and it is a
+/// warning — the page renders and publishes. The first half of the criterion is the lint
+/// existing at all; this test is the proof that it is *wired to a surface* rather than a
+/// function nothing calls.
+#[tokio::test]
+async fn a_heading_that_skips_back_to_an_h1_is_reported_by_the_dry_run() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let editor = fixture.editor_token().await;
+
+    let late = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/blocks/validate",
+            Some(&editor),
+            Some(json!({
+                "blocks": [
+                    block("heading", json!({ "text": "A section", "level": "h2" })),
+                    block("heading", json!({ "text": "The title", "level": "h1" }))
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(late.status, StatusCode::OK, "{}", late.body);
+    assert_eq!(
+        late.body["can_publish"],
+        json!(true),
+        "a late h1 renders fine: {}",
+        late.body
+    );
+    assert!(
+        late.body["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .any(|entry| entry["code"] == json!("block_heading_order")),
+        "the dry run must name the late h1: {}",
+        late.body
+    );
+
+    // The same two blocks, reordered: the warning is gone. "The warning disappears after
+    // reordering" is half of the criterion, and it is only true if the rule looks at order.
+    let fixed = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/blocks/validate",
+            Some(&editor),
+            Some(json!({
+                "blocks": [
+                    block("heading", json!({ "text": "The title", "level": "h1" })),
+                    block("heading", json!({ "text": "A section", "level": "h2" }))
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(fixed.status, StatusCode::OK, "{}", fixed.body);
+    assert_eq!(
+        fixed.body["issues"],
+        json!([]),
+        "the reordered pair must be silent: {}",
+        fixed.body
+    );
 
     fixture.cleanup().await;
 }
