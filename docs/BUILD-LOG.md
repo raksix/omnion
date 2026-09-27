@@ -1,3 +1,65 @@
+
+## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
+
+- **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
+  this process starts on a loopback port: a discovery document, a JWKS, an authorization endpoint
+  that answers `302` with a `Location`, a token endpoint that verifies the PKCE challenge itself and
+  spends a code exactly once, and a SAML endpoint that signs an assertion with both halves of the
+  XML-signature binding — all under one freshly generated 2048-bit RSA key.
+  `apps/api/tests/sso_live.rs` drives the **real router** against it: the browser is sent to the
+  provider's own endpoint, comes back with a code, the code is exchanged, the token is verified
+  against the *published* keys, the claim → role mapping attaches the role, JIT provisions the
+  account, and `GET /me` with the resulting cookie names the directory person. The same file does
+  SAML. Plus the fixes below.
+- **Why a stub and not more fixtures.** Every other proof of enterprise sign-in tested one layer:
+  a verifier against a synthetic token, a reader against a hand-built assertion, the HTTP layer
+  against refusals it triggers itself. None of them proved that a *browser* can complete a round
+  trip, because that needs a provider on the other end. The stub shares nothing with the code it
+  tests except the `rsa` crate, so agreement between the two sides is evidence rather than
+  tautology.
+- **Proof.** `cargo test --workspace --lib` → **598 unit tests, 0 failures**. `cargo test -p
+  omnion-api --test sso --test sso_live` → **3 walks, 0 failures**, all three in one database.
+  `pnpm typecheck` green. `cargo clippy --all-targets` adds no new warning.
+- **Four defects the walk found, and each is a thing no layer-by-layer test could see.**
+  **(1) Every SAML sign-in was broken.** The relay page posted the *return path* as `RelayState`
+  while the callback claims a **challenge** from `RelayState` — so the callback could never claim
+  one and every SAML sign-in ended in `invalid_state`. The page now carries the challenge `start`
+  issued (and HTML-escapes it, because the route is public and a `state` query is attacker-supplied
+  in the general case). **(2) `c_hash` was checked against the PKCE verifier's hash.** No provider
+  has ever seen the verifier, so a real directory could not satisfy that rule: it refused every
+  legitimate sign-in while proving nothing. It is now the real code hash (OIDC Core §3.1.3.6), and
+  a *missing* `c_hash` is not a refusal, because the claim is a RECOMMENDED and an optional claim
+  cannot be a mandatory rule. **(3) The SAML `test` button could never report success.** Its probe
+  was a self-closing `<saml:Assertion/>` that the reader never parses, and the verdict was
+  inferred from the error text — so every certificate read as broken. The certificate step is now
+  exposed on its own and the claim half is probed with a document the real reader accepts, which
+  also catches a typo in an attribute name before the first real assertion. **(4) The claim → role
+  mapping silently did nothing for every tenant.** It looked the role up with the tenant's
+  organization id, but the base roles are seeded at *platform* scope, so `editors` → `editor`
+  matched nothing and the person signed in with no role and no error — the worst possible outcome
+  for the feature whose whole point is the mapping. The lookup now falls back to the platform role,
+  the way the rest of the platform finds one.
+- **A test that only passes in one harness is a test that lies.** The walk's first version swept
+  `email like 'sso-live-%'` to clear leftovers from a crashed run. It passed in CI (one database
+  per job) and failed against a shared one, because it deleted a sibling suite's fixtures
+  mid-run. Every statement is now scoped to the walk's own organizations, and all three walks are
+  proven to pass together in one database.
+- **Owner action, still open: the disk.** `/mnt/apopic` (one 60 GB loop image shared by eight
+  worktrees' `target/`) hit **0 bytes free** twice during this tick and a link failed with
+  `No space left on device`. `target/debug/incremental` was cleared twice, and the **unclaimed**
+  `omnion-w4`/`w5`/`w7` worktree `target/` directories (12.6 GB of build artifacts, no wave owns
+  them, no `cargo` running) were removed. That returned 13 GB. **The unclaimed worktrees should be
+  pruned outright, or the box needs more room** — a link failure is a red build, and one will
+  happen again mid-tick.
+- **Owner action, still open: the shared dev database.** `omnion` has migration **19** applied from
+  a sibling branch that `main` does not have, so `db.migrate()` refuses with `VersionMissing(19)`
+  and every integration test that migrates fails there. CI is clean. This tick ran against a
+  dedicated `omnion_sso_live` database instead, which is the right shape for a local run and worth
+  making the default until the 0019 slot is reconciled.
+- **Next.** REQ-006 is **done** — every slice shipped and every acceptance box ticked. The next
+  REQ in wave 1 order is **REQ-010** (the enterprise file manager). This tick is not a close tick
+  in the QA-pass sense (no screen changed), so `scripts/qa/run.sh` was not run; the next tick that
+  lands a screen carries it.
 # Omnion — Build Log
 
 > Cross-tick memory for the **`omnion-build`** loop. Newest entries at the bottom. 3-5 lines
