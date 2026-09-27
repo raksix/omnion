@@ -185,18 +185,21 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
             }
 
             // A one-shot listener wants the payload of the first event that actually
-            // matched — the only honest answer to "what does this event really carry". It
-            // is collected here and written after the commit, for the same reason the audit
-            // rows are: the capture is a record of a run that happened, not a decision
-            // about whether it should.
-            if event.name == crate::catalogue::HOOK_EVENT {
-                captured.push((
-                    workflow.id,
-                    event.id,
-                    event.name.clone(),
-                    event.payload.clone(),
-                ));
-            }
+            // matched — the only honest answer to "what does this event really carry", and
+            // the only way to learn a payload shape the documentation got wrong. It is
+            // collected here and written after the commit, for the same reason the audit
+            // rows are: the capture is a record of a run that happened, not a decision about
+            // whether it should.
+            //
+            // The capture is placed *after* the conditions held and the steps resolved, so
+            // what the listener reports is the payload a real run would have used — an event
+            // the rule did not match is not what the author is asking to see.
+            captured.push((
+                workflow.id,
+                event.id,
+                event.name.clone(),
+                event.payload.clone(),
+            ));
 
             let steps = match resolve_steps(&rule, &event.payload) {
                 Ok(steps) => steps,

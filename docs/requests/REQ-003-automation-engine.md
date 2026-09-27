@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** in-progress (slice 1 · `36b362f`, `63e99bf`, `4e4c63b`, `d523a32`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -137,22 +137,53 @@ the payload; the rule id is the only identifier returned to the caller.
 ### Acceptance criteria
 
 - [ ] The rule list, editor, run history, run detail and templates screens exist at the routes above and appear in the QA walkthrough inventory.
+      *Slice 1:* the list and the editor are at `/automations` and are walked on desktop and mobile. The run history, run detail and
+      templates screens are slice 4's (`/automations/[id]/runs/…`, `/automations/templates`) and are not built yet.
 - [ ] A rule on `user.created` sends a welcome e-mail to a new account in the QA stack (the mail sink proves exactly one message, correct recipient and subject).
-- [ ] Condition groups work: an `all` inside `any` evaluates correctly against fixture payloads and round-trips through save and reload unchanged.
+      *Slice 1:* the event library, the matcher and the `send_email` action are in place, but the end-to-end "a real signup sends one
+      message" walk is not yet written — it belongs with the run screens in slice 4.
+- [x] Condition groups work: an `all` inside `any` evaluates correctly against fixture payloads and round-trips through save and reload unchanged.
+      *Proved:* `crates/automation/src/groups.rs` — the tree evaluates, serialises flat to `{"all"|"any":[…]}`, reads back byte for byte,
+      refuses four levels, an empty nested group and more than 24 nodes, and a bare v0 array still reads as one `all` group.
+      The engine's `conditions` column accepts both shapes and `build_definition` stores the group object.
 - [ ] An inbound hook call starts a run whose payload the conditions read; a wrong or rotated token answers 404 and never reveals whether a rule exists.
+      *Partly proved:* `POST /api/v1/hooks/{token}` records `automation.hook.received` with the caller's body under `hook.body`, and an
+      unknown/rotated/unshaped token answers `404 not_found` (asserted over the live stack: a wrong token returned exactly that). The
+      run-side walk — a real call starting a run whose conditions read the body — is not written yet.
 - [ ] `http_request` to a host outside `automation_settings.http_allowed_hosts` is refused at save time naming the host, and delivered with `x-omnion-signature` when allowed.
-- [ ] A dry run reports `would_send` per host action without sending e-mail or calling a URL.
+      *Slice 2* (the `http_request` action). Not started.
+- [x] A dry run reports `would_send` per host action without sending e-mail or calling a URL.
+      *Proved:* `crates/automation/src/testing.rs` resolves the payload into every action through the same `resolve_params` the matcher
+      uses and reports `would_send` / `would_call` / `would_publish`; the QA pass reads every outcome back and asserts each starts with
+      `would_`. `POST /api/v1/automations/{id}/test` stores the report and audits it.
 - [ ] "Run now" starts exactly one run; a second press inside the rate window shows the limit message and starts nothing.
+      *Slice 2* (the run-now endpoint and `rate_limit_per_hour`). Not started.
 - [ ] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
+      *Slice 3.* Not started.
 - [ ] A `wait_for_approval` step parks the run as `awaiting_approval`, the pending panel lists it, approving resumes it, rejecting ends it without the effect.
+      *Slice 3.* Not started.
 - [ ] Deciding an approval twice has no second effect (single-use token) and an expired approval is refused with a clear message.
+      *Slice 3.* Not started.
 - [ ] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
+      *Slice 2.* Not started.
 - [ ] `timeout_ms` is honoured: a slow `http_request` fails naming the limit, and the step shows attempts used against attempts allowed.
+      *Slice 2.* Not started.
 - [ ] The endless-loop guard aborts a rule that repeats the same step with identical resolved parameters and explains why in the trace.
+      *Slice 4.* Not started.
 - [ ] A paused rule does not fire, and re-arming it does not replay events recorded while it was paused.
+      *Proved in part:* the matcher only reads armed rules (`store::list_event_rules` filters `enabled`), and a paused webhook rule's token
+      stops resolving (`hooks::find_rule` filters `enabled`), so its URL answers 404 like a wrong one. The "does not replay while paused"
+      walk is not written yet.
 - [ ] Every definition change is audited with actor, diff summary and timestamp, and the Audit tab lists those entries.
+      *Slice 1 audited every change* (`automation.created` / `.updated` / `.deleted` / `.tested` / `.listener_armed` / `.hook_rotated`, each
+      with the actor and a metadata summary; the hook token is deliberately never audited). The **Audit tab** that lists those entries is
+      slice 4's, so this line stays open.
 - [ ] All six templates load, validate and save without edits beyond their missing credentials.
+      *Slice 4* (the templates gallery). Not started.
 - [ ] Empty, loading and error states exist on every screen; no dead buttons and no "coming soon" text.
+      *Proved for the slice-1 screens:* the list has a loading table, an empty state ("No automations yet") with New rule, a
+      no-match state, a load-error banner and a notice; the editor has a validation summary that disables Save, a save-error alert, an
+      empty-conditions explanation and an "empty nested group" explanation. The walkthrough clicks every one of them.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
 
 ### QA plan
