@@ -1,9 +1,10 @@
 //! Permission simulator: the explanation behind one decision (docs/07-IAM.md §18).
 //!
-//! The verdict is not computed here — it comes from [`evaluate::effective_permissions_for`], the
-//! same resolution the route guard runs. This module only explains it: every binding of the
-//! subject is listed with its state, and the bindings that count are traced through their roles
-//! so the reader sees which entry (own or inherited) decided the answer, and which deny won.
+//! The verdict is not computed here — it comes from [`evaluate::authorize_subject`], the same
+//! resolution the route guard runs (roles first, then the ABAC policies of the organization).
+//! This module only explains it: every binding of the subject is listed with its state, the
+//! bindings that count are traced through their roles, every policy is listed with its verdict,
+//! so the reader sees which entry decided the answer — and which deny, role or policy, won.
 
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -12,8 +13,9 @@ use uuid::Uuid;
 use crate::bindings;
 use crate::catalogue;
 use crate::error::{PermissionsError, Result};
-use crate::evaluate::{self, Decision, Grant, Via};
+use crate::evaluate::{self, Decision, DenyReason, Grant, Via};
 use crate::model::{ResourceContext, Subject};
+use crate::policies;
 
 /// One binding considered while answering a simulator query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,12 +46,12 @@ pub struct SimulationStep {
     pub inherited_from: Option<String>,
 }
 
-/// The role behind a decision, as the verdict card shows it.
+/// The role or policy behind a decision, as the verdict card shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulatedSource {
     /// Role id.
     pub role_id: Uuid,
-    /// Role key.
+    /// Role key (or `policy` when a policy decided).
     pub role_key: String,
     /// Role name.
     pub role_name: String,
@@ -57,6 +59,8 @@ pub struct SimulatedSource {
     pub role_priority: i32,
     /// How the permission reached the subject.
     pub via: &'static str,
+    /// The policy behind the decision, when a policy made it.
+    pub policy: Option<SimulatedPolicy>,
 }
 
 impl From<&Grant> for SimulatedSource {
@@ -67,8 +71,51 @@ impl From<&Grant> for SimulatedSource {
             role_name: grant.role_name.clone(),
             role_priority: grant.role_priority,
             via: via_name(grant.via),
+            policy: grant.policy.as_ref().map(SimulatedPolicy::from_stamp),
         }
     }
+}
+
+/// The policy behind a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedPolicy {
+    /// Policy id.
+    pub policy_id: Uuid,
+    /// Its name.
+    pub policy_name: String,
+    /// The priority it won with.
+    pub priority: i32,
+}
+
+impl SimulatedPolicy {
+    fn from_stamp(stamp: &evaluate::PolicyStamp) -> Self {
+        Self {
+            policy_id: stamp.policy_id,
+            policy_name: stamp.policy_name.clone(),
+            priority: stamp.priority,
+        }
+    }
+}
+
+/// One policy of the organization, with its verdict for this question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedPolicyStep {
+    /// Policy id.
+    pub policy_id: Uuid,
+    /// Its name.
+    pub policy_name: String,
+    /// `allow` or `deny`.
+    pub effect: &'static str,
+    /// Its priority.
+    pub priority: i32,
+    /// Whether it is enabled at all.
+    pub enabled: bool,
+    /// Whether its targets cover the permission.
+    pub targeted: bool,
+    /// Whether its conditions hold for the attributes in question.
+    pub satisfied: bool,
+    /// Whether it therefore decided (or is a candidate that lost on priority).
+    pub applies: bool,
 }
 
 /// The answer to one simulator query.
@@ -76,12 +123,14 @@ impl From<&Grant> for SimulatedSource {
 pub struct SimulationReport {
     /// `true` when the subject holds the permission.
     pub allowed: bool,
-    /// `allowed`, `explicit_deny` or `missing_permission`.
+    /// `allowed`, `explicit_deny`, `policy_denied` or `missing_permission`.
     pub reason: &'static str,
-    /// The role that decided it: the winning allow, or the winning deny.
+    /// The role or policy that decided it: the winning allow, or the winning deny.
     pub source: Option<SimulatedSource>,
     /// Every binding considered, the decisive ones first.
     pub steps: Vec<SimulationStep>,
+    /// Every policy of the organization with its verdict for this question.
+    pub policies: Vec<SimulatedPolicyStep>,
     /// How many bindings were looked at.
     pub considered: usize,
     /// How many of them counted.
@@ -101,9 +150,8 @@ pub async fn simulate(
         return Err(PermissionsError::UnknownSimulatedAction(key.to_owned()));
     }
 
-    // The verdict comes from the same resolution the guard runs.
-    let effective = evaluate::effective_permissions_for(pool, subject, context).await?;
-    let decision = effective.decision(key);
+    // The verdict comes from the same resolution the guard runs: roles, then policies.
+    let decision = evaluate::authorize_subject(pool, subject, context, key).await?;
 
     let graph = evaluate::load_role_graph(pool, context.organization_id).await?;
     let all = bindings::bindings_for(pool, subject).await?;
@@ -165,24 +213,60 @@ pub async fn simulate(
     let (reason, source) = match &decision {
         Decision::Allowed(grant) => ("allowed", Some(SimulatedSource::from(grant))),
         Decision::Denied {
+            reason: DenyReason::PolicyDeny,
+            source: Some(grant),
+        } => ("policy_denied", Some(SimulatedSource::from(grant))),
+        Decision::Denied {
             source: Some(grant),
             ..
         } => ("explicit_deny", Some(SimulatedSource::from(grant))),
         Decision::Denied { source: None, .. } => ("missing_permission", None),
     };
 
+    // Every policy of the organization, with its verdict for this question.
+    let mut evaluated: Vec<SimulatedPolicyStep> = Vec::new();
+    if let Some(organization_id) = context.organization_id {
+        let attributes = policies::attributes_for(pool, subject, context, key).await?;
+        let candidates = policies::candidates(pool, organization_id, key, &attributes).await?;
+        evaluated = candidates
+            .into_iter()
+            .map(|candidate| {
+                let applies = candidate.applies();
+                SimulatedPolicyStep {
+                    policy_id: candidate.policy_id,
+                    policy_name: candidate.policy_name,
+                    effect: candidate.effect.as_str(),
+                    priority: candidate.priority,
+                    enabled: candidate.enabled,
+                    targeted: candidate.targeted,
+                    satisfied: candidate.satisfied,
+                    applies,
+                }
+            })
+            .collect();
+    }
+
     let counted = steps.iter().filter(|step| step.counts).count();
-    let note = format!(
+    let mut note = format!(
         "{} binding(s) looked at, {} counted — revoked, expired and out-of-scope rows never decide.",
         steps.len(),
         counted
     );
+    if !evaluated.is_empty() {
+        let applying = evaluated.iter().filter(|policy| policy.applies).count();
+        note.push_str(&format!(
+            " {} policy(ies) evaluated, {} applies.",
+            evaluated.len(),
+            applying
+        ));
+    }
 
     Ok(SimulationReport {
         allowed: decision.is_allowed(),
         reason,
         source,
         steps,
+        policies: evaluated,
         considered: all.len(),
         counted,
         note,
@@ -216,5 +300,6 @@ pub fn via_name(via: Via) -> &'static str {
         Via::InheritedAllow => "inherited_allow",
         Via::ExplicitDeny => "explicit_deny",
         Via::InheritedDeny => "inherited_deny",
+        Via::Policy => "policy",
     }
 }

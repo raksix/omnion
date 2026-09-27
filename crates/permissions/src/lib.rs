@@ -11,8 +11,11 @@
 //!   unit-tested without a database.
 //! * [`roles`], [`bindings`], [`seed`] — the persistence side, which only stores and loads.
 //!
-//! Deciding on a request is RBAC only: the ABAC policy engine (docs/07-IAM.md §11) plugs in
-//! later as `crates/policy-engine`, consuming the same [`evaluate::EffectivePermissions`].
+//! Deciding on a request is one path: [`evaluate::authorize_subject`] resolves the role bindings
+//! and then hands the answer to [`policies::apply`], where the organization's ABAC policies get
+//! the last word (docs/07-IAM.md §11). The evaluation itself is `omnion-policy-engine`, which
+//! stays pure and database-free; the guard, the effective-permissions screen and the simulator
+//! all come through the same function, so no two callers can disagree.
 
 #![forbid(unsafe_code)]
 
@@ -21,8 +24,10 @@ pub mod catalogue;
 pub mod error;
 pub mod evaluate;
 pub mod groups;
+pub mod invariants;
 pub mod matching;
 pub mod model;
+pub mod policies;
 pub mod roles;
 pub mod seed;
 pub mod service_accounts;
@@ -32,11 +37,13 @@ pub mod versions;
 pub use catalogue::{CATALOGUE, PermissionDef, get as permission, is_known};
 pub use error::{PermissionsError, Result};
 pub use evaluate::{
-    Decision, DenyReason, EffectivePermissions, Grant, RoleGraph, Trace, Via, authorize,
+    Decision, DenyReason, EffectivePermissions, Grant, PolicyStamp, RoleGraph, Trace, Via, authorize,
     authorize_subject, effective_permissions, effective_permissions_for, effective_permissions_in,
     load_role_graph,
 };
+pub use invariants::{InvariantRefusal, PRIVILEGED_ROLE_KEYS, check_binding_revocation};
 pub use matching::glob_matches;
+pub use policies::{PolicyDraft, PolicyRecord, PolicyVersionRecord};
 pub use model::{
     Effect, MAX_INHERITANCE_DEPTH, MAX_PRIORITY, MIN_PRIORITY, NewBinding, NewRole,
     NewSubjectBinding, ParentChange, PermissionChange, PermissionSummary, ResourceContext, Role,

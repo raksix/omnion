@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::bindings;
 use crate::error::Result;
 use crate::model::{Effect, ResourceContext, RoleAssignment, Scope, Subject};
+use crate::policies;
 use crate::roles;
 
 /// How a permission reached the principal.
@@ -34,6 +35,8 @@ pub enum Via {
     ExplicitDeny,
     /// An ancestor of a bound role refuses the key.
     InheritedDeny,
+    /// An ABAC policy decided it, after the roles had their say.
+    Policy,
 }
 
 impl Via {
@@ -42,7 +45,7 @@ impl Via {
         match self {
             Self::ExplicitDeny => 3,
             Self::InheritedDeny => 2,
-            Self::ExplicitAllow => 1,
+            Self::ExplicitAllow | Self::Policy => 1,
             Self::InheritedAllow => 0,
         }
     }
@@ -55,6 +58,10 @@ impl Via {
 }
 
 /// Where a decision came from — the data behind "Role → Marketing Manager".
+///
+/// When the decision was made by an ABAC policy instead (docs/07-IAM.md §11), `via` is
+/// [`Via::Policy`] and [`Grant::policy`] carries the policy itself; the role fields then name it,
+/// so every existing reader keeps working while a policy-aware reader can say more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     /// Role that carries the entry.
@@ -67,6 +74,34 @@ pub struct Grant {
     pub role_priority: i32,
     /// How the permission reached the principal.
     pub via: Via,
+    /// The policy behind the decision, when a policy made it.
+    pub policy: Option<PolicyStamp>,
+}
+
+/// The ABAC policy behind a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyStamp {
+    /// Id of the policy.
+    pub policy_id: Uuid,
+    /// Its name.
+    pub policy_name: String,
+    /// The priority it won with.
+    pub priority: i32,
+}
+
+impl Grant {
+    /// A decision that came from a policy rather than a role.
+    #[must_use]
+    pub fn from_policy(stamp: PolicyStamp) -> Self {
+        Self {
+            role_id: stamp.policy_id,
+            role_key: "policy".to_owned(),
+            role_name: stamp.policy_name.clone(),
+            role_priority: stamp.priority,
+            via: Via::Policy,
+            policy: Some(stamp),
+        }
+    }
 }
 
 /// Why a permission is not held.
@@ -74,6 +109,8 @@ pub struct Grant {
 pub enum DenyReason {
     /// A role refuses it explicitly (or through inheritance).
     ExplicitDeny,
+    /// An ABAC policy refuses it.
+    PolicyDeny,
     /// No role grants it.
     MissingPermission,
 }
@@ -173,6 +210,7 @@ impl EffectivePermissions {
             role_name: role.name.clone(),
             role_priority: role.priority,
             via,
+            policy: None,
         };
         let target = match effect {
             Effect::Allow => &mut self.grants,
@@ -399,6 +437,12 @@ pub async fn effective_permissions_in(
 }
 
 /// Decide whether a subject holds one permission in one context.
+///
+/// This is the whole decision path (docs/07-IAM.md §2, §11): the role bindings resolve first,
+/// then the organization's ABAC policies get their say — an allow policy can grant what RBAC did
+/// not, a deny policy takes away what RBAC granted, and with neither the RBAC answer stands. The
+/// guard, the list filters and the simulator all come through here, so no two callers can
+/// disagree.
 pub async fn authorize_subject(
     pool: &PgPool,
     subject: Subject,
@@ -406,7 +450,8 @@ pub async fn authorize_subject(
     key: &str,
 ) -> Result<Decision> {
     let effective = effective_permissions_for(pool, subject, context).await?;
-    Ok(effective.decision(key))
+    let base = effective.decision(key);
+    policies::apply(pool, subject, context, key, base).await
 }
 
 /// Decide whether an account holds one permission in one scope.

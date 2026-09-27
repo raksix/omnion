@@ -98,6 +98,12 @@ pub enum PermissionsError {
     /// The machine key does not exist, is revoked, or does not match its secret.
     #[error("invalid machine key")]
     InvalidMachineKey,
+    /// No policy carries this id.
+    #[error("policy not found")]
+    PolicyNotFound,
+    /// The policy is not usable (its name, priority, target or conditions).
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(String),
     /// The role could not be found while checking a simulator query.
     #[error("the simulated action is not a known permission: {0}")]
     UnknownSimulatedAction(String),
