@@ -133,17 +133,36 @@ export function Block({ block }: { block: ContentBlock }) {
         </section>
       );
     case "columns": {
+      // The children of a Columns block are `column` wrappers, not content. A wrapper renders
+      // as one cell of the grid; a slice-1 payload that put blocks straight under `columns`
+      // still renders, because a child that is not a wrapper is drawn as a cell of its own —
+      // that is what makes the validator's new rule an error the author can fix rather than a
+      // page that disappears.
       const children = block.children ?? [];
       return (
         <section className="mn-block mn-columns" data-columns={number(block, "columns", 2)}>
           {children.map((child) => (
             <div key={child.id} className="mn-column">
-              <BlockTree blocks={[child]} />
+              {child.type === "column" ? (
+                <BlockTree blocks={child.children ?? []} />
+              ) : (
+                <Block block={child} />
+              )}
             </div>
           ))}
         </section>
       );
     }
+    case "column":
+      // A Column normally renders inside the Columns branch above. Reaching it directly means
+      // the payload is the shape the validator reports as `block_column_orphan`; it still
+      // renders its children rather than throwing, so a draft with that mistake is readable
+      // instead of a page that 500s on an author who is mid-fix.
+      return (
+        <div className="mn-block mn-column">
+          <BlockTree blocks={block.children ?? []} />
+        </div>
+      );
     case "card_grid": {
       const items = list(block, "items");
       return (
