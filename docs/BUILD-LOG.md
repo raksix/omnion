@@ -1831,3 +1831,33 @@ QA_STACK=w6 … bash scripts/qa/run.sh                        → see below
   `ai`, `analytics` and the `iam-*` screens: it is one harness gap, not per-screen defects.
   **Owner action:** the QA pass needs to bind the owner role after the wizard (`seed::bind_owner`
   is what the API integration tests use) before any permission-guarded screen counts as proven.
+
+### Browser proof for the two screens (private w6 stack)
+
+The walkthrough could not show the populated screens because the QA account carries no role, so
+the two were driven directly against the same private stack with an owner-bound account
+(`qa-sample@omnion.test`, org `qa-org`, owner role bound), which is what the panel reads.
+
+```text
+POST /api/v1/secrets/{id}/credential   payment_key → 201 · ssh_key → 201
+POST /api/v1/secrets/{id}/credential   on the `file` provider → 400 secret_read_only   (spec: read-only providers are not writable)
+PUT  /api/v1/credential-slots/…/smtp   → 200
+PUT  same secret as primary+fallback   → 409 credential_slot_self_reference
+GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answered."
+/secrets/credentials  → 3 rows, chips valid / invalid / unknown, no value on screen, 0 console errors
+/secrets/slots        → 6 slots, 2 assigned with primary+fallback, 0 console errors
+```
+
+- **A missing `#[serde(with = "time::serde::rfc3339")]` renders as garbage, not as a compile error.**
+  `SlotView.last_resolved_at` is a bare `time::OffsetDateTime`, so serde emitted the raw
+  `time` tuple — `[2026, 270, 21, 45, 41, 906321000, 0, 0, 0]` — and the panel printed the first
+  number as if it were a year. Every sibling route already carried the attribute; five fields in
+  this file did not. Found by reading the rendered screen, not by a failing test: nothing in the
+  suite asserted the wire format. `93b713a` fixes all five.
+- **A check constraint is documentation.** Building the fixture failed twice before the rows went
+  in: `secrets_bridge_locator_check` (a non-`local` provider needs a locator) and
+  `secrets_scope_type_check` (`organization`/`global` only). Both are the schema refusing an
+  inconsistent row, which is exactly what they exist for.
+- **A session cookie is bound to one origin.** The panel talks to the API on :18085 while the
+  browser is on :3105, so a curl-minted cookie must be injected into the browser context; logging
+  in through the form alone bounces back to `/login` in a scripted pass.
