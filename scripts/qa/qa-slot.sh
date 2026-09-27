@@ -23,6 +23,13 @@ WAIT="${QA_SLOT_WAIT:-900}"
 mkdir -p "$LOCKDIR" "$HOLDERDIR"
 mine="$LOCKDIR/$$-$(date +%s)"
 
+# The caller reads our stdout through a command substitution, which only ends when EVERY
+# process holding the write end of that pipe has exited. The holder below is a child of this
+# script, so without this it inherits the pipe, `$(… | tail -n 1)` never sees EOF, and the pass
+# waits forever on a place it already took. Detaching the holder's standard streams is what
+# makes the script's own exit the end of the pipe.
+hold() { exec >/dev/null 2>&1 </dev/null; while :; do sleep 30; done; }
+
 count_places() { find "$LOCKDIR" -maxdepth 1 -type f | wc -l; }
 
 # A stale place from a killed pass would block the queue forever: reclaim one that is
@@ -47,7 +54,7 @@ while :; do
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
-    while :; do sleep 30; done &          # keeps the place while this caller lives
+    hold &                            # keeps the place while this caller lives
     echo $! > "${HOLDERDIR}/${mine##*/}"
     echo "$!"                                 # stdout: the holder pid for run.sh
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
