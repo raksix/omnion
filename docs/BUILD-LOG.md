@@ -1766,3 +1766,47 @@
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-27 · omnion-wave6 · REQ-125 slice 2 — typed credentials + credential slots
+
+**What.** A credential profile now extends a secret with a `kind`
+(`api_key`, `oauth_token`, `smtp_account`, `payment_key`, `ssh_key`) and structured **non-secret**
+fields; the value stays in `secret_versions.envelope` and never travels through a profile row.
+`credential_slots` binds a slot (`ai.provider`, `smtp`, `payments.stripe`, `storage.s3`,
+`ssh.release`, `identity.ldap`) for a scope to a primary and an optional fallback secret, so a
+consumer resolves through the slot and swapping a credential is a slot update. The resolver
+records who resolved last, which lets the editor name the workload a removal would affect. Two
+screens ship with it: `/secrets/credentials` (kind, validation chip, last validated, next
+validation) and `/secrets/slots` (scope, slot, primary, fallback, state, last resolved).
+
+**Proof.**
+
+```text
+cargo test -p omnion-secrets --quiet                        → 31 passed, 0 failed
+cargo test -p omnion-api --test secret_credentials --quiet   → 1 passed, 0 failed
+pnpm typecheck                                               → 2/2 packages successful
+QA_STACK=w6 … bash scripts/qa/run.sh                        → see below
+```
+
+**Next.** Slice 3 — leases, loopback redemption, the helper subcommand and deployment keys.
+
+### What this tick taught
+
+- **A 500 with the column name in the message is a spec/code disagreement, not a typo.** The
+  credential list selected `c.validate_interval_days` while the shipped migration defines
+  `validation_interval_days`. The failure only appeared once the test pointed at the *private*
+  wave database, because the shared dev database had never applied this wave's `0019`.
+- **A green 403 can be a green test.** The cross-tenant assertion expected `200` for a foreign
+  organization while the route (correctly, per the spec) refuses scope escalation with `403`. The
+  assertion was the defect: when a route and a test disagree, the route is the spec.
+- **Seven parallel writers make migration version numbers collide.** `0019` is now claimed by
+  this wave, `wave2-cms` and `wave3-automation`, and `0021` by `main` and `wave4`. sqlx keys
+  applied migrations on the version number *and* the file checksum, so a shared database applies
+  whichever branch reached it first and every other branch then fails with
+  `Migration(VersionMismatch(19))`. **Every wave needs its own private database** — this wave
+  runs against `omnion_w6_dev`; pointing a test at the shared `omnion` database tests another
+  wave's migration set, not this code.
+- **The disk pressure of the previous tick is a shared, moving target.** `/mnt/apopic` went from
+  100% to 71% mid-tick when a sibling loop ran its own reclamation. This worktree's `target/` is
+  a symlink into `/dev/shm`, so a full volume cannot corrupt *this* build — that one decision
+  (taken earlier) is what kept the gates runnable through the incident.
