@@ -13,7 +13,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-OUT_ROOT="$ROOT/qa-artifacts"
+# The artifacts are throwaway screenshots, and the volume the worktrees live on is shared with
+# every other writer (six of them, all building Rust and Next at once). QA_OUT_ROOT moves them to
+# another filesystem when there is one with room — a RAM-backed tmpfs, in practice — so a pass is
+# bounded by that filesystem instead of by a race nobody in this worktree can win. The report is
+# copied back into the worktree at the end, so the artifact layout is unchanged either way.
+OUT_ROOT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}"
 OUT="$OUT_ROOT/$TS"
 mkdir -p "$OUT"
 
