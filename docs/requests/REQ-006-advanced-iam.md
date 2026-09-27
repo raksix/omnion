@@ -1,6 +1,6 @@
 # REQ-006 — Advanced IAM
 
-> **Status:** in-progress — slices 1–3a shipped (role depth, subjects/scopes/simulator, and the security policy / sessions / devices / TOTP half of slice 3); WebAuthn passkeys and slice 4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`)
+> **Status:** in-progress — slices 1–3b shipped (role depth; subjects/scopes/simulator; the security policy / sessions / devices / TOTP, and WebAuthn passkeys); slice 4 pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`, `crates/permissions`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -174,7 +174,7 @@ Migration `database/migrations/0011_iam_advanced.sql` — append-only and commen
 - [ ] Safety invariants hold: removing the last owner binding, or the caller’s own last privileged binding, is refused with a message naming the invariant.
 - [x] A revoked session is rejected on the next request and `sign-out-all` clears every session (one event each); idle timeout, absolute lifetime and the concurrent cap come from the policy row, never from constants. *(slice 3a: the same walk revokes one session and the next request answers `401`, `sign-out-all` ends both live sessions, the same untouched row is refused at a five-minute idle window and accepted once the policy says two hours (so it is the policy, not a constant), and the concurrent cap of two retires the oldest with `revoke_reason = 'concurrent_cap'`.)*
 - [x] Lockout works per account and per IP with outcomes recorded in `sign_in_attempts`; a denied IP is refused before any password check; step-up is demanded for MFA reset and key issuance; a recovery code works exactly once. *(slice 3a: `apps/api/tests/iam.rs::sessions_devices_mfa_and_the_security_policy_are_proven_end_to_end` — three failures lock the account at the threshold the policy names and the fourth answer is `account_locked`; the correct password is refused while locked; a denied address answers `address_blocked` for the correct password as well, an allowlist refuses an address outside it, and the fourth failure from one address is refused by the address count; TOTP enrols, confirmation issues ten recovery codes, a sign-in answers a challenge instead of a cookie, and a recovery code works exactly once; `reset-mfa` and key issuance both answer `403 step_up_required` until the caller proves identity again.)*
-- [ ] TOTP and a **passkey** both enrol and verify. *(slice 3a ships TOTP; WebAuthn/passkeys — the ceremony, CBOR parsing and signature verification — is the remaining piece of slice 3.)*
+- [x] TOTP and a **passkey** both enrol and verify. *(slice 3a ships TOTP; slice 3b ships WebAuthn: `crates/identity/src/webauthn/` parses the client data, the authenticator data and the CBOR attestation object, extracts the COSE key for **ES256** and **EdDSA**, verifies the signature over `authenticatorData || SHA-256(clientDataJSON)`, refuses a counter that does not move forward, and accepts the documented loopback origin so the QA stack can run a real ceremony. Proof: `cargo test --workspace` — the ceremony unit tests (both families plus every refusal) and `apps/api/tests/webauthn.rs::a_passkey_enrols_and_signs_in_end_to_end`, which registers a credential with a software authenticator, signs in with an assertion, proves the session carries `webauthn` in its auth methods, refuses a replayed counter and a foreign origin, demands a step-up to remove the factor and ends password-only again. Browser proof: the `iam-passkeys` pass of `scripts/qa/walkthrough.cjs` drives the panel with a Chrome virtual authenticator.)*
 - [ ] OIDC and SAML sign-in complete against a test provider with JIT provisioning and the mapped role; a SCIM create → update → deactivate round trip appears in the sync log.
 - [ ] An approved request grants the permission only inside its window and expires on its own; every role, binding, policy, session, device and approval change writes an audit entry; all routes answer 401/403/200 as documented; every screen has empty, loading and error states with zero high findings in the QA pass.
 
@@ -248,10 +248,61 @@ What the visual check should see: a matrix with a sticky category header, tri-st
   recovery code that works exactly once, and step-up demanded for MFA reset and key issuance
   (with the audit trail carrying every one of those actions). The walkthrough drives the same
   screens in the browser (`scripts/qa/walkthrough.cjs`, pass `iam-security-depth`).
-- **Remaining in this slice**: WebAuthn/passkeys (the `webauthn` factor shape is in the table and
-  the API; the ceremony itself — CBOR parsing and signature verification — is the next step), and
-  the `mfa_required` policy flag is stored and surfaced but does not yet force enrolment at
-  sign-in.
+- **Remaining from this slice**: the `mfa_required` policy flag is stored and surfaced but does
+  not yet force enrolment at sign-in. WebAuthn/passkeys shipped as slice 3b, below.
+
+### Slice 3b — WebAuthn passkeys (shipped)
+
+- **The ceremony lives in `crates/identity/src/webauthn/`**, in three pieces: `cbor.rs` is a small
+  CBOR reader (definite lengths only — an indefinite or floating-point item is refused rather
+  than guessed at), `cose.rs` reads a COSE credential public key and verifies **ES256** (P-256
+  ECDSA over the DER signature WebAuthn carries) and **EdDSA** (Ed25519, strict verification, so
+  the small-order keys that let a signature verify under two keys are rejected), and `mod.rs`
+  runs the two ceremonies.
+- **Registration** checks that the client data says `webauthn.create` and names the challenge
+  this server issued, that the origin is one this installation serves, that the authenticator
+  data hashes to the relying party id and reports a present user, that the attested credential
+  extracts to a supported COSE key, and — when a `packed` statement carries a self signature —
+  that the signature verifies over `authenticatorData || SHA-256(clientDataJSON)`. Attestation is
+  requested as `none`, so the provenance of an authenticator is never claimed, only its key.
+- **Assertion** (the sign-in) verifies the same challenge/origin/relying-party rules and the
+  signature over the same message, and refuses a signature counter that does not move forward —
+  the cloned-authenticator check. A counter-less authenticator (`0` and stored `0`) is accepted,
+  which is the honest reading of a device that does not implement one.
+- **The documented loopback exception.** Browsers treat `http://localhost` and `http://127.0.0.1`
+  as secure contexts, and `OriginPolicy` accepts a loopback origin from any port unless
+  `OMNION_WEBAUTHN_ALLOW_LOOPBACK=false`; `OMNION_WEBAUTHN_RP_ID` (default `localhost`) is the
+  host a credential is bound to and `OMNION_WEBAUTHN_ORIGINS` pins the deployment's own origin.
+  The exception is a first-class rule with its own test and the QA pass exercises a real ceremony
+  over it, instead of a test that silently skips.
+- **Migration `0018_webauthn.sql`**: `webauthn_challenges` (single-use, purpose-scoped,
+  short-lived; one live challenge per account and purpose) plus the per-kind factor index. The
+  factor rows themselves needed nothing: `0011` already carried the credential columns, the
+  confirm-shape constraint and the unique live-credential index.
+- **Routes**: `/api/v1/auth/webauthn/register/begin|complete`, `/passkeys` (list),
+  `/passkeys/{id}` (remove, step-up) — enrolment runs behind the caller's own session, because a
+  passkey belongs to the account at the keyboard and an administrator may only remove one
+  (`/iam/users/{id}/reset-mfa`). The sign-in half (`authenticate/begin|complete`) sits beside
+  `auth/mfa/verify`: the password check answers a challenge token, and a verified assertion
+  consumes it and opens the same session a password sign-in opens (its auth methods record
+  `password` and `webauthn`). Every ceremony refusal names the one check that did not hold
+  (`400 webauthn_refused`), a spent or unknown challenge is its own error, and a credential that
+  is already enrolled answers `409 credential_registered`.
+- **Panel**: the user detail's **Second factors** tab gained a passkeys section — the
+  self-service list with enrolment ("Add a passkey" runs `navigator.credentials.create` through
+  `apps/admin/lib/webauthn.ts`), removal behind the step-up prompt, an empty state, and an honest
+  sentence for an account other than the signed-in one. The sign-in screen now has the second
+  step a factor demands: a code field, a recovery code, and **Use a passkey**
+  (`navigator.credentials.get`), with the ceremony's own errors surfaced.
+- **Proof.** `cargo test --workspace` green: the ceremony units (ES256 and EdDSA round trips, a
+  packed self attestation verified and a broken one refused, wrong challenge/origin/relying
+  party/cross-origin/counter refusals, the loopback policy) and
+  `apps/api/tests/webauthn.rs::a_passkey_enrols_and_signs_in_end_to_end` over the real router.
+  The QA walkthrough's `iam-passkeys` pass enrols a passkey on the owner's account with a Chrome
+  **virtual authenticator**, reads the row back, signs in with the passkey after the password
+  step, and removes it again (an account left with a passkey would break every later
+  password-only sign-in the walk performs).
+- **Remaining in this slice**: nothing. `mfa_required` still needs enforcing at sign-in.
 
 ### Slice 2 — Subjects, scopes and the simulator (shipped)
 
