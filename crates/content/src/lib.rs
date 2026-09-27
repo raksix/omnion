@@ -19,8 +19,9 @@ pub mod validation;
 
 pub use blocks::{
     Block, BlockDefinition, BlockIssue, BlockValidationReport, CATEGORIES, MAX_BLOCKS, MAX_DEPTH,
-    PropDef, PropDefault, PropKind, REGISTRY, REGISTRY_VERSION, blocks_to_value, default_props,
-    definition, is_known, parse_blocks, registry_document, validate,
+    PropDef, PropDefault, PropKind, REGISTRY, REGISTRY_VERSION, TreeSanitizeReport,
+    blocks_to_value, default_props, definition, is_known, parse_blocks, registry_document,
+    sanitize_tree, validate,
 };
 pub use comments::{
     COMMENT_COLUMNS, CommentSource, MAX_COMMENT_BODY, NewRevisionComment, RevisionComment,

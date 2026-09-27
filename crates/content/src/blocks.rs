@@ -1169,6 +1169,63 @@ pub fn normalize(block: &mut Block) {
     }
 }
 
+/// Sanitise every `raw_html` block in a tree, in place, and report what changed.
+///
+/// The sanitiser runs **here**, on the way into storage, rather than in the renderer: a payload
+/// the API accepted has already been made safe, so a database read, a cache, a theme override or
+/// a future export path cannot resurrect markup that was only stripped on the way to the screen.
+/// The editor calls the same function through the validate route to show the author what their
+/// paste lost, so the preview and the stored value cannot disagree.
+pub fn sanitize_tree(blocks: &mut [Block]) -> Vec<TreeSanitizeReport> {
+    let mut reports = Vec::new();
+    collect_reports(blocks, "", &mut reports);
+    reports
+}
+
+/// One block's sanitisation outcome, addressed by the id the editor already has selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeSanitizeReport {
+    /// The block whose `raw_html` prop was rewritten.
+    pub block_id: Uuid,
+    /// Where in the tree the block sits (`[2].children[0]`), matching the validator's paths.
+    pub path: String,
+    /// What the sanitiser removed.
+    pub report: crate::sanitize::SanitizeReport,
+}
+
+/// Walk the tree in document order, sanitising each `raw_html` block as it is reached.
+fn collect_reports(blocks: &mut [Block], parent_path: &str, reports: &mut Vec<TreeSanitizeReport>) {
+    for (index, block) in blocks.iter_mut().enumerate() {
+        let path = if parent_path.is_empty() {
+            format!("[{index}]")
+        } else {
+            format!("{parent_path}.children[{index}]")
+        };
+        if block.kind == "raw_html" {
+            if let Some(html) = block
+                .props
+                .get("html")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            {
+                let (clean, report) = crate::sanitize::sanitize_html(&html);
+                if !report.is_clean() {
+                    if let Some(object) = block.props.as_object_mut() {
+                        object.insert("html".to_owned(), Value::String(clean));
+                    }
+                }
+                reports.push(TreeSanitizeReport {
+                    block_id: block.id,
+                    path,
+                    report,
+                });
+                continue;
+            }
+        }
+        collect_reports(&mut block.children, &path, reports);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,6 +1233,78 @@ mod tests {
     /// One block payload with a fresh id.
     fn block(kind: &str, props: Value) -> Value {
         json!({ "id": Uuid::new_v4().to_string(), "type": kind, "props": props })
+    }
+
+    #[test]
+    fn the_tree_sanitiser_rewrites_raw_html_in_place() {
+        let mut parsed = parse_blocks(&json!([
+            block("heading", json!({ "text": "Safe", "level": "h2" })),
+            block(
+                "raw_html",
+                json!({ "html": "<p onclick=\"x()\">ok</p><script>bad()</script>" })
+            ),
+        ]))
+        .expect("the payload parses");
+
+        let reports = sanitize_tree(&mut parsed);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].path, "[1]");
+        assert!(reports[0].report.removed_tags.contains("script"));
+
+        let stored = blocks_to_value(&parsed);
+        let html = stored[1]["props"]["html"]
+            .as_str()
+            .expect("the prop is text");
+        assert!(!html.contains("onclick"), "the handler survived: {html}");
+        assert!(!html.contains("script"), "the script survived: {html}");
+        assert!(html.contains("ok"), "the visible text must survive: {html}");
+    }
+
+    #[test]
+    fn the_tree_sanitiser_reaches_a_nested_block_and_names_its_path() {
+        let mut parsed = parse_blocks(&json!([{
+            "id": Uuid::new_v4().to_string(),
+            "type": "columns",
+            "props": { "columns": "2" },
+            "children": [
+                block("text", json!({ "text": "left" })),
+                block("raw_html", json!({ "html": "<script>x</script>" })),
+            ],
+        }]))
+        .expect("the payload parses");
+
+        let reports = sanitize_tree(&mut parsed);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].path, "[0].children[1]");
+        assert!(
+            !blocks_to_value(&parsed)[0]["children"][1]["props"]["html"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("script")
+        );
+    }
+
+    #[test]
+    fn a_clean_raw_html_block_is_reported_as_unchanged() {
+        let mut parsed = parse_blocks(&json!([block(
+            "raw_html",
+            json!({ "html": "<p>fine</p>" }),
+        )]))
+        .expect("the payload parses");
+        let reports = sanitize_tree(&mut parsed);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].report.is_clean());
+        assert_eq!(reports[0].report.change_count(), 0);
+    }
+
+    #[test]
+    fn a_tree_without_raw_html_produces_no_reports() {
+        let mut parsed = parse_blocks(&json!([
+            block("heading", json!({ "text": "A", "level": "h1" })),
+            block("text", json!({ "text": "B" })),
+        ]))
+        .expect("the payload parses");
+        assert!(sanitize_tree(&mut parsed).is_empty());
     }
 
     #[test]

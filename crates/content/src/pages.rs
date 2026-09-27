@@ -198,6 +198,11 @@ pub async fn update_page(
                     )));
                 }
                 let mut parsed = crate::blocks::parse_blocks(payload)?;
+                // Raw HTML is sanitised on the way *into* storage, not on the way to the screen:
+                // once a value is stored it is already safe, so a theme override, a cache, an
+                // export or a future renderer cannot resurrect markup that was only stripped for
+                // the one page that happened to draw it.
+                let _sanitized = crate::blocks::sanitize_tree(&mut parsed);
                 for block in &mut parsed {
                     let _ = crate::blocks::normalize(block);
                 }
