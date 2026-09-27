@@ -59,10 +59,12 @@ pub struct CredentialView {
     /// The validator's sentence, already redacted.
     pub validation_message: String,
     /// When it was last checked.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub validation_checked_at: Option<time::OffsetDateTime>,
     /// How often it re-runs; 0 means on demand only.
     pub validation_interval_days: i32,
     /// When it is next due.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub next_validation_at: Option<time::OffsetDateTime>,
     /// `local`, `file` or `env`.
     pub provider: String,
@@ -73,6 +75,7 @@ pub struct CredentialView {
     /// The current version of the secret. Metadata, not content.
     pub version: i32,
     /// When the secret was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     /// The slots this credential is assigned to, filled by the list route.
     pub slots: Vec<String>,
@@ -163,6 +166,7 @@ pub struct ValidationResponse {
     /// The sentence the chip carries.
     pub validation_message: String,
     /// When the check ran.
+    #[serde(with = "time::serde::rfc3339")]
     pub checked_at: time::OffsetDateTime,
     /// `true` when the credential is usable.
     pub valid: bool,
@@ -198,6 +202,7 @@ pub struct SlotView {
     /// The last consumer that resolved here — `None` means nobody has yet.
     pub last_resolved_by: Option<String>,
     /// When it was last resolved.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_resolved_at: Option<time::OffsetDateTime>,
     /// What an operator sees when the slot is empty.
     pub empty_reason: String,
