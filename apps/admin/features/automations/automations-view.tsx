@@ -39,6 +39,7 @@ import {
   deleteAutomation,
   fetchAutomation,
   fetchAutomationCatalogue,
+  fetchOrganizations,
   fetchAutomationTests,
   fetchAutomations,
   listenAutomation,
@@ -180,10 +181,15 @@ const EMPTY_DRAFT: Draft = {
 };
 
 /** The automations list with the editor beside it. */
-export function AutomationsView() {
+export function AutomationsView({ openId }: { openId?: string } = {}) {
   const { user } = useSession();
   const [catalogue, setCatalogue] = useState<AutomationCatalogue | null>(null);
   const [automations, setAutomations] = useState<Automation[] | null>(null);
+  // A platform account (no primary organization) has to name one: an organization-scoped rule
+  // belongs to a tenant, and the API refuses a nameless write. The IAM screens pick the first
+  // organization the same way, so an administrator sees the same tenant everywhere.
+  const [organizations, setOrganizations] = useState<string[] | null>(null);
+  const [selectedOrg, setSelectedOrg] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -207,7 +213,12 @@ export function AutomationsView() {
   const [busy, setBusy] = useState<string | null>(null);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
-  const organizationId = user?.organization_id ?? null;
+  const platformAccount = user ? user.organization_id === null : false;
+  const organizationId = platformAccount ? selectedOrg : (user?.organization_id ?? null);
+  // A platform account that has not chosen a tenant yet has nothing to show, and saying so is
+  // better than showing an empty table that looks like "this tenant has no rules".
+  const needsOrg = platformAccount && organizationId === null;
+  const [loadingOrganizations, setLoadingOrganizations] = useState(false);
 
   useEffect(() => {
     fetchAutomationCatalogue()
@@ -217,6 +228,24 @@ export function AutomationsView() {
 
   useEffect(() => {
     if (!user) {
+      return;
+    }
+    if (user.organization_id === null && organizations === null) {
+      setLoadingOrganizations(true);
+      fetchOrganizations()
+        .then((list) => {
+          setOrganizations(list.map((organization) => organization.id));
+          setSelectedOrg(list[0]?.id ?? null);
+        })
+        .catch(() => setOrganizations([]))
+        .finally(() => setLoadingOrganizations(false));
+      return;
+    }
+    // A platform account with no organization cannot read any rule: the endpoint needs one to
+    // scope the list to, and answering "all tenants' rules" to a platform account would leak
+    // every tenant's automations into one list.
+    if (needsOrg) {
+      setAutomations([]);
       return;
     }
     let cancelled = false;
@@ -239,7 +268,7 @@ export function AutomationsView() {
     return () => {
       cancelled = true;
     };
-  }, [user, organizationId, reloadToken]);
+  }, [user, organizationId, organizations, needsOrg, loadingOrganizations, reloadToken]);
 
   // The list's own filters: an event, a state, and a name search.
   const filtered = useMemo(() => {
@@ -298,6 +327,20 @@ export function AutomationsView() {
     }
   }, []);
 
+  // `/automations/[id]` opens that rule's editor as soon as the list has arrived. The id is
+  // remembered so a later reload (a filter change, a save) does not fight the route.
+  const appliedOpen = useRef<string | null>(null);
+  useEffect(() => {
+    if (!openId || !automations || appliedOpen.current === openId) {
+      return;
+    }
+    const target = automations.find((automation) => automation.id === openId);
+    if (target) {
+      appliedOpen.current = openId;
+      void openEdit(target);
+    }
+  }, [openId, automations, openEdit]);
+
   const closeEditor = useCallback(() => {
     setDraft(null);
     setSaveError(null);
@@ -308,6 +351,12 @@ export function AutomationsView() {
   /** Write the open rule, then close the editor on success. */
   const save = useCallback(async () => {
     if (!draft) {
+      return;
+    }
+    // A rule belongs to a tenant; a platform account that has not chosen one has nothing to
+    // write, and saying so beats sending a request the API can only refuse.
+    if (organizationId === null) {
+      setSaveError("Choose an organization before saving a rule.");
       return;
     }
     setSaving(true);
@@ -543,6 +592,26 @@ export function AutomationsView() {
                 </option>
               ))}
             </select>
+            {platformAccount && organizations && organizations.length > 1 ? (
+              <>
+                <label className="sr-only" htmlFor="automation-organization">
+                  Organization
+                </label>
+                <select
+                  id="automation-organization"
+                  data-automation-organization
+                  value={organizationId ?? ""}
+                  onChange={(event) => setSelectedOrg(event.target.value || null)}
+                  className="rounded-md border border-line bg-paper px-2.5 py-1.5 text-[12.5px]"
+                >
+                  {organizations.map((id) => (
+                    <option key={id} value={id}>
+                      {id}
+                    </option>
+                  ))}
+                </select>
+              </>
+            ) : null}
             <label className="sr-only" htmlFor="automation-state-filter">
               Filter by state
             </label>
@@ -561,14 +630,22 @@ export function AutomationsView() {
 
           {filtered.length === 0 ? (
             <EmptyState
-              title={automations.length === 0 ? "No automations yet" : "No rule matches these filters"}
+              title={
+                needsOrg
+                  ? "Choose an organization"
+                  : automations.length === 0
+                    ? "No automations yet"
+                    : "No rule matches these filters"
+              }
               hint={
-                automations.length === 0
-                  ? "A rule listens for an event, checks its conditions and runs its actions. Start with one on the event you care about."
-                  : "Clear the search or the filters to see the rules again."
+                needsOrg
+                  ? "A platform account reads one organization's rules at a time — the rules of every tenant would not belong in one list."
+                  : automations.length === 0
+                    ? "A rule listens for an event, checks its conditions and runs its actions. Start with one on the event you care about."
+                    : "Clear the search or the filters to see the rules again."
               }
               action={
-                automations.length === 0 ? (
+                automations.length === 0 && !needsOrg ? (
                   <button
                     type="button"
                     data-automation-empty-new
@@ -831,8 +908,17 @@ function AutomationEditor({
     if (maxDepth < 2) {
       return;
     }
-    const group: AutomationGroup = { mode: "any", any: [] };
+    // The new group is born **holding one row**. An empty group can never be saved (an empty
+    // `any` never holds, and the layer refuses it), so a button that added a group the author
+    // then had to find a way to fill — through a control that only appeared *inside* the new
+    // group — was a control that produced an unsavable rule.
+    const first = eventFields[0]?.key ?? "status";
+    const group: AutomationGroup = {
+      mode: "any",
+      any: [{ field: first, operator: "equals", value: "" }],
+    };
     updateRootNode(members(draft.conditions).length, group);
+    setOpenGroup("root");
   };
 
   return (
@@ -1336,6 +1422,22 @@ function ConditionGroupEditor({
             ? "No conditions — the rule fires on every one of its events."
             : "An empty group can never hold; add a condition or remove it."}
         </p>
+      ) : null}
+
+      {depth < maxDepth - 1 || depth === 1 ? (
+        <button
+          type="button"
+          data-automation-group-add-condition={depth}
+          onClick={() => {
+            const first = fields[0]?.key ?? "status";
+            const added: AutomationCondition = { field: first, operator: "equals", value: "" };
+            const next = [...rows, added];
+            onChange({ mode: group.mode ?? "all", all: next, any: next });
+          }}
+          className="w-fit rounded-md border border-line px-2 py-1 text-[11.5px] hover:bg-quiet-soft"
+        >
+          <Plus className="h-3 w-3" aria-hidden="true" /> Add condition here
+        </button>
       ) : null}
 
       <ul className="flex flex-col gap-1.5">

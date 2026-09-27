@@ -44,16 +44,19 @@ alter table workflows add constraint workflows_hook_shape check (
 -- workflows.conditions: a group tree, or the v0 flat array
 -- ---------------------------------------------------------------------------------------------
 
--- v0 asserted `jsonb_typeof(conditions) = 'array'`. A group tree is an object with
--- exactly one of `all` / `any`; both are accepted from here on and the matcher treats
--- an array as `{"all": […]}`, which is what every row before this migration means.
+-- v0 asserted `jsonb_typeof(conditions) = 'array'`. A group tree is an object with exactly
+-- one of `all` / `any`, and that one value is the array of members — so the object is checked
+-- through the *type* of `conditions -> 'all'` or `conditions -> 'any'`, never through
+-- `jsonb_array_length(conditions)` (which only accepts an array and errors on an object).
 alter table workflows drop constraint workflows_conditions_is_array;
 alter table workflows add constraint workflows_conditions_is_group check (
     jsonb_typeof(conditions) = 'array'
     or (
         jsonb_typeof(conditions) = 'object'
-        and jsonb_array_length(conditions) = 1
-        and (conditions ? 'all' or conditions ? 'any')
+        and (
+            (jsonb_typeof(conditions -> 'all') = 'array' and not (conditions ? 'any'))
+            or (jsonb_typeof(conditions -> 'any') = 'array' and not (conditions ? 'all'))
+        )
     )
 );
 

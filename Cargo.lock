@@ -1302,12 +1302,15 @@ dependencies = [
 name = "omnion-automation"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "omnion-audit",
  "omnion-content",
  "omnion-events",
  "omnion-workflows",
+ "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "time",

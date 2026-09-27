@@ -2486,6 +2486,28 @@ async function main() {
   // `--only=wizard` re-checks the first-run flow on its own (reset the database first): it drives
   // the steps, then reports what the onboarding endpoints answered. A full pass is minutes; this is
   // the tool for "did the setup step just get refused?".
+  //
+  // `--only=<depth pass>` runs ONE depth pass against an already-running stack and stops. A full
+  // pass on a box that also hosts two other writers' stacks is twenty minutes of browser, and a
+  // pass that dies half way through has proved nothing about the pass it never reached; this runs
+  // the pass a developer is actually working on. Reset the database first if the pass expects the
+  // first-run wizard to have run.
+  const only = (process.argv.find((arg) => arg.startsWith("--only=")) || "").split("=")[1];
+  if (only && DEPTH_PASSES[only]) {
+    await ensureSignedIn(page, report);
+    await DEPTH_PASSES[only](page, report);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ only, ...report, netFailures, onboardingFailures: netFailures.filter((f) => String(f.url || "").includes("/onboarding/")) }, null, 2),
+    );
+    console.log(`ONLY_PASS=${only} NET_FAILURES=${netFailures.length}`);
+    for (const line of report.steps.filter((step) => String(step.page || "").includes(only.replace(/Depth$/, "")))) {
+      console.log(`  ${JSON.stringify(line)}`);
+    }
+    await browser.close();
+    process.exit(netFailures.length === 0 ? 0 : 1);
+  }
+
   if (process.argv.includes("--only=wizard")) {
     const onboardingFailures = netFailures.filter((f) => String(f.url || "").includes("/onboarding/"));
     const finished = await page
@@ -3708,11 +3730,20 @@ async function runAutomationsDepth(page, report) {
     });
   await page.waitForTimeout(400);
 
-  // A nested condition: an `all` inside the root, which is the shape the request names.
+  // A nested condition: a group inside the root, which is the shape the request names. The
+  // group is **filled** rather than left empty — an empty nested group is refused at save time
+  // (an empty `any` can never hold), so a pass that only added one would be asserting the very
+  // refusal this slice introduced.
   await page.locator("[data-automation-add-condition]").first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(300);
   await page.locator("[data-automation-add-group]").first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(400);
+  // The nested group's own "add condition" is the one inside the deeper group box.
+  const nestedAdd = page.locator("[data-automation-group='2'] [data-automation-group-add-condition]").first();
+  if ((await nestedAdd.count()) > 0) {
+    await nestedAdd.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
   const fieldOptions = await page.locator("[data-automation-field] option").count();
   note({
     step: "conditions",
@@ -3812,7 +3843,23 @@ async function runAutomationsDepth(page, report) {
   });
   await shot(page, "page-automations-hook");
 
-  // The list's own filters, read on the rule the pass created.
+  // The pass owns every rule named "QA welcome rule" — a run that died half way through
+  // leaves one behind, and the next run's "the list is empty" step would then be reading a
+  // rule it did not create. Sweeping first is what makes the empty state meaningful.
+  const staleRows = await page.locator('[data-automation-row] a', { hasText: "QA welcome rule" }).count();
+  for (let index = 0; index < staleRows; index += 1) {
+    const stale = page.locator('[data-automation-row] a', { hasText: "QA welcome rule" }).first();
+    await stale.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-automation-delete-input]").first().fill("QA welcome rule").catch(() => {});
+    await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+  note({ step: "sweep", removedStale: staleRows });
+
+  // The list's own filters, read on the rule the pass creates.
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(900);
   const allRows = await page.locator("[data-automation-row]").count();
@@ -3850,3 +3897,23 @@ async function runAutomationsDepth(page, report) {
   report.automations = { steps };
   log(`automations: ${JSON.stringify(steps)}`);
 }
+
+/**
+ * The depth passes that `--only=<name>` can run on their own.
+ *
+ * The key is the pass's own name minus the `Depth` suffix (`automations` for
+ * `runAutomationsDepth`), so the flag reads like the thing it drives. A pass that is not listed
+ * here simply cannot be run alone, which is the honest default: a partial pass that silently ran
+ * nothing would report "0 failures" and mean nothing by it.
+ */
+const DEPTH_PASSES = {
+  automations: (page, report) => runAutomationsDepth(page, report),
+  analytics: (page, report) => runAnalyticsDepth(page, report),
+  search: (page, report) => runSearchDepth(page, report),
+  iamroles: (page, report) => runIamRolesDepth(page, report),
+  iampolicies: (page, report) => runIamPoliciesDepth(page, report),
+  iamsecurity: (page, report) => runIamSecurityDepth(page, report),
+  iamapprovals: (page, report) => runIamApprovalsDepth(page, report),
+  iamprovisioning: (page, report) => runIamProvisioningDepth(page, report),
+  passkeys: (page, report) => runPasskeysDepth(page, report),
+};
