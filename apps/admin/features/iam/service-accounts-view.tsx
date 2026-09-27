@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Bot, Copy, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, X } from "lucide-react";
 
 import { useSession } from "@/lib/session";
+import { StepUpPrompt } from "@/features/iam/step-up-prompt";
 import {
   ApiError,
   createIamBinding,
@@ -46,6 +47,8 @@ export function ServiceAccountsView() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [issuedToken, setIssuedToken] = useState<{ name: string; token: string } | null>(null);
+  // A refused dangerous action, parked until a step-up lets it run again.
+  const [stepUpAction, setStepUpAction] = useState<string | null>(null);
   // The open identity.
   const [openId, setOpenId] = useState<string | null>(null);
   const [detail, setDetail] = useState<IamServiceAccountDetail | null>(null);
@@ -145,6 +148,13 @@ export function ServiceAccountsView() {
     }
   };
 
+  /**
+   * Issue a key.
+   *
+   * Issuing a credential is a dangerous operation (REQ-006, slice 3): the API demands a fresh
+   * step-up, so a refusal parks the action and the prompt below proves identity before it runs
+   * again.
+   */
   const issueKey = async () => {
     if (!openId || !detail) return;
     setBusy(true);
@@ -155,6 +165,10 @@ export function ServiceAccountsView() {
       setKeyLabel("");
       await openAccount(openId);
     } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "step_up_required") {
+        setStepUpAction("Issue a machine key");
+        return;
+      }
       setError(
         cause instanceof ApiError ? `${cause.message} (${cause.code})` : "The key was not issued.",
       );
@@ -667,6 +681,16 @@ export function ServiceAccountsView() {
           </aside>
         ) : null}
       </div>
+
+      <StepUpPrompt
+        open={stepUpAction !== null}
+        action={stepUpAction ?? ""}
+        onClose={() => setStepUpAction(null)}
+        onDone={() => {
+          setStepUpAction(null);
+          void issueKey();
+        }}
+      />
     </div>
   );
 }

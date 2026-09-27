@@ -10,28 +10,36 @@
  */
 import { useCallback, useEffect, useState } from "react";
 
-import { KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, UserCog } from "lucide-react";
+import { Fingerprint, KeyRound, Plus, RefreshCw, ShieldCheck, ShieldOff, Trash2, UserCog } from "lucide-react";
 import Link from "next/link";
 
 import { useSession } from "@/lib/session";
 import {
   ApiError,
+  confirmIamTotp,
   createIamBinding,
+  enrollIamTotp,
   fetchEffectivePermissions,
   fetchIamBindings,
+  fetchIamFactors,
   fetchIamUser,
   fetchRoles,
   fetchSites,
+  resetIamMfa,
   revokeIamBinding,
+  revokeIamFactor,
   updateIamUser,
   type IamBinding,
   type IamEffectivePermissions,
+  type IamFactor,
+  type IamFactorList,
   type IamRole,
   type IamUserDetail,
 } from "@/lib/api";
+import { StepUpPrompt } from "@/features/iam/step-up-prompt";
 import type { Site } from "@/lib/types";
 
-type Tab = "profile" | "bindings" | "effective";
+type Tab = "profile" | "bindings" | "effective" | "factors";
 
 /** How a scope reads. */
 function scopeLabel(binding: IamBinding): string {
@@ -79,6 +87,22 @@ export function UserDetailView({ userId }: { userId: string }) {
   const [scopeModule, setScopeModule] = useState("");
   const [scopeResource, setScopeResource] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
+  // Second factors (REQ-006, slice 3).
+  const [factors, setFactors] = useState<IamFactorList | null>(null);
+  const [factorLabel, setFactorLabel] = useState("Authenticator app");
+  const [enrolment, setEnrolment] = useState<{
+    factor: IamFactor;
+    secret: string;
+    otpauth_uri: string;
+  } | null>(null);
+  const [confirmCode, setConfirmCode] = useState("");
+  const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
+  const [factorBusy, setFactorBusy] = useState(false);
+  // A refused dangerous action, parked until a step-up lets it run again.
+  const [pendingAction, setPendingAction] = useState<{
+    label: string;
+    run: () => Promise<void>;
+  } | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -115,6 +139,112 @@ export function UserDetailView({ userId }: { userId: string }) {
       void fetchSites(detail.user.organization_id).then(setSites).catch(() => setSites([]));
     }
   }, [detail]);
+
+  /** Read the account's factors (when the tab opens, and after every change). */
+  const loadFactors = useCallback(async () => {
+    try {
+      setFactors(await fetchIamFactors(userId));
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError
+          ? { code: cause.code, message: cause.message }
+          : { code: "unknown_error", message: "The second factors could not be read." },
+      );
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    if (tab !== "factors") return;
+    void loadFactors();
+  }, [tab, loadFactors]);
+
+  /**
+   * Run a dangerous action; when the API answers `step_up_required`, park it and ask for a fresh
+   * proof — the same action runs again once the session carries one.
+   */
+  const withStepUp = async (label: string, run: () => Promise<void>) => {
+    try {
+      await run();
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "step_up_required") {
+        setPendingAction({ label, run });
+        return;
+      }
+      setError(
+        cause instanceof ApiError
+          ? { code: cause.code, message: cause.message }
+          : { code: "unknown_error", message: "The action failed." },
+      );
+    }
+  };
+
+  const startEnrolment = async () => {
+    setFactorBusy(true);
+    setError(null);
+    setNotice(null);
+    setRecoveryCodes(null);
+    try {
+      setEnrolment(await enrollIamTotp(userId, factorLabel));
+      setConfirmCode("");
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError
+          ? { code: cause.code, message: cause.message }
+          : { code: "unknown_error", message: "The enrolment could not be started." },
+      );
+    } finally {
+      setFactorBusy(false);
+    }
+  };
+
+  const confirmEnrolment = async () => {
+    if (!enrolment) return;
+    setFactorBusy(true);
+    setError(null);
+    try {
+      const body = await confirmIamTotp(userId, enrolment.factor.id, confirmCode);
+      setRecoveryCodes(body.recovery_codes);
+      setEnrolment(null);
+      setConfirmCode("");
+      setNotice("The factor is confirmed. Store the recovery codes — they are shown once.");
+      await loadFactors();
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError
+          ? { code: cause.code, message: cause.message }
+          : { code: "unknown_error", message: "The code could not be confirmed." },
+      );
+    } finally {
+      setFactorBusy(false);
+    }
+  };
+
+  const removeFactor = async (factor: IamFactor) => {
+    setFactorBusy(true);
+    setError(null);
+    setNotice(null);
+    await withStepUp(`Remove the ${factor.kind} factor`, async () => {
+      await revokeIamFactor(userId, factor.id);
+      setNotice(`The ${factor.kind} factor was removed.`);
+      await loadFactors();
+    });
+    setFactorBusy(false);
+  };
+
+  const resetFactors = async () => {
+    setFactorBusy(true);
+    setError(null);
+    setNotice(null);
+    await withStepUp("Reset every second factor of this account", async () => {
+      const body = await resetIamMfa(userId);
+      setNotice(
+        `Every factor was cleared (${body.factors_revoked} removed); the account signs in with its password again.`,
+      );
+      setRecoveryCodes(null);
+      await loadFactors();
+    });
+    setFactorBusy(false);
+  };
 
   const saveProfile = async () => {
     setBusy(true);
@@ -249,6 +379,7 @@ export function UserDetailView({ userId }: { userId: string }) {
               ["profile", "Profile"],
               ["bindings", `Roles & bindings (${bindings.filter((entry) => entry.active).length})`],
               ["effective", `Effective permissions (${effective?.granted_count ?? 0})`],
+              ["factors", `Second factors (${factors?.confirmed ?? 0})`],
             ] as [Tab, string][]
           ).map(([id, label]) => (
             <button
@@ -595,6 +726,233 @@ export function UserDetailView({ userId }: { userId: string }) {
           )}
         </section>
       ) : null}
+
+      {tab === "factors" ? (
+        <section className="flex flex-col gap-3" aria-label="Second factors">
+          <div className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-line bg-surface p-4">
+            <div className="max-w-xl">
+              <h2 className="text-[13px] font-medium text-ink">Second factors</h2>
+              <p className="text-[12px] text-muted">
+                An authenticator app (TOTP) and single-use recovery codes. A confirmed factor is
+                demanded at sign-in; removing one or resetting the account needs a fresh proof of
+                your own identity.
+              </p>
+              <p className="mt-1 text-[12px] text-muted" data-factors-recovery-remaining>
+                {factors?.recovery_codes_remaining ?? 0} recovery codes left
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={factorBusy || Boolean(enrolment)}
+                data-factor-enrol-start
+                onClick={() => void startEnrolment()}
+                className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-accent-soft disabled:text-accent-strong"
+              >
+                <Fingerprint className="size-3.5" aria-hidden />
+                Enrol an authenticator
+              </button>
+              <button
+                type="button"
+                disabled={factorBusy || (factors?.factors.length ?? 0) === 0}
+                data-factors-reset
+                data-qa-guard="mfa-reset"
+                onClick={() => void resetFactors()}
+                className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-caution transition hover:bg-panel disabled:opacity-50"
+              >
+                <ShieldOff className="size-3.5" aria-hidden />
+                Reset all
+              </button>
+            </div>
+          </div>
+
+          <label className="flex w-fit flex-col gap-1.5">
+            <span className="text-[12.5px] font-medium text-ink">Label for a new factor</span>
+            <input
+              value={factorLabel}
+              data-factor-label
+              onChange={(event) => setFactorLabel(event.target.value)}
+              className="h-9 w-64 rounded-lg border border-line bg-surface px-2 text-[13px] text-ink outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+            />
+          </label>
+
+          {enrolment ? (
+            <div
+              data-factor-enrolment
+              className="flex flex-col gap-2 rounded-xl border border-accent/40 bg-accent-soft/40 p-4"
+            >
+              <h3 className="text-[12.5px] font-medium text-ink">
+                Add this secret to the authenticator app
+              </h3>
+              <p className="text-[12px] text-muted">
+                Scan the link or type the secret; it is shown exactly once.
+              </p>
+              <code
+                data-factor-secret
+                className="w-fit rounded-lg border border-line bg-surface px-2 py-1 font-mono text-[12.5px] text-ink"
+              >
+                {enrolment.secret}
+              </code>
+              <code
+                data-factor-uri
+                className="break-all rounded-lg border border-line bg-surface px-2 py-1 font-mono text-[11.5px] text-muted"
+              >
+                {enrolment.otpauth_uri}
+              </code>
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[12.5px] font-medium text-ink">Code from the app</span>
+                  <input
+                    value={confirmCode}
+                    data-factor-confirm-code
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    placeholder="123456"
+                    onChange={(event) => setConfirmCode(event.target.value)}
+                    className="h-9 w-32 rounded-lg border border-line bg-surface px-2 font-mono text-[13px] text-ink outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={factorBusy || confirmCode.trim().length === 0}
+                  data-factor-confirm
+                  data-qa-guard="factor-confirm"
+                  onClick={() => void confirmEnrolment()}
+                  className="flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-accent-soft disabled:text-accent-strong"
+                >
+                  <KeyRound className="size-3.5" aria-hidden />
+                  Confirm
+                </button>
+                <button
+                  type="button"
+                  disabled={factorBusy}
+                  data-factor-enrol-cancel
+                  onClick={() => {
+                    setEnrolment(null);
+                    setConfirmCode("");
+                  }}
+                  className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-ink transition hover:bg-panel"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {recoveryCodes ? (
+            <div
+              data-factor-recovery-codes
+              className="flex flex-col gap-2 rounded-xl border border-line bg-quiet-soft p-4"
+            >
+              <h3 className="text-[12.5px] font-medium text-ink">
+                Recovery codes — copy them now, they are shown once
+              </h3>
+              <ul className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
+                {recoveryCodes.map((code) => (
+                  <li
+                    key={code}
+                    className="rounded-lg border border-line bg-surface px-2 py-1 font-mono text-[12.5px] text-ink"
+                  >
+                    {code}
+                  </li>
+                ))}
+              </ul>
+              <button
+                type="button"
+                data-factor-recovery-done
+                onClick={() => setRecoveryCodes(null)}
+                className="w-fit rounded-lg border border-line px-3 py-1 text-[12px] text-ink transition hover:bg-panel"
+              >
+                I have stored them
+              </button>
+            </div>
+          ) : null}
+
+          {factors && factors.factors.length === 0 ? (
+            <div
+              data-factors-empty
+              className="rounded-xl border border-dashed border-line bg-surface p-6 text-center text-[12.5px] text-muted"
+            >
+              No second factor yet. Enrolling one asks for a code at every sign-in — and no longer
+              from the password alone.
+            </div>
+          ) : null}
+
+          {factors && factors.factors.length > 0 ? (
+            <div className="overflow-x-auto rounded-xl border border-line bg-surface">
+              <table className="w-full min-w-[640px] text-left text-[12.5px]">
+                <thead className="border-b border-line text-[11.5px] uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="px-3 py-2">Kind</th>
+                    <th className="px-3 py-2">Label</th>
+                    <th className="px-3 py-2">State</th>
+                    <th className="px-3 py-2">Last used</th>
+                    <th className="px-3 py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {factors.factors.map((factor) => (
+                    <tr
+                      key={factor.id}
+                      data-factor-row={factor.kind}
+                      className="border-b border-line/60 last:border-0"
+                    >
+                      <td className="px-3 py-2 font-mono text-[12px] text-ink">{factor.kind}</td>
+                      <td className="px-3 py-2 text-ink">{factor.label}</td>
+                      <td className="px-3 py-2">
+                        {factor.confirmed ? (
+                          <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-700">
+                            confirmed
+                          </span>
+                        ) : (
+                          <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-700">
+                            waiting for a code
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-muted">
+                        {factor.last_used_at
+                          ? new Date(factor.last_used_at).toLocaleString()
+                          : "never"}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          type="button"
+                          disabled={factorBusy}
+                          data-factor-remove
+                          data-qa-guard="factor-remove"
+                          onClick={() => void removeFactor(factor)}
+                          className="rounded-lg border border-line px-2 py-1 text-[11.5px] text-caution transition hover:bg-panel"
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+
+      <StepUpPrompt
+        open={pendingAction !== null}
+        action={pendingAction?.label ?? ""}
+        onClose={() => setPendingAction(null)}
+        onDone={() => {
+          const pending = pendingAction;
+          setPendingAction(null);
+          if (pending) {
+            void pending.run().catch(() => {
+              setError({
+                code: "step_up_retry_failed",
+                message: "The action could not be completed.",
+              });
+            });
+          }
+        }}
+      />
     </div>
   );
 }

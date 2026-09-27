@@ -20,12 +20,25 @@ export class ApiError extends Error {
   readonly status: number;
   /** Stable machine-readable code from the API error body. */
   readonly code: string;
+  /**
+   * Structured detail the API attached to the refusal.
+   *
+   * A security-policy refusal names the `field` it refused, a step-up refusal names the
+   * `action`; without this the panel could only print the sentence.
+   */
+  readonly details: Record<string, unknown> | null;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    details: Record<string, unknown> | null = null,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 
   /** `true` when the session is missing or expired. */
@@ -38,6 +51,7 @@ type ErrorBody = {
   error?: {
     code?: string;
     message?: string;
+    details?: Record<string, unknown>;
   };
 };
 
@@ -79,6 +93,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       response.status,
       body.error?.code ?? "unknown_error",
       body.error?.message ?? `The API answered with status ${response.status}.`,
+      body.error?.details ?? null,
     );
   }
 
@@ -2422,4 +2437,255 @@ export type IamOverview = {
 export function fetchIamOverview(organizationId?: string | null): Promise<IamOverview> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
   return request<IamOverview>(`/api/v1/iam/overview${query}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security policy, sessions, devices and second factors (REQ-006, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** The organization's security policy (`GET /api/v1/iam/security-policies`). */
+export type IamSecurityPolicy = {
+  organization_id: string;
+  password_min_length: number;
+  password_require_classes: number;
+  password_history: number;
+  password_expiry_days: number;
+  lockout_attempts: number;
+  lockout_minutes: number;
+  ip_allowlist: string[];
+  ip_denylist: string[];
+  session_idle_minutes: number;
+  session_absolute_days: number;
+  session_concurrent_max: number;
+  device_trust_days: number;
+  mfa_required: boolean;
+  updated_by: string | null;
+  updated_at: string;
+};
+
+/** One field of the before/after diff a policy save answers with. */
+export type IamPolicyChange = { field: string; before: string; after: string };
+
+/** What a policy save answers. */
+export type IamPolicySave = {
+  before: IamSecurityPolicy;
+  after: IamSecurityPolicy;
+  changes: IamPolicyChange[];
+};
+
+/** Read the security policy (creating the defaults when the organization has none yet). */
+export function fetchSecurityPolicy(organizationId?: string | null): Promise<IamSecurityPolicy> {
+  const params = new URLSearchParams();
+  if (organizationId) params.set("organization_id", organizationId);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request<IamSecurityPolicy>(`/api/v1/iam/security-policies${suffix}`);
+}
+
+/** Save a partial policy and read back the diff it applied. */
+export function updateSecurityPolicy(
+  patch: Partial<Omit<IamSecurityPolicy, "organization_id" | "updated_by" | "updated_at">>,
+  organizationId?: string | null,
+): Promise<IamPolicySave> {
+  const params = new URLSearchParams();
+  if (organizationId) params.set("organization_id", organizationId);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request<IamPolicySave>(`/api/v1/iam/security-policies${suffix}`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+}
+
+/** One row of the session list. */
+export type IamSession = {
+  id: string;
+  user_id: string;
+  user_email: string;
+  user_display_name: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  device_label: string | null;
+  auth_methods: string[];
+  created_at: string;
+  last_seen_at: string | null;
+  expires_at: string;
+  absolute_expires_at: string | null;
+  revoked_at: string | null;
+  revoke_reason: string | null;
+  step_up_at: string | null;
+  state: string;
+  current: boolean;
+  revocable: boolean;
+};
+
+/** List sessions with the state each row is in. */
+export function fetchIamSessions(query: {
+  userId?: string;
+  organizationId?: string | null;
+  search?: string;
+  state?: string;
+  includeInactive?: boolean;
+}): Promise<{ sessions: IamSession[]; total: number; idle_minutes: number }> {
+  const params = new URLSearchParams();
+  if (query.userId) params.set("user_id", query.userId);
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  if (query.search) params.set("search", query.search);
+  if (query.state) params.set("state", query.state);
+  if (query.includeInactive) params.set("include_inactive", "true");
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request(`/api/v1/iam/sessions${suffix}`);
+}
+
+/** Revoke one session. */
+export function revokeIamSession(sessionId: string): Promise<IamSession> {
+  return request<IamSession>(`/api/v1/iam/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Sign every live session of an account out. */
+export function signOutAllSessions(
+  userId: string,
+): Promise<{ user_id: string; revoked: number; session_ids: string[] }> {
+  return request(`/api/v1/iam/users/${encodeURIComponent(userId)}/sign-out-all`, {
+    method: "POST",
+  });
+}
+
+/** One row of the device list. */
+export type IamDevice = {
+  id: string;
+  user_id: string;
+  user_email: string;
+  user_display_name: string;
+  label: string;
+  platform: string;
+  browser: string;
+  fingerprint_hint: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  trusted_until: string | null;
+  revoked: boolean;
+  session_count: number;
+  trusted: boolean;
+};
+
+/** List known devices. */
+export function fetchIamDevices(query: {
+  userId?: string;
+  organizationId?: string | null;
+  search?: string;
+  includeRevoked?: boolean;
+}): Promise<{ devices: IamDevice[]; total: number; device_trust_days: number }> {
+  const params = new URLSearchParams();
+  if (query.userId) params.set("user_id", query.userId);
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  if (query.search) params.set("search", query.search);
+  if (query.includeRevoked) params.set("include_revoked", "true");
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request(`/api/v1/iam/devices${suffix}`);
+}
+
+/** Set (or clear) a device's trust window. */
+export function trustIamDevice(
+  deviceId: string,
+  input: { days?: number; trustedUntil?: string },
+): Promise<IamDevice> {
+  return request<IamDevice>(`/api/v1/iam/devices/${encodeURIComponent(deviceId)}/trust`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(input.days !== undefined ? { days: input.days } : {}),
+      ...(input.trustedUntil !== undefined ? { trusted_until: input.trustedUntil } : {}),
+    }),
+  });
+}
+
+/** Forget a device: it stops being trusted and its live sessions end. */
+export function forgetIamDevice(deviceId: string): Promise<IamDevice> {
+  return request<IamDevice>(`/api/v1/iam/devices/${encodeURIComponent(deviceId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** One enrolled second factor. */
+export type IamFactor = {
+  id: string;
+  kind: string;
+  label: string;
+  confirmed: boolean;
+  confirmed_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+};
+
+/** What the factor list answers. */
+export type IamFactorList = {
+  user_id: string;
+  factors: IamFactor[];
+  recovery_codes_remaining: number;
+  confirmed: number;
+};
+
+/** List an account's factors and its remaining recovery codes. */
+export function fetchIamFactors(userId: string): Promise<IamFactorList> {
+  return request<IamFactorList>(`/api/v1/iam/users/${encodeURIComponent(userId)}/mfa`);
+}
+
+/** Start TOTP enrolment; the secret comes back exactly once. */
+export function enrollIamTotp(
+  userId: string,
+  label?: string,
+): Promise<{ factor: IamFactor; secret: string; otpauth_uri: string }> {
+  return request(`/api/v1/iam/users/${encodeURIComponent(userId)}/mfa`, {
+    method: "POST",
+    body: JSON.stringify({ label: label ?? "" }),
+  });
+}
+
+/** Confirm a pending factor with a code; the recovery codes are shown once. */
+export function confirmIamTotp(
+  userId: string,
+  factorId: string,
+  code: string,
+): Promise<{ factor_id: string; confirmed: boolean; recovery_codes: string[] }> {
+  return request(
+    `/api/v1/iam/users/${encodeURIComponent(userId)}/mfa/${encodeURIComponent(factorId)}/confirm`,
+    { method: "POST", body: JSON.stringify({ code }) },
+  );
+}
+
+/** Remove one factor (needs a fresh step-up for a confirmed one). */
+export function revokeIamFactor(
+  userId: string,
+  factorId: string,
+): Promise<{ factor_id: string; revoked: boolean }> {
+  return request(
+    `/api/v1/iam/users/${encodeURIComponent(userId)}/mfa/${encodeURIComponent(factorId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Clear every factor of an account (needs a fresh step-up). */
+export function resetIamMfa(userId: string): Promise<{ user_id: string; factors_revoked: number }> {
+  return request(`/api/v1/iam/users/${encodeURIComponent(userId)}/reset-mfa`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Prove identity again for a dangerous operation.
+ *
+ * `password` is the caller's own; an enrolled `code` works instead. The fresh mark lasts
+ * `window_minutes`, which every dangerous route reads.
+ */
+export function stepUpSession(input: {
+  password?: string;
+  code?: string;
+}): Promise<{ session_id: string; step_up: boolean; window_minutes: number }> {
+  return request("/api/v1/auth/step-up", {
+    method: "POST",
+    body: JSON.stringify({
+      ...(input.password !== undefined ? { password: input.password } : {}),
+      ...(input.code !== undefined ? { code: input.code } : {}),
+    }),
+  });
 }
