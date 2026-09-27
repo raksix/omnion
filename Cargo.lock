@@ -1471,6 +1471,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-secrets"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-storage"
 version = "0.1.0"
 dependencies = [
