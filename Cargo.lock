@@ -1269,6 +1269,7 @@ dependencies = [
  "omnion-module-analytics",
  "omnion-onboarding",
  "omnion-permissions",
+ "omnion-policy-engine",
  "omnion-search",
  "omnion-storage",
  "omnion-workflows",
@@ -1438,12 +1439,22 @@ name = "omnion-permissions"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "omnion-policy-engine",
  "rand 0.8.8",
  "serde_json",
  "sha2",
  "sqlx",
  "thiserror",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-policy-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
