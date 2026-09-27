@@ -89,6 +89,7 @@ pub mod public;
 pub mod readyz;
 pub mod scim;
 pub mod search;
+pub mod secrets;
 pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
@@ -605,6 +606,29 @@ pub fn router(state: AppState) -> Router {
             omnion_module_analytics::collect::MAX_BODY_BYTES,
         ));
 
+    // The key ring and the rotation ceremony (docs/requests/REQ-125, slice 1). Reading the
+    // ring is `secrets.read`; starting a rotation, pausing and resuming its walk is
+    // `secrets.root.manage`, because a rotation is the one irreversible operation on the ring.
+    let secrets_root_key = Router::new()
+        .route("/secrets/root-key", get(secrets::read_root_key))
+        .route(
+            "/secrets/root-key/rewrap-jobs/{id}",
+            get(secrets::read_rewrap_job),
+        )
+        .route_layer(guards::require(&state, "secrets.read"));
+
+    let secrets_rotation = Router::new()
+        .route("/secrets/root-key/rotate", post(secrets::rotate_root_key))
+        .route(
+            "/secrets/root-key/rewrap-jobs/{id}/pause",
+            post(secrets::pause_rewrap_job),
+        )
+        .route(
+            "/secrets/root-key/rewrap-jobs/{id}/resume",
+            post(secrets::resume_rewrap_job),
+        )
+        .route_layer(guards::require(&state, "secrets.root.manage"));
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -633,6 +657,8 @@ pub fn router(state: AppState) -> Router {
             search_settings_read.merge(search_settings_write),
         )
         .route("/search/recent", search_recent)
+        .merge(secrets_root_key)
+        .merge(secrets_rotation)
         .route("/commands", commands_route)
         .route("/commands/{id}/run", command_run)
         .route("/command-center/context", command_context)

@@ -399,6 +399,38 @@ impl Default for SearchConfig {
     }
 }
 
+/// Secret key-ring knobs (docs/requests/REQ-125).
+///
+/// The re-wrap walk is the one long-running writer in the secrets store, so its batch is small
+/// and its poll is bounded below by the runner itself. Both default to values that finish a
+/// small installation's rotation in seconds without ever holding a lock a lease redemption
+/// needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretsConfig {
+    /// Whether this process walks a live re-wrap job (`OMNION_SECRETS_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two re-wrap ticks (`OMNION_SECRETS_POLL_MS`).
+    pub rewrap_poll_ms: u64,
+    /// Versions one tick may re-seal (`OMNION_SECRETS_REWRAP`).
+    pub rewrap_batch: usize,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            rewrap_poll_ms: DEFAULT_SECRETS_POLL_MS,
+            rewrap_batch: DEFAULT_SECRETS_REWRAP_BATCH,
+        }
+    }
+}
+
+/// Default re-wrap poll interval: a small ring finishes in seconds, a large one never blocks.
+const DEFAULT_SECRETS_POLL_MS: u64 = 2_000;
+
+/// Default versions per re-wrap batch — a write window a redemption can queue behind.
+const DEFAULT_SECRETS_REWRAP_BATCH: usize = 25;
+
 /// Analytics collection and rollup knobs (docs/requests/REQ-007).
 ///
 /// The rollup worker of `apps/api` reads these: it rebuilds the recent hourly and daily buckets
@@ -524,6 +556,8 @@ pub struct Config {
     pub automation: AutomationConfig,
     /// Search indexer knobs (REQ-002).
     pub search: SearchConfig,
+    /// The secret re-wrap walk (docs/requests/REQ-125).
+    pub secrets: SecretsConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
     /// Email settings of the `send_email` action (P13).
@@ -680,6 +714,18 @@ impl Config {
             batch: read_count(&read, "OMNION_SEARCH_BATCH", DEFAULT_SEARCH_BATCH)?,
         };
 
+        // The re-wrap walk (docs/requests/REQ-125): a small batch by default, because a batch is
+        // a write window a lease redemption has to queue behind.
+        let secrets = SecretsConfig {
+            runner_enabled: read_flag(&read, "OMNION_SECRETS_RUNNER", true)?,
+            rewrap_poll_ms: read_positive(
+                &read,
+                "OMNION_SECRETS_POLL_MS",
+                DEFAULT_SECRETS_POLL_MS,
+            )?,
+            rewrap_batch: read_count(&read, "OMNION_SECRETS_REWRAP", DEFAULT_SECRETS_REWRAP_BATCH)?,
+        };
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -701,6 +747,7 @@ impl Config {
         };
 
         let config = Self {
+            secrets,
             env,
             http: HttpConfig { host, port },
             database,
@@ -748,6 +795,7 @@ impl Default for Config {
             events: EventsConfig::default(),
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
+            secrets: SecretsConfig::default(),
             analytics: AnalyticsConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),

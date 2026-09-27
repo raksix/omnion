@@ -39,6 +39,7 @@
 pub mod error;
 pub mod keyring;
 pub mod redaction;
+pub mod store;
 pub mod validators;
 
 pub use error::{Result, SecretsError};
@@ -47,4 +48,9 @@ pub use keyring::{
     WrapOutcome, generate_key_id, wrap_key,
 };
 pub use redaction::{hint_for, mask_value, redact};
+pub use store::{
+    BatchReport, REWRAP_BATCH, RewrapJob, RootKeyRow, active_key_row, ensure_active_key,
+    finish_job, list_root_keys, live_rewrap_job, load_ring, operator_key, pause_job,
+    recover_missing_job, resume_job, rewrap_batch, ring_coverage, self_check, start_rotation,
+};
 pub use validators::{CredentialKind, ValidationOutcome, validate};

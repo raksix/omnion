@@ -266,6 +266,50 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "iam",
         description: "Change the password, lockout, IP and session policy",
     },
+    // The secrets surface (docs/requests/REQ-125). Reading the key ring is deliberately
+    // separated from managing the root key: an operator who may see that a rotation exists is
+    // not the one who may start one, because a rotation is irreversible if the operator key is
+    // wrong.
+    PermissionDef {
+        key: "secrets.read",
+        category: "secrets",
+        description: "Read secrets, the key ring state and the credential slot assignments",
+    },
+    PermissionDef {
+        key: "secrets.manage",
+        category: "secrets",
+        description: "Create, change and archive stored secrets",
+    },
+    PermissionDef {
+        key: "secrets.root.manage",
+        category: "secrets",
+        description: "Rotate the installation root key and run a re-wrap ceremony",
+    },
+    PermissionDef {
+        key: "secrets.assign",
+        category: "secrets",
+        description: "Assign credentials to slots and change their primary and fallback",
+    },
+    PermissionDef {
+        key: "secrets.lease",
+        category: "secrets",
+        description: "Issue and revoke short-lived secret leases",
+    },
+    PermissionDef {
+        key: "secrets.deploy_keys.read",
+        category: "secrets",
+        description: "Read deployment keys and their use log",
+    },
+    PermissionDef {
+        key: "secrets.deploy_keys.manage",
+        category: "secrets",
+        description: "Create, revoke and delete deployment keys",
+    },
+    PermissionDef {
+        key: "secrets.audit",
+        category: "secrets",
+        description: "Read the secrets audit trail and acknowledge anomaly flags",
+    },
     PermissionDef {
         key: "iam.sessions.read",
         category: "iam",

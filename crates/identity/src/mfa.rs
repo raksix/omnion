@@ -419,11 +419,7 @@ pub async fn create_passkey(
 }
 
 /// Record that a passkey just verified, moving its counter forward.
-pub async fn record_passkey_use(
-    pool: &PgPool,
-    factor_id: Uuid,
-    sign_count: u32,
-) -> Result<()> {
+pub async fn record_passkey_use(pool: &PgPool, factor_id: Uuid, sign_count: u32) -> Result<()> {
     sqlx::query("update mfa_factors set last_used_at = now(), sign_count = $2 where id = $1")
         .bind(factor_id)
         .bind(i64::from(sign_count))

@@ -18,5 +18,6 @@ pub mod intent_resolver;
 pub mod routes;
 pub mod scope;
 pub mod search_runner;
+pub mod secrets_runner;
 pub mod state;
 pub mod workflow_runner;

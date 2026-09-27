@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+    analytics_runner, automation_runner, event_runner, search_runner, secrets_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -122,6 +123,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
+    }
+
+    // The secret re-wrap walk (REQ-125): each tick re-seals one small batch of a live
+    // rotation's versions, resuming from the job's cursor after a restart.
+    if state.config().secrets.runner_enabled {
+        let _rewrap = secrets_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the secret re-wrap runner is disabled (OMNION_SECRETS_RUNNER=false)");
     }
 
     let app = routes::router(state);
