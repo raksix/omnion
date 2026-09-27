@@ -27,6 +27,11 @@ API_NAME="omnion-qa-api-$STACK"
 ADMIN_NAME="omnion-qa-admin-$STACK"
 WEB_NAME="omnion-qa-web-$STACK"
 API_URL="http://127.0.0.1:$API_PORT"
+# Every stack owns its database, or two passes would drop each other's rows.
+QA_DB_NAME="omnion_qa"
+[ "$STACK" != "main" ] && QA_DB_NAME="omnion_qa_$STACK"
+QA_DB="$QA_DB_NAME"
+export QA_DB
 export NODE_PATH="${QA_NODE_PATH:-/root/test-hermes/node_modules}"
 export QA_CHROME="${QA_CHROME:-/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -55,7 +60,7 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/omnion_qa" \
+  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
