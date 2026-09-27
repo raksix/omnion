@@ -91,11 +91,20 @@ pub struct PublishedPageResponse {
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/public/pages/{slug}`.
+///
+/// `?viewport=mobile` asks for the phone render. It is not a display preference the renderer
+/// could apply on the client: the REQ asks for blocks hidden per viewport to be *absent* from
+/// the other viewport's render, and a block that is merely CSS-hidden is still in the HTML the
+/// device downloads, still in the accessibility tree, and still counted by every reader-mode
+/// extractor. So the decision is made here, on the payload, before the page leaves the API.
 #[derive(Debug, Deserialize)]
 pub struct PublicPageQuery {
     /// Site hint: a host when it contains a dot, otherwise a site key.
     #[serde(default)]
     pub site: Option<String>,
+    /// Viewport the caller is rendering for.
+    #[serde(default)]
+    pub viewport: Option<String>,
 }
 
 /// What a `?site=` value addresses.
@@ -148,6 +157,21 @@ pub async fn get_published_page(
         return Err(page_not_found(&slug));
     };
 
+    // The viewport filter runs on the stored payload before it is handed out. A page that
+    // carries blocks the author hid from phones is a different page for a phone, and the only
+    // honest way to serve that is to never build the other one.
+    let read_on = read_on_from(query.viewport.as_deref());
+    let blocks = match omnion_content::parse_blocks(&revision.blocks) {
+        Ok(parsed) => omnion_content::blocks_to_value(&omnion_content::filter_for_viewport(
+            &parsed,
+            read_on,
+        )),
+        // A payload the registry cannot read is served exactly as stored: the renderer's own
+        // fallback is what a visitor gets, and refusing the page over a bad block would take a
+        // working page down for a mistake in one block.
+        Err(_) => revision.blocks.clone(),
+    };
+
     Ok(Json(PublishedPageResponse {
         site: PublicSiteBody {
             key: site.key,
@@ -164,10 +188,23 @@ pub async fn get_published_page(
             title: revision.title,
             body: revision.body,
             summary: revision.summary,
-            blocks: revision.blocks,
+            blocks,
             published_at: revision.published_at,
         },
     }))
+}
+
+/// Read the `?viewport=` value; anything that is not `mobile` is a wide render.
+///
+/// One value is enough. The rule the REQ states is a two-way one (hidden from phones, hidden
+/// from desktops), and a third word for "tablet" would mean the platform guessing which side of
+/// a line a 900px screen falls on — which is the stylesheet's job, and which the author already
+/// controls by choosing a breakpoint in their own theme.
+fn read_on_from(viewport: Option<&str>) -> omnion_content::ReadOn {
+    match viewport.map(str::trim) {
+        Some("mobile") => omnion_content::ReadOn::Mobile,
+        _ => omnion_content::ReadOn::Desktop,
+    }
 }
 
 /// The `404` of the public surface: one shape for "not here", never "not published".
