@@ -61,11 +61,29 @@ type ConditionRow = {
   value: string;
 };
 
+/**
+ * The row the editor opens with.
+ *
+ * Its id is a constant on purpose: this component is server-rendered first, and a counter that
+ * runs during the render would give the server and the client different ids — the classic
+ * hydration mismatch. Rows added later exist only on the client, so a counter is safe there.
+ */
+function initialRow(): ConditionRow {
+  return {
+    id: "row-initial",
+    negate: false,
+    attribute: "resource.path",
+    operator: "starts_with",
+    value: "/blog",
+  };
+}
+
 let rowSeq = 0;
-function newRow(): ConditionRow {
+/** A row the reader added (client-only). */
+function nextRow(): ConditionRow {
   rowSeq += 1;
   return {
-    id: `row-${rowSeq}`,
+    id: `row-added-${rowSeq}`,
     negate: false,
     attribute: "resource.path",
     operator: "starts_with",
@@ -167,7 +185,7 @@ export function PoliciesView() {
   const [targets, setTargets] = useState<string[]>([]);
   const [targetInput, setTargetInput] = useState("");
   const [mode, setMode] = useState<"all" | "any">("all");
-  const [rows, setRows] = useState<ConditionRow[]>([newRow()]);
+  const [rows, setRows] = useState<ConditionRow[]>(() => [initialRow()]);
   const [jsonMode, setJsonMode] = useState(false);
   const [jsonText, setJsonText] = useState('{\n  "all": []\n}');
   const [noticeAboutNesting, setNoticeAboutNesting] = useState<string | null>(null);
@@ -273,7 +291,7 @@ export function PoliciesView() {
     setTargets([]);
     setTargetInput("");
     setMode("all");
-    setRows([newRow()]);
+    setRows([initialRow()]);
     setJsonMode(false);
     setJsonText('{\n  "all": []\n}');
     setVersions(null);
@@ -651,6 +669,7 @@ export function PoliciesView() {
             {jsonMode ? (
               <textarea
                 value={jsonText}
+                aria-label="Condition tree as JSON"
                 data-conditions-json
                 onChange={(event) => setJsonText(event.target.value)}
                 rows={8}
@@ -682,6 +701,7 @@ export function PoliciesView() {
                     </label>
                     <input
                       value={row.attribute}
+                      aria-label="Condition attribute"
                       data-condition-attribute={row.id}
                       list="policy-attributes"
                       onChange={(event) => updateRow(row.id, { attribute: event.target.value })}
@@ -690,6 +710,7 @@ export function PoliciesView() {
                     />
                     <select
                       value={row.operator}
+                      aria-label="Condition operator"
                       data-condition-operator={row.id}
                       onChange={(event) => updateRow(row.id, { operator: event.target.value })}
                       className="h-8 rounded-lg border border-line bg-surface px-2 font-mono text-[12px] text-ink outline-none focus:border-accent"
@@ -702,6 +723,7 @@ export function PoliciesView() {
                     </select>
                     <input
                       value={row.value}
+                      aria-label="Condition value"
                       data-condition-value={row.id}
                       onChange={(event) => updateRow(row.id, { value: event.target.value })}
                       placeholder="/legal"
@@ -722,7 +744,7 @@ export function PoliciesView() {
                   <button
                     type="button"
                     data-condition-add
-                    onClick={() => setRows((current) => [...current, newRow()])}
+                    onClick={() => setRows((current) => [...current, nextRow()])}
                     className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12px] font-medium transition hover:bg-quiet-soft"
                   >
                     <Plus className="size-3.5" aria-hidden /> Add condition
@@ -808,6 +830,7 @@ export function PoliciesView() {
               <div className="flex items-center gap-2">
                 <input
                   value={targetInput}
+                  aria-label="Target permission"
                   data-policy-target-input
                   list="policy-permissions"
                   onChange={(event) => setTargetInput(event.target.value)}
