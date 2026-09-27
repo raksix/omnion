@@ -73,6 +73,7 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
+pub mod automation_approvals;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -537,6 +538,14 @@ pub fn router(state: AppState) -> Router {
     let execution_resume_from =
         post(automation::resume_from).layer(guards::require(&state, "workflows.run"));
 
+    // Pending approvals (docs/requests/REQ-003 slice 3). Reading the gates and letting a
+    // parked run go on are one power, and deliberately NOT `workflows.run`: the person who
+    // writes a rule must not be the person who waves through everything that rule parks.
+    let approvals_list = get(automation_approvals::list_approvals)
+        .layer(guards::require(&state, "workflows.approve"));
+    let approval_decide = post(automation_approvals::decide_approval)
+        .layer(guards::require(&state, "workflows.approve"));
+
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
@@ -818,6 +827,8 @@ pub fn router(state: AppState) -> Router {
         .route("/automations/{id}/tests", automation_tests)
         .route("/automations/{id}/rotate-hook", automation_rotate_hook)
         .route("/automations/{id}/run", automation_run)
+        .route("/approvals", approvals_list)
+        .route("/approvals/{id}/decide", approval_decide)
         .route("/workflow-executions/{id}/retry-step", execution_retry_step)
         .route(
             "/workflow-executions/{id}/resume-from",

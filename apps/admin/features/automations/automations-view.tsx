@@ -19,12 +19,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  Check,
   Copy,
   FlaskConical,
   Play,
   Plus,
   Radio,
   RefreshCw,
+  ShieldCheck,
   Trash2,
   Webhook,
   X,
@@ -37,18 +39,22 @@ import { useSession } from "@/lib/session";
 import {
   ApiError,
   createAutomation,
+  decideApproval,
   deleteAutomation,
+  fetchApprovals,
   fetchAutomation,
   fetchAutomationCatalogue,
   fetchOrganizations,
   fetchAutomationTests,
   fetchAutomations,
+  fetchIamUsers,
   listenAutomation,
   rotateAutomationHook,
   runAutomation,
   testAutomation,
   updateAutomation,
   type Automation,
+  type AutomationApproval,
   type AutomationCatalogue,
   type AutomationCondition,
   type AutomationDryRun,
@@ -144,6 +150,7 @@ const STEP_KIND_LABELS: Record<string, string> = {
   wait: "Wait",
   branch: "Branch",
   stop: "Stop",
+  approval: "Wait for approval",
 };
 
 /** What each error policy does, in words a rule author can act on. */
@@ -170,6 +177,17 @@ function defaultParamsFor(kind: string, current: Record<string, unknown>) {
       return { field: "event.status", operator: "equals", value: "published" };
     case "stop":
       return { reason: "this run was stopped on purpose" };
+    case "approval":
+      // A gate with no permission named is the platform's own `workflows.approve`, and the
+      // message is what a decider reads — so both are filled in rather than left blank, and
+      // an author who never touches them gets a working gate.
+      return typeof current.permission === "string"
+        ? current
+        : {
+            permission: "workflows.approve",
+            message: "a person must approve this step before the run goes on",
+            expires_in_hours: 72,
+          };
     case "task":
       if (current.url) {
         return current;
@@ -224,6 +242,21 @@ type Draft = {
   steps: AutomationStep[];
   /** The rule's own failure policy; a step that inherits takes this. */
   onError: Automation["on_error"];
+  /** Whose authority the rule's host actions run with; `null` follows the author. */
+  runAs: string | null;
+  /**
+   * The API's own sentence about the rule's current authority, kept so the editor shows
+   * what the *server* resolved rather than guessing from the picker's value. A rule whose
+   * author was deleted answers "runs as nobody" here, and that is a fact the editor has to
+   * be able to show rather than infer.
+   */
+  runAsDescription: string;
+  /**
+   * What each of the rule's actions needs from the run-as account, as the API reported it
+   * for this rule. Kept on the draft rather than fetched separately so the sentence under
+   * the picker and the sentence the engine will enforce come from one list.
+   */
+  actionPermissions: [string, string][];
 };
 
 const EMPTY_DRAFT: Draft = {
@@ -234,6 +267,9 @@ const EMPTY_DRAFT: Draft = {
   event: "page.published",
   hookTriggered: false,
   onError: "stop",
+  runAs: null,
+  runAsDescription: "Runs as the rule's author",
+  actionPermissions: [],
   conditions: { mode: "all", all: [] },
   steps: [
     {
@@ -283,6 +319,18 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
   const [lastRun, setLastRun] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
+  // The gates parked runs are waiting on (REQ-003 slice 3). `null` is "not loaded yet" and
+  // is drawn as a loading strip, not as an empty panel — an empty panel and an unanswered
+  // question look identical otherwise, and one of them is a lie.
+  const [approvals, setApprovals] = useState<AutomationApproval[] | null>(null);
+  const [approvalsError, setApprovalsError] = useState<string | null>(null);
+  const [deciding, setDeciding] = useState<string | null>(null);
+  // The accounts the run-as picker offers. Loaded while an editor is open and not before:
+  // `/automations` is a screen a reader without `users.read` may still have to use, and a
+  // failing account list must not become a red banner on a list screen. A picker with no
+  // choices still says, in words, that the rule follows its author.
+  const [runAsAccounts, setRunAsAccounts] = useState<{ id: string; label: string }[]>([]);
+
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
   const platformAccount = user ? user.organization_id === null : false;
   const organizationId = platformAccount ? selectedOrg : (user?.organization_id ?? null);
@@ -296,6 +344,106 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
       .then(setCatalogue)
       .catch(() => setCatalogue(null));
   }, []);
+
+  // The pending gates. Re-read whenever the list reloads, because a decision made in
+  // another tab has to disappear from this one — a queue that only shrinks on this screen's
+  // own clicks is a queue that lies.
+  useEffect(() => {
+    if (!organizationId) {
+      setApprovals([]);
+      return;
+    }
+    let live = true;
+    fetchApprovals({ organizationId })
+      .then((answer) => {
+        if (live) {
+          setApprovals(answer.approvals);
+          setApprovalsError(null);
+        }
+      })
+      .catch((cause) => {
+        if (!live) {
+          return;
+        }
+        // A caller without `workflows.approve` sees nothing rather than a red banner: the
+        // panel is not a page they can use, and an error about a power they do not have is
+        // noise. The rule list below is still fully readable.
+        setApprovals(
+          cause instanceof ApiError && (cause.status === 403 || cause.status === 404)
+            ? []
+            : null,
+        );
+        setApprovalsError(
+          cause instanceof ApiError && (cause.status === 403 || cause.status === 404)
+            ? null
+            : cause instanceof ApiError
+              ? cause.message
+              : "The pending approvals could not be loaded.",
+        );
+      });
+    return () => {
+      live = false;
+    };
+  }, [organizationId, reloadToken]);
+
+  // The accounts, fetched when the editor opens and refreshed when the tenant changes.
+  useEffect(() => {
+    if (!draft || !organizationId) {
+      setRunAsAccounts([]);
+      return;
+    }
+    let live = true;
+    fetchIamUsers({ organizationId, status: "active" })
+      .then((answer) => {
+        if (!live) {
+          return;
+        }
+        setRunAsAccounts(
+          answer.users.map((account) => ({
+            id: account.id,
+            label: `${account.display_name || account.email} — ${account.email}`,
+          })),
+        );
+      })
+      // A caller without `users.read` simply gets an author-follows rule: the picker keeps
+      // its default option and says so, rather than the editor failing to open.
+      .catch(() => {
+        if (live) {
+          setRunAsAccounts([]);
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [draft !== null, organizationId]);
+
+  /** Approve or reject one gate, then re-read the queue. */
+  const decide = useCallback(
+    async (gate: AutomationApproval, decision: "approved" | "rejected") => {
+      setDeciding(gate.id);
+      setNotice(null);
+      setLoadError(null);
+      try {
+        const answer = await decideApproval(gate.id, decision);
+        setNotice(
+          decision === "approved"
+            ? `“${gate.rule_name ?? "The rule"}” was approved — its run continues from step ${gate.step_no}.`
+            : `“${gate.rule_name ?? "The rule"}” was rejected — its run ended at step ${gate.step_no} and nothing after it ran.`,
+        );
+        void answer;
+        setReloadToken((token) => token + 1);
+      } catch (cause) {
+        setLoadError(
+          cause instanceof ApiError
+            ? cause.message
+            : "That approval could not be decided.",
+        );
+      } finally {
+        setDeciding(null);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!user) {
@@ -386,6 +534,9 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
       event: automation.event,
       hookTriggered: automation.trigger === "inbound_webhook",
       onError: automation.on_error ?? "stop",
+      runAs: automation.run_as_user_id ?? null,
+      runAsDescription: automation.run_as_description,
+      actionPermissions: automation.action_permissions ?? [],
       conditions: toEditable(automation.conditions),
       steps: stepsOf(automation),
     });
@@ -445,6 +596,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
       conditions: toWire(draft.conditions),
       hook_triggered: draft.hookTriggered,
       on_error: draft.onError,
+      run_as_user_id: draft.runAs,
       actions: draft.steps,
     };
 
@@ -506,6 +658,11 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           conditions: automation.conditions,
           hook_triggered: automation.trigger === "inbound_webhook",
           on_error: automation.on_error,
+          // Carried through rather than defaulted: arming or disarming a rule is a whole-rule
+          // write, and one that dropped this would quietly move the rule off the service
+          // account it was handed to — a change nobody notices until a run stops on a
+          // permission error.
+          run_as_user_id: automation.run_as_user_id ?? null,
           actions: stepsOf(automation),
         });
         reload();
@@ -663,6 +820,82 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
         >
           {loadError}
         </p>
+      ) : null}
+
+      {/* The pending gates, above the table and only when something is waiting. Drawn
+          apart from the rules on purpose: a parked run is not a rule, it is a question to a
+          person, and burying it in a table of definitions is how an approval sits for three
+          days. */}
+      {approvalsError ? (
+        <p
+          data-automation-approvals-error
+          role="alert"
+          className="rounded-md bg-critical-soft px-3 py-2 text-[12.5px] text-critical"
+        >
+          {approvalsError}
+        </p>
+      ) : null}
+      {approvals !== null && approvals.length > 0 ? (
+        <section
+          data-automation-approvals
+          aria-label="Pending approvals"
+          className="flex flex-col gap-2 rounded-lg border border-line bg-quiet-soft/40 p-3"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+            <h3 className="text-[13px] font-medium">
+              {approvals.length} run{approvals.length === 1 ? "" : "s"} waiting on you
+            </h3>
+            <span className="text-[12px] text-muted">
+              A run stays parked until somebody with the deciding permission answers.
+            </span>
+          </div>
+          <ul className="flex flex-col gap-2" data-automation-approval-list>
+            {approvals.map((gate) => (
+              <li
+                key={gate.id}
+                data-automation-approval={gate.id}
+                className="flex flex-col gap-2 rounded-md border border-line bg-paper p-2.5 sm:flex-row sm:items-start sm:justify-between"
+              >
+                <div className="min-w-0">
+                  <p className="text-[12.5px] font-medium">
+                    {gate.rule_name ?? "A rule"} · step {gate.step_no} — {gate.step_name}
+                  </p>
+                  <p className="text-[12px] text-muted">{gate.message}</p>
+                  <p className="mt-0.5 text-[11.5px] text-muted">
+                    Asked {formatTimestamp(gate.requested_at)}
+                    {gate.expired
+                      ? " · expired — this run will end without it"
+                      : ` · decides by ${formatTimestamp(gate.expires_at)}`}
+                    {` · needs ${gate.permission}`}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    data-automation-approval-approve={gate.id}
+                    disabled={deciding === gate.id || gate.expired}
+                    onClick={() => void decide(gate, "approved")}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-ink px-2.5 py-1.5 text-[12.5px] text-paper disabled:opacity-50"
+                  >
+                    <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    data-automation-approval-reject={gate.id}
+                    disabled={deciding === gate.id}
+                    onClick={() => void decide(gate, "rejected")}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] hover:bg-quiet-soft disabled:opacity-50"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                    Reject
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
       ) : null}
 
       {automations === null && !loadError ? <LoadingTable columns={COLUMNS.length} /> : null}
@@ -902,6 +1135,8 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           onRunNow={runNow}
           onRotateHook={rotateHook}
           onArmDelete={setConfirmDelete}
+          runAsChoices={runAsAccounts}
+          organizationId={organizationId}
         />
       ) : null}
 
@@ -946,6 +1181,10 @@ type EditorProps = {
   onRunNow: (automationId: string) => void;
   onRotateHook: (automationId: string) => void;
   onArmDelete: (name: string) => void;
+  /** The accounts of this tenant, for the run-as picker. */
+  runAsChoices: { id: string; label: string }[];
+  /** The organization the rule belongs to, for the account list. */
+  organizationId: string | null;
 };
 
 /** The rule editor: trigger, conditions, actions, and the test-fire surface. */
@@ -968,9 +1207,33 @@ function AutomationEditor({
   onRunNow,
   onRotateHook,
   onArmDelete,
+  runAsChoices,
+  organizationId,
 }: EditorProps) {
   const eventFields = fieldsFor(catalogue, draft.event);
   const maxDepth = catalogue?.max_group_depth ?? 3;
+  // What the actions below need from the run-as account, straight from the API's own map.
+  // De-duplicated and in order, because a rule that sends an e-mail and publishes a page
+  // needs one sentence, not three.
+  const neededPermissions = useMemo(() => {
+    const actions = new Set(
+      draft.steps.map((step) => step.action).filter((action): action is string => Boolean(action)),
+    );
+    return draft.actionPermissions
+      .filter(([action]) => actions.has(action))
+      .map(([, permission]) => permission)
+      .filter((permission, index, all) => all.indexOf(permission) === index);
+  }, [draft.steps, draft.actionPermissions]);
+  // The API's sentence describes the rule as *saved*. While the picker holds a different
+  // value than the one that was loaded, that sentence is about the old state — so the
+  // editor says what the picker now means, and falls back to the API's wording only when
+  // the two agree. An unsaved rule has no API sentence at all, and the default is the one
+  // true statement available.
+  const runAsHelp = draft.runAs
+    ? "Runs as the account chosen in this rule's settings, checked when each step runs."
+    : draft.id
+      ? draft.runAsDescription
+      : "Runs as the rule's author, checked when each step runs.";
   const maxConditions = catalogue?.max_conditions ?? 24;
   const conditionCount = countNodes(members(draft.conditions));
   const [openGroup, setOpenGroup] = useState<string | null>("root");
@@ -1023,6 +1286,40 @@ function AutomationEditor({
       const reason = step.params?.reason;
       if (typeof reason !== "string" || !reason.trim()) {
         problems.push(`“${label}” stops the run without saying why.`);
+      }
+    }
+    if (step.kind === "approval") {
+      // A gate with no permission is a run that parks and nobody can open; a gate with a
+      // permission that is not a key is a run that will never open either. Both are said
+      // here, in the summary, before a save is attempted — the server refuses them too,
+      // but an author who only learns on save cannot fix the rule in one pass.
+      const permission = step.params?.permission;
+      if (typeof permission !== "string" || !permission.trim()) {
+        problems.push(`“${label}” waits for approval but names nobody who may decide.`);
+      } else if (
+        !permission
+          .split(".")
+          .every((segment) => segment.length > 0 && /^[a-z0-9_]+$/.test(segment))
+      ) {
+        problems.push(
+          `“${label}” waits for ${permission}, which is not a permission key.`,
+        );
+      }
+      const message = step.params?.message;
+      if (typeof message !== "string" || !message.trim()) {
+        problems.push(`“${label}” waits for approval with no message for the decider.`);
+      }
+      const hours = step.params?.expires_in_hours;
+      const ceiling = catalogue?.max_approval_ttl_hours ?? 720;
+      if (
+        typeof hours !== "number" ||
+        !Number.isInteger(hours) ||
+        hours < 1 ||
+        hours > ceiling
+      ) {
+        problems.push(
+          `“${label}” waits ${String(hours)} hours; a gate may wait 1 to ${ceiling}.`,
+        );
       }
     }
   }
@@ -1333,6 +1630,51 @@ function AutomationEditor({
           </select>
           <span>— each step can override this.</span>
         </div>
+
+        {/* Whose authority the rule's actions run with (REQ-003 slice 3). This is the most
+            consequential control on the screen and it reads like a settings line because
+            that is what it is: the account whose permissions are resolved *when a step
+            runs*, not a snapshot of what the author held when the rule was saved. The
+            consequences are spelled out under it rather than left for somebody to find out
+            from a failed run. */}
+        <div className="flex flex-col gap-1 rounded-md border border-line p-2.5">
+          <div className="flex flex-wrap items-center gap-2 text-[12px]">
+            <label htmlFor="automation-run-as">Run this rule as</label>
+            <select
+              id="automation-run-as"
+              data-automation-run-as
+              value={draft.runAs ?? ""}
+              onChange={(event) =>
+                onDraftChange({ ...draft, runAs: event.target.value || null })
+              }
+              className="rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+            >
+              <option value="">The rule&apos;s author (the default)</option>
+              {runAsChoices.map((choice) => (
+                <option key={choice.id} value={choice.id}>
+                  {choice.label}
+                </option>
+              ))}
+            </select>
+            {runAsChoices.length === 0 ? (
+              <span className="text-[11.5px] text-muted">
+                Accounts cannot be listed here, so the rule follows its author.
+              </span>
+            ) : null}
+          </div>
+          <p className="text-[11.5px] text-muted" data-automation-run-as-help>
+            {runAsHelp}
+          </p>
+          {draft.steps.some((step) => step.action) ? (
+            <p className="text-[11.5px] text-muted">
+              This rule&apos;s actions need:{" "}
+              <span className="font-mono text-[11px]">
+                {neededPermissions.join(", ")}
+              </span>
+              . If the account loses one, the run stops on that step and says which.
+            </p>
+          ) : null}
+        </div>
         {draft.steps.length === 0 ? (
           <p className="text-[12.5px] text-muted" data-automation-no-actions>
             A rule needs at least one action. Add one below.
@@ -1524,6 +1866,66 @@ function AutomationEditor({
                     className="w-72 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
                   />
                   <span>— shown in the run&apos;s trace.</span>
+                </div>
+              ) : null}
+              {step.kind === "approval" ? (
+                /* A gate's three parameters are typed controls, not a JSON box. The whole
+                   point of the step is that a *person* reads the message and a *named
+                   permission* opens it; an author who has to hand-write JSON to say that
+                   is an author who will not put a gate in their rule. */
+                <div
+                  className="flex flex-col gap-2 text-[11.5px] text-muted"
+                  data-automation-approval-step={index}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label htmlFor={`automation-approval-permission-${index}`}>
+                      Who may decide
+                    </label>
+                    <input
+                      id={`automation-approval-permission-${index}`}
+                      data-automation-approval-permission={index}
+                      value={String(step.params?.permission ?? "")}
+                      onChange={(event) =>
+                        setStepParam(index, "permission", event.target.value)
+                      }
+                      className="w-56 rounded-md border border-line bg-paper px-2 py-1 font-mono text-[12px]"
+                    />
+                    <span>
+                      — a permission key, e.g.{" "}
+                      <span className="font-mono">{catalogue?.approval_permission ?? "workflows.approve"}</span>
+                      . The run stops until somebody who holds it answers.
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label htmlFor={`automation-approval-message-${index}`}>
+                      Message for the decider
+                    </label>
+                    <input
+                      id={`automation-approval-message-${index}`}
+                      data-automation-approval-message={index}
+                      value={String(step.params?.message ?? "")}
+                      onChange={(event) => setStepParam(index, "message", event.target.value)}
+                      className="w-96 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label htmlFor={`automation-approval-ttl-${index}`}>
+                      Decides within
+                    </label>
+                    <input
+                      id={`automation-approval-ttl-${index}`}
+                      data-automation-approval-ttl={index}
+                      type="number"
+                      min={1}
+                      max={catalogue?.max_approval_ttl_hours ?? 720}
+                      value={String(step.params?.expires_in_hours ?? "")}
+                      onChange={(event) =>
+                        setStepParam(index, "expires_in_hours", Number(event.target.value))
+                      }
+                      className="w-24 rounded-md border border-line bg-paper px-2 py-1 text-[12px]"
+                    />
+                    <span>hours — after that the run ends without the step.</span>
+                  </div>
                 </div>
               ) : null}
               {step.kind === "task" ? (

@@ -3216,6 +3216,11 @@ export type AutomationCatalogue = {
   branch_operators: AutomationOperator[];
   /** The step kinds a definition may carry. */
   step_kinds: string[];
+  /** The permission that may decide a parked `approval` step. */
+  approval_permission: string;
+  /** The default and the ceiling of a gate's lifetime, in hours. */
+  approval_ttl_hours: number;
+  max_approval_ttl_hours: number;
   /** What a step's own failure may do; `inherit` takes the rule's policy. */
   on_error_policies: AutomationStepOnError[];
   /** The longest a step may block, in milliseconds, and the default. */
@@ -3251,7 +3256,7 @@ export type AutomationRunStep = {
   step_no: number;
   /** Step name. */
   name: string;
-  /** `task`, `wait`, `branch` or `stop`. */
+  /** `task`, `wait`, `branch`, `stop` or `approval`. */
   kind: string;
   /** Action key of a task step. */
   action: string | null;
@@ -3368,6 +3373,12 @@ export type Automation = {
   actions: AutomationNode[];
   /** The rule's own error policy; a step that inherits takes this. */
   on_error: AutomationOnError;
+  /** Whose authority the rule's host actions run with; `null` means the author. */
+  run_as_user_id: string | null;
+  /** Which of the two it is, in a sentence the editor shows beside the picker. */
+  run_as_description: string;
+  /** What each host action needs, so the panel can say what a run-as account is asked for. */
+  action_permissions: [string, string][];
   /** How many runs the trigger has started. */
   trigger_count: number;
   /** When the rule last fired. */
@@ -3390,7 +3401,7 @@ export type AutomationOnError = "stop" | "continue";
 export type AutomationStep = {
   /** Display name; unique within the rule. */
   name: string;
-  /** `task`, `wait`, `branch` or `stop`. */
+  /** `task`, `wait`, `branch`, `stop` or `approval`. */
   kind: string;
   /** Action key of a task step. */
   action?: string | null;
@@ -3482,6 +3493,92 @@ export type AutomationTestResult = {
   recorded: AutomationTestEvent;
 };
 
+/**
+ * One gate a parked automation run is waiting on (REQ-003 slice 3).
+ *
+ * There is deliberately **no token** on this type. The panel decides through the decider's
+ * own session and the gate's own id, so reading the queue can never hand out the credential
+ * that opens it — the token is minted by the engine when the run parks and travels to the
+ * decider out of band, exactly as the inbound hook token does.
+ */
+export type AutomationApproval = {
+  /** Approval id — what the decision endpoint is addressed by. */
+  id: string;
+  /** The run that is parked. */
+  execution_id: string;
+  /** The step inside that run. */
+  step_no: number;
+  /** The step's name. */
+  step_name: string;
+  /** The rule that asked, when the rule still exists. */
+  rule_id: string | null;
+  /** Its name. */
+  rule_name: string | null;
+  /** Organization the gate belongs to. */
+  organization_id: string;
+  /** When the run parked. */
+  requested_at: string;
+  /** When the gate stops accepting decisions. */
+  expires_at: string;
+  /** The permission a decider must hold. */
+  permission: string;
+  /** The message the author wrote for the decider. */
+  message: string;
+  /** `true` when the deadline has passed; the panel then offers only Reject. */
+  expired: boolean;
+};
+
+/** The answer of a decision: what happened to the run. */
+export type AutomationDecisionResult = {
+  /** The gate that was decided. */
+  approval_id: string;
+  /** What it was decided as. */
+  decision: "approved" | "rejected";
+  /** The run that was let go (approved) or ended (rejected). */
+  execution_id: string;
+  /** `running` after an approval, `cancelled` after a rejection. */
+  execution_status: string;
+};
+
+/** `GET /api/v1/approvals` — the gates waiting in one organization. */
+export function fetchApprovals(
+  options: { organizationId?: string | null; status?: "pending" | "decided" } = {},
+): Promise<{ approvals: AutomationApproval[]; total: number }> {
+  const query = new URLSearchParams();
+  if (options.organizationId) {
+    query.set("organization_id", options.organizationId);
+  }
+  query.set("status", options.status ?? "pending");
+  return request<{ approvals: AutomationApproval[]; total: number }>(
+    `/api/v1/approvals?${query.toString()}`,
+  );
+}
+
+/**
+ * `POST /api/v1/approvals/{id}/decide` — let a parked run go on, or end it.
+ *
+ * The token is sent in the body, never in the path: a token in a URL is written to every
+ * access log on the way in, and an approval is a credential that can let a message leave
+ * the process. A repeat press is answered `200` with the decision the gate already has,
+ * so a double click cannot apply twice.
+ *
+ * **No token is sent from the panel**, and that is the point of the split: the *authority*
+ * to decide is the session's `workflows.approve`, which this screen's route guard already
+ * checked, while the token is the second factor a notification carries. A decider who
+ * followed a link brings one and it is checked; a decider who opened the panel brings their
+ * session, which is the same power by a different route.
+ */
+export function decideApproval(
+  approvalId: string,
+  decision: "approved" | "rejected",
+  note?: string,
+): Promise<AutomationDecisionResult> {
+  return request<AutomationDecisionResult>(
+    `/api/v1/approvals/${encodeURIComponent(approvalId)}/decide`,
+    { method: "POST", body: JSON.stringify({ decision, note: note ?? null }) },
+  );
+}
+
 /** A newly minted hook token — the only response that carries one. */
 export type AutomationHookToken = {
   /** The URL to give the caller, token included. */
@@ -3526,6 +3623,13 @@ export type AutomationInput = {
   hook_triggered?: boolean;
   /** The rule's own failure policy; a step that inherits takes this. */
   on_error?: AutomationOnError;
+  /**
+   * Whose authority the rule's host actions run with; `null` follows the author.
+   *
+   * The API resolves it at *run* time, so handing a rule to a service account changes what
+   * happens from the next run — which is what a settings field is expected to do.
+   */
+  run_as_user_id?: string | null;
   actions: AutomationStep[];
 };
 

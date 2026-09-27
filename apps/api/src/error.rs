@@ -114,6 +114,17 @@ impl ApiError {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    /// The sentence a client reads.
+    ///
+    /// Public because a refusal's wording is part of its contract: a test that asserts
+    /// "this 404 does not name the gate" cannot reach a private field, and a test that only
+    /// asserts the *code* would not notice a sentence that started leaking the id. It is
+    /// never used to build a response — `IntoResponse` reads the field directly.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl From<CoreError> for ApiError {

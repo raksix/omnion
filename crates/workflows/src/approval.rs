@@ -322,6 +322,14 @@ pub async fn end_at_rejection(
     step_id: Uuid,
     reason: &str,
 ) -> Result<()> {
+    // The steps *after* the gate are closed first, with the branch's own sentence — "the
+    // run ended before this step" — which is right for them. Order matters: this helper
+    // exempts one `step_id` and stamps the rest, so it has to run *before* the gate's own
+    // row is written, or the gate's real reason gets overwritten by the generic one and an
+    // operator reading the trace sees a step that "never ran" rather than one a person
+    // refused.
+    let _ = crate::store::end_run_after_branch(pool, execution_id, step_id).await?;
+
     sqlx::query(
         "update workflow_steps set status = 'cancelled', finished_at = now(), error = $2 \
          where id = $1 and status in ('waiting', 'pending', 'running')",
@@ -331,8 +339,31 @@ pub async fn end_at_rejection(
     .execute(pool)
     .await?;
 
-    let _ = crate::store::end_run_after_branch(pool, execution_id, step_id).await?;
-    crate::store::settle_execution_as(pool, execution_id, "cancelled").await?;
+    // Settle the run **from `awaiting_approval`, not from `running`**. This is the bug the
+    // first version of this function had: it reached for the store's `settle_execution_as`,
+    // which guards on `status = 'running'`, and a rejection happens while the run is
+    // *parked* — so the write matched zero rows and the run sat in `awaiting_approval`
+    // forever, with a gate that said "rejected" and a trace that never ended. The two
+    // voluntary endings (a branch, a stop) both run from `running` and the store's guard is
+    // right for them; a rejection is the one ending that starts from a parked run, so it
+    // needs its own predicate.
+    let settled = sqlx::query(
+        "update workflow_executions set status = 'cancelled', finished_at = now(), \
+         approval_id = null where id = $1 and status = 'awaiting_approval'",
+    )
+    .bind(execution_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if settled == 0 {
+        // Not parked: the run was cancelled, failed or completed between the decision and
+        // this write. A decision on a run that is no longer waiting is not an error — the
+        // caller already answered from the row it read — so the ending falls back to the
+        // store's ordinary guard and lets whoever won the race stand.
+        crate::store::settle_execution_as(pool, execution_id, "cancelled").await?;
+    }
+
     Ok(())
 }
 
@@ -467,6 +498,194 @@ pub async fn open(
     Ok(issued)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The reads the panel makes
+// ---------------------------------------------------------------------------------------------
+
+/// Columns of one gate, joined with the step it parks and the rule it came from.
+pub const APPROVAL_COLUMNS: &str = "a.id, a.execution_id, a.step_id, a.step_no, \
+     a.organization_id, a.rule_id, a.requested_at, a.expires_at, a.decision, a.decided_by, \
+     a.decided_at, a.note, s.name as step_name, s.params, w.name as rule_name";
+
+/// One gate, with the step's name and parameters and the rule's name.
+///
+/// The join is not decoration: the panel's pending panel draws a row per gate, and asking
+/// for the step name and the rule name with three more queries *per row* is what a list of
+/// twenty waiting gates turns into sixty round trips. One statement, one round trip.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ApprovalRow {
+    /// Approval id.
+    pub id: Uuid,
+    /// The run that is parked.
+    pub execution_id: Uuid,
+    /// The step inside that run.
+    pub step_id: Uuid,
+    /// Its 1-based position.
+    pub step_no: i32,
+    /// Organization the gate belongs to.
+    pub organization_id: Uuid,
+    /// The rule that asked, when the rule still exists.
+    pub rule_id: Option<Uuid>,
+    /// When the run parked.
+    pub requested_at: OffsetDateTime,
+    /// When the gate stops accepting decisions.
+    pub expires_at: OffsetDateTime,
+    /// `approved`, `rejected` or `null`.
+    pub decision: Option<String>,
+    /// Who decided, once somebody has.
+    pub decided_by: Option<Uuid>,
+    /// When they decided.
+    pub decided_at: Option<OffsetDateTime>,
+    /// Their note.
+    pub note: Option<String>,
+    /// The gated step's name.
+    pub step_name: String,
+    /// The gated step's parameters, read back through [`params_from`].
+    pub params: serde_json::Value,
+    /// The rule's name, when the rule still exists.
+    pub rule_name: Option<String>,
+}
+
+impl ApprovalRow {
+    /// The gate's own parameters, read the way the engine read them when it wrote the row.
+    ///
+    /// A row whose parameters no longer parse falls back to the defaults rather than
+    /// failing: a gate is still a gate, and a panel that refuses to list it because one
+    /// column drifted is worse than one that lists it with the platform's own values.
+    #[must_use]
+    pub fn params(&self) -> ApprovalParams {
+        params_from(&self.params).unwrap_or_default()
+    }
+
+    /// `true` when nobody has decided and the deadline has passed.
+    #[must_use]
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.decision.is_none() && self.expires_at <= now
+    }
+}
+
+fn approval_select(extra: &str) -> String {
+    format!(
+        "select {APPROVAL_COLUMNS} from workflow_approvals a \
+         join workflow_steps s on s.id = a.step_id \
+         left join workflows w on w.id = a.rule_id {extra}"
+    )
+}
+
+/// The gates of one organization, oldest first.
+///
+/// `decided` picks the side: `false` is the pending queue, `true` the trail. The predicate
+/// is `(decision is not null) = $2` rather than a second query — one statement, and the
+/// "no rows" answer is the same for both sides.
+pub async fn list(
+    pool: &PgPool,
+    organization_id: Uuid,
+    decided: bool,
+    limit: i64,
+) -> Result<Vec<ApprovalRow>> {
+    let sql = approval_select(
+        "where a.organization_id = $1 and (a.decision is not null) = $2 \
+         order by a.requested_at asc, a.id limit $3",
+    );
+
+    let rows: Vec<ApprovalRow> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(decided)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows)
+}
+
+/// One gate, with its step and rule.
+pub async fn find(pool: &PgPool, approval_id: Uuid) -> Result<Option<ApprovalRow>> {
+    let row: Option<ApprovalRow> = sqlx::query_as(&approval_select("where a.id = $1"))
+        .bind(approval_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row)
+}
+
+/// Decide a gate, once, optionally checking the token that was issued for it.
+///
+/// The one statement that is the whole single-use story: `decision is null` means a second
+/// decision matches zero rows, and the caller can report "somebody already decided this"
+/// rather than applying twice.
+///
+/// The token is **optional** and that is a deliberate split of the two things a gate
+/// involves:
+///
+/// * the *authority* to decide is the caller's `workflows.approve` — the route guard, not
+///   this function. A session that holds it may open any gate of its organization, which
+///   is what the pending panel needs and what "a person with the deciding permission may
+///   let this go" has to mean;
+/// * the *token* is the second factor a notification carries. It is checked here when it
+///   is sent, so a forwarded link whose token belongs to a different gate decides nothing,
+///   and a replay of one that was already used matches nothing either.
+///
+/// `None` therefore means "no second factor presented", never "no authority": the guard
+/// has already answered the second question. A token that does not match and a gate that
+/// does not exist both come back as `None`, so the caller can answer one way and cannot
+/// become an oracle for which gates exist.
+pub async fn decide(
+    pool: &PgPool,
+    approval_id: Uuid,
+    token: Option<&str>,
+    decision: Decision,
+    decided_by: Uuid,
+    note: Option<&str>,
+) -> Result<Option<Gate>> {
+    let sql = match token {
+        Some(_) => {
+            "update workflow_approvals set decision = $3, decided_by = $4, decided_at = now(), \
+             note = $5 where id = $1 and decision_token_hash = $2 and decision is null \
+             returning execution_id, step_id"
+        }
+        // The same statement with the token predicate dropped — written out rather than
+        // built with a placeholder, so the two shapes are both visible in the source and
+        // neither can be reached with a null comparison.
+        None => {
+            "update workflow_approvals set decision = $2, decided_by = $3, decided_at = now(), \
+             note = $4 where id = $1 and decision is null returning execution_id, step_id"
+        }
+    };
+
+    let row: Option<Gate> = match token {
+        Some(token) => {
+            sqlx::query_as(sql)
+                .bind(approval_id)
+                .bind(hash_token(token))
+                .bind(decision.as_str())
+                .bind(decided_by)
+                .bind(note)
+                .fetch_optional(pool)
+                .await?
+        }
+        None => {
+            sqlx::query_as(sql)
+                .bind(approval_id)
+                .bind(decision.as_str())
+                .bind(decided_by)
+                .bind(note)
+                .fetch_optional(pool)
+                .await?
+        }
+    };
+
+    Ok(row)
+}
+
+/// What a decision wrote: the run and the step it touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct Gate {
+    /// The parked run.
+    pub execution_id: Uuid,
+    /// The gated step.
+    pub step_id: Uuid,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +799,89 @@ mod tests {
             deadline > opened,
             "a gate that is already dead is refused at write time"
         );
+    }
+
+    #[test]
+    fn an_expired_gate_is_one_nobody_decided_and_the_clock_passed() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let row = ApprovalRow {
+            id: Uuid::nil(),
+            execution_id: Uuid::nil(),
+            step_id: Uuid::nil(),
+            step_no: 1,
+            organization_id: Uuid::nil(),
+            rule_id: None,
+            requested_at: now,
+            expires_at: now + Duration::hours(1),
+            decision: None,
+            decided_by: None,
+            decided_at: None,
+            note: None,
+            step_name: "gate".to_owned(),
+            params: serde_json::json!({}),
+            rule_name: None,
+        };
+
+        assert!(!row.is_expired(now), "an hour is left");
+        // The boundary is `<=`, not `<`: a gate whose deadline is exactly now has stopped
+        // accepting decisions, because the write that decides it is guarded the same way.
+        // A gate one second *before* its deadline is still open — that is the second the
+        // decider's click has to beat.
+        assert!(
+            !row.is_expired(now + Duration::hours(1) - Duration::seconds(1)),
+            "one second before the deadline is still open"
+        );
+        assert!(
+            row.is_expired(now + Duration::hours(1)),
+            "on the deadline is not"
+        );
+        assert!(row.is_expired(now + Duration::days(9)));
+        // A gate somebody already decided is not "expired" whatever the clock says: it is
+        // decided, and the panel shows that instead of offering a button.
+        let decided = ApprovalRow {
+            decision: Some("rejected".to_owned()),
+            ..row.clone()
+        };
+        assert!(!decided.is_expired(now + Duration::days(9)));
+    }
+
+    #[test]
+    fn a_gate_row_reads_its_parameters_the_way_the_engine_wrote_them() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let base = ApprovalRow {
+            id: Uuid::nil(),
+            execution_id: Uuid::nil(),
+            step_id: Uuid::nil(),
+            step_no: 1,
+            organization_id: Uuid::nil(),
+            rule_id: None,
+            requested_at: now,
+            expires_at: now,
+            decision: None,
+            decided_by: None,
+            decided_at: None,
+            note: None,
+            step_name: "gate".to_owned(),
+            params: serde_json::json!({
+                "permission": "content.pages.publish",
+                "message": "publish this?",
+                "expires_in_hours": 4,
+            }),
+            rule_name: None,
+        };
+
+        let params = base.params();
+        assert_eq!(params.permission, "content.pages.publish");
+        assert_eq!(params.message, "publish this?");
+        assert_eq!(params.expires_in_hours, 4);
+
+        // A row whose parameters drifted (a definition edited under an open gate) falls back
+        // to the platform's own values rather than failing the list it appears in.
+        let drifted = ApprovalRow {
+            params: serde_json::json!({ "permission": "!!!" }),
+            ..base
+        };
+        assert_eq!(drifted.params().permission, APPROVAL_PERMISSION);
     }
 
     #[test]

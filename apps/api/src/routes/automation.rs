@@ -206,6 +206,13 @@ pub struct CatalogueResponse {
     pub branch_operators: Vec<CatalogueOperator>,
     /// The step kinds a definition may carry, in the order the editor lists them.
     pub step_kinds: Vec<&'static str>,
+    /// The permission that may decide a parked `approval` step, and the default lifetime of
+    /// a gate in hours — the editor offers both, and both come from the engine rather than
+    /// from a constant written in the panel.
+    pub approval_permission: &'static str,
+    /// The default and the ceiling of a gate's lifetime, in hours.
+    pub approval_ttl_hours: i32,
+    pub max_approval_ttl_hours: i32,
     /// What a step's own failure may do; `inherit` takes the rule's policy.
     pub on_error_policies: Vec<&'static str>,
     /// The longest a step may block, in milliseconds, and the default.
@@ -262,8 +269,13 @@ pub fn catalogue() -> CatalogueResponse {
                 needs_value: !matches!(*key, "exists" | "not_exists"),
             })
             .collect(),
-        step_kinds: vec!["task", "wait", "branch", "stop"],
+        // `approval` joins the four: it is an engine kind (the engine decides it, no action
+        // is named) and it is the one that *parks on a person* rather than on a clock.
+        step_kinds: vec!["task", "wait", "branch", "stop", "approval"],
         on_error_policies: vec!["inherit", "stop", "continue"],
+        approval_permission: omnion_workflows::APPROVAL_PERMISSION,
+        approval_ttl_hours: omnion_workflows::approval::DEFAULT_TTL_HOURS,
+        max_approval_ttl_hours: omnion_workflows::approval::MAX_TTL_HOURS,
         max_step_timeout_ms: omnion_workflows::MAX_STEP_TIMEOUT_MS,
         default_step_timeout_ms: omnion_workflows::DEFAULT_STEP_TIMEOUT_MS,
         outbound_methods: omnion_workflows::actions::OUTBOUND_METHODS.to_vec(),
@@ -1393,7 +1405,11 @@ mod tests {
             operators,
             "a branch uses the same operators the conditions do"
         );
-        assert_eq!(catalogue.step_kinds, vec!["task", "wait", "branch", "stop"]);
+        assert_eq!(
+            catalogue.step_kinds,
+            vec!["task", "wait", "branch", "stop", "approval"],
+            "the editor offers every kind the engine can run, and no more"
+        );
         assert_eq!(
             catalogue.on_error_policies,
             vec!["inherit", "stop", "continue"]

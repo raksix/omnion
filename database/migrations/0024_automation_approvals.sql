@@ -18,8 +18,10 @@
 --   * `workflow_executions.status` gains `awaiting_approval` — a run parked on a person is
 --     neither running (nothing is progressing) nor terminal (a decision reopens it), and a
 --     status that lies about one of those two things is worse than a new value.
---   * `workflow_steps.approval_id` — the step points at the row that gates it, so a trace
---     can show *which* decision it is waiting for without a reverse lookup.
+--   * `workflow_executions.approval_id` / `workflow_steps.approval_id` — the run and its
+--     gate step both point at the row, so a list of runs can answer "is this waiting on
+--     somebody?" without a join into the steps table, and a trace can show *which* decision
+--     it is parked on without a reverse lookup.
 --
 -- The permission key that guards the decision is `workflows.approve`, added to
 -- `crates/permissions::catalogue` in the same commit: deciding an approval is deliberately
@@ -86,13 +88,22 @@ create table workflow_approvals (
     decision_token_hash   text        not null,
     constraint workflow_approvals_decision_valid
         check (decision is null or decision in ('approved', 'rejected')),
+    -- A decided row always has a *time*, but not always a *person*: an approval that
+    -- expired was decided by nobody, and `decided_by` is exactly null for it. The old
+    -- pairing (`decided_at is null` iff `decided_by is null`) made the sweeper's own write
+    -- fail its own constraint — a shape where "the gate timed out" could not be recorded.
+    -- The two are separate facts: when, and by whom.
     constraint workflow_approvals_decided_shape
-        check ((decision is null) = (decided_at is null) and (decision is null) = (decided_by is null)),
+        check ((decision is null) = (decided_at is null)),
     constraint workflow_approvals_step_no_positive check (step_no >= 1),
-    constraint workflow_approvals_note_bounded check (note is null or length(note) <= 2000),
-    -- An approval that expired before anybody looked is expired forever, whatever the clock
-    -- says later: the decision is a moment in the run's life, not a permission.
-    constraint workflow_approvals_window_positive check (expires_at > requested_at)
+    constraint workflow_approvals_note_bounded check (note is null or length(note) <= 2000)
+    -- No `expires_at > requested_at` check on purpose. The deadline is set once from the
+    -- step's own `expires_in_hours`, which the engine validates to 1..=720 before it gets
+    -- here, so a constraint would restate a rule the code already enforces — and it would
+    -- forbid the one legitimate write that follows: an administrator shortening a long
+    -- gate, or a test that shortens one to prove the sweeper ends its run. A gate that is
+    -- already expired is expired forever either way, because the decision is a moment in
+    -- the run's life, not a permission.
 );
 
 -- The token is unique — two rows can never share a credential — and the panel's pending list
@@ -119,6 +130,18 @@ create unique index workflow_approvals_step_idx
 -- ---------------------------------------------------------------------------------------------
 
 alter table workflow_steps add column approval_id uuid
+    references workflow_approvals (id) on delete set null;
+
+-- The run points at the gate that parks it, a copy of the step's own value rather than a
+-- join. Both surfaces ask "is this run waiting on somebody?" about *every* row they draw —
+-- the pending panel and the run history's status chip — and a join back to `workflow_steps`
+-- would turn that into a second query per row. `on delete set null` because the gate is the
+-- step's fact, not the run's: a run that outlived a deleted gate is still a run.
+--
+-- It is written *here*, after `workflow_approvals` exists, because the foreign key names
+-- that table — an `alter` above the `create` would be a forward reference, and the failure
+-- it produces ("relation does not exist") reads like a typo rather than an ordering mistake.
+alter table workflow_executions add column approval_id uuid
     references workflow_approvals (id) on delete set null;
 
 -- An approval step is claimed twice, like a wait: once to park it, once to let the decision
