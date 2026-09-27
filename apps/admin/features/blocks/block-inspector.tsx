@@ -182,7 +182,7 @@ export function BlockInspector({
         </nav>
       ) : null}
 
-      <div className="rounded-xl border border-line bg-surface">
+      <div className="rounded-xl border border-line bg-surface" data-block-inspector>
         <div className="flex items-center justify-between border-b border-line px-3 py-2">
           <h2 className="text-[13px] font-medium">{definition?.label ?? block.type}</h2>
           {definition ? (

@@ -3680,7 +3680,13 @@ async function runBlockEditorDepth(page, report) {
     (await page.locator('a[href^="/pages/"][href$="/edit"]').count()) > 0;
 
   // The editor's address is the page's id, so the row's own link is how a person gets there.
-  const editorLink = page.locator('a[href^="/pages/"][href$="/edit"]').first();
+  // It has to be *this page's* row: the list carries a row per page, and the first link on the
+  // screen belongs to whichever page sorts first — which after a fresh database is a different
+  // page every run, and the pass would then drive somebody else's content.
+  const ownRow = page.locator("tr", { hasText: "QA block page" });
+  const editorLink = (await ownRow.count()) > 0
+    ? ownRow.locator('a[href^="/pages/"][href$="/edit"]').first()
+    : page.locator('a[href^="/pages/"][href$="/edit"]').first();
   if ((await editorLink.count()) === 0) {
     steps.blocked = "no page row carried an editor link";
     report.blockEditor = steps;
@@ -3709,7 +3715,9 @@ async function runBlockEditorDepth(page, report) {
   await page.waitForTimeout(300);
 
   // A heading first, then a text, then a columns container: the container is what proves
-  // nesting, and the heading is what the heading-order rule is about.
+  // nesting, and the heading is what the heading-order rule is about. The heading's text is
+  // required, so the pass fills it the moment the block lands — that is the flow the REQ asks
+  // for, and a heading left empty would block the publish for a reason the pass created.
   await page.locator("[data-block-insert-option=heading]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(500);
   await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
@@ -3726,7 +3734,8 @@ async function runBlockEditorDepth(page, report) {
   // ---- Inspector ----------------------------------------------------------------------------
   // The heading's text prop: `heading`'s first prop is the text, and the panel generated it
   // from the schema, so it is the field the schema names.
-  const headingField = page.locator('[data-block-inspector] label').filter({ hasText: "Heading" }).locator("input, textarea, select").first();
+  // The heading was selected as it landed, so its text field is the one the schema names.
+  const headingField = page.locator("#block-prop-text").first();
   await headingField.fill("QA heading from the walkthrough").catch(() => {});
   await page.waitForTimeout(900);
   steps.inspectedValue = (await page.locator('[data-block-canvas-block=heading]').first().innerText().catch(() => "")).replace(/\s+/g, " ").trim();
@@ -3742,7 +3751,7 @@ async function runBlockEditorDepth(page, report) {
   if ((await rows.count()) > 1) {
     await rows.nth(1).click({ timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(400);
-    const textField = page.locator('[data-block-inspector] label').filter({ hasText: "Text" }).locator("textarea").first();
+    const textField = page.locator("#block-prop-text").first();
     await textField.fill("A paragraph written by the QA walkthrough.").catch(() => {});
     await page.waitForTimeout(800);
   }
@@ -3771,12 +3780,30 @@ async function runBlockEditorDepth(page, report) {
   steps.issueMessages = await page.locator("[data-block-issues] li").count();
   await shot(page, "page-block-editor-validation");
 
+  // The summary is a way INTO the problem, not a number: clicking it selects the first block
+  // that needs attention, which is the only way a blocking issue on a block the author is not
+  // looking at was ever reachable.
+  await page.locator("[data-block-first-issue]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.firstIssueSelectable = (await page.locator("[data-block-inspector]").count()) > 0;
+  steps.issueVisibleAfterJump = (await page.locator("[data-block-issues] li").count()) > 0;
+  note("jumped to the first blocking block");
+
   // Filling the field clears it, and the same page then publishes — which is the whole point of
   // validation being the API's: the editor and the save can never disagree about it.
-  const imageBlockRow = page.locator("[data-block-outline-row]").last();
-  await imageBlockRow.click({ timeout: 5000 }).catch(() => {});
+  const imageBlockRow = page.locator("[data-block-canvas-block=image]").first();
+  if ((await imageBlockRow.count()) > 0) {
+    await imageBlockRow.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  // An image needs both halves: the URL and the alternative text. Filling only the alt leaves
+  // the required `src` blocking, which is the API being right and the pass being incomplete.
+  const srcField = page.locator("#block-prop-src").first();
+  await srcField
+    .fill("/api/v1/public/media/00000000-0000-0000-0000-000000000000")
+    .catch(() => {});
   await page.waitForTimeout(500);
-  const altField = page.locator('[data-block-inspector] label').filter({ hasText: "Alternative text" }).locator("input, textarea").first();
+  const altField = page.locator("#block-prop-alt").first();
   await altField.fill("A screenshot of the QA walkthrough").catch(() => {});
   await page.waitForTimeout(1000);
   steps.clearedAfterFix =
@@ -3811,11 +3838,21 @@ async function runBlockEditorDepth(page, report) {
   note("deleted a block");
 
   // ---- Save and publish ---------------------------------------------------------------------
-  await page.locator("[data-block-save]").first().click({ timeout: 6000 }).catch(() => {});
-  await page.waitForTimeout(1800);
-  steps.saved =
-    (await page.locator("[data-block-status]").innerText().catch(() => "")).includes("Last saved") ||
-    (await page.locator("text=revision").count()) > 0;
+  // The save is proven by the revision the server reports, not by the editor's own clock:
+  // "Last saved" is printed from the page it loaded, so it is true the moment the screen opens
+  // and would happily have passed a save that never happened.
+  const beforeSave = Number(
+    (await page.locator("[data-block-status]").getAttribute("data-block-count").catch(() => "0")) || 0,
+  );
+  await page.locator("[data-block-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.saveNotice = (
+    await page.locator("[role=alert], p.text-muted").allInnerTexts().catch(() => [])
+  )
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  steps.saved = /revision/i.test(steps.saveNotice) && beforeSave > 0;
   await shot(page, "page-block-editor-saved");
 
   await page.locator("[data-block-publish]").first().click({ timeout: 8000 }).catch(() => {});
@@ -3826,8 +3863,13 @@ async function runBlockEditorDepth(page, report) {
   // ---- The page really renders ---------------------------------------------------------------
   // The public renderer draws the published block tree; a page that saved but renders nothing
   // is the "preview lies" bug the REQ names, and it is only visible from the outside.
-  await page.goto(`${URL_WEB}/qa-block-page`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1600);
+  // `?site=` is how a renderer addresses a site on a multi-site installation: the QA stack
+  // serves on 127.0.0.1, which resolves no domain, so without it the renderer is answering
+  // "this request does not address one site" and the page looks broken.
+  await page
+    .goto(`${URL_WEB}/qa-block-page?site=${CREDS.siteKey}`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(2200);
   const rendered = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
   steps.publicRendered = rendered.includes("QA heading from the walkthrough");
   steps.publicHasSemanticFigure = (await page.locator("figure").count()) > 0;

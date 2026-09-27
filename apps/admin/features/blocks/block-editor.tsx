@@ -90,6 +90,10 @@ export function BlockEditor() {
   const [selected, setSelected] = useState<number[] | null>(null);
   const [issues, setIssues] = useState<BlockIssue[]>([]);
   const [canPublish, setCanPublish] = useState(true);
+  // "The API has not answered yet" is its own fact, not the absence of a blocking issue. Folding
+  // the two together made a freshly opened editor claim the API was unreachable for the 250ms
+  // before the first dry run landed.
+  const [validated, setValidated] = useState(false);
   const [blockCount, setBlockCount] = useState(0);
   const [insertOpen, setInsertOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -167,11 +171,13 @@ export function BlockEditor() {
           setIssues(result.issues);
           setCanPublish(result.can_publish);
           setBlockCount(result.block_count);
+          setValidated(true);
         })
         .catch(() => {
           // A dry run that cannot be reached must not silently report "fine": the page keeps its
-          // last known answer and the save below is the one that will really be refused.
+          // last known answer, publishing is held back, and the bar says why.
           setCanPublish(false);
+          setValidated(false);
         });
     }, 250);
     return () => {
@@ -185,6 +191,18 @@ export function BlockEditor() {
   const selectedBlock = selected ? blockAt(blocks, selected) : undefined;
   const selectedIssues = selectedBlock ? (issueMap.get(selectedBlock.id) ?? []) : [];
   const blocking = issues.filter((issue) => issue.severity === "error");
+  // The path of the first block that needs attention, so the summary in the bottom bar is a
+  // way *into* the problem rather than a number the author has to go hunting for. Before this,
+  // a blocking issue on a block that is not selected was counted in the bar and visible
+  // nowhere else — "1 block needs attention" with no way to reach it is a dead end.
+  const firstBlockingPath = (() => {
+    const first = blocking[0];
+    if (!first) {
+      return null;
+    }
+    const entry = walk(blocks).find(({ block }) => block.id === first.block_id);
+    return entry ? entry.path : null;
+  })();
   const words = useMemo(() => wordCount(blocks), [blocks]);
   const crumbs = useMemo(
     () => (registry && selected ? breadcrumb(registry, blocks, selected) : []),
@@ -204,13 +222,19 @@ export function BlockEditor() {
       }
       const block = newBlock(definition);
       setBlocks((current) => {
+        // The new block is selected as it lands. An author who pressed *Heading* is about to
+        // type a heading, and an editor that makes them find the new row in the outline first
+        // is an editor they will use once and then stop opening.
         if (!selected || selected.length === 0) {
+          setSelected([current.length]);
           return [...current, block];
         }
         const parent = blockAt(current, selected);
         if (parent?.children && !definition.container) {
+          setSelected([...selected, parent.children.length]);
           return appendChild(current, selected, block);
         }
+        setSelected([...selected.slice(0, -1), selected[selected.length - 1] + 1]);
         return insertAfter(current, selected, block);
       });
       setInsertOpen(false);
@@ -428,6 +452,7 @@ export function BlockEditor() {
                   <li key={block.id}>
                     <button
                       type="button"
+                      data-block-outline-row
                       onClick={() => setSelected(path)}
                       aria-current={
                         selected?.join("-") === path.join("-") ? "true" : undefined
@@ -566,9 +591,16 @@ export function BlockEditor() {
           {words} words · {blockCount} blocks
         </span>
         {blocking.length > 0 ? (
-          <span className="font-medium text-accent-strong">
+          <button
+            type="button"
+            data-block-first-issue
+            onClick={() => setSelected(firstBlockingPath ?? selected)}
+            title={firstBlockingPath ? "Go to the first block that needs attention" : undefined}
+            className="font-medium text-accent-strong underline decoration-accent/40 underline-offset-2 transition hover:decoration-accent"
+          >
             {blocking.length} block{blocking.length === 1 ? "" : "s"} need attention
-          </span>
+            {firstBlockingPath ? " — show me" : ""}
+          </button>
         ) : issues.length > 0 ? (
           <span className="text-caution">
             {issues.length} warning{issues.length === 1 ? "" : "s"}
@@ -578,7 +610,11 @@ export function BlockEditor() {
         )}
         <span className="ml-auto">
           {savedAt ? `Last saved ${new Date(savedAt).toLocaleTimeString()}` : "Not saved yet"}
-          {canPublish ? "" : " · the API could not be reached to confirm the tree"}
+          {validated
+            ? ""
+            : canPublish
+              ? " · checking…"
+              : " · the API could not be reached to confirm the tree"}
         </span>
         <button
           type="button"
