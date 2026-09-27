@@ -40,16 +40,21 @@ import { BlockCanvas } from "@/features/blocks/block-canvas";
 import { BlockInspector, InsertPanel } from "@/features/blocks/block-inspector";
 import { blockLabel, blockSummary, definitionFor } from "@/features/blocks/block-library";
 import {
+  MAX_COLUMNS,
   MAX_DEPTH,
+  MIN_COLUMNS,
+  addColumn,
   appendChild,
   blockAt,
   breadcrumb,
   cloneWithNewIds,
   duplicateBlock,
   insertAfter,
+  insertColumns,
   moveBlock,
   newBlock,
   removeBlock,
+  removeColumn,
   setProp,
   walk,
   wordCount,
@@ -220,6 +225,19 @@ export function BlockEditor() {
         );
         return;
       }
+      // A Columns block is not a single node: inserting one has to bring the column wrappers
+      // with it, because "two of these side by side" needs each column to be its own node. The
+      // author lands inside the first column, which is the block they are about to fill.
+      if (definition.key === "columns") {
+        setBlocks((current) => {
+          const placed = insertColumns(current, selected ?? [], definition);
+          setSelected(placed.path);
+          return placed.blocks;
+        });
+        setInsertOpen(false);
+        setActionError(null);
+        return;
+      }
       const block = newBlock(definition);
       setBlocks((current) => {
         // The new block is selected as it lands. An author who pressed *Heading* is about to
@@ -229,7 +247,13 @@ export function BlockEditor() {
           setSelected([current.length]);
           return [...current, block];
         }
+        // Selecting a `column` puts the block inside that column rather than beside the
+        // Columns block — the same rule as selecting any other container.
         const parent = blockAt(current, selected);
+        if (parent?.type === "column" && !definition.container) {
+          setSelected([...selected, (parent.children?.length ?? 0)]);
+          return appendChild(current, selected, block);
+        }
         if (parent?.children && !definition.container) {
           setSelected([...selected, parent.children.length]);
           return appendChild(current, selected, block);
@@ -354,6 +378,20 @@ export function BlockEditor() {
   const position = selected ? (selected[selected.length - 1] ?? 0) : 0;
   const canMoveUp = selected ? position > 0 : false;
   const canMoveDown = selected ? position < siblings.length - 1 : false;
+
+  // The column controls belong to the Columns block, not to a column: the count is the layout's
+  // own property, so it is edited where the layout is selected and nowhere else. A column can
+  // only be removed from the inside, which is why the delete button on a column checks the
+  // count before it offers to take the blocks with it.
+  const columnsPath = selectedBlock?.type === "columns" ? selected : null;
+  const columnCount = columnsPath ? (blockAt(blocks, columnsPath)?.children?.length ?? 0) : 0;
+  const canAddColumn = columnsPath !== null && columnCount < MAX_COLUMNS;
+  const isColumn = selectedBlock?.type === "column";
+  const columnParentPath = isColumn && selected ? selected.slice(0, -1) : null;
+  const columnIndex = isColumn && selected ? (selected[selected.length - 1] ?? 0) : -1;
+  const canRemoveColumn =
+    columnParentPath !== null &&
+    (blockAt(blocks, columnParentPath)?.children?.length ?? 0) > MIN_COLUMNS;
 
   return (
     <div className="flex flex-col gap-4" data-block-editor>
@@ -510,6 +548,66 @@ export function BlockEditor() {
               onCrumb={setSelected}
               actions={
                 <>
+                  {columnsPath !== null ? (
+                    <button
+                      type="button"
+                      data-block-add-column
+                      onClick={() =>
+                        setBlocks((current) => addColumn(current, columnsPath))
+                      }
+                      disabled={!canAddColumn}
+                      aria-label="Add a column"
+                      title={
+                        canAddColumn
+                          ? "Add a column"
+                          : `A Columns block holds at most ${MAX_COLUMNS} columns`
+                      }
+                      className="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11.5px] transition hover:bg-canvas disabled:opacity-40"
+                    >
+                      <Plus className="size-3" aria-hidden />
+                      Add column
+                    </button>
+                  ) : null}
+                  {isColumn && columnParentPath !== null ? (
+                    <button
+                      type="button"
+                      data-block-remove-column
+                      onClick={() => {
+                        if (!canRemoveColumn) {
+                          setActionError(
+                            `A Columns block keeps at least ${MIN_COLUMNS} columns. Add another one before removing this.`,
+                          );
+                          return;
+                        }
+                        const filled =
+                          blockAt(blocks, columnParentPath)?.children?.[columnIndex]?.children
+                            ?.length ?? 0;
+                        if (
+                          filled > 0 &&
+                          !window.confirm(
+                            `This column holds ${filled} block${filled === 1 ? "" : "s"}. Removing the column removes ${filled === 1 ? "it" : "them"} too.`,
+                          )
+                        ) {
+                          return;
+                        }
+                        setActionError(null);
+                        setBlocks((current) =>
+                          removeColumn(current, columnParentPath, columnIndex),
+                        );
+                        setSelected(columnParentPath);
+                      }}
+                      aria-label="Remove this column"
+                      title={
+                        canRemoveColumn
+                          ? "Remove this column and everything in it"
+                          : `A Columns block keeps at least ${MIN_COLUMNS} columns`
+                      }
+                      className="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11.5px] text-accent-strong transition hover:bg-accent-soft"
+                    >
+                      <Trash2 className="size-3" aria-hidden />
+                      Remove column
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() =>
