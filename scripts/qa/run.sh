@@ -67,8 +67,13 @@ step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
-if [ ! -x target/debug/omnion-api ]; then
-  step "building the API (first pass only)"
+# A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
+# a migration edited after the last build is silently the previous version — and a syntax error in
+# it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
+# than the newest migration, which is cheap when nothing changed and correct when something did.
+if [ ! -x target/debug/omnion-api ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+  step "building the API (first pass, or a migration changed since the last build)"
   cargo build -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
