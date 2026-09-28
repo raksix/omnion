@@ -2476,3 +2476,55 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
 - **Next.** REQ-126 slice 2 — the metric registry with the documented families, the cardinality
   budget enforced at registration, `GET /metrics` in the Prometheus text format, the catalogue
   seeded from the registry, and the catalogue and chart screen.
+
+## 2026-09-28 · REQ-126 slice 2 — the metric registry, the cardinality guard, `/metrics`, the catalogue and its screen
+
+**What.** `crates/telemetry::metrics` declares the 21 families the request names and enforces the
+label rules in one place: labels are positional and closed (a recorder offering a `user_id` has it
+truncated away), a bounded position learns its first 24 values and folds the rest into `other`, and
+a family at its series cap folds the sample and counts it in
+`omnion_registry_budget_exceeded{family=…}`. Each series keeps a bounded one-minute ring so a chart
+is a delta for a counter, a last value for a gauge and a mean for a histogram — anything else makes
+the chart disagree with the metric's own semantics. Migration `0037_metric_catalog.sql` projects
+the registry into `obs_metric_catalog` so the panel documents what the process can record;
+`GET /metrics` is unversioned and unauthenticated beside the probes, and the request middleware
+records the two HTTP families from the same completed context the log line is built from.
+
+**Proof.**
+- `cargo test -p omnion-telemetry --quiet` → **54 passed, 0 failed** (19 of them new).
+- `cargo test -p omnion-api --test observability_metrics` → **10 passed, 0 failed** against
+  `omnion_w6_dev`, including the traffic walk (two ids → one series, value 2, status class),
+  the three-way budget report, the resync audit and the content-type.
+- Regression: `observability_logs` 3/3, `secret_audit` 2/2, `omnion-permissions` 63/63.
+- `pnpm typecheck` → 2/2 (admin + web).
+- QA: the private stack (`w6`, 18085/3105/3205) with the new route and a scoped depth pass —
+  see the counters below.
+
+**Three defects the walk found, all of them mine.**
+1. **A duplicate `# HELP` line makes Prometheus refuse the WHOLE scrape.** The budget counter is a
+   declared family *and* the exposition wrote its header a second time when it emitted a sample.
+   Every unit test was green because each one greps for a single line; a scraper is not. Now the
+   derived block emits samples only, and a test asserts exactly one HELP and one TYPE per name.
+2. **The label-set overflow folded silently** — the acceptance line says a budget breach is
+   "reported and labelled, not silently dropped", and the first draft dropped into `other` and said
+   nothing. The integration test drove `BOUNDED_SET_CAP` and found it. The overflow now counts into
+   the same counter, because a fold is a fold whichever cap produced it.
+3. **A screen that renders a hard-coded list looks identical in a screenshot.** The depth pass
+   asserts the row count comes from the API and that selecting a second family changes the chart's
+   heading, which a wired-to-nothing selector would also satisfy by repainting.
+
+**Two test bugs worth recording, because both would have taught the next reader to distrust the
+assertion.** `"provider".contains("id")` is *true* — a substring test for an identity label rejects
+a correct family, so the check is now an exact-name list. And the traffic walk asserted the series
+ended in `1` when two requests were made: the assertion described a single request, so it passed
+against a correct counter and failed against the thing under test.
+
+**Not in this slice, and said so in the request file rather than ticked:** the exporters, alert
+rules, silences and settings screens (slice 4), the trace search (slice 3), and the
+`infra/observability/` bundle — the families it queries are now fixed and asserted by name, so that
+bundle has a contract to import against.
+
+**Next.** REQ-126 slice 3 — the tracing spine and the exporter pipeline: spans for HTTP → SQLx →
+queue publish, W3C `traceparent` propagation, parent-based sampling with the error bias, and the
+bounded exporter buffers with `omnion_exporter_dropped_total`.
+
