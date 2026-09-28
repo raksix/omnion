@@ -19,16 +19,23 @@
 
 pub mod error;
 pub mod model;
+pub mod preferences;
 pub mod store;
 pub mod vocabulary;
 
 pub use error::{NotificationError, Result};
-pub use model::{CategoryCount, ListQuery, NewNotification, Notification, NotificationPage, Summary};
+pub use model::{
+    CategoryCount, ListQuery, NewNotification, Notification, NotificationPage, Summary,
+};
+pub use preferences::{
+    DIGEST_CADENCES, IN_APP, PreferenceCell, Preferences, Settings, StatedPreference,
+    default_quiet_hours, validate_quiet_hours, validate_settings, validate_stated,
+};
 pub use store::{
     archive, delete, find, list, mark_all_read, record, record_many, set_read, set_read_many,
     summary, validate_categories, validate_channel, within_emit_budget,
 };
 pub use vocabulary::{
-    CATEGORIES, CHANNELS, EMIT_BUDGET_PER_MINUTE, MAX_BULK_IDS, MAX_PAGE, PRIORITIES,
-    is_category, is_channel, is_priority,
+    CATEGORIES, CHANNELS, EMIT_BUDGET_PER_MINUTE, MAX_BULK_IDS, MAX_PAGE, PRIORITIES, is_category,
+    is_channel, is_priority,
 };
