@@ -52,7 +52,10 @@ mod tests {
             NotificationError::invalid("category").code(),
             "invalid_notification"
         );
-        assert_eq!(NotificationError::BudgetExhausted.code(), "notification_rate_limited");
+        assert_eq!(
+            NotificationError::BudgetExhausted.code(),
+            "notification_rate_limited"
+        );
     }
 
     #[test]
