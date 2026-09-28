@@ -1,3 +1,127 @@
+## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
+
+build media: retention policies, the run log, the hold, and the reference repair
+
+REQ-010 slice 4's remaining half, and the last piece of the slice. Slice 1 gave the
+library a trash whose countdown was always the *site's* fallback and that no worker
+ever enforced; what is here is the policy itself — scoped to a site or a folder —
+plus the sweeps that act on it, the log that records every run, and the refusal that
+stops a purge from deleting a hero image a live page still resolves to.
+
+**0049_media_retention.sql**, `crates/media/src/retention.rs`,
+`apps/api/src/routes/media_retention.rs`, `apps/api/src/retention_runner.rs`,
+`features/media/retention-view.tsx` (a **Retention** tab on `/media/settings`) and the
+file's `LegalHold` block on the detail screen.
+
+**Six decisions, each a shortcut that produces a plausible wrong answer.** The
+**current version is exempt from the version sweep by number, never by age** — the
+obvious query, "delete every version older than N days", deletes the version `media`
+is serving and leaves `storage_key` naming an object that no longer exists, and the
+current version is the highest number in `media_versions` (the same one `next_version`
+hands out under a row lock). The **hold is a column on `media` rather than a flag on
+the policy**: three destructive sweeps must respect it, a policy flag would have to be
+joined into all three, and the first one somebody edits forgets the others — the
+forgotten one is the one that deletes evidence. A **purge refuses a referenced file
+and names the referrers**, because `media_references` cascades away with the file, so
+a purge *can* silently delete a hero image a published page resolves to. **A run that
+found nothing writes a row**, because retention is the one library feature whose
+absence of activity is indistinguishable from being broken, and a run's `summary`
+separates *nothing was eligible* from *N held* from *N still referenced* from *the run
+stopped early*. The **folder policy wins and the site policy is the fallback, never
+the shortest window of everything that matches** — a campaign folder cannot be
+shortened by a site-wide rule that happens to be tighter. And the **repair scan drops
+the other kind of lie**: a reference to a page deleted during a migration refuses a
+purge for ever, and only a referent the platform can *prove* is gone is dropped, so a
+module that arrives tomorrow does not find its usage rows already deleted.
+
+The worker reaches the sweep through the **route's** `run_once`, not a second copy of
+it: two answers to "what may this file go" is how a nightly sweep and an operator's
+click start disagreeing about the same row, and the operator who reads the screen is
+the one who is misled. And the tick is **minutes, not days** — a sweep is idempotent,
+so an empty tick is a no-op, and a worker that only ran at 02:00 has exactly one
+failure mode with nothing in between to show it.
+
+**Three defects in my own crate code, all caught by the unit tests written beside it.**
+`describe()` printed "30 days day(s)" because the format string spelled the unit *and*
+`plural_days` appended it — and a `contains("30 days")` assertion passes over that
+happily, so both spellings now assert the *absence* of "day(s)". The cross-field check
+defaulted the other window to the **minimum** (1) rather than the **column default**
+(30), so a create sending `purge_after_days = 5` passed validation and was then refused
+by the database as a bare constraint name; the defaults are now named constants bound
+to the insert, so the check and the write cannot disagree about what "the default" is.
+
+**The third is serde rather than logic, and it is the one worth remembering.**
+`Option<Option<Uuid>>` with `#[serde(default)]` *looks* like it carries "absent" and
+"null" separately. It does not — and neither does `Option<Value>`, because serde's
+`Option` visitor maps a `null` to `None` whatever the inner type is. So the explicit
+`folder_id: null` — the one edit an operator most often wants, "this rule was for one
+folder, now it is for everything" — silently arrived as "leave the scope alone", and
+the screen would have reported **saved** over an unchanged scope, which is the worst
+shape a save can have. The scope is now read from the *key's presence* in the raw map,
+which is the only place the distinction exists. The walk proves the **write** happens,
+not just the decode: it clears the scope, reads `folder_id` back out of PostgreSQL, and
+then proves the other half by sending a body that omits the field and finding the scope
+untouched.
+
+**One defect no unit test could have found, and it was the trigger again.** The
+`sites` trigger inserted a policy row without a `name`, and `name` is `not null` with
+no default — so **every site creation failed** with `null value in column "name" of
+relation "media_retention_policies"`. That reads as neither a retention problem nor a
+migration problem but as *the site could not be created*, and it fires from a trigger
+two migrations away, so the only place the error names the cause is the function body.
+All five walks died on it identically before their first assertion. This is the third
+time a `sites` trigger has been the defect in this REQ (0028 presets, 0044 scan
+settings) and the fourth time the seed alone left a *new* site with a pleasant `GET`
+and a save that wrote nothing.
+
+**The environment was the other half of the tick.** MinIO refuses writes with
+`XMinioStorageFull` at 95% disk, and `/mnt/apopic` was at 95% — so three of five walks
+failed at the **upload**, not at anything retention did. `docker system df` reported
+1.2G reclaimable under "dangling" volumes and the honest reading was that four of the
+five were production data (solexx PostgreSQL, sooliva Redis and Mongo, teknofest
+Mongo) whose container merely happened to be stopped; the space came from this
+repository's own `target/debug/deps` instead — 26 stale test-binary links, 5.7G, of
+which nothing was running. **A dangling volume is not garbage**, and MinIO's threshold
+is a hard wall rather than a slow degradation.
+
+**Proof.** `--test media_retention` → **5 walks, 0 failures** over the real router and
+a real database. Both versions of a file are aged past a one-day window and the sweep
+removes **only** the superseded one, asserted by reading `media_versions` back out of
+PostgreSQL *and* by finding the served version's bytes still in the object store — a
+length check would pass by accident. A hold beats a 400-day-old trash row, a refusal
+with no reason writes nothing, the reason lands in `audit_log`, a second identical press
+reports `changed: false` rather than a second audit row that reads as a second person,
+and the release is effective on the very next run. A purge over a referenced file is
+refused naming `page <id> (hero_image_id)`; the page is deleted; a second purge is
+**still** refused; the repair removes one row; the third purge goes through. A folder
+policy outranks the site rule through the crate's own resolver; a `purge_after_days`
+inside the **stored** `trash_days` is refused and the refusal writes nothing; a policy
+of another tenant is a `404` whose refusal deletes nothing; a reader may read the policy
+and the log and may not create, edit, delete, run, repair or hold.
+`cargo test -p omnion-media --lib` → **179**, `-p omnion-api --lib` → **147**,
+`-p omnion-core --lib` → **34**; `--test media` (14), `--test media_shares` (5) and
+`--test media_retention` (5) are green against the routes this touches. `apps/admin`
+`tsc --noEmit` clean.
+
+**Not run: the browser pass.** The retention tab is walked by
+`scripts/qa/run.sh` — `runMediaRetention` opens the tab, asserts every policy states
+its consequence in a sentence and names its scope, drives the cross-field warning
+*before* the save, creates and saves a policy, runs a pass and asserts the notice is
+a sentence rather than a bare zero and that the log wrote a row even when nothing
+was eligible, and toggles the file's hold on and back off — the whole function is
+written and `node --check` passes. It did not execute: `scripts/qa/qa-slot.sh` caps
+the box at **one** concurrent pass and a sibling wave held the slot for the entire
+25-minute window, so this pass was still queued when `timeout 1500` fired and
+printed only `waiting for a QA slot`. That is scheduling contention, not a red
+result, and it is recorded as **unrun** rather than as a pass. REQ-010 therefore
+stays `in-progress` and this slice is not closed on tests alone — the gate is the
+browser pass, and the next tick runs it first.
+
+**Next.** The Usage and Activity tabs on the file detail — they answer
+`media_references` and an activity read, and the reference rows the repair scan now
+maintains are what finally give them rows to read. Then slice 4 closes and the queue
+moves to REQ-021 (notification centre), the first untouched item in wave 1.
+
 ## 2026-09-28 — REQ-010 slice 4 (scanning half + grants half) · the access layer, and a red that had been hiding for four ticks
 
 build media: folder and file grants, with a deny that wins at any depth
@@ -2954,6 +3078,121 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
 
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
+
+- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  filtered listing against a real database — the walk that asserts the audit rows for
+  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  made the walk real and then fixed what it found.
+- **Six defects, none of them visible to the layer that owned them.**
+  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+     only exist where the value beside it was pushed.
+  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+     trash summary answered 500. Cast back to `bigint`.
+  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+     row against the pre-update snapshot, so no ordering is needed.
+  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+     new path, so `parent_id` became the folder itself on every move, and the first move of a
+     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+     *parent's* path.
+  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+  and a move to where a folder already is is a no-op.
+- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+  session and to an account with no media permission, a site created after the migration still
+  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  a file moves between folders without its storage key changing, a filter narrows the listing and
+  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  no new warning.
+- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  `target/debug/incremental` in this worktree returned 2.9 GB.
+- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+  history, the preview pipeline and the file detail screen do not.
+
+## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
+
+- **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
+  replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
+  one back *as a new version* rather than by rewriting history.
+- **The migration the plan assumed already existed.** The last tick's handover note said
+  "the `media_versions` table exists". It did not — `0025` created folders, browser columns and
+  the trash, and nothing had ever written a version row. So slice 2 ships `0026`, which creates
+  the table and backfills version 1 for every existing file, **copying `created_at`** rather than
+  stamping `now()`. A history that starts at the migration date is a lie about when the file
+  arrived, and it is exactly the kind of lie that is invisible for a year.
+- **Three rules, each a place a shortcut produces a plausible wrong answer.**
+  1. **A version is append-only.** A restore *copies* the old bytes to a new key and appends the
+     copy. Rewriting a row would make "what did this file look like on day 3" depend on whether
+     anybody took a shortcut in between.
+  2. **The number comes from the database.** `next_version` reads `max(version)` under
+     `for update` on the `media` row — a *scalar subquery*, because `FOR UPDATE` on an aggregate
+     is a no-op in PostgreSQL. Reading the max in Rust would open a window between two reads and
+     let two concurrent replaces both claim 4, which surfaces as a "duplicate key" error that
+     names the index and not the cause.
+  3. **A number is never reused.** A pruned version leaves a hole.
+- **The transaction is opened by the crate, not the route.** This was fought out with the
+  compiler: a route-held `sqlx::Transaction` surfaces `sqlx::Error` where everything else in
+  `omnion_media` is a `MediaError`, and `ApiError` has `From` for the latter but deliberately
+  **not** for the former. `omnion_media::begin_version` / `commit_version` hand back only
+  `MediaError`, which is the honest boundary: the library owns the transaction because the
+  guarantee rule 2 exists for spans it.
+- **The header probe reads 64 KB, not the file.** `crates/media/probe.rs` pulls dimensions,
+  duration and page count out of the *header* for PNG, GIF, JPEG, BMP, TIFF, WebP (all three
+  containers), MP4/QuickTime, WebM, WAV, MP3, Ogg and PDF. A 4 GB video upload must not cost a
+  full read to learn it is 12 minutes long. Every extractor answers "I do not know" rather than
+  guessing — a wrong dimension breaks every layout that reads it and is not obviously wrong once
+  it is stored. Two findings the unit tests forced out: a WebP canvas stored as `0` is a corrupt
+  header, **not** a one-pixel image (reading `0 + 1` would put a 1×1 box on screen for a file
+  that has no size), and one blanket 30-byte minimum across the three WebP containers refuses a
+  short-but-complete `VP8L` header.
+- **The walk corrected a test that had been asserting a route which never existed.** The walk
+  read the current bytes from `/api/v1/media/files/{id}/raw` and got an empty body: the file
+  manager's *listing* is `/media/files`, the read is `/media/{id}/raw`, and no route was ever
+  registered at the address the test used. Three more corrections came out of the same run — the
+  404 is `media_not_found` (not `file_not_found`), an empty upload answers `invalid_request`
+  (not `file_empty`), and the history reads **newest first**, so a check written against an
+  assumed oldest-first order fails on a correct response.
+- **The fixture leaked objects until it read the union.** Cleanup read `media.storage_key`, but a
+  replace *moves* that column to the new key — the old one is named only by the history, so every
+  replaced version's object stayed in the bucket. A test cleanup that misses them is a slow leak
+  that nobody notices for a month.
+- **Proof.** `cargo test -p omnion-media --lib` → **46 tests, 0 failures** (24 new, mostly header
+  probes and the version key rules). `cargo test -p omnion-api --lib` → **109 tests, 0 failures**.
+  `cargo test -p omnion-api --test media` against `omnion_test_main` → **11 walks, 0 failures**,
+  over the real router: a replace leaves version 1 downloadable and **byte-identical** (compared
+  as bytes, not as a length — a length check would pass by accident on an overwrite), the row
+  points at the version it serves, the three versions own three keys, a download of an old
+  version is an attachment named `hero-v1.png`, a restore appends version 3 with version 1's
+  checksum while version 2 is untouched, and the routes refuse without a session, without
+  `media.read`, and name a missing version by number. `pnpm --filter @omnion/admin typecheck`
+  green. The QA pass ran on the default stack.
+- **Environment note.** `/mnt/apopic` was at 99 % (610 MB free) when the tests finished; this
+  worktree's `target/debug/incremental` returned 1.2 GB and the unclaimed `omnion-w5`/`omnion-w6`
+  worktrees' `target/` returned a further 2.7 GB. **Owner action:** those worktrees hold build
+  artefacts for waves nobody has started; they will fill the image again.
+- **Next.** Slice 3 — transformation presets with a content-addressed cache, per-site storage
+  settings with a connection test, the CDN purge hook, share links and duplicate detection with
+  merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
+  serve path, and EXIF extraction.
 
 ## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
 
@@ -3116,6 +3355,7 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   and the API-level proof for both is the Rust suite, which is green.
 
 ## 2026-09-28 — the board answered 404 on every organization created after its own migration
+## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
 
 **What.** `0022_crm.sql` wrote `crm_seed_default_pipeline(organization)` — the function that
 builds a pipeline and its six stages — and then called it exactly once, in the same statement
@@ -3174,6 +3414,83 @@ compile at once, so a build can sit at 0% CPU for minutes before it is scheduled
 CRM walk suite is **~11 minutes** on its own (`--test-threads=1` against the shared database), so
 it does not fit inside a foreground call and is run as a background process.
 
+- **What.** The last open item of slice 3: what the *camera* said about its own picture. The
+  geometry probe already read a file's size from its header; this reads the other half of what an
+  editor asks about a photograph — which body took it, at what shutter speed, with which lens, on
+  which day. `crates/media/src/exif.rs` (the reader), `0042_media_exif.sql` (the column), the
+  `exif` column on `media` plus the `display_width`/`display_height` pair on the file response, and
+  the Metadata tab's **Camera** block.
+- **Six decisions, each a shortcut that produces a plausible wrong answer.**
+  1. *A TIFF header is not EXIF.* The IFD format is shared by TIFF, GeoTIFF and half a dozen
+     makers' proprietary blocks; what makes the block EXIF is the `Exif\0\0` signature inside a
+     JPEG `APP1`, an `EXIF` chunk in a WebP or an `eXIf` chunk in a PNG. The container is checked
+     before any TIFF parsing runs.
+  2. *Nothing is read from outside the prefix.* Every field's value may be an *offset*, and an
+     offset is attacker-controlled. Every read is a range request whose failure is the answer.
+  3. *A zero denominator is absent; `1/200` is not.* The first guard refused the normal case
+     (`den > num`) and kept the corrupt one — the exact inversion, which is how a reader ends up
+     with no shutter speed on every photograph and a divide-by-zero on the one broken file.
+  4. *Orientation changes the box, not the file.* Values 5–8 store the picture sideways and
+     browsers rotate it themselves, so a grid reserving `width × height` reserves the wrong box and
+     shifts every image below it. The stored columns carry the oriented pair, the raw value stays
+     in the record, and the API sends both readings.
+  5. *A GPS fix is a flag, never coordinates.* There is no field in the type a coordinate could
+     occupy, so a media library cannot quietly file an operator's home address into a row that
+     search, an API key and a share link can all read.
+  6. *A replacement replaces the record.* A screenshot over a camera original must not keep
+     claiming to have been shot on a body it was never near.
+- **The QA pass did not complete, and it found the tick's one real bug anyway.** The full pass ran
+  629 clicks and then died with `Target page, context or browser has been closed` — the
+  "browser context dies under parallel passes" case already documented for this box, with 21
+  sibling QA processes and 0 GB free at the moment it failed. So the gate is **not** claimed as
+  green this tick. What *did* run is `scripts/qa/probe-media-camera.cjs`, a one-screen probe added
+  because "the full pass crashed" and "the screen is broken" must not read the same in a log: it
+  signs in, uploads a JPEG that really carries a block, reads the block's rows and reads the
+  API's own response — **13/13 checks pass**.
+- **The bug it found: the rotation was applied twice.** The writer already stores the *oriented*
+  geometry (an orientation-6 4000×3000 frame is written as 3000×4000), and `display_size()` then
+  applied the swap again on the way out — so the panel reported a landscape picture for a portrait
+  photograph, and the facts list read `4000 × 3000` for a file every browser draws tall. The unit
+  test on `oriented_size` passed the whole time, because the function was correct; it was being
+  called on the wrong input. This is the case the QA pass exists for and the Rust suite cannot
+  see, and it is why the fix ships with a regression test shaped like the bug: a row carrying the
+  oriented columns *and* the record that produced them.
+- **Proof.** 19 new unit tests in `exif.rs`, 5 in `model.rs` and two walks over the real router →
+  0 failures. Both
+  walks read the column **out of PostgreSQL**, because a response that omits a field is
+  indistinguishable from one that stored it and chose not to say so. An orientation-6 frame of
+  4000×3000 stores 3000 and 4000; a text file grows no record; a replacement in a format with no
+  block clears it and the geometry falls back to the frame's own; a restore brings version 1's
+  record back; the serialised object is scanned for `lat`, `lon`, `GPSLatitude`, `GPSLongitude` and
+  `altitude`. `cargo test -p omnion-media --lib` → **122** (was 98), `-p omnion-api --lib` → **122**,
+  and `--test media` (13, was 11), `--test media_transform` (5), `--test media_settings` (2),
+  `--test media_duplicates` (6), `--test media_shares` (5) are unchanged and green. `pnpm
+  --filter @omnion/admin typecheck` clean. The migration applies across the whole set on a fresh
+  database.
+- **The QA pass had to grow a screen before it could test one.** The library pass uploads a PNG,
+  and a PNG carries no EXIF — so the Camera block would only ever have been seen in its empty
+  state, which the "no untested screen" rule forbids. The pass now *builds* a JPEG that carries a
+  real block, uploads it, opens its detail screen and asserts the body, `ISO 400`, `1/200 s`,
+  `f/1.8` and the rotated dimensions.
+- **Four bugs the walkthrough's own JPEG builder had, each of which produced a file that read as a
+  parser bug and was really a builder writing the format wrong.** The TIFF block is little-endian
+  while the JPEG framing around it is big-endian, so a segment length written with the block's
+  `u16` reads as a 57 KB segment in a 253-byte file and the block is then unreachable; a directory
+  is a count plus its entries plus a four-byte next-directory pointer, and the two that get
+  forgotten put every later offset on the wrong field; a value offset is measured from the start of
+  the *block*, not from the directory that holds the entry, so a value laid down before the
+  sub-directory exists is overwritten by it; and a RATIONAL is two words wide rather than four
+  bytes, so a cursor that steps by the entry's width lands every rational after the first on the
+  wrong field. None of the four would have been found by a screenshot — the file simply had no
+  camera record and the screen showed its empty state, correctly.
+- **Environment.** `/mnt/apopic` sat at **94 %** (3.6 GB free) on entry, and this worktree's own
+  `target/` was 9.9 GB of it. Reclaiming *only this worktree's* `target/debug/incremental`
+  (verified first: no live `cargo` holds it) returned 1.7 GB. **Owner action:** the worktrees under
+  `/mnt/apopic` still hold ~30 GB of `target/`; a shared `CARGO_TARGET_DIR` is the structural fix.
+- **Next.** Slice 4 — folder and file grants with inheritance, the scanning pipeline with
+  quarantine and release, retention policies with the daily worker, and reference-based purge
+  refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
+  and releasable, and a retention run removes exactly the eligible rows.
 
 ## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
 
@@ -3237,6 +3554,75 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
+
+## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
+
+**What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
+readable: `GET /api/v1/media/{id}/references` (where a file is used) and `/activity` (what has
+been done to it), `crates/media/src/usage.rs`, `omnion_audit::for_target`,
+`features/media/{usage,activity}-tab.tsx`, and the two tabs on `/media/files/{id}`. Both reads are
+`media.read`, and both load the file through its own site scope — including a **trashed** file,
+because "what happened to this" is asked precisely after the deletion.
+
+Five decisions, each a shortcut that produces a plausible wrong answer:
+
+  1. **Records and rows are reported apart, and the sentence says which it means.** A page
+     naming one hero in three fields is one record and three rows. The summary is the server's,
+     not the panel's, so the two cannot disagree about what the integers mean.
+  2. **A reference whose record is gone is rendered unresolved, with no link, and names its own
+     fix.** It refuses a purge for ever; a list that dropped it would shorten every week with no
+     way to tell a quiet file from a broken one.
+  3. **Only the kinds that exist today are resolved.** `page` is a closed list, not a match over
+     `resource_kind` — a module arriving tomorrow registers its own kind without a migration, and
+     a lookup that switched on the kind would have to grow a branch for ever.
+  4. **A file's story is written under two target names.** `media` for the bytes, `media_file`
+     for a grant. A filter naming only the first answers "who could see this file in March" with
+     a list of uploads — the most reassuring possible wrong answer. A folder rename is *not* in
+     it, and that exclusion is as much a part of the claim as the inclusions.
+  5. **The action arrives as a sentence beside its token**, and an action the server has not seen
+     is shown in its own words rather than dropped: a trail with a hole in it is worse than one
+     with an unfamiliar entry. A deleted account reads as "an account that has since been
+     removed", never as "the platform".
+
+**Proof.** `bash scripts/qa/run-media-walk.sh media_usage` → **6 walks, 0 failures** against the
+real router. Four of the six exist because the shortcut gives a plausible wrong answer rather
+than an error: the three-fields/one-record split; the stale reference being reported *and* the
+repair scan really clearing it; the label coming from the **published** revision rather than the
+newest one (a draft's title on a list answering "which published pages use this" is a confident
+wrong answer); and a grant appearing on the trail under its other target name. The other two are
+the permission (a reader holding `media.read` alone opens both screens) and the trash (a trashed
+file still answers both). `cargo test -p omnion-api --lib` → **152 passed, 0 failed**;
+`-p omnion-media -p omnion-audit` → **181 passed, 0 failed**; `pnpm typecheck` → 2 successful, 0
+errors.
+
+**Three defects, all of them in the test rather than the code** — and that is the honest report.
+The fixture lacked `media.settings.manage` and `media.delete`; and it asserted a `404` for
+another tenant's file where the whole media surface answers `403 cross_organization`. The route's
+own doc comment had made the same wrong claim and now says what the platform does and why the
+convention is the safer of the two: a `404` here would have made these the only two screens where
+a foreign file is *invisible* rather than forbidden.
+
+**Also fixed: the QA slot could be held hostage for 75 minutes.** `qa-slot.sh` names its place
+file after `$$` — its own pid — and exits the instant it takes the place, so the reaper's
+`kill -0` tested a pid that is dead within milliseconds of a *healthy* pass and fell back on age
+alone. One crashed pass then held every later pass at "waiting for a QA slot" until each died at
+its own timeout with no report. The reaper now reads the holder pid, which lives exactly as long
+as the pass. Proved both ways against a synthetic slot dir with a real sleep as the live holder:
+it spared the live place and reclaimed both dead ones. This is the second time this loop has hit a
+stale-lock class, and the tell is the same both times — a symptom that reads as "the machine is
+busy" rather than "a lock file is lying".
+
+**Gate.** `bash scripts/qa/run.sh` was started first, as slice 4's outstanding condition, and is
+**still queued behind siblings** — five concurrent walkthroughs from the w2/w3/w4/w7 worktrees
+hold the one place `QA_SLOTS=1` allows. The walkthrough now drives both new tabs
+(`checkUsageTab` / `checkActivityTab`), so the harness that finally gets the slot is already
+extended; the retention tab's own pass (`runMediaRetention`) has now been queued for two
+consecutive ticks and remains unrun.
+
+**Next.** Re-run `bash scripts/qa/run.sh` and require zero high findings from `runMediaUsage`
+alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
+first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
+slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
 
 ## 2026-09-28 — the pass was racing four reads, and the race pointed at a picker that said nothing
 

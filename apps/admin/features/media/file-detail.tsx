@@ -1,13 +1,16 @@
 "use client";
 
 /**
- * The file detail screen (docs/requests/REQ-010, slice 2): preview on the left, tabs on the right.
+ * The file detail screen (docs/requests/REQ-010, slices 2 and 4): preview on the left, tabs on
+ * the right.
  *
  * One file, one screen, and the things an editor needs about it: what it is (the preview and
  * its facts), what happened to it (the version history), what is written about it (the
- * metadata) and who outside the platform can fetch it (the share links). Usage and activity
- * tabs arrive with slice 4 — a tab that cannot answer yet is not on the screen, rather than
- * being there and refusing.
+ * metadata), who outside the platform can fetch it (the share links), who inside it can (the
+ * permissions), where the site uses it (usage) and what has been done to it (activity).
+ *
+ * The last two arrived with slice 4, which is what finally made the `media_references` table
+ * readable: until then the purge could refuse a file for ever and no screen could say why.
  *
  * The version list is not decoration. Replacing a file writes a new version and restoring an old
  * one appends a *new* version rather than rewriting history, so this screen has to show both, and
@@ -18,10 +21,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
+  Clock,
   Copy,
   Download,
   History,
   Info,
+  Link as LinkIcon,
   Link2,
   Plus,
   RotateCcw,
@@ -39,6 +44,8 @@ import { FilePreview, formatDuration, previewKind } from "@/features/media/file-
 import { ScanBadge } from "@/features/media/media-shared";
 import { GrantsTab } from "@/features/media/grants-tab";
 import { SharesTab } from "@/features/media/shares-tab";
+import { ActivityTab } from "@/features/media/activity-tab";
+import { UsageTab } from "@/features/media/usage-tab";
 import {
   ApiError,
   createMediaVersion,
@@ -54,7 +61,7 @@ import { formatBytes, formatTimestamp } from "@/lib/format";
 import type { MediaExif, MediaFile, MediaVersion, MediaVersionList } from "@/lib/types";
 
 /** Which tab of the right-hand panel is on screen. */
-type Tab = "metadata" | "versions" | "permissions" | "shares";
+type Tab = "metadata" | "versions" | "permissions" | "shares" | "usage" | "activity";
 
 /** The file detail screen. */
 export function MediaFileDetail() {
@@ -343,6 +350,20 @@ export function MediaFileDetail() {
               icon={<Link2 className="h-3.5 w-3.5" aria-hidden />}
               label="Share"
             />
+            <TabButton
+              id="media-tab-usage"
+              active={tab === "usage"}
+              onClick={() => setTab("usage")}
+              icon={<LinkIcon className="h-3.5 w-3.5" aria-hidden />}
+              label="Usage"
+            />
+            <TabButton
+              id="media-tab-activity"
+              active={tab === "activity"}
+              onClick={() => setTab("activity")}
+              icon={<Clock className="h-3.5 w-3.5" aria-hidden />}
+              label="Activity"
+            />
           </div>
 
           <div className="min-h-0 flex-1 overflow-auto p-3">
@@ -365,6 +386,10 @@ export function MediaFileDetail() {
               />
             ) : tab === "permissions" ? (
               <GrantsTab targetKind="file" targetId={fileId} siteId={file.site_id} />
+            ) : tab === "usage" ? (
+              <UsageTab mediaId={fileId} />
+            ) : tab === "activity" ? (
+              <ActivityTab mediaId={fileId} />
             ) : (
               <SharesTab mediaId={fileId} />
             )}

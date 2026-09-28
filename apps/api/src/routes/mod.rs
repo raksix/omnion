@@ -110,6 +110,7 @@ pub mod media_scan;
 mod media_settings;
 pub mod media_shares;
 pub mod media_transform;
+pub mod media_usage;
 pub mod media_versions;
 pub mod onboarding;
 pub mod public;
@@ -628,6 +629,16 @@ pub fn router(state: AppState) -> Router {
         post(media_retention::repair).layer(guards::require(&state, "media.settings.manage"));
     let media_file_hold: MethodRouter<AppState, Infallible> =
         put(media_retention::set_file_hold).layer(guards::require(&state, "media.settings.manage"));
+
+    // Usage and activity (REQ-010, slice 4). Both reads are `media.read` on purpose: where a
+    // file is used and what has been done to it are the same power as opening it, and neither
+    // list contains anything the caller could not already read from the file itself. A separate
+    // key would be a second opinion rather than a boundary — and the reader who most needs the
+    // trail is the one with the fewest keys.
+    let media_references: MethodRouter<AppState, Infallible> =
+        get(media_usage::references).layer(guards::require(&state, "media.read"));
+    let media_activity: MethodRouter<AppState, Infallible> =
+        get(media_usage::activity).layer(guards::require(&state, "media.read"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -1194,6 +1205,10 @@ pub fn router(state: AppState) -> Router {
         .route("/media/{id}/shares", media_share_create)
         .route("/media/{id}/shares/revoke-all", media_share_revoke_all)
         .route("/media/{id}/shares/{share_id}", media_share_revoke)
+        // Usage and activity (REQ-010, slice 4): the two reads the file-detail screen's last
+        // two tabs are made of.
+        .route("/media/{id}/references", media_references)
+        .route("/media/{id}/activity", media_activity)
         .route("/media/transformation-presets", media_presets)
         // The duplicate report and its merge. `duplicates` is a static segment declared before
         // `/media/{id}/…`, so axum ranks it ahead of the parameter route — same rule the
