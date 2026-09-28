@@ -166,6 +166,53 @@ pub async fn update_workflow(
     Ok(workflow)
 }
 
+/// Rewrite a workflow definition on a caller's connection.
+///
+/// The same statement as [`update_workflow`], for the one caller that must not commit on
+/// its own: a version restore writes the definition **and** the history row that records
+/// it, and those two are one fact. With a pool in each, a failure between them leaves a
+/// restored rule whose history does not mention the restore — which is exactly the state
+/// the Versions tab exists to make impossible to explain.
+pub async fn update_workflow_on<'e, E>(
+    executor: E,
+    id: Uuid,
+    update: WorkflowUpdate,
+) -> Result<Option<Workflow>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let sql = format!(
+        "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
+         trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
+         conditions = $11, on_error = $12, run_as_user_id = $13, \
+         rate_limit_per_hour = coalesce($14, rate_limit_per_hour), \
+         concurrency = coalesce($15, concurrency), updated_at = now() \
+         where id = $1 returning {}",
+        workflow_columns()
+    );
+
+    let workflow: Option<Workflow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(update.name)
+        .bind(update.description)
+        .bind(update.site_id)
+        .bind(update.enabled)
+        .bind(update.trigger.as_str())
+        .bind(update.schedule)
+        .bind(update.next_run_at)
+        .bind(update.steps)
+        .bind(update.trigger_event)
+        .bind(update.conditions)
+        .bind(update.on_error.as_str())
+        .bind(update.run_as_user_id)
+        .bind(update.rate_limit_per_hour)
+        .bind(update.concurrency)
+        .fetch_optional(executor)
+        .await?;
+
+    Ok(workflow)
+}
+
 /// Remove a workflow and (through the schema) its executions.
 pub async fn delete_workflow(pool: &PgPool, id: Uuid) -> Result<bool> {
     let removed = sqlx::query("delete from workflows where id = $1")
@@ -612,6 +659,38 @@ pub async fn fail_step_ignored(pool: &PgPool, step_id: Uuid, message: &str) -> R
     .await?;
 
     Ok(())
+}
+
+/// Attach a **run guard's** reason to a step that has already succeeded.
+///
+/// This exists because [`fail_step`] cannot be reused here, and the reason it cannot is the
+/// whole point of this function. A guard is consulted *after* `complete_step` has already
+/// written `status = 'succeeded'`, and `fail_step`'s guard clause is `and status = 'running'`
+/// — so the call matched **zero rows**. The run still stopped, the steps after it were still
+/// closed, and the reason an operator needs was silently dropped on the floor.
+///
+/// A silently-dropped write is the worst kind of bug in a state machine: everything *looks*
+/// right — the run is `failed`, the trace shows the repeat, only the sentence saying why is
+/// missing — and the missing sentence is the entire reason the guard's message is long. The
+/// trace showed three steps with no explanation, which is the same as the guard not being
+/// installed.
+///
+/// So the step goes back to `failed` (it did repeat, and a trace that says `succeeded` next to
+/// a stopped run is lying), the guard's reason is written, and the row is **not** marked
+/// `ignored`: unlike a step whose failure the rule outlived, this one is the reason the run
+/// stopped, and `settle_execution` must see it.
+pub async fn fail_step_after_success(pool: &PgPool, step_id: Uuid, message: &str) -> Result<u64> {
+    let failed = sqlx::query(
+        "update workflow_steps set status = 'failed', finished_at = now(), error = $2 \
+         where id = $1 and status = 'succeeded'",
+    )
+    .bind(step_id)
+    .bind(message)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(failed)
 }
 
 /// Close every step after `step_id` as cancelled, because a branch or a stop ended the run.

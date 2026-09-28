@@ -838,7 +838,23 @@ async fn advance_step(
                         let reason = verdict.reason.unwrap_or_else(|| {
                             "a run guard stopped this run after the step".to_owned()
                         });
-                        store::fail_step(pool, claimed.id, &reason).await?;
+                        // `fail_step_after_success`, **not** `fail_step`. The guard is
+                        // consulted after `complete_step` has already written `succeeded`, and
+                        // `fail_step`'s `and status = 'running'` clause therefore matched
+                        // zero rows: the run stopped, the later steps were closed, and the one
+                        // sentence saying why was silently thrown away. The row count is
+                        // checked rather than ignored, because a state machine that reports
+                        // success for a write that changed nothing is the defect this replaced.
+                        let recorded =
+                            store::fail_step_after_success(pool, claimed.id, &reason).await?;
+                        if recorded == 0 {
+                            tracing::error!(
+                                step_id = %claimed.id,
+                                step_no = claimed.step_no,
+                                "a run guard stopped the run but the reason could not be \
+                                 recorded: the step was in neither 'running' nor 'succeeded'"
+                            );
+                        }
                         store::end_run_after_branch(pool, claimed.execution_id, claimed.id).await?;
                         tracing::warn!(
                             step_id = %claimed.id,
