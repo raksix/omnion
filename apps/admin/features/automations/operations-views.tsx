@@ -210,13 +210,14 @@ export function VersionsPanel({
   if (history.untracked) {
     return (
       <EmptyState
+        testId="automation-versions"
         title="No history yet"
         hint={`This rule was written before versions were recorded. The first edit from now on starts the history at version ${history.current_version + 1}.`}
       />
     );
   }
   if (history.versions.length === 0) {
-    return <EmptyState title="No history yet" hint="Save the rule once and its version appears here." />;
+    return <EmptyState testId="automation-versions" title="No history yet" hint="Save the rule once and its version appears here." />;
   }
 
   return (
@@ -326,6 +327,7 @@ export function AuditPanel({ automationId }: { automationId: string }) {
     // a missing feature. This says the trail is empty, which is a different fact.
     return (
       <EmptyState
+        testId="automation-audit"
         title="Nothing has been recorded yet"
         hint="Every change to this rule is written here the moment it happens."
       />

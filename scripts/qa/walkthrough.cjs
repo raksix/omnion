@@ -5461,6 +5461,43 @@ async function openRuleByName(page, ruleName, timeout = 15000) {
   return false;
 }
 
+/**
+ * Which screen answered, when a panel listed no rows.
+ *
+ * A row count of zero is not a diagnosis. The same zero means three different things: the
+ * fetch is still in flight, the panel rendered its empty state because there is genuinely
+ * nothing, or the fetch failed and the panel rendered its error. A pass that records only
+ * the count reports all three as `rows: 0` and the reader — the next tick, deciding what to
+ * fix — has no way to tell a working screen from a broken one. So the panel's own error and
+ * empty-state hooks are read, and the message is recorded with the count.
+ *
+ * The hooks are the ones the panels already write (`data-automation-*-error`, and the
+ * empty-state block), so this adds no new contract for the product to satisfy.
+ */
+async function readPanelState(page, kind) {
+  const error = await page
+    .locator(`[data-automation-${kind}-error], [data-automation-${kind}s-error]`)
+    .first()
+    .innerText()
+    .catch(() => "");
+  if (error.trim()) {
+    return { state: "error", message: error.replace(/\s+/g, " ").trim().slice(0, 160) };
+  }
+  // The empty state is a heading inside the panel; the panels have no row, so it is the only
+  // thing left on screen and its presence is the difference between "empty" and "unfinished".
+  const empty = await page
+    .locator("[data-automation-empty], [data-empty-state]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  if (empty.trim()) {
+    return { state: "empty", message: empty.replace(/\s+/g, " ").trim().slice(0, 160) };
+  }
+  const loading = await page.locator("[data-loading], .animate-pulse").count();
+  if (loading > 0) return { state: "loading", message: "still fetching" };
+  return { state: "blank", message: "no rows, no error and no empty state" };
+}
+
 async function runAutomationsOperationsDepth(page, report) {
   const steps = [];
   const note = (entry) => {
@@ -5619,6 +5656,12 @@ async function runAutomationsOperationsDepth(page, report) {
     .catch(() => {});
   await page.waitForTimeout(800);
   const versionRows = await page.locator("[data-automation-version-row]").count();
+  // A panel that answers with an error, or with "nothing yet", is a different fact from a
+  // panel that lists rows — and counting only the rows reports both as zero. The Versions and
+  // Audit tabs are the two screens slice 4 closes on, so their *state* is recorded next to
+  // their row count: a zero with an empty-state message is a screen that works, and a zero
+  // with a fetch error is a bug, and only the message tells the two apart.
+  const versionsState = await readPanelState(page, "version");
   // The rule has one write so far. A second one gives the restore something to restore.
   await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
   await page.locator("[data-automation-description]").first().waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
@@ -5660,6 +5703,9 @@ async function runAutomationsOperationsDepth(page, report) {
     restoreOffered: restoreButtons,
     // The history is a line, not a rewind: a restore adds a version rather than removing one.
     appended: versionsAfterRestore > versionsAfterEdit,
+    // Which screen answered, when no row did.
+    stateWhenEmpty: versionsState.state,
+    message: (versionsState.message || restoreNotice).slice(0, 130),
     notice: restoreNotice.slice(0, 130),
   });
   await shot(page, "page-automations-operations-versions");
@@ -5669,6 +5715,7 @@ async function runAutomationsOperationsDepth(page, report) {
   await page.locator("[data-automation-audit], [role=alert]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(800);
   const auditRows = await page.locator("[data-automation-audit-row]").count();
+  const auditState = await readPanelState(page, "audit");
   const auditActions = await page
     .locator("[data-automation-audit-row]")
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-automation-audit-row")).filter(Boolean));
@@ -5678,6 +5725,9 @@ async function runAutomationsOperationsDepth(page, report) {
     actions: [...new Set(auditActions)].join(", "),
     listsTheCreate: auditActions.includes("automation.created"),
     listsTheEdit: auditActions.includes("automation.updated"),
+    // Same rule as Versions: a zero has to say *which* zero it is.
+    stateWhenEmpty: auditState.state,
+    message: auditState.message,
   });
   await shot(page, "page-automations-operations-audit");
 
