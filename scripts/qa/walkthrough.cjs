@@ -5724,7 +5724,20 @@ async function runAutomationsOperationsDepth(page, report) {
       .replace(/\s+/g, " ")
       .trim();
   }
-  const versionsAfterRestore = await page.locator("[data-automation-version-row]").count();
+  // The restore is a write the panel performs *after* the request returns, so the row it adds
+  // is not there the instant the button click resolves — the same reason the edit's version
+  // is polled for rather than assumed. Reading it straight after the click reported 0 rows and
+  // "appended: false" for a restore that had demonstrably worked: the audit tab, read a step
+  // later, lists `automation.version_restored` for the very same rule.
+  let versionsAfterRestore = 0;
+  for (let wait = 0; wait < 10; wait += 1) {
+    versionsAfterRestore = await page.locator("[data-automation-version-row]").count();
+    if (versionsAfterRestore > versionsAfterEdit) break;
+    await page.waitForTimeout(700);
+    await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-automation-tab='versions']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
   note({
     step: "versions",
     rowsAfterCreate: versionRows,
