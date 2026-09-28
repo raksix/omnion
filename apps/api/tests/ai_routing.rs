@@ -384,6 +384,63 @@ async fn the_dry_run_resolves_a_map_without_calling_a_provider() {
     harness.dispose().await;
 }
 
+/// A fresh install can write its **first** route map.
+///
+/// This is the walk that was missing when the browser pass found the bug: the store inserted
+/// `scope_key`, which migration 0045 declares `generated always as (...)`, and PostgreSQL
+/// refuses any INSERT that names a generated column. The existing routing walks never caught
+/// it because they all ran against a branch where 0045 had not been applied yet, so every
+/// write in this file went down a path the production schema does not have. The write now
+/// names only the two ids and lets the database derive the scope — the property that makes a
+/// read and a write unable to disagree about what a scope is.
+#[tokio::test]
+async fn a_fresh_install_can_write_its_first_route_map() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let (base_url, _mock) = mock_provider().await;
+    let fixture = connected(&harness, &base_url).await;
+
+    // Nothing is configured yet, and the first write must not touch a generated column.
+    let before = harness
+        .call(get("/api/v1/ai/routing", Some(&fixture.token)))
+        .await;
+    assert_eq!(before.status, StatusCode::OK, "{:?}", before.body);
+    assert!(
+        candidates_of(&before.body, "cheap").is_empty(),
+        "a fresh install has no cheap route yet: {:?}",
+        before.body
+    );
+
+    let saved = harness
+        .call(put(
+            "/api/v1/ai/routing",
+            json!({
+                "task": "cheap",
+                "candidates": [{ "model_id": fixture.small, "requirements": [] }]
+            }),
+            &fixture.token,
+        ))
+        .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "the first route write was refused: {:?}",
+        saved.body
+    );
+    assert_eq!(saved.body["error"].as_object(), None, "and it carried no error");
+
+    // The row is really in the table, under the scope the database derived.
+    let (count,): (i64,) =
+        sqlx::query_as("select count(*) from ai_task_routes where task = 'cheap' and scope_key = 'installation'")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the row must be readable");
+    assert_eq!(count, 1, "the derived scope must be the installation's");
+
+    harness.dispose().await;
+}
+
 /// A two-fallback route degrades to the first fallback when the primary is switched off, and
 /// the walk says which requirement/candidate caused the skip.
 #[tokio::test]

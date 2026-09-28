@@ -341,11 +341,20 @@ pub async fn replace_task_map(
 
     for (index, (candidate, model)) in candidates.iter().zip(resolved.iter()).enumerate() {
         sqlx::query(
+            // `scope_key` is **not** in the column list. It is a `generated always as (...)`
+            // column — the whole point of migration 0045's decision 1 — and PostgreSQL refuses
+            // any INSERT that names it: "cannot insert a non-DEFAULT value into column
+            // scope_key". The database derives the scope from the two ids, which is what keeps
+            // a read and a write from ever disagreeing about what a scope is.
+            //
+            // This is the bug the API walks could not see and the browser pass caught: the
+            // routing walks all wrote their maps through this function *before* migration 0045
+            // existed on the branch they ran against, so they exercised a different code path
+            // and passed. The walkthrough clicks the real button against the real schema.
             "insert into ai_task_routes \
-             (scope_key, organization_id, site_id, task, position, model_id, requirements, updated_by) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (organization_id, site_id, task, position, model_id, requirements, updated_by) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
         )
-        .bind(scope.key())
         .bind(column_organization)
         .bind(column_site)
         .bind(task)
@@ -354,6 +363,10 @@ pub async fn replace_task_map(
         .bind(&candidate.requirements)
         .bind(updated_by)
         .execute(&mut *tx)
+        // Seven binds for seven placeholders, in the column list's order. The numbering is
+        // positional, so a column removed and a bind forgotten is a silent shift rather than a
+        // type error — `$3` would receive a `text` where a `uuid` is expected and PostgreSQL
+        // would say so, but only on the first row that uses a site.
         .await?;
     }
 
