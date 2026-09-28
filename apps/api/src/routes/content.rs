@@ -539,6 +539,129 @@ pub async fn list_revisions(
     }))
 }
 
+/// `GET /api/v1/pages/{id}/preview?viewport={mobile|desktop}`.
+///
+/// The renderer-frame payload for the page's *working draft* (REQ-063, slice 2).
+///
+/// The frame is a real render, not a second representation of the page: the tree that leaves
+/// here is the same one `GET /pages/{id}` hands the editor and the same one the public renderer
+/// draws, passed through the *server's* viewport filter. A preview that filtered with CSS would
+/// show the author a phone page with a desktop block still in the DOM, which is exactly the
+/// "preview lies" bug the REQ names.
+///
+/// The payload is scoped to the draft on purpose. Inline editing writes draft revisions, so a
+/// frame that read the published revision would be reviewing the page visitors are not seeing,
+/// and a save in the frame would appear to do nothing to it.
+pub async fn preview_page(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(page_id): Path<Uuid>,
+    Query(query): Query<PreviewQuery>,
+) -> Result<Json<PagePreviewBody>, ApiError> {
+    let page = page_in_scope(&state, &current, page_id).await?;
+    let pool = state.db().pool();
+    let draft = pages::current_draft(pool, page.id).await?;
+    let published = pages::published_revision(pool, page.id).await?;
+
+    // A page with no draft at all is a page that has never been edited since creation, which the
+    // model makes impossible — but the frame says so rather than rendering an empty page, since
+    // "nothing here" and "nothing to preview" are different answers.
+    let draft = draft.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_draft_revision",
+            "this page has no working draft to preview",
+        )
+    })?;
+
+    let viewport = preview_viewport(query.viewport.as_deref());
+    // The filter is the same call the public renderer makes, so "what the phone sees" has one
+    // implementation. A preview that filtered differently from the site would be a third answer
+    // to the same question.
+    let read_on = if viewport == "mobile" {
+        omnion_content::ReadOn::Mobile
+    } else {
+        omnion_content::ReadOn::Desktop
+    };
+    let parsed = omnion_content::parse_blocks(&draft.blocks).unwrap_or_default();
+    let visible = omnion_content::filter_for_viewport(&parsed, read_on);
+    let report = omnion_content::validate(&draft.blocks);
+
+    Ok(Json(PagePreviewBody {
+        page_id: page.id,
+        slug: page.slug.clone(),
+        title: draft.title.clone(),
+        viewport,
+        // The frame carries the whole stored tree *and* the filtered one, and the two numbers are
+        // not equal whenever the author hid something. Rendering only the filtered tree would
+        // make a "hidden on phones" block indistinguishable from a deleted one.
+        blocks: omnion_content::blocks_to_value(&parsed),
+        visible_blocks: omnion_content::blocks_to_value(&visible),
+        block_count: parsed.len() as i32,
+        visible_count: visible.len() as i32,
+        body: draft.body.clone(),
+        revision_id: draft.id,
+        revision_no: draft.revision_no,
+        published_revision_no: published.as_ref().map(|entry| entry.revision_no),
+        can_publish: report.can_publish,
+        // The issues travel as the validator's own struct list, serialised here rather than typed
+        // into the response: they are a read-only report, and a struct field would freeze the
+        // validator's shape into the wire format the first time a code appeared on an issue.
+        issues: serde_json::to_value(&report.issues).unwrap_or_else(|_| json!([])),
+    }))
+}
+
+/// `?viewport=` — which screen the frame is drawing for.
+#[derive(Debug, Default, Deserialize)]
+pub struct PreviewQuery {
+    /// `mobile` asks for the phone render; anything else (including an unknown value) is the
+    /// wide one, so a typo in a link cannot produce a frame that draws nothing.
+    #[serde(default)]
+    pub viewport: Option<String>,
+}
+
+fn preview_viewport(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some("mobile") => "mobile",
+        _ => "desktop",
+    }
+}
+
+/// Response body of the preview frame.
+#[derive(Debug, Serialize)]
+pub struct PagePreviewBody {
+    /// Page the frame draws.
+    pub page_id: Uuid,
+    /// Address of the page inside its site.
+    pub slug: String,
+    /// Draft title, as the frame's document title.
+    pub title: String,
+    /// `desktop` or `mobile` — the screen this payload was filtered for.
+    pub viewport: &'static str,
+    /// The stored block tree, unfiltered.
+    pub blocks: Value,
+    /// The tree this viewport actually renders.
+    pub visible_blocks: Value,
+    /// Blocks in the stored tree.
+    pub block_count: i32,
+    /// Blocks this viewport renders.
+    pub visible_count: i32,
+    /// Plain body text, for a page that still renders from its body.
+    pub body: String,
+    /// Draft revision the frame reads.
+    pub revision_id: Uuid,
+    /// Its revision number.
+    pub revision_no: i32,
+    /// The revision visitors see, when the page has one. The frame names it so the author can
+    /// see that their inline edits have not reached the public page.
+    pub published_revision_no: Option<i32>,
+    /// Whether the draft is whole enough to publish.
+    pub can_publish: bool,
+    /// Validation issues of the stored tree, so the frame can show the same badges the editor
+    /// does rather than a second opinion.
+    pub issues: Value,
+}
+
 /// Read one revision of a page.
 pub async fn get_revision(
     State(state): State<AppState>,

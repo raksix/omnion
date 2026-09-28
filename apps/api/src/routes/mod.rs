@@ -403,6 +403,13 @@ pub fn router(state: AppState) -> Router {
     let page_publish =
         post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));
 
+    // REQ-063 slice 2: the preview frame reads the *draft* of a page and hands the panel a tree
+    // the server has already filtered for the chosen viewport. It changes nothing, so it carries
+    // the same read key as opening the page — a frame that needed a second permission would only
+    // teach authors to skip the one screen that shows the phone render.
+    let page_preview =
+        get(content::preview_page).layer(guards::require(&state, "content.pages.read"));
+
     let page_restore =
         post(content::restore_revision).layer(guards::require(&state, "content.pages.restore"));
 
@@ -827,6 +834,7 @@ pub fn router(state: AppState) -> Router {
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)
+        .route("/pages/{id}/preview", page_preview)
         .route("/pages/{id}/restore", page_restore)
         .route("/pages/{id}/revisions", page_revisions)
         .route("/pages/{id}/revisions/{revision_id}", page_revision)
