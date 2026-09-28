@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 2 at 4/4: containers + validation + revision diff + inline preview) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
+> **Status:** in-progress (slice 2 CLOSED in a browser — 0 high findings from this wave; slice 3 next: patterns + templates) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request

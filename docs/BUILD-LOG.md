@@ -2111,3 +2111,44 @@
 - **Next.** Finish the API integration run, then slice 2 (4/4): the inline-editing frame at
   `/pages/<id>/preview`. Then a QA browser pass — the walkthrough step for the nested columns
   and the one for this compare have both been written and neither has yet been run in a browser.
+
+## 2026-09-28 · wave 2 (REQ-063, slice 2 closed in a browser)
+
+The blocking item for two ticks ran at last, and it was the harness that failed — twice, in two
+different ways, both of which had been silently green in the plan.
+
+- **The pass was testing a binary that predated the screens.** `run.sh` built the API only when
+  `target/debug/omnion-api` was MISSING, so a leftover binary answered happily and every route
+  that no longer existed returned 404 — read as "the screen is broken" rather than "the build is
+  stale". The binary carried no `pages/{id}/preview` route at all. The build now also fires when
+  a source is newer than the binary.
+- **The compare ran before the thing that makes a compare worth running.** The QA page's newest
+  two revisions were both block-empty, the server correctly answered "nothing changed", and the
+  pass recorded zero diff rows for a screen that works. Verified by hand against the same stack
+  first (3 rows, 1 changed entry, 3 base options, no console errors) — which is what made it
+  clear the screen was fine and the ORDER was wrong. The compare is now invoked after the preview
+  frame's save.
+- **A `.textContent()` with no timeout took the whole run down.** The media step read a footer
+  that may not render; it hung 30s and threw a `TimeoutError` that aborted the pass before the
+  vision review and the report. Now a value that may be absent.
+
+- **Proof.**
+  - `bash scripts/qa/run.sh` (stack `w2`, 18081/3101/3201, database `omnion_qa_w2`) → **no fatal**,
+    894 clicks · 70 field fills · 2 form submissions · 943 screenshots · 32 pages.
+  - The block-editor depth pass, in the browser: `revisionRows: 3`, `diffEntries: 1`,
+    `diffCounts: [added:0, changed:1, moved:0, removed:0]`, `againstOptions: 3`,
+    `baseSwitched: true`, `diffRecomputed: true`, `changedRowNamesProp: true` (the row names
+    "Heading" and "text", and carries no `"props"` key).
+  - The inline-editing frame: `previewToast: "Saved as draft revision 3."`,
+    `previewRevisionAdvanced: true`, `previewLiveUnchanged: true` (the published number never
+    moved), `previewHasNoPublish: true` (the verb is not on the router), `previewCounts:
+    {block: 5, visible: 5}`, phone frame 390px wide, `previewCleanAfterSave: true`.
+  - **High findings from this wave: 0.** All 381 high findings in the report are `/media`,
+    `/api/v1/media/folders`, `/api/v1/media/files` and `/media/trash` — the main writer's file
+    manager, not this branch.
+  - `cargo test -p omnion-content --quiet` → 93 passed, 0 failed. `pnpm typecheck` → 2/2.
+
+- **Next.** Slice 3: patterns and templates. Check `ls database/migrations | tail -5` first —
+  siblings took 0019/0020/0021/0022 and the ledger is append-only, so the number is chosen, not
+  assumed. And `git fetch` shows `origin/main` is 8 commits ahead: merge it at the START of the
+  next tick, before editing, never mid-slice.
