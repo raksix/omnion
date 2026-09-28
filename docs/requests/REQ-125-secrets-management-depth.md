@@ -1,6 +1,6 @@
 # REQ-125 — Secrets & Credential Management
 
-> **Status:** done (4 of 4 slices · commit 2ad9f0e) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** done (4 of 4 slices · gate re-run and green · commit 93f339e) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
