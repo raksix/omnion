@@ -1460,7 +1460,110 @@ async function runMediaFileDetail(page, report) {
   const previewButtons = await page.locator("button:has-text('Preview')").count();
   note({ step: "version-preview-buttons", previewButtons });
 
-  return { ok: rendered && kind !== null, steps: steps.length, kind, fileId, camera: Boolean(cameraFileId) };
+  // The last two tabs (REQ-010, slice 4). Both read a file that has been through real actions, so
+  // the interesting claims are not "the tab rendered" but the two sentences the whole feature
+  // rests on:
+  //
+  //   * Usage — an unused file must SAY it is safe to delete, not just be empty. An empty list
+  //     beside a heading reads identically for "nothing uses this" and "we could not read it",
+  //     and only one of those means it is safe to press delete.
+  //   * Activity — the upload this pass just performed must be on the trail. A tab that renders
+  //     an empty state for a file that was uploaded two minutes ago is showing a broken read.
+  const usage = await checkUsageTab(page);
+  note({ step: "usage", ...usage });
+  await shot(page, "page-media-file-usage");
+
+  const activity = await checkActivityTab(page);
+  note({ step: "activity", ...activity });
+  await shot(page, "page-media-file-activity");
+
+  return {
+    ok: rendered && kind !== null && usage.rendered && activity.rendered && activity.showsUpload,
+    steps: steps.length,
+    kind,
+    fileId,
+    camera: Boolean(cameraFileId),
+    usage,
+    activity,
+  };
+}
+
+/**
+ * Open the Usage tab and check the sentence under it.
+ *
+ * The assertion is deliberately about the *wording*, not about a row count: the QA library's
+ * sample file has no page pointing at it, so the only thing on screen that can be wrong in a way
+ * a count cannot catch is whether the screen tells the reader that this file is safe to delete.
+ */
+async function checkUsageTab(page) {
+  await page.click("#media-tab-usage").catch(() => {});
+  await page.waitForSelector('[data-testid="media-usage-tab"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-usage-tab"]').count()) > 0;
+  if (!rendered) {
+    return { rendered: false, reason: "the usage tab did not render" };
+  }
+
+  const summary =
+    (await page
+      .locator('[data-testid="media-usage-summary"]')
+      .first()
+      .innerText()
+      .catch(() => "")) ?? "";
+  const rows = await page.locator('[data-testid="media-usage-row"]').count();
+  // An unused file is the state this pass is in, so the empty state has to be *spoken*: the
+  // sentence is what makes "breaks nothing" a claim rather than an absence.
+  const saysItIsSafe = /breaks nothing/i.test(summary);
+  const hasList = rows > 0;
+  // No delete control on this tab: removing a usage row would make the library claim a page
+  // does not point at this file while the page still does.
+  const dangerousButtons = await page
+    .locator('[data-testid="media-usage-tab"] button:has-text("Delete")')
+    .count();
+
+  return { rendered, rows, summary, saysItIsSafe, hasList, dangerousButtons };
+}
+
+/**
+ * Open the Activity tab and check that the upload this pass performed is on the trail.
+ *
+ * An empty trail for a file that was uploaded a minute ago is the exact failure this catches:
+ * the endpoint answers 200 with no rows, the screen renders its empty state, and nothing about
+ * either looks wrong.
+ */
+async function checkActivityTab(page) {
+  await page.click("#media-tab-activity").catch(() => {});
+  await page.waitForSelector('[data-testid="media-activity-tab"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-activity-tab"]').count()) > 0;
+  if (!rendered) {
+    return { rendered: false, reason: "the activity tab did not render" };
+  }
+
+  const rows = await page.locator('[data-testid="media-activity-row"]').count();
+  const actions = await page
+    .locator('[data-testid="media-activity-row"]')
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-action")))
+    .catch(() => []);
+  const summaries = await page
+    .locator('[data-testid="media-activity-row"] p')
+    .allTextContents()
+    .catch(() => []);
+  // The upload is the action that put the file here at all, so its absence is the defect.
+  const showsUpload = actions.includes("media.uploaded");
+  // A sentence, never the raw token: `media.uploaded` on screen would be a database column.
+  const readsAsSentences =
+    summaries.length > 0 && summaries.every((text) => !/^media\./.test(text.trim()));
+
+  // Open the detail disclosure on the first row — an expandable that is never expanded by the
+  // pass is a control nobody has clicked.
+  const toggles = await page.locator('[data-testid="media-activity-toggle"]').count();
+  let detailOpened = false;
+  if (toggles > 0) {
+    await page.locator('[data-testid="media-activity-toggle"]').first().click().catch(() => {});
+    await page.waitForTimeout(400);
+    detailOpened = (await page.locator('[data-testid="media-activity-detail"]').count()) > 0;
+  }
+
+  return { rendered, rows, actions, showsUpload, readsAsSentences, toggles, detailOpened };
 }
 
 /**
