@@ -100,12 +100,23 @@ function record(entry) {
 
 const consoleLog = [];
 /**
- * Refusals a pass provokes on purpose — a step-up gate in front of a dangerous action, for
- * instance. They are assertions the pass makes (it proves the prompt appeared and the retry
- * succeeded), not defects, so a pass registers one immediately before the act with
- * `expectRefusal` and the roll-up reports what it swallowed as `expectedRefusals` instead of a
- * finding. An allowance is single-use and indexed, so it can only excuse an entry that arrived
- * after it was registered.
+ * Refusals and failures a pass provokes on purpose — a step-up gate in front of a dangerous
+ * action, a field submitted wrong on purpose, or a 500 the pass answers itself to prove the
+ * screen survives an outage. They are assertions the pass makes, not defects, so a pass
+ * registers one immediately before the act with `expectRefusal` and the roll-up reports what it
+ * swallowed as `refusedOnPurpose` instead of a finding.
+ *
+ * Two properties keep the allowance from hiding real defects:
+ *
+ *   * **It is positional.** The window opens at the moment of registration, so it can only excuse
+ *     an entry that arrived after it.
+ *   * **It is bounded in time.** The pass closes it with `endRefusalWindow` once the provocation
+ *     is over, so a failure that happens later — for a reason the pass never caused — is reported
+ *     again. An allowance that never closes is an allowance that eventually hides the next bug.
+ *
+ * An allowance covers a *window* rather than a single entry on purpose: one provoked 500 is not
+ * one network entry. A screen that loads twice, or a StrictMode double render, sends the same
+ * request several times and all of them belong to the provocation.
  */
 const expectedRefusals = [];
 
@@ -120,16 +131,30 @@ const expectedRefusals = [];
  */
 const aiStateFindings = [];
 
-/** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
+/** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line).
+ *
+ *  The window is bounded by *position*, not by the moment the roll-up reads it. The pass closes it
+ *  with `endRefusalWindow`, which records how far it reached; a boolean "closed" flag would retract
+ *  the allowance from entries the pass had already provoked, and the provocation really did happen.
+ */
 function expectRefusal(match, reason) {
   expectedRefusals.push({
     match,
     reason,
     consoleFrom: consoleLog.length,
     netFrom: netFailures.length,
-    claimedConsole: false,
-    claimedNet: false,
+    claimed: 0,
   });
+}
+
+/** Close the open registration for `match`, so only what it provoked stays excused. */
+function endRefusalWindow(match) {
+  const entry = [...expectedRefusals].reverse().find((e) => e.match === match && e.netTo === undefined);
+  if (entry) {
+    entry.netTo = netFailures.length;
+    entry.consoleTo = consoleLog.length;
+  }
+  return entry;
 }
 
 const netFailures = [];
@@ -1361,6 +1386,9 @@ async function runAiStatesDepth(page, report) {
   );
   note({ step: "providers-outage", ...providersDown });
   await shot(page, "ai-providers-outage");
+  // The provocation is over. Everything the failing screen did to answer 500 belongs to it; a
+  // failure after this point is a real one again.
+  endRefusalWindow("/ai/providers");
 
   // ---- the retry really re-requests ------------------------------------------------------
   await unroute("**/api/v1/ai/providers**");
@@ -1401,6 +1429,7 @@ async function runAiStatesDepth(page, report) {
   );
   note({ step: "models-outage", ...modelsDown });
   await shot(page, "ai-models-outage");
+  endRefusalWindow("/ai/models");
   await unroute("**/api/v1/ai/models**");
 
   // ---- the transport itself fails ---------------------------------------------------------
@@ -1423,6 +1452,7 @@ async function runAiStatesDepth(page, report) {
   );
   note({ step: "connection-refused", ...offline });
   await shot(page, "ai-providers-offline");
+  endRefusalWindow("/ai/providers");
   await unroute("**/api/v1/ai/providers**");
 
   return { providersDown, afterRetry, modelsDown, offline };
@@ -3768,11 +3798,17 @@ async function main() {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    const deliberate = /status of 40[13]/.test(f.text)
-      ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
+    // The set is the statuses a pass can *provoke on purpose*: 401/403 for a step-up or a
+    // permission refusal, 400 for a field the pass deliberately submits wrong, and 5xx for the
+    // server-error states a pass has to reach to prove the screen survives one. The registration
+    // is what makes this safe — an unregistered 500 is still a high finding.
+    const deliberate = /status of (40[013]|5\d\d)|ERR_CONNECTION_REFUSED|ERR_NETWORK/.test(f.text)
+      ? expectedRefusals.find(
+          (entry) => index >= entry.consoleFrom && (entry.consoleTo === undefined || index < entry.consoleTo),
+        )
       : null;
     if (deliberate) {
-      deliberate.claimedConsole = true;
+      deliberate.claimed += 1;
       refusedOnPurpose.push({ kind: "console", detail: `${f.phase} ${f.text.slice(0, 120)}`, reason: deliberate.reason });
       continue;
     }
@@ -3780,15 +3816,28 @@ async function main() {
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
   }
   for (const [index, n] of netFailures.entries()) {
+    // A pass registers a failure it provoked on purpose before it happens, and the statuses it may
+    // register are 401/403 (a refusal), 400 (a wrong field submitted on purpose), 5xx (the
+    // server-error state the screen is being tested against) and no status at all (`net::ERR_*` —
+    // the transport died, so the server never answered). Registration is the only thing that makes
+    // an allowance: an unclaimed entry here is still a high finding.
+    //
+    // A registration covers its whole window rather than one entry. One provoked failure is not
+    // one network entry — a screen that loads twice, or a StrictMode double render, sends the same
+    // 500 two or three times, and matching them one-for-one would report the second and third as
+    // defects the pass itself caused.
     const deliberate = expectedRefusals.find(
       (entry) =>
-        !entry.claimedNet &&
         index >= entry.netFrom &&
+        (entry.netTo === undefined || index < entry.netTo) &&
         String(n.url || "").includes(entry.match) &&
-        [401, 403].includes(n.status),
+        (n.status === 0 ||
+          !n.status ||
+          [400, 401, 403].includes(n.status) ||
+          (n.status >= 500 && n.status < 600)),
     );
     if (deliberate) {
-      deliberate.claimedNet = true;
+      deliberate.claimed += 1;
       refusedOnPurpose.push({ kind: "request", status: n.status, url: n.url, reason: deliberate.reason });
       continue;
     }
