@@ -2283,3 +2283,61 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`
   (timeout 1500s). It is the last gate for closing REQ-051, and the copilot's panel card still
   has to be added to the walkthrough route list before it is worth running.
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part four: the CRM in the palette
+
+- **What shipped.** **`5bedddb`** — `crates/search/src/providers.rs` gains three providers, and
+  `crates/search/src/indexer.rs` the three upserts, three prune arms and the `crm.*` event plans.
+  `database/migrations/0031_crm_search_providers.sql` enables the keys. **`241cf91`** — the three
+  screens read `?focus=<id>`, and the three walks that prove it.
+- **The split is the point, and it is the module's, not the index's.** `contacts` and `companies`
+  carry `crm.contacts.read` because the CRM already treats them as one surface; `deals` carries
+  `crm.deals.read` of its own. The palette filters a provider on the key of the screen it points
+  at, so a contact-only reader finds people and gets **no** deal rows — the same refusal
+  `/api/v1/crm/deals` already gives them. A search that answered with the pipeline would be the
+  wider door around a decision the module deliberately made.
+- **Three decisions worth writing down.**
+  1. **Archiving is a remove, not a refresh.** An archived record still *exists* as a row the
+     module can read, so an `Index` plan would bring it straight back. The CRM lists hide
+     archived rows by default, which means a document that outlived its archive would answer with
+     a record the panel will not show when the person follows the link. All three upserts also
+     carry `where archived_at is null`, so a full reindex agrees with the event drain.
+  2. **A contact's notes never reach the index.** The module flags them
+     `crm.fields.sensitive.read` precisely because a contract note is the CRM's most private
+     column, and a `tsvector` cannot answer a per-role question. The rule the module states is
+     the rule the index keeps — otherwise the palette would be a way to search the field the IAM
+     was built to hide.
+  3. **A deal carries its stage's *name*.** `won` is a word a person types and `4f2c…` is not, and
+     a move into a differently-named stage must answer under the new name without a reindex. The
+     lost reason is a tag only: a reason is "too expensive", and putting it in the vector would
+     make a competitor's objection the most findable word in the index.
+- **Two defects the walks were written to find, and one the fixture was.**
+  - The walks first signed the **CRM manager** in to run the reindex. `search.manage` is a
+    platform key a tenant manager does not hold, so the reindex answered `403` — the walk was
+    asking the wrong actor, and the fixture now keeps the owner's address for exactly this.
+  - They then searched with the same manager and got `403` on `search.read`. That is not a bug:
+    the **box** is its own surface and its own key, refused before any provider is considered. A
+    walk that wants to prove the provider split has to hand the box over explicitly, or it proves
+    the palette is closed rather than what is behind it. Both are now granted, and the second one
+    is worth remembering as a *fact about the system*, not only about the test.
+- **Proof.** `cargo test -p omnion-search` → **47/47** (five new: the registry's route/permission
+  contract, archive-is-a-remove, the deep link, the archived guard, the notes exclusion).
+  `cargo test -p omnion-module-crm --lib` → **146/146**. `cargo test -p omnion-api --lib` →
+  **129/129**. `cargo test -p omnion-api --test crm` against `omnion_test_w4_t6c`, a database
+  created for this run → **39/39** (the 36 prior walks plus the three new ones, all re-proved).
+  `tsc --noEmit` in `apps/admin` → **clean**.
+- **Environment note.** `/mnt/apopic` hit **100%** mid-tick: two `cargo` invocations ran at once
+  (a `--lib` run and a `--tests` run) and each links a ~290 MB test binary, so the second died
+  with `IO failure on output stream: No space left on device` and then a linker bus error. The
+  fix is not mysterious — `target/debug/deps` held **5 GB of re-linkable test binaries** from
+  earlier ticks. `find target/debug/deps -type f -executable -size +100M -delete` gave 4 GB back
+  instantly, and only the one suite under test needed to be rebuilt. **A test binary is a build
+  artifact, not a result**: deleting it costs a link, never a fact.
+- **Next.** The `form.submitted` consumer (REQ-064 — a submitted form becomes a contact and a
+  deal) and the workflow-trigger proof (that an automation rule on `crm.deal.stage_changed` runs
+  once), which needs wave 3's engine rather than this module's. Then the **w4 QA browser pass**,
+  which has still never run on this branch: `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103
+  QA_WEB_PORT=3203 bash scripts/qa/run.sh` (timeout 1500s). Before that run, add the **copilot
+  card** to `scripts/qa/walkthrough.cjs`'s depth passes — it is not in the route list yet, so the
+  walkthrough would not visit the screen the previous tick shipped and the pass would prove
+  nothing about it. It is the last gate for closing REQ-051.
