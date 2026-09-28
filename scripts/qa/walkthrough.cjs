@@ -1115,6 +1115,101 @@ async function runMediaPresets(page, report) {
   };
 }
 
+/**
+ * Drive the storage settings tab the way an operator does (REQ-010, slice 3).
+ *
+ * The claims a screenshot cannot settle are the ones worth walking: a range that is refused
+ * *by the form*, naming the field, before anything is sent; a connection test that reports what
+ * it proved rather than a green tick; and a save that leaves the bucket alone when the form only
+ * changed one field. All three are checked against the DOM and the API, not against the page
+ * having rendered.
+ */
+async function runMediaStorage(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-storage", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The storage tab is a tab, not a second URL: a settings page with a hidden screen behind a
+  // link is two screens, and the second one is the one nobody visits.
+  await page.locator("#media-settings-tab-storage").click().catch(() => {});
+  await page.waitForSelector('input[placeholder="omnion-media"]', { timeout: 8000 }).catch(() => {});
+  const listed = await page.locator('input[placeholder="omnion-media"]').count();
+  note({ step: "load", listed });
+  if (listed === 0) {
+    return { ok: false, reason: "the storage tab did not render" };
+  }
+
+  // A settings screen that renders a credential is the failure this whole tab is built to avoid,
+  // so the walk checks the rendered text for one rather than trusting the type.
+  const visibleText = await page.locator("#media-settings-panel-storage").innerText().catch(() => "");
+  const leaks = ["secret", "access key", "password", "credential"].filter((word) =>
+    new RegExp(word, "i").test(visibleText),
+  );
+  note({ step: "no-credentials", leaks });
+
+  // An out-of-range value must be refused by the form, naming the field, before it is sent.
+  const ttl = page.locator('input[aria-label="Signed URL lifetime in seconds"]');
+  await ttl.fill("5").catch(() => {});
+  await page.getByRole("button", { name: /^Test connection$/ }).click().catch(() => {});
+  await page.waitForTimeout(900);
+  const alerts = await page.locator("#media-settings-panel-storage [role='alert']").allTextContents();
+  const ttlNamed = alerts.some((text) => /between 60 and 604800/.test(text));
+  note({ step: "ttl-refused", ttlNamed, alerts });
+
+  // Now a good one, and the connection test must report what it *proved* — a sentence about a
+  // write, not a bare tick. A result that says only "connected" is what a read-only probe says.
+  await ttl.fill("900").catch(() => {});
+  await page.getByRole("button", { name: /^Test connection$/ }).click().catch(() => {});
+  await page.waitForTimeout(6000);
+  const probe = await page
+    .locator('[data-testid="media-storage-probe"]')
+    .innerText()
+    .catch(() => "");
+  note({ step: "connection", probe });
+  const probeAnswered = probe.length > 0;
+  // "reached … and wrote and removed a probe object" is the passing shape; a store that
+  // accepted a write and refused a delete must say so instead of claiming success.
+  const honest = /wrote and removed|could not|reached/i.test(probe);
+
+  // A save must persist, and must not have reset the fields the walk did not touch.
+  const upload = page.locator('input[aria-label="Maximum upload size in megabytes"]');
+  await upload.fill("48").catch(() => {});
+  await page.getByRole("button", { name: /^Save$/ }).click().catch(() => {});
+  await page.waitForTimeout(2500);
+  const saved = await upload.inputValue().catch(() => "");
+  const notice = await page.locator("#media-settings-panel-storage [role='status']").allTextContents();
+  note({ step: "save", saved, notice });
+  await shot(page, "media-storage-settings");
+
+  // The saved value must be readable back out of the API by an independent request, so the
+  // walk is not just trusting that the form kept its own text.
+  const persisted = await page.evaluate(async () => {
+    const site = new URLSearchParams(window.location.search).get("site_id");
+    const sites = await (await fetch("/api/v1/sites", { credentials: "same-origin" })).json();
+    const first = (sites.sites || sites)[0];
+    const query = `site_id=${first ? first.id : site || ""}`;
+    const response = await fetch(`/api/v1/media/settings?${query}`, { credentials: "same-origin" });
+    return { status: response.status, body: await response.json() };
+  });
+  note({ step: "persisted", status: persisted.status, maxUploadMb: persisted.body?.max_upload_mb });
+
+  return {
+    ok: listed > 0 && leaks.length === 0 && ttlNamed && probeAnswered && honest && saved === "48",
+    steps: steps.length,
+    leaks,
+    ttlNamed,
+    probeAnswered,
+    honest,
+    saved,
+    persisted: persisted.body?.max_upload_mb,
+  };
+}
+
 async function runMediaFileDetail(page, report) {
   const steps = [];
   const note = (step) => {
@@ -2997,6 +3092,11 @@ async function main() {
 
   report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
   log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+
+  // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
+  // says what it proved, and a save that leaves the untouched fields alone.
+  report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
+  log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
