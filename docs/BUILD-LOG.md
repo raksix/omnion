@@ -2071,3 +2071,43 @@
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
 
+## 2026-09-28 · REQ-097 · AI provider runtime — slice 3, the runner and the substitution
+
+- **What.** The two halves slice 3 was missing. **The probe runner** (`apps/api/src/ai_health_runner.rs`,
+  `OMNION_AI_HEALTH_RUNNER`, 60 s default) samples every enabled provider each tick through the
+  *same* `probe_now` the "Probe now" button calls — a second copy of the probe is how a Health
+  tab ends up with a button and a sparkline that disagree about what "probed" means — and prunes
+  what fell out of retention in the same tick. The interval is read through `read_positive`, so a
+  zero or negative value is refused at boot rather than spinning the runner against the operator's
+  own API keys. **The substitution** (`crates/ai-hub/src/failover.rs` + `POST /ai/chat`): a
+  request that named only a task and failed before its first streamed byte is retried against the
+  next enabled provider, the swap is announced as `ai.provider.failover_used` *before* the
+  substitute's first byte reaches the caller, and the completed audit names the provider that
+  actually answered.
+
+- **Two rules, kept as decisions rather than flags.** A pinned `provider/model` request gets
+  `Plan::Pinned` — one provider, no successor — and the route narrows the chain to that single row
+  before walking it, so there is nowhere to move it. The first byte is marked at the one place a
+  delta is handed to a subscriber, because the client may already have received it before
+  `stream_chat` returns. Both are stated in unit tests without a database and a socket.
+
+- **Proof.**
+  - `cargo test -p omnion-ai-hub -p omnion-api --lib` → **190 passed** (84 AI Hub, 106 API).
+  - `cargo test -p omnion-api --test ai_hub` against `omnion_test_w7` → **11 passed**, including
+    the two new walks: the runner writes exactly one sample per enabled provider (not one per
+    step of the five-step test), announces a transition per change and **nothing** when the status
+    held, takes a provider to `down` after three consecutive failures, and never dials a
+    switched-off one; the substitution is recorded with both provider names while a pinned request
+    emits no substitution and writes `substituted_from = NULL`.
+  - `pnpm typecheck` → green (admin + web).
+  - `QA_STACK=w7 … bash scripts/qa/run.sh` → see the run note below.
+
+- **Two defects the walks caught, both in code written this tick.** The tick report counted a
+  `Some((from, to))` transition as a *success*, so a dead endpoint going `unknown → degraded` was
+  reported as a healthy provider — a runner that says two providers are fine while one is refusing
+  is a runner nobody can act on. And the completed audit read `target.name`, the **first**
+  provider, so after a substitution the answer was attributed to the one that had just failed.
+
+- **Next.** The local-endpoint walk (an Ollama-, vLLM- and llama.cpp-shaped base URL each passing
+  Test, Discover and a streamed chat), the refusal to remove the installation's default provider,
+  and the mid-stream vendor-error frame.
