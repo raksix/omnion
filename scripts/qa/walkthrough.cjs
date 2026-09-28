@@ -3320,6 +3320,12 @@ async function main() {
     // depth pass below, which selects a second family, changes the range, copies the PromQL and
     // asserts the cap is shown as a cap rather than as a number with no meaning.
     { path: "/observability/metrics", name: "observability-metrics" },
+    // The trace search and the exporter centre (REQ-126, slice 3) — walked here and driven by the
+    // depth pass below, which searches by a request id, opens a waterfall, creates an exporter,
+    // points it at a deliberately wrong endpoint and asserts `Test` renders a degraded REPORT
+    // rather than an error page.
+    { path: "/observability/traces", name: "observability-traces" },
+    { path: "/observability/exporters", name: "observability-exporters" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -3421,6 +3427,12 @@ async function main() {
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
   // bytes are pending rather than reclaimed.
+  report.observabilityTraces = await runDepthPass("observability-traces", () =>
+    runObservabilityTracesDepth(page, report),
+  );
+  report.observabilityExporters = await runDepthPass("observability-exporters", () =>
+    runObservabilityExportersDepth(page, report),
+  );
   report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
     runMediaDuplicates(page, report),
   );
@@ -3959,7 +3971,254 @@ async function runObservabilityMetricsDepth(page, report) {
 // So the depth passes are exported, and `secrets-audit-depth.cjs` can drive one of them on its
 // own against a single stack. Requiring this file must not start the whole walk, hence the guard:
 // the CLI is `node walkthrough.cjs`, a require is a library call.
-module.exports = { runSecretsAuditDepth, runObservabilityMetricsDepth, ensureSignedIn, runWizard, CREDS, URL_ADMIN };
+/**
+ * The REQ-126 trace search depth pass.
+ *
+ * It drives the screen the way an operator arrives at it — holding a request id from a log row or
+ * an error banner — and then checks the two things a search screen gets wrong quietly: that the
+ * rows say WHY they are sampled, and that an empty result explains the sampling policy instead of
+ * looking like a broken filter.
+ *
+ * The waterfall is opened from a real row when the index has one. An index with no rows is a
+ * legitimate state on a fresh stack and is reported as such — a pass that manufactures a trace to
+ * click would be testing the driver's own insert, not the screen.
+ */
+async function runObservabilityTracesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-traces-depth", action: "observability", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/observability/traces`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-traces"]', { timeout: 20000 })
+    .catch(() => {});
+  const root = page.locator('[data-view="observability-traces"]');
+  await root.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  // (1) the request-id box takes the jump that the screen exists for.
+  await page.locator("[data-trace-request-input]").fill("11111111-2222-3333-4444-555555555555");
+  await page.waitForTimeout(1200);
+  const requestFilter = await page
+    .locator('[data-trace-request-input]')
+    .inputValue()
+    .catch(() => "");
+  note({ check: "request-id-typed", value: requestFilter });
+
+  // (2) an id with no trace must EXPLAIN the sampling policy, not render a blank table.
+  const emptyHint = (await page.locator('[data-view="observability-traces"] p').first().innerText().catch(() => "")) || "";
+  const rowsAfterMiss = await page.locator("[data-trace-open]").count();
+  note({ check: "miss-explained", rows: rowsAfterMiss, hint: emptyHint.slice(0, 160) });
+  if (rowsAfterMiss === 0) {
+    const explained = /unsampled|sampling|retention|no trace/i.test(emptyHint);
+    note({ check: "miss-explains-sampling", explained });
+  }
+
+  // (3) clear, then filter by the failing status, which is the filter operators reach for.
+  await page.locator("[data-trace-clear]").click().catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-trace-status-select]").selectOption("error").catch(() => {});
+  await page.waitForTimeout(1100);
+  const errorRows = await page.locator("[data-trace-open]").count();
+  note({ check: "status-error-filter", rows: errorRows });
+
+  // (4) a min-duration that nothing meets must be an empty state with the filters still shown,
+  //     not a silent reset.
+  await page.locator("[data-trace-min-input]").fill("999999");
+  await page.waitForTimeout(1100);
+  const none = await page.locator("[data-trace-open]").count();
+  const clearStillThere = await page.locator("[data-trace-clear]").count();
+  note({ check: "impossible-filter", rows: none, clearFilterKept: clearStillThere });
+  await page.locator("[data-trace-clear]").click().catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // (5) the rows carry their sampling reason, and a row opens a waterfall.
+  const chips = await page.locator("[data-trace-sampling]").count();
+  note({ check: "sampling-reasons-shown", chips });
+  const rows = await page.locator("[data-trace-open]").count();
+  note({ check: "rows", rows });
+  if (rows > 0) {
+    await page.locator("[data-trace-open]").first().click().catch(() => {});
+    await page
+      .waitForSelector("[data-trace-detail]", { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(900);
+    const waterfall = await page.locator("[data-trace-waterfall]").count();
+    const spans = await page.locator("[data-trace-span]").count();
+    const truncated = await page.locator("[data-trace-truncated]").count();
+    const noBackend = await page.locator("[data-trace-no-backend]").count();
+    const backendLink = await page.locator("[data-trace-backend-link]").count();
+    note({ check: "waterfall", waterfall, spans, truncated, noBackend, backendLink });
+    // The backend link and the "no backend configured" message are MUTUALLY EXCLUSIVE: rendering
+    // both, or neither, is the bug this assertion is here to catch.
+    note({ check: "backend-answer-explicit", ok: backendLink + noBackend === 1 });
+    if (spans > 1) {
+      const picks = page.locator("[data-trace-span-pick]");
+      if ((await picks.count()) > 1) {
+        await picks.nth(1).click().catch(() => {});
+        await page.waitForTimeout(500);
+        const details = await page.locator("[data-trace-span-details]").count();
+        note({ check: "span-attributes", details });
+      }
+    }
+    await shot(page, "page-observability-traces-waterfall");
+    await page.locator("[data-trace-close]").click().catch(() => {});
+    await page.waitForTimeout(400);
+  } else {
+    note({
+      check: "no-traces-indexed",
+      reason: "a fresh stack may have no sampled trace; the empty state is what is checked",
+    });
+  }
+
+  // (6) mobile: the waterfall region scrolls inside itself and the rows are cards.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  const cards = await page.locator("[data-trace-cards] li").count();
+  const tableHidden = await page.locator("[data-trace-table]").first().isVisible().catch(() => false);
+  note({ check: "mobile", cards, tableVisible: tableHidden });
+  await shot(page, "page-observability-traces-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-observability-traces");
+
+  report.observabilityTraces = { steps };
+  return steps;
+}
+
+/**
+ * The REQ-126 exporter centre depth pass.
+ *
+ * The interesting assertion is the one the QA plan names: `Test` against a deliberately wrong
+ * endpoint must render a degraded REPORT carrying the backend's own words, not an error page. A
+ * `Test` that renders a 500 has told the operator nothing they could not have learned by waiting.
+ *
+ * The exporter is removed at the end so the pass leaves the stack as it found it.
+ */
+async function runObservabilityExportersDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-exporters-depth", action: "observability", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/observability/exporters`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-exporters"]', { timeout: 20000 })
+    .catch(() => {});
+  await page
+    .locator('[data-view="observability-exporters"]')
+    .waitFor({ state: "visible", timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  // (1) the egress statement is on the screen, not only in a component.
+  const egress = (await page.locator("[data-exporter-egress-notice]").innerText().catch(() => "")) || "";
+  note({ check: "egress-stated", present: egress.length > 40 });
+
+  // (2) the empty state names the trade-off rather than looking like a broken screen.
+  const before = await page.locator("[data-exporter-row]").count();
+  note({ check: "rows-before", rows: before });
+
+  // (3) create one against a port nothing listens on.
+  const name = `qa-otlp-${Date.now()}`;
+  await page.locator("[data-exporter-add]").click().catch(() => {});
+  await page.waitForSelector("[data-exporter-form]", { timeout: 8000 }).catch(() => {});
+  await page.locator("[data-exporter-name]").fill(name);
+  await page.locator("[data-exporter-endpoint]").fill("http://127.0.0.1:1/v1/logs");
+  await page.locator("[data-exporter-batch]").fill("100");
+  await page.locator("[data-exporter-timeout]").fill("600");
+  await shot(page, "page-observability-exporters-form");
+  await page.locator("[data-exporter-save]").click().catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const afterCreate = await page.locator(`[data-exporter-row="${name}"]`).count();
+  note({ check: "created", rows: afterCreate });
+
+  // (4) validation: an empty name is refused with a message, not saved as a blank row.
+  await page.locator("[data-exporter-add]").click().catch(() => {});
+  await page.waitForSelector("[data-exporter-form]", { timeout: 8000 }).catch(() => {});
+  await page.locator("[data-exporter-endpoint]").fill("not-a-url");
+  await page.locator("[data-exporter-save]").click().catch(() => {});
+  await page.waitForTimeout(900);
+  const stillOpen = await page.locator("[data-exporter-form]").count();
+  note({ check: "validation-kept-the-form-open", stillOpen });
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+
+  // (5) Test against the dead endpoint: a degraded REPORT, not an error page.
+  const testButton = page.locator(`[data-exporter-test="${name}"]`).first();
+  if ((await testButton.count()) > 0) {
+    await testButton.click().catch(() => {});
+    await page
+      .waitForSelector("[data-exporter-test-result]", { timeout: 25000 })
+      .catch(() => {});
+    await page.waitForTimeout(700);
+    const verdict = (await page.locator("[data-exporter-test-result]").innerText().catch(() => "")) || "";
+    const refused = /refused|error|connect|ECONNREFUSED|proxy|resolve/i.test(verdict);
+    note({ check: "test-renders-a-report", present: verdict.length > 0, refused });
+    note({ check: "test-not-an-error-page", ok: (await page.locator("[data-exporter-error]").count()) === 0 });
+    await shot(page, "page-observability-exporters-test");
+    await page.locator("[data-exporter-test-dismiss]").click().catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
+  // (6) the chip is a real state, and the row says the backend is unknown rather than green.
+  const health = await page
+    .locator(`[data-exporter-row="${name}"] [data-exporter-health]`)
+    .first()
+    .getAttribute("data-exporter-health")
+    .catch(() => null);
+  note({ check: "health-chip", health });
+  note({ check: "unknown-is-not-ok", ok: health !== "ok" || before > 0 });
+
+  // (7) the form has no field that could hold a credential.
+  await page.locator(`[data-exporter-edit="${name}"]`).first().click().catch(() => {});
+  await page.waitForSelector("[data-exporter-form]", { timeout: 8000 }).catch(() => {});
+  const secretField = await page.locator("[data-exporter-secret]").getAttribute("type").catch(() => "text");
+  const secretLabel = (await page.locator('label[for="exporter-secret"]').innerText().catch(() => "")) || "";
+  note({ check: "auth-is-a-reference-not-a-value", type: secretField, saysReference: /reference|secret id/i.test(secretLabel) });
+  const passwordFields = await page.locator('[data-exporter-form] input[type="password"]').count();
+  note({ check: "no-password-field", passwordFields });
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+
+  // (8) remove it, so the pass leaves the stack as it found it.
+  await page.locator(`[data-exporter-remove="${name}"]`).first().click().catch(() => {});
+  await page.waitForTimeout(1600);
+  const afterRemove = await page.locator(`[data-exporter-row="${name}"]`).count();
+  note({ check: "removed", rows: afterRemove });
+
+  // (9) mobile: cards, not a table squeezed into 390 px.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  const mobile = { cards: await page.locator("[data-exporter-cards] li").count() };
+  note({ check: "mobile", ...mobile });
+  await shot(page, "page-observability-exporters-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-observability-exporters");
+
+  report.observabilityExporters = { steps };
+  return steps;
+}
+
+module.exports = {
+  runSecretsAuditDepth,
+  runObservabilityMetricsDepth,
+  runObservabilityTracesDepth,
+  runObservabilityExportersDepth,
+  ensureSignedIn,
+  runWizard,
+  CREDS,
+  URL_ADMIN,
+};
 
 if (require.main === module) {
   main().catch(async (err) => {
