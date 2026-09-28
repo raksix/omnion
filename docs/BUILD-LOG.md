@@ -1821,6 +1821,173 @@ the only 2 failures are `apps/api/tests/events.rs`, which passes on its own (`2 
 fails only in a parallel run on its temporary-database teardown — a race between suites, not a
 defect, and not in this wave. `apps/admin` `tsc --noEmit` → **0 errors**. The QA browser pass
 is **not** recorded here: this tick is not the slice's close tick and the run window closed
+## 2026-09-28 — main merged, and slice 4's first half: activities and the merged record timeline
+
+**What.** Two things in one tick, because the first was a prerequisite for measuring the second.
+
+**The merge.** `origin/main` had moved 17 commits (IAM SSO, the file manager, the authentication
+screen). Three files conflicted and all three are shared, so each was resolved as a union rather
+than a choice: `app-shell.tsx` (both sides added a nav entry and its icon), `BUILD-LOG.md`
+(append-only) and `scripts/qa/walkthrough.cjs`, where two independent depth passes sit at the same
+insertion point — `runCrmDealsDepth` and `runIamAuthenticationDepth` — and the mobile route list
+became the union of both sides' entries. The walkthrough resolution was rebuilt from the three
+merge stages with `difflib` rather than by hand: a first attempt joined the blocks and lost the
+file's tail, which `node --check` caught as `Unexpected end of input`.
+
+**Slice 4, half one.** The activity feed, the log form, and one ordered timeline that merges a
+record's calls, meetings, notes and tasks with its deals' stage changes and archive markers.
+
+The rules that needed writing down, because the schema could not express them:
+
+* **An activity hangs off exactly one record.** `crm_activities_attached` only requires *one* of
+  the three foreign keys, so `company_id` **and** `contact_id` together satisfies the database
+  while making the timeline ambiguous about which record owns the row. The module is the stricter
+  of the two, and the API test proves the refusal.
+* **A task needs a due date or a done mark.** The open-task index is
+  `(organization_id, due_at) where done_at is null`, so a dateless open task appears on no list.
+* **The attachment is checked inside the statement that writes the row.** A separate existence
+  check is a race: an activity logged against a deal archived a millisecond later hangs off
+  nothing, and the API answers `404` rather than writing an orphan.
+
+The timeline is built rather than stored, and its stage changes come from the **deal rows**, not
+from the event log — so a record imported before the event bus existed still has a correct
+history, and a replayed event cannot duplicate an entry. The synthetic entry id carries its arm
+(`stage:<id>` / `archived:<id>`) because a deal's stage change and its archive marker are two
+entries of one timeline, and two identical React keys means one of them silently overwrites the
+other.
+
+**A defect the tests caught in the first draft.** `relative_label` had the sign inverted:
+`then - at` is **negative** for the past, so the first version read `"in 5m"` for something that
+happened five minutes ago. Two unit tests caught it. The same function is mirrored in
+`apps/admin/lib/crm.ts` — a label is a presentation decision, and two spellings of one idea is how
+a timeline ends up disagreeing with its own feed — so both now carry the same bucket bounds and a
+comment naming the sign. A third test failure was the *test's* fault, not the code's: 14 days is
+`1_209_600s`, below the week bucket's `2_592_000s` floor, so `"14d"` is correct and the
+expectation was wrong. The bucket bounds are consts now, because a range *pattern* cannot hold the
+arithmetic they are written with.
+
+**Proof.** `cargo test -p omnion-module-crm` → **132 passed** (106 before this tick; 26 new).
+`apps/admin` `tsc --noEmit` → 0 errors. `node --check scripts/qa/walkthrough.cjs` → clean. The
+route-level `crm_activities.rs` handlers carry their own unit tests, and the integration walks are
+written but **have not run** — they need a database, and `/mnt/apopic` was at 97% with four other
+writers compiling when the tick ended. The QA browser pass is likewise not run.
+
+**Next.** Run `cargo test -p omnion-api --test crm` against a **fresh** database (see the
+`VersionMissing` note in REQ-051 — the shared dev database carries applied migrations no branch
+has, and a throwaway one is the only way the walks execute), then the w4 QA pass:
+`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`. That
+is also the last gate for slice 3. Then the rest of slice 4: the copilot's two endpoints, the
+global-search registration and the `form.submitted` consumer.
+
+**Environment note.** `/mnt/apopic` went to **98%** (1.5 GB free) mid-tick and a
+`cargo build -p omnion-api` died with `No space left on device` writing a `.rmeta`. `CARGO_INCREMENTAL=0`
+and `CARGO_BUILD_JOBS=1` are the settings that got the rest of the tick through. The seven writers'
+`target/` directories are still the pressure — they total over 27 GB on a 60 GB mount — and a
+shared `CARGO_TARGET_DIR` would remove it permanently.
+
+---
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4: the gate that had never run, and the copilot's module
+
+**What.** Ran the database gate that two ticks had deferred, against a throwaway database
+(`omnion_w4_gate`) rather than the shared development one, and built the copilot's module — the
+piece of slice 4 that is pure rule and needs no provider to prove.
+
+The suite **ran for the first time**: 29 of 35 walks passed and the six slice-4 walks failed. They
+had never executed — the default database's migration ledger carries versions 19 and 21 from a run
+against files no branch carries, so the fixture panicked before any test body and the "29 passed"
+being reported was 29 of the *slice-1-3* walks. The six new ones were silently not in that number.
+
+They found **four product defects** and three mistakes inside the walks themselves:
+
+* The activity feed's visibility clause emitted `any($1, $2)` instead of `any($1)` — a
+  `separated(", ")` of individual binds where the array operator needs one array parameter. A 500
+  for every caller at the `team` level. `open_tasks` repeated it by hand; `set_activity_done` used
+  `$3` for both the `done_at` timestamp *and* the id list, so closing any task was a 500 too. One
+  shared `push_activity_visibility` now serves all three.
+* `Activity` and `TimelineEntry` serialised their timestamps with no serde attribute, so every
+  activity response carried `time`'s tuple (`[2026, 263, …]`).
+* `ActivityChanges`' three timestamps were bare `Option<OffsetDateTime>`, and `time`'s serde support
+  is opt-in per field — a bare one accepts **no** JSON string, so logging a task with a due date
+  was a 422 for every caller. `dates::instant` is the new round trip: RFC 3339 as written, a
+  zone-less `datetime-local` value as UTC, an explicit offset on the way back out.
+* In the walks: an e-mail passed where a session token belonged (a 401 that reads as a broken
+  endpoint), a deal's id passed to a route that takes an activity's, `rp.permission` where the
+  column is `permission_key`, and `actor_user_id` read from a helper that names the key `actor`.
+
+`modules/crm/src/copilot.rs` is new: the deal + company + history read through the **caller's own
+`Scope`** (so a copilot call is exactly as restricted as the card it sits on), the two instructions
+as constants, and a sanitiser that treats the model's answer as untrusted text — unwraps a stray
+code fence, strips tag runs and control characters, caps a runaway answer, and refuses an answer
+that is only markup with a new `CrmError::EmptyAnswer` (mapped to a `502` with the code
+`crm_copilot_empty_answer`). The module writes nothing to any CRM row, by construction.
+
+**Proof.** `cargo test -p omnion-module-crm` → **146 passed** (139 before; 7 new for the timestamp
+round trip, plus the copilot's 7 in the previous commit). `cargo test -p omnion-api --test crm`
+against `omnion_w4_gate` → **35 passed, 0 failed** (29 of them the slice-1-3 walks, re-proved; 6 the
+slice-4 walks, running for the first time). `pnpm typecheck` → 2/2 packages, 0 errors.
+
+**Next.** The copilot's two endpoints (`POST /api/v1/crm/copilot/summarize` and `/follow-up`,
+`crm.copilot.use`, each audited) — the module is in and the route is not — then the global-search
+registration (REQ-002) and the `form.submitted` consumer. The **w4 QA browser pass still has not run
+this tick** (`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`);
+it is the last gate for closing REQ-051, and `/mnt/apopic` was back at 97% with other writers
+compiling when the tick ended.
+
+**Environment note.** `/mnt/apopic` is shared by seven writers and the mount sat at 97-98% for most
+of this tick (1.5-3.0 GB free). `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2` and deleting this
+worktree's own `target/debug/incremental` (46 MB) kept it workable; the seven `target/` directories
+still total over 27 GB on a 60 GB mount, and a shared `CARGO_TARGET_DIR` remains the permanent fix.
+
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
+
+- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  filtered listing against a real database — the walk that asserts the audit rows for
+  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  made the walk real and then fixed what it found.
+- **Six defects, none of them visible to the layer that owned them.**
+  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+     only exist where the value beside it was pushed.
+  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+     trash summary answered 500. Cast back to `bigint`.
+  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+     row against the pre-update snapshot, so no ordering is needed.
+  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+     new path, so `parent_id` became the folder itself on every move, and the first move of a
+     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+     *parent's* path.
+  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+  and a move to where a folder already is is a no-op.
+- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+  session and to an account with no media permission, a site created after the migration still
+  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  a file moves between folders without its storage key changing, a filter narrows the listing and
+  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  no new warning.
+- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  `target/debug/incremental` in this worktree returned 2.9 GB.
+- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+  history, the preview pipeline and the file detail screen do not.
 before the 6-10 minute pass could finish, so slice 3's close tick carries it.
 
 **A migration number is global across branches, and it is worth repeating after being bitten
@@ -2060,120 +2227,3 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
-## 2026-09-28 — main merged, and slice 4's first half: activities and the merged record timeline
-
-**What.** Two things in one tick, because the first was a prerequisite for measuring the second.
-
-**The merge.** `origin/main` had moved 17 commits (IAM SSO, the file manager, the authentication
-screen). Three files conflicted and all three are shared, so each was resolved as a union rather
-than a choice: `app-shell.tsx` (both sides added a nav entry and its icon), `BUILD-LOG.md`
-(append-only) and `scripts/qa/walkthrough.cjs`, where two independent depth passes sit at the same
-insertion point — `runCrmDealsDepth` and `runIamAuthenticationDepth` — and the mobile route list
-became the union of both sides' entries. The walkthrough resolution was rebuilt from the three
-merge stages with `difflib` rather than by hand: a first attempt joined the blocks and lost the
-file's tail, which `node --check` caught as `Unexpected end of input`.
-
-**Slice 4, half one.** The activity feed, the log form, and one ordered timeline that merges a
-record's calls, meetings, notes and tasks with its deals' stage changes and archive markers.
-
-The rules that needed writing down, because the schema could not express them:
-
-* **An activity hangs off exactly one record.** `crm_activities_attached` only requires *one* of
-  the three foreign keys, so `company_id` **and** `contact_id` together satisfies the database
-  while making the timeline ambiguous about which record owns the row. The module is the stricter
-  of the two, and the API test proves the refusal.
-* **A task needs a due date or a done mark.** The open-task index is
-  `(organization_id, due_at) where done_at is null`, so a dateless open task appears on no list.
-* **The attachment is checked inside the statement that writes the row.** A separate existence
-  check is a race: an activity logged against a deal archived a millisecond later hangs off
-  nothing, and the API answers `404` rather than writing an orphan.
-
-The timeline is built rather than stored, and its stage changes come from the **deal rows**, not
-from the event log — so a record imported before the event bus existed still has a correct
-history, and a replayed event cannot duplicate an entry. The synthetic entry id carries its arm
-(`stage:<id>` / `archived:<id>`) because a deal's stage change and its archive marker are two
-entries of one timeline, and two identical React keys means one of them silently overwrites the
-other.
-
-**A defect the tests caught in the first draft.** `relative_label` had the sign inverted:
-`then - at` is **negative** for the past, so the first version read `"in 5m"` for something that
-happened five minutes ago. Two unit tests caught it. The same function is mirrored in
-`apps/admin/lib/crm.ts` — a label is a presentation decision, and two spellings of one idea is how
-a timeline ends up disagreeing with its own feed — so both now carry the same bucket bounds and a
-comment naming the sign. A third test failure was the *test's* fault, not the code's: 14 days is
-`1_209_600s`, below the week bucket's `2_592_000s` floor, so `"14d"` is correct and the
-expectation was wrong. The bucket bounds are consts now, because a range *pattern* cannot hold the
-arithmetic they are written with.
-
-**Proof.** `cargo test -p omnion-module-crm` → **132 passed** (106 before this tick; 26 new).
-`apps/admin` `tsc --noEmit` → 0 errors. `node --check scripts/qa/walkthrough.cjs` → clean. The
-route-level `crm_activities.rs` handlers carry their own unit tests, and the integration walks are
-written but **have not run** — they need a database, and `/mnt/apopic` was at 97% with four other
-writers compiling when the tick ended. The QA browser pass is likewise not run.
-
-**Next.** Run `cargo test -p omnion-api --test crm` against a **fresh** database (see the
-`VersionMissing` note in REQ-051 — the shared dev database carries applied migrations no branch
-has, and a throwaway one is the only way the walks execute), then the w4 QA pass:
-`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`. That
-is also the last gate for slice 3. Then the rest of slice 4: the copilot's two endpoints, the
-global-search registration and the `form.submitted` consumer.
-
-**Environment note.** `/mnt/apopic` went to **98%** (1.5 GB free) mid-tick and a
-`cargo build -p omnion-api` died with `No space left on device` writing a `.rmeta`. `CARGO_INCREMENTAL=0`
-and `CARGO_BUILD_JOBS=1` are the settings that got the rest of the tick through. The seven writers'
-`target/` directories are still the pressure — they total over 27 GB on a 60 GB mount — and a
-shared `CARGO_TARGET_DIR` would remove it permanently.
-
----
-
-## 2026-09-28 — wave 4 · REQ-051 slice 4: the gate that had never run, and the copilot's module
-
-**What.** Ran the database gate that two ticks had deferred, against a throwaway database
-(`omnion_w4_gate`) rather than the shared development one, and built the copilot's module — the
-piece of slice 4 that is pure rule and needs no provider to prove.
-
-The suite **ran for the first time**: 29 of 35 walks passed and the six slice-4 walks failed. They
-had never executed — the default database's migration ledger carries versions 19 and 21 from a run
-against files no branch carries, so the fixture panicked before any test body and the "29 passed"
-being reported was 29 of the *slice-1-3* walks. The six new ones were silently not in that number.
-
-They found **four product defects** and three mistakes inside the walks themselves:
-
-* The activity feed's visibility clause emitted `any($1, $2)` instead of `any($1)` — a
-  `separated(", ")` of individual binds where the array operator needs one array parameter. A 500
-  for every caller at the `team` level. `open_tasks` repeated it by hand; `set_activity_done` used
-  `$3` for both the `done_at` timestamp *and* the id list, so closing any task was a 500 too. One
-  shared `push_activity_visibility` now serves all three.
-* `Activity` and `TimelineEntry` serialised their timestamps with no serde attribute, so every
-  activity response carried `time`'s tuple (`[2026, 263, …]`).
-* `ActivityChanges`' three timestamps were bare `Option<OffsetDateTime>`, and `time`'s serde support
-  is opt-in per field — a bare one accepts **no** JSON string, so logging a task with a due date
-  was a 422 for every caller. `dates::instant` is the new round trip: RFC 3339 as written, a
-  zone-less `datetime-local` value as UTC, an explicit offset on the way back out.
-* In the walks: an e-mail passed where a session token belonged (a 401 that reads as a broken
-  endpoint), a deal's id passed to a route that takes an activity's, `rp.permission` where the
-  column is `permission_key`, and `actor_user_id` read from a helper that names the key `actor`.
-
-`modules/crm/src/copilot.rs` is new: the deal + company + history read through the **caller's own
-`Scope`** (so a copilot call is exactly as restricted as the card it sits on), the two instructions
-as constants, and a sanitiser that treats the model's answer as untrusted text — unwraps a stray
-code fence, strips tag runs and control characters, caps a runaway answer, and refuses an answer
-that is only markup with a new `CrmError::EmptyAnswer` (mapped to a `502` with the code
-`crm_copilot_empty_answer`). The module writes nothing to any CRM row, by construction.
-
-**Proof.** `cargo test -p omnion-module-crm` → **146 passed** (139 before; 7 new for the timestamp
-round trip, plus the copilot's 7 in the previous commit). `cargo test -p omnion-api --test crm`
-against `omnion_w4_gate` → **35 passed, 0 failed** (29 of them the slice-1-3 walks, re-proved; 6 the
-slice-4 walks, running for the first time). `pnpm typecheck` → 2/2 packages, 0 errors.
-
-**Next.** The copilot's two endpoints (`POST /api/v1/crm/copilot/summarize` and `/follow-up`,
-`crm.copilot.use`, each audited) — the module is in and the route is not — then the global-search
-registration (REQ-002) and the `form.submitted` consumer. The **w4 QA browser pass still has not run
-this tick** (`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`);
-it is the last gate for closing REQ-051, and `/mnt/apopic` was back at 97% with other writers
-compiling when the tick ended.
-
-**Environment note.** `/mnt/apopic` is shared by seven writers and the mount sat at 97-98% for most
-of this tick (1.5-3.0 GB free). `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2` and deleting this
-worktree's own `target/debug/incremental` (46 MB) kept it workable; the seven `target/` directories
-still total over 27 GB on a 60 GB mount, and a shared `CARGO_TARGET_DIR` remains the permanent fix.
