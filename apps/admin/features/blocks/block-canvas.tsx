@@ -289,6 +289,12 @@ function CanvasBlock({
       data-block-canvas-block={block.type}
       data-block-has-error={blocking ? "true" : "false"}
       data-block-inline-editable={inline ? "true" : "false"}
+      // Which block is selected, as a fact rather than as a Tailwind class. Every other
+      // property a test needs is already a `data-` attribute here, and the selection was the
+      // odd one out — so a step that has to act on "the block the author is looking at" could
+      // only reach it by matching a utility class that a stylesheet change would silently
+      // invalidate. A class name is a rendering decision; a selection is behaviour.
+      data-block-selected={active ? "true" : "false"}
       className={`relative rounded-lg border transition ${
         active ? "border-accent ring-2 ring-accent/15" : "border-line hover:border-accent/40"
       } ${blocking ? "border-accent-strong" : ""}`}

@@ -5138,7 +5138,7 @@ async function runBlockEditorDepth(page, report) {
   steps.visibilityControlPresent = (await hideOn.count()) > 0;
   await hideOn.selectOption("mobile").catch(() => {});
   await page.waitForTimeout(1200);
-  const selectedRow = page.locator("[data-block-canvas-block].ring-accent").first();
+  const selectedRow = page.locator('[data-block-canvas-block][data-block-selected=true]').first();
   const badgeRow = (await selectedRow.count()) > 0 ? selectedRow : page.locator('[data-block-canvas-block=heading]').first();
   steps.hiddenBadge = (await badgeRow.locator("[data-block-hidden-on=mobile]").count()) > 0;
   steps.hiddenBadgeText = (
