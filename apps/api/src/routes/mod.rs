@@ -97,6 +97,7 @@ pub mod sso;
 pub mod tenancy;
 pub mod tenancy_departments;
 pub mod tenancy_limits;
+pub mod tenancy_member_detail;
 pub mod tenancy_members;
 pub mod webauthn;
 pub mod webhooks;
@@ -373,8 +374,15 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "organizations.manage")),
         );
 
-    let organization_member = patch(tenancy_members::update_member)
-        .layer(guards::require(&state, "organizations.manage"))
+    // The member drawer's read is the `GET` of the same resource (REQ-005, slice 4) rather than a
+    // `/detail` sub-path: a member *is* the row, and a screen that had to ask for a second
+    // address to see one member would be a second route to keep in step with this one.
+    let organization_member = get(tenancy_member_detail::get_member)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            patch(tenancy_members::update_member)
+                .layer(guards::require(&state, "organizations.manage")),
+        )
         .merge(
             delete(tenancy_members::remove_member)
                 .layer(guards::require(&state, "organizations.manage")),
@@ -440,6 +448,21 @@ pub fn router(state: AppState) -> Router {
         );
     let member_departments = get(tenancy_departments::list_member_departments)
         .layer(guards::require(&state, "organizations.read"));
+
+    // The member drawer (REQ-005, slice 4): one read of everything the drawer shows, and the
+    // three binding operations beside it. The read rides `organizations.read`; the writes need
+    // *both* `organizations.manage` (they are changes to this tenant's people) and
+    // `iam.bindings.manage` (they are role grants) — exactly as the department-role route above
+    // already does, because a grant is a grant whoever asks for it through a tenant path.
+    let organization_member_role_bindings: MethodRouter<AppState, Infallible> =
+        post(tenancy_member_detail::grant_member_role)
+            .layer(guards::require(&state, "organizations.manage"))
+            .layer(guards::require(&state, "iam.bindings.manage"));
+    let organization_member_role_binding: MethodRouter<AppState, Infallible> =
+        patch(tenancy_member_detail::extend_member_role)
+            .merge(delete(tenancy_member_detail::revoke_member_role))
+            .layer(guards::require(&state, "organizations.manage"))
+            .layer(guards::require(&state, "iam.bindings.manage"));
 
     // Settings, modules, limits and usage (REQ-005, slice 3). Reads ride
     // `organizations.read`, writes `organizations.manage`. The usage route is a `GET` that
@@ -1014,6 +1037,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/organizations/{id}/members/{user_id}/departments",
             member_departments,
+        )
+        .route(
+            "/organizations/{id}/members/{user_id}/role-bindings",
+            organization_member_role_bindings,
+        )
+        .route(
+            "/organizations/{id}/members/{user_id}/role-bindings/{binding_id}",
+            organization_member_role_binding,
         )
         .route("/organizations/{id}/settings", organization_settings)
         .route("/organizations/{id}/modules", organization_modules)

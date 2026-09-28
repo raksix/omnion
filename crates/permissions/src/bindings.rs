@@ -168,6 +168,35 @@ pub async fn revoke(pool: &PgPool, binding_id: Uuid) -> Result<bool> {
     Ok(revoked)
 }
 
+/// Move a temporary binding's expiry to a new moment.
+///
+/// This exists as a store operation rather than being spelled at the route, because "extend"
+/// is a real third verb beside grant and revoke (REQ-005, slice 4's member drawer), and the one
+/// thing it must never do is *insert* a second row. Two live bindings for one role and scope
+/// would leave the effective-permissions screen showing the same role twice with different
+/// windows, and neither row would be the truth.
+///
+/// A revoked row is not extendable: `revoked_at is null` is in the statement, so re-opening a
+/// grant the trail already recorded as revoked would make the audit lie. The caller's `None`
+/// therefore means "there was no such live binding" and is answered as a `404`, not as a silent
+/// success.
+pub async fn extend_expiry(
+    pool: &PgPool,
+    binding_id: Uuid,
+    expires_at: OffsetDateTime,
+) -> Result<Option<RoleBinding>> {
+    let row: Option<BindingRow> = sqlx::query_as(&format!(
+        "update role_bindings set expires_at = $2 where id = $1 and revoked_at is null \
+         returning {BINDING_COLUMNS}"
+    ))
+    .bind(binding_id)
+    .bind(expires_at)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(BindingRow::into_binding).transpose()
+}
+
 /// Revoke every live binding a subject holds (deleting a group or a machine identity).
 pub async fn revoke_for_subject(pool: &PgPool, subject: Subject) -> Result<u64> {
     let revoked = sqlx::query(

@@ -560,6 +560,20 @@ fn code_of(body: &Value) -> String {
         .to_owned()
 }
 
+/// The `id` of a response body, as the string the API answered with.
+///
+/// A helper rather than `as_str().unwrap()` at every call site, and it returns the *string* on
+/// purpose: a uuid has to be parsed back out of the JSON to be compared, and doing that in the
+/// helper means every assertion reads `body["id"] == id_of(body)`. The parse failure a test
+/// *should* see is "the response has no id", and a panic that says so is worth more than an
+/// `unwrap()` forty lines from the assertion that cares.
+fn id_of(body: &Value) -> String {
+    body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the body carries an id: {body}"))
+        .to_owned()
+}
+
 // ---------------------------------------------------------------------------------------------
 // The walks
 // ---------------------------------------------------------------------------------------------
@@ -3193,3 +3207,428 @@ async fn set_retention(db: &Db, organization_id: Uuid, days: i32) {
     .expect("the retention window must be storable");
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// The member drawer (REQ-005, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// The powers the drawer walks need on top of [`ADMIN_PERMISSIONS`], and the reason they are a
+/// separate grant.
+///
+/// The drawer's three writes are guarded by `iam.bindings.manage` *as well as*
+/// `organizations.manage`. An administrator holding only the latter answers `403
+/// permission_denied` from the permission layer, and that is indistinguishable — from the
+/// outside — from the guard the walk means to exercise. A walk built on that fixture would
+/// "prove" the drawer refuses a cross-tenant grant while proving only that the caller was
+/// short of a permission.
+const DRAWER_PERMISSIONS: [&str; 3] = [
+    "iam.bindings.read",
+    "iam.bindings.manage",
+    "audit.read",
+];
+
+/// Grant the drawer powers to an account and return the role it created.
+///
+/// The role id is returned because the walk has to grant *a* role through the drawer and needs
+/// a role that is definitely this tenant's; building one inline and then reading it back out of
+/// the response would make the test depend on the API it is testing.
+async fn grant_drawer_permissions(db: &Db, organization_id: Uuid, user_id: Uuid) -> Uuid {
+    let role = role_store::create_role(
+        db.pool(),
+        omnion_permissions::model::NewRole {
+            organization_id,
+            key: format!("drawer-admin-{}", Uuid::new_v4().simple()),
+            name: "Drawer Administrator".to_owned(),
+            description: "Runs the member drawer".to_owned(),
+            priority: 800,
+            inherits_role_id: None,
+        },
+    )
+    .await
+    .expect("the drawer role must be created");
+
+    let entries: Vec<omnion_permissions::model::RolePermissionInput> = DRAWER_PERMISSIONS
+        .iter()
+        .map(|key| omnion_permissions::model::RolePermissionInput {
+            key: (*key).to_owned(),
+            effect: omnion_permissions::model::Effect::Allow,
+        })
+        .collect();
+    role_store::set_role_permissions(db.pool(), role.id, &entries)
+        .await
+        .expect("the drawer permission set must be written");
+
+    omnion_permissions::bindings::grant(
+        db.pool(),
+        omnion_permissions::model::NewBinding {
+            role_id: role.id,
+            user_id,
+            scope: omnion_permissions::Scope::Organization { organization_id },
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the drawer binding must be granted");
+
+    role.id
+}
+
+/// The member drawer answers for a member of this tenant, and the whole of it: the identity, the
+/// bindings with their scope and expiry, the departments and the member's own trail.
+///
+/// The point of the first assertions is negative as much as positive: a drawer that returned
+/// `200` with an empty `bindings` array for a member who *does* hold roles would render
+/// perfectly and be wrong, so the walk grants first and reads after.
+#[tokio::test]
+async fn the_member_drawer_answers_with_everything_it_renders() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+
+    // The second account of organization A is the subject of the drawer.
+    let subject = fixture.accounts[1];
+    let role_id = grant_drawer_permissions(&fixture.db, fixture.org_a, fixture.accounts[0]).await;
+
+    let uri = format!(
+        "/api/v1/organizations/{}/members/{subject}",
+        fixture.org_a
+    );
+
+    let opened = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(opened.status, StatusCode::OK, "drawer: {}", opened.body);
+    assert_eq!(opened.body["user_id"], subject.to_string());
+    assert!(opened.body["email"].is_string());
+    assert!(opened.body["membership_id"].is_string());
+    assert!(opened.body["status"].is_string());
+    // The empty state is a real answer, not a missing key: a panel branching on
+    // `bindings.length` must not have to guard against `undefined`.
+    assert!(opened.body["bindings"].is_array());
+    assert!(opened.body["departments"].is_array());
+    assert!(opened.body["recent_audit"].is_array());
+
+    // Grant a role through the drawer and read it back.
+    let granted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({ "role_id": role_id })),
+        ),
+    )
+    .await;
+    assert_eq!(granted.status, StatusCode::CREATED, "grant: {}", granted.body);
+    assert_eq!(granted.body["role_id"], role_id.to_string());
+    // The default scope is the organization's, and it is named rather than assumed — a grant
+    // that silently resolved to `global` would be a tenant administrator handing out a platform
+    // grant.
+    assert_eq!(granted.body["scope_type"], "organization");
+    assert_eq!(granted.body["active"], true);
+    assert!(granted.body["expires_at"].is_null());
+    let binding_id = id_of(&granted.body);
+
+    let after = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK);
+    let bindings = after.body["bindings"].as_array().expect("an array of bindings");
+    assert_eq!(bindings.len(), 1, "{:?}", after.body["bindings"]);
+    assert_eq!(bindings[0]["id"], binding_id);
+    assert_eq!(bindings[0]["role_id"], role_id.to_string());
+
+    // The grant is on this tenant's trail, naming the member and the role.
+    let trail = after.body["recent_audit"].as_array().expect("an audit array");
+    let role_changed = trail
+        .iter()
+        .find(|row| row["action"] == "organization.member.role_changed");
+    assert!(
+        role_changed.is_some(),
+        "the drawer must show the grant it just made: {:?}",
+        after.body["recent_audit"]
+    );
+
+    // The other tenant's administrator may not open this member at all — a `404`, because a
+    // `403` would confirm that the user id exists somewhere.
+    let other = fixture.other_admin_token().await;
+    let foreign = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&other), None),
+    )
+    .await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+    assert_eq!(code_of(&foreign.body), "organization_not_found");
+
+    fixture.cleanup().await;
+}
+
+/// Extend is a third verb, not a revoke-and-re-grant: the temporary grant moves its own expiry
+/// and keeps its identity, its creation record and its place in the trail.
+///
+/// The last assertion is the one that matters. Revoke-then-grant would pass every other line of
+/// this walk, and it would leave two rows — one revoked, one live — where the effective
+/// permissions screen shows the same role twice with two different windows. Asserting that the
+/// *same* binding id answers with the new date is what proves the row was updated rather than
+/// replaced.
+#[tokio::test]
+async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+    let subject = fixture.accounts[1];
+    let role_id = grant_drawer_permissions(&fixture.db, fixture.org_a, fixture.accounts[0]).await;
+
+    let uri = format!(
+        "/api/v1/organizations/{}/members/{subject}",
+        fixture.org_a
+    );
+
+    // A grant with a window an hour out.
+    let first_hour = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let granted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({
+                "role_id": role_id,
+                "expires_at": first_hour.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(granted.status, StatusCode::CREATED, "grant: {}", granted.body);
+    let binding_id = id_of(&granted.body);
+    let original_expiry = granted.body["expires_at"].as_str().expect("an expiry").to_owned();
+
+    // Extending backwards is refused: "extend" that lands in the past is a grant that reads as
+    // renewed and does nothing.
+    let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let backwards = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("{uri}/role-bindings/{binding_id}"),
+            Some(&admin),
+            Some(json!({
+                "expires_at": past.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(backwards.status, StatusCode::BAD_REQUEST);
+    assert_eq!(code_of(&backwards.body), "expiry_in_the_past");
+
+    // A timestamp the platform cannot read is refused by name too, not answered as "extended to
+    // nothing".
+    let garbage = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("{uri}/role-bindings/{binding_id}"),
+            Some(&admin),
+            Some(json!({ "expires_at": "next tuesday" })),
+        ),
+    )
+    .await;
+    assert_eq!(garbage.status, StatusCode::BAD_REQUEST);
+    assert_eq!(code_of(&garbage.body), "invalid_expiry");
+
+    // The real extension: a week out, on the same row.
+    let week = OffsetDateTime::now_utc() + time::Duration::days(7);
+    let extended = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("{uri}/role-bindings/{binding_id}"),
+            Some(&admin),
+            Some(json!({
+                "expires_at": week.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        extended.status, StatusCode::OK,
+        "extend: {}",
+        extended.body
+    );
+    assert_eq!(extended.body["id"], binding_id, "the same row answered");
+    assert_ne!(extended.body["expires_at"], original_expiry);
+    assert_eq!(extended.body["active"], true);
+
+    // Exactly one binding for this member and this role, and it is the extended one.
+    let after = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&admin), None),
+    )
+    .await;
+    let bindings = after.body["bindings"].as_array().expect("an array of bindings");
+    assert_eq!(bindings.len(), 1, "an extension must not add a row: {bindings:?}");
+    assert_eq!(bindings[0]["id"], binding_id);
+
+    // Revoking it is the last step, and a *revoked* binding cannot be extended afterwards: the
+    // trail would otherwise record a revocation the row no longer honours.
+    let revoked = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("{uri}/role-bindings/{binding_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::OK, "revoke: {}", revoked.body);
+    assert_eq!(revoked.body["active"], false);
+    assert!(revoked.body["revoked_at"].is_string());
+
+    let reopen = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("{uri}/role-bindings/{binding_id}"),
+            Some(&admin),
+            Some(json!({
+                "expires_at": week.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(reopen.status, StatusCode::NOT_FOUND);
+    assert_eq!(code_of(&reopen.body), "binding_not_found");
+
+    fixture.cleanup().await;
+}
+
+/// A tenant cannot grant a role to somebody it does not employ, or a role that belongs to
+/// another tenant — and it cannot reach a binding id from elsewhere either.
+///
+/// Three refusals, three different reasons, and the cross-tenant one is a `404` for the same
+/// reason the drawer itself is: a `403` would confirm that the id exists.
+#[tokio::test]
+async fn a_grant_stays_inside_the_tenant_that_makes_it() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+    let subject = fixture.accounts[1];
+    let role_id = grant_drawer_permissions(&fixture.db, fixture.org_a, fixture.accounts[0]).await;
+
+    // A fresh account that belongs to nobody.
+    let (outsider_id, _outsider_email) = create_account(&fixture.db).await;
+    fixture.track_account(outsider_id).await;
+
+    let uri = format!(
+        "/api/v1/organizations/{}/members/{outsider_id}",
+        fixture.org_a
+    );
+
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({ "role_id": role_id })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND);
+    assert_eq!(code_of(&refused.body), "member_not_found");
+
+    // A role from the *other* tenant, granted to a real member of this one.
+    let other_role = grant_drawer_permissions(&fixture.db, fixture.org_b(), fixture.accounts[2]).await;
+    let member_uri = format!(
+        "/api/v1/organizations/{}/members/{subject}",
+        fixture.org_a
+    );
+    let cross_role = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{member_uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({ "role_id": other_role })),
+        ),
+    )
+    .await;
+    assert_eq!(cross_role.status, StatusCode::FORBIDDEN);
+    assert_eq!(code_of(&cross_role.body), "cross_organization");
+
+    // A `global` scope is refused by name rather than quietly downgraded to the organization's:
+    // a tenant administrator asking for it is asking for something the platform owns.
+    let global_scope = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{member_uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({ "role_id": role_id, "scope_type": "global" })),
+        ),
+    )
+    .await;
+    assert_eq!(global_scope.status, StatusCode::BAD_REQUEST);
+    assert_eq!(code_of(&global_scope.body), "unsupported_scope");
+
+    // A department scope needs its key, and says so rather than creating a grant with an empty
+    // scope — which would resolve for nobody.
+    let headless = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{member_uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({ "role_id": role_id, "scope_type": "department" })),
+        ),
+    )
+    .await;
+    assert_eq!(headless.status, StatusCode::BAD_REQUEST);
+    assert_eq!(code_of(&headless.body), "department_required");
+
+    // A binding id that exists — in this tenant — is still a `404` for another member, so one
+    // member's drawer cannot revoke another's grant by guessing an id.
+    let granted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{member_uri}/role-bindings"),
+            Some(&admin),
+            Some(json!({ "role_id": role_id })),
+        ),
+    )
+    .await;
+    assert_eq!(granted.status, StatusCode::CREATED, "grant: {}", granted.body);
+    let binding_id = id_of(&granted.body);
+
+    let other = fixture.other_admin_token().await;
+    let foreign = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!(
+                "/api/v1/organizations/{}/members/{subject}/role-bindings/{binding_id}",
+                fixture.org_b()
+            ),
+            Some(&other),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign.status, StatusCode::NOT_FOUND,
+        "another tenant may not revoke: {}",
+        foreign.body
+    );
+
+    fixture.cleanup().await;
+}
