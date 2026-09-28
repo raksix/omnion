@@ -1,6 +1,6 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** in-progress · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** in-progress (`bcbfc71`) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 >
 > Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,
