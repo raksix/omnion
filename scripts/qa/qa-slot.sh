@@ -53,6 +53,16 @@ while :; do
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
+    # The holder must not inherit this script's stdout: `run.sh` reads the pid with
+    # `… | tail -n 1`, and a background child holding the same pipe open means `tail` never
+    # sees EOF — the pass prints "place taken" and then hangs there forever, with a slot held
+    # and no walkthrough running. Redirecting the holder's stdio to /dev/null is what makes the
+    # pipeline finish.
+    while :; do sleep 30; done </dev/null >/dev/null 2>&1 &
+    holder=$!
+    echo "$holder" > "${HOLDERDIR}/${mine##*/}"
+    echo "$holder"                                # stdout: the holder pid for run.sh
+
     # The holder must NOT inherit stdout: run.sh reads this script through a
     # `$(… | tail -n 1)` command substitution, and a background child that keeps
     # the pipe open makes the substitution wait for an EOF that never arrives —

@@ -12,7 +12,9 @@ import type {
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
+  MediaReplaceResult,
   MediaTrash,
+  MediaVersionList,
   OnboardingStatus,
   Organization,
   OwnerSetupResult,
@@ -450,6 +452,53 @@ export function mediaBulkAction(
     method: "POST",
     body: JSON.stringify({ site_id: siteId, action, ids, ...options }),
   });
+}
+
+/** One file of the library, with its folder and editorial fields. */
+export function fetchMediaFile(mediaId: string): Promise<MediaFile> {
+  return request<MediaFile>(`/api/v1/media/files/${encodeURIComponent(mediaId)}`);
+}
+
+/** The version history of one file. */
+export function fetchMediaVersions(mediaId: string): Promise<MediaVersionList> {
+  return request<MediaVersionList>(`/api/v1/media/${encodeURIComponent(mediaId)}/versions`);
+}
+
+/**
+ * Replace the bytes of a file, keeping the old ones.
+ *
+ * The note rides as its own multipart part rather than in the query, so a note with a newline in
+ * it cannot corrupt the URL — and the file name is deliberately *not* sent: a replace keeps the
+ * name the library already shows, and renaming is a separate, auditable action.
+ */
+export function createMediaVersion(
+  mediaId: string,
+  file: File,
+  note = "",
+): Promise<MediaReplaceResult> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("note", note);
+  return request<MediaReplaceResult>(`/api/v1/media/${encodeURIComponent(mediaId)}/versions`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+/** Bring an old version back as the newest one. */
+export function restoreMediaVersion(
+  mediaId: string,
+  version: number,
+): Promise<MediaReplaceResult> {
+  return request<MediaReplaceResult>(
+    `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/restore`,
+    { method: "POST" },
+  );
+}
+
+/** Panel read path of one version's bytes. */
+export function mediaVersionRawUrl(mediaId: string, version: number): string {
+  return `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/raw`;
 }
 
 // ---------------------------------------------------------------------------------------------

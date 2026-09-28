@@ -880,6 +880,24 @@ async function uploadMediaSample(page) {
  * the trash rather than destroying it, and the trash screen brings that same file back. A screen
  * that only looked right in a screenshot would pass all of that without doing any of it.
  */
+/**
+ * Run one depth pass without letting it end the run.
+ *
+ * A depth pass is a question asked of a screen; a screen that answers badly is a finding, and a
+ * finding belongs in the report next to the other findings — not as the reason the report was
+ * never written. The error is recorded under the pass's own name so it is counted, not hidden.
+ */
+async function runDepthPass(name, pass) {
+  try {
+    return await pass();
+  } catch (cause) {
+    const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    log(`depth pass ${name} failed: ${reason}`);
+    record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
+    return { ok: false, steps: 0, reason };
+  }
+}
+
 async function runMediaFileManager(page, report) {
   const steps = [];
   const note = (step) => {
@@ -938,7 +956,15 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "image");
   await page.waitForTimeout(1200);
   const imageRows = await page.locator("tbody tr").count();
-  const footer = await page.locator("text=/Showing \\d+ of \\d+/").first().textContent();
+  // The footer is a *report*, not a precondition: a listing that renders no rows has no footer
+  // to read, and waiting 30 s for one throws away the rest of the pass — the depth passes below
+  // this line never run and the whole QA run dies on a screen that is behaving correctly. A
+  // missing footer is recorded as absent and the pass continues.
+  const footerLocator = page.locator("text=/Showing \\d+ of \\d+/").first();
+  const footer =
+    (await footerLocator.count()) > 0
+      ? await footerLocator.textContent({ timeout: 3000 }).catch(() => null)
+      : null;
   note({ step: "filter-kind", imageRows, footer });
   await shot(page, "media-filtered");
   await page.selectOption("#media-kind", "");
@@ -979,6 +1005,112 @@ async function runMediaFileManager(page, report) {
   note({ step: "empty-or-error", emptyOrError });
 
   return { ok: true, steps: steps.length };
+}
+
+// ------------------------------------------------------- file detail (REQ-010, slice 2)
+
+/**
+ * The file detail screen: preview, metadata and the version history.
+ *
+ * The pass finds a real file through the API the panel itself uses, opens its detail screen and
+ * checks that what renders is that file — the name on screen, a preview element chosen by the
+ * file's content type, the dimensions the header of its bytes carried, and a history that has at
+ * least the upload. It then saves a piece of metadata and reads it back, which is the one write
+ * on this screen a visitor can undo by accident.
+ *
+ * A screen that only ever renders its 404 state passes a route walk, so the id is taken from a
+ * real row: the point is to test the screen, not the router that guards it.
+ */
+async function runMediaFileDetail(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-file-detail", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadMediaSample(page);
+  await page.waitForTimeout(1500);
+  note({ step: "upload", ...uploaded });
+  if (!uploaded || !uploaded.ok) {
+    return { ok: false, reason: "no file to open — the upload step did not succeed" };
+  }
+
+  // The library listing carries the ids; the first row's link is the detail screen's own route.
+  const fileId = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  note({ step: "file-id", fileId });
+  if (!fileId) {
+    return { ok: false, reason: "the library rendered no file to open" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="media-file-name"]', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const name = await page.locator('[data-testid="media-file-name"]').first().textContent().catch(() => "");
+  const rendered = (await page.locator('[data-testid="media-file-name"]').count()) > 0;
+  note({ step: "open", rendered, name });
+
+  // The preview is chosen by content type, so *one* of the six renderers must be on screen —
+  // and none of them may be an empty box. A frame that rendered nothing would still count here,
+  // so the element's own box is measured.
+  const previews = {
+    image: '[data-testid="media-preview-image"]',
+    video: '[data-testid="media-preview-video"]',
+    audio: '[data-testid="media-preview-audio"]',
+    pdf: '[data-testid="media-preview-pdf"]',
+    text: '#media-preview-text',
+    download: '#media-preview-download',
+  };
+  let kind = null;
+  let box = null;
+  for (const [name_, selector] of Object.entries(previews)) {
+    const locator = page.locator(selector).first();
+    if ((await locator.count()) > 0) {
+      kind = name_;
+      box = await locator.boundingBox().catch(() => null);
+      break;
+    }
+  }
+  note({ step: "preview", kind, width: box ? Math.round(box.width) : 0, height: box ? Math.round(box.height) : 0 });
+  await shot(page, "page-media-file-detail");
+
+  // The facts the header of the bytes carried, when the probe read them.
+  const facts = await page
+    .locator("dl")
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({ step: "facts", facts: facts.replace(/\s+/g, " ").slice(0, 200) });
+
+  // The metadata tab saves and reads back. A save that reported success without repainting would
+  // leave the old value in the field, so the value is read from the DOM after the round trip.
+  const altText = `QA alt text ${Date.now()}`;
+  await page.fill("#media-alt-text", altText);
+  await page.click("#media-save-metadata");
+  await page.waitForTimeout(1500);
+  const savedNotice = (await page.locator('[data-testid="media-file-notice"]').count()) > 0;
+  const fieldAfter = await page.inputValue("#media-alt-text").catch(() => "");
+  note({ step: "save-metadata", savedNotice, kept: fieldAfter === altText });
+
+  // The version tab lists the history; an upload is at least version 1.
+  await page.click("#media-tab-versions");
+  await page.waitForTimeout(900);
+  const versionRows = await page.locator("[data-testid^='media-version-']").count();
+  const currentBadge = await page.locator("text=current").count();
+  note({ step: "versions", versionRows, currentBadge });
+  await shot(page, "page-media-file-detail-versions");
+
+  // A preview of an old version is only offered when there is one; with a single version the
+  // button is absent, which is the correct answer rather than a disabled control.
+  const previewButtons = await page.locator("button:has-text('Preview')").count();
+  note({ step: "version-preview-buttons", previewButtons });
+
+  return { ok: rendered && kind !== null, steps: steps.length, kind, fileId };
 }
 
 // ---------------------------------------------------------------- palette (REQ-002)
@@ -2611,8 +2743,11 @@ async function main() {
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
-      `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`,
+      // A page that renders one big image can ask for a heap the box has not got, and the tab
+      // dies with `Page crashed` — which used to end the run. Capping the renderer heap turns
+      // that into a slower render and a GC instead of a dead tab.
       ...MEMORY_ARGS,
+      `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`,
     ],
   });
 
@@ -2673,6 +2808,10 @@ async function main() {
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
     { path: "/media/trash", name: "media-trash" },
+    // The file detail screen (REQ-010, slice 2) is NOT in this list on purpose: its path
+    // carries a file id, and a route walked with a placeholder id only proves that the 404
+    // state renders. `runMediaFileDetail` below opens a *real* file's screen instead. Listing
+    // the bare prefix here produced exactly that 404 screenshot.
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
@@ -2736,24 +2875,49 @@ async function main() {
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
   ];
+  // The route loop is per-route isolated for the same reason the depth passes are: a crashed
+  // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
+  // memory) used to end the entire run, so every route after the crash and every depth pass
+  // were skipped and no report was written at all. A page that dies is a finding about that
+  // page; the pages after it still have to be looked at.
   for (const route of routes) {
     log(`page: ${route.name}`);
-    await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForTimeout(900);
-    if (route.name === "media") {
-      report.mediaUpload = await uploadMediaSample(page);
-      log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
-      await page.waitForTimeout(600);
+    try {
+      await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(900);
+      if (route.name === "media") {
+        report.mediaUpload = await uploadMediaSample(page);
+        log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
+        await page.waitForTimeout(600);
+      }
+      const diag = await diagnostics(page);
+      await shot(page, `page-${route.name}`);
+      await interact(page, route.name, report);
+      report.pages.push({ ...route, diagnostics: diag });
+    } catch (cause) {
+      const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+      log(`page ${route.name} failed: ${reason}`);
+      record({ page: route.name, action: "route-failed", reason });
+      report.pages.push({ ...route, failed: reason });
     }
-    const diag = await diagnostics(page);
-    await shot(page, `page-${route.name}`);
-    await interact(page, route.name, report);
-    report.pages.push({ ...route, diagnostics: diag });
   }
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
-  report.mediaFiles = await runMediaFileManager(page, report);
+  // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
+  // cannot run is a finding of its own ("this screen did not answer"), not a reason to end the
+  // whole run before the remaining screens have been looked at.
+  report.mediaFiles = await runDepthPass("media-file-manager", () =>
+    runMediaFileManager(page, report),
+  );
+
+  // The file detail screen (REQ-010, slice 2): a real file is opened, its preview renders, the
+  // metadata saves, and the version history is read. This is the pass that proves the screen is
+  // a screen — a route walked only by id would render its error state and look visited.
+  report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
+    runMediaFileDetail(page, report),
+  );
+  log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);

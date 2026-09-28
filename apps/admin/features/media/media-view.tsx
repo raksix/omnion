@@ -20,6 +20,7 @@ import {
   Folder,
   FolderPlus,
   Grid2x2,
+  Info,
   LayoutList,
   ListFilter,
   Pencil,
@@ -955,7 +956,12 @@ export function MediaView() {
                             </span>
                           )}
                           <div className="min-w-0">
-                            <p className="truncate font-medium">{file.filename}</p>
+                            <Link
+                              href={`/media/files/${file.id}`}
+                              className="block truncate font-medium underline-offset-2 hover:underline"
+                            >
+                              {file.filename}
+                            </Link>
                             {file.tags.length > 0 ? (
                               <p className="truncate text-[11.5px] text-muted">
                                 {file.tags.join(", ")}
@@ -974,6 +980,13 @@ export function MediaView() {
                       </td>
                       <td className="px-3 py-2.5">
                         <div className="flex items-center gap-1">
+                          <Link
+                            href={`/media/files/${file.id}`}
+                            aria-label={`Open the details of ${file.filename}`}
+                            className="rounded p-1.5 text-muted transition hover:text-ink"
+                          >
+                            <Info className="size-3.5" aria-hidden />
+                          </Link>
                           <a
                             href={mediaRawUrl(file.id)}
                             aria-label={`Download ${file.filename}`}

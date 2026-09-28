@@ -686,12 +686,49 @@ mod tests {
         // every filtered listing sent `folder_id = $2$2` and PostgreSQL refused it. An unfiltered
         // listing still worked, which is why no earlier test saw it.
         for (label, query) in [
-            ("folder", ListQuery { folder_id: Some(Uuid::nil()), ..ListQuery::new() }),
-            ("search", ListQuery { search: Some("a".to_owned()), ..ListQuery::new() }),
-            ("tag", ListQuery { tag: Some("hero".to_owned()), ..ListQuery::new() }),
-            ("size", ListQuery { min_bytes: Some(10), max_bytes: Some(99), ..ListQuery::new() }),
-            ("uploader", ListQuery { uploaded_by: Some(Uuid::nil()), ..ListQuery::new() }),
-            ("scan", ListQuery { scan_status: Some("clean".to_owned()), ..ListQuery::new() }),
+            (
+                "folder",
+                ListQuery {
+                    folder_id: Some(Uuid::nil()),
+                    ..ListQuery::new()
+                },
+            ),
+            (
+                "search",
+                ListQuery {
+                    search: Some("a".to_owned()),
+                    ..ListQuery::new()
+                },
+            ),
+            (
+                "tag",
+                ListQuery {
+                    tag: Some("hero".to_owned()),
+                    ..ListQuery::new()
+                },
+            ),
+            (
+                "size",
+                ListQuery {
+                    min_bytes: Some(10),
+                    max_bytes: Some(99),
+                    ..ListQuery::new()
+                },
+            ),
+            (
+                "uploader",
+                ListQuery {
+                    uploaded_by: Some(Uuid::nil()),
+                    ..ListQuery::new()
+                },
+            ),
+            (
+                "scan",
+                ListQuery {
+                    scan_status: Some("clean".to_owned()),
+                    ..ListQuery::new()
+                },
+            ),
             (
                 "everything",
                 ListQuery {
@@ -717,7 +754,10 @@ mod tests {
             // A placeholder is always followed by something that is not another placeholder.
             for (index, part) in sql.split('$').enumerate().skip(1) {
                 let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-                assert!(!digits.is_empty(), "[{label}] a bare `$` in the clause: {sql}");
+                assert!(
+                    !digits.is_empty(),
+                    "[{label}] a bare `$` in the clause: {sql}"
+                );
                 let after = &part[digits.len()..];
                 assert!(
                     !after.starts_with('$'),
@@ -747,22 +787,36 @@ mod tests {
             ),
             "{sql}"
         );
-        assert_eq!(sql.matches("$2").count(), 1, "no placeholder is reused: {sql}");
+        assert_eq!(
+            sql.matches("$2").count(),
+            1,
+            "no placeholder is reused: {sql}"
+        );
     }
 
     #[test]
     fn the_tag_clause_compares_from_the_placeholder_side() {
         // `$n = any(tags)`: writing the text first would produce `any(tags) = $2`, which plans
         // against a whole array and never matches.
-        let sql = statement(&ListQuery { tag: Some("hero".to_owned()), ..ListQuery::new() });
+        let sql = statement(&ListQuery {
+            tag: Some("hero".to_owned()),
+            ..ListQuery::new()
+        });
         assert!(sql.ends_with(" and $2 = any(tags)"), "{sql}");
     }
 
     #[test]
     fn the_version_filter_needs_no_placeholder() {
-        let sql = statement(&ListQuery { has_versions: true, ..ListQuery::new() });
+        let sql = statement(&ListQuery {
+            has_versions: true,
+            ..ListQuery::new()
+        });
         assert!(sql.ends_with(" and version_count > 1"), "{sql}");
-        assert_eq!(sql.matches('$').count(), 1, "only the site id is bound: {sql}");
+        assert_eq!(
+            sql.matches('$').count(),
+            1,
+            "only the site id is bound: {sql}"
+        );
     }
 
     #[test]
@@ -784,7 +838,10 @@ mod tests {
             ..ListQuery::new()
         });
         assert!(direct.ends_with(" and folder_id = $2"), "{direct}");
-        assert!(!direct.contains("exists"), "a folder listing does not walk the tree");
+        assert!(
+            !direct.contains("exists"),
+            "a folder listing does not walk the tree"
+        );
 
         let subtree = statement(&ListQuery {
             folder_id: Some(Uuid::nil()),
