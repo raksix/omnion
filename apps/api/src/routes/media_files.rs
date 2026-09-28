@@ -426,8 +426,11 @@ pub async fn folder_tree(
 ) -> std::result::Result<Json<FolderTreeResponse>, ApiError> {
     let site = site_in_scope(&state, &current, query.site_id).await?;
     let pool = state.db().pool();
-    let folders = omnion_media::list_folders(pool, site.id).await?;
+    // The root first: it is a get-or-create, so on a site created after the migration this is the
+    // call that materialises it. Listing before materialising would answer a tree with no root in
+    // it — exactly the empty rail the operator sees when they open a new site's media.
     let root = omnion_media::root_folder(pool, site.id).await?;
+    let folders = omnion_media::list_folders(pool, site.id).await?;
 
     let mut bodies = Vec::with_capacity(folders.len());
     for folder in &folders {
@@ -532,9 +535,15 @@ pub async fn move_folder(
         .ok_or_else(folder_not_found)?;
     let site = site_in_scope(&state, &current, existing.site_id).await?;
 
+    // An omitted `parent_id` means "stay where you are", not "go to the root": the body documents
+    // that, and a rename is by far the most common reason to call this route. Resolving the parent
+    // from the current row also means a move and a rename cannot disagree about the tree.
     let parent = match body.parent_id {
         Some(id) => folder_in_scope(pool, id, site.id).await?,
-        None => omnion_media::root_folder(pool, site.id).await?,
+        None => match existing.parent_id {
+            Some(parent_id) => folder_in_scope(pool, parent_id, site.id).await?,
+            None => omnion_media::root_folder(pool, site.id).await?,
+        },
     };
 
     let name = match body.name {
