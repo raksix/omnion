@@ -42,14 +42,21 @@ import {
   AlertTriangle,
   ArrowLeft,
   CheckCircle2,
+  ClipboardCopy,
+  ClipboardPaste,
+  Copy,
   GitBranch,
+  LayoutGrid,
   Loader2,
   Maximize,
   Minus,
   Play,
   Plus,
   RefreshCw,
+  Redo2,
   Table2,
+  Undo2,
+  Wand2,
   Zap,
   ZoomIn,
   ZoomOut,
@@ -153,7 +160,18 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   // The graph as it was when the current drag began, so one press of undo removes the whole
   // gesture instead of one pointer sample of it.
   const dragOriginRef = useRef<HistorySnapshot | null>(null);
-  // A marble? No: the minimap's own rectangle, and whether the author wants to see it.
+  // The rubber band, in screen pixels. `startX/startY` is kept so a drag that runs up and
+  // left still measures from where the pointer went down rather than from the origin.
+  const [marquee, setMarquee] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    startX: number;
+    startY: number;
+    additive: boolean;
+  } | null>(null);
+  // The minimap's own rectangle, and whether the author wants to see it.
   const [minimapOpen, setMinimapOpen] = useState(true);
 
   const nodeTypes = useMemo(() => {
@@ -489,27 +507,104 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const updateNode = useCallback(
     (id: string, patch: Partial<GraphNode>) => {
-      setNodes((current) =>
-        current.map((node) => (node.id === id ? { ...node, ...patch } : node)),
-      );
-      queueSave();
+      const before = currentSnapshot();
+      const nextNodes = nodes.map((node) => (node.id === id ? { ...node, ...patch } : node));
+      // A re-type is one gesture: the same node and the same field, so it coalesces with the
+      // keystrokes before it instead of costing a press of undo per character.
+      const fields = Object.keys(patch).sort().join(",");
+      commit(`edit:${id}:${fields}`, before, nextNodes, edges);
     },
-    [queueSave],
+    [commit, currentSnapshot, edges, nodes],
   );
 
-  const removeNode = useCallback(
-    (id: string) => {
-      // The edges go with it: a connection whose endpoint is gone is exactly the dangling
-      // edge validation would then refuse the whole graph for.
-      setNodes((current) => current.filter((node) => node.id !== id));
-      setEdges((current) =>
-        current.filter((edge) => edge.source !== id && edge.target !== id),
+  /**
+   * Lay the graph out left to right by its edges.
+   *
+   * Longest-path layering rather than insertion order: a hand-built graph's node array says
+   * nothing about what runs first, and laying out by array order puts a branch's two arms on
+   * top of each other — a layout that *looks* broken and explains nothing on screen.
+   *
+   * The result is one undoable entry, so an automatic layout is as reversible as a manual one.
+   */
+  const autoLayout = useCallback(() => {
+    if (nodes.length === 0) {
+      return;
+    }
+    const before = currentSnapshot();
+    const depth = new Map<string, number>();
+    for (const node of nodes) {
+      depth.set(node.id, 0);
+    }
+    // Relax the edges until nothing grows: a small DAG settles in a handful of passes, and
+    // the visit cap keeps a cycle (which validation will report separately) from hanging here.
+    for (let pass = 0; pass < nodes.length; pass += 1) {
+      let moved = false;
+      for (const edge of edges) {
+        const from = depth.get(edge.source) ?? 0;
+        const to = depth.get(edge.target) ?? 0;
+        if (to < from + 1) {
+          depth.set(edge.target, from + 1);
+          moved = true;
+        }
+      }
+      if (!moved) {
+        break;
+      }
+    }
+    const columns = new Map<number, number>();
+    const ROW = CARD_H + GRID * 4;
+    const COL = CARD_W + GRID * 6;
+    const nextNodes = nodes.map((node) => {
+      const column = depth.get(node.id) ?? 0;
+      const row = columns.get(column) ?? 0;
+      columns.set(column, row + 1);
+      return {
+        ...node,
+        position: {
+          x: clampCoord(40 + column * COL),
+          y: clampCoord(40 + row * ROW),
+        },
+      };
+    });
+    commit("auto-layout", before, nextNodes, edges);
+  }, [commit, currentSnapshot, edges, nodes]);
+
+  /**
+   * Remove one node or a whole selection, as a single undoable step.
+   *
+   * The edges go with them: a connection whose endpoint is gone is exactly the dangling edge
+   * validation would then refuse the whole graph for. Removing three nodes at once is one
+   * entry rather than three, because three presses of undo to undo one keypress is how a user
+   * learns to distrust the button.
+   */
+  const removeNodes = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) {
+        return;
+      }
+      const doomed = new Set(ids);
+      const before = currentSnapshot();
+      const nextNodes = nodes.filter((node) => !doomed.has(node.id));
+      if (nextNodes.length === nodes.length) {
+        return;
+      }
+      const nextEdges = edges.filter(
+        (edge) => !doomed.has(edge.source) && !doomed.has(edge.target),
       );
-      setSelected((current) => (current === id ? null : current));
-      queueSave();
+      commit(
+        ids.length === 1 ? `remove:${ids[0]}` : `remove:${[...doomed].sort().join(",")}`,
+        before,
+        nextNodes,
+        nextEdges,
+      );
+      selectionRef.current = new Set();
+      setSelectionCount(0);
+      setSelected((current) => (current && doomed.has(current) ? null : current));
     },
-    [queueSave],
+    [commit, currentSnapshot, edges, nodes],
   );
+
+  const removeNode = useCallback((id: string) => removeNodes([id]), [removeNodes]);
 
   const connect = useCallback(
     (source: string, sourcePort: string, target: string) => {
@@ -612,15 +707,57 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const onCanvasPointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      // Space-drag or the middle button pans; a plain click on empty canvas clears the
-      // selection, which is what a person expects from clicking the desk.
+      // Space-drag or the middle button pans; a plain drag on empty canvas draws a marquee,
+      // and a click without movement clears the selection — what a person expects from
+      // clicking the desk.
       if (event.button === 1 || spaceHeld.current) {
         setPanning({ x: event.clientX, y: event.clientY, vx: viewport.x, vy: viewport.y });
         return;
       }
+      if (event.button !== 0) {
+        return;
+      }
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) {
+        return;
+      }
+      // Shift keeps the existing selection, so a second marquee adds to the first instead of
+      // replacing it — the one modifier every drawing tool agrees on.
+      if (!event.shiftKey) {
+        selectionRef.current = new Set();
+        setSelectionCount(0);
+      }
       setSelected(null);
+      setMarquee({
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+        w: 0,
+        h: 0,
+        startX: event.clientX - rect.left,
+        startY: event.clientY - rect.top,
+        additive: event.shiftKey,
+      });
     },
     [viewport],
+  );
+
+  /** Centre the viewport on a graph point — the minimap's whole job. */
+  const jumpTo = useCallback(
+    (x: number, y: number) => {
+      const element = canvasRef.current;
+      if (!element) {
+        return;
+      }
+      const rect = element.getBoundingClientRect();
+      const next = {
+        zoom: viewport.zoom,
+        x: rect.width / 2 - x * viewport.zoom,
+        y: rect.height / 2 - y * viewport.zoom,
+      };
+      setViewport(next);
+      persistLayout(next);
+    },
+    [persistLayout, viewport.zoom],
   );
 
   const onPointerMove = useCallback(
@@ -640,6 +777,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         persistLayout(next);
         return;
       }
+      if (marquee) {
+        setMarquee({
+          ...marquee,
+          w: event.clientX - rect.left - marquee.startX,
+          h: event.clientY - rect.top - marquee.startY,
+        });
+        return;
+      }
       if (dragging) {
         moveNode(
           dragging.id,
@@ -648,7 +793,31 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         );
       }
     },
-    [dragging, moveNode, panning, persistLayout, viewport],
+    [dragging, marquee, moveNode, panning, persistLayout, viewport],
+  );
+
+  /**
+   * What a marquee caught: every node whose card *overlaps* the band, in graph coordinates.
+   *
+   * Overlap rather than containment because a rubber band that only catches fully-enclosed
+   * cards silently ignores the node you were obviously pointing at — and the band is drawn
+   * from a single pointer position, so "obviously" is the common case.
+   */
+  const marqueeSelection = useCallback(
+    (band: NonNullable<typeof marquee>): string[] => {
+      const left = Math.min(band.startX, band.startX + band.w);
+      const top = Math.min(band.startY, band.startY + band.h);
+      const right = Math.max(band.startX, band.startX + band.w);
+      const bottom = Math.max(band.startY, band.startY + band.h);
+      return nodes
+        .filter((node) => {
+          const x0 = node.position.x * viewport.zoom + viewport.x;
+          const y0 = node.position.y * viewport.zoom + viewport.y;
+          return x0 < right && x0 + CARD_W * viewport.zoom > left && y0 < bottom && y0 + CARD_H * viewport.zoom > top;
+        })
+        .map((node) => node.id);
+    },
+    [nodes, viewport],
   );
 
   const onPointerUp = useCallback(() => {
@@ -656,11 +825,24 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       setPanning(null);
       return;
     }
+    if (marquee) {
+      const caught = marqueeSelection(marquee);
+      // A click with no drag is a click on the desk, not a zero-area band that catches
+      // whatever happens to overlap the pixel it landed on.
+      const travelled = Math.abs(marquee.w) > 4 || Math.abs(marquee.h) > 4;
+      if (travelled && caught.length > 0) {
+        const next = new Set(marquee.additive ? [...selectionRef.current, ...caught] : caught);
+        selectionRef.current = next;
+        setSelectionCount(next.size);
+      }
+      setMarquee(null);
+      return;
+    }
     if (dragging) {
       setDragging(null);
       commitMove();
     }
-  }, [commitMove, dragging, panning]);
+  }, [commitMove, dragging, marquee, marqueeSelection, panning]);
 
   // Space is the pan modifier; tracked in a ref because a keydown does not re-render.
   const spaceHeld = useRef(false);
@@ -688,14 +870,62 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const onCanvasKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
       const step = event.shiftKey ? GRID * 5 : GRID;
-      if (event.key === "Delete" || event.key === "Backspace") {
-        if (selected) {
-          event.preventDefault();
-          removeNode(selected);
+
+      // ---- the clipboard and history keys, which need no selection to mean something -----
+      // `isTypingTarget` has already let the field itself through, so a rename typed into the
+      // inspector cannot be undone by a Ctrl+Z that the browser handled first.
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          doRedo();
+        } else {
+          doUndo();
         }
         return;
       }
-      if (!selected) {
+      // Ctrl+Y is redo on Windows and macOS both, and a builder that only answers Ctrl+Shift+Z
+      // is a builder whose redo nobody finds.
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        doRedo();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+        event.preventDefault();
+        copySelection();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") {
+        event.preventDefault();
+        pasteClipboard();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        duplicateSelected();
+        return;
+      }
+      if (event.key === "Escape") {
+        // Escape clears the selection, which is also the only way out of a marquee that the
+        // user started by accident and cannot see the end of.
+        if (selectionCount > 0 || selected) {
+          event.preventDefault();
+          selectionRef.current = new Set();
+          setSelectionCount(0);
+          setSelected(null);
+        }
+        return;
+      }
+
+      if (event.key === "Delete" || event.key === "Backspace") {
+        const doomed = selectionRef.current.size > 0 ? [...selectionRef.current] : selected ? [selected] : [];
+        if (doomed.length > 0) {
+          event.preventDefault();
+          removeNodes(doomed);
+        }
+        return;
+      }
+      if (!selected && selectionCount === 0) {
         return;
       }
       const nudge: Record<string, [number, number]> = {
@@ -709,22 +939,24 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
       event.preventDefault();
-      setNodes((current) =>
-        current.map((node) =>
-          node.id === selected
-            ? {
-                ...node,
-                position: {
-                  x: clampCoord(snap(node.position.x + delta[0])),
-                  y: clampCoord(snap(node.position.y + delta[1])),
-                },
-              }
-            : node,
-        ),
+      // A multi-selection moves as one: nudging only the node the inspector is showing would
+      // leave a marquee-selected group half moved and the user with no way to say so.
+      const moving = new Set(selectionRef.current.size > 0 ? [...selectionRef.current] : [selected]);
+      const before = currentSnapshot();
+      const nextNodes = nodes.map((node) =>
+        moving.has(node.id)
+          ? {
+              ...node,
+              position: {
+                x: clampCoord(snap(node.position.x + delta[0])),
+                y: clampCoord(snap(node.position.y + delta[1])),
+              },
+            }
+          : node,
       );
-      queueSave();
+      commit("nudge", before, nextNodes, edges);
     },
-    [queueSave, removeNode, selected],
+    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, nodes, pasteClipboard, removeNodes, selected, selectionCount],
   );
 
   // ---- actions ----------------------------------------------------------------------------
@@ -882,6 +1114,65 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
             label="Fit"
             testId="builder-fit"
           />
+          <ToolbarButton
+            onClick={autoLayout}
+            icon={<Wand2 className="h-3.5 w-3.5" aria-hidden="true" />}
+            label="Auto layout"
+            testId="builder-auto-layout"
+            disabled={nodes.length === 0}
+            title="Lay the nodes out by their edges"
+          />
+          <ToolbarButton
+            onClick={() => setMinimapOpen((open) => !open)}
+            icon={<LayoutGrid className="h-3.5 w-3.5" aria-hidden="true" />}
+            label="Minimap"
+            testId="builder-minimap"
+            pressed={minimapOpen}
+          />
+          <ToolbarButton
+            onClick={doUndo}
+            icon={<Undo2 className="h-3.5 w-3.5" aria-hidden="true" />}
+            label="Undo"
+            testId="builder-undo"
+            disabled={!canUndo}
+            title={canUndo ? "Undo the last change" : "Nothing to undo"}
+          />
+          <ToolbarButton
+            onClick={doRedo}
+            icon={<Redo2 className="h-3.5 w-3.5" aria-hidden="true" />}
+            label="Redo"
+            testId="builder-redo"
+            disabled={!canRedo}
+            title={canRedo ? "Redo the change you undid" : "Nothing to redo"}
+          />
+          <ToolbarButton
+            onClick={duplicateSelected}
+            icon={<Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+            label="Duplicate"
+            testId="builder-duplicate"
+            disabled={!selected}
+            title={selected ? "Duplicate the selected node" : "Select a node first"}
+          />
+          <ToolbarButton
+            onClick={copySelection}
+            icon={<ClipboardCopy className="h-3.5 w-3.5" aria-hidden="true" />}
+            label="Copy"
+            testId="builder-copy"
+            disabled={!selected}
+            title={selected ? "Copy the selection" : "Select a node first"}
+          />
+          <ToolbarButton
+            onClick={pasteClipboard}
+            icon={<ClipboardPaste className="h-3.5 w-3.5" aria-hidden="true" />}
+            label={clipboardCount > 0 ? `Paste (${clipboardCount})` : "Paste"}
+            testId="builder-paste"
+            disabled={clipboardCount === 0}
+            title={
+              clipboardCount === 0
+                ? "Nothing copied yet"
+                : `Paste ${clipboardCount} copied node${clipboardCount === 1 ? "" : "s"}`
+            }
+          />
           <Link
             href={`/automations/${workflowId}`}
             className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1.5 text-[12.5px] hover:bg-quiet-soft"
@@ -976,6 +1267,23 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
           aria-label="Workflow canvas"
           data-builder-canvas
         >
+          {/* The marquee. Drawn in screen coordinates, not graph ones: a rubber band that
+              scales with the zoom is a band the user cannot aim with. */}
+          {marquee ? (
+            <div
+              className="pointer-events-none absolute border border-accent/60 bg-accent/10"
+              style={{
+                left: Math.min(marquee.x, marquee.x + marquee.w),
+                top: Math.min(marquee.y, marquee.y + marquee.h),
+                width: Math.abs(marquee.w),
+                height: Math.abs(marquee.h),
+              }}
+              data-marquee
+            />
+          ) : null}
+
+          {minimapOpen ? <Minimap nodes={nodes} viewport={viewport} selectionRef={selectionRef} selectionCount={selectionCount} onJump={jumpTo} /> : null}
+
           <div className="absolute inset-0" style={style}>
             <svg className="absolute left-0 top-0 overflow-visible" width="1" height="1">
               {edges.map((edge) => {
@@ -1022,6 +1330,9 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
             {nodes.map((node) => {
               const nodeType = nodeTypes.get(node.type);
+              // A multi-selected card is drawn exactly like the single selection: a marquee
+              // that highlights nothing reads as a marquee that did not work.
+              const isMultiSelected = selectionCount > 1 && selectionRef.current.has(node.id);
               const hasProblems = findings.some(
                 (finding) =>
                   finding.severity === "error" && finding.node_id === node.id,
@@ -1037,10 +1348,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                     minHeight: CARD_H,
                     borderColor: hasProblems
                       ? "var(--color-accent)"
-                      : selected === node.id
+                      : isMultiSelected || selected === node.id
                         ? "var(--color-ink)"
                         : "var(--color-line)",
-                    outline: selected === node.id ? "2px solid var(--color-ink)" : "none",
+                    outline: isMultiSelected || selected === node.id ? "2px solid var(--color-ink)" : "none",
                     outlineOffset: 2,
                   }}
                   onPointerDown={(event) => {
@@ -1254,6 +1565,7 @@ function ToolbarButton({
   testId,
   disabled,
   title,
+  pressed,
 }: {
   onClick: () => void;
   icon: React.ReactNode;
@@ -1261,6 +1573,9 @@ function ToolbarButton({
   testId: string;
   disabled?: boolean;
   title?: string;
+  /** A toggle's state. Rendered as `aria-pressed` and a visible tint, because a button that
+   *  looks the same whether the feature is on or off is a control that cannot be read. */
+  pressed?: boolean;
 }) {
   return (
     <button
@@ -1269,7 +1584,13 @@ function ToolbarButton({
       disabled={disabled}
       title={title}
       aria-label={label || undefined}
-      className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1.5 text-[12.5px] hover:bg-quiet-soft disabled:opacity-40 disabled:hover:bg-transparent"
+      aria-pressed={pressed}
+      data-pressed={pressed === undefined ? undefined : pressed ? "on" : "off"}
+      className={
+        pressed
+          ? "inline-flex items-center gap-1.5 rounded-md border border-line bg-quiet-soft px-2 py-1.5 text-[12.5px] hover:bg-quiet-soft disabled:opacity-40"
+          : "inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1.5 text-[12.5px] hover:bg-quiet-soft disabled:opacity-40 disabled:hover:bg-transparent"
+      }
       data-testid={testId}
     >
       {icon}
@@ -1563,6 +1884,131 @@ function isTypingTarget(target: EventTarget | null): boolean {
     target.tagName === "TEXTAREA" ||
     target.tagName === "SELECT" ||
     target.isContentEditable
+  );
+}
+
+/**
+ * The minimap: the whole graph at a glance, with the part you are looking at marked.
+ *
+ * Two decisions that a minimap usually gets wrong:
+ *
+ * * **It scales to the nodes, not to a fixed scale.** A fixed scale makes a five-node graph a
+ *   speck in the corner and a fifty-node graph an unreadable smear; here the bounds are the
+ *   nodes' own, so the map is full whatever the size, and the scale itself is printed so a
+ *   user knows the map is not lying about distance.
+ * * **It is a button, not a decoration.** Clicking it centres the viewport there. A minimap
+ *   that only shows you where you are, on a graph of any size, is a picture.
+ *
+ * Selection is read through a ref rather than a prop so that dragging a marquee across forty
+ * nodes does not re-render the map on every pointer sample — the map only needs to know *that*
+ * something is selected, which is why it takes the count.
+ */
+function Minimap({
+  nodes,
+  viewport,
+  selectionRef,
+  selectionCount,
+  onJump,
+}: {
+  nodes: GraphNode[];
+  viewport: { x: number; y: number; zoom: number };
+  selectionRef: React.RefObject<Set<string>>;
+  selectionCount: number;
+  onJump: (x: number, y: number) => void;
+}) {
+  const W = 180;
+  const H = 120;
+  const PAD = 8;
+
+  if (nodes.length === 0) {
+    // An empty box with a scale would claim a graph exists. Say what is actually true.
+    return (
+      <div
+        className="absolute bottom-3 right-3 rounded-md border border-line bg-panel/90 p-2 text-[11px] text-muted"
+        data-minimap
+        data-minimap-state="empty"
+      >
+        No nodes yet
+      </div>
+    );
+  }
+
+  const minX = Math.min(...nodes.map((node) => node.position.x));
+  const minY = Math.min(...nodes.map((node) => node.position.y));
+  const maxX = Math.max(...nodes.map((node) => node.position.x + CARD_W));
+  const maxY = Math.max(...nodes.map((node) => node.position.y + CARD_H));
+  const spanX = Math.max(maxX - minX, 1);
+  const spanY = Math.max(maxY - minY, 1);
+  const scale = Math.min((W - PAD * 2) / spanX, (H - PAD * 2) / spanY);
+
+  const project = (x: number, y: number) => ({
+    left: PAD + (x - minX) * scale,
+    top: PAD + (y - minY) * scale,
+  });
+
+  // The viewport rectangle, inverted back into graph space: the map is drawn in graph units
+  // scaled down, and the visible window is the inverse of that.
+  const viewWidth = (W - PAD * 2) / scale;
+  const viewHeight = (H - PAD * 2) / scale;
+  const view = project(-viewport.x / viewport.zoom, -viewport.y / viewport.zoom);
+  const selected = selectionRef.current;
+
+  return (
+    <div
+      className="absolute bottom-3 right-3 rounded-md border border-line bg-panel/90 p-1"
+      data-minimap
+      data-minimap-state="ready"
+      data-minimap-selection={selectionCount}
+    >
+      <button
+        type="button"
+        className="relative block"
+        style={{ width: W, height: H }}
+        onClick={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          onJump(
+            minX + (event.clientX - rect.left - PAD) / scale,
+            minY + (event.clientY - rect.top - PAD) / scale,
+          );
+        }}
+        aria-label="Centre the view here"
+        data-minimap-canvas
+      >
+        {nodes.map((node) => {
+          const at = project(node.position.x, node.position.y);
+          return (
+            <span
+              key={node.id}
+              className={
+                selected.has(node.id)
+                  ? "absolute rounded-[2px] bg-accent"
+                  : "absolute rounded-[2px] bg-muted/60"
+              }
+              style={{
+                left: at.left,
+                top: at.top,
+                width: Math.max(CARD_W * scale, 2),
+                height: Math.max(CARD_H * scale, 2),
+              }}
+              data-minimap-node={node.id}
+            />
+          );
+        })}
+        <span
+          className="pointer-events-none absolute border border-foreground/50"
+          style={{
+            left: view.left,
+            top: view.top,
+            width: Math.min(viewWidth * scale, W),
+            height: Math.min(viewHeight * scale, H),
+          }}
+          data-minimap-viewport
+        />
+      </button>
+      <p className="px-1 pt-1 text-[10px] text-muted">
+        {nodes.length} node{nodes.length === 1 ? "" : "s"} · {(1 / scale).toFixed(0)}px/px
+      </p>
+    </div>
   );
 }
 

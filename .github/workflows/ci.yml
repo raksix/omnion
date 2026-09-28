@@ -473,6 +473,10 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Typecheck
         run: pnpm typecheck
+      # The panel's own unit tests (REQ-004 slice 2 added the runner). Without this step the
+      # tests exist in the tree and nothing in CI ever runs them.
+      - name: Admin unit tests
+        run: pnpm --filter @omnion/admin test
       - name: Build (admin + public renderer)
         run: pnpm build
       # The panel really serves: the sign-in screen answers 200 and the request gate keeps an
