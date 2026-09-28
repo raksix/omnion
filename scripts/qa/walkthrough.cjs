@@ -5448,41 +5448,46 @@ async function runAutomationsApprovalsDepth(page, report) {
  * a phantom.
  */
 async function openRuleByName(page, ruleName, timeout = 15000) {
-  const row = page.locator("[data-automation-row] a", { hasText: ruleName }).first();
   const deadline = Date.now() + timeout;
-  // "The editor is open" means the *rule's* form is on screen, which is `[data-automation-name]`
-  // carrying the rule's own name — not the row link, and not the list behind it. The URL alone
-  // is not proof either: the route is client-side, so a navigation commits before the rule is
-  // fetched, and during that beat the list is still mounted and every panel query finds
-  // nothing. Reading the name out of the form is the one signal that means "this is the rule
-  // you asked for, loaded".
+  // "The editor is open" means the *rule's own form* is on screen, which is
+  // `[data-automation-name]` carrying the rule's name. Not the URL — the route is client-side,
+  // so a navigation commits before the rule is fetched and the list is still mounted through
+  // that beat. Not the row link either. Reading the name out of the loaded form is the one
+  // signal that means "this is the rule you asked for, and it is loaded".
   const editorShows = async () =>
     (await page.locator("[data-automation-name]").first().inputValue().catch(() => "")) === ruleName;
+  const onList = async () => (await page.locator("[data-automation-row]").count()) > 0;
+
   while (Date.now() < deadline) {
-    if ((await row.count()) > 0) {
-      // Clicking a row the list is about to replace is the failure this loop has to survive:
-      // a save returns to the list, the list re-reads, and the click lands in a row that is
-      // torn out from under the pointer. So the click is retried **while still on the list** —
-      // once the URL is the rule's, the only thing left to do is wait, and clicking again
-      // there would navigate away from the very editor it was waiting for.
-      while (Date.now() < deadline) {
-        if (await editorShows()) return true;
-        if (!page.url().includes("/automations/")) {
-          await row.click({ timeout: 4000 }).catch(() => {});
-        }
-        await page.waitForTimeout(400);
-      }
-      // The click's own promise resolving is not evidence the editor opened, and a `.catch`ed
-      // wait is not either — so a failed click and a failed wait both fell through to an
-      // unconditional `true`. That is the phantom this helper was written to end, reopened one
-      // layer up: the pass went on to read Versions and Audit **on the list page**, reported
-      // both as empty, and the two screenshots came out byte-identical because they were
-      // literally the same page. So the answer is what is on screen now.
-      log(`openRuleByName: the editor did not open for "${ruleName}" (still on ${page.url()})`);
-      return false;
+    // One unconditional trip to the list, then one click, then a wait for the form. Anything
+    // cleverer is a guess about where the pass happens to be standing, and the pass stands
+    // somewhere new every time — the list, the editor, a run's trace, the gallery. The list is
+    // the only page that can always reach the editor in one click, so it is the only page
+    // worth navigating to. (A URL test cannot tell them apart: a run's trace also lives under
+    // /automations/, and a pass that waited there for the name field waited out its whole
+    // deadline on a page that has none.)
+    if (!(await onList())) {
+      await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForSelector("[data-automation-row]", { timeout: 6000 }).catch(() => {});
     }
-    await page.waitForTimeout(500);
+    const target = page.locator("[data-automation-row] a", { hasText: ruleName }).first();
+    if ((await target.count()) > 0) {
+      await target.click({ timeout: 4000 }).catch(() => {});
+    }
+    // The click is retried under a short budget, because a save returns to the list mid
+    // re-read and the click can land in a row that is torn out from under the pointer.
+    for (let waited = 0; waited < 8 && Date.now() < deadline; waited += 1) {
+      if (await editorShows()) return true;
+      await page.waitForTimeout(300);
+    }
   }
+  // The click's promise resolving is not evidence the editor opened, and a `.catch`ed wait is
+  // not either — so a failed click and a failed wait both fell through to an unconditional
+  // `true` once. That is the phantom this helper was written to end, reopened one layer up:
+  // the pass went on to read Versions and Audit **on the list page**, reported both as empty,
+  // and the two screenshots came out byte-identical because they were literally the same
+  // page. So the answer is what is on screen now, and a false here is a no-result run.
+  log(`openRuleByName: the editor did not open for "${ruleName}" (still on ${page.url()})`);
   return false;
 }
 
