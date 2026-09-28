@@ -22,6 +22,8 @@ import type {
   MediaGrantSubject,
   MediaGrantsResponse,
   MediaShare,
+  MediaActivity,
+  MediaUsage,
   MediaStorageProbe,
   MediaStorageSettings,
   MediaQuarantineList,
@@ -531,6 +533,26 @@ export function restoreMediaVersion(
 /** Panel read path of one version's bytes. */
 export function mediaVersionRawUrl(mediaId: string, version: number): string {
   return `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/raw`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Usage and activity (docs/requests/REQ-010, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Where a file is used.
+ *
+ * Both of these read a file that may already be in the trash: "what happened to this" is asked
+ * precisely after the deletion, so the panel must be able to open the trail from the trash
+ * screen and not answer a blank page to the one person who needs it.
+ */
+export function fetchMediaUsage(mediaId: string): Promise<MediaUsage> {
+  return request<MediaUsage>(`/api/v1/media/${encodeURIComponent(mediaId)}/references`);
+}
+
+/** What has happened to a file, newest first. */
+export function fetchMediaActivity(mediaId: string): Promise<MediaActivity> {
+  return request<MediaActivity>(`/api/v1/media/${encodeURIComponent(mediaId)}/activity`);
 }
 
 // ---------------------------------------------------------------------------------------------
