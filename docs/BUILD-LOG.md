@@ -2227,3 +2227,59 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part three: the copilot's two endpoints
+
+- **The merge first.** `origin/main` had moved 8 commits (the file manager's folder half, the QA
+  rebuild gate). One conflict, in the append-only build log, resolved as a union from the three
+  merge stages rather than by hand: `0 missing` from each side's added lines, no markers left, all
+  43 section headers intact.
+- **What shipped.** **`d2b9f74`** — `apps/api/src/routes/crm_copilot.rs` and its two routes.
+  `crm.copilot.use` has been in the catalogue and in the owner's role since slice 4 part two, with
+  nothing behind it; this is the thing that answers it. The route is thin the way slices 1-3 are:
+  the scoped context read, the two instructions and the sanitiser are the module's
+  (`modules/crm/src/copilot.rs`), the provider call is `omnion_ai_hub`'s, and what lives in the
+  HTTP layer is the audit row and the wiring.
+- **Two decisions worth writing down.**
+  1. **The scoped read runs before the model is resolved.** A deal in another organization is a
+     `404` from `CopilotContext::read` and never reaches a provider. Resolving the model first
+     would let the endpoint answer `409 no_default_model` for an id the caller may not look at —
+     which is the id space being confirmed, one status code at a time.
+  2. **Every call is audited, failures included** — `crm.copilot.summarized` /
+     `crm.copilot.follow_up_drafted`, and `crm.copilot.failed` on the error path. The catalogue
+     gives the reason the key exists at all: *a model that can read the whole CRM is a
+     data-exfiltration surface even when it only returns text, and the audit of the call is the
+     record of what it saw.* An unaudited failure makes "never used here" and "tried, could not
+     answer" the same answer. The metadata carries the deal, the action, the model and the size,
+     and deliberately **not** the draft and **not** the deal's title.
+- **Two defects the walk found while being written, both fixed in the same commit.**
+  - `grant_and_login` places its account in the **foreign** organization, so a cross-tenant
+    caller built with it reads a deal in the *other* tenant and the `404` passes for the wrong
+    reason. The walk now creates one account per organization explicitly and proves the scope in
+    **both** directions — one direction proves a scope exists, both prove it is the scope and not
+    a rule that happens to hide this one row.
+  - `crm_activities::tests::a_timeline_for_something_that_is_not_a_record_is_a_400` asserted
+    `invalid_list_query`, a code the API has never emitted. The mapping has been
+    `invalid_crm_query` since the surface was mounted, and `crm_deals.rs` and `tests/crm.rs`
+    already say so — the assertion was the stale thing, not the mapping. Two facts, one code: when
+    a whole assertion is off, read a *passing* neighbour's spelling before editing the code.
+- **No provider is faked.** This installation connects none, so a copilot call **fails** here —
+  and the walk asserts the audit precisely *because* a failure is still a call. The model's text
+  belongs to the provider and is not asserted; the sanitiser's text rules (fences, tags, control
+  characters, the length cap, the empty-answer refusal) are unit-tested in the module, which is
+  where they belong.
+- **Proof.** `cargo test -p omnion-module-crm --lib` → **146/146**. `cargo test -p omnion-api
+  --lib` → **129/129**. `cargo test -p omnion-api --test crm` against `omnion_test_w4_tick`, a
+  database created for this run → **36/36** (the 35 prior walks plus this one, all re-proved).
+  `pnpm typecheck` → **2/2**.
+- **Environment note.** `/mnt/apopic` sat at 97% again (2.0 GB free) with seven writers on the
+  mount. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2` and this worktree's own
+  `target/debug/incremental` kept the tick through; the seven `target/` directories still total
+  over 27 GB and a shared `CARGO_TARGET_DIR` remains the permanent fix.
+- **Next.** The last of slice 4: the global-search registration (REQ-002 — how
+  `crates/search` / `apps/api/src/routes/search.rs` collects its sources, and register
+  contacts/companies/deals with a deep link), then the `form.submitted` consumer (REQ-064) creating
+  a contact + deal. Then the **w4 QA browser pass**, which has still never run on this branch:
+  `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`
+  (timeout 1500s). It is the last gate for closing REQ-051, and the copilot's panel card still
+  has to be added to the walkthrough route list before it is worth running.
