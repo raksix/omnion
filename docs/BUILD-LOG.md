@@ -2357,3 +2357,52 @@
 - **Next.** The last item of slice 4 is the `organization.member.joined` webhook-isolation walk — an
   org-scoped webhook endpoint subscribed to that event must receive **only** its own tenant's
   deliveries, which is the slice's done-when — then the mobile pass, then the REQ can close.
+
+## 2026-09-28 — REQ-005 slice 4, third unit · the webhook-isolation walk (the slice's done-when)
+
+- **What.** Slice 4's stated done-when is *"an org-scoped webhook endpoint subscribed to
+  `organization.member.joined` delivers only that organization's events"*, and nothing executed
+  it. This tick makes it a real walk over real receivers — `apps/api/tests/events.rs`,
+  `a_members_join_reaches_only_the_tenant_it_belongs_to`. Three loopback receivers, three real
+  endpoints, two tenants, and **both** routes that emit the name: the administrative
+  `POST /organizations/{id}/members` and the invitation acceptance (which is why the walk opens
+  the tenant's invite policy to `self_serve` first — under the default `owner_approval` the
+  create answers `202` with no token, which is the *correct* behaviour and useless here).
+- **The third endpoint is the point of the walk.** Tenant A gets a second endpoint subscribed to
+  `organization.module.disabled`. Subscription filtering and organization filtering are two
+  different rules, and a walk that only exercises the first will pass an implementation that
+  ignores the second — the two tenants' endpoints are then the only evidence, and they are the
+  *same* evidence. With the quiet endpoint, "A got its own and not B's" and "A's other endpoint
+  got nothing" are separate facts, so a fan-out that ignored the subscription list fails for its
+  own reason.
+- **The direction that catches a name-only fan-out.** "B receives nothing" is a weak assertion:
+  an implementation that matched on the event *name* alone would still satisfy it, because the
+  event carries its own organization. The last third emits a fact belonging to **no** tenant —
+  a platform fact — with both tenants' endpoints already subscribed to that exact name, and
+  requires `deliveries == 0` and a following tick that claims 0. That is the case where the two
+  rules come apart.
+- **Delivery order is the runner's, not the walk's.** The first draft indexed `captured[0]` and
+  asserted the acceptance's `payload.via`; it failed with `left: Null` because the *administrative
+  add* was the delivery that arrived first — the runner claims `order by next_attempt_at, created_at`
+  and both rows were due in the same batch. The deliveries are now selected by what they carry
+  (`find(|body| body["payload"]["via"] == "invitation")`), which is a statement about the platform
+  rather than about a queue's tie-break. A test that asserts an ordering the code does not promise
+  passes until a batch changes, and then fails for a reason that has nothing to do with the thing
+  under test.
+- **Proof.** `cargo test -p omnion-api --test events` → **3 passed, 0 failed** (the two
+  pre-existing walks plus the new one). `cargo test -p omnion-api --test tenancy_limits` →
+  **22 passed, 3 failed**, unchanged from the baseline BUILD-LOG records
+  (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
+  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows` — cross-test interference
+  between parallel walks sharing one database, reproduced at HEAD and unrelated to this change;
+  this tick touched no production code at all). `pnpm typecheck` in `apps/admin` → clean.
+- **Environment.** `/mnt/apopic` opened the tick at 94% (3.5G free) with load 6.4, so the build ran
+  on `CARGO_TARGET_DIR=/dev/shm/w5-target` as established. A dedicated `omnion_w5_events_test`
+  database was created for the suite's own walks; the suite creates and drops its own
+  throwaway databases, so this one only carries the connection.
+- **Next.** The mobile pass — the member drawer and the settings/audit tabs at 390×844 — then
+  the full QA walkthrough (`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104 QA_WEB_PORT=3204
+  bash scripts/qa/run.sh`), which has not yet run green on this branch: seven writers on one 60G
+  mount have had the volume between 94% and 100% all tick, and the last several attempts died on
+  `Page crashed` and `Execution context was destroyed` under host load rather than on anything in
+  the code. The REQ stays open until the real pass runs.
