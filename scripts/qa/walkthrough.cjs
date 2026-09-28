@@ -4428,6 +4428,16 @@ async function main() {
     if (value === false) pushFindings("high", "crm-keyboard-mobile", `keyboard/mobile step failed: ${name}`);
     if (value === undefined) pushFindings("medium", "crm-keyboard-mobile", `keyboard/mobile step never ran: ${name}`);
   }
+  // The state sweep gets the same treatment, for the same reason, and the cost of not having had
+  // it is measurable: the run this was written against reported `contacts_hasAState`,
+  // `companies_hasAState` and `deals_hasAState` all as `false` — three screens with no error state
+  // at all — and the pass still said "high 59", with every one of those 59 pointing at a media
+  // screen, so the three claims the box is *about* were in the JSON and nowhere else. A
+  // `false` here is a high finding; an unset step is a medium one.
+  for (const [name, value] of Object.entries(report.crmStates ?? {})) {
+    if (value === false) pushFindings("high", "crm-state", `state step failed: ${name}`);
+    if (value === undefined) pushFindings("medium", "crm-state", `state step never ran: ${name}`);
+  }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {
     if (f.type === "warning") continue;
@@ -5868,17 +5878,25 @@ async function runCrmStateSweep(page, report) {
   await page.route("**/api/v1/crm/**", stub);
 
   // ---- one screen per list, each with the same refusal ----------------------------------------
+  //
+  // Six screens, not five: `/crm/settings/pipelines` is the sixth route the module ships, and it
+  // was missing here for the same reason the board was missing — the sweep grew one screen at a
+  // time and the editor was never added, so the box saying "all six" was being ticked on five.
+  // It is also the screen that hid the defect this tick fixed: it renders its **empty** state
+  // from a `rows` array that starts empty, so a refused read used to answer with "This pipeline
+  // has no stages — add the first one" *and* a button that writes into the tenant.
   const screens = [
     { path: "/crm/contacts", qa: "crm-contacts-error", label: "contacts" },
     { path: "/crm/companies", qa: "crm-companies-error", label: "companies" },
     { path: "/crm/deals", qa: "crm-deals-error", label: "deals" },
     { path: "/crm/activities", qa: "crm-activities-error", label: "activities" },
     { path: "/crm/leads", qa: "crm-leads-error", label: "leads" },
+    { path: "/crm/settings/pipelines", qa: "crm-stages-error", label: "stages", read: "/api/v1/crm/pipelines" },
   ];
 
   for (const screen of screens) {
     failNext = true;
-    failPath = LIST_READ[screen.label];
+    failPath = screen.read ?? LIST_READ[screen.label];
     await page.goto(`${URL_ADMIN}${screen.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     // The strip and the block are two shapes of the same state: a screen that keeps its own body
     // shows a strip, a screen that replaced its list shows a block. Both count.
@@ -5894,6 +5912,15 @@ async function runCrmStateSweep(page, report) {
     steps[`${screen.label}_showsTheRequestId`] = text.includes(REQUEST_ID);
     steps[`${screen.label}_hasARetry`] =
       (await page.locator(`[data-qa='${screen.qa}-retry'], [data-qa='${screen.qa.replace(/-error$/, "-body-error")}-retry']`).count()) > 0;
+    // **A refusal must not be dressed as an empty tenant.** The pipelines editor is the screen
+    // that got this wrong: it renders "This pipeline has no stages" from a `rows` array that
+    // starts empty, so a 503 produced a confident claim about the data plus a button that writes
+    // a stage. A reader who follows it creates a stage in a pipeline whose shape nobody has seen.
+    // The claim is the thing to catch, not the button — a screen may legitimately show an empty
+    // state once it *knows* the answer is empty, and only then.
+    steps[`${screen.label}_doesNotClaimToBeEmpty`] = !/has no stages|add the first one|no deals yet/i.test(
+      await page.locator("body").innerText().catch(() => ""),
+    );
     if (screen.label === "contacts") {
       await shot(page, "page-crm-contacts-error");
     }

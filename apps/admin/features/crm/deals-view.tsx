@@ -1222,7 +1222,13 @@ export function PipelinesSettingsView() {
   const [pipelines, setPipelines] = useState<CrmPipeline[] | null>(null);
   const [selected, setSelected] = useState<string>("");
   const [rows, setRows] = useState<CrmPipeline["stages"]>([]);
+  // Two errors, for the same reason the board has two (`loadError` there, 18f7): a *save* refused
+  // leaves the editor exactly as the person left it — the stage they renamed is still on screen
+  // with their name on it — so it belongs above the list. A *read* refused leaves nothing: no
+  // pipeline, no stages, and the list below would then claim "this pipeline has no stages", which
+  // is a fact about the screen's own ignorance rather than about the tenant.
   const [error, setError] = useState<ScreenErrorValue>(null);
+  const [loadError, setLoadError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
@@ -1231,6 +1237,7 @@ export function PipelinesSettingsView() {
   const { organizationId } = useCrmTenant();
 
   useEffect(() => {
+    setLoadError(null);
     fetchCrmPipelines(organizationId ?? undefined)
       .then((rows_) => {
         setPipelines(rows_);
@@ -1238,7 +1245,7 @@ export function PipelinesSettingsView() {
         setSelected((current) => current || first);
       })
       .catch((problem) =>
-        setError(toScreenError(problem, "The pipelines could not be loaded.")),
+        setLoadError(toScreenError(problem, "The pipelines could not be loaded.")),
       );
   }, [reloadToken, organizationId]);
 
@@ -1330,6 +1337,21 @@ export function PipelinesSettingsView() {
         <p className="border-b border-line bg-canvas px-4 py-2.5 text-[12px] text-muted">{notice}</p>
       ) : null}
 
+      {loadError ? (
+        /* A refused read replaces the editor, exactly as `fed62b5` made the board replace its own
+           columns. Three claims cannot be true at once, and the worst of the three is the one this
+           used to make: "This pipeline has no stages — add the first one". It arrives within a
+           second of a 503, it is confident, it has a *button*, and following it writes a stage
+           into a pipeline whose shape nobody has seen. A screen that cannot read is allowed to
+           say so and to offer the retry; it is not allowed to have an opinion about the
+           tenant's data. The board's deal form is one route away, so nothing is trapped here. */
+        <ErrorState
+          error={loadError}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-stages-error"
+        />
+      ) : null}
+
       <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
         <label className="flex items-center gap-1.5">
           <span className="text-[12px] text-muted">Pipeline</span>
@@ -1348,7 +1370,27 @@ export function PipelinesSettingsView() {
         </label>
       </div>
 
-      {rows.length === 0 ? (
+      {/* `pipelines === null` is the read in flight and `rows.length === 0` is a pipeline that
+          genuinely has no stages. Both start as an empty array, so without this the screen showed
+          its "add the first stage" empty state during every load — including the first paint,
+          before a single byte of the answer had arrived. An empty state is a statement about the
+          data; saying it while the data is still in flight is how a slow connection talks somebody
+          into creating a stage that already exists. */}
+      {loadError ? null : pipelines === null ? (
+        <ul className="divide-y divide-line" data-qa="crm-stages-loading">
+          {[0, 1, 2].map((row) => (
+            <li key={row} className="flex flex-wrap items-end gap-2 px-4 py-3">
+              {[176, 96, 72].map((width, at) => (
+                <span
+                  key={at}
+                  style={{ width }}
+                  className="h-[30px] animate-pulse rounded-lg bg-surface"
+                />
+              ))}
+            </li>
+          ))}
+        </ul>
+      ) : rows.length === 0 ? (
         <EmptyState
           title="This pipeline has no stages"
           hint="A board is a list of columns. Add the first one and a deal will land in it."
