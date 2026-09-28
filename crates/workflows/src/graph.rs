@@ -1228,7 +1228,22 @@ fn step_for(node: &Node, node_type: &NodeType, graph: &Graph) -> Result<StepDefi
                 .unwrap_or("equals")
                 .to_owned();
             let value = params.get("value").cloned().unwrap_or(Value::Null);
-            Ok(StepDefinition::branch(name, field, operator, value))
+            // The false edge ends the run, and the projection says so on the step itself: a
+            // trace that stops here can then show *which* comparison stopped it, instead of
+            // the run simply running out of steps.
+            let false_target = graph
+                .edges
+                .iter()
+                .find(|edge| edge.source == node.id && edge.source_port == "false")
+                .map(|edge| edge.target.as_str());
+            let reason = false_target
+                .and_then(|id| graph.node(id))
+                .map(|target| target.label.clone());
+            let mut step = StepDefinition::branch(name.clone(), field, operator, value);
+            if let Some(reason) = reason {
+                step.params["false_label"] = json!(reason);
+            }
+            Ok(step)
         }
         "approval" => {
             let permission = params.get("permission").and_then(Value::as_str);
