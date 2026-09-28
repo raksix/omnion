@@ -24,6 +24,9 @@
 //! which is where connections become tenant-scoped.
 
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -1153,9 +1156,7 @@ pub struct ProbeOutcome {
 }
 
 /// `GET /api/v1/ai/failover` — the chain as the router walks it right now.
-pub async fn failover_chain(
-    State(state): State<AppState>,
-) -> Result<Json<FailoverView>, ApiError> {
+pub async fn failover_chain(State(state): State<AppState>) -> Result<Json<FailoverView>, ApiError> {
     let chain = omnion_ai_hub::health_store::failover_preview(state.db().pool()).await?;
     Ok(Json(FailoverView {
         chain,
@@ -1200,11 +1201,7 @@ pub async fn set_failover_order(
         providers: omnion_ai_hub::health_store::enabled_providers(state.db().pool()).await?,
     };
 
-    let names: Vec<&str> = view
-        .chain
-        .iter()
-        .map(|entry| entry.name.as_str())
-        .collect();
+    let names: Vec<&str> = view.chain.iter().map(|entry| entry.name.as_str()).collect();
     let entry = NewAuditEntry::by_user(current.user.id, "ai.failover.reordered")
         .organization(current.user.organization_id)
         .target("ai_failover", "chain".to_owned())
@@ -1329,8 +1326,19 @@ pub async fn chat(
     // The request shape is checked before the stream opens, so a bad one answers 400.
     omnion_ai_hub::validate_request(&request)?;
 
+    // The chain this call may walk. A request that named `provider/model` is pinned: the plan
+    // carries that one provider and no successor, so the walk below cannot move it — it is the
+    // decision itself, not a flag the walk re-decides. A request that named only a task gets the
+    // enabled providers in the order the Failover panel draws.
+    let pinned = omnion_ai_hub::pinned_provider(state.db().pool(), body.model.as_deref()).await?;
+    let all = omnion_ai_hub::store::failover_chain(state.db().pool()).await?;
+    let providers = match omnion_ai_hub::plan(&all, pinned, omnion_ai_hub::Progress::Nothing) {
+        omnion_ai_hub::Plan::Pinned { .. } => vec![resolved.provider.clone()],
+        omnion_ai_hub::Plan::Chain { .. } | omnion_ai_hub::Plan::Exhausted { .. } => all,
+    };
+
     let target = ProviderTarget::from_provider(&resolved.provider);
-    let provider_name = resolved.provider.name.clone();
+    let provider_id = resolved.provider.id;
     let model_key = resolved.model.model_key.clone();
     let model_id = resolved.id();
     let pool = state.db().pool().clone();
@@ -1341,73 +1349,182 @@ pub async fn chat(
     let (frames, receiver) = mpsc::channel::<Frame>(STREAM_BUFFER);
 
     tokio::spawn(async move {
-        let (deltas, mut delta_receiver) = mpsc::channel::<ChatEvent>(STREAM_BUFFER);
-        let relay = frames.clone();
-        let pump = tokio::spawn(async move {
-            while let Some(event) = delta_receiver.recv().await {
-                let frame = match event {
-                    ChatEvent::Start {
-                        provider,
-                        model,
-                        protocol,
-                    } => Frame::Start {
-                        provider,
-                        model,
-                        protocol,
-                    },
-                    ChatEvent::Delta(content) => Frame::Delta(content),
-                };
-                if relay.send(frame).await.is_err() {
+        // The failover walk (REQ-097, slice 3). A failure *before the first streamed byte* is
+        // retried against the next provider in the chain — and only when the request named no
+        // provider, because a pinned request puts exactly one entry in `candidates` and the walk
+        // below therefore has nowhere to move to.
+        let mut attempts: Vec<omnion_ai_hub::Attempt> = Vec::new();
+        let mut current = target;
+        let mut served_by = provider_id;
+        let mut outcome = None;
+        let started = Instant::now();
+
+        loop {
+            let attempt = omnion_ai_hub::Attempt {
+                provider_id: current.id,
+                provider_name: current.name.clone(),
+                error: None,
+            };
+
+            // The first byte is the boundary failover may act on: after it the caller has seen
+            // part of an answer, and a replay would be a second, different answer.
+            let first_byte = Arc::new(AtomicBool::new(false));
+            let mark = Arc::clone(&first_byte);
+            // One channel per attempt, dropped when the attempt ends, so the pump below finishes
+            // on its own and a substitute provider never inherits the failed one's deltas.
+            let (attempt_deltas, mut watched) = mpsc::channel::<ChatEvent>(STREAM_BUFFER);
+            let relay = frames.clone();
+            let pump_attempt = tokio::spawn(async move {
+                while let Some(event) = watched.recv().await {
+                    let frame = match event {
+                        ChatEvent::Start {
+                            provider,
+                            model,
+                            protocol,
+                        } => Frame::Start {
+                            provider,
+                            model,
+                            protocol,
+                        },
+                        ChatEvent::Delta(content) => {
+                            // Marked here, at the one place a byte is handed to a subscriber —
+                            // the client may already have received it.
+                            mark.store(true, Ordering::SeqCst);
+                            Frame::Delta(content)
+                        }
+                    };
+                    if relay.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let result = stream_chat(&current, &request, &attempt_deltas).await;
+            // The provider stopped writing: close the channel so the pump ends and the flag holds
+            // whatever this attempt actually delivered.
+            drop(attempt_deltas);
+            let _ = pump_attempt.await;
+            let streamed = first_byte.load(Ordering::SeqCst);
+
+            match result {
+                Ok(answer) => {
+                    attempts.push(omnion_ai_hub::Attempt {
+                        error: None,
+                        ..attempt
+                    });
+                    outcome = Some(answer);
                     break;
                 }
+                Err(error) => {
+                    attempts.push(omnion_ai_hub::Attempt {
+                        error: Some(error.to_string()),
+                        ..attempt
+                    });
+
+                    let progress = if streamed {
+                        omnion_ai_hub::Progress::AfterFirstByte
+                    } else {
+                        omnion_ai_hub::Progress::BeforeFirstByte
+                    };
+                    let substitute = if omnion_ai_hub::is_retryable(&error) {
+                        omnion_ai_hub::next(&providers, &attempts, progress)
+                    } else {
+                        None
+                    };
+
+                    let Some(substitute) = substitute else {
+                        // The chain is spent, or this request was never allowed to move. The
+                        // caller gets the first provider's complaint with the later ones
+                        // appended, because the first is the provider they asked for.
+                        let final_error = omnion_ai_hub::final_error(&attempts).unwrap_or(error);
+                        record_usage(&pool, &attempts, &served_by, "error", started.elapsed())
+                            .await;
+                        let _ = frames
+                            .send(Frame::Failed {
+                                code: final_error.code(),
+                                message: final_error.to_string(),
+                            })
+                            .await;
+                        let entry = NewAuditEntry::by_user(user_id, "ai.chat.failed")
+                            .organization(organization_id)
+                            .target("ai_model", model_id.clone())
+                            .metadata(json!({
+                                "provider": current.name,
+                                "model": model_key,
+                                "error": final_error.to_string(),
+                                "attempts": attempts.len(),
+                            }))
+                            .ip_address(ip_address.clone());
+                        if let Err(error) = omnion_audit::record(&pool, entry).await {
+                            tracing::warn!(%error, "the AI chat audit row could not be written");
+                        }
+                        return;
+                    };
+
+                    // Record the attempt that failed *and* announce the substitution, both
+                    // before any byte of the new provider's answer reaches the caller.
+                    record_usage(
+                        &pool,
+                        &attempts,
+                        &attempt.provider_id,
+                        "error",
+                        started.elapsed(),
+                    )
+                    .await;
+                    announce_failover(
+                        &pool,
+                        &attempts,
+                        &substitute,
+                        &model_key,
+                        user_id,
+                        organization_id,
+                        ip_address.as_deref(),
+                    )
+                    .await;
+
+                    let Some(provider) =
+                        omnion_ai_hub::find_provider(&pool, substitute.provider_id)
+                            .await
+                            .ok()
+                            .flatten()
+                    else {
+                        // The substitute was removed between planning and dialling: there is
+                        // nothing left to try, and the error the caller already has is the truth.
+                        break;
+                    };
+                    served_by = provider.id;
+                    current = ProviderTarget::from_provider(&provider);
+                }
             }
+        }
+
+        let answer = outcome.expect("an answer or an early return above");
+        record_usage(&pool, &attempts, &served_by, "ok", started.elapsed()).await;
+
+        // `current` is the provider that actually answered, which after a substitution is *not*
+        // the one the request was routed to. The caller is told the final provider, because "the
+        // standby served this" is the fact the operator needs to see next to the answer.
+        let metadata = json!({
+            "provider": current.name,
+            "model": model_key,
+            "chars": answer.content.chars().count(),
+            "finish_reason": answer.finish_reason,
+            "substitutions": attempts.len().saturating_sub(1),
+            "usage": answer.usage.as_ref().map(|usage| json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            })),
         });
 
-        let outcome = stream_chat(&target, &request, &deltas).await;
-        drop(deltas);
-        let _ = pump.await;
-
-        let (action, code, metadata) = match &outcome {
-            Ok(outcome) => (
-                "ai.chat.completed",
-                None,
-                json!({
-                    "provider": provider_name,
-                    "model": model_key,
-                    "chars": outcome.content.chars().count(),
-                    "finish_reason": outcome.finish_reason,
-                    "usage": outcome.usage.as_ref().map(|usage| json!({
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                    })),
-                }),
-            ),
-            Err(error) => (
-                "ai.chat.failed",
-                Some(error.code()),
-                json!({
-                    "provider": provider_name,
-                    "model": model_key,
-                    "error": error.to_string(),
-                }),
-            ),
-        };
-
-        let frame = match outcome {
-            Ok(outcome) => Frame::Done {
-                finish_reason: outcome.finish_reason,
-                chars: outcome.content.chars().count(),
-                usage: outcome.usage,
-            },
-            Err(error) => Frame::Failed {
-                code: code.unwrap_or("internal_error"),
-                message: error.to_string(),
-            },
+        let frame = Frame::Done {
+            finish_reason: answer.finish_reason,
+            chars: answer.content.chars().count(),
+            usage: answer.usage,
         };
         let _ = frames.send(frame).await;
 
-        let entry = NewAuditEntry::by_user(user_id, action)
+        let entry = NewAuditEntry::by_user(user_id, "ai.chat.completed")
             .organization(organization_id)
             .target("ai_model", model_id)
             .metadata(metadata)
@@ -1420,6 +1537,102 @@ pub async fn chat(
     let stream = ReceiverStream::new(receiver).map(Frame::event);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Failover bookkeeping
+// ---------------------------------------------------------------------------------------------
+
+/// Record the usage row of every attempt a chat walk made.
+///
+/// One row per attempt, not one per request: the Usage tab shows requests **and** errors per
+/// provider, and a substitution is two provider-level facts — the one that failed and the one
+/// that answered. A single row would make the failed provider look like it never served anything
+/// and the substitute look like it served a request nobody made.
+async fn record_usage(
+    pool: &sqlx::PgPool,
+    attempts: &[omnion_ai_hub::Attempt],
+    served_by: &uuid::Uuid,
+    outcome: &str,
+    elapsed: std::time::Duration,
+) {
+    let latency_ms = i32::try_from(elapsed.as_millis()).unwrap_or(i32::MAX);
+    for (index, attempt) in attempts.iter().enumerate() {
+        // The last attempt is the one whose row carries the substitution; the earlier ones are
+        // the failures that led to it.
+        let substituted_from = if index + 1 == attempts.len() && outcome == "ok" {
+            attempts.first().map(|first| first.provider_id)
+        } else {
+            None
+        };
+        let row = omnion_ai_hub::health_store::NewUsage {
+            provider_id: if outcome == "ok" {
+                *served_by
+            } else {
+                attempt.provider_id
+            },
+            model_key: None,
+            task: "chat".to_owned(),
+            outcome: if attempt.error.is_some() && outcome != "ok" {
+                "error".to_owned()
+            } else {
+                outcome.to_owned()
+            },
+            http_status: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms,
+            substituted_from,
+            first_byte_at: None,
+        };
+        if let Err(error) = omnion_ai_hub::health_store::record_usage(pool, row).await {
+            tracing::warn!(%error, "a provider usage row could not be written");
+        }
+    }
+}
+
+/// Announce a substitution: the requested provider, the one that took over, and why.
+///
+/// This is the `ai.provider.failover_used` event the request names, and it is written **before**
+/// the substitute's first byte reaches the caller. A substitution the operator can only discover
+/// afterwards, in a bill, is not a failover they can trust.
+#[allow(clippy::too_many_arguments)]
+async fn announce_failover(
+    pool: &sqlx::PgPool,
+    attempts: &[omnion_ai_hub::Attempt],
+    substitute: &omnion_ai_hub::Attempt,
+    model_key: &str,
+    user_id: uuid::Uuid,
+    organization_id: Option<uuid::Uuid>,
+    ip_address: Option<&str>,
+) {
+    let requested = attempts
+        .first()
+        .map(|attempt| attempt.provider_name.clone())
+        .unwrap_or_default();
+    let reason = attempts
+        .last()
+        .and_then(|attempt| attempt.error.clone())
+        .unwrap_or_default();
+
+    let mut entry = NewAuditEntry::by_user(user_id, "ai.provider.failover_used")
+        .target("ai_provider", substitute.provider_id.to_string())
+        .metadata(json!({
+            "requested_provider": requested,
+            "substitute_provider": substitute.provider_name,
+            "model": model_key,
+            "task": "chat",
+            "reason": reason,
+        }));
+    if let Some(organization_id) = organization_id {
+        entry = entry.organization(organization_id);
+    }
+    if let Some(ip_address) = ip_address {
+        entry = entry.ip_address(Some(ip_address.to_owned()));
+    }
+    if let Err(error) = omnion_audit::record(pool, entry).await {
+        tracing::warn!(%error, "the failover event could not be written");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

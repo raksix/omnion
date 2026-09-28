@@ -32,7 +32,7 @@ pub use client::{
 pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
 pub use error::{AiHubError, Result};
 pub use failover::{
-    Attempt, Plan, Progress, Routing, chain_of, final_error, is_retryable, next, plan,
+    Attempt, Plan, Progress, chain_of, final_error, is_retryable, next, pinned_provider, plan,
 };
 pub use model::{
     AiModel, ApiKeyChange, DEFAULT_PROTOCOL, DiscoveryAction, DiscoveryDiff, DiscoveryLine,

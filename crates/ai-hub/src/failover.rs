@@ -21,9 +21,10 @@
 //! off, and a health verdict that silently rewrites routing is a verdict with no way back. The
 //! chain is the *enabled* providers in order, and that is what the Failover panel previews.
 
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::error::AiHubError;
+use crate::error::{AiHubError, Result};
 use crate::model::Provider;
 
 /// How a request named its model, which is what decides whether it may be rerouted.
@@ -222,6 +223,25 @@ pub fn final_error(attempts: &[Attempt]) -> Option<AiHubError> {
         status: 502,
         message,
     })
+}
+
+/// The provider a request pinned itself to, when it named `provider/model`.
+///
+/// This is the *router's own* rule, asked the same way: a prefix counts as a provider only when
+/// a provider of that name is really connected, because a model key may itself contain a slash
+/// (`meta-llama/Llama-3.1-8B-Instruct`). Reading the rule from a second place is how a pinned
+/// request ends up quietly rerouted — the failover walk and the router would disagree about what
+/// "pinned" means, and the walk would be the one that moves the request.
+pub async fn pinned_provider(pool: &PgPool, requested: Option<&str>) -> Result<Option<Uuid>> {
+    let Some(value) = requested else {
+        return Ok(None);
+    };
+    let Some((prefix, _rest)) = value.split_once('/') else {
+        return Ok(None);
+    };
+    Ok(crate::store::find_provider_by_name(pool, prefix)
+        .await?
+        .map(|provider| provider.id))
 }
 
 #[cfg(test)]
