@@ -113,13 +113,53 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
   it. A test asserts an embedding-only model is refused for `chat` and that the refusal text
   carries the capability. The "UI filters the select" half lands with slice 2's routing screen,
   which is where a select exists.*
-- [ ] A task map with a primary and two fallbacks resolves to the primary; disabling the primary inside a test resolves to the first fallback and writes `fallback_index = 1` with a reason naming the skip.
-- [ ] A candidate that fails a required capability is skipped for that reason, and the decision walk records it.
-- [ ] Resolution order is exact: explicit pin beats feature override beats task route beats installation default; a test asserts each adjacent pair.
-- [ ] Feature overrides resolve site over organization over installation; removing an override restores the inherited model without touching the task map.
-- [ ] A site-level task map does not change another site's decisions (test asserts two sites diverge).
-- [ ] `POST /ai/routing/preview` returns the walk (attempted, skipped with reason, chosen) and performs zero provider calls (test counts upstream requests = 0).
-- [ ] A routing PUT naming a disabled or capability-incompatible model is refused with the task, candidate and requirement in the message.
+- [x] A task map with a primary and two fallbacks resolves to the primary; disabling the primary inside a test resolves to the first fallback and writes `fallback_index = 1` with a reason naming the skip.
+  *Proved in `ai_routing.rs` — `disabling_the_primary_degrades_to_the_first_fallback` writes a
+  three-candidate chain, asserts the primary answers, switches it off **through the catalog's own
+  PATCH** (not by editing rows), then asserts the first *usable* fallback answers at position 3
+  with a walk naming "switched off" and the model. The walk carries all three candidates and exactly
+  one is marked chosen — a walk with two winners is not a walk.* The `fallback_index` **column** is
+  slice 3's `ai_route_decisions`; the crate reports the same fact as `ResolvedCandidate::position`,
+  and the decision writer is what turns it into a stored column.
+- [x] A candidate that fails a required capability is skipped for that reason, and the decision walk records it.
+  *Proved in two places. The crate's `a_candidate_missing_a_requirement_is_skipped_with_that_requirement_named`
+  sets a `tools` requirement against a model that does not claim it and asserts the walk's reason
+  contains the requirement. On the API, `a_capability_incompatible_route_is_refused_and_the_old_map_survives`
+  refuses a model with no tools flag in a `coding` route and checks the message carries the task, the
+  candidate and the requirement — and that the previous map survived the refusal.*
+- [x] Resolution order is exact: explicit pin beats feature override beats task route beats installation default; a test asserts each adjacent pair.
+  *The order is one exported list, `RULES`, and a test asserts its contents **in order** — a set
+  check would not catch a swap of the last two, which changes behaviour while leaving the same five
+  names in place. Each adjacent pair is its own fixture differing only in the rule under test:
+  `an_explicit_pin_beats_a_feature_override`, `a_feature_pin_beats_a_task_route`,
+  `a_task_route_beats_the_installation_default`,
+  `the_installation_default_answers_only_when_no_map_named_a_usable_candidate`,
+  `an_installation_with_nothing_configured_refuses_and_says_why`. The API serves the list to the
+  panel so the legend cannot drift from the resolver.*
+- [x] Feature overrides resolve site over organization over installation; removing an override restores the inherited model without touching the task map.
+  *Proved in the crate (`a_site_pin_wins_over_the_organizations_pin`,
+  `an_organization_pin_answers_a_site_that_has_none`) and end to end
+  (`removing_an_override_restores_the_inherited_model`): an installation pin, an organization pin
+  shadowing it, then the organization pin removed — the installation one is inherited again and the
+  decision's scope reads `installation`. An override write never touches the task map; they are
+  separate tables and separate endpoints.*
+- [x] A site-level task map does not change another site's decisions (test asserts two sites diverge).
+  *`a_site_map_does_not_change_the_installation_or_a_sibling_site` writes a `cheap` map for site one
+  naming one model, then asserts site one answers with it, the sibling site of the **same**
+  organization answers with something else, and the installation map is still empty. A write that
+  reached the installation would be an edit of the platform-wide map from a tenant request.*
+- [x] `POST /api/v1/ai/routing/preview` returns the walk (attempted, skipped with reason, chosen) and performs zero provider calls (test counts upstream requests = 0).
+  *`the_dry_run_resolves_a_map_without_calling_a_provider` uses a mock provider that **increments a
+  counter on every request**, reads it before and after the preview, and asserts it did not move.
+  "Looks like it does not dial out" is a weaker claim than "the provider answered nothing". The
+  endpoint module holds no provider client at all, so the promise is structural rather than a matter
+  of remembering. The walk is asserted entry by entry: position 1 chosen, position 2 skipped with
+  "not reached".*
+- [x] A routing PUT naming a disabled or capability-incompatible model is refused with the task, candidate and requirement in the message.
+  *`a_capability_incompatible_route_is_refused_and_the_old_map_survives` — the message is checked
+  for all three (`coding`, the model key, `tools`) and the map is re-read to prove the good chain is
+  still there. Validation runs against the **stored** model, not the payload, so a caller cannot
+  claim a capability the registry does not carry.*
 - [ ] Price edits surface on `/ai/costs` for new requests only — historical rows keep their recorded cost (test asserts an old `ai_usage` row is unchanged).
 - [ ] Every task row shows "Last resolved" from the newest decision; a task that cannot resolve renders the warning banner and appears in `/ai/routing/unresolved`.
 - [ ] `/ai/logs` filters by task, feature, model, fallback-used and date, and the CSV export matches the filtered rows row-for-row.
@@ -142,6 +182,13 @@ The visual check must see: numeric columns right-aligned (context window, costs)
    *Done when:* a price edit changes the cost of the next request only, and a capability-incompatible model is refused everywhere it could be picked.
 2. **Task routing and overrides** — `ai_task_routes`, `ai_feature_overrides`, the `/ai/routing` screen with scope selector and drag order, the resolution order, the dry-run preview, validation on PUT.
    *Done when:* a two-fallback route degrades correctly under test, the preview performs no provider call, and scopes do not leak into each other.
+   *Shipped (`0244b29`, `7fa1f89`, `b0a3a25`, `1a14298`).* The tables and their constraints are
+   `database/migrations/0045_ai_task_routes.sql`; the resolver is `crates/ai-hub/src/routing.rs`
+   (pure, 145 unit tests in the crate) and the reads/writes `routing_store.rs`; the endpoints are
+   `apps/api/src/routes/ai_routing.rs`; the screen is `apps/admin/features/ai/ai-routing.tsx`.
+   All three "done when" clauses are proved in `apps/api/tests/ai_routing.rs` (10/10): the
+   two-fallback degradation, the preview's zero provider calls (counted, not asserted by absence),
+   and the site/sibling/installation divergence.
 3. **Decision log and explanation** — `ai_route_decisions`, the decision writer in the resolve path, `/ai/logs` with its detail view, the retention runner, the `ai_usage.decision_id` link, the events.
    *Done when:* every resolved request has a decision row with a reason, a fallback is visible end to end, and a cost row joins back to its decision.
 
