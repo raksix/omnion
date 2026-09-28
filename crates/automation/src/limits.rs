@@ -213,9 +213,7 @@ impl Admit {
     pub fn reason(self, policy: &Policy) -> Option<String> {
         match self {
             Self::Allowed { .. } => None,
-            Self::RateLimited {
-                used, limit, ..
-            } => Some(format!(
+            Self::RateLimited { used, limit, .. } => Some(format!(
                 "the rule may start {limit} runs an hour and has started {used} in this window; \
                  this trigger was not run and the next one may start after the window rolls over"
             )),
@@ -391,12 +389,10 @@ pub async fn set_last_error(
 
 /// Clear the last refusal, which is what admitting a run does.
 pub async fn clear_last_error(connection: &mut PgConnection, workflow_id: Uuid) -> Result<()> {
-    sqlx::query(
-        "update workflows set last_error = null where id = $1 and last_error is not null",
-    )
-    .bind(workflow_id)
-    .execute(&mut *connection)
-    .await?;
+    sqlx::query("update workflows set last_error = null where id = $1 and last_error is not null")
+        .bind(workflow_id)
+        .execute(&mut *connection)
+        .await?;
     Ok(())
 }
 
@@ -423,9 +419,7 @@ pub fn limit_metadata(verdict: Admit, policy: &Policy) -> Option<serde_json::Val
     let reason = verdict.reason(policy)?;
     Some(match verdict {
         Admit::Allowed { .. } => unreachable!("an admitted run has no reason"),
-        Admit::RateLimited {
-            used, limit, ..
-        } => json!({
+        Admit::RateLimited { used, limit, .. } => json!({
             "bound": "rate_limit_per_hour",
             "used": used,
             "limit": limit,
@@ -483,7 +477,10 @@ mod tests {
         assert_eq!(Concurrency::Skip.as_str(), "skip");
 
         for policy in Concurrency::ALL {
-            assert!(!policy.describe().is_empty(), "the picker shows the sentence");
+            assert!(
+                !policy.describe().is_empty(),
+                "the picker shows the sentence"
+            );
         }
     }
 

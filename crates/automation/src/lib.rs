@@ -64,14 +64,22 @@ pub mod mail;
 pub mod matcher;
 pub mod model;
 pub mod outbound;
+pub mod templates;
 pub mod testing;
+pub mod versions;
 
 pub use actions::AutomationActions;
 pub use authority::Authority;
 pub use binding::{resolve_params, validate_bindings};
 pub use condition::{Condition, ConditionOperator};
 pub use error::{AutomationError, Result};
+pub use limits::{Admit, Policy, admit};
+pub use loopguard::LoopGuard;
 pub use mail::{Email, MailError, MailSettings};
 pub use matcher::{MatchReport, drain, event_cursor};
 pub use model::{AutomationRule, NewRule, build_definition};
 pub use outbound::{HttpSettings, Response as HttpResponse};
+// The gallery is a list of definitions a user *installs*, so the crate exports it as a
+// lookup rather than as a store: installing is an ordinary create the route performs.
+pub use templates::{NewTemplateRule, Template, all as list_templates, find as find_template};
+pub use versions::{Change, Version, list as list_versions, record as record_version};

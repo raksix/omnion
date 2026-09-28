@@ -12,7 +12,7 @@
 
 use omnion_workflows::definition::{StepDefinition, Trigger, WorkflowDefinition};
 use omnion_workflows::{OnError, TriggerKind, Workflow};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -184,6 +184,31 @@ impl AutomationRule {
             &self.actions,
             self.hook_triggered,
         )
+    }
+
+    /// The rule as one JSON document — what a version row stores (REQ-003 slice 4).
+    ///
+    /// This is deliberately **not** `serde_json::to_value(self)`. A snapshot that carries
+    /// the row's own bookkeeping (`trigger_count`, `last_error`, `created_at`, …) is a
+    /// snapshot of the database row, not of the rule, and the panel's diff would then
+    /// report "3 runs" as an edit to the definition. The fields listed here are the ones
+    /// an operator can change from the editor; everything else is derived or historical.
+    pub fn snapshot(&self) -> Result<Value> {
+        let definition = self.definition()?;
+        Ok(json!({
+            "name": self.name,
+            "description": self.description,
+            "enabled": self.enabled,
+            "site_id": self.site_id,
+            "event": self.event,
+            "hook_triggered": self.hook_triggered,
+            "conditions": self.stored_conditions,
+            "steps": definition.steps_json()?,
+            "on_error": self.on_error.as_str(),
+            "run_as_user_id": self.run_as_user_id,
+            "rate_limit_per_hour": self.rate_limit_per_hour,
+            "concurrency": self.concurrency.as_str(),
+        }))
     }
 }
 

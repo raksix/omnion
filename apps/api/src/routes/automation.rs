@@ -460,9 +460,7 @@ impl AutomationInput {
             // a rule with a limit the panel cannot explain is refused with the *bound's*
             // message instead of with whatever the definition check notices first.
             rate_limit_per_hour: match self.rate_limit_per_hour {
-                Some(limit) => {
-                    Some(omnion_automation::limits::Policy::check_rate_limit(limit)?)
-                }
+                Some(limit) => Some(omnion_automation::limits::Policy::check_rate_limit(limit)?),
                 None => None,
             },
             concurrency: self.concurrency.map(Into::into),
@@ -733,6 +731,28 @@ pub async fn create_automation(
     .await?;
 
     let stored = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
+
+    // The first version, written next to the rule rather than by a follow-up call. A rule
+    // whose creation is not in its own history has no "before", so the Versions tab would
+    // start at the first *edit* and the audit trail would be missing the row that explains
+    // why the rule exists at all.
+    let mut tx = state
+        .db()
+        .pool()
+        .begin()
+        .await
+        .map_err(automation_db_error)?;
+    let version = omnion_automation::versions::record(
+        &mut tx,
+        &stored,
+        omnion_automation::versions::Change::Created,
+        Some(current.user.id),
+        None,
+    )
+    .await?;
+    tx.commit().await.map_err(automation_db_error)?;
+    let _ = version;
+
     let hook = hook_body(state.db().pool(), &stored).await?;
     Ok((
         StatusCode::CREATED,
@@ -815,7 +835,9 @@ pub async fn update_automation(
         run_as_user_id: rule.run_as_user_id,
         // The bounds the request sent, or the ones the rule already had: a `PUT` from a
         // client that has not learned about them yet must not reset them to the default.
-        rate_limit_per_hour: rule.rate_limit_per_hour.unwrap_or(existing.rate_limit_per_hour),
+        rate_limit_per_hour: rule
+            .rate_limit_per_hour
+            .unwrap_or(existing.rate_limit_per_hour),
         // The two live on different types on purpose: the wire speaks the two-variant enum
         // (a typo is a 400, not a row the guard has to guess at) while the row keeps the
         // stored text, and the update takes the text. So the write converts once, here, and
@@ -851,6 +873,27 @@ pub async fn update_automation(
 
     let stored = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
     let _ = definition;
+
+    // One row per edit, carrying the definition *as it was written* — which is why this
+    // runs after the update and reads the stored rule rather than the request: a snapshot
+    // of what the caller sent would be a snapshot of their intent, not of the rule.
+    let mut tx = state
+        .db()
+        .pool()
+        .begin()
+        .await
+        .map_err(automation_db_error)?;
+    let version = omnion_automation::versions::record(
+        &mut tx,
+        &stored,
+        omnion_automation::versions::Change::Updated,
+        Some(current.user.id),
+        None,
+    )
+    .await?;
+    tx.commit().await.map_err(automation_db_error)?;
+    let _ = version;
+
     let hook = hook_body(state.db().pool(), &stored).await?;
     let window = rate_window(state.db().pool(), &stored).await;
     Ok(Json(AutomationBody::build(
@@ -1326,6 +1369,11 @@ fn execution_not_found() -> ApiError {
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// Turn a database failure into the answer the rest of this module gives.
+fn automation_db_error(err: sqlx::Error) -> ApiError {
+    ApiError::from(omnion_audit::AuditError::Database(err))
+}
 
 /// Write an audit row; a privileged action is not reported as successful without one.
 async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {

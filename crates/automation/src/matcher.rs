@@ -247,8 +247,7 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
             // interleaving them would both see an empty window — which is exactly the
             // failure the request's risk note names.
             let policy = Policy::from_columns(workflow.rate_limit_per_hour, &workflow.concurrency);
-            let verdict =
-                limits::admit(&mut transaction, workflow.id, &policy, now).await?;
+            let verdict = limits::admit(&mut transaction, workflow.id, &policy, now).await?;
             if !verdict.is_allowed() {
                 report.skipped += 1;
                 if let Some(reason) = verdict.reason(&policy) {
