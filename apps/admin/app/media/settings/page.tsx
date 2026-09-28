@@ -1,6 +1,6 @@
 import { AppShell } from "@/components/app-shell";
 import { RequireAuth } from "@/components/require-auth";
-import { MediaSettingsView } from "@/features/media/presets-view";
+import { MediaSettingsTabs } from "@/features/media/presets-view";
 
 export const metadata = { title: "Media settings" };
 
@@ -9,9 +9,9 @@ export default function MediaSettingsPage() {
     <RequireAuth>
       <AppShell
         title="Media settings"
-        description="The named image sizes this site can serve, and the URL each one is asked for by"
+        description="Where this site's files are stored, and the named image sizes it can serve"
       >
-        <MediaSettingsView />
+        <MediaSettingsTabs />
       </AppShell>
     </RequireAuth>
   );

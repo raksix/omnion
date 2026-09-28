@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { useSites } from "@/lib/sites";
 import type { MediaPreset } from "@/lib/types";
+import { MediaStorageSettingsView } from "@/features/media/storage-settings-view";
 
 /** The fits a preset can use, with the label each one gets. */
 const FITS: [string, string][] = [
@@ -80,6 +81,72 @@ function toDraft(preset: MediaPreset): Draft {
     format: preset.format,
     quality: String(preset.quality),
   };
+}
+
+/**
+ * The two things a media settings screen answers, as tabs.
+ *
+ * Both belong to one screen because they are the two halves of the same question: a *preset*
+ * says what a size is, a *storage* record says where the bytes are, and an operator who finds
+ * one expects the other to be on the same page rather than behind a second URL. The tab state
+ * is component state rather than a query parameter, because there is no link anywhere that
+ * deep-links into "the storage tab of the settings page" — a URL for a transient selection is a
+ * URL somebody will bookmark and then be confused by.
+ */
+export function MediaSettingsTabs() {
+  const [tab, setTab] = useState<"storage" | "presets">("presets");
+  const tabs: [typeof tab, string][] = [
+    ["presets", "Transformation"],
+    ["storage", "Storage"],
+  ];
+
+  return (
+    <div className="space-y-3">
+      <div role="tablist" aria-label="Media settings" className="flex items-center gap-1">
+        {tabs.map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            id={`media-settings-tab-${value}`}
+            aria-selected={tab === value}
+            aria-controls={`media-settings-panel-${value}`}
+            onClick={() => setTab(value)}
+            className={[
+              "rounded-lg px-3 py-1.5 text-[12.5px] transition",
+              tab === value
+                ? "bg-accent text-white"
+                : "border border-line text-muted hover:bg-canvas hover:text-ink",
+            ].join(" ")}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/*
+        The inactive panel stays mounted rather than being unmounted: a form that is only in the
+        DOM while its tab is open is a form whose unsaved edits vanish the moment somebody
+        glances at the other tab. `hidden` keeps both out of the way and both in memory.
+      */}
+      <div
+        role="tabpanel"
+        id="media-settings-panel-presets"
+        aria-labelledby="media-settings-tab-presets"
+        hidden={tab !== "presets"}
+      >
+        <MediaSettingsView />
+      </div>
+      <div
+        role="tabpanel"
+        id="media-settings-panel-storage"
+        aria-labelledby="media-settings-tab-storage"
+        hidden={tab !== "storage"}
+      >
+        <MediaStorageSettingsView />
+      </div>
+    </div>
+  );
 }
 
 /** The transformation presets of the selected site. */

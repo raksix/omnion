@@ -683,6 +683,14 @@ impl From<MediaError> for ApiError {
                     None => Self::bad_request("invalid_preset", message),
                 }
             }
+            // Every storage field error names the field that caused it, and carries it as a
+            // detail — the settings form puts the message under that input, and a *save* and a
+            // *connection test* of the same bad value produce the same field, so a person is
+            // never told to fix a field on one path that the other path accepted.
+            MediaError::InvalidStorageSetting { field, message } => {
+                Self::bad_request("invalid_storage_setting", message)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

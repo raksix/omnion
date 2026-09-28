@@ -86,6 +86,7 @@ pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod media_files;
+pub mod media_settings;
 pub mod media_transform;
 pub mod media_versions;
 pub mod onboarding;
@@ -493,6 +494,19 @@ pub fn router(state: AppState) -> Router {
         .merge(delete(media_transform::delete))
         .layer(guards::require(&state, "media.settings.manage"));
 
+    // Storage settings (REQ-010, slice 3). Reading them is `media.read` — the browser's own
+    // settings screen is not the only caller, and knowing the upload ceiling is not a secret.
+    // Writing them and proving a connection are `media.settings.manage`, the same power the
+    // presets carry, and deliberately not `media.manage`: organising a library is not the same
+    // permission as repointing where every file in it lives.
+    let media_settings_route: MethodRouter<AppState, Infallible> =
+        get(media_settings::read).layer(guards::require(&state, "media.read"));
+    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
+        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_test: MethodRouter<AppState, Infallible> =
+        post(media_settings::test_connection)
+            .layer(guards::require(&state, "media.settings.manage"));
+
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
     let public_pages = get(public::get_published_page);
@@ -878,6 +892,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/media/{id}/versions/{version}/raw", media_version_raw)
         .route("/media/transformation-presets", media_presets)
+        // `/media/settings` is a *static* segment and `/media/{id}/…` is a parameter one.
+        // Axum ranks the static match first, so the settings row is never read as a media
+        // id — which is why the literal is declared here and not spelled as `{id}`.
+        .route("/media/settings", media_settings_route)
+        .route("/media/settings", media_settings_write)
+        .route("/media/settings/test-connection", media_settings_test)
         .route("/media/transformation-presets", media_preset_create)
         .route("/media/transformation-presets/{id}", media_preset)
         .route(
