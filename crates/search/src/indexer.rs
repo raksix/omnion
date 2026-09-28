@@ -115,6 +115,46 @@ pub fn event_plan(name: &str) -> Option<EventPlan> {
             action: EventAction::Index,
             id_key: "site_id",
         },
+        // The CRM (docs/requests/REQ-051). The `updated` events carry `contact_id` /
+        // `company_id` / `deal_id`; the *created* events carry the record's own ref, whose id
+        // key is the same name. Archiving is a **remove**, not an update: an archived record is
+        // still a row the module can read, and a search that kept answering with it would be
+        // showing a record the CRM list itself hides.
+        "crm.contact.created" | "crm.contact.updated" | "crm.contact.merged" => EventPlan {
+            provider: "contacts",
+            action: EventAction::Index,
+            id_key: "contact_id",
+        },
+        "crm.contact.archived" => EventPlan {
+            provider: "contacts",
+            action: EventAction::Remove,
+            id_key: "contact_id",
+        },
+        "crm.company.created" | "crm.company.updated" => EventPlan {
+            provider: "companies",
+            action: EventAction::Index,
+            id_key: "company_id",
+        },
+        "crm.company.archived" => EventPlan {
+            provider: "companies",
+            action: EventAction::Remove,
+            id_key: "company_id",
+        },
+        "crm.deal.created" | "crm.deal.updated" | "crm.deal.stage_changed" => EventPlan {
+            provider: "deals",
+            action: EventAction::Index,
+            id_key: "deal_id",
+        },
+        "crm.deal.won" | "crm.deal.lost" => EventPlan {
+            provider: "deals",
+            action: EventAction::Index,
+            id_key: "deal_id",
+        },
+        "crm.deal.archived" => EventPlan {
+            provider: "deals",
+            action: EventAction::Remove,
+            id_key: "deal_id",
+        },
         _ => return None,
     };
     Some(plan)
@@ -428,6 +468,26 @@ async fn prune(transaction: &mut Transaction<'_, Postgres>, spec: &ProviderSpec)
             "delete from search_documents d where d.provider = 'settings' \
              and not exists (select 1 from organizations o where d.entity_id = o.id::text)"
         }
+        // The CRM's three registers drop with their row, and — unlike the content providers — an
+        // **archived** record is not indexed either. The CRM lists hide archived rows by default
+        // (their own filter, `archived_at is null`), so a document that outlived the archive would
+        // answer a search with a record the panel will not show when the same person opens the
+        // list the hit points at. Archive and delete look the same from the index, on purpose.
+        "contacts" => {
+            "delete from search_documents d where d.provider = 'contacts' \
+             and not exists (select 1 from crm_contacts c \
+                             where c.id::text = d.entity_id and c.archived_at is null)"
+        }
+        "companies" => {
+            "delete from search_documents d where d.provider = 'companies' \
+             and not exists (select 1 from crm_companies c \
+                             where c.id::text = d.entity_id and c.archived_at is null)"
+        }
+        "deals" => {
+            "delete from search_documents d where d.provider = 'deals' \
+             and not exists (select 1 from crm_deals dl \
+                             where dl.id::text = d.entity_id and dl.archived_at is null)"
+        }
         other => {
             debug_assert!(false, "provider {other} has no prune");
             return Ok(0);
@@ -689,6 +749,101 @@ from sites s \
 where true {filter} \
 ";
 
+/// Upsert of the CRM contact provider: one document per live contact.
+///
+/// The title is the contact's display name and the `url` opens the contact list **with that row
+/// marked**, which is the same deep-link contract the pages provider uses. The company is carried
+/// in the document and the vector so "find the person at Northwind" works, but the company's
+/// *own* register keeps its own document: joining a second provider's row into this one would
+/// hand out a company to a caller who may read people and not companies.
+///
+/// A contact's **notes** are deliberately absent. The module flags free-text fields as sensitive
+/// (`crm.fields.sensitive.read`) precisely because a contract note is the CRM's most private
+/// column; the index has no way to answer a per-role question about a vector, so the rule the
+/// module states is the rule the index keeps.
+const CONTACTS_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select c.organization_id, null, 'contacts', 'contact', c.id::text, \
+       trim(concat_ws(' ', c.first_name, c.last_name)), \
+       concat_ws(' · ', c.email, c.job_title, c.status), \
+       '/crm/contacts?focus=' || c.id::text, \
+       c.owner_user_id, \
+       array[c.status]::text[], \
+       coalesce(c.email, '') || ' ' || coalesce(co.name, ''), \
+       c.updated_at, \
+       setweight(to_tsvector('simple', trim(concat_ws(' ', c.first_name, c.last_name))), 'A') || \
+       setweight(to_tsvector('simple', c.status), 'B') || \
+       setweight(to_tsvector('simple', concat_ws(' · ', coalesce(c.email, ''), \
+                                                 coalesce(c.job_title, ''), c.status)), 'C') || \
+       setweight(to_tsvector('simple', concat_ws(' ', coalesce(c.email, ''), \
+                                                 coalesce(co.name, ''))), 'D') \
+from crm_contacts c \
+left join crm_companies co on co.id = c.company_id \
+where c.archived_at is null {filter} \
+";
+
+/// Upsert of the CRM company provider: one document per live company. The domain and the industry
+/// are what somebody types into the palette box when they half-remember an account, so both are
+/// weighted with the name rather than left in the subtitle only.
+const COMPANIES_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select c.organization_id, null, 'companies', 'company', c.id::text, \
+       c.name, \
+       concat_ws(' · ', c.domain, c.industry, c.status), \
+       '/crm/companies?focus=' || c.id::text, \
+       c.owner_user_id, \
+       array[c.status]::text[], \
+       coalesce(c.domain, ''), \
+       c.updated_at, \
+       setweight(to_tsvector('simple', c.name), 'A') || \
+       setweight(to_tsvector('simple', c.status), 'B') || \
+       setweight(to_tsvector('simple', concat_ws(' · ', coalesce(c.domain, ''), \
+                                                 coalesce(c.industry, ''), c.status)), 'C') || \
+       setweight(to_tsvector('simple', coalesce(c.domain, '')), 'D') \
+from crm_companies c \
+where c.archived_at is null {filter} \
+";
+
+/// Upsert of the CRM deal provider: one document per live deal.
+///
+/// The document carries the **stage name** rather than the stage's id: `won` is a word a person
+/// searches for and `4f2c…` is not, and a deal moved into a differently-named stage must answer
+/// under the new name without a reindex. The amount rides the subtitle in the currency's own
+/// digits because a hit's subtitle is the line under its title, and "Renewal · 12,000 USD ·
+/// Negotiation" is the answer; the probability is a tag so `is:won` and `is:lost` are filters
+/// rather than text matches. The lost reason is a tag only for a lost deal — a reason is
+/// "too expensive", which nobody pastes into a search box, and putting it in the vector would
+/// make a competitor's objection the most findable word in the index.
+const DEALS_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select d.organization_id, null, 'deals', 'deal', d.id::text, \
+       d.title, \
+       concat_ws(' · ', s.name, to_char(d.amount, 'FM9,999,999,999.00') || ' ' || d.currency, \
+                 s.kind), \
+       '/crm/deals?focus=' || d.id::text, \
+       d.owner_user_id, \
+       array_remove(array[s.kind]::text[], null), \
+       coalesce(co.name, '') || ' ' || coalesce(ct.first_name || ' ' || ct.last_name, ''), \
+       d.updated_at, \
+       setweight(to_tsvector('simple', d.title), 'A') || \
+       setweight(to_tsvector('simple', s.kind), 'B') || \
+       setweight(to_tsvector('simple', concat_ws(' · ', s.name, s.kind)), 'C') || \
+       setweight(to_tsvector('simple', concat_ws(' ', coalesce(co.name, ''), \
+                                                 coalesce(ct.first_name, '') || ' ' || \
+                                                 coalesce(ct.last_name, ''))), 'D') \
+from crm_deals d \
+join crm_pipeline_stages s on s.id = d.stage_id \
+left join crm_companies co on co.id = d.company_id \
+left join crm_contacts ct on ct.id = d.contact_id \
+where d.archived_at is null {filter} \
+";
+
 /// Build a provider's upsert statement: the SQL above, the optional single-entity filter and the
 /// shared conflict tail.
 #[must_use]
@@ -700,6 +855,9 @@ pub fn upsert_statement(provider_key: &str, entity_id: Option<Uuid>) -> Option<S
         "sites" => (SITES_UPSERT, "s.id"),
         "translations" => (TRANSLATIONS_UPSERT, "t.id"),
         "settings" => (SETTINGS_UPSERT, "o.id"),
+        "contacts" => (CONTACTS_UPSERT, "c.id"),
+        "companies" => (COMPANIES_UPSERT, "c.id"),
+        "deals" => (DEALS_UPSERT, "d.id"),
         // Activity rows are two sources behind one entity id (`audit-12` / `event-9`), and nothing
         // addresses one of them by uuid: the only way in is a full pass, so a single-entity upsert
         // writes nothing rather than guessing at a row. That also keeps `index_entity` harmless
@@ -753,6 +911,63 @@ mod tests {
                 providers::provider(plan.provider).is_some(),
                 "{name} names provider {} which is not registered",
                 plan.provider
+            );
+        }
+    }
+
+    #[test]
+    fn archiving_a_crm_record_removes_its_document_rather_than_rewriting_it() {
+        // An archived record still exists as a row the module can read, so the create/update
+        // plans would happily re-index it and bring it straight back. Archive is a remove.
+        for (event, provider_key) in [
+            ("crm.contact.archived", "contacts"),
+            ("crm.company.archived", "companies"),
+            ("crm.deal.archived", "deals"),
+        ] {
+            let plan = event_plan(event).unwrap_or_else(|| panic!("{event} must have a plan"));
+            assert_eq!(plan.provider, provider_key, "{event} names the wrong register");
+            assert_eq!(
+                plan.action,
+                EventAction::Remove,
+                "{event} must drop the document, not refresh it"
+            );
+        }
+        // And the write side stays a write: a deal that reaches `won` is still on the board.
+        for event in ["crm.deal.won", "crm.deal.lost", "crm.deal.stage_changed"] {
+            assert_eq!(
+                event_plan(event).map(|plan| plan.action),
+                Some(EventAction::Index),
+                "{event} must refresh the document so the stage name follows the move"
+            );
+        }
+    }
+
+    #[test]
+    fn the_crm_documents_carry_their_deep_link_and_never_a_note() {
+        let contact = upsert_statement("contacts", None).expect("contacts upsert");
+        assert!(
+            contact.contains("'/crm/contacts?focus=' || c.id::text"),
+            "a contact hit must open that contact"
+        );
+        assert!(
+            !contact.contains("c.notes"),
+            "a contact's notes are the sensitive column and must never reach the index"
+        );
+        let company = upsert_statement("companies", None).expect("companies upsert");
+        assert!(company.contains("'/crm/companies?focus=' || c.id::text"));
+        let deal = upsert_statement("deals", None).expect("deals upsert");
+        assert!(deal.contains("'/crm/deals?focus=' || d.id::text"));
+        // The stage's *name* is what a person types; its id is not, and a move between two
+        // differently-named stages must answer under the new name without a reindex.
+        assert!(
+            deal.contains("join crm_pipeline_stages s on s.id = d.stage_id") && deal.contains("s.name"),
+            "a deal must carry its stage name"
+        );
+        // Archived rows are not indexed at all, in every one of the three upserts.
+        for sql in [&contact, &company, &deal] {
+            assert!(
+                sql.contains("archived_at is null"),
+                "an archived record must not be written to the index"
             );
         }
     }
