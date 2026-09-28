@@ -58,6 +58,8 @@ import {
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
 
+import { AiHealthPanels } from "./ai-health-panel";
+
 /**
  * The PATCH body for one capability toggle.
  *
@@ -432,6 +434,11 @@ export function AiView() {
   // piece of state — a diff from one provider must never appear under another.
   const [flagsOpen, setFlagsOpen] = useState<string | null>(null);
   const [discovery, setDiscovery] = useState<Record<string, AiDiscoveryReport>>({});
+
+  // Slice 3 (REQ-097): which of the Health / Usage / Failover panels is open. One at a time and
+  // one shared across rows — an operator comparing two providers' health wants the same tab on
+  // both, and two open sparklines stacked in a list is just noise.
+  const [panel, setPanel] = useState<"health" | "usage" | "failover" | null>(null);
 
   // The chat.
   const [chatModel, setChatModel] = useState("");
@@ -1124,6 +1131,11 @@ export function AiView() {
                     onApply={() => void applyDiscovery(provider)}
                   />
                 ) : null}
+                <AiHealthPanels
+                  provider={provider}
+                  openPanel={panel}
+                  onToggle={(next) => setPanel(panel === next ? null : next)}
+                />
               </li>
             ))}
           </ul>

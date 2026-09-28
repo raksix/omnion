@@ -1211,6 +1211,158 @@ export function removeAiProvider(providerId: string): Promise<null> {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// AI Hub — health, usage and the failover chain (REQ-097 slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One probe sample, newest first. `status` is what *this* probe saw. */
+export type AiHealthSample = {
+  id: number;
+  provider_id: string;
+  status: AiHealthStatus;
+  latency_ms: number;
+  http_status: number | null;
+  error: string | null;
+  checked_at: string;
+};
+
+/**
+ * The header above the samples.
+ *
+ * `uptime_percent` is `null` — not `0` and not `100` — when the window holds no sample at all: a
+ * provider nobody has probed yet has no uptime, and rendering it as a number is the first lie the
+ * panel would tell.
+ */
+export type AiHealthSummary = {
+  status: AiHealthStatus;
+  uptime_percent: number | null;
+  p95_latency_ms: number | null;
+  sample_count: number;
+  baseline_latency_ms: number | null;
+  last_checked_at: string | null;
+  last_error: string | null;
+};
+
+/** The Health tab's payload: header, samples and the windows it may offer, in one call. */
+export type AiHealthView = {
+  provider_id: string;
+  provider_name: string;
+  /** The window the *server* applied, echoed back so the label cannot lie. */
+  window: string;
+  summary: AiHealthSummary;
+  samples: AiHealthSample[];
+  windows: string[];
+};
+
+/** One day of a provider's usage. */
+export type AiUsageDay = {
+  day: string;
+  requests: number;
+  errors: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+};
+
+/**
+ * The Usage tab's totals.
+ *
+ * `missing_usage` is the number of calls that reported no token counts: they are excluded from the
+ * sums and reported here, so a stream that ended without a usage frame shows as unknown rather
+ * than quietly becoming free.
+ */
+export type AiUsageSummary = {
+  requests: number;
+  errors: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  missing_usage: number;
+  p95_latency_ms: number | null;
+  error_rate_percent: number;
+  by_day: AiUsageDay[];
+};
+
+/** The Usage tab's payload. */
+export type AiUsageView = {
+  provider_id: string;
+  provider_name: string;
+  window: string;
+  summary: AiUsageSummary;
+  windows: string[];
+};
+
+/** One step of the failover chain, as the preview draws it. */
+export type AiFailoverEntry = {
+  rank: number;
+  id: string;
+  name: string;
+  priority: number;
+  health: AiHealthStatus;
+  is_default: boolean;
+};
+
+/** The chain and the membership it may be drawn from. */
+export type AiFailoverView = {
+  chain: AiFailoverEntry[];
+  providers: string[];
+};
+
+/** What "Probe now" answers with — the refreshed header, so the tab needs no reload. */
+export type AiProbeOutcome = {
+  provider_id: string;
+  ok: boolean;
+  latency_ms: number;
+  failing_step: string | null;
+  transition: { from: AiHealthStatus; to: AiHealthStatus } | null;
+  summary: AiHealthSummary;
+  report: AiTestReport;
+};
+
+/** Read a provider's Health tab over a window (`1h`, `6h`, `24h`, `7d`, `30d`). */
+export function fetchAiProviderHealth(
+  providerId: string,
+  window = "24h",
+): Promise<AiHealthView> {
+  return request<AiHealthView>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/health?window=${encodeURIComponent(window)}`,
+  );
+}
+
+/** Read a provider's Usage tab over a window. */
+export function fetchAiProviderUsage(
+  providerId: string,
+  window = "24h",
+): Promise<AiUsageView> {
+  return request<AiUsageView>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/usage?window=${encodeURIComponent(window)}`,
+  );
+}
+
+/** Take one probe sample now, and get the refreshed header back with it. */
+export function probeAiProvider(providerId: string): Promise<AiProbeOutcome> {
+  return request<AiProbeOutcome>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/probe`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/** The failover chain as the router walks it right now. */
+export function fetchAiFailover(): Promise<AiFailoverView> {
+  return request<AiFailoverView>("/api/v1/ai/failover");
+}
+
+/**
+ * Persist the failover order.
+ *
+ * The answer is the chain *as the server stored it* — a client that reordered optimistically must
+ * render this, not its own guess, or a rejected order would look accepted.
+ */
+export function setAiFailoverOrder(providerIds: string[]): Promise<AiFailoverView> {
+  return request<AiFailoverView>("/api/v1/ai/failover", {
+    method: "PUT",
+    body: JSON.stringify({ provider_ids: providerIds }),
+  });
+}
+
 /** Replace the set of models one provider serves. */
 export async function replaceAiProviderModels(
   providerId: string,
