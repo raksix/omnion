@@ -635,9 +635,16 @@ async fn rule_audit_entries(
     organization_id: Uuid,
     limit: i64,
 ) -> Result<Vec<AuditBody>, ApiError> {
+    // `ip_address` is an `inet` column and `AuditEntry.ip_address` is a `String`, so the
+    // column has to be cast on the way out exactly as it is on the way in — `crates/audit`
+    // writes `ip_address::text` for precisely this reason. Selecting the bare `inet`
+    // decodes into TEXT and every read of this query fails with "mismatched types", which
+    // the Audit tab showed as an empty trail: the endpoint answered 500 and the panel drew
+    // an error, and both read as "nothing was ever recorded" because that is what the
+    // screen was actually told.
     let rows = sqlx::query_as::<_, omnion_audit::AuditEntry>(
         "select id, organization_id, actor_user_id, actor_type, action, target_type, \
-         target_id, metadata, ip_address, created_at from audit_log \
+         target_id, metadata, ip_address::text as ip_address, created_at from audit_log \
          where organization_id = $1 and target_id = $2 \
          order by created_at desc, id desc limit $3",
     )

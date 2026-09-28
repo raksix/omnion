@@ -219,6 +219,33 @@ fn get(uri: &str, token: &str) -> Request<Body> {
     request(Method::GET, uri, Some(token), None)
 }
 
+/// A request that carries a client address, so the audit row it writes has an `ip_address`.
+///
+/// This is not a cosmetic header. `audit_log.ip_address` is an `inet` column, and the trail's
+/// read decodes it into a `String` — which only works when the column is cast to text. A walk
+/// whose requests carry no address writes rows with a NULL `ip_address` and therefore never
+/// exercises the decode, which is how the Audit tab shipped answering 500 on every real
+/// request (every request a browser makes has an address) while its own test passed. A
+/// fixture that cannot reach the bug is not a fixture for this bug.
+fn post_from(uri: &str, body: Value, token: &str, address: &str) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("omnion_session={token}"))
+        .body(Body::from(body.to_string()))
+        .expect("the request must build");
+    // `ClientAddress` reads the connection's `ConnectInfo`, not a header — `x-forwarded-for`
+    // is a lie the platform does not tell (an audit row's address is the socket's). The
+    // harness drives the router directly, so it has to hand over the extension a real server
+    // would have attached.
+    let ip: std::net::IpAddr = address.parse().expect("the address must be an IP");
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(ip, 51234)));
+    request
+}
+
 fn post(uri: &str, body: Value, token: &str) -> Request<Body> {
     request(Method::POST, uri, Some(token), Some(body))
 }
@@ -751,14 +778,39 @@ async fn every_definition_change_is_listed_in_the_audit_tab() {
     let (user_id, token) = account(&harness, Some(organization_id)).await;
     grant(&harness, user_id, organization_id, &AUTHOR_KEYS).await;
 
-    let rule_id = create_rule(
-        &harness,
-        &token,
-        organization_id,
-        "Audited rule",
-        json!([echo_step("First")]),
+    // Created from a request that carries an address, so its audit row has an `ip_address`
+    // — the column whose decode broke the Audit tab. Every browser request has one, so a
+    // walk that writes no address is a walk that cannot see this bug.
+    let created = harness
+        .call(post_from(
+            "/api/v1/automations",
+            rule_body(organization_id, "Audited rule", json!([echo_step("First")])),
+            &token,
+            "203.0.113.9",
+        ))
+        .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the rule must be created: {}",
+        created.body
+    );
+    let rule_id = created.body["id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the rule must carry an id");
+    let with_address: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where target_id = $1 and ip_address is not null",
     )
-    .await;
+    .bind(rule_id.to_string())
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the audit rows must be readable");
+    assert!(
+        with_address > 0,
+        "this walk's rule must have an audit row carrying an address, or it proves nothing \
+         about a trail whose rows do"
+    );
 
     let answer = harness
         .call(get(&format!("/api/v1/automations/{rule_id}/audit"), &token))
