@@ -772,6 +772,48 @@ export function fetchCrmTimeline(
   return crmRequest(`/api/v1/crm/${plural}/${id}/timeline?limit=${limit}`);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The deal copilot (REQ-051, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** What the copilot asked for. The route echoes it back, so the card can label itself. */
+export type CrmCopilotAction = "summarize" | "follow-up";
+
+/**
+ * One copilot answer.
+ *
+ * `is_draft` is read rather than assumed: the whole point of the feature is that a model's
+ * suggestion never lands on a record on its own, and a client that treats a response as final
+ * would quietly undo that promise from the other end. `draft` is already plain text — the
+ * server's sanitiser removed markup, so the panel renders it in a text node and there is no
+ * second sanitising pass for a future refactor to forget.
+ */
+export type CrmCopilotAnswer = {
+  deal_id: string;
+  action: CrmCopilotAction;
+  model: string;
+  draft: string;
+  chars: number;
+  is_draft: boolean;
+};
+
+/**
+ * Ask the copilot about one deal.
+ *
+ * One function for both actions rather than two, because the route is one handler with two paths
+ * and a client with two spellings is a client with two ways to send the wrong one.
+ */
+export function askCrmCopilot(
+  dealId: string,
+  action: CrmCopilotAction,
+  model?: string,
+): Promise<CrmCopilotAnswer> {
+  return crmRequest(`/api/v1/crm/copilot/${action}/${dealId}`, {
+    method: "POST",
+    body: JSON.stringify(model ? { model } : {}),
+  });
+}
+
 /**
  * A short, human relative time — the same rounding the API's own label uses.
  *

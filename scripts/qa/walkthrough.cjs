@@ -2993,6 +2993,11 @@ async function main() {
   await runCrmActivitiesDepth(page, report);
   log(`crm deals depth: ${JSON.stringify(report.crmDeals)}`);
 
+  // The deal copilot (REQ-051, slice 4): the two endpoints have been reachable only from curl
+  // since they shipped, so this pass is what makes the feature a feature. It runs after the
+  // activities pass because it needs a deal on the board, which the deals pass put there.
+  await runCrmCopilotDepth(page, report);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -4299,6 +4304,94 @@ async function runCrmActivitiesDepth(page, report) {
 
   report.crmActivities = steps;
   log(`crm activities depth: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The copilot depth pass (REQ-051, slice 4).
+ *
+ * The two endpoints have been behind a screen nobody could reach since they shipped, so this
+ * pass is what makes the feature real rather than available. What it asserts is the *shape* of
+ * the feature rather than a model's eloquence, because this installation connects no provider and
+ * a pass that waited for prose would never finish:
+ *
+ * * the card opens the panel for **its own** deal and no other;
+ * * the panel opens empty and says what it is rather than showing a spinner forever;
+ * * asking produces **a verdict** — an answer or a refusal, both of which are answers, and the
+ *   pass requires the card to stop showing a pending state either way;
+ * * a refusal is shown in the card as a *sentence*, because "the copilot could not be reached"
+ *   rendered as a silently missing panel is the failure mode a person cannot report;
+ * * Escape closes it, and a card's Enter does not also open the deal form behind the panel.
+ */
+async function runCrmCopilotDepth(page, report) {
+  const steps = {};
+
+  await page.goto(`${URL_ADMIN}/crm/deals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-qa-board='pipeline'], [data-qa-row]", { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const card = page.locator("[data-qa='deal-copilot']").first();
+  steps.cardHasAButton = (await card.count()) > 0;
+  if (!steps.cardHasAButton) {
+    // The pass reports the *absence* rather than skipping: a board with no copilot entry point
+    // is the defect, and a pass that quietly moves on leaves it unrecorded.
+    await shot(page, "page-crm-copilot-missing");
+    report.crmCopilot = steps;
+    log(`crm copilot depth: ${JSON.stringify(steps)}`);
+    return;
+  }
+
+  const dealId = await card.getAttribute("data-copilot-deal");
+  await card.click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-qa='copilot-panel']", { timeout: 12000 }).catch(() => {});
+
+  const panel = page.locator("[data-qa='copilot-panel']").first();
+  steps.panelOpens = (await panel.count()) > 0;
+  // The panel is about the card that opened it, which is the whole reason it hangs off the card.
+  steps.panelIsAboutThisDeal = (await panel.getAttribute("data-copilot-deal")) === dealId;
+  steps.opensWithAnExplanation = (await page.locator("[data-qa='copilot-empty']").count()) > 0;
+  steps.bothActionsOffered =
+    (await page.locator("#crm-copilot-summarize").count()) > 0 &&
+    (await page.locator("#crm-copilot-follow-up").count()) > 0;
+  steps.noDealFormOpenedBehindIt = (await page.locator("#crm-deal-form").count()) === 0;
+  await shot(page, "page-crm-copilot-open");
+
+  // ---- asking produces a verdict, either way ------------------------------------------------
+  // This installation connects no provider, so the honest outcome is the failure path — and it
+  // is the failure path that has to be *legible*, because "the button did nothing" is not a bug
+  // report a user can file.
+  await page.locator("#crm-copilot-summarize").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const pending = await page.locator("#crm-copilot-summarize").innerText().catch(() => "");
+  steps.showsAPendingState = /Summarizing/i.test(pending);
+
+  await page.waitForSelector("[data-qa='copilot-answer'], [data-qa='copilot-error']", { timeout: 45000 })
+    .catch(() => {});
+  const answered = await page.locator("[data-qa='copilot-answer']").count();
+  const refused = await page.locator("[data-qa='copilot-error']").count();
+  steps.answerOrRefusal = answered > 0 || refused > 0;
+  steps.noDeadButton = steps.answerOrRefusal;
+  steps.refusalIsASentence = refused > 0
+    ? (await page.locator("[data-qa='copilot-error']").first().innerText().catch(() => "")).trim().length > 10
+    : true;
+  if (answered > 0) {
+    steps.draftIsMarked = (await page.locator("[data-qa='copilot-draft-flag']").count()) > 0;
+    // The answer is a *draft*: the marker has to say so, or the feature has broken its own
+    // promise from the client end while the server keeps writing `is_draft: true`.
+    steps.markedAsADraft = (await page.locator("[data-qa='copilot-draft-flag']").first().innerText())
+      .includes("draft");
+    steps.draftRendersAsText = (await page.locator("[data-qa='copilot-answer'] script").count()) === 0;
+  }
+  await shot(page, "page-crm-copilot-answer");
+
+  // ---- Escape closes it, and the board is usable again ---------------------------------------
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(700);
+  steps.escapeCloses = (await page.locator("[data-qa='copilot-panel']").count()) === 0;
+  steps.boardStillThere = (await page.locator("[data-qa='deal-copilot']").count()) > 0;
+  await shot(page, "page-crm-copilot-closed");
+
+  report.crmCopilot = steps;
+  log(`crm copilot depth: ${JSON.stringify(steps)}`);
 }
 
 /**

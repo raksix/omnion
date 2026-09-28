@@ -20,13 +20,14 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { AlertTriangle, ArrowLeftRight, LayoutGrid, List, Plus, X } from "lucide-react";
+import { AlertTriangle, ArrowLeftRight, LayoutGrid, List, Plus, Sparkles, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { ApiError } from "@/lib/api";
 import {
   CRM_CURRENCIES,
+  askCrmCopilot,
   archiveCrmDeal,
   createCrmDeal,
   fetchCrmDeals,
@@ -35,6 +36,8 @@ import {
   moveCrmDealStage,
   updateCrmDeal,
   type CrmBoard,
+  type CrmCopilotAction,
+  type CrmCopilotAnswer,
   type CrmDeal,
   type CrmPipeline,
 } from "@/lib/crm";
@@ -127,6 +130,64 @@ export function DealsView() {
   const [dropStage, setDropStage] = useState<string | null>(null);
   const [focusedCard, setFocusedCard] = useState<string | null>(null);
   const titleRef = useRef<HTMLInputElement | null>(null);
+
+  // ---- the copilot card ---------------------------------------------------------------------
+  //
+  // It hangs off the focused card rather than off a row, because a card *is* the record on this
+  // screen: a deal with six copilot buttons and a list of forty deals is a screen where every
+  // button has to ask which row it is about. One card, one deal, and it opens on the same
+  // `?focus=` link a search hit uses, so the two entry points behave identically.
+  const [copilotOpen, setCopilotOpen] = useState(false);
+  const [copilotBusy, setCopilotBusy] = useState<CrmCopilotAction | null>(null);
+  const [copilotAnswer, setCopilotAnswer] = useState<CrmCopilotAnswer | null>(null);
+  const [copilotError, setCopilotError] = useState<string | null>(null);
+  const copilotClose = useRef<HTMLButtonElement | null>(null);
+
+  const runCopilot = useCallback(
+    async (deal: CrmDeal, action: CrmCopilotAction) => {
+      setCopilotBusy(action);
+      setCopilotError(null);
+      try {
+        setCopilotAnswer(await askCrmCopilot(deal.id, action));
+      } catch (problem) {
+        // A failure is a *result* the card has to be able to show: this installation may connect
+        // no provider, and "the copilot could not answer" is a sentence a person can act on where
+        // a silently missing card is not.
+        setCopilotError(
+          problem instanceof ApiError
+            ? problem.message
+            : "The copilot could not be reached.",
+        );
+        setCopilotAnswer(null);
+      } finally {
+        setCopilotBusy(null);
+      }
+    },
+    [],
+  );
+
+  // Closing with Escape is what makes a side panel feel like a panel rather than a new page.
+  useEffect(() => {
+    if (!copilotOpen) return;
+    copilotClose.current?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setCopilotOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [copilotOpen]);
+
+  // The deal the panel is about, read from the board *and* the list. The panel follows the
+  // focus rather than the other way round: clicking a card sets both, and if the board reloads
+  // while the panel is open the id survives in `focusedCard` even if the object does not.
+  const copilotDeal = useMemo(() => {
+    if (!focusedCard) return null;
+    return (
+      board?.deals.find((deal) => deal.id === focusedCard) ??
+      list?.find((deal) => deal.id === focusedCard) ??
+      null
+    );
+  }, [board, focusedCard, list]);
 
   const stages = board?.pipeline.stages ?? [];
 
@@ -280,9 +341,17 @@ export function DealsView() {
     }
     appliedFocus.current = focusParam;
     setFocusedCard(focusParam);
+    // `?focus=` with `&copilot=1` is a link *to the answer*, not only to the card: the palette
+    // offers "ask the copilot about this deal" as a row, and a link that lands on a card whose
+    // panel stays shut makes that row a dead button. The id alone still lands on the card.
+    if (searchParams.get("copilot") === "1") {
+      setCopilotAnswer(null);
+      setCopilotError(null);
+      setCopilotOpen(true);
+    }
     const card = document.querySelector<HTMLElement>(`[data-qa-card="${focusParam}"]`);
     card?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [focusParam, board]);
+  }, [focusParam, searchParams, board]);
 
   const openCreate = useCallback(() => {
     setForm({ ...EMPTY_FORM, stage_id: stages[0]?.id ?? "" });
@@ -585,6 +654,29 @@ export function DealsView() {
                         {deal.lost_reason ? (
                           <p className="mt-1.5 text-[11px] text-muted">Reason: {deal.lost_reason}</p>
                         ) : null}
+                        {/* The copilot lives *on* the card, not in a row menu: on a board the card
+                            is the record, and a menu would make every question start with "which
+                            card?". Focus opens the panel for this deal and nothing else. */}
+                        <button
+                          type="button"
+                          data-qa="deal-copilot"
+                          data-copilot-deal={deal.id}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setFocusedCard(deal.id);
+                            setCopilotAnswer(null);
+                            setCopilotError(null);
+                            setCopilotOpen(true);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+                          }}
+                          aria-label={`Ask the copilot about ${deal.title}`}
+                          className="mt-2 inline-flex items-center gap-1 rounded-md border border-line px-1.5 py-0.5 text-[11px] text-muted transition hover:border-accent/40 hover:text-ink"
+                        >
+                          <Sparkles className="size-3" aria-hidden />
+                          Copilot
+                        </button>
                       </article>
                     ))}
                   </div>
@@ -900,6 +992,100 @@ export function DealsView() {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {copilotOpen && copilotDeal ? (
+        <aside
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="crm-copilot-title"
+          data-qa="copilot-panel"
+          data-copilot-deal={copilotDeal.id}
+          className="fixed inset-y-0 right-0 z-30 flex w-full max-w-sm flex-col border-l border-line bg-surface shadow-2xl"
+        >
+          <div className="flex items-start justify-between gap-2 border-b border-line px-4 py-3">
+            <div className="min-w-0">
+              <h3 id="crm-copilot-title" className="text-[13.5px] font-medium">
+                Copilot
+              </h3>
+              <p className="truncate text-[11.5px] text-muted">{copilotDeal.title}</p>
+            </div>
+            <button
+              type="button"
+              ref={copilotClose}
+              data-qa="copilot-close"
+              onClick={() => setCopilotOpen(false)}
+              aria-label="Close the copilot"
+              className="rounded p-1 text-muted transition hover:bg-canvas hover:text-ink"
+            >
+              <X className="size-4" aria-hidden />
+            </button>
+          </div>
+
+          <div className="flex gap-2 border-b border-line px-4 py-3">
+            <button
+              type="button"
+              id="crm-copilot-summarize"
+              onClick={() => void runCopilot(copilotDeal, "summarize")}
+              disabled={copilotBusy !== null}
+              className="flex-1 rounded-lg bg-accent px-2.5 py-1.5 text-[12px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-50"
+            >
+              {copilotBusy === "summarize" ? "Summarizing…" : "Summarize deal"}
+            </button>
+            <button
+              type="button"
+              id="crm-copilot-follow-up"
+              onClick={() => void runCopilot(copilotDeal, "follow-up")}
+              disabled={copilotBusy !== null}
+              className="flex-1 rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-canvas disabled:opacity-50"
+            >
+              {copilotBusy === "follow-up" ? "Drafting…" : "Draft follow-up"}
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-4 py-3">
+            {copilotError ? (
+              <p
+                role="alert"
+                data-qa="copilot-error"
+                className="rounded-lg border border-danger/30 bg-danger/5 px-3 py-2.5 text-[12px] text-danger"
+              >
+                {copilotError}
+              </p>
+            ) : copilotAnswer ? (
+              <figure data-qa="copilot-answer" data-copilot-action={copilotAnswer.action}>
+                {/* The draft marker is the feature's promise, so it is a *fact* here and not a
+                    nicety: the answer came back `is_draft: false` and the panel says so. */}
+                <figcaption className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted">
+                  <span className="font-medium text-ink">
+                    {copilotAnswer.action === "summarize" ? "Summary" : "Follow-up draft"}
+                  </span>
+                  <span>· {copilotAnswer.model}</span>
+                  <span
+                    data-qa="copilot-draft-flag"
+                    className={`rounded-full px-1.5 py-0.5 ${
+                      copilotAnswer.is_draft
+                        ? "bg-surface text-muted"
+                        : "border border-warning/40 text-warning"
+                    }`}
+                  >
+                    {copilotAnswer.is_draft ? "draft" : "written to the record"}
+                  </span>
+                </figcaption>
+                {/* A text node, on purpose: the server's sanitiser already reduced the answer to
+                    plain text, and rendering it as markup here would put that promise back in
+                    the hands of a later refactor. */}
+                <p className="whitespace-pre-wrap text-[12.5px] leading-relaxed">{copilotAnswer.draft}</p>
+              </figure>
+            ) : (
+              <p data-qa="copilot-empty" className="text-[12px] text-muted">
+                Nothing asked yet. Both answers are read-only suggestions — nothing is written to
+                the deal without an explicit save, and every call is audited with the deal, the
+                model and the size of the answer.
+              </p>
+            )}
+          </div>
+        </aside>
       ) : null}
     </CrmShell>
   );
