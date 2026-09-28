@@ -111,6 +111,7 @@ pub struct TimelineEntry {
     /// Which of the three sources produced it.
     pub source: TimelineSource,
     /// When it happened. The only ordering key the stream has.
+    #[serde(with = "crate::dates::instant")]
     pub occurred_at: OffsetDateTime,
     /// The activity's kind, when the entry is an activity.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,10 +129,10 @@ pub struct TimelineEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached_id: Option<Uuid>,
     /// A task's due date.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", with = "crate::dates::instant::option")]
     pub due_at: Option<OffsetDateTime>,
     /// When a task was completed.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", with = "crate::dates::instant::option")]
     pub done_at: Option<OffsetDateTime>,
     /// The owner, for a task.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,13 +176,13 @@ pub struct ActivityChanges {
     #[serde(default)]
     pub deal_id: Option<Uuid>,
     /// When it happened; defaults to now.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::instant::option")]
     pub occurred_at: Option<OffsetDateTime>,
     /// A task's due date.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::instant::option")]
     pub due_at: Option<OffsetDateTime>,
     /// Marked done at creation time.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::instant::option")]
     pub done_at: Option<OffsetDateTime>,
 }
 
@@ -426,11 +427,16 @@ pub struct Activity {
     pub contact_id: Option<Uuid>,
     /// The deal, when it hangs off one.
     pub deal_id: Option<Uuid>,
-    /// When it happened.
+    /// When it happened. Serialised as RFC 3339, like every timestamp on this wire: without the
+    /// attribute `time`'s tuple form (`[2026, 263, …]`) reaches the panel, which no form can read
+    /// and no test can round-trip.
+    #[serde(with = "crate::dates::instant")]
     pub occurred_at: OffsetDateTime,
     /// A task's due date.
+    #[serde(with = "crate::dates::instant::option")]
     pub due_at: Option<OffsetDateTime>,
     /// When a task was completed.
+    #[serde(with = "crate::dates::instant::option")]
     pub done_at: Option<OffsetDateTime>,
     /// The owner.
     pub owner_user_id: Option<Uuid>,
@@ -671,13 +677,9 @@ pub async fn list_activities_with(
     push_done_filter(&mut builder, done);
 
     // The visibility rule is the same one every list applies: the caller sees their own
-    // activities and, at a wider level, their team's.
-    builder.push(" and (a.created_by is null or a.created_by = any(");
-    let mut sep = builder.separated(", ");
-    for id in scope.visible_user_ids() {
-        sep.push_bind(id);
-    }
-    builder.push("))");
+    // activities and, at a wider level, their team's. An unowned activity belongs to nobody and
+    // stays visible, or a record nobody claimed yet would be invisible to everyone.
+    push_activity_visibility(&mut builder, scope);
 
     builder.push(" order by a.occurred_at desc, a.id desc limit ");
     builder.push_bind(limit + 1);
@@ -691,25 +693,56 @@ pub async fn list_activities_with(
     Ok(Page::new(items, cursor, 0))
 }
 
+/// The activity feed's visibility clause.
+///
+/// The three levels are the platform's, and the one that bites is `Team`: `= any(...)` needs the
+/// ids as a **single** array parameter, so they go in as one `push_bind(Vec)`. Handing `any(`
+/// followed by a comma-separated list of individual binds instead produces `any($1, $2)`, which
+/// Postgres answers with "op ANY/ALL (array) requires array on right side" — a 500 on the feed
+/// for every caller at the team level, which is to say for most installations.
+fn push_activity_visibility<'a>(builder: &mut QueryBuilder<'a, sqlx::Postgres>, scope: &Scope) {
+    use crate::model::Visibility;
+    match scope.visibility {
+        Visibility::Own => {
+            builder
+                .push(" and (a.created_by is null or a.created_by = ")
+                .push_bind(scope.user_id)
+                .push(")");
+        }
+        Visibility::Team => {
+            // `visible_user_ids` already appends the caller, so this is never empty — an empty
+            // array would make the clause match nothing rather than everything.
+            builder
+                .push(" and (a.created_by is null or a.created_by = any(")
+                .push_bind(scope.visible_user_ids())
+                .push("))");
+        }
+        Visibility::All => {}
+    }
+}
+
 /// The open tasks of the overview: due, not done, and the caller's to answer.
 pub async fn open_tasks(
     pool: &PgPool,
     scope: &Scope,
     limit: i64,
 ) -> Result<Vec<Activity>> {
-    sqlx::query_as::<_, Activity>(&format!(
-        "select {ACTIVITY_COLUMNS} from crm_activities
-         where organization_id = $1 and kind = 'task' and done_at is null
-           and due_at is not null
-           and (created_by is null or created_by = any($2))
-         order by due_at asc limit $3"
-    ))
-    .bind(scope.organization_id)
-    .bind(&scope.visible_user_ids())
-    .bind(limit.clamp(1, 100))
-    .fetch_all(pool)
-    .await
-    .map_err(Into::into)
+    // The visibility clause is the shared one rather than a hand-written `any($2)`: that spelling
+    // only works when the caller is the sole visible user, and it silently stops being an array
+    // comparison for everyone else.
+    let mut builder: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(format!(
+        "select {ACTIVITY_COLUMNS} from crm_activities where organization_id = "
+    ));
+    builder.push_bind(scope.organization_id);
+    builder.push(" and kind = 'task' and done_at is null and due_at is not null");
+    push_activity_visibility(&mut builder, scope);
+    builder.push(" order by due_at asc limit ").push_bind(limit.clamp(1, 100));
+
+    builder
+        .build_query_as::<Activity>()
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
 }
 
 /// Mark a task done (or open again).
@@ -720,18 +753,23 @@ pub async fn set_activity_done(
     done: bool,
 ) -> Result<Activity> {
     let at = if done { Some(now()) } else { None };
-    sqlx::query_as::<_, Activity>(&format!(
-        "update crm_activities set done_at = $3, updated_at = now()
-         where id = $1 and organization_id = $2
-           and (created_by is null or created_by = any($3))
-         returning {ACTIVITY_COLUMNS}"
-    ))
-    .bind(id)
-    .bind(scope.organization_id)
-    .bind(at)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(CrmError::NotFound("activity"))
+    // `$3` was the `done_at` timestamp *and* the id list in the same statement, so the task's
+    // owner-scoping clause compared a timestamp against a uuid array — a 500 on every completion
+    // rather than a wrong answer. The clause is rebuilt with the builder so each placeholder has
+    // exactly one bind behind it.
+    let mut builder: QueryBuilder<sqlx::Postgres> =
+        QueryBuilder::new("update crm_activities set done_at = ");
+    builder.push_bind(at);
+    builder.push(", updated_at = now() where id = ").push_bind(id);
+    builder.push(" and organization_id = ").push_bind(scope.organization_id);
+    push_activity_visibility(&mut builder, scope);
+    builder.push(format!(" returning {ACTIVITY_COLUMNS}"));
+
+    builder
+        .build_query_as::<Activity>()
+        .fetch_optional(pool)
+        .await?
+        .ok_or(CrmError::NotFound("activity"))
 }
 
 // ---------------------------------------------------------------------------------------------

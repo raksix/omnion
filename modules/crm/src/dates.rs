@@ -8,6 +8,12 @@
 //! So this is the module a CRM date field names. It is deliberately *date only* — a close date
 //! has no time and no zone, and a timestamp where the writer meant a day is a bug that shows up
 //! as an off-by-one in the calendar column.
+//!
+//! The second half of the file is [`instant`], the same idea for a field that *does* carry a time
+//! (a task's due date). That one exists because a bare `OffsetDateTime` is the mistake this module
+//! was written to end: `time`'s `serde` support for it is opt-in per field, and a field that
+//! forgets the attribute accepts **no** JSON string at all — which reads, at the form, as a task
+//! that refuses to be given a due date.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::macros::format_description;
@@ -100,6 +106,191 @@ pub mod option {
             None => Ok(None),
         }
     }
+}
+
+/// A timestamp on the wire, as RFC 3339 — plus the two shapes a browser sends instead.
+///
+/// `time`'s `rfc3339` helper is strict and correct, but a `<input type="datetime-local">` hands
+/// the form `2026-10-01T09:00` with **no zone**, and a person in Turkey meant that as their own
+/// wall clock. Two rules follow, and both belong here rather than in each route:
+///
+/// * **RFC 3339 with an offset** is read as written (`2026-10-01T09:00:00Z`).
+/// * **A local wall clock with no offset** is read as UTC. The alternative — guessing the
+///   browser's zone from a header — would make the same payload mean different instants for two
+///   people, and a task that moves by hours depending on who created it is not a fixable bug.
+///   A timestamp field stores what the server can agree on, and the panel sends an offset when it
+///   has one.
+///
+/// The zone-less value is therefore *not* a silent assumption in the output: `to_wire` always
+/// answers an explicit offset, so a value read from this module and written back is unambiguous
+/// even though the value that came in was not.
+pub mod instant {
+    use time::format_description::well_known::Rfc3339;
+    use time::macros::format_description;
+    use time::{OffsetDateTime, PrimitiveDateTime};
+
+    use super::{instant_message, Deserializer, Serialize, Serializer};
+    use serde::Deserialize as _;
+
+    /// What `<input type="datetime-local">` produces: a wall clock and nothing else.
+    const LOCAL: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]");
+    /// The same field, to the second — Safari and a person typing both do this.
+    const LOCAL_SECONDS: &[time::format_description::FormatItem<'_>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+
+    /// Read a timestamp from any of the three accepted shapes.
+    pub fn parse(raw: &str) -> Result<OffsetDateTime, time::error::Parse> {
+        if let Ok(parsed) = OffsetDateTime::parse(raw, &Rfc3339) {
+            return Ok(parsed);
+        }
+        parse_as_utc(raw)
+    }
+
+    /// A zone-less wall clock, read as UTC.
+    fn parse_as_utc(raw: &str) -> Result<OffsetDateTime, time::error::Parse> {
+        let primitive = PrimitiveDateTime::parse(raw, LOCAL)
+            .or_else(|_| PrimitiveDateTime::parse(raw, LOCAL_SECONDS))?;
+        Ok(primitive.assume_utc())
+    }
+
+    /// A timestamp as the string a caller receives.
+    #[must_use]
+    pub fn to_wire(at: &OffsetDateTime) -> String {
+        // Rfc3339 on a valid instant cannot fail; the fallback is unreachable, and says so.
+        at.format(&Rfc3339).unwrap_or_else(|_| {
+            debug_assert!(false, "an OffsetDateTime always formats as RFC 3339");
+            String::new()
+        })
+    }
+
+    /// Serialises a timestamp as RFC 3339.
+    pub fn serialize<S>(at: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        to_wire(at).serialize(serializer)
+    }
+
+    /// Reads a timestamp, and answers a message naming the shape when it is not one.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<OffsetDateTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        parse(&raw).map_err(|_| serde::de::Error::custom(instant_message(&raw)))
+    }
+
+    /// The same, for a field that may be absent.
+    pub mod option {
+        use super::{parse, Deserializer, OffsetDateTime, Serializer};
+        // `instant_message` is a private helper of the parent `dates` module, one level further
+        // up, so the refusal a blank-or-wrong field gets is the same sentence either way in.
+        use super::super::instant_message;
+        use serde::Deserialize as _;
+
+        /// Serialises an optional timestamp.
+        pub fn serialize<S>(at: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match at {
+                Some(at) => super::serialize(at, serializer),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        /// Reads an optional timestamp.
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            match Option::<String>::deserialize(deserializer)? {
+                Some(raw) => parse(&raw)
+                    .map(Some)
+                    .map_err(|_| serde::de::Error::custom(instant_message(&raw))),
+                None => Ok(None),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde::{Deserialize, Serialize};
+        use time::macros::datetime;
+        use time::{Date, Month, Time};
+
+        #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(default)]
+        struct Task {
+            #[serde(with = "super::option")]
+            due_at: Option<OffsetDateTime>,
+        }
+
+        #[test]
+        fn a_zoned_timestamp_is_read_as_written() {
+            let row: Task = serde_json::from_str(r#"{"due_at":"2026-10-01T09:00:00Z"}"#)
+                .expect("an RFC 3339 instant parses");
+            assert_eq!(row.due_at, Some(datetime!(2026-10-01 9:00 UTC)));
+            assert_eq!(super::to_wire(&datetime!(2026-10-01 9:00 UTC)), "2026-10-01T09:00:00Z");
+        }
+
+        #[test]
+        fn a_browser_datetime_local_value_is_accepted() {
+            // Exactly what `<input type="datetime-local">` hands the form.
+            for raw in [r#"{"due_at":"2026-10-01T09:00"}"#, r#"{"due_at":"2026-10-01T09:00:00"}"#] {
+                let row: Task = serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+                assert_eq!(row.due_at, Some(datetime!(2026-10-01 9:00 UTC)), "{raw}");
+            }
+        }
+
+        #[test]
+        fn an_omitted_and_a_null_due_date_are_the_same_request() {
+            let omitted: Task = serde_json::from_str("{}").expect("omitting a due date is legal");
+            let null: Task = serde_json::from_str(r#"{"due_at":null}"#).expect("a null is legal");
+            assert_eq!(omitted.due_at, None);
+            assert_eq!(null.due_at, None);
+        }
+
+        #[test]
+        fn what_comes_back_always_carries_an_offset() {
+            // The value that came in had no zone; the value that goes out must, or the next
+            // reader cannot tell whether it was local or UTC.
+            let row: Task = serde_json::from_str(r#"{"due_at":"2026-10-01T09:00"}"#).unwrap();
+            let out = serde_json::to_string(&row).unwrap();
+            assert!(out.contains('Z'), "{out}");
+        }
+
+        #[test]
+        fn a_timestamp_the_wire_cannot_describe_is_refused_with_a_readable_message() {
+            let error = serde_json::from_str::<Task>(r#"{"due_at":"next tuesday"}"#)
+                .expect_err("free text is not a timestamp");
+            assert!(error.to_string().contains("next tuesday"), "quotes the input: {error}");
+        }
+
+        #[test]
+        fn the_time_crate_tuple_form_is_refused() {
+            let error = serde_json::from_str::<Task>(r#"{"due_at":[2026,273,9,0,0,0,0,0,0]}"#)
+                .expect_err("a tuple is not a timestamp");
+            assert!(error.to_string().contains("string"), "names the type: {error}");
+        }
+
+        #[test]
+        fn midnight_on_the_first_is_accepted_as_a_day_and_a_time() {
+            let at = parse("2026-01-01T00:00").expect("midnight parses");
+            assert_eq!(at.date(), Date::from_calendar_date(2026, Month::January, 1).unwrap());
+            assert_eq!(at.time(), Time::MIDNIGHT);
+        }
+    }
+}
+
+/// What a person is told when a timestamp is not one.
+fn instant_message(raw: &str) -> String {
+    format!(
+        "a timestamp such as 2026-10-01T09:00:00Z, not {raw:?} — \
+         the format is ISO 8601, and a time without a zone is read as UTC"
+    )
 }
 
 #[cfg(test)]

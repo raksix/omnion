@@ -2970,9 +2970,28 @@ async fn every_activity_route_is_permission_guarded() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let (_, contact_id, deal_id, marker) =
-        crm_trio(&fixture, &fixture.manager, "guard").await;
+    let manager = fixture.token(&fixture.manager).await;
+    let (_, contact_id, deal_id, marker) = crm_trio(&fixture, &manager, "guard").await;
     let reader = fixture.token(&fixture.reader).await;
+
+    // The close route names an **activity**, not the record it hangs off, so the walk needs one
+    // to exist. Passing the deal's id answers 404 for a caller who is allowed to write, which
+    // proves nothing about the guard.
+    let task = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({
+                "kind": "task", "subject": format!("Guard {marker}"),
+                "deal_id": deal_id, "due_at": "2026-10-01T09:00:00Z",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(task.status, StatusCode::CREATED, "{}", task.body);
+    let task_id: Uuid = serde_json::from_value(task.body["id"].clone()).expect("an id");
 
     // 401 without a session, 403 with a session that lacks the key, 200 with it.
     for (method, uri, body) in [
@@ -2984,7 +3003,7 @@ async fn every_activity_route_is_permission_guarded() {
         ),
         (
             Method::POST,
-            format!("/api/v1/crm/activities/{deal_id}/done"),
+            format!("/api/v1/crm/activities/{task_id}/done"),
             Some(json!({ "done": true })),
         ),
         (
@@ -3013,7 +3032,7 @@ async fn every_activity_route_is_permission_guarded() {
 
         let allowed = call(
             &fixture.state,
-            request(method, &uri, Some(&fixture.manager), body.clone()),
+            request(method, &uri, Some(&manager), body.clone()),
         )
         .await;
         assert!(allowed.status.is_success(), "{uri} must answer the manager: {}", allowed.body);
@@ -3027,7 +3046,7 @@ async fn a_logged_activity_appears_in_the_feed_and_on_the_records_timeline() {
     };
     let manager = fixture.token(&fixture.manager).await;
     let (company_id, contact_id, deal_id, marker) =
-        crm_trio(&fixture, &fixture.manager, "log").await;
+        crm_trio(&fixture, &manager, "log").await;
 
     let logged = call(
         &fixture.state,
@@ -3062,7 +3081,8 @@ async fn a_logged_activity_appears_in_the_feed_and_on_the_records_timeline() {
         .iter()
         .find(|row| row["metadata"]["request_id"] == json!(activity_id.to_string()))
         .unwrap_or_else(|| panic!("the log must be audited: {audits:?}"));
-    assert_eq!(entry["actor_user_id"], json!(fixture.manager_id.to_string()));
+    // `audit_rows` names the actor `actor`; the column is `actor_user_id`, the key is not.
+    assert_eq!(entry["actor"], json!(fixture.manager_id.to_string()));
     let fields = entry["metadata"]["fields"].as_array().expect("a field list");
     assert!(fields.iter().any(|f| f == "kind"), "{fields:?}");
 
@@ -3158,7 +3178,7 @@ async fn the_activity_feed_filters_by_kind_and_by_state() {
         return;
     };
     let manager = fixture.token(&fixture.manager).await;
-    let (_, contact_id, _, marker) = crm_trio(&fixture, &fixture.manager, "filter").await;
+    let (_, contact_id, _, marker) = crm_trio(&fixture, &manager, "filter").await;
 
     let note = call(
         &fixture.state,
@@ -3288,7 +3308,7 @@ async fn the_activity_form_refuses_what_it_names() {
         return;
     };
     let manager = fixture.token(&fixture.manager).await;
-    let (_, contact_id, deal_id, marker) = crm_trio(&fixture, &fixture.manager, "refuse").await;
+    let (_, contact_id, deal_id, marker) = crm_trio(&fixture, &manager, "refuse").await;
 
     // No record: the refusal lands on the field the form renders the message under.
     let floating = call(
@@ -3389,7 +3409,8 @@ async fn an_activity_of_another_organization_is_invisible() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let (company_id, contact_id, _, marker) = crm_trio(&fixture, &fixture.manager, "tenant").await;
+    let manager = fixture.token(&fixture.manager).await;
+    let (company_id, contact_id, _, marker) = crm_trio(&fixture, &manager, "tenant").await;
 
     // Logged by the manager, in `fixture.org`.
     let logged = call(
@@ -3397,7 +3418,7 @@ async fn an_activity_of_another_organization_is_invisible() {
         request(
             Method::POST,
             "/api/v1/crm/activities",
-            Some(&fixture.manager),
+            Some(&manager),
             Some(json!({
                 "kind": "note", "subject": format!("Private {marker}"), "contact_id": contact_id,
             })),
@@ -3495,11 +3516,11 @@ async fn the_new_activity_keys_are_in_the_catalogue_and_the_owner_holds_them() {
     // The owner is the account every seeded role is built from, so the new keys have to be in it
     // or a fresh install cannot read its own activity feed.
     let held: Vec<String> = sqlx::query_scalar(
-        "select rp.permission from role_permissions rp
+        "select rp.permission_key from role_permissions rp
          join roles r on r.id = rp.role_id
          where r.organization_id is null
            and r.key = 'owner'
-           and rp.permission in ('crm.activities.read', 'crm.activities.create', 'crm.copilot.use')",
+           and rp.permission_key in ('crm.activities.read', 'crm.activities.create', 'crm.copilot.use')",
     )
     .fetch_all(fixture.db.pool())
     .await

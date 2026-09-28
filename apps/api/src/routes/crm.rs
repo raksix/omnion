@@ -829,6 +829,15 @@ impl From<CrmError> for ApiError {
             CrmError::InvalidStageChange(message) => {
                 Self::bad_request("invalid_crm_stage_change", message)
             }
+            // The call reached the model and came back with nothing readable. That is an upstream
+            // answer, not a bad request and not our bug, so it is a `502` with a stable code the
+            // panel can offer a retry against — rendering an empty draft as if the model had
+            // written one is the outcome this variant exists to prevent.
+            CrmError::EmptyAnswer => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "crm_copilot_empty_answer",
+                "the assistant returned an empty answer — try again",
+            ),
             CrmError::Database(err) if database_unavailable(&err) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "dependency_unavailable",
