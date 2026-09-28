@@ -33,10 +33,10 @@ pub use browser::{
     purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
 };
 pub use duplicates::{
-    DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES, MergeOutcome, NewReference, Reference,
-    SiteLabel, clear_references, count_live_shares, count_references, duplicate_groups,
-    duplicate_groups_across, group_members, list_references, merge_group, reclaimable_total,
-    record_reference, repoint_references, site_labels,
+    CrossSiteCopy, CrossSiteGroup, DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES,
+    MergeOutcome, NewReference, Reference, SiteLabel, clear_references, count_live_shares,
+    count_references, duplicate_groups, duplicate_groups_across, group_members, list_references,
+    merge_group, reclaimable_total, record_reference, repoint_references, site_labels,
 };
 pub use error::{MediaError, Result};
 pub use folder_store::{

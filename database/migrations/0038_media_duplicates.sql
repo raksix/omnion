@@ -111,3 +111,38 @@ comment on view media_duplicate_groups is
     'Live files of a site that share a checksum, with the bytes a merge would put in the trash. '
     'Reclaimable excludes the keeper''s own copy, so the number is what a purge returns and not '
     'the size of the whole group (REQ-010).';
+
+-- ---------------------------------------------------------------------------------------------
+-- The same question, asked of the whole installation
+-- ---------------------------------------------------------------------------------------------
+
+-- The per-site view is the *actionable* one: a group is two files of one library, and a merge
+-- can decide which of them a page resolves to. That decision cannot be made across sites — a
+-- merge repoints rows inside one site, so a cross-site group has no keeper and no single click
+-- that resolves it.
+--
+-- So the cross-site view groups by checksum *alone* and answers the other question a platform
+-- owner is actually asking: "which bytes does this installation hold more than once?". The same
+-- bytes in two tenants is the common and interesting case, and the per-site view reports it as
+-- nothing at all — each tenant holds exactly one copy, and each tenant's group is empty.
+--
+-- `reclaimable_bytes` is zero here on purpose. The number would be real storage, but no button
+-- can return it, and a column that reads as an available saving in a report with no save button
+-- is the kind of number an operator quotes to somebody else.
+create or replace view media_duplicate_groups_cross_site as
+select m.checksum,
+       count(*)::integer                          as file_count,
+       count(distinct m.site_id)::integer          as site_count,
+       sum(m.size_bytes)::bigint                  as total_bytes,
+       min(m.created_at)                          as first_seen,
+       max(m.created_at)                          as last_seen
+from media m
+where m.deleted_at is null
+  and m.checksum <> ''
+group by m.checksum
+having count(*) > 1;
+
+comment on view media_duplicate_groups_cross_site is
+    'The same checksum held more than once anywhere in the installation. Read-only: a merge is a '
+    'per-site decision, so this report says where the copies are and the operator acts site by '
+    'site (REQ-010).';

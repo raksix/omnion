@@ -18,6 +18,7 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
@@ -32,8 +33,8 @@ use crate::scope::platform_only;
 use crate::state::AppState;
 
 use omnion_media::{
-    DuplicateGroup, MediaFile, MergeOutcome, duplicate_groups, duplicate_groups_across,
-    group_members, merge_group, site_labels,
+    CrossSiteCopy, CrossSiteGroup, DuplicateGroup, MediaFile, MergeOutcome, duplicate_groups,
+    duplicate_groups_across, group_members, merge_group,
 };
 
 /// Shortest checksum a group may be named by.
@@ -59,12 +60,82 @@ pub struct DuplicateQuery {
     pub expand: Option<String>,
 }
 
+/// A cross-site group: one checksum the installation holds in more than one place.
+///
+/// Deliberately has no `reclaimable_bytes`. The bytes are real storage, but no button on this
+/// report can return them — a merge repoints rows inside one site and cannot decide which tenant
+/// keeps the file — so a "reclaimable" column here would be a number with no action behind it,
+/// and an operator would quote it as a saving.
+#[derive(Debug, Serialize)]
+pub struct CrossSiteGroupBody {
+    /// The checksum, short.
+    pub checksum: String,
+    /// The full checksum.
+    pub full_checksum: String,
+    /// How many live copies the installation holds.
+    pub file_count: i32,
+    /// How many sites hold it.
+    pub site_count: i32,
+    /// Bytes held by all of them.
+    pub total_bytes: i64,
+    /// Earliest upload.
+    #[serde(with = "time::serde::rfc3339")]
+    pub first_seen: time::OffsetDateTime,
+    /// Latest upload.
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_seen: time::OffsetDateTime,
+    /// Where the copies are.
+    pub sites: Vec<CrossSiteCopyBody>,
+}
+
+/// One site's holding of a cross-site group.
+#[derive(Debug, Serialize)]
+pub struct CrossSiteCopyBody {
+    /// Site id.
+    pub site_id: Uuid,
+    /// Site name.
+    pub site_name: String,
+    /// Copies that site holds.
+    pub file_count: i32,
+    /// Bytes that site holds.
+    pub site_bytes: i64,
+}
+
+impl From<&CrossSiteCopy> for CrossSiteCopyBody {
+    fn from(copy: &CrossSiteCopy) -> Self {
+        Self {
+            site_id: copy.site_id,
+            site_name: copy.site_name.clone(),
+            file_count: copy.file_count,
+            site_bytes: copy.site_bytes,
+        }
+    }
+}
+
+/// The installation-wide report.
+#[derive(Debug, Serialize)]
+pub struct CrossSiteReport {
+    /// The sites it covered.
+    pub site_ids: Vec<Uuid>,
+    /// Always true; present so a client reads one field rather than inferring from the shape.
+    pub cross_site: bool,
+    /// How many checksums.
+    pub group_count: usize,
+    /// Bytes held by all the listed copies.
+    pub total_bytes: i64,
+    /// The groups, largest first.
+    pub groups: Vec<CrossSiteGroupBody>,
+    /// Why there is nothing to merge from here, in words the screen shows rather than hides.
+    pub notice: String,
+}
+
 /// One group as the report returns it.
 #[derive(Debug, Serialize)]
 pub struct DuplicateGroupBody {
     /// Site the group belongs to.
     pub site_id: Uuid,
-    /// Site name, present only in a cross-site report.
+    /// Site name. Present only when the caller asked for names; the per-site report is already
+    /// scoped to one site, so it is `None` there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_name: Option<String>,
     /// The checksum every member shares — short, for the eye and for a re-lookup.
@@ -219,11 +290,16 @@ fn plural(count: i64, one: &str, many: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// The duplicate report of a site, or of the whole installation for a platform owner.
+///
+/// Two shapes rather than one with an optional part: the per-site report is actionable (every
+/// group has a keeper to pick) and the cross-site one is not (no merge can decide which tenant
+/// keeps a file), so a client that read one shape and got the other would find a `Merge` button
+/// on a row that cannot be merged.
 pub async fn report(
     State(state): State<AppState>,
     current: CurrentSession,
     Query(query): Query<DuplicateQuery>,
-) -> std::result::Result<Json<DuplicateReport>, ApiError> {
+) -> std::result::Result<Response, ApiError> {
     let pool = state.db().pool();
 
     // Two sites is one question with a different scope, so it is a different code path rather
@@ -238,10 +314,8 @@ pub async fn report(
                 "name at least one site, or use `site_id` for a single one",
             ));
         }
-        let labels = site_labels(pool, &site_ids).await?;
         let groups = duplicate_groups_across(pool, &site_ids).await?;
-        let body = build_report(pool, site_ids, true, groups, &labels, expanded(&query)).await?;
-        return Ok(Json(body));
+        return Ok(Json(cross_site_body(site_ids, groups)).into_response());
     }
 
     let site_id = query
@@ -249,8 +323,8 @@ pub async fn report(
         .ok_or_else(|| ApiError::bad_request("site_id", "a duplicate report covers one site"))?;
     let site = site_in_scope(&state, &current, site_id).await?;
     let groups = duplicate_groups(pool, site.id).await?;
-    let body = build_report(pool, vec![site.id], false, groups, &[], expanded(&query)).await?;
-    Ok(Json(body))
+    let body = build_report(pool, vec![site.id], groups, expanded(&query)).await?;
+    Ok(Json(body).into_response())
 }
 
 /// Merge a group down to one file: the keeper the caller named, references repointed, the
@@ -340,6 +414,35 @@ fn expanded(query: &DuplicateQuery) -> bool {
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+/// Build the installation-wide report body.
+fn cross_site_body(site_ids: Vec<Uuid>, groups: Vec<CrossSiteGroup>) -> CrossSiteReport {
+    let total_bytes: i64 = groups.iter().map(|group| group.total_bytes).sum();
+    let bodies: Vec<CrossSiteGroupBody> = groups
+        .into_iter()
+        .map(|group| CrossSiteGroupBody {
+            checksum: short_checksum(&group.checksum),
+            full_checksum: group.checksum.clone(),
+            file_count: group.file_count,
+            site_count: group.site_count,
+            total_bytes: group.total_bytes,
+            first_seen: group.first_seen,
+            last_seen: group.last_seen,
+            sites: group.sites.iter().map(CrossSiteCopyBody::from).collect(),
+        })
+        .collect();
+    CrossSiteReport {
+        group_count: bodies.len(),
+        total_bytes,
+        notice: "This report says where each file is stored more than once across the whole \
+                 installation. Reclaiming it is a per-site decision — open the site's own \
+                 duplicate report to merge the copies inside it."
+            .to_owned(),
+        site_ids,
+        cross_site: true,
+        groups: bodies,
+    }
+}
+
 /// Build the response body, expanding each group when asked.
 ///
 /// `expand` costs one query per group rather than one big one: a library with four hundred groups
@@ -348,9 +451,7 @@ fn expanded(query: &DuplicateQuery) -> bool {
 async fn build_report(
     pool: &sqlx::PgPool,
     site_ids: Vec<Uuid>,
-    cross_site: bool,
     groups: Vec<DuplicateGroup>,
-    labels: &[omnion_media::SiteLabel],
     expand: bool,
 ) -> std::result::Result<DuplicateReport, ApiError> {
     let mut reclaimable = 0i64;
@@ -382,10 +483,7 @@ async fn build_report(
         };
         bodies.push(DuplicateGroupBody {
             site_id,
-            site_name: labels
-                .iter()
-                .find(|label| label.id == site_id)
-                .map(|label| label.name.clone()),
+            site_name: None,
             checksum: short_checksum(&group.checksum),
             full_checksum: group.checksum.clone(),
             file_count: group.file_count,
@@ -398,7 +496,7 @@ async fn build_report(
     }
     Ok(DuplicateReport {
         site_ids,
-        cross_site,
+        cross_site: false,
         reclaimable_bytes: reclaimable,
         group_count: bodies.len(),
         groups: bodies,

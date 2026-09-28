@@ -258,7 +258,11 @@ async fn repoint_in(
     from: Uuid,
     to: Uuid,
 ) -> Result<(i64, i64)> {
-    let ((moved, collapsed),): ((i64, i64),) = sqlx::query_as(
+    // `query_as::<_, (i64, i64)>` — the statement returns TWO columns. Declaring the row as
+    // `((i64, i64),)` asks sqlx for one *composite* column, and PostgreSQL's answer is a plain
+    // int8, so the failure reads "Rust type (i64,i64) (as RECORD) is not compatible with INT8"
+    // and names the type rather than the mistake.
+    let (moved, collapsed): (i64, i64) = sqlx::query_as(
         "with keeper_side as ( \
              select resource_kind, resource_id, field \
              from media_references where media_id = $2 \
@@ -308,16 +312,84 @@ pub async fn duplicate_groups(pool: &PgPool, site_id: Uuid) -> Result<Vec<Duplic
         .await?)
 }
 
-/// The duplicate groups across several sites, for a platform owner.
+/// One checksum held more than once anywhere in the named sites.
 ///
-/// The same projection with the site filter lifted. `site_id = any($1)` rather than a join to
-/// `sites`, so a site that was deleted mid-scan contributes its (already gone) rows rather than
-/// dropping the whole query — and the `group by` still keeps the groups separate per site, which
-/// is what a cross-site report means by "this file is stored in three sites".
+/// **No `FromRow` derive**, unlike every other row type in this crate: the `sites` field is
+/// assembled in Rust from a second query, so a derive would demand that `Vec<CrossSiteCopy>`
+/// implement `Decode` — and the error it produces ("CrossSiteCopy: Decode is not satisfied")
+/// names a struct that is not in the statement at all. The database half is [`CrossSiteRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossSiteGroup {
+    /// The checksum every copy shares.
+    pub checksum: String,
+    /// How many live files hold it, across every named site.
+    pub file_count: i32,
+    /// How many different sites hold it — the number that says "this is not one tenant's mess".
+    pub site_count: i32,
+    /// Bytes held by all of them.
+    pub total_bytes: i64,
+    /// Earliest upload.
+    pub first_seen: OffsetDateTime,
+    /// Latest upload.
+    pub last_seen: OffsetDateTime,
+    /// The sites that hold it, with their names.
+    pub sites: Vec<CrossSiteCopy>,
+}
+
+/// The database half of a cross-site group: the columns, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct CrossSiteRow {
+    checksum: String,
+    file_count: i32,
+    site_count: i32,
+    total_bytes: i64,
+    first_seen: OffsetDateTime,
+    last_seen: OffsetDateTime,
+}
+
+impl CrossSiteRow {
+    /// Attach the located copies, producing the type the route reads.
+    fn with_sites(self, sites: Vec<CrossSiteCopy>) -> CrossSiteGroup {
+        CrossSiteGroup {
+            checksum: self.checksum,
+            file_count: self.file_count,
+            site_count: self.site_count,
+            total_bytes: self.total_bytes,
+            first_seen: self.first_seen,
+            last_seen: self.last_seen,
+            sites,
+        }
+    }
+}
+
+/// Where one copy of a cross-site group lives.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct CrossSiteCopy {
+    /// The checksum this site holds a copy of — the join key back to its group.
+    pub checksum: String,
+    /// Site id.
+    pub site_id: Uuid,
+    /// Site name, for the report's "Site" column.
+    pub site_name: String,
+    /// How many live copies that site holds.
+    pub file_count: i32,
+    /// Bytes that site holds.
+    pub site_bytes: i64,
+}
+
+/// The installation-wide report: which bytes this deployment holds more than once.
+///
+/// This is *not* the per-site report with the site filter lifted, and the difference is the
+/// whole point of the mode. Per-site, the interesting case is "two copies in one library": a
+/// merge decides which of them a page resolves to. Across sites, the interesting case is "these
+/// two tenants hold the same file" — which is a *platform owner's* storage question with no
+/// single-click answer, because a merge repoints rows inside one site and cannot decide which
+/// tenant keeps the file. So the grouping is by checksum alone, and `reclaimable` is absent
+/// rather than zero: there is nothing to offer a button for.
 pub async fn duplicate_groups_across(
     pool: &PgPool,
     site_ids: &[Uuid],
-) -> Result<Vec<DuplicateGroup>> {
+) -> Result<Vec<CrossSiteGroup>> {
     if site_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -327,14 +399,56 @@ pub async fn duplicate_groups_across(
             requested: site_ids.len(),
         });
     }
-    let sql = "select site_id, checksum, file_count, total_bytes, reclaimable_bytes, \
-                      first_seen, last_seen \
-               from media_duplicate_groups where site_id = any($1) \
-               order by reclaimable_bytes desc, site_id, checksum";
-    Ok(sqlx::query_as::<_, DuplicateGroup>(sql)
-        .bind(site_ids)
-        .fetch_all(pool)
-        .await?)
+    // Grouped here rather than read from the view and filtered by an `exists`: the view counts
+    // every site in the installation, so filtering it afterwards would report `file_count = 9`
+    // for a checksum the caller named two sites for — a total that includes the copies they were
+    // not asking about. The view stays the *documented* shape; this is the scoped version of it.
+    let rows: Vec<CrossSiteRow> = sqlx::query_as(
+        "select checksum, count(*)::integer as file_count, \
+                count(distinct site_id)::integer as site_count, \
+                sum(size_bytes)::bigint as total_bytes, \
+                min(created_at) as first_seen, max(created_at) as last_seen \
+         from media \
+         where site_id = any($1) and deleted_at is null and checksum <> '' \
+         group by checksum \
+         having count(*) > 1 \
+         order by total_bytes desc, checksum",
+    )
+    .bind(site_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let wanted: Vec<String> = rows.iter().map(|row| row.checksum.clone()).collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let copies: Vec<CrossSiteCopy> = sqlx::query_as(
+        "select m.checksum, m.site_id, s.name as site_name, count(*)::integer as file_count, \
+                sum(m.size_bytes)::bigint as site_bytes \
+         from media m join sites s on s.id = m.site_id \
+         where m.checksum = any($2) and m.site_id = any($1) and m.deleted_at is null \
+         group by m.checksum, m.site_id, s.name \
+         order by s.name",
+    )
+    .bind(site_ids)
+    .bind(&wanted)
+    .fetch_all(pool)
+    .await?;
+
+    // Grouped in Rust rather than by a second statement per group: the copy list is small
+    // (one row per site holding the bytes) and a query per group would make an owner's report
+    // over a hundred checksums a hundred round trips.
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let sites = copies
+                .iter()
+                .filter(|copy| copy.checksum == row.checksum)
+                .cloned()
+                .collect();
+            row.with_sites(sites)
+        })
+        .collect())
 }
 
 /// The names of the sites a cross-site report covers, for its "Site" column.
