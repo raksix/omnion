@@ -10,9 +10,10 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { Check, MailPlus, RefreshCw, Search, Send, Trash2, UserMinus, X } from "lucide-react";
+import { Check, Loader2, MailPlus, RefreshCw, Search, Send, Trash2, UserMinus, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 
+import { AuditTab } from "@/features/organizations/audit-tab";
 import { DepartmentsTab } from "@/features/organizations/departments-tab";
 import { BillingTab, ModulesTab, SettingsTab } from "@/features/organizations/settings-tabs";
 
@@ -25,7 +26,9 @@ import {
   fetchOrganization,
   fetchOrganizationInvitations,
   fetchOrganizationMembers,
+  fetchQueuedOrganizationInvitations,
   fetchRoles,
+  releaseQueuedOrganizationInvitation,
   removeOrganizationMember,
   revokeOrganizationInvitation,
   updateOrganizationMember,
@@ -63,7 +66,7 @@ function InviteDialog({
   onClose,
 }: {
   organizationId: string;
-  onDone: (token: string) => void;
+  onDone: (result: { token: string; queued: boolean }) => void;
   onClose: () => void;
 }) {
   const [email, setEmail] = useState("");
@@ -101,7 +104,10 @@ function InviteDialog({
         role_id: roleId || null,
         message: message.trim() || undefined,
       });
-      onDone(created.token);
+      // A queued invitation (`owner_approval`) answers 202 with no token, because there is no
+      // working link until an owner releases it. Reporting it as a sent invitation with an
+      // empty link would send the operator off to mail a `/invite/` that answers "waiting".
+      onDone({ token: created.token, queued: created.invitation.status === "awaiting_approval" });
     } catch (cause) {
       setError(
         cause instanceof ApiError ? cause.message : "The invitation could not be sent.",
@@ -325,6 +331,8 @@ function MembersTab({ organization }: { organization: Organization }) {
           {notice}
         </p>
       ) : null}
+
+      <InvitationQueue organizationId={organization.id} onSettled={() => void load()} />
 
       <div className="overflow-hidden rounded-xl border border-line bg-surface">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
@@ -638,10 +646,12 @@ function MembersTab({ organization }: { organization: Organization }) {
         <InviteDialog
           organizationId={organization.id}
           onClose={() => setInviting(false)}
-          onDone={(token) => {
+          onDone={({ token, queued }) => {
             setInviting(false);
             setNotice(
-              `Invitation sent. The single-use link is /invite/${token.slice(0, 8)}… — it is shown once, so copy it into your mail now.`,
+              queued
+                ? "Invitation queued. This organization runs the owner-approval policy, so an owner releases it below and the link appears then — there is nothing to mail yet."
+                : `Invitation sent. The single-use link is /invite/${token.slice(0, 8)}… — it is shown once, so copy it into your mail now.`,
             );
             void load();
           }}
@@ -654,16 +664,204 @@ function MembersTab({ organization }: { organization: Organization }) {
 /**
  * The tabs this organization screen carries.
  *
- * Roles, API keys and audit still arrive with their own requests — the panel never shows a tab
- * it cannot fill, and a tab that renders an empty state for a feature that does not exist yet
- * is a dead control wearing an empty state.
+ * Roles and API keys still arrive with their own requests — the panel never shows a tab it
+ * cannot fill, and a tab that renders an empty state for a feature that does not exist yet is a
+ * dead control wearing an empty state.
  */
+/** A loadable tab: never both an error and a list, never a spinner over stale rows. */
+type QueueState = "loading" | "ready" | "error";
+
+/**
+ * The `owner_approval` queue (REQ-005, slice 3).
+ *
+ * It appears only when something is actually waiting, because a permanently empty "0 waiting"
+ * box is a control that never does anything. Each row carries the two decisions an owner has:
+ * release it (which mints the single-use link, shown once) or revoke it.
+ *
+ * The release link is displayed in a `role="status"` region rather than a toast, because it is
+ * the one thing the inviter has to *copy*: a toast that disappears would take the only working
+ * link with it, and the release cannot be repeated — a second release is refused by name, since
+ * it would mint a different link and silently orphan the first.
+ */
+function InvitationQueue({
+  organizationId,
+  onSettled,
+}: {
+  organizationId: string;
+  onSettled: () => void;
+}) {
+  const [queued, setQueued] = useState<OrganizationInvitation[] | null>(null);
+  const [state, setState] = useState<QueueState>("loading");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [released, setReleased] = useState<{ email: string; link: string } | null>(null);
+
+  const load = useCallback(async () => {
+    setState("loading");
+    setError(null);
+    try {
+      const body = await fetchQueuedOrganizationInvitations(organizationId);
+      setQueued(body.invitations);
+      setState("ready");
+    } catch (cause) {
+      setState("error");
+      setError(
+        cause instanceof ApiError ? cause.message : "The approval queue could not be loaded.",
+      );
+    }
+  }, [organizationId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const release = async (invitation: OrganizationInvitation) => {
+    setBusy(invitation.id);
+    setError(null);
+    try {
+      const created = await releaseQueuedOrganizationInvitation(organizationId, invitation.id);
+      setReleased({ email: invitation.email, link: created.accept_url });
+      onSettled();
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError
+          ? `${cause.message} (${cause.code})`
+          : "The release was refused.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const revoke = async (invitation: OrganizationInvitation) => {
+    setBusy(invitation.id);
+    setError(null);
+    try {
+      await revokeOrganizationInvitation(organizationId, invitation.id);
+      setReleased(null);
+      onSettled();
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError
+          ? `${cause.message} (${cause.code})`
+          : "The revocation was refused.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // A 403 here is the owner check, and it is a real answer: the policy is working. It is shown
+  // rather than swallowed, because an owner who cannot release must learn *why*.
+  if (state === "error") {
+    return (
+      <div
+        role="status"
+        className="rounded-xl border border-caution/40 bg-caution-soft px-4 py-3 text-[12.5px] text-caution"
+      >
+        {error}
+      </div>
+    );
+  }
+
+  if (state !== "ready") {
+    return <LoadingTable columns={3} rows={1} />;
+  }
+
+  if (queued === null || queued.length === 0) {
+    return null;
+  }
+
+  return (
+    <div
+      data-invitation-queue="1"
+      className="overflow-hidden rounded-xl border border-caution/40 bg-surface"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line px-4 py-3">
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-[13.5px] font-medium">Waiting for approval</h2>
+          <span className="text-[12px] text-muted">{queued.length} queued</span>
+        </div>
+        <p className="text-[11.5px] text-muted">
+          This organization runs the owner-approval invite policy. An owner releases each one, and
+          the link is shown once at that moment.
+        </p>
+      </div>
+
+      {released ? (
+        <div
+          role="status"
+          data-invitation-released="1"
+          className="border-b border-line bg-canvas/60 px-4 py-3 text-[12.5px]"
+        >
+          <p>
+            Released for <strong className="font-medium">{released.email}</strong>. Copy the link
+            now — it is shown once and the release cannot be repeated.
+          </p>
+          <code className="mt-1.5 block overflow-x-auto rounded-md border border-line bg-surface px-2.5 py-1.5 font-mono text-[12px]">
+            {released.link}
+          </code>
+        </div>
+      ) : null}
+
+      <ul className="divide-y divide-line">
+        {queued.map((invitation) => (
+          <li
+            key={invitation.id}
+            data-queue-row={invitation.email}
+            className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+          >
+            <span className="flex min-w-0 flex-col">
+              <span className="truncate text-[13px] font-medium">{invitation.email}</span>
+              <span className="truncate text-[12px] text-muted">
+                invited by {invitation.invited_by_name ?? "a member"}
+                {invitation.role_name ? ` · ${invitation.role_name}` : ""}
+                {" · "}
+                {formatTimestamp(invitation.created_at)}
+              </span>
+            </span>
+            <span className="flex items-center gap-2">
+              <button
+                type="button"
+                data-qa-guard="write"
+                data-queue-release={invitation.email}
+                onClick={() => void release(invitation)}
+                disabled={busy === invitation.id}
+                className="flex items-center gap-1 rounded-lg bg-accent px-2.5 py-1 text-[12px] font-medium text-white transition disabled:opacity-60"
+              >
+                {busy === invitation.id ? (
+                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                ) : (
+                  <Check className="size-3" aria-hidden />
+                )}
+                Release
+              </button>
+              <button
+                type="button"
+                data-qa-guard="write"
+                data-queue-revoke={invitation.email}
+                onClick={() => void revoke(invitation)}
+                disabled={busy === invitation.id}
+                className="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
+              >
+                <Trash2 className="size-3" aria-hidden />
+                Revoke
+              </button>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 const TABS = [
   { key: "members", label: "Members" },
   { key: "departments", label: "Departments" },
   { key: "modules", label: "Modules" },
   { key: "settings", label: "Settings" },
   { key: "billing", label: "Billing" },
+  { key: "audit", label: "Audit" },
 ] as const;
 
 /** `/organizations/[id]`. */
@@ -755,6 +953,7 @@ export function OrganizationDetailView({ organizationId }: { organizationId: str
       {tab === "modules" ? <ModulesTab organization={organization} /> : null}
       {tab === "settings" ? <SettingsTab organization={organization} /> : null}
       {tab === "billing" ? <BillingTab organization={organization} /> : null}
+      {tab === "audit" ? <AuditTab organization={organization} /> : null}
     </div>
   );
 }
