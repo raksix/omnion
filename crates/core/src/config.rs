@@ -82,22 +82,24 @@ pub const DEFAULT_ANALYTICS_POLL_MS: u64 = 15_000;
 /// Default beacon budget of one site and caller per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
 pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
 
-/// Default cadence of the per-organization audit retention sweep, in seconds
-/// (`OMNION_AUDIT_RETENTION_SWEEP_SECONDS`).
-///
-/// A day, not a minute: the shortest window a tenant can ask for is 30 days
-/// (`omnion_identity::tenancy_limits::MIN_AUDIT_RETENTION_DAYS`), so a sweep that runs every
-/// minute would do the same work ninety-nine times out of a hundred. The first tick runs at
-/// boot, so a nightly sweep still happens on a process that is restarted more often than
-/// once a day.
-pub const DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS: u64 = 86_400;
+/// How often the retention worker sweeps (REQ-010, slice 4).
+pub const DEFAULT_RETENTION_POLL_MS: u64 = 900_000;
 
-/// How many organizations one sweep tick looks at (`OMNION_AUDIT_RETENTION_SWEEP_BATCH`).
-///
-/// The tick reads the tenants that actually have something to purge, and a batch keeps a
-/// large installation's nightly run from holding one statement open for every tenant it has
-/// ever had. Whatever falls outside the batch is picked up on the next tick.
+/// Sites one retention tick walks before it yields to the next tick.
+pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
+
+/// How often the audit sweep wakes up. An hour is deliberate: a tenant's shortest legal window
+/// is 30 days, so a tick that finds nothing to remove is the normal outcome and the only reason
+/// to look more often is to notice a newly-shortened window promptly.
+pub const DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS: u64 = 3_600;
+
+/// Organizations one audit sweep tick walks. A tenant per tick keeps the transaction small and
+/// bounds the work a single slow organization can cost the rest of the platform.
 pub const DEFAULT_AUDIT_RETENTION_SWEEP_BATCH: usize = 200;
+
+/// The same bound as a `u64`, because the environment is read through `read_positive`, which
+/// parses into a `u64` and refuses a negative or zero value.
+const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
 
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
@@ -442,28 +444,58 @@ impl Default for AnalyticsConfig {
     }
 }
 
-/// Audit retention sweep knobs (docs/requests/REQ-005, slice 4).
+/// The retention worker of `apps/api` reads these: each tick sweeps the superseded versions and
+/// the trash of every site that has a library, and repairs the reference rows whose referent is
+/// gone.
 ///
-/// The sweep of `apps/api/src/retention_runner.rs` reads these: every tick it walks the
-/// tenants whose stored `organization_settings.audit_retention_days` window has expired rows
-/// and removes them, then files a system audit row and announces
-/// `organization.retention.swept` with the count and the cutoff.
-///
-/// The sweep is on by default because retention that only runs when somebody remembers is not
-/// retention: a setting that is stored, validated and rendered but never read is exactly the
-/// kind of "coming soon" the platform does not ship.
+/// `poll_ms` is the *tick*, not the day. A sweep is idempotent — it claims rows, removes them
+/// and writes what it computed — so a tick that finds nothing is a no-op, and the daily
+/// character of the work comes from the windows in the policies rather than from the timer.
+/// That is deliberate: a worker that only ran at 02:00 and did nothing on the rest of the day
+/// is a worker whose single failure is invisible until the next morning, and a `poll_ms` of a
+/// few minutes costs a handful of empty statements per site per tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionConfig {
+    /// Whether this process sweeps libraries (`OMNION_RETENTION_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two sweeps (`OMNION_RETENTION_POLL_MS`).
+    pub poll_ms: u64,
+    /// How many sites one tick may walk (`OMNION_RETENTION_MAX_SITES`).
+    pub max_sites: i64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_RETENTION_POLL_MS,
+            max_sites: DEFAULT_RETENTION_MAX_SITES,
+        }
+    }
+}
+
+/// Audit retention sweep knobs (docs/requests/REQ-005, slice 4).
+///
+/// A second config next to [`RetentionConfig`] rather than a second set of knobs on it, because
+/// the two workers are unrelated: this one enforces each tenant's own stored
+/// `organization_settings.audit_retention_days` window over the audit trail, the other sweeps
+/// superseded media versions and site trash. Folding them into one struct would let an operator
+/// who switched media retention off silently switch the audit sweep off too.
+///
+/// On by default because retention that only runs when somebody remembers is not retention: a
+/// setting that is stored, validated and rendered but never read is exactly the kind of
+/// "coming soon" the platform does not ship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRetentionConfig {
     /// Whether this process sweeps expired audit rows (`OMNION_AUDIT_RETENTION_SWEEP`).
     pub sweep_enabled: bool,
-    /// Delay between two sweep ticks, in seconds
-    /// (`OMNION_AUDIT_RETENTION_SWEEP_SECONDS`).
+    /// Delay between two sweep ticks, in seconds (`OMNION_AUDIT_RETENTION_SWEEP_SECONDS`).
     pub sweep_seconds: u64,
     /// Tenants one tick looks at (`OMNION_AUDIT_RETENTION_SWEEP_BATCH`).
     pub sweep_batch: usize,
 }
 
-impl Default for RetentionConfig {
+impl Default for AuditRetentionConfig {
     fn default() -> Self {
         Self {
             sweep_enabled: true,
@@ -574,8 +606,10 @@ pub struct Config {
     pub search: SearchConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
-    /// Audit retention sweep knobs (REQ-005, slice 4).
+    /// Media library retention worker knobs (REQ-010, slice 4).
     pub retention: RetentionConfig,
+    /// Audit retention sweep knobs (REQ-005, slice 4).
+    pub audit_retention: AuditRetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -730,17 +764,20 @@ impl Config {
             batch: read_count(&read, "OMNION_SEARCH_BATCH", DEFAULT_SEARCH_BATCH)?,
         };
 
-        let analytics = AnalyticsConfig {
-            runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
-            poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
-            collect_per_minute: read_positive(
+        // Read here so a malformed value is a configuration error at boot rather than a
+        // worker that silently keeps its default — the same treatment every other knob gets.
+        let retention = RetentionConfig {
+            runner_enabled: read_flag(&read, "OMNION_RETENTION_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_RETENTION_POLL_MS", DEFAULT_RETENTION_POLL_MS)?,
+            max_sites: i64::try_from(read_positive(
                 &read,
-                "OMNION_ANALYTICS_COLLECT_PER_MINUTE",
-                DEFAULT_ANALYTICS_COLLECT_PER_MINUTE,
-            )?,
+                "OMNION_RETENTION_MAX_SITES",
+                DEFAULT_RETENTION_MAX_SITES_U64,
+            )?)
+            .unwrap_or(DEFAULT_RETENTION_MAX_SITES),
         };
 
-        let retention = RetentionConfig {
+        let audit_retention = AuditRetentionConfig {
             sweep_enabled: read_flag(&read, "OMNION_AUDIT_RETENTION_SWEEP", true)?,
             sweep_seconds: read_positive(
                 &read,
@@ -751,6 +788,16 @@ impl Config {
                 &read,
                 "OMNION_AUDIT_RETENTION_SWEEP_BATCH",
                 DEFAULT_AUDIT_RETENTION_SWEEP_BATCH,
+            )?,
+        };
+
+        let analytics = AnalyticsConfig {
+            runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
+            collect_per_minute: read_positive(
+                &read,
+                "OMNION_ANALYTICS_COLLECT_PER_MINUTE",
+                DEFAULT_ANALYTICS_COLLECT_PER_MINUTE,
             )?,
         };
 
@@ -776,6 +823,7 @@ impl Config {
             search,
             analytics,
             retention,
+            audit_retention,
             mail,
             log,
         };
@@ -815,6 +863,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             analytics: AnalyticsConfig::default(),
             retention: RetentionConfig::default(),
+            audit_retention: AuditRetentionConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }

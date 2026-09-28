@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
+use omnion_api::audit_retention;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
@@ -119,6 +120,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The analytics rollup worker rebuilds the recent hourly and daily buckets in this process
     // (REQ-007): each tick recomputes from the raw rows, which is idempotent, so a tick that
     // cannot reach the database is logged and the next one writes the same buckets.
+    // The retention worker prunes superseded versions and the trash of every site that has a
+    // library (REQ-010, slice 4), and repairs the reference rows whose referent is gone. A
+    // tick that finds nothing writes no row and logs at debug — a worker that warns on every
+    // empty tick is a worker whose real warnings stop being read.
+    if state.config().retention.runner_enabled {
+        let _retention = retention_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
+    }
+
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
@@ -128,8 +139,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The audit retention sweep applies each tenant's own stored window, unattended
     // (REQ-005, slice 4): the number an operator typed into the Settings tab is enforced by
     // the platform, so the trail holds what that tenant said it should hold — and no more.
-    if state.config().retention.sweep_enabled {
-        let _sweeper = retention_runner::spawn(state.clone());
+    if state.config().audit_retention.sweep_enabled {
+        let _sweeper = audit_retention::spawn(state.clone());
     } else {
         tracing::info!(
             "the audit retention sweep is disabled (OMNION_AUDIT_RETENTION_SWEEP=false)"

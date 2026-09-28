@@ -78,22 +78,21 @@ create table media_grants (
         check (effect = 'allow' or can_read or can_write or can_delete or can_share)
 );
 
--- One row per (node, subject), as a **unique index** and not a table constraint.
+-- One row per (node, subject), expressed as a **unique index** and not as a table
+-- constraint. A table-level `unique` constraint accepts *column names*, not expressions,
+-- so `unique (coalesce(...), coalesce(...), ...)` is a syntax error -- and because the
+-- migrations apply as a set, that one statement stops every later migration from
+-- applying too. The symptom reads like a total regression; the cause is a rule about
+-- where expressions may appear.
 --
--- The uniqueness spans `(folder_id, media_id)` where exactly one of the two is set, and
--- that is the reason it is an index: a table-level `unique` constraint accepts *column
--- names*, not expressions, so `unique (coalesce(...), coalesce(...), ...)` is a syntax
--- error that takes the whole migration set down with it — the database then refuses every
--- subsequent migration too, which reads like a total regression when it is one line.
+-- The uniqueness spans `(folder_id, media_id)` with exactly one of the two set, so the
+-- nil uuid is the sentinel: `media_grants_node_xor` guarantees one side is null and the
+-- coalesce can never collapse a folder row onto a file row.
 --
--- The nil uuid is the sentinel: `media_grants_node_xor` guarantees one side is null, so
--- the coalesce can never collapse a folder row onto a file row.
---
--- The expression here is duplicated in `crates/media/src/grants.rs` (`GRANT_CONFLICT`),
--- because the writer's `on conflict` clause must name this exact index — a conflict target
--- that does not match the index is a statement PostgreSQL refuses. Two files, two
--- languages, so the drift is real; the API crate's `media_grants` suite pins the two
--- against each other.
+-- This expression is duplicated in `crates/media/src/grants.rs` as `GRANT_CONFLICT`,
+-- because the `on conflict` target in `put_grant` must name this exact index. Two files,
+-- two languages, so the drift is real; the API crate's `media_grants` suite pins the two
+-- against each other by text.
 create unique index if not exists media_grants_node_x_subject
     on media_grants (
         coalesce(folder_id, '00000000-0000-0000-0000-000000000000'::uuid),

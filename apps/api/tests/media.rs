@@ -2173,6 +2173,25 @@ fn exif_entry(out: &mut Vec<u8>, tag: u16, kind: u16, count: u32, inline: [u8; 4
     out.extend_from_slice(&inline);
 }
 
+/// The byte offset of IFD0's `index`-th entry, in the layout [`jpeg_with_exif`] builds.
+fn ifd0_entry_at(index: usize) -> usize {
+    // 8 (the TIFF header) + 2 (the entry count) + index * 12.
+    10 + index * 12
+}
+
+/// The byte offset of the sub-directory's `index`-th entry.
+///
+/// Every byte of the prefix is really there: the TIFF header, IFD0's count field, IFD0's four
+/// entries, **IFD0's four-byte next-directory pointer**, and the sub-directory's own count
+/// field. Forgetting the next-pointer — which the first version of this function did — put
+/// every sub-directory entry four bytes early, which is invisible for five of them and fatal
+/// for the sixth: the lens pointer then landed inside the value area and overwrote the start of
+/// the camera make.
+fn sub_entry_at(index: usize) -> usize {
+    const BEFORE_SUB: usize = 8 + 2 + 4 * 12 + 4 + 2;
+    BEFORE_SUB + index * 12
+}
+
 /// The value bytes of a JPEG carrying a real EXIF block.
 ///
 /// `orientation` and the frame size are the two things a test moves to change what the reader
@@ -2194,7 +2213,6 @@ fn jpeg_with_exif(orientation: u16, width: u16, height: u16) -> Vec<u8> {
 
     // IFD0 at offset 8, so its value area starts after its own table.
     block.extend_from_slice(&(IFD0_ENTRIES as u16).to_le_bytes());
-    let ifd0_values_at = block.len() + IFD0_ENTRIES * 12;
     exif_entry(&mut block, 0x010f, 2, 6, [0; 4]);
     exif_entry(&mut block, 0x0110, 2, 14, [0; 4]);
     // A SHORT lives in the first two bytes of the entry's four, high bytes zero.
@@ -2205,34 +2223,75 @@ fn jpeg_with_exif(orientation: u16, width: u16, height: u16) -> Vec<u8> {
     let subdir_at = block.len();
 
     block.extend_from_slice(&(SUB_ENTRIES as u16).to_le_bytes());
-    let sub_wide_at = block.len() + SUB_ENTRIES * 12;
     exif_entry(&mut block, 0x8827, 3, 1, inline_short(400));
     exif_entry(&mut block, 0x829a, 5, 1, [0; 4]);
     exif_entry(&mut block, 0x829d, 5, 1, [0; 4]);
     exif_entry(&mut block, 0x920a, 5, 1, [0; 4]);
     exif_entry(&mut block, 0x9003, 2, 20, [0; 4]);
-    exif_entry(&mut block, 0xa434, 2, 27, [0; 4]);
+    exif_entry(&mut block, 0xa434, 2, 25, [0; 4]);
     block.extend_from_slice(&0u32.to_le_bytes());
 
-    // Now the value area, in the order the entries above need it, each patched with its own
-    // offset. An offset is measured from the start of the block, which is why `value_at` starts
-    // where IFD0's table ended rather than at zero.
-    let mut value_at = ifd0_values_at;
-    let mut place = |at: usize, bytes: &[u8]| {
-        block[at..at + 4].copy_from_slice(&(value_at as u32).to_le_bytes());
-        value_at += bytes.len();
+    // Now the value area. An offset is measured from the **start of the block**, and the area
+    // sits after the last table rather than after any one of them — so every value is appended
+    // here and the entry that declared it is patched with wherever the bytes actually landed.
+    //
+    // The first version computed each table's value area as `block.len() + entries * 12` at the
+    // moment that table finished. That is right for the *last* table and wrong for every other
+    // one, and it was wrong twice over: IFD0's values were addressed before the sub-directory
+    // existed at all, and `sub_wide_at` was taken before the sub-directory's own next-pointer.
+    // The result was the lens pointer landing inside the value area and overwriting the first
+    // two bytes of the camera make — so the reader parsed a block whose make began mid-word and
+    // reported *no camera at all*, which the walk read as a null column rather than as a
+    // broken fixture. Silent, total, and pointing at the code under test rather than at the
+    // code that built the input.
+    //
+    // One allocator, shared, is the fix: an offset is wherever the bytes are, and the reader
+    // is the one thing that has to agree.
+    // The value area is written first and the pointers second, because a pointer is only known
+    // once its value has landed. The first version fused the two into one `place` closure —
+    // which wrote the pointer into the entry and *then* appended the value, so a value longer
+    // than four bytes overwrote the pointer that had just named it. IFD0's `make` and `model`
+    // are both longer than four bytes, and both came back as no camera at all.
+    let mut value_at = block.len();
+    //
+    // Named pairs, because the whole bug was positional: two parallel lists that happened to
+    // line up, and a reader has to count to check whether they still do. Here each value sits
+    // beside the entry that declares it, so "is the lens pointed at the lens" is a glance.
+    //
+    // ISO is a SHORT and lives *inside* its entry, so it has no pointer and is not here.
+    let wide: Vec<(usize, Vec<u8>)> = vec![
+        (ifd0_entry_at(0) + 8, b"Canon\0".to_vec()),
+        (ifd0_entry_at(1) + 8, b"Canon EOS R5\0".to_vec()),
+        // 0x829a exposure: a RATIONAL is numerator *then* denominator, and `1/200 s` is the
+        // case the reader's zero-denominator guard exists for.
+        (sub_entry_at(1) + 8, {
+            let mut value = 1u32.to_le_bytes().to_vec();
+            value.extend_from_slice(&200u32.to_le_bytes());
+            value
+        }),
+        // 0x829d aperture: f/1.8.
+        (sub_entry_at(2) + 8, {
+            let mut value = 180u32.to_le_bytes().to_vec();
+            value.extend_from_slice(&100u32.to_le_bytes());
+            value
+        }),
+        // 0x920a focal length in 35mm: 50mm, a whole number, so denominator one.
+        (sub_entry_at(3) + 8, {
+            let mut value = 50u32.to_le_bytes().to_vec();
+            value.extend_from_slice(&1u32.to_le_bytes());
+            value
+        }),
+        // 0x9003 the date, then 0xa434 the lens.
+        (sub_entry_at(4) + 8, b"2019:07:04 12:34:56\0".to_vec()),
+        (sub_entry_at(5) + 8, b"RF 24-70mm F2.8 L IS USM\0".to_vec()),
+    ];
+    for (_, bytes) in &wide {
         block.extend_from_slice(bytes);
-    };
-    place(ifd0_values_at, b"Canon\0");
-    place(ifd0_values_at + 12, b"Canon EOS R5\0");
-    place(sub_wide_at + 12, &1u32.to_le_bytes());
-    place(sub_wide_at + 24, &200u32.to_le_bytes());
-    place(sub_wide_at + 36, &180u32.to_le_bytes());
-    place(sub_wide_at + 48, &100u32.to_le_bytes());
-    place(sub_wide_at + 60, &5000u32.to_le_bytes());
-    place(sub_wide_at + 72, &100u32.to_le_bytes());
-    place(sub_wide_at + 84, b"2019:07:04 12:34:56\0");
-    place(sub_wide_at + 96, b"RF 24-70mm F2.8 L IS USM\0");
+    }
+    for (slot, bytes) in wide.iter() {
+        block[*slot..*slot + 4].copy_from_slice(&(value_at as u32).to_le_bytes());
+        value_at += bytes.len();
+    }
     block[subdir_pointer_at..subdir_pointer_at + 4]
         .copy_from_slice(&(subdir_at as u32).to_le_bytes());
 
@@ -2251,17 +2310,58 @@ fn jpeg_with_exif(orientation: u16, width: u16, height: u16) -> Vec<u8> {
     jpeg
 }
 
-/// Read one column of a `media` row straight out of the database.
+/// Read one `jsonb` column of a `media` row straight out of the database.
 ///
 /// The API's own response is not enough: the question is what was *stored*, and a response that
 /// omits a field is indistinguishable from one that stored it and chose not to say so.
-async fn media_column(state: &AppState, id: Uuid, column: &str) -> Value {
+async fn media_column(state: &AppState, id: Uuid, column: &str) -> Option<Value> {
     let sql = format!("select {column} from media where id = $1");
     sqlx::query_scalar(&sql)
         .bind(id)
         .fetch_one(state.db().pool())
         .await
         .unwrap_or_else(|error| panic!("the {column} column must be readable: {error}"))
+}
+
+/// Read one **integer** column, by its own name.
+///
+/// A second helper rather than one that returns `Value` for everything, because a `jsonb`
+/// decode of an `int4` is a type error rather than a wrong number: the column came back as
+/// `mismatched types; Value (as JSONB) is not compatible with INT4`, which reads as a schema
+/// problem and is really a helper that was only ever written for the two jsonb columns beside
+/// it. The geometry assertions were passing through the API response and a null `exif` was
+/// pointing the other way, so the helper hid the fact that the two kinds of column were being
+/// read with one tool.
+async fn media_int(state: &AppState, id: Uuid, column: &str) -> i32 {
+    let sql = format!("select {column} from media where id = $1");
+    sqlx::query_scalar(&sql)
+        .bind(id)
+        .fetch_one(state.db().pool())
+        .await
+        .unwrap_or_else(|error| panic!("the {column} column must be readable: {error}"))
+}
+
+/// The builder and the reader agree, proved with no database and no walk.
+///
+/// The fixture was wrong twice and the walks could not tell which. The first failure was an
+/// out-of-range slice *inside the builder*; the second was a `make` that quietly stopped
+/// parsing, so `stored["make"]` was `null` — and a null column is a perfectly legal answer to
+/// "what did the camera say", so it reads as a fact about the file rather than a fact about the
+/// fixture. This test is the one that would have caught the second in a second, with the answer
+/// printed next to the bytes.
+#[test]
+fn the_camera_builder_produces_a_block_the_reader_accepts() {
+    let exif = omnion_media::read_exif("image/jpeg", &jpeg_with_exif(6, 4000, 3000));
+    assert_eq!(exif.make.as_deref(), Some("Canon"), "make");
+    assert_eq!(exif.model.as_deref(), Some("Canon EOS R5"), "model");
+    assert_eq!(exif.lens.as_deref(), Some("RF 24-70mm F2.8 L IS USM"), "lens");
+    assert_eq!(exif.iso, Some(400), "iso");
+    assert_eq!(exif.exposure_ms, Some(5), "1/200 s is five milliseconds");
+    assert_eq!(exif.aperture_x100, Some(180), "f/1.8 is 180 hundredths");
+    assert_eq!(exif.focal_length_mm, Some(50), "focal length in 35mm");
+    assert_eq!(exif.orientation, Some(6), "orientation");
+    assert!(!exif.gps, "no fix means no flag");
+    assert_eq!(exif.captured_at.as_deref(), Some("2019-07-04T12:34:56"));
 }
 
 #[tokio::test]
@@ -2290,7 +2390,9 @@ async fn a_camera_record_is_read_from_the_bytes_and_never_holds_a_coordinate() {
         .expect("a uuid");
 
     // The record comes out of the bytes, not out of the file name.
-    let stored = media_column(&fixture.state, id, "exif").await;
+    let stored = media_column(&fixture.state, id, "exif")
+        .await
+        .expect("a photograph with a camera block must store one");
     assert_eq!(stored["make"], "Canon", "the maker is read from the block");
     assert_eq!(stored["model"], "Canon EOS R5");
     assert_eq!(stored["lens"], "RF 24-70mm F2.8 L IS USM");
@@ -2315,8 +2417,8 @@ async fn a_camera_record_is_read_from_the_bytes_and_never_holds_a_coordinate() {
     }
 
     // The geometry the row stores is the geometry a reader sees.
-    assert_eq!(media_column(&fixture.state, id, "width").await, 3000);
-    assert_eq!(media_column(&fixture.state, id, "height").await, 4000);
+    assert_eq!(media_int(&fixture.state, id, "width").await, 3000);
+    assert_eq!(media_int(&fixture.state, id, "height").await, 4000);
 
     // The listing sends both readings, so a grid reserves the right box and a version list can
     // still show what the camera stored.
@@ -2356,9 +2458,7 @@ async fn a_camera_record_is_read_from_the_bytes_and_never_holds_a_coordinate() {
         .parse()
         .expect("a uuid");
     assert!(
-        media_column(&fixture.state, plain_id, "exif")
-            .await
-            .is_null(),
+        media_column(&fixture.state, plain_id, "exif").await.is_none(),
         "a text file must not grow a camera record"
     );
 
@@ -2388,11 +2488,13 @@ async fn a_replacement_replaces_the_camera_record_rather_than_inheriting_it() {
         .expect("a uuid");
     let versions = format!("/api/v1/media/{id}/versions");
     assert_eq!(
-        media_column(&fixture.state, id, "exif").await["model"],
+        media_column(&fixture.state, id, "exif")
+            .await
+            .expect("the restored version brings its camera record back")["model"],
         "Canon EOS R5"
     );
     // Orientation 1 is upright, so the stored columns are the frame's own.
-    assert_eq!(media_column(&fixture.state, id, "width").await, 4000);
+    assert_eq!(media_int(&fixture.state, id, "width").await, 4000);
 
     // A replacement that is a *different* photograph: same body, a portrait crop stored sideways.
     let reshot = jpeg_with_exif(8, 4000, 3000);
@@ -2413,11 +2515,13 @@ async fn a_replacement_replaces_the_camera_record_rather_than_inheriting_it() {
     // The orientation moved to the new version, so the geometry moved with it: a 4000×3000 frame
     // stored at orientation 8 is drawn as 3000 wide by 4000 high.
     assert_eq!(
-        media_column(&fixture.state, id, "exif").await["orientation"],
+        media_column(&fixture.state, id, "exif")
+            .await
+            .expect("the replaced file carries its own record")["orientation"],
         8
     );
-    assert_eq!(media_column(&fixture.state, id, "width").await, 3000);
-    assert_eq!(media_column(&fixture.state, id, "height").await, 4000);
+    assert_eq!(media_int(&fixture.state, id, "width").await, 3000);
+    assert_eq!(media_int(&fixture.state, id, "height").await, 4000);
 
     // A replacement in a format with no camera block *clears* the record. Keeping the previous
     // body's lens on a screenshot is a wrong fact, not a stale cache — and the geometry falls
@@ -2436,15 +2540,15 @@ async fn a_replacement_replaces_the_camera_record_rather_than_inheriting_it() {
     .await;
     assert_eq!(flattened.status, StatusCode::CREATED);
     assert!(
-        media_column(&fixture.state, id, "exif").await.is_null(),
+        media_column(&fixture.state, id, "exif").await.is_none(),
         "a replacement with no camera block must clear the record"
     );
     assert_eq!(
-        media_column(&fixture.state, id, "width").await,
+        media_int(&fixture.state, id, "width").await,
         1200,
         "the rotation is gone, so the frame's own width stands"
     );
-    assert_eq!(media_column(&fixture.state, id, "height").await, 630);
+    assert_eq!(media_int(&fixture.state, id, "height").await, 630);
 
     // Restoring the first version brings its record back, read from its own bytes.
     let restored = call(
@@ -2458,12 +2562,14 @@ async fn a_replacement_replaces_the_camera_record_rather_than_inheriting_it() {
     )
     .await;
     assert_eq!(restored.status, StatusCode::OK);
-    let back = media_column(&fixture.state, id, "exif").await;
+    let back = media_column(&fixture.state, id, "exif")
+        .await
+        .expect("a restore brings version 1's record back");
     assert_eq!(
         back["orientation"], 1,
         "the restored bytes carry their own record"
     );
-    assert_eq!(media_column(&fixture.state, id, "width").await, 4000);
+    assert_eq!(media_int(&fixture.state, id, "width").await, 4000);
 
     fixture.cleanup().await;
 }

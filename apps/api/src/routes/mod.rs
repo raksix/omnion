@@ -87,9 +87,10 @@ pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
-pub mod media_duplicates;
 pub mod media_files;
 pub mod media_grants;
+pub mod media_duplicates;
+pub mod media_retention;
 pub mod media_scan;
 mod media_settings;
 pub mod media_shares;
@@ -679,8 +680,8 @@ pub fn router(state: AppState) -> Router {
     // permission as repointing where every file in it lives.
     let media_settings_route: MethodRouter<AppState, Infallible> =
         get(media_settings::read).layer(guards::require(&state, "media.read"));
-    let media_settings_write: MethodRouter<AppState, Infallible> =
-        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
+        .layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -720,18 +721,18 @@ pub fn router(state: AppState) -> Router {
     // (organise a library) nor `media.delete` (remove a file) is that power.
     let media_scan_route: MethodRouter<AppState, Infallible> =
         get(media_scan::read).layer(guards::require(&state, "media.read"));
-    let media_scan_write: MethodRouter<AppState, Infallible> =
-        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_run: MethodRouter<AppState, Infallible> =
-        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
+        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
+        .layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
         get(media_scan::list_held).layer(guards::require(&state, "media.read"));
     let media_quarantine_release: MethodRouter<AppState, Infallible> =
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_test: MethodRouter<AppState, Infallible> =
-        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
+        .layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -741,23 +742,46 @@ pub fn router(state: AppState) -> Router {
     // able to decide who else may read what they uploaded.
     let media_folder_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
-    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
-        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
+        .layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
-    let media_file_grant_write: MethodRouter<AppState, Infallible> =
-        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
-    // Two independent routers rather than one value mounted twice: `MethodRouter` is moved
-    // into each `.route()` call, so sharing it would move out of the first and fail the second
-    // at runtime rather than at compile time.
-    let media_folder_grant_delete: MethodRouter<AppState, Infallible> =
-        delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
-    let media_file_grant_delete: MethodRouter<AppState, Infallible> =
+    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
+        .layer(guards::require(&state, "media.manage"));
+    // A grant is removed by its own id alone — the row knows the node it was written on, so
+    // putting the node in the URL as well would make a two-parameter path with a one-parameter
+    // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
+    // both *static* segments under `/media/`, so they rank ahead of `/media/{id}/…` and are
+    // never read as a media id.
+    let media_grant_delete: MethodRouter<AppState, Infallible> =
         delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
     let media_subjects: MethodRouter<AppState, Infallible> =
         get(media_grants::subjects).layer(guards::require(&state, "media.read"));
     let media_grant_effective: MethodRouter<AppState, Infallible> =
         get(media_grants::effective).layer(guards::require(&state, "media.read"));
+
+    // Retention (REQ-010, slice 4). Reading a policy, the run log and the trash's own numbers
+    // is `media.read` — a person who cannot change a window must still be able to ask what the
+    // site promises to keep, because "my file was deleted by a policy" is exactly that
+    // question. Writing a policy, running a sweep, setting a hold and repairing references are
+    // `media.settings.manage`, the key slice 3 already gave the storage screen: retention is
+    // the destructive half of the same screen, so it is the same key.
+    let media_retention: MethodRouter<AppState, Infallible> =
+        get(media_retention::read).layer(guards::require(&state, "media.read"));
+    let media_retention_create: MethodRouter<AppState, Infallible> =
+        post(media_retention::create).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_update: MethodRouter<AppState, Infallible> =
+        put(media_retention::update).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_delete: MethodRouter<AppState, Infallible> =
+        delete(media_retention::delete).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_run: MethodRouter<AppState, Infallible> =
+        post(media_retention::run_now).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_runs: MethodRouter<AppState, Infallible> =
+        get(media_retention::runs).layer(guards::require(&state, "media.read"));
+    let media_retention_repair: MethodRouter<AppState, Infallible> =
+        post(media_retention::repair).layer(guards::require(&state, "media.settings.manage"));
+    let media_file_hold: MethodRouter<AppState, Infallible> =
+        put(media_retention::set_file_hold).layer(guards::require(&state, "media.settings.manage"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -1252,16 +1276,24 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine", media_quarantine)
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
+        .route("/media/grants/{grant_id}", media_grant_delete)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        .route(
-            "/media/folders/{id}/grants/{grant_id}",
-            media_folder_grant_delete,
-        )
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
-        .route("/media/{id}/grants/{grant_id}", media_file_grant_delete)
         .route("/media/grant-subjects", media_subjects)
         .route("/media/{id}/grant-effective", media_grant_effective)
+        // Retention. `retention`, `retention/runs` and `retention/repair` are *static*
+        // segments declared here, so axum ranks them ahead of `/media/{id}/…` — the same
+        // reason `/media/scan-settings` is spelled as a literal rather than a parameter.
+        .route("/media/retention", media_retention)
+        .route("/media/retention", media_retention_create)
+        .route("/media/retention/runs", media_retention_runs)
+        .route("/media/retention/run", media_retention_run)
+        .route("/media/retention/repair", media_retention_repair)
+        .route("/media/retention/{id}", media_retention_update)
+        .route("/media/retention/{id}", media_retention_delete)
+        // The hold is on a *file*, so it lives under the file rather than under the policy.
+        .route("/media/files/{id}/hold", media_file_hold)
         .route("/media/transformation-presets", media_preset_create)
         .route("/media/transformation-presets/{id}", media_preset)
         .route(

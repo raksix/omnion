@@ -1,268 +1,196 @@
-//! The per-organization audit retention sweep (docs/requests/REQ-005, slice 4).
+//! The background retention worker (REQ-010, slice 4).
 //!
-//! `main.rs` spawns this task when the sweep is enabled (`OMNION_AUDIT_RETENTION_SWEEP`, default
-//! on). Each tick it reads every organization's own stored `audit_retention_days`, works out the
-//! instant that tenant's window closed, and removes the rows that fell out of it — then files a
-//! system audit row and announces `organization.retention.swept` with the count and the cutoff.
+//! `main.rs` spawns this task when the worker is enabled (`OMNION_RETENTION_RUNNER`, default
+//! on). Each tick sweeps the superseded versions and the trash of every site that has a
+//! library, and repairs the reference rows whose referent is gone.
 //!
-//! Why a runner at all, when the analytics module already has a retention purge: the two are
-//! the same idea at different scopes. `privacy::purge` is a *site* about a site's visitors, an
-//! operator action with a button and a result. This is the *organization's own* window, applied
-//! by the platform, unattended — the thing that makes a stored number mean something. A setting
-//! that is validated, saved and rendered but never read is a promise the product does not keep.
+//! Five decisions shape this file, and each is a place the obvious shortcut is wrong:
 //!
-//! Three decisions are worth naming, because each of them is easy to get quietly wrong:
-//!
-//! * **Each tenant keeps its own window.** There is no global retention: the number in
-//!   `organization_settings` belongs to that organization, and a sweep that used one platform
-//!   default would silently delete a tenant's history that the tenant paid to keep.
-//! * **A sweep that removed nothing files nothing.** The audit row and the event are about a
-//!   deletion that happened. A nightly `organization.retention.swept` with
-//!   `rows_removed: 0` on a platform with two hundred tenants would be two hundred rows a day
-//!   in the trail, and a trail full of its own housekeeping is a trail nobody reads. So the
-//!   tick skips a tenant with nothing to purge, entirely.
-//! * **The audit row is written after the delete, not inside the same transaction.** A trail
-//!   that cannot record its own housekeeping would have no way to explain the gap a purge left;
-//!   and the row is deliberately *newer* than the cutoff, so the next sweep cannot remove the
-//!   receipt for the previous one.
+//! * **The tick is minutes, not days, and the "daily" in the plan is the windows, not the
+//!   timer.** A sweep is idempotent — it claims rows, removes them and writes what it
+//!   computed — so a tick that finds nothing is a no-op. A worker that only ran at 02:00 has
+//!   one failure mode and no way to show it: the run at 02:00 either worked or it did not, and
+//!   nothing in between produces evidence either way. Minutes-long ticks cost a handful of
+//!   empty statements per site and make a broken sweep visible within the hour.
+//! * **A site that cannot be swept does not abandon the others.** One site whose object store
+//!   is refusing deletes must not stop the sweep of a thousand that are fine, and the failure
+//!   is logged with the site named rather than swallowed.
+//! * **The repair scan runs before the sweeps, not after.** A reference row pointing at a page
+//!   that no longer exists refuses a purge for ever, so a library whose pages were deleted
+//!   during a migration is permanently unpurgeable until somebody repairs it. Repairing first
+//!   means the same tick can act on what it just learned was a lie; repairing afterwards means
+//!   the operator waits a whole cycle for no reason.
+//! * **The repair scan only touches a referent it can prove is gone.** `pages` is the only
+//!   kind the platform can verify today. A kind it cannot verify is *kept*, because deleting a
+//!   reference to a module that arrives tomorrow is a library that forgets where its files are
+//!   used — and the purge refusal is the only thing standing between that module and a broken
+//!   site.
+//! * **Nothing here emits a `media.retention_applied` event.** The route does, and it carries
+//!   the actor. A worker event with no actor is an event every subscriber has to learn to
+//!   ignore, and a retention run is a *site* fact that the run log already records in full.
 
 use std::time::Duration as StdDuration;
 
-use omnion_audit::{NewAuditEntry, RetentionSweep};
-use omnion_events::{NewEvent, bus};
-use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::state::AppState;
 
-/// Start the sweep worker; the returned handle is kept by the binary (and ends with the
+/// Start the retention worker; the returned handle is kept by the binary (and ends with the
 /// process).
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
-    let retention = state.config().retention.clone();
-    let sweep_seconds = retention.sweep_seconds.max(1);
+    let poll_ms = state.config().retention.poll_ms.max(1_000);
+    let max_sites = state.config().retention.max_sites;
 
-    tracing::info!(
-        sweep_seconds,
-        batch = retention.sweep_batch,
-        "audit retention sweep started"
-    );
+    tracing::info!(poll_ms, max_sites, "retention worker started");
 
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(StdDuration::from_secs(sweep_seconds));
-        // A slow tick must not turn into a burst of catch-up sweeps. The work is idempotent,
-        // so skipping is free, while a catch-up burst would re-read every tenant back to back.
+        let mut ticks = tokio::time::interval(StdDuration::from_millis(poll_ms));
+        // A slow tick must not turn into a burst of catch-up ticks: the rows are still there,
+        // so the next tick sweeps the same set again and the run log shows two passes rather
+        // than one enormous one.
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // The first tick fires immediately: a process that is restarted more often than the
-        // cadence still sweeps, instead of a tenant on a daily schedule losing a day every
-        // time the box rebooted.
+        // The first tick fires immediately; boot has its own work to do.
         ticks.tick().await;
 
         loop {
             ticks.tick().await;
-            if let Err(error) = sweep_once(&state).await {
-                tracing::warn!(error = %error, "the audit retention sweep tick failed");
+            if let Err(error) = tick(&state, max_sites).await {
+                tracing::warn!(error = %error, "the retention tick failed");
             }
         }
     })
 }
 
-/// Run one sweep across the tenants that have something to purge.
+/// One pass over every site that has a library.
 ///
-/// Returns how many rows went. A tenant whose `organization_settings` row is missing falls back
-/// to the schema default rather than being skipped: the settings table is backfilled, so a
-/// missing row means a tenant created between the backfill and now, and *not* sweeping it would
-/// keep rows forever — the opposite of what the setting promises.
-pub async fn sweep_once(state: &AppState) -> Result<i64, omnion_audit::AuditError> {
-    let now = OffsetDateTime::now_utc();
-    let mut removed_total = 0_i64;
+/// Bounded by `max_sites`: an installation with a thousand sites does not hold a thousand
+/// statements open in one tick, and the remainder is picked up by the next one rather than
+/// lost. The bound is a `limit` on the site query, not a slice afterwards, so the truncation
+/// is visible in the log as a count.
+pub async fn tick(state: &AppState, max_sites: i64) -> std::result::Result<TickReport, omnion_media::MediaError> {
+    let pool = state.db().pool();
 
-    for window in due_windows(state, now).await? {
-        let removed = match omnion_audit::purge_before(
-            state.db().pool(),
-            window.organization_id,
-            window.cutoff,
-        )
-        .await
-        {
-            Ok(removed) => removed,
-            Err(error) => {
-                tracing::warn!(
-                    organization_id = %window.organization_id,
-                    error = %error,
-                    "the retention sweep could not purge one organization"
-                );
-                continue;
-            }
-        };
+    // First, because a reference to a page that no longer exists refuses a purge for ever.
+    let repaired = omnion_media::repair_references(pool, REPAIR_BATCH).await?;
+    if repaired > 0 {
+        tracing::info!(repaired, "stale media reference rows were removed");
+    }
 
-        if removed == 0 {
-            // The oldest-row probe and the delete disagree only under a concurrent write, and
-            // a delete that removed nothing has no receipt to file.
-            continue;
-        }
-
-        removed_total += removed;
-        announce(state, &window, removed).await;
+    let sites = omnion_media::sites_with_media(pool).await?;
+    let walked = sites.len();
+    let batch: Vec<Uuid> = sites.into_iter().take(max_sites.max(1) as usize).collect();
+    if walked > batch.len() {
         tracing::info!(
-            organization_id = %window.organization_id,
-            retention_days = window.retention_days,
-            rows_removed = removed,
-            "audit retention swept one organization"
+            walked,
+            swept = batch.len(),
+            "the retention tick reached its site bound; the rest waits for the next tick"
         );
     }
 
-    Ok(removed_total)
-}
-
-/// One organization's window and the instant it closed.
-struct Window {
-    /// Tenant the window belongs to.
-    organization_id: Uuid,
-    /// The stored window, in days.
-    retention_days: i32,
-    /// Rows older than this are outside it.
-    cutoff: OffsetDateTime,
-}
-
-/// The tenants whose window has closed on at least one row, oldest first.
-///
-/// Two statements rather than a join over every row: the candidate list is small (tenants with
-/// something to purge, capped at the batch), and the per-tenant probe is what makes the
-/// per-tenant window authoritative. Ordering by the oldest expired row means a tick that hits
-/// its batch cap works on the tenants that have the most history waiting, and the rest follow
-/// on the next tick rather than being starved forever.
-async fn due_windows(
-    state: &AppState,
-    now: OffsetDateTime,
-) -> Result<Vec<Window>, omnion_audit::AuditError> {
-    let batch = state.config().retention.sweep_batch as i64;
-
-    // A tenant with no settings row still gets the default window, and the schema default is
-    // the same 365 days `load_settings` falls back to. The `left join` is what keeps such a
-    // tenant from being invisible to the sweep.
-    let candidates: Vec<(Uuid, Option<i32>, Option<OffsetDateTime>)> = sqlx::query_as(
-        "select o.id, s.audit_retention_days, \
-                (select min(a.created_at) from audit_log a where a.organization_id = o.id) as oldest \
-         from organizations o \
-         left join organization_settings s on s.organization_id = o.id \
-         order by oldest asc nulls last, o.id asc \
-         limit $1",
-    )
-    .bind(batch)
-    .fetch_all(state.db().pool())
-    .await?;
-
-    let mut windows = Vec::new();
-    for (organization_id, stored_days, oldest) in candidates {
-        let retention_days = stored_days.unwrap_or(DEFAULT_RETENTION_DAYS);
-        let Some(oldest) = oldest else {
-            // A tenant with no audit rows has nothing to purge, which is not a failure.
-            continue;
-        };
-
-        let cutoff = now - time::Duration::days(i64::from(retention_days));
-        if oldest >= cutoff {
-            continue;
+    let mut purged = 0_i64;
+    let mut versions = 0_i64;
+    let mut failed = 0_usize;
+    for site_id in &batch {
+        // One site that cannot be swept must not abandon the others: the run log for the
+        // sites that worked is the point of the tick, and a single misconfigured object
+        // store is not a reason to stop pruning a thousand libraries.
+        match sweep_site(state, *site_id).await {
+            Ok((site_purged, site_versions)) => {
+                purged += site_purged;
+                versions += site_versions;
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    site_id = %site_id,
+                    code = error.code(),
+                    "a site could not be swept: {}",
+                    error.message()
+                );
+            }
         }
-
-        windows.push(Window {
-            organization_id,
-            retention_days,
-            cutoff,
-        });
     }
 
-    Ok(windows)
+    Ok(TickReport { sites: batch.len(), purged, versions, repaired, failed })
 }
 
-/// The window a tenant without a settings row is held to.
-///
-/// Kept next to the sweep rather than imported from the identity crate's migration so the
-/// fallback is one line to read next to the `unwrap_or` that uses it — and so the sweep does
-/// not depend on a *load* path to know what an absent row means.
-const DEFAULT_RETENTION_DAYS: i32 = 365;
+/// How many stale reference rows one tick removes. Bounded because the repair is a scan over
+/// `media_references` joined against `pages`, and a library with a hundred thousand rows must
+/// not turn one tick into a maintenance window.
+const REPAIR_BATCH: i64 = 500;
 
-/// File the system audit row and announce the sweep on the bus.
-///
-/// The audit row goes first: the event bus is a convenience for live consumers, while the trail
-/// is the durable record. A failure of the bus is a warning, not a failed sweep — the rows are
-/// already gone, and re-running the delete would not bring back a receipt we could not write.
-async fn announce(state: &AppState, window: &Window, removed: i64) {
-    let sweep = RetentionSweep {
-        organization_id: window.organization_id,
-        retention_days: window.retention_days,
-        cutoff: window.cutoff,
-        rows_removed: removed,
-    };
+/// What one pass did. Returned rather than only logged so a caller (and a test) can assert it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TickReport {
+    /// Sites swept.
+    pub sites: usize,
+    /// Files purged across them.
+    pub purged: i64,
+    /// Superseded versions removed across them.
+    pub versions: i64,
+    /// Stale reference rows removed.
+    pub repaired: i64,
+    /// Sites that could not be swept.
+    pub failed: usize,
+}
 
-    if let Err(error) = omnion_audit::record(
-        state.db().pool(),
-        NewAuditEntry::system("organization.retention.swept")
-            .target("organization", sweep.organization_id.to_string())
-            .organization(sweep.organization_id)
-            .metadata(serde_json::json!({
-                "retention_days": sweep.retention_days,
-                "rows_removed": sweep.rows_removed,
-                "cutoff": sweep.cutoff,
-            })),
-    )
-    .await
-    {
-        tracing::warn!(
-            organization_id = %sweep.organization_id,
-            error = %error,
-            "the retention sweep could not file its audit row"
-        );
-        return;
+impl TickReport {
+    /// Whether the pass did anything at all.
+    ///
+    /// A tick that removed nothing is *not* a failure and the worker says so at `debug`, not
+    /// at `warn`: a warning per empty tick is a log nobody reads by the end of the day.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.purged == 0 && self.versions == 0 && self.repaired == 0
     }
+}
 
-    let emission = bus::emit(
-        state.db().pool(),
-        NewEvent::new("organization.retention.swept")
-            .organization(sweep.organization_id)
-            .payload(serde_json::json!({
-                "retention_days": sweep.retention_days,
-                "rows_removed": sweep.rows_removed,
-                "cutoff": sweep.cutoff,
-            })),
-    )
-    .await;
-
-    if let Err(error) = emission {
-        tracing::warn!(
-            organization_id = %sweep.organization_id,
-            error = %error,
-            "the retention sweep event could not be recorded"
-        );
-    }
+/// Sweep one site's library, writing its run row.
+///
+/// The same function the route's `Run now` reaches through `run_once`, and deliberately so: two
+/// answers to "what may this file go" is how a nightly sweep and an operator's click start
+/// disagreeing about the same row.
+async fn sweep_site(
+    state: &AppState,
+    site_id: Uuid,
+) -> std::result::Result<(i64, i64), crate::error::ApiError> {
+    // The route's `run_once` is `pub` precisely so the worker and the button share it. A
+    // worker with its own copy of the sweep is a worker that can drift from the screen that
+    // says what it will do — and the operator who reads the screen is the one who is misled.
+    let outcome = crate::routes::media_retention::run_once(state, site_id, None).await?;
+    Ok((outcome.run.purged, outcome.run.versions_removed))
 }
 
 #[cfg(test)]
 mod tests {
-    use omnion_core::config::RetentionConfig;
+    use super::*;
 
+    /// A tick that removed nothing is idle, and idle is not failure.
+    ///
+    /// The trap this pins: a worker that logs a warning whenever a tick finds nothing fills
+    /// the log with entries nobody reads, and the *real* warning — a sweep that cannot reach
+    /// the database — becomes the one line in a thousand that still gets looked at.
     #[test]
-    fn the_sweep_is_on_by_default() {
-        // Retention that only runs when somebody remembers is not retention. A default of
-        // `false` would make the whole feature a lie on a stock installation.
-        let defaults = RetentionConfig::default();
-        assert!(
-            defaults.sweep_enabled,
-            "the sweep must be on without configuration"
-        );
+    fn an_empty_tick_is_idle_and_a_failing_site_is_not() {
+        let empty = TickReport { sites: 12, ..TickReport::default() };
+        assert!(empty.is_idle());
+
+        let held = TickReport { repaired: 1, ..TickReport::default() };
+        assert!(!held.is_idle(), "a repair is work, even when nothing was removed");
+
+        let worked = TickReport { sites: 2, purged: 1, versions: 3, repaired: 0, failed: 0 };
+        assert!(!worked.is_idle());
     }
 
+    /// A site that failed is counted, not hidden, and it does not stop the others.
     #[test]
-    fn the_default_cadence_is_longer_than_the_shortest_window_a_tenant_can_ask_for() {
-        let defaults = RetentionConfig::default();
-        assert!(
-            defaults.sweep_seconds >= 60 * 60,
-            "a minute-cadence sweep would re-read every tenant 1440 times a day to remove \
-             rows that are at least 30 days old"
-        );
-        assert_eq!(defaults.sweep_batch, 200);
+    fn a_failing_site_is_counted_rather_than_swallowed() {
+        let report = TickReport { sites: 3, purged: 2, versions: 0, repaired: 0, failed: 1 };
+        assert_eq!(report.sites, 3);
+        assert_eq!(report.purged, 2, "the sites that worked still counted");
+        assert_eq!(report.failed, 1, "and the one that did not is visible");
     }
 }

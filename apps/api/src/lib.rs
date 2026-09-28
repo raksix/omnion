@@ -14,6 +14,7 @@ pub mod dto;
 pub mod error;
 pub mod event_runner;
 pub mod guards;
+pub mod audit_retention;
 pub mod intent_resolver;
 pub mod module_guard;
 pub mod retention_runner;

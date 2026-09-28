@@ -6,6 +6,7 @@
  */
 import type {
   CreatedMediaShare,
+  NewMediaGrant,
   Media,
   MediaBulkResult,
   MediaCrossSiteReport,
@@ -17,6 +18,9 @@ import type {
   MediaFolderTree,
   MediaMergeResult,
   MediaPreset,
+  MediaGrant,
+  MediaGrantSubject,
+  MediaGrantsResponse,
   MediaShare,
   MediaStorageProbe,
   MediaStorageSettings,
@@ -28,6 +32,12 @@ import type {
   MediaSweepResult,
   MediaStorageSettingsInput,
   MediaReplaceResult,
+  MediaRetentionList,
+  MediaRetentionPolicy,
+  MediaRetentionPolicyInput,
+  MediaRetentionRepair,
+  MediaRetentionRunList,
+  MediaRetentionRunResult,
   MediaTrash,
   MediaVersionList,
   OnboardingStatus,
@@ -702,6 +712,58 @@ export function revokeAllMediaShares(mediaId: string): Promise<{ revoked: number
     `/api/v1/media/${encodeURIComponent(mediaId)}/shares/revoke-all`,
     { method: "POST" },
   );
+}
+
+// --------------------------------------------------------------------------------------------
+// Folder and file grants (docs/requests/REQ-010, slice 4)
+// --------------------------------------------------------------------------------------------
+
+/** The grants on one node — a folder or a file — with the chain a file inherits from. */
+export function fetchMediaGrants(
+  targetKind: "file" | "folder",
+  targetId: string,
+): Promise<MediaGrantsResponse> {
+  const path = targetKind === "folder" ? "folders" : "media";
+  return request<MediaGrantsResponse>(
+    `/api/v1/${path}/${encodeURIComponent(targetId)}/grants`,
+  );
+}
+
+/** What a grant is written with. The four bits are separate, so a caller that sends only
+ * `can_read` gets exactly `can_read`. */
+export function createMediaGrant(
+  targetKind: "file" | "folder",
+  targetId: string,
+  grant: NewMediaGrant,
+): Promise<MediaGrant> {
+  const path = targetKind === "folder" ? "folders" : "media";
+  return request<MediaGrant>(`/api/v1/${path}/${encodeURIComponent(targetId)}/grants`, {
+    method: "PUT",
+    body: JSON.stringify(grant),
+  });
+}
+
+/**
+ * Remove one grant, by its own id.
+ *
+ * The node is deliberately **not** in the URL: the row already knows what it was written on,
+ * and a path with two parameters and a one-parameter handler is the shape axum rejects with a
+ * bare `500` and no body. The server answers `404` for a grant of another organization, so an
+ * id that is not yours is indistinguishable from one that does not exist.
+ */
+export function removeMediaGrant(grantId: string): Promise<void> {
+  return request<void>(`/api/v1/media/grants/${encodeURIComponent(grantId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** The subjects this site's organization can name: its own users, groups and roles. */
+export function fetchGrantSubjects(siteId: string, search = ""): Promise<MediaGrantSubject[]> {
+  const query = new URLSearchParams({ site_id: siteId });
+  if (search) {
+    query.set("search", search);
+  }
+  return request<MediaGrantSubject[]>(`/api/v1/media/grant-subjects?${query.toString()}`);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -4590,6 +4652,84 @@ export function runMediaScan(siteId: string): Promise<MediaSweepResult> {
 /** The run log of a site, newest first. */
 export function fetchMediaScanRuns(siteId: string): Promise<MediaScanRunList> {
   return request<MediaScanRunList>(`/api/v1/media/scan/runs?${mediaQuery(siteId)}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-010, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** A site's retention policies and the numbers around them. */
+export function fetchMediaRetention(siteId: string): Promise<MediaRetentionList> {
+  return request<MediaRetentionList>(`/api/v1/media/retention?${mediaQuery(siteId)}`);
+}
+
+/** Create a retention policy. */
+export function createMediaRetentionPolicy(
+  siteId: string,
+  input: MediaRetentionPolicyInput,
+): Promise<MediaRetentionPolicy> {
+  return request<MediaRetentionPolicy>(`/api/v1/media/retention?${mediaQuery(siteId)}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Change a retention policy.
+ *
+ * The body is sent **verbatim**, including a `folder_id: null`. The API reads the scope from
+ * the key's presence rather than from a deserialised value — serde's `Option` maps a `null`
+ * to `None` whatever the inner type is, so `Option<Option<Uuid>>` cannot tell "leave the
+ * scope alone" from "widen it to the whole site". Dropping a null here would make the second
+ * edit an operator most often wants unreachable.
+ */
+export function saveMediaRetentionPolicy(
+  siteId: string,
+  policyId: string,
+  input: MediaRetentionPolicyInput,
+): Promise<MediaRetentionPolicy> {
+  return request<MediaRetentionPolicy>(
+    `/api/v1/media/retention/${policyId}?${mediaQuery(siteId)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** Delete a retention policy. */
+export function deleteMediaRetentionPolicy(siteId: string, policyId: string): Promise<void> {
+  return request<void>(`/api/v1/media/retention/${policyId}?${mediaQuery(siteId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Sweep a site now and return what the pass actually did. */
+export function runMediaRetention(siteId: string): Promise<MediaRetentionRunResult> {
+  return request<MediaRetentionRunResult>(`/api/v1/media/retention/run?${mediaQuery(siteId)}`, {
+    method: "POST",
+  });
+}
+
+/** The retention run log of a site, newest first. */
+export function fetchMediaRetentionRuns(siteId: string): Promise<MediaRetentionRunList> {
+  return request<MediaRetentionRunList>(`/api/v1/media/retention/runs?${mediaQuery(siteId)}`);
+}
+
+/** Drop the reference rows whose referent is gone. */
+export function repairMediaReferences(siteId: string): Promise<MediaRetentionRepair> {
+  return request<MediaRetentionRepair>(`/api/v1/media/retention/repair?${mediaQuery(siteId)}`, {
+    method: "POST",
+  });
+}
+
+/** Put a file under a legal hold, or take it off one. The reason is required either way. */
+export function setMediaHold(
+  fileId: string,
+  hold: boolean,
+  reason: string,
+): Promise<{ media_id: string; legal_hold: boolean; changed: boolean }> {
+  return request<{ media_id: string; legal_hold: boolean; changed: boolean }>(
+    `/api/v1/media/files/${fileId}/hold`,
+    { method: "PUT", body: JSON.stringify({ hold, reason }) },
+  );
 }
 
 /** The open quarantines of a site, with their totals. */

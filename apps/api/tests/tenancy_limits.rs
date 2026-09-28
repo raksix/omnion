@@ -3238,7 +3238,7 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
     plant_audit_row(&fixture.db, fixture.org_b(), "test.b100", now - (day * 100)).await;
     plant_audit_row(&fixture.db, fixture.org_b(), "test.b400", now - (day * 400)).await;
 
-    let removed = omnion_api::retention_runner::sweep_once(&fixture.state)
+    let removed = omnion_api::audit_retention::sweep_once(&fixture.state)
         .await
         .expect("the sweep must run");
     assert_eq!(
@@ -3314,7 +3314,7 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
 
     // A second sweep over the same data removes nothing and files nothing: a trail full of its
     // own nightly housekeeping is a trail nobody reads.
-    let again = omnion_api::retention_runner::sweep_once(&fixture.state)
+    let again = omnion_api::audit_retention::sweep_once(&fixture.state)
         .await
         .expect("the sweep must run again");
     assert_eq!(again, 0, "a second sweep over the same rows is a no-op");
@@ -3363,7 +3363,7 @@ async fn a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still
         .await
         .expect("the settings row must be removable for this walk");
 
-    let removed = omnion_api::retention_runner::sweep_once(&fixture.state)
+    let removed = omnion_api::audit_retention::sweep_once(&fixture.state)
         .await
         .expect("the sweep must run");
     assert_eq!(

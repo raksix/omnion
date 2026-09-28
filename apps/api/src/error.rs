@@ -115,24 +115,25 @@ impl ApiError {
         self.code
     }
 
-    /// The structured detail, when the refusal carried one.
-    ///
-    /// `ApiError` deliberately has no `Display`: the human sentence goes into the response body
-    /// and a client reads the *structure*, not a formatted string. That makes the structure
-    /// unreachable from outside the crate until a test or a client has to assert on it — and an
-    /// assertion that has to reach into a private field to check a refusal names its status is
-    /// an assertion that gets dropped instead of fixed.
-    #[must_use]
-    pub fn details(&self) -> Option<&Value> {
-        self.details.as_ref()
-    }
-
     /// The human-readable explanation, for assertions and for a log line.
     ///
     /// The companion of [`ApiError::code`]: the code is what a client branches on and the
     /// message is what a person reads, so a test that checks one without the other pins half
     /// the contract — and it is the message that has to name the field and the three legal
     /// values, which is the part a client cannot reconstruct.
+    /// The structured detail, when the refusal carried one.
+    ///
+    /// Exposed because a refusal that can explain itself should be *checked* by the thing that
+    /// refuses: `module_guard` asserts the answer names the module it switched off, and
+    /// `scope` asserts a cross-tenant read carries no detail at all. Without an accessor those
+    /// assertions would have to reach into a private field from another module, and the
+    /// guarantee — "a refusal names its source" — would be untestable rather than merely
+    /// unenforced.
+    #[must_use]
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
+
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -280,94 +281,10 @@ impl From<IdentityError> for ApiError {
             ),
             // Shape problems the store refuses (slug, key, status, host, address) are the
             // caller's: the field is what they have to fix, so this is a 400.
+            // Shape problems the store refuses (slug, key, status, host) are the caller's.
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
-            | IdentityError::InvalidHost(message)
-            | IdentityError::InvalidEmail(message) => Self::bad_request("invalid_request", message),
-            // Memberships and invitations (REQ-005, slice 1). Every refusal names what
-            // happened, because the panel has to tell a reader apart from an organization
-            // account that simply does not exist — except a token that is not valid, which
-            // answers the same way for unknown, revoked and used, so the public link cannot be
-            // used to discover an organization.
-            IdentityError::InvalidMembership(message)
-            | IdentityError::InvalidInvitation(message) => {
-                Self::bad_request("invalid_request", message)
-            }
-            IdentityError::MemberAlreadyPresent => Self::new(
-                StatusCode::CONFLICT,
-                "already_member",
-                "this account is already a member of the organization",
-            ),
-            IdentityError::MemberNotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "member_not_found",
-                "this account is not a member of the organization",
-            ),
-            IdentityError::InvitationNotFound
-            | IdentityError::InvitationAlreadyUsed
-            | IdentityError::InvitationRevoked => Self::new(
-                StatusCode::NOT_FOUND,
-                "invitation_not_found",
-                "this invitation link is not valid",
-            ),
-            IdentityError::InvitationExpired => Self::new(
-                StatusCode::GONE,
-                "invitation_expired",
-                "this invitation has expired — ask for a new one",
-            ),
-            // A queued link is not an error and not a `404` either: the invitee did nothing
-            // wrong and the panel can say something useful — "an owner has to release this".
-            // Without this arm it fell through to `internal_error`, which tells the invitee the
-            // platform is broken and sends them to the manager who cannot fix it.
-            IdentityError::InvitationAwaitingApproval => Self::new(
-                StatusCode::CONFLICT,
-                "invitation_awaiting_approval",
-                "this invitation is waiting for an owner to release it",
-            ),
-            IdentityError::InvitationAlreadyPending(_) => Self::new(
-                StatusCode::CONFLICT,
-                "invitation_already_pending",
-                "this address already has a pending invitation in this organization",
-            ),
-            // Departments (REQ-005, slice 2). A parent or department that belongs to another
-            // organization answers `department_not_found` exactly like one that does not exist,
-            // so an id from another tenant cannot be probed.
-            IdentityError::InvalidDepartment(message) => {
-                Self::bad_request("invalid_request", message)
-            }
-            IdentityError::DepartmentNotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "department_not_found",
-                "no such department",
-            ),
-            IdentityError::DepartmentKeyTaken => Self::new(
-                StatusCode::CONFLICT,
-                "department_key_taken",
-                "a department with this key already exists in the organization",
-            ),
-            IdentityError::DepartmentCycle => Self::new(
-                StatusCode::CONFLICT,
-                "department_cycle",
-                "a department cannot be moved inside itself",
-            ),
-            // Settings, modules and limits (REQ-005, slice 3). A refused field names what the
-            // reader has to fix, and a module the installation does not ship is a 404: the
-            // row would describe a feature this build cannot serve, so the tab must not offer
-            // a switch for it.
-            IdentityError::InvalidSettings(message) => {
-                Self::bad_request("invalid_organization_settings", message)
-            }
-            IdentityError::InvalidLimits(message) => {
-                Self::bad_request("invalid_organization_limits", message)
-            }
-            IdentityError::InvalidModule(message) => {
-                Self::bad_request("invalid_module_key", message)
-            }
-            IdentityError::ModuleNotInstalled(key) => Self::new(
-                StatusCode::NOT_FOUND,
-                "module_not_installed",
-                format!("this installation does not ship the module {key:?}"),
-            ),
+            | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
@@ -802,10 +719,8 @@ impl From<MediaError> for ApiError {
             }
             MediaError::TooManySites { limit, requested } => Self::bad_request(
                 "too_many_sites",
-                format!(
-                    "a cross-site report may cover at most {limit} sites; {requested} were \
-                         named"
-                ),
+                format!("a cross-site report may cover at most {limit} sites; {requested} were \
+                         named"),
             ),
             // Every storage field error names the field that caused it, and carries it as a
             // detail — the settings form puts the message under that input, and a *save* and a
@@ -830,6 +745,32 @@ impl From<MediaError> for ApiError {
                 MediaError::InvalidReleaseReason.to_string(),
             )
             .with_details(serde_json::json!({ "field": "reason" })),
+            // Same rule for the retention settings, with its own code so a client can tell a
+            // bad window from a bad scanner endpoint — they are two tabs of one screen, and
+            // the message is rendered under the input that caused it.
+            MediaError::InvalidRetentionSetting { field, reason } => {
+                Self::bad_request("invalid_retention_setting", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
+            // A missing policy is a `404`, and the tenancy scope lives *inside* the lookup
+            // rather than being applied afterwards — the same lesson `media_grants::delete_one`
+            // learned from a walk that got a `403` for another tenant's grant id and thereby
+            // confirmed the id exists.
+            MediaError::RetentionPolicyNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "retention_policy_not_found",
+                "no such retention policy on this site",
+            ),
+            MediaError::PolicyNameTaken { name } => Self::new(
+                StatusCode::CONFLICT,
+                "retention_policy_name_taken",
+                format!("a retention policy named `{name}` already exists on this site"),
+            )
+            .with_details(serde_json::json!({ "field": "name" })),
+            // A purge that cannot happen: the request was legal, the file is past its window,
+            // and something in the platform still resolves to it. A `400` would send an
+            // operator to fix a form that was never wrong — the fix is to repoint a page.
+            MediaError::PurgeRefused { reason } => Self::new(StatusCode::CONFLICT, "purge_refused", reason),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

@@ -204,6 +204,42 @@ pub async fn create(
     let input = CreateShareInput::from_optional(body);
     let media = media_site_in_scope(&state, &current, media_id).await?;
 
+    // **The share capability, resolved through the grant chain.** The route's own
+    // `guards::require` proved the caller holds `media.share`; this asks the narrower
+    // question a grant answers — may *this* person hand *this* file to somebody outside. A
+    // writer with no `share` bit is refused here rather than being given a link and a
+    // "somebody else has to do it", which is how a capability ends up on a client's machine
+    // that should never have had it.
+    //
+    // `media.read` is assumed rather than asked: the route guard already refused a caller who
+    // cannot read the file, so the only bit in question is `share`.
+    let chain = omnion_media::load_chain(state.db().pool(), media_id, media.folder_id)
+        .await
+        .map_err(ApiError::from)?;
+    let group_ids = omnion_media::group_ids_of(state.db().pool(), current.user.id)
+        .await
+        .map_err(ApiError::from)?;
+    let decision = omnion_media::resolve(&chain, "user", current.user.id, &group_ids);
+    let share_bit = crate::routes::media_grants::require_capability(
+        &decision,
+        omnion_media::Capabilities {
+            read: true,
+            write: true,
+            delete: true,
+            share: true,
+        },
+    );
+    if !share_bit.share {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "media_grant_denied",
+            format!(
+                "You may edit this file but you may not share it. {}",
+                decision.reason
+            ),
+        ));
+    }
+
     // A link over a file that is already unservable would be created and immediately useless,
     // so it is refused at creation with the same words the serve path uses.
     if media.deleted {
@@ -224,13 +260,17 @@ pub async fn create(
         Some(password) => {
             // Validated by the same function a sign-in uses, so a link cannot carry a password
             // the platform would refuse to check later.
-            Some(hash_password(password).await.map_err(|err| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "password_rejected",
-                    format!("the share password was rejected: {err}"),
-                )
-            })?)
+            Some(
+                hash_password(password)
+                    .await
+                    .map_err(|err| {
+                        ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "password_rejected",
+                            format!("the share password was rejected: {err}"),
+                        )
+                    })?,
+            )
         }
     };
 
@@ -364,8 +404,8 @@ pub async fn revoke_all(
     Path(media_id): Path<Uuid>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let media = media_site_in_scope(&state, &current, media_id).await?;
-    let closed =
-        revoke_for_media(state.db().pool(), media_id, "revoked for the whole file").await?;
+    let closed = revoke_for_media(state.db().pool(), media_id, "revoked for the whole file")
+        .await?;
 
     if closed > 0 {
         record(
@@ -430,7 +470,11 @@ pub async fn public_shared(
     if media.deleted_at.is_some() {
         return Err(share_refusal(ShareRefusal::FileUnavailable));
     }
-    if crate::routes::media::ensure_servable(&state, &media)
+    // The scan half only, and for the same reason as the public renderer: a share link is
+    // held by somebody who never signs in, so a grant — which narrows a *sign-in*'s access —
+    // has nothing to say about the token's bearer. What the holder must not reach is a file
+    // the site's scanner has not cleared, and that is exactly this gate.
+    if crate::routes::media::ensure_scan_allows(&state, &media)
         .await
         .is_err()
     {
@@ -455,6 +499,12 @@ struct ScopedMedia {
     site_id: Uuid,
     site_organization: Uuid,
     filename: String,
+    /// The folder the file sits in, for the grant chain.
+    ///
+    /// Carried here rather than re-read: the chain is a folder walk, and doing it against a
+    /// second copy of the row would mean two reads that could disagree about a file somebody
+    /// moved between them — which is exactly the race a grant has to be decided inside.
+    folder_id: Option<Uuid>,
     /// Whether the file is in the trash. Read through [`MediaFile`] rather than the base
     /// `Media`, because `deleted_at` is a file-manager column and a share over a trashed file
     /// is exactly the case this route has to catch.
@@ -475,6 +525,7 @@ async fn media_site_in_scope(
         site_id: media.site_id,
         site_organization: site.organization_id,
         filename: media.filename,
+        folder_id: media.folder_id,
         deleted: media.deleted_at.is_some(),
     })
 }
@@ -551,10 +602,7 @@ fn share_url(token: &str) -> String {
     if base.is_empty() {
         return format!("/api/v1/public/media/shared/{token}");
     }
-    format!(
-        "{}/api/v1/public/media/shared/{token}",
-        base.trim_end_matches('/')
-    )
+    format!("{}/api/v1/public/media/shared/{token}", base.trim_end_matches('/'))
 }
 
 /// Trim and cap a revocation reason so the audit trail cannot be used as a notes field.
@@ -566,11 +614,7 @@ fn normalize_reason(reason: &str) -> String {
             break;
         }
         // One line, so a reason cannot break the audit log's own rendering.
-        out.push(if ch == '\n' || ch == '\r' || ch == '\t' {
-            ' '
-        } else {
-            ch
-        });
+        out.push(if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch });
     }
     out
 }
@@ -582,10 +626,7 @@ fn normalize_reason(reason: &str) -> String {
 /// opaque domain is a page that runs script in the holder's browser with the platform's name on
 /// it. The platform's own upload validation already limits what can be stored, and an
 /// attachment sidesteps the case where it grows.
-async fn serve_shared(
-    state: &AppState,
-    media: &MediaFile,
-) -> std::result::Result<Response, ApiError> {
+async fn serve_shared(state: &AppState, media: &MediaFile) -> std::result::Result<Response, ApiError> {
     let bytes = state.storage().get(&media.storage_key).await?;
     let mut response = Response::new(axum::body::Body::from(bytes));
     let headers = response.headers_mut();
@@ -601,6 +642,10 @@ async fn serve_shared(
     // a revocation is that it is immediate.
     headers.insert(header::CACHE_CONTROL, header_value("no-store")?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header_value("nosniff")?,
+    );
     Ok(response)
 }
 
@@ -627,10 +672,7 @@ mod tests {
 
     #[test]
     fn a_revocation_reason_cannot_break_the_audit_line() {
-        assert_eq!(
-            normalize_reason("  sent to the wrong client \n"),
-            "sent to the wrong client"
-        );
+        assert_eq!(normalize_reason("  sent to the wrong client \n"), "sent to the wrong client");
         assert_eq!(normalize_reason("a\tb"), "a b");
         assert_eq!(normalize_reason(&"x".repeat(500)).chars().count(), 200);
         assert_eq!(normalize_reason(""), "");
@@ -689,10 +731,7 @@ mod tests {
         ] {
             let err = share_refusal(refusal);
             assert_eq!(err.code(), refusal.as_str());
-            assert!(
-                !format!("{:?}", err).is_empty(),
-                "{refusal:?} has nothing to say"
-            );
+            assert!(!format!("{:?}", err).is_empty(), "{refusal:?} has nothing to say");
         }
     }
 

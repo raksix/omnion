@@ -1,3 +1,213 @@
+## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
+
+build media: retention policies, the run log, the hold, and the reference repair
+
+REQ-010 slice 4's remaining half, and the last piece of the slice. Slice 1 gave the
+library a trash whose countdown was always the *site's* fallback and that no worker
+ever enforced; what is here is the policy itself — scoped to a site or a folder —
+plus the sweeps that act on it, the log that records every run, and the refusal that
+stops a purge from deleting a hero image a live page still resolves to.
+
+**0049_media_retention.sql**, `crates/media/src/retention.rs`,
+`apps/api/src/routes/media_retention.rs`, `apps/api/src/retention_runner.rs`,
+`features/media/retention-view.tsx` (a **Retention** tab on `/media/settings`) and the
+file's `LegalHold` block on the detail screen.
+
+**Six decisions, each a shortcut that produces a plausible wrong answer.** The
+**current version is exempt from the version sweep by number, never by age** — the
+obvious query, "delete every version older than N days", deletes the version `media`
+is serving and leaves `storage_key` naming an object that no longer exists, and the
+current version is the highest number in `media_versions` (the same one `next_version`
+hands out under a row lock). The **hold is a column on `media` rather than a flag on
+the policy**: three destructive sweeps must respect it, a policy flag would have to be
+joined into all three, and the first one somebody edits forgets the others — the
+forgotten one is the one that deletes evidence. A **purge refuses a referenced file
+and names the referrers**, because `media_references` cascades away with the file, so
+a purge *can* silently delete a hero image a published page resolves to. **A run that
+found nothing writes a row**, because retention is the one library feature whose
+absence of activity is indistinguishable from being broken, and a run's `summary`
+separates *nothing was eligible* from *N held* from *N still referenced* from *the run
+stopped early*. The **folder policy wins and the site policy is the fallback, never
+the shortest window of everything that matches** — a campaign folder cannot be
+shortened by a site-wide rule that happens to be tighter. And the **repair scan drops
+the other kind of lie**: a reference to a page deleted during a migration refuses a
+purge for ever, and only a referent the platform can *prove* is gone is dropped, so a
+module that arrives tomorrow does not find its usage rows already deleted.
+
+The worker reaches the sweep through the **route's** `run_once`, not a second copy of
+it: two answers to "what may this file go" is how a nightly sweep and an operator's
+click start disagreeing about the same row, and the operator who reads the screen is
+the one who is misled. And the tick is **minutes, not days** — a sweep is idempotent,
+so an empty tick is a no-op, and a worker that only ran at 02:00 has exactly one
+failure mode with nothing in between to show it.
+
+**Three defects in my own crate code, all caught by the unit tests written beside it.**
+`describe()` printed "30 days day(s)" because the format string spelled the unit *and*
+`plural_days` appended it — and a `contains("30 days")` assertion passes over that
+happily, so both spellings now assert the *absence* of "day(s)". The cross-field check
+defaulted the other window to the **minimum** (1) rather than the **column default**
+(30), so a create sending `purge_after_days = 5` passed validation and was then refused
+by the database as a bare constraint name; the defaults are now named constants bound
+to the insert, so the check and the write cannot disagree about what "the default" is.
+
+**The third is serde rather than logic, and it is the one worth remembering.**
+`Option<Option<Uuid>>` with `#[serde(default)]` *looks* like it carries "absent" and
+"null" separately. It does not — and neither does `Option<Value>`, because serde's
+`Option` visitor maps a `null` to `None` whatever the inner type is. So the explicit
+`folder_id: null` — the one edit an operator most often wants, "this rule was for one
+folder, now it is for everything" — silently arrived as "leave the scope alone", and
+the screen would have reported **saved** over an unchanged scope, which is the worst
+shape a save can have. The scope is now read from the *key's presence* in the raw map,
+which is the only place the distinction exists. The walk proves the **write** happens,
+not just the decode: it clears the scope, reads `folder_id` back out of PostgreSQL, and
+then proves the other half by sending a body that omits the field and finding the scope
+untouched.
+
+**One defect no unit test could have found, and it was the trigger again.** The
+`sites` trigger inserted a policy row without a `name`, and `name` is `not null` with
+no default — so **every site creation failed** with `null value in column "name" of
+relation "media_retention_policies"`. That reads as neither a retention problem nor a
+migration problem but as *the site could not be created*, and it fires from a trigger
+two migrations away, so the only place the error names the cause is the function body.
+All five walks died on it identically before their first assertion. This is the third
+time a `sites` trigger has been the defect in this REQ (0028 presets, 0044 scan
+settings) and the fourth time the seed alone left a *new* site with a pleasant `GET`
+and a save that wrote nothing.
+
+**The environment was the other half of the tick.** MinIO refuses writes with
+`XMinioStorageFull` at 95% disk, and `/mnt/apopic` was at 95% — so three of five walks
+failed at the **upload**, not at anything retention did. `docker system df` reported
+1.2G reclaimable under "dangling" volumes and the honest reading was that four of the
+five were production data (solexx PostgreSQL, sooliva Redis and Mongo, teknofest
+Mongo) whose container merely happened to be stopped; the space came from this
+repository's own `target/debug/deps` instead — 26 stale test-binary links, 5.7G, of
+which nothing was running. **A dangling volume is not garbage**, and MinIO's threshold
+is a hard wall rather than a slow degradation.
+
+**Proof.** `--test media_retention` → **5 walks, 0 failures** over the real router and
+a real database. Both versions of a file are aged past a one-day window and the sweep
+removes **only** the superseded one, asserted by reading `media_versions` back out of
+PostgreSQL *and* by finding the served version's bytes still in the object store — a
+length check would pass by accident. A hold beats a 400-day-old trash row, a refusal
+with no reason writes nothing, the reason lands in `audit_log`, a second identical press
+reports `changed: false` rather than a second audit row that reads as a second person,
+and the release is effective on the very next run. A purge over a referenced file is
+refused naming `page <id> (hero_image_id)`; the page is deleted; a second purge is
+**still** refused; the repair removes one row; the third purge goes through. A folder
+policy outranks the site rule through the crate's own resolver; a `purge_after_days`
+inside the **stored** `trash_days` is refused and the refusal writes nothing; a policy
+of another tenant is a `404` whose refusal deletes nothing; a reader may read the policy
+and the log and may not create, edit, delete, run, repair or hold.
+`cargo test -p omnion-media --lib` → **179**, `-p omnion-api --lib` → **147**,
+`-p omnion-core --lib` → **34**; `--test media` (14), `--test media_shares` (5) and
+`--test media_retention` (5) are green against the routes this touches. `apps/admin`
+`tsc --noEmit` clean.
+
+**Not run: the browser pass.** The retention tab is walked by
+`scripts/qa/run.sh` — `runMediaRetention` opens the tab, asserts every policy states
+its consequence in a sentence and names its scope, drives the cross-field warning
+*before* the save, creates and saves a policy, runs a pass and asserts the notice is
+a sentence rather than a bare zero and that the log wrote a row even when nothing
+was eligible, and toggles the file's hold on and back off — the whole function is
+written and `node --check` passes. It did not execute: `scripts/qa/qa-slot.sh` caps
+the box at **one** concurrent pass and a sibling wave held the slot for the entire
+25-minute window, so this pass was still queued when `timeout 1500` fired and
+printed only `waiting for a QA slot`. That is scheduling contention, not a red
+result, and it is recorded as **unrun** rather than as a pass. REQ-010 therefore
+stays `in-progress` and this slice is not closed on tests alone — the gate is the
+browser pass, and the next tick runs it first.
+
+**Next.** The Usage and Activity tabs on the file detail — they answer
+`media_references` and an activity read, and the reference rows the repair scan now
+maintains are what finally give them rows to read. Then slice 4 closes and the queue
+moves to REQ-021 (notification centre), the first untouched item in wave 1.
+
+## 2026-09-28 — REQ-010 slice 4 (scanning half + grants half) · the access layer, and a red that had been hiding for four ticks
+
+build media: folder and file grants, with a deny that wins at any depth
+
+REQ-010 slice 4, the permissions half. A permission says whether an account may
+touch the library; a grant says **not this one, not here**. That asymmetry is the
+whole design, and the alternative — a layer that could also hand capabilities out —
+would be a second, un-audited source of truth beside the permission catalogue. The
+first thing anybody would build on such a layer is a "grant a contractor read on the
+whole library" button that quietly bypasses IAM.
+
+**0047_media_grants.sql** creates the table with the XOR constraint (a grant on
+neither node is a grant on the whole site; one on both is ambiguous in exactly the
+way two resolvers disagree), the unique (node, subject) index and three lookups.
+Deliberately **no `sites` trigger**, unlike 0028/0029/0044 which all closed the
+"a site created after the migration has nothing" gap: a grant attaches to a folder
+or a file, and a new site has neither until somebody opens the library, so there is
+no node for a trigger to write to.
+
+**`resolve()` is a pure function with no pool in it**, because a deny-wins rule
+tested only over HTTP is a rule somebody refactors away while changing a handler.
+The answer is "the union of the allows, minus the union of the denies" and not a
+fold in list order: a fold lets a file allow recorded after a folder deny undo it,
+and lets a root allow re-open a file whose own grant says no. A subject named
+*only* by denies gets nothing rather than "everything except what was refused".
+
+**The gate.** `ensure_servable` is two halves now, in an order — grant, then scan.
+The public renderer and the share-token route call the **scan half alone**: a grant
+narrows a sign-in and cannot describe an anonymous visitor, so applying one there
+would break every published page the moment somebody narrowed a folder. Share
+*creation* resolves the chain's `share` bit on its own, so a writer with no share
+bit is refused a capability their role would otherwise have let them hand out.
+
+**Three defects the walks found, none of which a unit test could have seen.**
+
+*One.* A deny with no bit set removes nothing and reads as one that does; refused
+at the API with the field named, and refused by the screen first.
+
+*Two, and it is the one that matters.* `delete_one` resolved the grant's node,
+which loaded the file, which ran the tenancy check and answered `403` — confirming
+that another tenant's grant id exists, which is precisely the oracle the 404 rule
+exists to prevent. The lookup now scopes by organization **in the same `where`**,
+so there is no window in which an id's existence leaks, and the walk proves both
+halves: a foreign grant answers 404 *and* the refusal did not delete their row.
+
+*Three.* A URL with two path parameters and a one-parameter handler is the shape
+axum rejects with a bare `500` and no body. The grant delete route now carries the
+grant id alone, because the row already knows the node it was written on. Half a
+tick went into reading that 500 as an unrelated panic before the shape was read
+off the mount list.
+
+**Also fixed: a pre-existing red that had been hiding for four ticks.** The EXIF
+fixture computed the sub-directory's offsets without IFD0's four-byte
+next-directory pointer, so the *lens* pointer landed inside the value area and
+overwrote the first two bytes of the camera make. The reader then reported no
+camera at all — and a null `exif` column is a perfectly legal answer to "what did
+the camera say", so every piece of evidence pointed at the reader instead of at the
+fixture. The value area is now written by allocation with named pairs rather than by
+arithmetic, and a new test calls the reader on the builder's own output and asserts
+every field: no database, no object store, no walk, and the bytes next to the
+answer. Two of the walk's helpers also could not express what they were asserting —
+a `jsonb` decode cannot hold the null that this whole feature exists to distinguish
+from "read nothing" — so `media_column` returns `Option<Value>` and `media_int`
+reads the integer columns.
+
+**Proof.** `--test media_grants` → **8 walks, 0 failures**, against a disposable
+database (`scripts/qa/run-media-walk.sh`, because the shared development database
+carries a sibling wave's migrations and the suite dies with `VersionMissing` before
+reaching an assertion). Every value is read **out of PostgreSQL** wherever a row is
+concerned, because a response that omits a field is indistinguishable from one that
+stored it and chose not to say so. A file deny refuses the raw route with a `403`
+naming where the deny was found, while a bystander holding every permission still
+reads the same file. A folder deny reaches a file two folders down and the tab
+shows the three-node chain with the folder that carries it marked. A group deny
+reaches its members, and **leaving the team restores access on the next request**.
+A deny naming only `share` leaves reading alone while the create route refuses. An
+untouched chain serves every file. `cargo test -p omnion-media --lib` → **164**
+(was 148), `-p omnion-api --lib` → **140** (was 127), `--test media` → **14** (was
+red), `--test media_shares` → **5**, `--test media_scan` unchanged. `apps/admin`
+`tsc --noEmit` clean.
+
+**Next.** Slice 4's last third: retention policies with the daily worker and its run
+log, and reference-based purge refusal plus the repair scan — which is also what
+finally gives the Usage and Activity tabs rows to read. Done when a retention run
+removes exactly the eligible rows and a purge names the resources holding a file.
+
 ## 2026-09-28 — REQ-010 slice 3 (four fifths) · duplicates, and the row that survives the merge
 
 - **What shipped.** **`0038_media_duplicates.sql`**, `crates/media/src/duplicates.rs`,
