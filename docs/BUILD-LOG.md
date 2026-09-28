@@ -3869,3 +3869,46 @@ assuming any of it.
 **Next.** Read `crmStates` (the six `*_doesNotClaimToBeEmpty` keys and `stages_*`) and
 `crmKeyboardMobile` in the newest w4 report; only then tick the two remaining boxes and set
 REQ-051 to `done`. After that, REQ-052 (sales & quotes).
+
+## 2026-09-28 · tick 18 · REQ-051 · the keyboard box's own proof step was the defect
+
+**What.** No CRM code changed this tick. The `?` sheet in `crm-parts.tsx` is a list of claims, and
+the step written last tick to keep it honest asserted the **opposite** of its own comment.
+
+**The defect (`3f1f435`).** `theSheetOnlyPromisesLiveKeys` read the sheet, took the first
+`g then X` it found, and asserted that string was **empty** — reasoning that a two-key prefix was a
+binding nobody listens for. The sheet deliberately advertises four live destinations
+(`g then d/a/l/s`), each built from `CRM_NAV`, so the step was `false` against a **correct** screen.
+Wired to a high finding (as tick 17 wired it), it would have blocked the keyboard box permanently
+and the next tick would have gone looking for a product bug that did not exist.
+
+It was wrong twice over. It asserted a *count* where the claim is about *behaviour*, which is the
+mistake this pass exists to stop: a sheet that prints `g then d` and navigates nowhere reads
+exactly like one that works. So every advertised destination is now collected from the sheet's own
+text and **pressed for real** — `g` arms, the letter fires, the assertion is the URL — and the step
+is the conjunction over all of them. A row the screen advertises and does not honour now fails; a
+row it does not advertise is not this step's business. The `?`-closes assertion moved to after the
+loop, because the loop navigates off the screen it was standing on.
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `cargo test -p omnion-api --lib
+routes::crm` **27/27** · `pnpm turbo run typecheck --force` **2/2** · `node --check
+scripts/qa/walkthrough.cjs` parses. `3f1f435` pushed to `origin/wave4`.
+
+**Read while waiting, and worth writing down.** The newest *complete* w4 report is
+`qa-artifacts/20260928-181211`, which **predates** `fa6181c` / `fed62b5` / `4e94c4b` — it still
+carries a parse error in `contacts-view.tsx` that `4e94c4b` removed, and its `crmStates` shows
+`contacts/companies/deals_hasAState = false` for the same reason. Nothing in it is evidence about
+the current tree. The three defect fixes since then are code-verified only.
+
+**Environment note for the next tick.** `/etc/profile.d/omnion-qa-limits.sh` sets
+`QA_SLOT_WAIT=3600`, so a pass waits **an hour** for the box-wide slot, not the 900 s the script
+defaults to. This pass started at 20:17 and was still queued at 21:00 behind w6. Two stale `run.sh`
+wrappers of **this** worktree (ticks 15 and 17) were still alive and queued on the *same* ports
+(18083/3103/3203) — two passes that would have collided on startup. Killed both; the trap in
+`run.sh` is the only thing that frees a place, so a killed wrapper's place file needs the reaper's
+`QA_SLOT_REAP_GRACE` (120 s) to lapse. **Check `pgrep -f 'omnion-w4.*run.sh'` before starting a
+pass** — a queue entry is not a no-op.
+
+**Next.** The pass carrying `everyAdvertisedGoKeyNavigates` and the six `*_doesNotClaimToBeEmpty`
+keys has still not run. Read `crmStates` and `crmKeyboardMobile` from the newest w4 report; only
+then tick the two remaining boxes and set REQ-051 to `done`. Then REQ-052 (sales & quotes).
