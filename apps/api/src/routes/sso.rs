@@ -35,6 +35,7 @@ use omnion_identity::sso::challenges::{self, SsoChallenge};
 use omnion_identity::sso::claims::{self, Identity};
 use omnion_identity::sso::mappings;
 use omnion_identity::sso::oidc::{self, Discovery, HttpClient, MetadataCache, VerifiedAssertion};
+use omnion_identity::sso::protocol_steps;
 use omnion_identity::sso::providers::{self, AuthProvider, ProviderKind};
 use omnion_identity::sso::provisioning::{self, ProvisionOutcome};
 use omnion_identity::sso::saml::{self, SamlConfig};
@@ -1284,6 +1285,24 @@ async fn discovery_for(provider: &AuthProvider) -> Result<Discovery, ApiError> {
             format!("the provider's discovery document is incomplete: {error}"),
         )
     })?;
+    // The document says who it *is*; the row says who it was configured to be. RFC 8414 requires
+    // those to match, and the whole security of OIDC rests on it — a document served by the
+    // configured host that names a different issuer is a host serving somebody else's identity.
+    //
+    // It is checked *here*, in the one function every code path reads the document through, and
+    // not in the caller: a check a caller can forget is a check that eventually is. The metadata
+    // cache makes that concrete — a document fetched once is served to every later sign-in, so a
+    // mismatch the `Test connection` button reports and the callback ignores is a mismatch an
+    // operator has been told about and nothing has acted on. Same function, same verdict.
+    protocol_steps::require_issuer(&discovery, config_text(provider, "issuer").as_deref()).map_err(
+        |error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "provider_misconfigured",
+                error.to_string(),
+            )
+        },
+    )?;
     cache.put(&key, document);
     Ok(discovery)
 }
