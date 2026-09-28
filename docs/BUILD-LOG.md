@@ -3209,3 +3209,46 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
 >>>>>>> origin/main
+
+## 2026-09-28 — REQ-004 slice 2 · the interaction depth, and a merge that nearly became a boot failure
+
+**Merged main first, and it was not a formality.** main shipped `0050_notifications.sql` inside
+the same window this branch had claimed `0050_workflow_graph.sql`. Both files are valid SQL and
+both sit in the tree after the merge, so every static check passes; sqlx keys its ledger on the
+*number*, so the API refuses to boot with a line about a migration that is not in the migration
+list. The graph migration is now `0051`, its header and the REQ reference with it, and
+`ls database/migrations | awk -F_ '{print $1}' | sort | uniq -d` is empty.
+
+Three conflicts, read before resolved: the lucide import is a genuine union (the merged NAV
+uses both `Workflow` and `Bell`); `admin/lib/api.ts` is append-only with zero symbol overlap
+(15 graph exports against 9 notification exports), so both halves are kept verbatim;
+`BUILD-LOG.md` was concatenated and verified by multiset against each half — nothing dropped.
+
+**What shipped.** `builder-history.ts`: a snapshot history, not a delta. Coalesces a gesture by
+key and time; a change that changes nothing is not an entry; a fresh edit discards the redo
+future; undo returns the state *before* the last change (the off-by-one that reads `cursor - 1`
+gets exactly backwards). Wired into the builder as one `commit(key, before, nodes, edges)`
+choke-point, so a rename, a nudge, a three-node delete, a paste and an auto-layout are each one
+press. Toolbar: Undo, Redo, Duplicate, Copy, Paste, Auto layout, Minimap. Keys: Ctrl+Z,
+Ctrl+Shift+Z, Ctrl+Y, Ctrl+C, Ctrl+V, Ctrl+D, Escape.
+
+**Proof.**
+- `pnpm --filter @omnion/admin test` — 12/12. The first run caught a real defect in my own
+  module: `snapshotOf` copied shallowly, so a drag still in progress mutated the history's idea
+  of "before" and undo would have restored a position the user had moved on from.
+- `pnpm --filter @omnion/admin typecheck` — clean.
+- `cargo check -p omnion-api --all-targets` — clean (4m16s; warnings only, all in files this
+  branch does not own).
+- The API binary was rebuilt and verified to embed 0051 (`strings … | grep workflows_graph_is_object`
+  → 2) before any pass was run. The pass that ran against the *previous* tick's binary would
+  have been green and wrong.
+
+**The QA gate did not run — it is queued, not passed.** w6 holds the single QA slot with a live
+walkthrough; this pass waited the full window with its own stack never up, so the artifact
+directory is empty and there is no result to read. That is a no-result run, not a red one, and
+the slice stays in-progress. Slice 2 therefore does **not** close: the browser has still never
+seen the minimap, the marquee or an undo.
+
+**Next.** Re-run the w3 pass first — the builder's interaction depth is unproven in a browser.
+Then: `⌘A` and `Shift+click`, palette keyboard-add, edge selection and `Del` on an edge, and the
+inspector's expression autocomplete.
