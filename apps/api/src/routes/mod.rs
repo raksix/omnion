@@ -87,6 +87,7 @@ pub mod automation;
 pub mod commands;
 pub mod content;
 pub mod crm;
+pub mod crm_activities;
 pub mod crm_deals;
 pub mod crm_views;
 pub mod health;
@@ -782,7 +783,38 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "crm.pipelines.manage"));
 
+    // Activities and the merged timeline. Reading the feed and reading one record's history are
+    // the same exposure, so they share `crm.activities.read` — a separate "timeline" key would
+    // let a caller read a contact's history through a deal screen while being refused on the
+    // contact itself. Writing is its own decision: the feed is the only place a CRM record's
+    // history can be *added* to.
+    let crm_activities_read = Router::new()
+        .route("/crm/activities", get(crm_activities::list_activities))
+        // Three explicit paths rather than `/crm/{record}/{id}/timeline`: the wildcard form
+        // would sit in the same segment tree as `/crm/deals/{id}/stage`, and a param-at-param
+        // match in that position is a route table that only one of the two can win.
+        .route(
+            "/crm/contacts/{id}/timeline",
+            get(crm_activities::contact_timeline),
+        )
+        .route(
+            "/crm/companies/{id}/timeline",
+            get(crm_activities::company_timeline),
+        )
+        .route("/crm/deals/{id}/timeline", get(crm_activities::deal_timeline))
+        .route_layer(guards::require(&state, "crm.activities.read"));
+
+    let crm_activities_create = Router::new()
+        .route("/crm/activities", post(crm_activities::create_activity))
+        .route(
+            "/crm/activities/{id}/done",
+            post(crm_activities::complete_activity),
+        )
+        .route_layer(guards::require(&state, "crm.activities.create"));
+
     let crm = crm_read
+        .merge(crm_activities_read)
+        .merge(crm_activities_create)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)

@@ -654,3 +654,152 @@ export function saveCrmPipelineStages(pipelineId: string, stages: CrmStageInput[
     body: JSON.stringify({ stages }),
   });
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Activities and the merged timeline (REQ-051, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** The four kinds an activity can be. The order the form offers them. */
+export const CRM_ACTIVITY_KINDS = ["call", "meeting", "note", "task"] as const;
+
+/** One of the four kinds. */
+export type CrmActivityKind = (typeof CRM_ACTIVITY_KINDS)[number];
+
+/** A logged activity: a call, a meeting, a note or a task hung off a record. */
+export type CrmActivity = {
+  id: string;
+  organization_id: string;
+  kind: string;
+  subject: string;
+  body: string;
+  company_id: string | null;
+  contact_id: string | null;
+  deal_id: string | null;
+  occurred_at: string;
+  due_at: string | null;
+  done_at: string | null;
+  owner_user_id: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Which of the three sources produced a timeline entry. */
+export type CrmTimelineSource = "activity" | "stage_change" | "archived";
+
+/**
+ * One row of a record's merged timeline.
+ *
+ * A union with a tag: the three sources carry different fields, and the fields an arm does not
+ * fill are **absent** rather than `null`, so a client can tell "there is no body" from "the body
+ * is an empty string".
+ */
+export type CrmTimelineEntry = {
+  id: string;
+  source: CrmTimelineSource;
+  occurred_at: string;
+  kind?: string;
+  subject?: string;
+  body?: string;
+  attached_to?: "contact" | "company" | "deal";
+  attached_id?: string;
+  due_at?: string;
+  done_at?: string;
+  owner_user_id?: string | null;
+};
+
+/** The feed's query: the shared list contract plus the two filters only activities have. */
+export type CrmActivityQuery = CrmListQuery & {
+  kind?: string;
+  done?: "open" | "done";
+};
+
+/** What a person logs. `company_id` / `contact_id` / `deal_id` — exactly one of them. */
+export type CrmActivityInput = {
+  kind: CrmActivityKind;
+  subject: string;
+  body?: string;
+  company_id?: string | null;
+  contact_id?: string | null;
+  deal_id?: string | null;
+  occurred_at?: string;
+  due_at?: string | null;
+  done_at?: string | null;
+};
+
+/** The feed, newest first. */
+export function fetchCrmActivities(
+  query: CrmActivityQuery = {},
+): Promise<CrmPage<CrmActivity>> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+  }
+  const suffix = params.toString();
+  return crmRequest(`/api/v1/crm/activities${suffix ? `?${suffix}` : ""}`);
+}
+
+/** Log an activity. */
+export function createCrmActivity(input: CrmActivityInput): Promise<CrmActivity> {
+  return crmRequest("/api/v1/crm/activities", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Close a task, or open it again. */
+export function setCrmActivityDone(id: string, done: boolean): Promise<CrmActivity> {
+  return crmRequest(`/api/v1/crm/activities/${id}/done`, {
+    method: "POST",
+    body: JSON.stringify({ done }),
+  });
+}
+
+/**
+ * The merged timeline of one record.
+ *
+ * Three explicit paths rather than a template: `/crm/{record}/{id}/timeline` would sit in the
+ * same segment tree as `/crm/deals/{id}/stage` and the two cannot both win, so the client spells
+ * the record out and the server never has to guess which one it was asked for.
+ */
+export function fetchCrmTimeline(
+  record: "contact" | "company" | "deal",
+  id: string,
+  limit = 50,
+): Promise<CrmPage<CrmTimelineEntry>> {
+  const plural = record === "company" ? "companies" : `${record}s`;
+  return crmRequest(`/api/v1/crm/${plural}/${id}/timeline?limit=${limit}`);
+}
+
+/**
+ * A short, human relative time — the same rounding the API's own label uses.
+ *
+ * Duplicated on purpose rather than shipped as a field: a label is a *presentation* decision, and
+ * a timeline that renders "5m ago" in the browser and "5 minutes ago" in an export is two
+ * spellings of one idea. Ordering always uses `occurred_at`, never this string.
+ */
+export function relativeTime(iso: string, at: Date = new Date()): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  // `then - now` is negative for a timestamp in the past, so the future is the positive side.
+  // (This is the same rounding the API's own `relative_label` does — see the module's note on the
+  // sign, which two unit tests had to pin down.)
+  const seconds = Math.round((then - at.getTime()) / 1000);
+  const magnitude = Math.abs(seconds);
+  if (magnitude <= 44) return "just now";
+  // The same buckets as the module's `relative_label`, in the same order and with the same
+  // boundaries, so the API and the browser cannot spell one idea two ways. Each bucket ends one
+  // second before the next begins — which is why "N m" starts at 45 and not at 60.
+  const [value, unit] =
+    magnitude < 3600
+      ? [Math.floor(magnitude / 60), "m"]
+      : magnitude < 86_400
+        ? [Math.floor(magnitude / 3600), "h"]
+        : magnitude < 2_592_000
+          ? [Math.floor(magnitude / 86_400), "d"]
+          : magnitude < 5_184_000
+            ? [Math.floor(magnitude / 604_800), "w"]
+            : [Math.floor(magnitude / 2_629_800), "mo"];
+  return seconds > 0 ? `in ${value}${unit}` : `${value}${unit} ago`;
+}
