@@ -1021,3 +1021,114 @@ export const NOTIFICATION_TIMEZONES = [
   "Asia/Tokyo",
   "Australia/Sydney",
 ] as const;
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3: the half that leaves the panel
+// ---------------------------------------------------------------------------------------------
+
+/** The four states a delivery can be in. A closed list, so the filter chips are exhaustive. */
+export const NOTIFICATION_DELIVERY_STATUSES = [
+  "pending",
+  "sent",
+  "failed",
+  "skipped",
+] as const;
+
+export type NotificationDeliveryStatus = (typeof NOTIFICATION_DELIVERY_STATUSES)[number];
+
+/**
+ * One row of the organization's delivery log.
+ *
+ * **There is no `title` and no `body` here, and that is the design.** An administrator opening
+ * the outbox during an incident needs to know *that* a delivery failed and *whose* it was — the
+ * content is a customer record, and this is the screen with the widest audience in the panel.
+ * The server's type cannot express it either, so adding a field is a visible review event rather
+ * than a "let's just show it" at the end of a feature.
+ */
+export type NotificationOutboxRow = {
+  id: string;
+  notification_id: string;
+  category: string;
+  priority: string;
+  user_id: string;
+  channel: string;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  max_attempts: number;
+  response_status: number | null;
+  error: string | null;
+  sent_at: string | null;
+  created_at: string;
+};
+
+/** The counts behind the filter chips, plus the total so a chip need not add them up itself. */
+export type NotificationOutboxCounts = {
+  pending: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  total: number;
+};
+
+/** The outbox answer: a page, the counts, and how far back the log reaches. */
+export type NotificationOutbox = {
+  rows: NotificationOutboxRow[];
+  counts: NotificationOutboxCounts;
+  retention_days: number;
+};
+
+/**
+ * One registered browser, as the devices list shows it.
+ *
+ * `endpoint_hint` is `…abcdef01` — enough for a reader to recognise their own phone, useless to
+ * somebody who screenshots the screen. The full endpoint is a capability key and the server
+ * never sends it back.
+ */
+export type NotificationDevice = {
+  id: string;
+  endpoint_hint: string;
+  user_agent: string | null;
+  created_at: string;
+  last_seen_at: string;
+};
+
+/** What registering a browser did — the four outcomes, not a boolean. */
+export type NotificationPushOutcome = "created" | "refreshed" | "reassigned" | "re-keyed";
+
+/** What a channel can do on this installation, and why. */
+export type NotificationChannelReadiness = {
+  channel: string;
+  available: boolean;
+  locked: boolean;
+  detail: string;
+};
+
+/** The four shapes a routing rule can address. Kept as data for the form's select. */
+export const NOTIFICATION_RECIPIENT_SHAPES = [
+  { value: "actor", label: "The actor who caused it", needsTarget: false },
+  { value: "permission:", label: "Everybody holding a permission", needsTarget: true },
+  { value: "role:", label: "Everybody with a role", needsTarget: true },
+  { value: "payload_user:", label: "The user named in the payload", needsTarget: true },
+] as const;
+
+/** One rule of the router: an event name, a category, and who hears about it. */
+export type NotificationRouteRule = {
+  id: string;
+  event_name: string;
+  category: string;
+  priority: string;
+  recipient: string;
+  title_template: string;
+  url_template: string | null;
+  enabled: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+
+/** What one routing pass did — the counts are the whole point of the answer. */
+export type NotificationRouteReport = {
+  created: number;
+  deduped: number;
+  unmatched_rules: number;
+  unknown_event: boolean;
+};
