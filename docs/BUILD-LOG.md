@@ -2657,3 +2657,79 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+## 2026-09-28 — REQ-117 · Forms → CRM lead pipeline (slice 1: capture and the mapping)
+
+- A lead does not come from the CRM; it comes from a form on somebody's website. This slice is
+  the seam. `modules/crm-intake` (a new module crate, not a core crate — see docs/04) owns the
+  sources that bind a capture surface to a pipeline, the mapping that fills a lead, the dedupe
+  verdict and the trail. Migration **`0051_crm_lead_intake.sql`**: `crm_intake_sources`,
+  `crm_leads`, `crm_lead_events`.
+
+- **The migration number is `0051`, not the spec's `0121`.** The ledger is append-only and
+  shared across nine writers; main's high-water is `0050`, and `0121` is a number the
+  content/commerce band is expected to take. Reserving a number I cannot see would collide the
+  next time two writers pick the same one. Noted in the REQ.
+
+- **Four decisions, each a shortcut that produces a plausible wrong answer.**
+  1. *A rejected submission is a row, not a hole.* Spam and unmappable submissions are stored
+     with `status`/`decision`/`rejection_reason`/`spam_score`. A form that starts rejecting
+     everything then looks like a form nobody submitted — the one failure an operator cannot
+     diagnose.
+  2. *The public endpoint will say nothing it does not have to.* The capture path answers one
+     shape whatever the verdict was; a response that distinguished "linked" from "new" teaches
+     an attacker which addresses are already in the CRM.
+  3. *Every verdict carries its reason.* The matched key and the score, the transform that
+     cleaned a value, the heuristic that judged a submission. The first time an operator is
+     wrong about one they stop trusting the inbox.
+  4. *Closed lists, checked against the migration.* Statuses, decisions, kinds, policies,
+     targets and transforms are Rust constants, and `vocabulary.rs` carries the test that
+     *reads the SQL file*. A status in Rust and not in SQL passes every unit test in the crate
+     and is then refused by the database — which reads as "nothing happened".
+
+- **The dedupe key is the whole slice, and it had two wrong answers in the first draft.**
+  `company_domain` returned the *last label*, which made `acme.com` and `acme.com.tr` — and
+  every other `.com` on earth — the same company. It now returns the full host
+  (`acme.com.tr`), because the narrower versions are wrong in the expensive direction: merging
+  two unrelated companies costs a real deal. And a filled honeypot scored 60 against a
+  threshold of 70, so the *most certain* signal the module has filed as a lead; it is now 100,
+  because the field is hidden and empty in a real browser and there is no legitimate case. The
+  weak signals (fast fill 40, wide payload 20) deliberately stay *under* the bar together —
+  60 is not a verdict, and a form that discards a hurried real visitor loses business.
+
+- **`strip_html` keeps the text inside a `<script>`.** The first version removed the tags and
+  left `alert(1)` behind, which is exactly what the transform exists to prevent. It now drops
+  the *content* of `script` and `style` the way a browser does, and treats an unterminated `<`
+  as text — a visitor who typed "a < b" should not lose the rest of their message.
+
+- **Module-absence degradation is designed.** `fetch_candidates` reads `crm_contacts`, which
+  belongs to REQ-051 on another writer's branch. A `42P01 undefined_table` is swallowed with a
+  warning and the submission is captured without matching; anything else propagates. An
+  installation without the CRM module must not answer `500` to every visitor's form.
+
+- **Proof.** `cargo test -p omnion-module-crm-intake` → **65 passed**;
+  `cargo clippy --all-targets` → **0 warnings**; `cargo fmt` clean.
+  `scripts/qa/run-crm-intake.sh` → **PASS**: 32 migrations applied in order, 3 tables, 7
+  indexes, and the nine refusals the crate relies on — a lead with no e-mail and no phone,
+  `status 'won'`, `decision 'maybe'`, `kind 'webhook'`, `dedupe policy 'always'`, a payload
+  over 256 KiB, a spam score over 100, a rate limit of 0, a second source of the same name —
+  plus the cascade: deleting a lead takes its trail and nulls the pointers *into* it without
+  deleting the rows that pointed at it.
+
+- **And the gate had to be fixed before it could be believed.** Its first version used
+  `returning … \gset` to capture the lead id; the `\gset` failed, the four statements after it
+  were syntax errors, and the script still printed `PASS`. Every `psql` call now goes through
+  one `PSQL` array that carries `ON_ERROR_STOP=1`, every answer is *compared* rather than
+  printed, and the values are read back from the database rather than grepped out of the
+  transcript. Proven by weakening the migration (`payload_bytes` ceiling removed) and watching
+  the gate fail with the right message.
+
+- **Not done in this slice, on purpose:** the router (`/api/v1/crm/intake/{key}`, the inbox,
+  the source editor), the admin screens and the walkthrough routes. Slice 1's "done when" is
+  acceptance 1–7 and 15–16 *plus* a public form submission landing as a lead — the HTTP path
+  is part of that line, so the slice is not closed here.
+
+- **Next.** The router and the event consumer: `apps/api/src/routes/crm_intake.rs`, the
+  `content.form.submitted` listener, the public keyed endpoint with its `202`/`401`/`429`
+  answers, and the permission family (`crm.leads.read`, `crm.leads.manage`, `crm.intake.manage`).
+  Then the three screens and the walkthrough routes, which is where the slice closes.

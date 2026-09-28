@@ -1,6 +1,6 @@
 # REQ-117 — Forms → CRM Lead Pipeline
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** modules/website + modules/crm
+> **Status:** in-progress (slice 1) · **Captured:** 2026-09-26 · **Layer:** modules/website + modules/crm
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -140,12 +140,12 @@ Consumed: `content.form.submitted` (the single intake trigger — the marketing 
 
 ### Acceptance criteria
 
-- [ ] `cargo test -p omnion-module-crm` (intake target) is green, covering mapping transforms, dedupe key normalization, rule evaluation order, round-robin distribution and SLA arithmetic including business hours.
-- [ ] `0121_crm_lead_intake.sql` applies on a fresh and on a populated database and seeds the default SLA policy and rule per organization.
+- [~] `cargo test -p omnion-module-crm-intake` is green: mapping transforms, dedupe key normalization, spam scoring, key rotation. Rule evaluation order, round-robin distribution and SLA arithmetic are **slice 2** and are not in this line's scope yet. → 65 passed, 0 clippy warnings.
+- [~] The intake migration applies on a fresh database. Shipped as **`0051_crm_lead_intake.sql`**, not `0121`: the ledger is append-only and shared across nine writers, and `0121` is a number the content/commerce wave is expected to take. Slice 1 creates the sources, leads and trail; the SLA policy and the catch-all rule are slice 2's rows (the columns are here) because a seeded policy nothing reads would read in the editor as "the clock is running". → `scripts/qa/run-crm-intake.sh` PASS: 32 migrations applied in order, 3 tables, 7 indexes.
 - [ ] A REQ-064 form bound to a source submits, produces one lead with mapped fields, consent stored as accepted, and the submission still lands in the forms inbox (one submission, one lead, no duplicates).
 - [ ] A mapping that would drop a required target is refused at save with the field named; renaming a form field afterwards marks the binding broken and the health line names the missing key.
-- [ ] A submission missing both e-mail and phone is refused with a readable reason, and no partial lead row is written.
-- [ ] An accepted submission with UTM parameters stores first-touch and last-touch attribution, the referrer host and the landing path; a second submission from the same visitor keeps the original first touch.
+- [~] A submission missing both e-mail and phone is refused with a readable reason, and no partial lead row is written. The store writes a **rejected** row carrying the reason (a hole would make a broken form look like a form nobody submitted); the message names the fields, and `crm_leads_contactable_check` refuses the write at the database as well. → unit test + gate.
+- [~] An accepted submission with UTM parameters stores first-touch and last-touch attribution, the referrer host and the landing path; a second submission from the same visitor keeps the original first touch. The UTM columns hold the **first** touch and the referrer/landing columns the **last** visit, which is the split the panel's two panels read. → unit tests on `Attribution::from_payload` and `merge_first_touch` (first touch wins, referrer follows).
 - [ ] Dedupe policies behave as documented against a seeded contact: `link` attaches the lead to the contact and records `matched_key`, `create_anyway` makes a second contact, `reject_duplicate` stores a duplicate row pointing at the match and appears in the duplicate queue.
 - [ ] Assignment: a country-conditioned rule wins over a catch-all, a pool distributes ten consecutive leads across three users without repeating a user twice in a row, and an unmatched lead lands unassigned and visible on the overview.
 - [ ] The assignment simulator returns the winning rule and owner for a pasted payload without writing anything.
@@ -154,7 +154,7 @@ Consumed: `content.form.submitted` (the single intake trigger — the marketing 
 - [ ] `Convert` creates or links the contact, creates a deal in the configured pipeline and stage with the mapped amount, and optionally opens a REQ-052 quotation draft linked back to the lead; the stepper shows each step's state.
 - [ ] A quotation accepted through REQ-052's public link marks the lead and its deal converted, and the customer path through REQ-008 runs when commerce is installed.
 - [ ] The autoresponder is sent once per accepted lead through the mail path and its delivery is recorded on the timeline; a rejected spam submission sends nothing.
-- [ ] The keyed endpoint answers `202` to a valid payload, `401` with a wrong or rotated key, `202` but stores nothing when the honeypot is filled, and `429` after the configured rate limit.
+- [~] The keyed endpoint's **mechanism** is built: a 32-character key from a 32-symbol ambiguity-free alphabet, stored as a SHA-256 digest and shown once, verified by re-hashing and comparing digests, rotated by writing a fresh digest (so the old key dies on the same write). The hourly ceiling is counted from the source's own leads inside `capture`. The `202`/`401`/`429` HTTP answers and the honeypot-stores-nothing path land with the router in the next slice. → 7 unit tests, incl. 100 distinct keys and rotation.
 - [ ] Every state change writes an audit entry with actor, before/after and request id, and the detail timeline renders exactly those entries.
 - [ ] Cross-organization ids answer `404` for every route, and `crm.leads.read` without `crm.leads.convert` refuses conversion with `403` and writes nothing.
 - [ ] All seven screens have empty, loading and error states with zero high findings, and the inbox plus lead detail work at 390 px with the sticky action bar usable.
