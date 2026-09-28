@@ -17,6 +17,8 @@
 pub mod client;
 pub mod connection_test;
 pub mod error;
+pub mod health;
+pub mod health_store;
 pub mod model;
 pub mod protocol;
 pub mod router;
@@ -26,8 +28,8 @@ pub use client::{
     ChatEvent, ChatMessage, ChatOutcome, ChatRequest, ChatRole, ChatUsage, ProviderTarget, chat,
     list_remote_models, stream_chat, validate_request,
 };
+pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
 pub use error::{AiHubError, Result};
-pub use connection_test::{TestReport, TestStep, StepStatus, run_test as test_provider};
 pub use model::{
     AiModel, ApiKeyChange, DEFAULT_PROTOCOL, DiscoveryAction, DiscoveryDiff, DiscoveryLine,
     HEALTH_STATUSES, MAX_MODEL_KEY_LEN, MAX_NAME_LEN, MAX_PRIORITY, MAX_RETRIES_CEILING,
