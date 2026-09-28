@@ -35,6 +35,8 @@ const ADMIN_PERMISSIONS: [&str; 3] = ["cdn.read", "cdn.manage", "cdn.purge"];
 
 struct TestResponse {
     status: StatusCode,
+    /// The `Set-Cookie` value, when the response set one.
+    set_cookie: Option<String>,
     body: Value,
 }
 
@@ -43,7 +45,17 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .oneshot(request)
         .await
         .expect("router must answer");
+
     let status = response.status();
+    // The session token arrives in a cookie and *nowhere else* — the login body carries no
+    // `token` field. A harness that reads `body["token"]` therefore reports "the fixture
+    // account cannot sign in" for a login that succeeded, which is how this suite looked
+    // like sixteen product failures instead of one broken helper.
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let bytes = response
         .into_body()
         .collect()
@@ -55,7 +67,11 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    TestResponse { status, body }
+    TestResponse {
+        status,
+        set_cookie,
+        body,
+    }
 }
 
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
@@ -296,14 +312,23 @@ async fn login(state: &AppState, email: &str) -> String {
         ),
     )
     .await;
-    assert!(
-        response.status.is_success(),
-        "the fixture account must be able to sign in: {}",
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "login body: {}",
         response.body
     );
-    response.body["token"]
-        .as_str()
-        .expect("the login response carries a token")
+    // Read the token out of the cookie, not out of `body["token"]`: the login response has
+    // no such field, so the old helper reported a successful sign-in as a failed fixture.
+    response
+        .set_cookie
+        .expect("login must set the session cookie")
+        .split(';')
+        .next()
+        .expect("the cookie has a value")
+        .split_once('=')
+        .expect("the cookie is name=value")
+        .1
         .to_string()
 }
 
@@ -425,8 +450,8 @@ async fn an_empty_name_is_refused_with_a_message_under_the_name_field() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.body["code"], "invalid_cache_rule");
-    assert_eq!(response.body["details"]["field"], "name");
+    assert_eq!(response.body["error"]["code"], "invalid_cache_rule");
+    assert_eq!(response.body["error"]["details"]["field"], "name");
     fixture.cleanup().await;
 }
 
@@ -450,8 +475,8 @@ async fn a_malformed_pattern_is_refused_and_names_the_pattern_field() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.body["code"], "invalid_path_pattern");
-    assert_eq!(response.body["details"]["field"], "path_pattern");
+    assert_eq!(response.body["error"]["code"], "invalid_path_pattern");
+    assert_eq!(response.body["error"]["details"]["field"], "path_pattern");
     fixture.cleanup().await;
 }
 
@@ -476,8 +501,8 @@ async fn a_ttl_above_the_one_year_cap_is_refused_and_names_the_ttl_field() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.body["code"], "invalid_ttl");
-    assert_eq!(response.body["details"]["field"], "edge_ttl_seconds");
+    assert_eq!(response.body["error"]["code"], "invalid_ttl");
+    assert_eq!(response.body["error"]["details"]["field"], "edge_ttl_seconds");
     fixture.cleanup().await;
 }
 
@@ -501,7 +526,7 @@ async fn a_duplicate_name_on_the_same_site_is_refused() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.body["code"], "duplicate_rule_name");
+    assert_eq!(response.body["error"]["code"], "duplicate_rule_name");
     fixture.cleanup().await;
 }
 
@@ -561,10 +586,11 @@ async fn a_reorder_persists_the_new_precedence() {
         .iter()
         .map(|rule| rule["id"].as_str().expect("an id"))
         .collect();
-    let mut reversed = ids.clone();
-    reversed.reverse();
+    // `ids` is the order the client SENT (the reverse of the order it read). That is the
+    // order the store must now report. Comparing against the order it started in would
+    // pass for a store that ignored the request entirely and fail for one that obeyed it.
     assert_eq!(
-        after_ids, reversed,
+        after_ids, ids,
         "the order the client sent is the order stored"
     );
     let priorities: Vec<i64> = after
@@ -594,7 +620,7 @@ async fn a_reorder_that_omits_a_rule_is_refused_and_changes_nothing() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.body["code"], "incomplete_reorder");
+    assert_eq!(response.body["error"]["code"], "incomplete_reorder");
 
     let after = rules_of(&fixture.state, &fixture.token_a, fixture.site_a).await;
     assert_eq!(
@@ -652,7 +678,7 @@ async fn another_organizations_rule_is_neither_readable_nor_writable() {
     )
     .await;
     assert_eq!(read.status, StatusCode::FORBIDDEN, "{}", read.body);
-    assert_eq!(read.body["code"], "permission_denied");
+    assert_eq!(read.body["error"]["code"], "permission_denied");
 
     // ...nor change it, even while naming its own site.
     let write = call(
@@ -715,7 +741,7 @@ async fn a_caller_without_the_cdn_keys_is_refused() {
     )
     .await;
     assert_eq!(response.status, StatusCode::FORBIDDEN, "{}", response.body);
-    assert_eq!(response.body["code"], "permission_denied");
+    assert_eq!(response.body["error"]["code"], "permission_denied");
 
     sqlx::query("delete from users where id = $1")
         .bind(user.id)
@@ -741,6 +767,12 @@ async fn the_two_settings_rows_are_both_allowed_and_the_platform_row_is_unique()
         .execute(pool)
         .await
         .expect("a site row must insert");
+    // The platform row is installation-wide and survives `cleanup`, so a leftover from a
+    // previous run would be refused here and read as the partial index being broken.
+    sqlx::query("delete from cdn_settings where site_id is null")
+        .execute(pool)
+        .await
+        .expect("a stale platform row must be removable");
     sqlx::query("insert into cdn_settings (site_id, provider) values (null, 'origin')")
         .execute(pool)
         .await
@@ -781,7 +813,7 @@ async fn a_mutation_writes_an_audit_entry_naming_the_actor_and_the_action() {
         return;
     };
     let before: i64 =
-        sqlx::query_scalar("select count(*) from audit_entries where action = 'cdn.rule.changed'")
+        sqlx::query_scalar("select count(*) from audit_log where action = 'cdn.rule.changed'")
             .fetch_one(fixture.db.pool())
             .await
             .expect("audit table must be readable");
@@ -802,7 +834,7 @@ async fn a_mutation_writes_an_audit_entry_naming_the_actor_and_the_action() {
     .await;
 
     let entry: (String, Option<Uuid>, Option<String>) = sqlx::query_as(
-        "select action, actor_user_id, ip_address from audit_entries \
+        "select action, actor_user_id, ip_address from audit_log \
          where action = 'cdn.rule.changed' order by created_at desc limit 1",
     )
     .fetch_one(fixture.db.pool())
@@ -811,10 +843,11 @@ async fn a_mutation_writes_an_audit_entry_naming_the_actor_and_the_action() {
     assert_eq!(entry.0, "cdn.rule.changed");
     assert_eq!(entry.1, Some(fixture.admin_a), "the actor is recorded");
     let after: i64 =
-        sqlx::query_scalar("select count(*) from audit_entries where action = 'cdn.rule.changed'")
+        sqlx::query_scalar("select count(*) from audit_log where action = 'cdn.rule.changed'")
             .fetch_one(fixture.db.pool())
             .await
             .expect("audit table must be readable");
     assert_eq!(after, before + 1);
     fixture.cleanup().await;
 }
+
