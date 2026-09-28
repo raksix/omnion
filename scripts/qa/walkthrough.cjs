@@ -1263,7 +1263,11 @@ async function runCommandCenter(page, report) {
   await page.waitForTimeout(800);
   const confirmShown = (await page.locator("[data-palette-confirm]").count()) === 1;
   const confirmText = confirmShown
-    ? (await page.locator("[data-palette-confirm]").first().innerText())
+    ? (await page
+        .locator("[data-palette-confirm]")
+        .first()
+        .innerText({ timeout: 5000 })
+        .catch(() => ""))
         .replace(/\s+/g, " ")
         .trim()
     : "";
@@ -1288,7 +1292,11 @@ async function runCommandCenter(page, report) {
   await page.waitForTimeout(3800);
   const doneShown = (await page.locator('[data-palette-run-result="done"]').count()) === 1;
   const doneText = doneShown
-    ? (await page.locator('[data-palette-run-result="done"]').first().innerText())
+    ? (await page
+        .locator('[data-palette-run-result="done"]')
+        .first()
+        .innerText({ timeout: 5000 })
+        .catch(() => ""))
         .replace(/\s+/g, " ")
         .trim()
     : "";
@@ -3973,7 +3981,11 @@ async function runBlockEditorDepth(page, report) {
   const imageBlock = page.locator("[data-block-canvas-block=image]").first();
   steps.imageNeedsAttention =
     (await imageBlock.getAttribute("data-block-has-error").catch(() => "false")) === "true";
-  steps.publishDisabledOnError = await page.locator("[data-block-publish]").isDisabled();
+  steps.publishDisabledOnError = await page
+    .locator("[data-block-publish]")
+    .first()
+    .isDisabled({ timeout: 5000 })
+    .catch(() => null);
   steps.issueMessages = await page.locator("[data-block-issues] li").count();
   await shot(page, "page-block-editor-validation");
 
@@ -4005,7 +4017,11 @@ async function runBlockEditorDepth(page, report) {
   await page.waitForTimeout(1000);
   steps.clearedAfterFix =
     (await blockStatus("data-block-errors")) === "0";
-  steps.publishEnabledAfterFix = !(await page.locator("[data-block-publish]").isDisabled());
+  steps.publishEnabledAfterFix = !(await page
+      .locator("[data-block-publish]")
+      .first()
+      .isDisabled({ timeout: 5000 })
+      .catch(() => true));
   note("fixed the blocking issue in the field");
 
   // ---- Reorder, duplicate, delete ------------------------------------------------------------
@@ -4132,7 +4148,11 @@ async function runBlockEditorDepth(page, report) {
   // A heading-order warning must never stop a publish: it is advisory by construction.
   steps.outlineWarningIsNotBlocking =
     (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0" &&
-    !(await page.locator("[data-block-publish]").isDisabled());
+    !(await page
+      .locator("[data-block-publish]")
+      .first()
+      .isDisabled({ timeout: 5000 })
+      .catch(() => true));
   await shot(page, "page-block-editor-heading-order");
   note("provoked a heading-order warning");
 
@@ -4483,8 +4503,15 @@ async function runBlockEditorDepth(page, report) {
     // dirty, and the save names the revision the server actually wrote.
     await page.locator("[data-block-preview-toggle-edit]").first().click({ timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(700);
+    // Guarded for the same reason as every read above: the toggle is absent on a page whose
+    // draft has no text blocks, and an unguarded read of a missing element throws after 30s
+    // and takes the whole pass with it.
     steps.previewEditingOn =
-      (await page.locator("[data-block-preview-toggle-edit]").getAttribute("aria-pressed")) === "true";
+      (await page
+        .locator("[data-block-preview-toggle-edit]")
+        .first()
+        .getAttribute("aria-pressed", { timeout: 5000 })
+        .catch(() => null)) === "true";
     const field = page.locator("[data-block-inline-field]").first();
     steps.previewInlineFields = await page.locator("[data-block-inline-field]").count();
     if ((await field.count()) > 0) {
@@ -4495,7 +4522,11 @@ async function runBlockEditorDepth(page, report) {
     }
     steps.previewDirtyAfterTyping =
       (await previewStatus("data-block-preview-dirty")) === "true";
-    steps.previewSaveEnabled = !(await page.locator("[data-block-preview-save]").isDisabled());
+    steps.previewSaveEnabled = !(await page
+      .locator("[data-block-preview-save]")
+      .first()
+      .isDisabled({ timeout: 5000 })
+      .catch(() => true));
     await shot(page, "page-block-preview-editing");
 
     // The save. The number in the toast is the assertion: it must name a revision HIGHER than
