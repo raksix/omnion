@@ -92,6 +92,7 @@ pub mod readyz;
 pub mod scim;
 pub mod search;
 pub mod secrets;
+pub mod secrets_audit;
 pub mod secrets_credentials;
 pub mod secrets_leases;
 pub mod sso;
@@ -781,6 +782,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "secrets.deploykeys.manage"));
 
+    // slice 4. The audit surface is its own permission (`secrets.audit`) and deliberately not
+    // `secrets.read`: reading which secrets an account has touched, from which address and
+    // under which request id is a bigger question than reading the list of secrets, and one
+    // operator should be able to grant the first without the second.
+    let secrets_audit = Router::new()
+        .route("/secrets/audit", get(secrets_audit::read_audit))
+        .route("/secrets/audit/export", get(secrets_audit::export_audit))
+        .route(
+            "/secrets/audit/anomalies",
+            get(secrets_audit::read_anomalies),
+        )
+        .route(
+            "/secrets/audit/anomalies/{id}/acknowledge",
+            patch(secrets_audit::acknowledge_anomaly),
+        )
+        .route_layer(guards::require(&state, "secrets.audit"));
+
     // Redemption is the ONE handler with no session guard. It is authenticated by the
     // deployment key in the header instead, so it lives on its own router and is never
     // reachable by a cookie: a browser cannot redeem a lease, which is the property the whole
@@ -831,6 +849,7 @@ pub fn router(state: AppState) -> Router {
         .merge(secrets_credentials_write)
         .merge(secrets_slot_assign)
         .merge(secrets_leases_read)
+        .merge(secrets_audit)
         .merge(secrets_lease_write)
         .merge(secrets_deploy_key_write)
         .merge(secrets_lease_redeem)

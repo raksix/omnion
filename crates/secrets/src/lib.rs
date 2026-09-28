@@ -36,6 +36,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod credentials;
 pub mod error;
 pub mod keyring;
@@ -44,6 +45,11 @@ pub mod redaction;
 pub mod store;
 pub mod validators;
 
+pub use audit::{
+    AnomalyRow, AuditFilter, AuditRow, DetectorSettings, Detectors, RevealCounts,
+    RevealObservation, SiemRecord, acknowledge_anomaly, list_anomalies, list_audit, load_settings,
+    record_reveal_anomalies, reveal_counts, siem_export, siem_record, tracked_actions,
+};
 pub use credentials::{
     CredentialRow, Resolution, SCOPES, SLOTS, SecretOwner, SlotRow, assign_slot, attach_profile,
     check_scope_and_slot, find_credential, find_secret_owner, find_slot, list_credentials,
