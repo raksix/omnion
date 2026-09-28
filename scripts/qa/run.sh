@@ -108,11 +108,19 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
+step "browser walkthrough${QA_ONLY:+ (scope: $QA_ONLY)}"
+# QA_ONLY narrows the pass to one area's depth passes (`--only=ai`, `--only=media`, …). It is the
+# tool for a writer whose request is a handful of screens on a box that cannot carry a full pass
+# in one sitting: the wizard, the sign-in, the roll-up and the refusal gate still run, so a scoped
+# report is a real report rather than a lighter one.
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" ${QA_ONLY:+--only="$QA_ONLY"}
 
-step "vision review"
-node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+if [ -z "${QA_ONLY:-}" ]; then
+  step "vision review"
+  node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+else
+  step "vision review (skipped — scoped pass)"
+fi
 
 step "summary"
 node -e '

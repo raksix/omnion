@@ -42,6 +42,36 @@ const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
 const STEP_MS = Number(arg("step-ms", "380"));
+
+/**
+ * `--only=<scope>` narrows a pass to the depth passes of one area, the way `--only=wizard`
+ * narrows it to the first-run flow. It exists because a full pass on a loaded box walks thirty-odd
+ * IAM and analytics screens first and the AI depth passes — the ones a provider-runtime request
+ * has to be closed on — start in the fortieth minute. A request that cannot be closed because the
+ * box ran out of memory before its own screens were reached stays open forever, which is the same
+ * as shipping nothing.
+ *
+ * The scope is **additive narrowing, never a different pass**: the wizard, the sign-in, the
+ * roll-up and the refusal gate all still run, so a scoped report is a real report — the findings
+ * come from the same code and mean the same thing. It only skips work no one asked for.
+ *
+ * Scopes:
+ *   --only=ai      the AI hub screens, the provider runtime pass and the every-screen-states pass
+ *   --only=media   the file manager's routes and its six depth passes
+ *   --only=iam     the identity screens and their depth passes
+ *   --only=analytics  the analytics screens and their depth passes
+ */
+const ONLY = (process.argv.find((a) => a.startsWith("--only=")) || "").split("=")[1] || "";
+/** Whether a named area is in scope. An empty scope means everything, as it always did. */
+const inScope = (area) => !ONLY || ONLY === area;
+/** The same area naming for the mobile loop, which carries its own route list. */
+const mArea = (path, name) => {
+  if (name === "ai" || path.startsWith("/ai")) return "ai";
+  if (name.startsWith("media") || path.startsWith("/media")) return "media";
+  if (name.startsWith("iam") || path.startsWith("/settings/iam") || path === "/settings/search") return "iam";
+  if (name.startsWith("analytics") || path.startsWith("/analytics")) return "analytics";
+  return "core";
+};
 /**
  * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
  * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
@@ -3855,68 +3885,68 @@ async function main() {
 
   // The analytics batch goes in before the routes are walked: the report screens read it, and the
   // history fixture gives their series more than one bucket to draw.
-  report.analytics = await seedAnalytics(report);
+  report.analytics = inScope("analytics") ? await seedAnalytics(report) : { skipped: "out of scope" };
   log(`analytics seed: ${JSON.stringify(report.analytics)}`);
 
   const routes = [
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
-    { path: "/media", name: "media" },
+    { path: "/media", name: "media", area: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
-    { path: "/media/duplicates", name: "media-duplicates" },
-    { path: "/media/trash", name: "media-trash" },
+    { path: "/media/duplicates", name: "media-duplicates", area: "media" },
+    { path: "/media/trash", name: "media-trash", area: "media" },
     // The transformation presets (REQ-010, slice 3) — walked here and driven by the depth pass
     // below, which creates a preset, submits an out-of-range quality to see the field error, and
     // asks for the preset URL to answer with real transformed bytes.
-    { path: "/media/settings", name: "media-settings" },
+    { path: "/media/settings", name: "media-settings", area: "media" },
     // The file detail screen (REQ-010, slice 2) is NOT in this list on purpose: its path
     // carries a file id, and a route walked with a placeholder id only proves that the 404
     // state renders. `runMediaFileDetail` below opens a *real* file's screen instead. Listing
     // the bare prefix here produced exactly that 404 screenshot.
     { path: "/sites", name: "sites" },
-    { path: "/ai", name: "ai" },
+    { path: "/ai", name: "ai", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
-    { path: "/settings/search", name: "search-settings" },
+    { path: "/settings/search", name: "search-settings", area: "iam" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
-    { path: "/settings/iam", name: "iam-overview" },
-    { path: "/settings/iam/users", name: "iam-users" },
-    { path: "/settings/iam/groups", name: "iam-groups" },
-    { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
-    { path: "/settings/iam/simulator", name: "iam-simulator" },
+    { path: "/settings/iam", name: "iam-overview", area: "iam" },
+    { path: "/settings/iam/users", name: "iam-users", area: "iam" },
+    { path: "/settings/iam/groups", name: "iam-groups", area: "iam" },
+    { path: "/settings/iam/service-accounts", name: "iam-service-accounts", area: "iam" },
+    { path: "/settings/iam/simulator", name: "iam-simulator", area: "iam" },
     // The ABAC policy builder (REQ-006, slice 4a) — the depth pass below drives the rows, the
     // dry run, a save with its version history and a removal.
-    { path: "/settings/iam/policies", name: "iam-policies" },
+    { path: "/settings/iam/policies", name: "iam-policies", area: "iam" },
     // The permission-request inbox and the SCIM provisioning screen (REQ-006, slice 4b) — the
     // depth passes below ask, approve, refuse, mint a token and drive a real SCIM round trip.
-    { path: "/settings/iam/approvals", name: "iam-approvals" },
-    { path: "/settings/iam/provisioning", name: "iam-provisioning" },
-    { path: "/settings/iam/authentication", name: "iam-authentication" },
+    { path: "/settings/iam/approvals", name: "iam-approvals", area: "iam" },
+    { path: "/settings/iam/provisioning", name: "iam-provisioning", area: "iam" },
+    { path: "/settings/iam/authentication", name: "iam-authentication", area: "iam" },
     // The security, session and device screens (REQ-006, slice 3) — the depth pass below drives
     // the policy fields, revokes a session and trusts a device.
-    { path: "/settings/iam/security", name: "iam-security" },
-    { path: "/settings/iam/sessions", name: "iam-sessions" },
-    { path: "/settings/iam/devices", name: "iam-devices" },
+    { path: "/settings/iam/security", name: "iam-security", area: "iam" },
+    { path: "/settings/iam/sessions", name: "iam-sessions", area: "iam" },
+    { path: "/settings/iam/devices", name: "iam-devices", area: "iam" },
     // The role screens (REQ-006, slice 1) — no untested screen: the list is walked here, and its
     // depth pass below creates a role, drives the matrix and reads the history back.
-    { path: "/settings/iam/roles", name: "iam-roles" },
+    { path: "/settings/iam/roles", name: "iam-roles", area: "iam" },
     // The analytics reports (REQ-007, slice 2): every screen of the section is walked, clicked and
     // measured, and the depth pass below reads the range, the comparison, a drawer and an export.
-    { path: "/analytics", name: "analytics" },
-    { path: "/analytics/pages", name: "analytics-pages" },
-    { path: "/analytics/sources", name: "analytics-sources" },
-    { path: "/analytics/audience", name: "analytics-audience" },
-    { path: "/analytics/events", name: "analytics-events" },
-    { path: "/analytics/downloads", name: "analytics-downloads" },
-    { path: "/analytics/forms", name: "analytics-forms" },
+    { path: "/analytics", name: "analytics", area: "analytics" },
+    { path: "/analytics/pages", name: "analytics-pages", area: "analytics" },
+    { path: "/analytics/sources", name: "analytics-sources", area: "analytics" },
+    { path: "/analytics/audience", name: "analytics-audience", area: "analytics" },
+    { path: "/analytics/events", name: "analytics-events", area: "analytics" },
+    { path: "/analytics/downloads", name: "analytics-downloads", area: "analytics" },
+    { path: "/analytics/forms", name: "analytics-forms", area: "analytics" },
     // Goals, funnels and realtime (REQ-007, slice 3), and the settings screen of slice 4 — the
     // section's own write surface, whose depth pass below drives it.
-    { path: "/analytics/goals", name: "analytics-goals" },
-    { path: "/analytics/realtime", name: "analytics-realtime" },
-    { path: "/analytics/settings", name: "analytics-settings" },
+    { path: "/analytics/goals", name: "analytics-goals", area: "analytics" },
+    { path: "/analytics/realtime", name: "analytics-realtime", area: "analytics" },
+    { path: "/analytics/settings", name: "analytics-settings", area: "analytics" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -3924,6 +3954,7 @@ async function main() {
   // were skipped and no report was written at all. A page that dies is a finding about that
   // page; the pages after it still have to be looked at.
   for (const route of routes) {
+    if (!inScope(route.area || "core")) continue;
     log(`page: ${route.name}`);
     try {
       await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -3947,12 +3978,16 @@ async function main() {
 
   // The AI provider runtime pass (REQ-097, slice 1): the form's own refusal, a real local
   // endpoint, the five-step connection test, and a dead endpoint that names its failing step.
-  report.aiProviders = await runAiProviderDepth(page, report);
+  if (inScope("ai")) {
+    report.aiProviders = await runAiProviderDepth(page, report);
+  }
   // The three states of every list — the one criterion that is a *claim* until the network
   // says otherwise. Each failure is provoked for real (a 500 and a dropped connection), the
   // retry is a real second request, and a skeleton on screen while an error is claimed is
   // itself the finding.
-  report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
+  if (inScope("ai")) {
+    report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
+  }
   log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
@@ -3960,80 +3995,108 @@ async function main() {
   // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
   // cannot run is a finding of its own ("this screen did not answer"), not a reason to end the
   // whole run before the remaining screens have been looked at.
-  report.mediaFiles = await runDepthPass("media-file-manager", () =>
-    runMediaFileManager(page, report),
-  );
+  if (inScope("media")) {
+    report.mediaFiles = await runDepthPass("media-file-manager", () =>
+      runMediaFileManager(page, report),
+    );
+  }
 
   // The file detail screen (REQ-010, slice 2): a real file is opened, its preview renders, the
   // metadata saves, and the version history is read. This is the pass that proves the screen is
   // a screen — a route walked only by id would render its error state and look visited.
-  report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
-    runMediaFileDetail(page, report),
-  );
+  if (inScope("media")) {
+    report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
+      runMediaFileDetail(page, report),
+    );
+  }
   log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
 
-  report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
+  if (inScope("media")) {
+    report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
+  }
   log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
 
   // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
   // says what it proved, and a save that leaves the untouched fields alone.
-  report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
+  if (inScope("media")) {
+    report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
+  }
   log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
 
   // The share tab (REQ-010, slice 3): the link is shown once and never again, the public URL
   // actually serves the bytes, and a revoke stops it on the very next request.
-  report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
+  if (inScope("media")) {
+    report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
+  }
   log(`media shares: ${JSON.stringify(report.mediaShares)}`);
 
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
   // bytes are pending rather than reclaimed.
-  report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
-    runMediaDuplicates(page, report),
-  );
+  if (inScope("media")) {
+    report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
+      runMediaDuplicates(page, report),
+    );
+  }
   log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
-  await runPalette(page, report);
+  if (inScope("core")) await runPalette(page, report);
 
   // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
-  await runCommandCenter(page, report);
+  if (inScope("core")) await runCommandCenter(page, report);
 
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
-  await runSearchDepth(page, report);
+  if (inScope("iam")) {
+    await runSearchDepth(page, report);
+  }
 
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
   // settings screen with slice 4 — this pass visits what exists today.
-  report.analyticsDepth = await runAnalyticsDepth(page, report);
+  if (inScope("analytics")) {
+    report.analyticsDepth = await runAnalyticsDepth(page, report);
+  }
 
   // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
   // completes it after it exists, and the funnel and the live counters are read back.
-  report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
+  if (inScope("analytics")) {
+    report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
+  }
   log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
-  report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  if (inScope("analytics")) {
+    report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  }
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
-  report.iamRoles = await runIamRolesDepth(page, report);
+  if (inScope("iam")) {
+    report.iamRoles = await runIamRolesDepth(page, report);
+  }
 
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
-  await runIamSubjectsDepth(page, report);
+  if (inScope("iam")) {
+    await runIamSubjectsDepth(page, report);
+  }
 
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
-  report.iamPolicies = await runIamPoliciesDepth(page, report);
+  if (inScope("iam")) {
+    report.iamPolicies = await runIamPoliciesDepth(page, report);
+  }
   log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
   // and a diff on save, the session list with a real revoke, the device registry and the MFA
   // enrolment dialog.
-  await runIamSecurityDepth(page, report);
+  if (inScope("iam")) {
+    await runIamSecurityDepth(page, report);
+  }
   log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -4050,26 +4113,34 @@ async function main() {
   // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
   // owner's own account, the panel lists it, the sign-in asks for it and completes with it, and
   // the pass is removed again so the account is back to its password.
-  await runPasskeysDepth(page, report);
+  if (inScope("iam")) {
+    await runPasskeysDepth(page, report);
+  }
   log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
   // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
   // refusals of the ask form. It runs after the count-sensitive passes because an approval adds a
   // time-boxed binding (and the generated grant role) to the organization.
-  await runIamApprovalsDepth(page, report);
+  if (inScope("iam")) {
+    await runIamApprovalsDepth(page, report);
+  }
   log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
 
   // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
   // round trip through the real endpoint from this browser, read the sync log back, revoke the
   // token and prove it is refused afterwards.
-  await runIamProvisioningDepth(page, report);
+  if (inScope("iam")) {
+    await runIamProvisioningDepth(page, report);
+  }
   log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
   // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
   // remove the provider and see the list go back to its empty state.
-  await runIamAuthenticationDepth(page, report);
+  if (inScope("iam")) {
+    await runIamAuthenticationDepth(page, report);
+  }
   log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
 
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
@@ -4082,6 +4153,7 @@ async function main() {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
   for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+    if (!inScope((route.area = mArea(route.path, route.name)))) continue;
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -4092,7 +4164,7 @@ async function main() {
   // The palette on a phone: a full-screen sheet with 44px rows and a reachable close control.
   // Overlay shots are viewport-only: a full-page screenshot of a fixed sheet shows the page
   // below the fold as well, which reads as an overlay that fails to cover the screen.
-  await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  if (!ONLY) await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await mpage.waitForTimeout(1200);
   let mobileOpened = false;
   for (let attempt = 0; attempt < 3 && !mobileOpened; attempt += 1) {
@@ -4132,8 +4204,12 @@ async function main() {
   await mobile.close();
 
   // Public renderer — reached through the site's own host so the renderer resolves the site.
+  // A scoped pass does not visit it: the renderer belongs to the content wave, not to the area being proven.
+  const webInScope = inScope("core") || inScope("media") || inScope("cms");
   const webBase = `http://${SITE_HOST}:${new URL(URL_WEB).port || 80}`;
+  if (!webInScope) report.web = { skipped: "out of scope" };
   try {
+    if (webInScope) {
     const wp = await context.newPage();
     attach(wp, "web");
     const res = await wp.goto(`${webBase}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -4168,6 +4244,7 @@ async function main() {
       report.web.firstLink = { href: root.links[0], url: wp.url(), diagnostics: await diagnostics(wp) };
     }
     await wp.close();
+    }
   } catch (err) {
     report.web = { error: String(err).slice(0, 300) };
   }
@@ -4258,8 +4335,8 @@ async function main() {
       `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${c.reason || ""} ${(c.errors || []).join(" | ")}`.slice(0, 240),
     );
   }
-  if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
-  if (report.web && !report.web.error) {
+  if (report.web && report.web.error && report.web.error !== "Error: skipped") pushFindings("high", "web-unreachable", report.web.error);
+  if (report.web && !report.web.error && !report.web.skipped) {
     const published = report.web.published;
     if (!published || published.status !== 200) {
       pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} did not render (status ${published ? published.status : "missing"})`);
