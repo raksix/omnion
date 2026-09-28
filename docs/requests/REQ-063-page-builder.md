@@ -127,7 +127,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
 - [x] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
 - [x] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
-- [ ] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
+- [x] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
 - [ ] `content.blocks.updated` and `content.page.published` are delivered to a subscribed endpoint with redelivery working.
 - [ ] The editor is usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone), and the walkthrough reports zero high findings.
 
