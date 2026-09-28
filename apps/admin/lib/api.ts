@@ -4184,3 +4184,92 @@ export function testMediaStorageConnection(
     body: JSON.stringify(input),
   });
 }
+
+/* ── the metric catalogue and the chart behind it (REQ-126, slice 2) ─────────────────────────── */
+
+/** One declared metric family, as `/observability/metrics/catalog` returns it. */
+export interface MetricFamily {
+  name: string;
+  kind: "counter" | "gauge" | "histogram";
+  unit: string;
+  description: string;
+  labels: string[];
+  source: "core" | "module" | "worker";
+  cardinality_estimate: number;
+  cardinality_budget: number;
+  budgeted: boolean;
+  last_seen_at: string | null;
+  /** `true` when this build emits the family (a module's row can outlive its build). */
+  live: boolean;
+  /** `true` when the family is folding samples into its `other` series. */
+  over_budget: boolean;
+}
+
+/** The label positions a family declares and the values the registry has actually seen. */
+export interface MetricLabelCatalogue {
+  metric: string;
+  labels: string[];
+  values: string[][];
+  bounded_set_cap: number;
+}
+
+/** The catalogue response. */
+export interface MetricCatalogResponse {
+  families: MetricFamily[];
+  label_catalogues: MetricLabelCatalogue[];
+  over_budget: string[];
+  global_budget: number;
+  max_points: number;
+}
+
+/** One minute bucket on a chart. */
+export interface MetricPoint {
+  at: string;
+  value: number;
+}
+
+/** One series, with its label values and its minute buckets. */
+export interface MetricSeries {
+  labels: string[];
+  total: number;
+  observations: number;
+  points: MetricPoint[];
+}
+
+/** One chart's worth of data. */
+export interface MetricQueryResponse {
+  metric: string;
+  kind: "counter" | "gauge" | "histogram";
+  unit: string;
+  labels: string[];
+  window_minutes: number;
+  max_points: number;
+  series: MetricSeries[];
+  promql: string;
+  /** `true` when the family is declared but has never recorded a sample in this process. */
+  no_samples: boolean;
+}
+
+/** The documented families, with the live series counts and the over-budget list. */
+export function fetchMetricCatalog(): Promise<MetricCatalogResponse> {
+  return request<MetricCatalogResponse>("/api/v1/observability/metrics/catalog");
+}
+
+/**
+ * One family's bounded chart.
+ *
+ * The window is sent in minutes and clamped by the API at `max_points`; the response carries the
+ * clamp back so the screen can say so rather than drawing a chart that quietly resampled.
+ */
+export function fetchMetricQuery(
+  metric: string,
+  windowMinutes: number,
+): Promise<MetricQueryResponse> {
+  const query = new URLSearchParams({ metric, window_minutes: String(windowMinutes) });
+  return request<MetricQueryResponse>(`/api/v1/observability/metrics/query?${query}`);
+}
+
+/** Re-seed the catalogue from the registry. A write: it audits, and it takes `observability.manage`. */
+export function syncMetricCatalog(): Promise<MetricCatalogResponse> {
+  return request<MetricCatalogResponse>("/api/v1/observability/metrics/sync", { method: "POST" });
+}
