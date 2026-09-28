@@ -600,13 +600,20 @@ fn ceiling_below_usage(
     usage: &OrganizationUsage,
 ) -> Option<tenancy_limits::LimitExceeded> {
     let check = |new: Option<i64>, old: Option<i64>, used: i64, resource: &'static str| {
+        // `None` is *unlimited*, which is higher than every number — and comparing the two
+        // `Option`s directly would say `Some(1) < None`, i.e. that putting a ceiling on an
+        // unlimited tenant is not a lowering at all. That transition is how a plan starts
+        // bounding anything, and it is exactly the one the check has to see.
+        let ceiling = |value: Option<i64>| value.unwrap_or(i64::MAX);
+
         match new {
-            // A ceiling that is not being lowered, or that is above what is used, is fine.
-            Some(new) if Some(new) < old => (used > new).then_some(tenancy_limits::LimitExceeded {
-                resource,
-                used,
-                limit: new,
-            }),
+            Some(new) if new < ceiling(old) => {
+                (used > new).then_some(tenancy_limits::LimitExceeded {
+                    resource,
+                    used,
+                    limit: new,
+                })
+            }
             _ => None,
         }
     };
@@ -953,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn raising_a_ceiling_is_always_allowed() {
+    fn raising_a_ceiling_above_current_usage_is_always_allowed() {
         let before = OrganizationLimits {
             organization_id: Uuid::nil(),
             plan: "standard".to_owned(),
@@ -963,13 +970,17 @@ mod tests {
             ai_monthly_limit_micros: None,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
+        // Every new ceiling clears what the organization currently holds. The previous version
+        // of this test raised seats and sites correctly but set `storage_bytes_limit` to one
+        // million against four million bytes in use — which the check refuses, and correctly:
+        // a ceiling below what is stored is not a raise however generous the other three look.
         let after = OrganizationLimits {
             organization_id: Uuid::nil(),
             plan: "enterprise".to_owned(),
             seat_limit: Some(500),
             site_limit: Some(50),
-            storage_bytes_limit: Some(1_000_000),
-            ai_monthly_limit_micros: Some(10_000),
+            storage_bytes_limit: Some(9_000_000),
+            ai_monthly_limit_micros: Some(500_000),
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
         let usage = OrganizationUsage {
@@ -981,7 +992,7 @@ mod tests {
 
         assert!(
             ceiling_below_usage(&before, &after, &usage).is_none(),
-            "raising a ceiling above current usage is the normal way to grow"
+            "raising every ceiling above current usage is the normal way to grow"
         );
     }
 
@@ -1013,6 +1024,76 @@ mod tests {
         };
 
         assert!(ceiling_below_usage(&before, &after, &usage).is_none());
+    }
+
+    #[test]
+    fn putting_a_ceiling_on_an_unlimited_tenant_is_a_lowering() {
+        // `Some(1) < None` is `false` in Rust, so a plain `Option` comparison would treat
+        // "unlimited becomes 1" as *not* a lowering and let it through unrefused. This is the
+        // transition a plan makes the moment somebody starts bounding a tenant, so it is the
+        // one that most needs checking.
+        let before = OrganizationLimits {
+            organization_id: Uuid::nil(),
+            plan: "standard".to_owned(),
+            seat_limit: None,
+            site_limit: None,
+            storage_bytes_limit: None,
+            ai_monthly_limit_micros: None,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let after = OrganizationLimits {
+            organization_id: Uuid::nil(),
+            plan: "standard".to_owned(),
+            seat_limit: Some(1),
+            site_limit: None,
+            storage_bytes_limit: None,
+            ai_monthly_limit_micros: None,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let usage = OrganizationUsage {
+            seats_used: 4,
+            sites_used: 0,
+            storage_used_bytes: 0,
+            ai_micros_this_month: 0,
+        };
+
+        let exceeded = ceiling_below_usage(&before, &after, &usage)
+            .expect("four members cannot fit under a ceiling of one");
+        assert_eq!(exceeded.resource, "seats");
+        assert_eq!(exceeded.limit, 1);
+    }
+
+    #[test]
+    fn an_unlimited_tenant_can_still_be_bounded_above_its_usage() {
+        let before = OrganizationLimits {
+            organization_id: Uuid::nil(),
+            plan: "standard".to_owned(),
+            seat_limit: None,
+            site_limit: None,
+            storage_bytes_limit: None,
+            ai_monthly_limit_micros: None,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let after = OrganizationLimits {
+            organization_id: Uuid::nil(),
+            plan: "business".to_owned(),
+            seat_limit: Some(20),
+            site_limit: None,
+            storage_bytes_limit: None,
+            ai_monthly_limit_micros: None,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let usage = OrganizationUsage {
+            seats_used: 4,
+            sites_used: 0,
+            storage_used_bytes: 0,
+            ai_micros_this_month: 0,
+        };
+
+        assert!(
+            ceiling_below_usage(&before, &after, &usage).is_none(),
+            "four members fit under a ceiling of twenty"
+        );
     }
 
     #[test]

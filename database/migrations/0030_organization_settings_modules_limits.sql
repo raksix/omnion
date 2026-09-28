@@ -96,6 +96,14 @@ create table organization_limits (
 -- defaults, so the Settings and Billing tabs never render an empty form for a tenant that
 -- exists. `on conflict do nothing` makes a re-run of the migration idempotent, and a platform
 -- that has already written settings keeps them.
+--
+-- The backfill is deliberately a one-shot `insert ... select`, and the *read* path upserts the
+-- same defaults on a miss. That is the right split: an organization created after this
+-- migration ran has no row until somebody first opens its Settings tab, and adding a trigger
+-- to cover that would fire on every delete-heavy installation to protect against a condition
+-- the read path already handles in one statement. The backfill's job is the tenants that
+-- already had settings *or limits* written when this migration ran — an organization with a
+-- custom `plan` from before the ceilings were split out keeps the plan and gains the others.
 insert into organization_settings (organization_id)
 select id from organizations
 on conflict (organization_id) do nothing;
