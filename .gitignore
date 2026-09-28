@@ -22,6 +22,10 @@ pnpm-debug.log*
 # QA artifacts (screenshots + raw logs stay on disk, never in git)
 qa-artifacts/
 
+# Per-writer QA report from a private stack run (ports 18085/3105/3205, db omnion_qa_w6).
+# Machine- and run-specific; the shared docs/qa/QA-LATEST.md belongs to the main writer.
+docs/qa/QA-LATEST-*.md
+
 # Turbo
 .turbo/
 

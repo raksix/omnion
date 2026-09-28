@@ -390,7 +390,6 @@ pub async fn issue_lease(
             .lease_id(issued.lease.id)
             .metadata(json!({
                 "name": owner.name,
-                "name": owner.name,
                 "consumer": issued.lease.consumer,
                 "environment": issued.lease.environment,
                 "max_uses": issued.lease.max_uses,
@@ -460,6 +459,10 @@ pub async fn revoke_lease(
         &state,
         NewAuditEntry::by_user(session.user.id, "secret.lease.revoked")
             .request_id(request_id)
+            // The column, not only `target_id`: the audit screen's lease filter and this suite's
+            // join both read `lease_id`, and a row that names the lease in one place and not the
+            // other is a row that only some queries can find.
+            .lease_id(id)
             .target("lease", id.to_string())
             .metadata(json!({
                 "secret_id": existing.secret_id,
