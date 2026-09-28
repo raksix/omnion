@@ -6763,7 +6763,77 @@ async function runWorkflowBuilderDepth(page, report) {
   const afterUndo = await page.locator("[data-node-id]").count();
   note({ step: "undo", afterUndo, returned: afterUndo === nodesBeforeKeyboardAdd });
 
-  // The edge delete: select an edge, Del, and the server's edge count falls. An edge whose
+  // The connection gesture: press an output port, press a target node, and the server's edge
+  // count rises. The refusal is the half that matters — a port the source does not export has
+  // to *say so*, and a gesture that refuses silently is indistinguishable from a dead button,
+  // so both outcomes are read back off the canvas rather than inferred from the count.
+  const connectProbe = await page
+    .evaluate(() => {
+      const cards = Array.from(document.querySelectorAll("[data-node-id]"));
+      if (cards.length < 2) return { attempted: false, reason: "fewer than two nodes" };
+      const first = cards.find((card) => card.querySelector("[data-port-out]"));
+      // The target is picked by identity and returned as an index, not re-found with
+      // `.nth(1)` on the way back in: node 1 is not necessarily the second card, and
+      // connecting a node to itself is the one refusal the gesture must not be measured on.
+      const secondIndex = cards.findIndex((card) => card !== first);
+      const port = first?.querySelector("[data-port-out]");
+      if (!first || secondIndex < 0 || !port) {
+        return { attempted: false, reason: "no port on a first card" };
+      }
+      port.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      return {
+        attempted: true,
+        first: first.getAttribute("data-node-id"),
+        port: port.getAttribute("data-port-key"),
+        second: cards[secondIndex].getAttribute("data-node-id"),
+        secondIndex,
+      };
+    })
+    .catch(() => ({ attempted: false }));
+  await page.waitForTimeout(400);
+  const draftShown = (await page.locator("[data-link-draft]").count()) > 0;
+  const edgesBeforeConnect = (await readGraph())?.edge_count ?? 0;
+  await page
+    .locator("[data-node-id]")
+    .nth(connectProbe.secondIndex ?? 1)
+    .click({ timeout: 5000, force: true })
+    .catch(() => {});
+await page.waitForTimeout(1400);
+const edgesAfterConnect = (await readGraph())?.edge_count ?? 0;
+const linkNotice = await page
+  .locator("[data-link-notice]")
+  .first()
+  .evaluate((el) => ({ tone: el.getAttribute("data-link-notice"), text: el.textContent?.trim() }))
+  .catch(() => null);
+note({
+  step: "port-connect",
+  ...connectProbe,
+  draftShown,
+  before: edgesBeforeConnect,
+  after: edgesAfterConnect,
+  notice: linkNotice,
+});
+await shot(page, "page-workflow-builder-connected");
+
+// Escape cancels a half-drawn connection: the draft hint has to disappear and the graph has to
+// be unchanged, or Escape is a gesture that silently mutates the definition.
+await page
+  .evaluate(() => {
+    const port = document.querySelector("[data-port-out]");
+    port?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  })
+  .catch(() => {});
+await page.waitForTimeout(300);
+await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+await page.keyboard.press("Escape");
+await page.waitForTimeout(500);
+note({
+  step: "port-connect-escape",
+  draftGone: (await page.locator("[data-link-draft]").count()) === 0,
+  edges: (await readGraph())?.edge_count ?? 0,
+});
+
+// The edge delete: select an edge, Del, and the server's edge count falls. An edge whose
   // deletion the canvas shows but the graph keeps is a ghost edge that comes back on reload.
   const edgesBefore = (await readGraph())?.edge_count ?? 0;
   const edgeHit = await page
