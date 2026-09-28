@@ -19,6 +19,7 @@
 
 pub mod error;
 pub mod model;
+pub mod preference_store;
 pub mod preferences;
 pub mod store;
 pub mod vocabulary;
@@ -26,6 +27,10 @@ pub mod vocabulary;
 pub use error::{NotificationError, Result};
 pub use model::{
     CategoryCount, ListQuery, NewNotification, Notification, NotificationPage, Summary,
+};
+pub use preference_store::{
+    allowed_channels, read_preferences, read_settings, reset_preferences, write_preferences,
+    write_settings,
 };
 pub use preferences::{
     DIGEST_CADENCES, IN_APP, PreferenceCell, Preferences, Settings, StatedPreference,
