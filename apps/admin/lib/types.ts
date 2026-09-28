@@ -1076,3 +1076,125 @@ export type PortKindCatalogue = {
   kinds: string[];
   descriptions: Record<string, string>;
 };
+
+/* ------------------------------------------------------------------ *
+ * Credential instances (REQ-087, slice 2)
+ * ------------------------------------------------------------------ */
+
+/**
+ * One credential, as the API reads it.
+ *
+ * There is no field here for a secret value and there never will be: the API answers with
+ * `has_secret` and a list of which fields to mask. A type that grew a `secret` field would
+ * mean the API grew one too, and that is the review you want.
+ */
+export type Credential = {
+  id: string;
+  key: string;
+  name: string;
+  type: string;
+  type_label: string;
+  scope: string;
+  sharing: string;
+  has_secret: boolean;
+  settings: Record<string, unknown>;
+  secret_fields: string[];
+  health: string;
+  effective_health: string;
+  expired: boolean;
+  health_checked_at: string | null;
+  health_detail: string | null;
+  oauth_subject: string | null;
+  oauth_expires_at: string | null;
+  oauth_scopes: string | null;
+  last_used_at: string | null;
+  owner_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** The credential list filters. */
+export type CredentialFilters = {
+  search?: string;
+  type?: string;
+  scope?: string;
+  health?: string;
+  sharing?: string;
+};
+
+/** The credential list payload. */
+export type CredentialPage = {
+  credentials: Credential[];
+  total: number;
+  needs_attention: number;
+  filters: {
+    search: string | null;
+    type: string | null;
+    scope: string | null;
+    health: string | null;
+    sharing: string | null;
+  };
+};
+
+/** One reference from a workflow graph to a credential. */
+export type CredentialUsageRef = {
+  workflow_id: string;
+  workflow_name: string;
+  node_id: string;
+  node_label: string | null;
+  node_type: string | null;
+};
+
+/** The usage view of one credential. */
+export type CredentialUsage = {
+  references: CredentialUsageRef[];
+  workflow_count: number;
+  node_type_count: number;
+  in_use: boolean;
+  key: string;
+};
+
+/** What a delete did, and what it broke. */
+export type CredentialDeleteResult = {
+  deleted: boolean;
+  references: CredentialUsageRef[];
+  workflow_count: number;
+};
+
+/** The result of a test hook run. */
+export type CredentialTestResult = {
+  ok: boolean;
+  duration_ms: number;
+  detail: string;
+  health: string;
+  credential: Credential;
+};
+
+/** One installed node package. */
+export type NodePackage = {
+  key: string;
+  version: string;
+  source: string;
+  checksum: string;
+  permissions: unknown[];
+  enabled: boolean;
+  installed_at: string;
+};
+
+/** The package ledger payload. */
+export type NodePackagePage = {
+  packages: NodePackage[];
+  total: number;
+};
+
+/** The body of a create. Secrets ride in `secrets[]`, never in `settings`. */
+export type NewCredential = {
+  key?: string;
+  name: string;
+  type: string;
+  scope?: string;
+  sharing?: string;
+  settings?: Record<string, unknown>;
+  secrets?: { field: string; value: string }[];
+};
+

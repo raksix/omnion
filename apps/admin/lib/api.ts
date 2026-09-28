@@ -54,6 +54,17 @@ import type {
   NodeTypePage,
   CredentialType,
   CredentialTypePage,
+  // Credential instances (REQ-087 slice 2). `Credential` is the masked read; there is no type
+  // here for a secret value because the API has no endpoint that returns one.
+  Credential,
+  CredentialDeleteResult,
+  CredentialFilters,
+  CredentialPage,
+  CredentialTestResult,
+  CredentialUsage,
+  NewCredential,
+  NodePackage,
+  NodePackagePage,
   PortKindCatalogue,
   RegistryLint,
   NotificationPage,
@@ -4095,4 +4106,116 @@ export async function fetchCredentialType(key: string): Promise<CredentialType> 
 /** The three port kinds and what each means. */
 export async function fetchPortKinds(): Promise<PortKindCatalogue> {
   return request<PortKindCatalogue>("/api/v1/port-kinds");
+}
+
+/* ------------------------------------------------------------------ *
+ * Credential instances (REQ-087, slice 2)
+ * ------------------------------------------------------------------ */
+
+/** Build the query string of a credential list read. */
+function credentialQuery(filters: CredentialFilters): string {
+  const params = new URLSearchParams();
+  if (filters.search) params.set("search", filters.search);
+  if (filters.type) params.set("type", filters.type);
+  if (filters.scope) params.set("scope", filters.scope);
+  if (filters.health) params.set("health", filters.health);
+  if (filters.sharing) params.set("sharing", filters.sharing);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+/** The credential list. */
+export async function fetchCredentials(
+  filters: CredentialFilters = {},
+): Promise<CredentialPage> {
+  return request<CredentialPage>(`/api/v1/credentials${credentialQuery(filters)}`);
+}
+
+/** One credential, masked. */
+export async function fetchCredential(id: string): Promise<Credential> {
+  return request<Credential>(`/api/v1/credentials/${encodeURIComponent(id)}`);
+}
+
+/** Create one. Secrets ride in `secrets[]` and are never sent anywhere else. */
+export async function createCredential(input: NewCredential): Promise<Credential> {
+  return request<Credential>("/api/v1/credentials", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Update the non-secret half. Sending a secret here is refused by the API, by design. */
+export async function updateCredential(
+  id: string,
+  patch: {
+    name?: string;
+    scope?: string;
+    sharing?: string;
+    owner_user_id?: string;
+    settings?: Record<string, unknown>;
+  },
+): Promise<Credential> {
+  return request<Credential>(`/api/v1/credentials/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * Remove one.
+ *
+ * `force` is the REQ's forced delete: it removes the row and returns the dependents so the
+ * panel can name what it broke. Without it the API answers `credential_in_use` with the same
+ * list in `details`, which is what the panel renders the "these workflows will break" line from.
+ */
+export async function deleteCredential(
+  id: string,
+  force = false,
+): Promise<CredentialDeleteResult> {
+  return request<CredentialDeleteResult>(
+    `/api/v1/credentials/${encodeURIComponent(id)}${force ? "?force=true" : ""}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Who names this credential. */
+export async function fetchCredentialUsage(id: string): Promise<CredentialUsage> {
+  return request<CredentialUsage>(`/api/v1/credentials/${encodeURIComponent(id)}/usage`);
+}
+
+/** Run the type's test hook. */
+export async function testCredential(id: string): Promise<CredentialTestResult> {
+  return request<CredentialTestResult>(
+    `/api/v1/credentials/${encodeURIComponent(id)}/test`,
+    { method: "POST" },
+  );
+}
+
+/** The only write path for a secret. The value is sent once and never read back. */
+export async function replaceCredentialSecret(
+  id: string,
+  secrets: { field: string; value: string }[],
+): Promise<Credential> {
+  return request<Credential>(`/api/v1/credentials/${encodeURIComponent(id)}/secret`, {
+    method: "POST",
+    body: JSON.stringify({ secrets }),
+  });
+}
+
+/** The installer ledger. */
+export async function fetchNodePackages(): Promise<NodePackagePage> {
+  return request<NodePackagePage>("/api/v1/node-packages");
+}
+
+/** Enable or disable a package. Disabling never touches a workflow. */
+export async function setNodePackageEnabled(key: string, enabled: boolean): Promise<NodePackage> {
+  return request<NodePackage>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+/** Remove a package; the ledger row stays, marked removed. */
+export async function removeNodePackage(key: string): Promise<void> {
+  await request<null>(`/api/v1/node-packages/${encodeURIComponent(key)}`, { method: "DELETE" });
 }
