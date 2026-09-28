@@ -157,6 +157,100 @@ export type MediaStorageSettingsInput = Partial<
   Omit<MediaStorageSettings, "public_base_summary" | "configured" | "visibility_note">
 >;
 
+/**
+ * A site's virus-scanning policy (`GET /api/v1/media/scan-settings`).
+ *
+ * There is no field that could hold a secret: the row stores the *name* of the environment
+ * variable the deployment keeps the scanner's shared secret under, and `secret_available`
+ * says whether this process can actually see it. A screen that could render a credential is a
+ * screen a future change has to be trusted not to make.
+ */
+export type MediaScanSettings = {
+  enabled: boolean;
+  endpoint: string;
+  /** The *name* of the environment variable holding the shared secret — never the secret. */
+  secret_env: string;
+  timeout_seconds: number;
+  /** `hold` refuses to serve a file whose scan could not complete; `serve` serves it anyway. */
+  on_error: string;
+  max_scan_mb: number;
+  /** Whether this process can see `secret_env` in its own environment. */
+  secret_available: boolean;
+  /** What the current policy does to a file, in a sentence. */
+  behaviour: string;
+  /** How many files are still waiting for their first scan. */
+  pending_count: number;
+  configured: boolean;
+};
+
+/** What a save sends. Every field is optional and folded onto the stored row. */
+export type MediaScanSettingsInput = Partial<
+  Omit<MediaScanSettings, "secret_available" | "behaviour" | "pending_count" | "configured">
+>;
+
+/** One held file (`GET /api/v1/media/quarantine`). */
+export type MediaQuarantineEntry = {
+  id: string;
+  media_id: string;
+  /** What the scanner said, in its own words. */
+  detail: string;
+  quarantined_at: string;
+  run_id: string | null;
+};
+
+/** The quarantine list of a site, with its totals. */
+export type MediaQuarantineList = {
+  site_id: string;
+  file_count: number;
+  /** How many bytes the held files occupy — a held icon and a held video differ in urgency. */
+  total_bytes: number;
+  entries: MediaQuarantineEntry[];
+};
+
+/** One scanning pass (`GET /api/v1/media/scan/runs`). */
+export type MediaScanRun = {
+  id: string;
+  kind: string;
+  outcome: string;
+  scanned: number;
+  flagged: number;
+  errors: number;
+  skipped: number;
+  endpoint: string;
+  engine: string;
+  started_at: string;
+  finished_at: string | null;
+  /** One sentence, never a number without a word. */
+  summary: string;
+};
+
+/** The run log of a site. */
+export type MediaScanRunList = {
+  site_id: string;
+  runs: MediaScanRun[];
+};
+
+/** The answer to "run the sweep now" (`POST /api/v1/media/scan/run`). */
+export type MediaSweepResult = {
+  run_id: string;
+  scanned: number;
+  flagged: number;
+  errors: number;
+  skipped: number;
+  outcome: string;
+  summary: string;
+  quarantine: MediaQuarantineList;
+};
+
+/** The answer to a scanner probe (`POST /api/v1/media/scan/test`). */
+export type MediaScanProbe = {
+  ok: boolean;
+  status: string;
+  detail: string;
+  engine: string;
+  note: string;
+};
+
 /** The answer to a connection test (`POST /api/v1/media/settings/test-connection`). */
 export type MediaStorageProbe = {
   ok: boolean;
@@ -281,6 +375,77 @@ export type MediaShare = {
  * `token` and `url` exist on this type and on no other — which is how the screen knows to put
  * the one-time copy panel on screen and to never try to show a link it cannot re-derive.
  */
+/**
+ * One grant on a folder or a file (docs/requests/REQ-010, slice 4).
+ *
+ * `subject_label` is `null` for a subject that has since been deleted. The panel prints
+ * "Deleted subject" rather than a raw uuid: a stale row refuses nobody and grants nobody, and
+ * the only action that matters on it is removal — a line showing a uuid teaches nobody which
+ * grant to remove.
+ */
+export type MediaGrant = {
+  id: string;
+  subject_kind: "user" | "group" | "role";
+  subject_id: string;
+  subject_label: string | null;
+  can_read: boolean;
+  can_write: boolean;
+  can_delete: boolean;
+  can_share: boolean;
+  effect: "allow" | "deny";
+  created_by: string | null;
+  created_at: string;
+  /** The capability words, for a summary line. */
+  capabilities: string[];
+};
+
+/** One folder on a file's chain, nearest first, with what it contributes. */
+export type MediaGrantChainNode = {
+  id: string;
+  /** The folder's materialised path, which is already the breadcrumb. */
+  path: string;
+  grant_count: number;
+  /** Whether it carries a deny that reaches this file's subject set. */
+  has_deny: boolean;
+};
+
+/** What the permissions tab reads: the rows on one node, and the chain above a file. */
+export type MediaGrantsResponse = {
+  target_kind: "file" | "folder";
+  target_id: string;
+  grants: MediaGrant[];
+  /** Whether a grant on this node reaches what is inside it. Always true for a folder. */
+  inherits: boolean;
+  chain: MediaGrantChainNode[];
+};
+
+/** What a grant is written with. Absent bits are `false`, never "unchanged". */
+export type NewMediaGrant = {
+  subject_kind: "user" | "group" | "role";
+  subject_id: string;
+  can_read?: boolean;
+  can_write?: boolean;
+  can_delete?: boolean;
+  can_share?: boolean;
+  effect?: "allow" | "deny";
+};
+
+/**
+ * One subject the picker may offer.
+ *
+ * `suggested` marks a group: it is the row that survives somebody joining and leaving a team,
+ * so a grant given to a person has to be rewritten when the person changes roles and a grant
+ * given to a group does not.
+ */
+export type MediaGrantSubject = {
+  id: string;
+  kind: "user" | "group" | "role";
+  label: string;
+  /** An email, a member count, or a role key — the second line of the picker's row. */
+  detail: string;
+  suggested: boolean;
+};
+
 export type CreatedMediaShare = {
   share: MediaShare;
   url: string;

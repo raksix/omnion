@@ -103,8 +103,10 @@ pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod media_files;
+pub mod media_grants;
 pub mod media_duplicates;
-pub mod media_settings;
+pub mod media_scan;
+mod media_settings;
 pub mod media_shares;
 pub mod media_transform;
 pub mod media_versions;
@@ -457,6 +459,9 @@ pub fn router(state: AppState) -> Router {
     // The raw path takes `?preset=` (REQ-010 slice 3). Without the parameter it serves the
     // original bytes exactly as before, so every existing caller and every published page keeps
     // working; with it, the answer is a generated derivative.
+    // The raw path takes `?preset=` (REQ-010 slice 3) and refuses a file the scanning policy
+    // holds (slice 4) — a derivative of a quarantined file is still a quarantined file, and
+    // the obvious place to forget that is the path a *published page* fetches.
     let media_raw: MethodRouter<AppState, Infallible> =
         get(media_transform::raw_with_preset).layer(guards::require(&state, "media.read"));
 
@@ -552,6 +557,53 @@ pub fn router(state: AppState) -> Router {
         get(media_duplicates::report).layer(guards::require(&state, "media.read"));
     let media_duplicates_merge: MethodRouter<AppState, Infallible> =
         post(media_duplicates::merge).layer(guards::require(&state, "media.manage"));
+
+    // Scanning (REQ-010, slice 4). Reading the policy, the run log and the quarantine list is
+    // `media.read` — the file browser shows a scan badge and an editor needs to know what it
+    // means. Changing the policy, running a sweep, probing a scanner and **releasing** a
+    // quarantined file are all `media.scan.manage`, which is deliberately its own key: a
+    // release is the action that undoes a safety decision, and neither `media.manage`
+    // (organise a library) nor `media.delete` (remove a file) is that power.
+    let media_scan_route: MethodRouter<AppState, Infallible> =
+        get(media_scan::read).layer(guards::require(&state, "media.read"));
+    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
+        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
+        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_runs_route: MethodRouter<AppState, Infallible> =
+        get(media_scan::runs).layer(guards::require(&state, "media.read"));
+    let media_quarantine: MethodRouter<AppState, Infallible> =
+        get(media_scan::list_held).layer(guards::require(&state, "media.read"));
+    let media_quarantine_release: MethodRouter<AppState, Infallible> =
+        post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
+        .layer(guards::require(&state, "media.scan.manage"));
+
+    // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
+    // platform decided for you are both `media.read` — the file browser shows who can see a
+    // file, and a person who cannot open one needs to be able to ask *why*. Writing is
+    // `media.manage`, deliberately: narrowing somebody out of a folder is a library
+    // organisation decision, and a contributor who may upload is not somebody who should be
+    // able to decide who else may read what they uploaded.
+    let media_folder_grants: MethodRouter<AppState, Infallible> =
+        get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
+        .layer(guards::require(&state, "media.manage"));
+    let media_file_grants: MethodRouter<AppState, Infallible> =
+        get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
+        .layer(guards::require(&state, "media.manage"));
+    // A grant is removed by its own id alone — the row knows the node it was written on, so
+    // putting the node in the URL as well would make a two-parameter path with a one-parameter
+    // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
+    // both *static* segments under `/media/`, so they rank ahead of `/media/{id}/…` and are
+    // never read as a media id.
+    let media_grant_delete: MethodRouter<AppState, Infallible> =
+        delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
+    let media_subjects: MethodRouter<AppState, Infallible> =
+        get(media_grants::subjects).layer(guards::require(&state, "media.read"));
+    let media_grant_effective: MethodRouter<AppState, Infallible> =
+        get(media_grants::effective).layer(guards::require(&state, "media.read"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -1130,6 +1182,24 @@ pub fn router(state: AppState) -> Router {
         .route("/media/settings", media_settings_route)
         .route("/media/settings", media_settings_write)
         .route("/media/settings/test-connection", media_settings_test)
+        // Scanning. `scan-settings`, `scan` and `quarantine` are all *static* segments declared
+        // here, so axum ranks them ahead of `/media/{id}/…` — the same reason `/media/settings`
+        // is spelled as a literal rather than a parameter.
+        .route("/media/scan-settings", media_scan_route)
+        .route("/media/scan-settings", media_scan_write)
+        .route("/media/scan/test", media_scan_test)
+        .route("/media/scan/run", media_scan_run)
+        .route("/media/scan/runs", media_scan_runs_route)
+        .route("/media/quarantine", media_quarantine)
+        .route("/media/quarantine/{id}/release", media_quarantine_release)
+        .route("/media/folders/{id}/grants", media_folder_grants)
+        .route("/media/folders/{id}/grants", media_folder_grant_write)
+        
+        .route("/media/{id}/grants", media_file_grants)
+        .route("/media/{id}/grants", media_file_grant_write)
+        .route("/media/grants/{grant_id}", media_grant_delete)
+        .route("/media/grant-subjects", media_subjects)
+        .route("/media/{id}/grant-effective", media_grant_effective)
         .route("/media/transformation-presets", media_preset_create)
         .route("/media/transformation-presets/{id}", media_preset)
         .route(

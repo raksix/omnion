@@ -204,6 +204,42 @@ pub async fn create(
     let input = CreateShareInput::from_optional(body);
     let media = media_site_in_scope(&state, &current, media_id).await?;
 
+    // **The share capability, resolved through the grant chain.** The route's own
+    // `guards::require` proved the caller holds `media.share`; this asks the narrower
+    // question a grant answers — may *this* person hand *this* file to somebody outside. A
+    // writer with no `share` bit is refused here rather than being given a link and a
+    // "somebody else has to do it", which is how a capability ends up on a client's machine
+    // that should never have had it.
+    //
+    // `media.read` is assumed rather than asked: the route guard already refused a caller who
+    // cannot read the file, so the only bit in question is `share`.
+    let chain = omnion_media::load_chain(state.db().pool(), media_id, media.folder_id)
+        .await
+        .map_err(ApiError::from)?;
+    let group_ids = omnion_media::group_ids_of(state.db().pool(), current.user.id)
+        .await
+        .map_err(ApiError::from)?;
+    let decision = omnion_media::resolve(&chain, "user", current.user.id, &group_ids);
+    let share_bit = crate::routes::media_grants::require_capability(
+        &decision,
+        omnion_media::Capabilities {
+            read: true,
+            write: true,
+            delete: true,
+            share: true,
+        },
+    );
+    if !share_bit.share {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "media_grant_denied",
+            format!(
+                "You may edit this file but you may not share it. {}",
+                decision.reason
+            ),
+        ));
+    }
+
     // A link over a file that is already unservable would be created and immediately useless,
     // so it is refused at creation with the same words the serve path uses.
     if media.deleted {
@@ -426,9 +462,22 @@ pub async fn public_shared(
         // a 404 that looks like a wrong token, which sends the holder to the wrong person.
         .ok_or_else(|| share_refusal(ShareRefusal::FileUnavailable))?;
 
-    // The file's own rules, applied through the link. A trashed or quarantined file is not
-    // served, and this is deliberately evaluated here rather than at creation.
-    if media.deleted_at.is_some() || media.scan_status == "flagged" {
+    // The file's own rules, applied through the link, through the *same* gate the panel's raw
+    // path uses. The earlier hand-rolled check here knew two states — trashed and flagged —
+    // and would have served a file the site's policy holds because nobody updated it when the
+    // `pending`/`error` states arrived. One gate means the panel and a share link cannot
+    // disagree about what a file is.
+    if media.deleted_at.is_some() {
+        return Err(share_refusal(ShareRefusal::FileUnavailable));
+    }
+    // The scan half only, and for the same reason as the public renderer: a share link is
+    // held by somebody who never signs in, so a grant — which narrows a *sign-in*'s access —
+    // has nothing to say about the token's bearer. What the holder must not reach is a file
+    // the site's scanner has not cleared, and that is exactly this gate.
+    if crate::routes::media::ensure_scan_allows(&state, &media)
+        .await
+        .is_err()
+    {
         return Err(share_refusal(ShareRefusal::FileUnavailable));
     }
 
@@ -450,6 +499,12 @@ struct ScopedMedia {
     site_id: Uuid,
     site_organization: Uuid,
     filename: String,
+    /// The folder the file sits in, for the grant chain.
+    ///
+    /// Carried here rather than re-read: the chain is a folder walk, and doing it against a
+    /// second copy of the row would mean two reads that could disagree about a file somebody
+    /// moved between them — which is exactly the race a grant has to be decided inside.
+    folder_id: Option<Uuid>,
     /// Whether the file is in the trash. Read through [`MediaFile`] rather than the base
     /// `Media`, because `deleted_at` is a file-manager column and a share over a trashed file
     /// is exactly the case this route has to catch.
@@ -470,6 +525,7 @@ async fn media_site_in_scope(
         site_id: media.site_id,
         site_organization: site.organization_id,
         filename: media.filename,
+        folder_id: media.folder_id,
         deleted: media.deleted_at.is_some(),
     })
 }

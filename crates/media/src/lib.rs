@@ -17,11 +17,13 @@ pub mod error;
 pub mod exif;
 pub mod folder_store;
 pub mod folders;
+pub mod grants;
 pub mod library;
 pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod scanning;
 pub mod shares;
 pub mod storage_settings;
 pub mod transform;
@@ -32,6 +34,14 @@ pub use browser::{
     FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
     purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+};
+pub use scanning::{
+    MAX_SCAN_MB, MAX_TIMEOUT_SECONDS, MIN_SCAN_MB, MIN_TIMEOUT_SECONDS, NewSiteScan,
+    PendingScan, Quarantine, ScanRequest, ScanResponse, ScanRun, ServeRefusal, SiteScan,
+    SweepCounts, Verdict, apply_verdict, begin_run, claim_pending, close_quarantine, finish_run,
+    interpret, is_quarantined, list_quarantines, list_runs, may_serve, parse_response,
+    quarantine_totals,
+    read_scan_settings, scan_identity, write_scan_settings,
 };
 pub use duplicates::{
     CrossSiteCopy, CrossSiteGroup, DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES,
@@ -44,6 +54,10 @@ pub use exif::{EXIF_HEADER_BYTES, Exif, ORIENTATION_TAG, oriented_size, read as 
 pub use folder_store::{
     count_files_in_folder, delete_empty_folder, find_folder, insert_folder, list_folders,
     move_folder, root_folder,
+};
+pub use grants::{
+    Capabilities, Chain, ChainNode, Decision, Grant, GrantTarget, MAX_CHAIN_DEPTH, NewGrant,
+    SUBJECT_KINDS, delete_grant, group_ids_of, list_grants, load_chain, put_grant, resolve,
 };
 pub use folders::{
     Folder, FolderMove, MAX_FOLDER_NAME_LENGTH, MAX_FOLDER_PATH_LENGTH, NewFolder,

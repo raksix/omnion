@@ -25,6 +25,7 @@ import {
   Link2,
   Plus,
   RotateCcw,
+  ShieldCheck,
   Tag as TagIcon,
   X,
 } from "lucide-react";
@@ -35,6 +36,7 @@ import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { FilePreview, formatDuration, previewKind } from "@/features/media/file-preview";
 import { ScanBadge } from "@/features/media/media-shared";
+import { GrantsTab } from "@/features/media/grants-tab";
 import { SharesTab } from "@/features/media/shares-tab";
 import {
   ApiError,
@@ -50,7 +52,7 @@ import { formatBytes, formatTimestamp } from "@/lib/format";
 import type { MediaExif, MediaFile, MediaVersion, MediaVersionList } from "@/lib/types";
 
 /** Which tab of the right-hand panel is on screen. */
-type Tab = "metadata" | "versions" | "shares";
+type Tab = "metadata" | "versions" | "permissions" | "shares";
 
 /** The file detail screen. */
 export function MediaFileDetail() {
@@ -326,6 +328,13 @@ export function MediaFileDetail() {
               label={`Versions${history ? ` (${history.version_total})` : ""}`}
             />
             <TabButton
+              id="media-tab-permissions"
+              active={tab === "permissions"}
+              onClick={() => setTab("permissions")}
+              icon={<ShieldCheck className="h-3.5 w-3.5" aria-hidden />}
+              label="Permissions"
+            />
+            <TabButton
               id="media-tab-shares"
               active={tab === "shares"}
               onClick={() => setTab("shares")}
@@ -352,6 +361,8 @@ export function MediaFileDetail() {
                 onPreview={setPreviewVersion}
                 onRestore={onRestore}
               />
+            ) : tab === "permissions" ? (
+              <GrantsTab targetKind="file" targetId={fileId} siteId={file.site_id} />
             ) : (
               <SharesTab mediaId={fileId} />
             )}

@@ -32,7 +32,7 @@ use omnion_identity::sites;
 use omnion_media::{
     MAX_UPLOAD_BYTES, Media, MediaError, NewMedia, normalize_content_type, object_key,
     sanitize_filename, serve_plan,
-};
+    MediaFile,};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -267,6 +267,121 @@ pub async fn upload_media(
     Ok((StatusCode::CREATED, Json(MediaBody::build(&media))))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Scan gating
+// ---------------------------------------------------------------------------------------------
+
+/// Refuse to serve a file whose scan state says it may not be served, and explain why.
+///
+/// This is the strict half of "scanning is best-effort at ingest, strict at serve" (REQ-010
+/// *Risks*): a scanner outage must not lose an upload, and an *unscanned* file must not be
+/// readable until it clears. Both halves live here rather than in the upload path, because a
+/// file can be flagged minutes or years after it was stored — a link made yesterday must stop
+/// working the moment the scanner flags the file, and only a check on the serve path does
+/// that.
+///
+/// The policy is read per request rather than cached, because a site flipping `on_error` from
+/// `hold` to `serve` has to take effect on the next request: a cached policy would keep
+/// refusing a file for as long as the entry lived, and the operator has just said the
+/// opposite on the settings screen.
+pub(crate) async fn ensure_servable(
+    state: &AppState,
+    current: &CurrentSession,
+    media: &MediaFile,
+) -> Result<(), ApiError> {
+    ensure_grant_allows(state, current, media).await?;
+    ensure_scan_allows(state, media).await
+}
+
+/// Refuse a file a grant chain has taken a capability away from.
+///
+/// The gate lives beside [`ensure_scan_allows`] rather than inside it, and it is *first*, for
+/// two reasons. A grant is about who is asking and a scan is about what the bytes are: a
+/// caller who may not read this file learns that from the grant, not from a `file_scan_failed`
+/// that names a state they were never allowed to know about. And the grant check is the
+/// cheaper one — two statements and a membership read, against a policy row and a quarantine
+/// probe on the hottest path in the library.
+///
+/// The narrowing rule is applied in one place, [`crate::routes::media_grants::require_capability`]:
+/// a chain that names this caller not at all leaves the catalogue's answer verbatim, and a
+/// chain that names them may only subtract from it. A version that intersected unconditionally
+/// would refuse every file in a library that has no grants on it.
+pub(crate) async fn ensure_grant_allows(
+    state: &AppState,
+    current: &CurrentSession,
+    media: &MediaFile,
+) -> Result<(), ApiError> {
+    // Fast path: a file in a library with no grants at all must not pay for a chain walk on
+    // every thumbnail. One indexed existence probe, and the common answer is that there is
+    // nothing to resolve.
+    let chain = omnion_media::load_chain(state.db().pool(), media.id, media.folder_id)
+        .await
+        .map_err(ApiError::from)?;
+    let group_ids = omnion_media::group_ids_of(state.db().pool(), current.user.id)
+        .await
+        .map_err(ApiError::from)?;
+    let decision = omnion_media::resolve(&chain, "user", current.user.id, &group_ids);
+    if !decision.touched {
+        return Ok(());
+    }
+
+    // What the catalogue alone would say. The route's own `guards::require` already refused a
+    // caller without `media.read`, so read is present by construction and this only decides
+    // the rest — but the *whole* intersection is computed so a grant naming nobody in
+    // particular cannot read past a catalogue that refused.
+    let catalogue = omnion_media::Capabilities {
+        read: true,
+        write: true,
+        delete: true,
+        // `share` is the capability that hands bytes to somebody who never signs in, and the
+        // route that creates a link is the only place it matters — the chain is read there
+        // again with the caller's own groups, so a share can never be created against a
+        // capability the caller does not hold.
+        share: true,
+    };
+    let effective = crate::routes::media_grants::require_capability(&decision, catalogue);
+    if effective.read {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "media_grant_denied",
+        format!(
+            "You do not have access to this file. {}",
+            decision.reason
+        ),
+    ))
+}
+
+/// The scan half of the serve gate, split out of [`ensure_servable`] so the grant rule has a
+/// name of its own.
+pub(crate) async fn ensure_scan_allows(state: &AppState, media: &MediaFile) -> Result<(), ApiError> {
+    // A `clean` file needs no policy read at all: the state already answers the question, and
+    // the panel serves far more of those than anything else, so a row read per request on the
+    // hottest path in the library is a cost with no benefit.
+    if media.scan_status == "clean" {
+        return Ok(());
+    }
+    let quarantined = omnion_media::is_quarantined(state.db().pool(), media.id).await?;
+    let policy = omnion_media::read_scan_settings(state.db().pool(), media.site_id).await?;
+    // Note that a *disabled* site is not an early return any more. `may_serve` reads
+    // `enabled` itself, because one state has to be refused whether or not anybody asked for
+    // scanning: a file the scanner flagged stays flagged after the switch is turned off.
+    match omnion_media::may_serve(&media.scan_status, quarantined, &policy) {
+        Ok(()) => Ok(()),
+        Err(refusal) => {
+            // A `404` for a trashed file and a `403` for everything else: the trashed case is
+            // already what the file's own route says, and the other three are a *state* the
+            // caller can act on by asking somebody with `media.scan.manage`.
+            let status = match refusal {
+                omnion_media::ServeRefusal::Trashed => StatusCode::NOT_FOUND,
+                _ => StatusCode::FORBIDDEN,
+            };
+            Err(ApiError::new(status, refusal.code(), refusal.message()))
+        }
+    }
+}
+
 /// One media row of the library.
 pub async fn get_media(
     State(state): State<AppState>,
@@ -285,6 +400,22 @@ pub async fn raw_media(
 ) -> Result<Response, ApiError> {
     let media = media_in_scope(&state, &current, media_id).await?;
     serve(&state, &media, "private, max-age=300").await
+}
+
+/// The bytes of one file for the panel, through the full file-manager row.
+///
+/// The plain `Media` row the original raw path reads carries no scan state at all, which is
+/// why this handler exists rather than the original being edited in place: the gate needs
+/// `deleted_at` and `scan_status`, and a `403` for a quarantined file must not be reachable by
+/// a caller who happens to know the old row's shape.
+pub async fn raw_file(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(media_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let file = crate::routes::media_files::file_in_scope(&state, &current, media_id).await?;
+    ensure_servable(&state, &current, &file).await?;
+    serve_file(&state, &file, "private, max-age=300").await
 }
 
 /// Remove one file: the object and its row.
@@ -343,10 +474,20 @@ pub async fn public_media(
     State(state): State<AppState>,
     Path(media_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let media = omnion_media::find_media(state.db().pool(), media_id)
+    // The public renderer reads the full row, not the base one, because a file that is
+    // quarantined or unscanned must be refused here too: the public path is the one an
+    // unauthenticated visitor reaches, and it is strictly the *worst* place to serve a file
+    // the scanner has not cleared.
+    let file = omnion_media::find_file_any_state(state.db().pool(), media_id)
         .await?
         .ok_or_else(media_not_found)?;
-    serve(&state, &media, "public, max-age=3600").await
+    // The **scan** half only. A grant narrows a sign-in's access and cannot describe an
+    // anonymous visitor, so applying one here would break every published page the moment
+    // somebody narrowed a folder — and the scanner's verdict is exactly the state an
+    // unauthenticated reader must not reach. The two halves are separate functions for this
+    // reason, and conflating them is the mistake this comment is here to stop.
+    ensure_scan_allows(&state, &file).await?;
+    serve_file(&state, &file, "public, max-age=3600").await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -438,6 +579,31 @@ async fn serve(
             "{}; filename=\"{}\"",
             plan.disposition, media.filename
         ))?,
+    );
+    headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    Ok(response)
+}
+
+/// Answer with the bytes of one file-manager row, under the serve plan of its content type.
+///
+/// A separate function from [`serve`] rather than a conversion between the two row types: a
+/// conversion would have to pick which row's columns are authoritative, and the answer would
+/// change the day a column is added to one of them.
+async fn serve_file(
+    state: &AppState,
+    media: &omnion_media::MediaFile,
+    cache_control: &'static str,
+) -> Result<Response, ApiError> {
+    let bytes = state.storage().get(&media.storage_key).await?;
+    let plan = serve_plan(&media.content_type);
+
+    let mut response = Response::new(Body::from(bytes));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        header_value(&format!("{}; filename=\"{}\"", plan.disposition, media.filename))?,
     );
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);

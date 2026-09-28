@@ -7,6 +7,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+# The virus-scanning client (REQ-010, slice 4) posts a file's bytes to a scanner endpoint and
+# reads back a verdict. It is a runtime dependency, not a test one: the sweep runs inside a
+# request, and a client that only exists under `cfg(test)` would make the pipeline a test-only
+# feature.
+reqwest = { workspace = true, features = ["json"] }
+
 axum = { workspace = true, features = ["multipart"] }
 tokio.workspace = true
 tower.workspace = true
