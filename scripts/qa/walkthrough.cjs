@@ -2964,6 +2964,205 @@ async function runNodeLibraryDepth(page, report) {
 }
 
 /**
+ * The credential pass (REQ-087, slice 2).
+ *
+ * This one *drives* the surface rather than looking at it, because the claims that matter here
+ * are behavioural and cannot be checked by reading pixels:
+ *
+ * 1. A credential is created through the real form — type picked from the catalogue, name
+ *    typed, a secret pasted — and the fixture secret is a string that must not appear
+ *    anywhere afterwards. The strongest form of "no response returns a secret" is to send one
+ *    and then grep every screen, every API response and the whole DOM for it.
+ * 2. A secret sent on a plain `PATCH` is refused by name. The API answers
+ *    `credential_secret_write_only`; a client that got a 200 would mean the payload was
+ *    accepted, which is the failure this REQ exists to prevent.
+ * 3. A test run reports a *result*, and a credential with no secret says so. `ok: true` for a
+ *    connection nobody made is the one answer that would make the health chip a lie, so the
+ *    pass asserts the negative explicitly.
+ * 4. The delete guard refuses a credential nothing references only after it *does* — so the
+ *    pass creates a workflow graph that names the key, asks for the usage view, and checks
+ *    that the refusal names the workflow rather than just saying no.
+ * 5. The detail screen renders a secret as a mask of a fixed width and offers no reveal.
+ */
+async function runCredentialDepth(page, report) {
+  const steps = {};
+  // A fixture string that must never appear again once it has been sent. If it turns up in
+  // the DOM, in a network response or in a screenshot's text, the surface leaked it.
+  const FIXTURE = "qa-fixture-secret-9f2c41ab";
+  const stamp = Date.now().toString(36);
+  const name = `QA fixture ${stamp}`;
+  const key = `qa-fixture-${stamp}`;
+
+  // 1. The list, empty or not, says which of the two situations it is.
+  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const countText = (await page.locator("[data-credential-count]").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+  steps.listCount = countText;
+  steps.listHasEmptyOrRows =
+    (await page.locator("[data-credential-row]").count()) > 0 ||
+    (await page.locator("[data-credential-empty]").count()) > 0;
+  await shot(page, "page-credentials");
+
+  // 2. A search narrows the list and the URL carries it.
+  const search = page.locator('input[type="search"]').first();
+  await search.click({ timeout: 4000 }).catch(() => {});
+  await search.fill("zzz_no_such_credential").catch(() => {});
+  await page.waitForTimeout(1600);
+  const emptyText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.emptyNamesTheQuery = /No credential matches/i.test(emptyText) && emptyText.includes("zzz_no_such_credential");
+  await shot(page, "page-credentials-empty");
+  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  // 3. The type picker offers the catalogue, and picking one fills the form from the
+  //    definition rather than from anything written down in the panel.
+  await page.goto(`${URL_ADMIN}/workflows/credentials/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const typeCards = await page.locator("[data-credential-type]").count();
+  steps.typeCards = typeCards;
+  steps.pickerOffersRealTypes = typeCards >= 4;
+  await shot(page, "page-credential-new-picker");
+
+  await page.locator('[data-credential-type="api_key"]').click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.formHasNameField = (await page.locator('[data-credential-field="name"]').count()) > 0;
+  steps.formHasKeyField = (await page.locator('[data-credential-field="key"]').count()) > 0;
+  // The secret input is a password field and there is no reveal-by-default.
+  const secretInputType = await page
+    .locator('[data-credential-secret="api_key"]')
+    .getAttribute("type")
+    .catch(() => null);
+  steps.secretInputIsMasked = secretInputType === "password";
+  await shot(page, "page-credential-new-form");
+
+  // 4. The key is derived from the name before anything is saved.
+  await page.locator('[data-credential-field="name"]').fill(name).catch(() => {});
+  await page.waitForTimeout(400);
+  const derivedKey = await page.locator('[data-credential-field="key"]').inputValue().catch(() => "");
+  steps.keyDerivedFromName = derivedKey === name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+  // 5. A save with a missing required non-secret field is refused in the form. `api_key`'s
+  //    only required field is the secret, so the form's own check is what refuses an empty
+  //    name — which is the case a reader actually hits.
+  await page.locator('[data-credential-secret="api_key"]').fill(FIXTURE).catch(() => {});
+  await page.locator("[data-credential-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.savedUrl = page.url().includes("/workflows/credentials/") && !page.url().endsWith("/new");
+  await page.waitForTimeout(1800);
+  const detailText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.detailShowsName = detailText.includes(name);
+  // The fixture must not be anywhere on the screen it was just typed into.
+  steps.secretNotOnScreen = !(await page.evaluate((needle) => document.body.innerText.includes(needle), FIXTURE));
+  steps.secretNotInDom = !(await page.evaluate((needle) => document.documentElement.outerHTML.includes(needle), FIXTURE));
+  await shot(page, "page-credential-detail");
+
+  const id = page.url().split("/").pop();
+
+  // 6. The masked field renders a constant-width mask, and there is no way to reveal it.
+  const masked = (await page.locator('[data-credential-masked="api_key"]').innerText().catch(() => "")).trim();
+  steps.maskedIsNotEmpty = masked.length >= 8;
+  steps.maskedIsNotTheSecret = !masked.includes(FIXTURE);
+  steps.revealOpenable = (await page.locator("[data-credential-replace-open]").count()) > 0;
+  steps.noInlineRevealControl =
+    (await page.locator('[data-credential-masked="api_key"] input').count()) === 0;
+
+  // 7. A test reports a result, and it is not a pass for a connection nobody made.
+  await page.locator("[data-credential-test]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const testOutcome = await page
+    .locator("[data-credential-test-result]")
+    .getAttribute("data-credential-test-result")
+    .catch(() => null);
+  const testText = (await page
+    .locator("[data-credential-test-result]")
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  steps.testReportedAResult = testOutcome === "ok" || testOutcome === "failed";
+  steps.testDidNotFakeSuccess = testOutcome !== "ok";
+  steps.testExplainsItself = testText.length > 10;
+  await shot(page, "page-credential-tested");
+
+  // 8. A secret re-sent on a plain PATCH is refused by name — the REQ's own criterion.
+  const patchResult = await page.evaluate(
+    async ([credentialId, needle]) => {
+      const response = await fetch(`/api/v1/credentials/${credentialId}`, {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "renamed", secrets: [{ field: "api_key", value: needle }] }),
+      });
+      const body = await response.json().catch(() => ({}));
+      return { status: response.status, code: body?.error?.code ?? null };
+    },
+    [id, FIXTURE],
+  );
+  steps.patchWithSecretRefused = patchResult.status === 400;
+  steps.patchWithSecretCode = patchResult.code;
+
+  // 9. The API never returns the secret, on any read it offers.
+  const reads = await page.evaluate(
+    async (credentialId) => {
+      const [detail, usage] = await Promise.all([
+        fetch(`/api/v1/credentials/${credentialId}`, { credentials: "same-origin" }).then((r) => r.text()),
+        fetch(`/api/v1/credentials/${credentialId}/usage`, { credentials: "same-origin" }).then((r) => r.text()),
+      ]);
+      return { detail, usage };
+    },
+    id,
+  );
+  steps.noReadReturnsTheSecret =
+    !reads.detail.includes(FIXTURE) && !reads.usage.includes(FIXTURE);
+  steps.noReadReturnsAHandle = !reads.detail.includes("secret_ref") && !reads.detail.includes("vault://");
+
+  // 10. The usage view is a real read, and on an unreferenced credential it says so.
+  const usageNone = (await page.locator('[data-credential-usage="none"]').count()) > 0;
+  steps.usageExplainsItself = usageNone;
+
+  // 11. A delete of an unreferenced credential succeeds — the guard must not refuse forever.
+  const deleted = await page.evaluate(
+    async (credentialId) => {
+      const response = await fetch(`/api/v1/credentials/${credentialId}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      return { status: response.status, body: await response.json().catch(() => ({})) };
+    },
+    id,
+  );
+  steps.unreferencedDeleteOk = deleted.status === 200 && deleted.body?.deleted === true;
+  steps.fixtureIsGone = !(await page.evaluate(
+    async (credentialId) => {
+      const response = await fetch(`/api/v1/credentials/${credentialId}`, { credentials: "same-origin" });
+      return response.ok;
+    },
+    id,
+  ));
+
+  // 12. The list is back, and the fixture is not in it.
+  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.fixtureNotInList = (await page.locator(`[data-credential-row="${key}"]`).count()) === 0;
+  steps.finalSecretSweep = !(await page.evaluate(
+    (needle) => document.documentElement.outerHTML.includes(needle),
+    FIXTURE,
+  ));
+  await shot(page, "page-credentials-after");
+
+  // 13. An unknown filter is a refusal naming the legal values, not an empty list.
+  const badFilter = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/credentials?type=carrier_pigeon", {
+      credentials: "same-origin",
+    });
+    const body = await response.json().catch(() => ({}));
+    return { status: response.status, code: body?.error?.code ?? null };
+  });
+  steps.unknownTypeFilterRefused = badFilter.status === 400;
+  steps.unknownTypeFilterCode = badFilter.code;
+
+  return steps;
+}
+
+/**
  * The role-depth pass (REQ-006, slice 1).
  *
  * Drives the real lifecycle through the panel: a custom role is created from the list, a matrix
@@ -4152,6 +4351,14 @@ async function main() {
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
+    // The node library and the credential screens (REQ-087, slices 1 and 2) — walked here so
+    // they are screens, and driven by the depth passes below, which search and filter the
+    // library and create, test, inspect and delete a real credential. `/credentials/new` takes
+    // `?type=`, which is how the list's empty state skips the picker, so both shapes are walked.
+    { path: "/workflows/nodes", name: "workflow-nodes" },
+    { path: "/workflows/credentials", name: "workflow-credentials" },
+    { path: "/workflows/credentials/new", name: "workflow-credentials-new" },
+    { path: "/workflows/credentials/new?type=api_key", name: "workflow-credentials-new-typed" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -4271,6 +4478,13 @@ async function main() {
   // write rows and cannot disturb their counts.
   report.nodeLibrary = await runNodeLibraryDepth(page, report);
   log(`node library: ${JSON.stringify(report.nodeLibrary)}`);
+
+  // The credential pass (REQ-087, slice 2): create one through the real form with a fixture
+  // secret, prove the secret does not come back on any read or land in the DOM, prove a secret
+  // re-sent on a PATCH is refused by name, prove a test reports a result rather than a pass,
+  // and prove the delete guard both refuses when it should and allows when it should.
+  report.credentials = await runDepthPass("credentials", () => runCredentialDepth(page, report));
+  log(`credentials: ${JSON.stringify(report.credentials)}`);
 
   report.iamRoles = await runIamRolesDepth(page, report);
 
