@@ -16,8 +16,9 @@
 //! draft. Themes, blocks and translation overlays build on this response in later phases.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use omnion_content::{ContentError, pages};
 use omnion_identity::Site;
 use omnion_identity::sites;
@@ -26,6 +27,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use crate::error::ApiError;
+use crate::routes::cdn_cache;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -119,12 +121,20 @@ fn classify_hint(value: &str) -> SiteHint<'_> {
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/public/pages/{slug}` — the published page behind an address.
+///
+/// The cache headers come from the site's cache-rule set (REQ-011) rather than from a
+/// literal here, and the validator is the published revision: two reads of one revision
+/// produce the same `ETag` and a conditional read answers `304`, while a re-publish
+/// produces a new one. The body is the *rendered* body, because that is what the cache
+/// stores — hashing the stored rows instead would be a validator for bytes the client
+/// never received.
 pub async fn get_published_page(
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Query(query): Query<PublicPageQuery>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-) -> Result<Json<PublishedPageResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let pool = state.db().pool();
     let site = resolve_site(pool, query.site.as_deref(), &headers).await?;
 
@@ -145,7 +155,7 @@ pub async fn get_published_page(
         return Err(page_not_found(&slug));
     };
 
-    Ok(Json(PublishedPageResponse {
+    let body = PublishedPageResponse {
         site: PublicSiteBody {
             key: site.key,
             name: site.name,
@@ -159,11 +169,54 @@ pub async fn get_published_page(
         revision: PublicRevisionBody {
             revision_no: revision.revision_no,
             title: revision.title,
-            body: revision.body,
+            body: revision.body.clone(),
             summary: revision.summary,
             published_at: revision.published_at,
         },
-    }))
+    };
+
+    // The rule set is matched against the *public address* the visitor asked for, not the
+    // API path: a rule author writes `/blog/hello`, and matching `/api/v1/public/pages/blog`
+    // would make every pattern they can express unmatched. The query string travels with it
+    // because a rule may allow-list a parameter; the site hint is stripped from it, because
+    // it selects the site rather than varying the page.
+    let request_path = format!("/{}", slug);
+    let shape = cdn_cache::request_shape(
+        &request_path,
+        public_query(raw_query.as_deref(), query.site.as_deref()).as_deref(),
+        &headers,
+    );
+    let policy = cdn_cache::policy_for(pool, site.id, &shape).await;
+
+    let response = Json(body).into_response();
+    Ok(cdn_cache::apply(
+        response,
+        &policy,
+        cdn_cache::Validator::Page {
+            revision_no: revision.revision_no,
+            body: &revision.body,
+        },
+        &headers,
+    ))
+}
+
+/// The query string a cache rule may key on: everything except the site hint.
+///
+/// The site hint addresses *which* site answered, so including it in the key would give
+/// the same page two cache entries on one domain and defeat the cache without protecting
+/// anything. Returns `None` when nothing is left, because "no query" and "an empty query"
+/// must key identically.
+fn public_query(raw: Option<&str>, site_hint: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let kept: Vec<&str> = raw
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split('=').next().unwrap_or(pair);
+            Some(name) != site_hint
+        })
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("&"))
 }
 
 /// The `404` of the public surface: one shape for "not here", never "not published".

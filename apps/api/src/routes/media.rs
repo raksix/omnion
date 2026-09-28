@@ -41,6 +41,7 @@ use uuid::Uuid;
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
+use crate::routes::cdn_cache;
 use crate::scope::ensure_same_organization;
 use crate::state::AppState;
 
@@ -399,9 +400,16 @@ pub async fn delete_media(
 /// Unauthenticated, like the rest of the public surface: a media id is an opaque UUID and this
 /// route serves exactly the object the row names. Per-media visibility (private folders,
 /// unpublished assets) arrives with the file manager (REQ-010).
+///
+/// The cache headers are not written here but decided by the site's cache-rule set (REQ-011):
+/// a rule an operator created has to change what a visitor's browser does, and a hardcoded
+/// `max-age` in this handler is what made the rule table a screen that changed nothing. The
+/// file's checksum is the validator, so a conditional request for a file whose bytes did not
+/// change answers `304` without reading the object store twice.
 pub async fn public_media(
     State(state): State<AppState>,
     Path(media_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     // The public renderer reads the full row, not the base one, because a file that is
     // quarantined or unscanned must be refused here too: the public path is the one an
@@ -411,7 +419,24 @@ pub async fn public_media(
         .await?
         .ok_or_else(media_not_found)?;
     ensure_servable(&state, &file).await?;
-    serve_file(&state, &file, "public, max-age=3600").await
+
+    // The rule set is matched against the API path here, not a public address: a media
+    // file is addressed by its id and has no address of its own, so `/api/v1/public/media/*`
+    // is the only path a rule author can write that matches this response.
+    let request_path = format!("/api/v1/public/media/{media_id}");
+    let shape = cdn_cache::request_shape(&request_path, None, &headers);
+    let policy = cdn_cache::policy_for(state.db().pool(), file.site_id, &shape).await;
+
+    let response = serve_file(&state, &file, "no-store").await?;
+    Ok(cdn_cache::apply(
+        response,
+        &policy,
+        cdn_cache::Validator::File {
+            checksum: &file.checksum,
+            id: file.id,
+        },
+        &headers,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
