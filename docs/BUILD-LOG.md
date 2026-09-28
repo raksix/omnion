@@ -2932,3 +2932,67 @@ metric families give it a contract to import against.
   quarantine and release, retention policies with the daily worker, and reference-based purge
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
+
+## 2026-09-28 · REQ-126 slice 4b — the retention sweep, and a prune that never ran once
+
+- **The finding.** Three of slice 4's components — the lifecycle, the alert evaluator and both
+  screens — shipped in the previous tick's commits, but the REQ's acceptance boxes were still
+  unticked and `state.json` had never been bumped. Reading the slice against the tree instead of
+  against its own description turned up two things the previous tick's gates could not see, both
+  the same shape as the exporter-pipeline hole from slice 3.
+- **The retention functions had no caller but their own test.** `store::prune`,
+  `trace_store::prune` and `alerts::prune_events` were all correct, all unit-tested, and
+  reachable from exactly one place: the test that called them. So an instance left up for a year
+  kept a year of log lines and trace rows while the settings screen showed a retention window
+  that nothing honoured. The tell is the same one that caught the exporter: a struct or function
+  whose only non-definition callers are inside `#[cfg(test)]`. `grep -rn` for the name and read
+  the file each hit is in — that is the check, and it is cheap enough to do every tick.
+- **`crates/telemetry::retention` is the caller** (`5b191a6`). A daily sweep that reads the ONE
+  settings row the screen writes, clamps both windows one-directionally (toward keeping MORE —
+  extra rows cost disk and are deletable later, fewer rows are gone forever), and prunes each
+  bounded table independently so one locked table cannot stop the rest. `OMNION_RETENTION_SWEEP`
+  is the documented way to run the deletion from an operator's own cron instead.
+- **The sweep then found that `trace_store::prune` had never worked at all.** It bound an `i64`
+  to `make_interval(days => $1)`; PostgreSQL's `make_interval` declares `days integer` and has
+  no bigint→integer cast for a named parameter, so the statement was refused with `42883` on
+  **every call, for every window**. The trace index has never been pruned by that function.
+  `alerts::prune_events` had the identical statement and is fixed the same way (`f956a3e`).
+- **Why it hid for a tick, which is the transferable part.** The sweep treats a failed prune as a
+  warning and carries on — correctly, because a sweep that is all-or-nothing never runs once one
+  table is locked. But a failed prune reported `trace_rows: 0`, and **0 is the number a quiet
+  sweep also reports**. A count that cannot be distinguished from a failure is not a report. So
+  `PruneReport` carries `errors`, `is_empty` folds it in (a failed sweep is not quiet), the loop
+  logs the count, and `record` **refuses to emit `observability.retention.pruned` from a pass
+  that failed** — an event that says "pruned 4 rows" must never come from a pass that deleted
+  nothing. `every_prune_statement_is_valid_postgres_not_only_valid_rust` now asserts `errors == 0`
+  against a real server, which is the only place the parameter's SQL type can be wrong.
+- **A unit test cannot catch that class, and the integration walk did.** `prune` is
+  `async fn prune(pool, i64) -> Result<i64, _>`; it type-checks perfectly. The mismatch lives
+  inside the statement text, and only a real PostgreSQL has an opinion about it. The walk writes
+  a 40-day-old line and a fresh one, sweeps, and reads both back **out of the database** — a
+  sweep that counts correctly and deletes nothing would pass on the report alone. The compliance
+  half is asserted against a row in ANOTHER table (a 400-day-old `audit_log` entry) rather than
+  by inspecting the diff for a missing `delete` (`dae2833`).
+- **The migration moved 0044 → 0046, and the check that missed it is worth writing down.** The
+  slot check has always been "an `ls` across every sibling worktree plus `origin/main`". Every
+  *committed* migration was clear of 0044 — and `0044_media_scanning.sql` was sitting
+  **untracked** in the main writer's working tree. A check that reads only `origin/main` reports
+  a slot free, and the collision then lands in the union, in a merge where neither branch was
+  internally inconsistent. The check that catches it is
+  `git status --short database/migrations/` in every sibling, not `git ls-tree origin/main`.
+- **Proof.** `cargo test -p omnion-telemetry --lib` → **153** (was 151, +2 retention unit tests,
+  and the family the sweep records is asserted declared). `cargo test -p omnion-api --test
+  observability_retention` → **7/7** against `omnion_w6_dev`. `pnpm typecheck` **2/2**. The
+  migration applies on a fresh database after the renumber (the dev database was dropped and
+  recreated, because a renumbered migration leaves the old checksum behind).
+- **Environment.** `/mnt/apopic` sat at **97 % (2.2 G free)** on entry and this worktree's
+  `/dev/shm` target held 6.8 G; the Rust gates survived because of that symlink. Four sibling
+  writers were inside `qa/run.sh` at tick start. The dev PostgreSQL is on **port 5433**, not the
+  default 5432 — a `createdb` against 5432 fails with a password error that reads like bad
+  credentials rather than a wrong port.
+- **Next.** The remaining `Events` block: `observability.alert.fired` / `.resolved`,
+  `exporter.degraded` / `.recovered`, `sampling.changed` and `log_level.changed` are documented
+  in the request and emitted **nowhere** — a grep over the tree finds only the doc. Seven of the
+  eight are dead today, which is the same "provable but unreachable" finding in a different
+  table. Then the `observability.read`-cannot-write `403` line, and the REQ's close gate
+  (`cargo test --workspace`, `pnpm build`, the private-stack walkthrough).
