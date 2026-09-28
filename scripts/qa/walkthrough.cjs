@@ -768,6 +768,21 @@ async function interact(page, pageName, report) {
     const before = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     const started = Date.now();
 
+    // A submit button **outside** a dialog — the provider form on the AI screen is inline, and
+    // clicking its submit with the sample values this loop has already typed is a POST the API
+    // refuses with a 400. That refusal is the product working: a form that accepted
+    // "e.g. Office AI" as a provider name would be the defect. Registering it here is what keeps
+    // the pass from reporting its own test as a broken screen, and the vocabulary is 4xx only so
+    // a 500 in the same window — the API crashing on input it just refused — is still a finding.
+    const submitsAForm = meta.tag === "button" && meta.type === "submit";
+    if (submitsAForm) {
+      expectRefusal(
+        "/api/v1/",
+        `interact(${pageName}): a sample-filled form is submitted on purpose and refused`,
+        [400, 401, 403, 422],
+      );
+    }
+
     const control = page.locator(`[data-qa-idx="${i}"]`);
     if (meta.tag === "select") {
       const picked = await control
@@ -840,6 +855,11 @@ async function interact(page, pageName, report) {
     await settleAfterClick(page);
     page.context().off("page", onPopup);
     for (const p of popups) await p.close().catch(() => {});
+
+    // Close the submission window as soon as the click has settled, before the outcome is judged.
+    // The allowance covers what *this* submit provoked and nothing after it, so a real failure two
+    // clicks later cannot inherit it.
+    if (submitsAForm) endRefusalWindow("/api/v1/");
 
     const after = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     let outcome = "ok";
@@ -4023,8 +4043,17 @@ async function main() {
 
   // The AI provider runtime pass (REQ-097, slice 1): the form's own refusal, a real local
   // endpoint, the five-step connection test, and a dead endpoint that names its failing step.
+  //
+  // The pass writes its own steps onto `report.aiProviders` as it takes them, so it is **called,
+  // not assigned** — `report.x = await runX()` would overwrite that with the function's return
+  // value, which is nothing. That is how a pass which had recorded eleven assertions ended up in
+  // the report as `undefined`, while the artifact beside it held every one of them.
   if (inScope("ai")) {
-    report.aiProviders = await runAiProviderDepth(page, report);
+    await runAiProviderDepth(page, report);
+    if (!report.aiProviders) {
+      // Belt and braces: a pass that somehow published nothing is a finding, not an empty report.
+      aiStateFindings.push("the AI provider depth pass returned without publishing a result");
+    }
   }
   // The three states of every list — the one criterion that is a *claim* until the network
   // says otherwise. Each failure is provoked for real (a 500 and a dropped connection), the
