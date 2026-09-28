@@ -5743,6 +5743,50 @@ async function runCrmStateSweep(page, report) {
   await shot(page, "page-crm-contacts-company-picker-error");
   await page.unroute("**/api/v1/crm/**");
 
+  // ---- a refused read replaces the body, it does not sit above a skeleton that never ends ----
+  // The board drew its error *strip above* a four-column skeleton. Both the strip and the
+  // skeleton stayed, because a refused read sets no board to render, so the loading branch kept
+  // its claim: "loading" forever, printed directly under "the store is not answering". A reader
+  // sees two incompatible states at once and neither is true. The other five CRM screens gate
+  // their body on the read; the board and the list now do too.
+  //
+  // The stub is pinned to the board's own read, which is a different request from the list's
+  // (`/crm/deals?view=board`), so this is the board branch and not the list one.
+  await page.route("**/api/v1/crm/**", (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    return request.method() === "GET" && url.pathname === LIST_READ.deals && url.searchParams.get("view") === "board"
+      ? route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          headers: { "x-request-id": REQUEST_ID },
+          body: JSON.stringify({
+            error: {
+              code: "dependency_unavailable",
+              message: "The pipeline store is not answering right now.",
+              request_id: REQUEST_ID,
+            },
+          }),
+        })
+      : route.continue();
+  });
+  await page.goto(`${URL_ADMIN}/crm/deals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const boardState = page.locator("[data-qa='crm-deals-board-error']").first();
+  await boardState.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  const boardText = (await boardState.innerText().catch(() => "")).trim();
+  steps.theBoardReplacesItsBodyOnARefusal = (await boardState.count()) > 0;
+  steps.theBoardNamesTheRequest = boardText.includes(REQUEST_ID);
+  // The assertion the strip could never have passed: no column is left claiming to load.
+  steps.noSkeletonIsLeftClaimingToLoad =
+    (await page.locator("[data-qa='crm-deals-board-error'] [aria-busy='true']").count()) === 0 &&
+    (await page.locator("[aria-busy='true'] .animate-pulse").count()) === 0;
+  // A screen that cannot read the board can still read the list: two views of one record, and
+  // refusing one must not take the other away.
+  steps.theOtherViewIsStillOffered =
+    (await page.locator("[data-qa='crm-deals-board-error-list']").count()) > 0;
+  await shot(page, "page-crm-deals-board-error");
+  await page.unroute("**/api/v1/crm/**");
+
   report.crmStates = steps;
   log(`crm state sweep: ${JSON.stringify(steps)}`);
 }

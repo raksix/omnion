@@ -24,7 +24,7 @@ import { AlertTriangle, ArrowLeftRight, LayoutGrid, List, Plus, Sparkles, X } fr
 import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
-import { ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
+import { ErrorState, ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
 import { ApiError } from "@/lib/api";
 import {
   CRM_CURRENCIES,
@@ -120,7 +120,14 @@ export function DealsView() {
   const [mode, setMode] = useState<"board" | "list">("board");
   const [pipelineId, setPipelineId] = useState<string>("");
   const [search, setSearch] = useState("");
+  // Two errors, not one. `error` is what an *action* refused (a drag, an archive) and it is a
+  // strip above a board that is still perfectly good — the reader moved a card and the server said
+  // no, so the card went back and the board is the answer. `loadError` is the screen's own read
+  // failing, and there is nothing to look at, so it replaces the body. Sharing one state between
+  // them is how a refused drag ends up blanking the pipeline: the two are different events and
+  // they have different bodies.
   const [error, setError] = useState<ScreenErrorValue>(null);
+  const [loadError, setLoadError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -199,6 +206,7 @@ export function DealsView() {
   /** Load whichever view is on screen. The board is the default because it is the screen. */
   const load = useCallback(async () => {
     setError(null);
+    setLoadError(null);
     try {
       if (mode === "board") {
         // The route answers `{ view, board }` so a list mode can share the path; the screen
@@ -214,7 +222,7 @@ export function DealsView() {
         setBoard(null);
       }
     } catch (problem) {
-      setError(toScreenError(problem, "The board could not be loaded."));
+      setLoadError(toScreenError(problem, "The board could not be loaded."));
     }
   }, [mode, pipelineId, search, organizationId]);
 
@@ -503,7 +511,28 @@ export function DealsView() {
       ) : null}
 
       {mode === "board" ? (
-        board === null ? (
+        loadError ? (
+          /* A refused read replaces the board rather than sitting above it. The strip alone left
+             a four-column skeleton underneath that could never resolve, because the load had
+             already given up: "loading" forever next to a refusal is a second, false claim about
+             the state of the screen. The other five CRM screens gate their body this way; the
+             board was the one that did not. */
+          <ErrorState
+            error={loadError}
+            onRetry={() => setReloadToken((token) => token + 1)}
+            qa="crm-deals-board-error"
+            action={
+              <button
+                type="button"
+                data-qa="crm-deals-board-error-list"
+                onClick={() => setMode("list")}
+                className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+              >
+                Read as a list
+              </button>
+            }
+          />
+        ) : board === null ? (
           <div className="flex gap-3 overflow-x-auto p-4" aria-busy="true">
             {[0, 1, 2, 3].map((column) => (
               <div key={column} className="h-40 w-56 shrink-0 animate-pulse rounded-xl bg-canvas" />
@@ -717,6 +746,24 @@ export function DealsView() {
             })}
           </div>
         )
+      ) : loadError ? (
+        /* The same gate as the board, and for the same reason: the list's skeleton was drawn
+           under the strip forever, because a refused read sets no rows to fall through to. */
+        <ErrorState
+          error={loadError}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-deals-list-error"
+          action={
+            <button
+              type="button"
+              data-qa="crm-deals-list-error-board"
+              onClick={() => setMode("board")}
+              className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+            >
+              Read as a board
+            </button>
+          }
+        />
       ) : list === null ? (
         <div className="divide-y divide-line" aria-busy="true">
           {[0, 1, 2, 3, 4].map((row) => (
