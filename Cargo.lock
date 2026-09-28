@@ -1540,6 +1540,7 @@ dependencies = [
 name = "omnion-notifications"
 version = "0.1.0"
 dependencies = [
+ "omnion-permissions",
  "serde",
  "serde_json",
  "sqlx",
