@@ -300,10 +300,18 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
     // REQ-005: the owner is platform-level (`users.organization_id` is null by design), so the
     // 0019 backfill cannot give it a membership. Creating the first organization has to enroll
     // its creator, or the Members tab of the installation's only tenant lists nobody.
-    let organization_id = organization.body["organization"]["id"]
-        .as_str()
-        .expect("the organization carries its id")
-        .to_owned();
+    // Read the id from the database, not from the response. `POST /onboarding/organization`
+    // answers a `StatusBody` — steps, summary, checklist, themes — and has never carried the
+    // created row, which is what the admin client reads too: it types the reply
+    // `Promise<OnboardingStatus>` and never looks for an id. Asserting `body["organization"]`
+    // here was asking for a field the contract does not have, and it failed on the first
+    // implementation it was ever run against.
+    let organization_id: Uuid = sqlx::query_scalar(
+        "select id from organizations order by created_at asc limit 1",
+    )
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the first run created exactly one organization");
     let members = harness
         .call(get(
             &format!("/api/v1/organizations/{organization_id}/members"),
