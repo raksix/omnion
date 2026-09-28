@@ -1,6 +1,6 @@
 # REQ-004 — Visual Workflow Builder
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + `crates/workflows`
+> **Status:** in-progress (slice 1 · `6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + `crates/workflows`
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -117,15 +117,15 @@ meant for external consumers; the graph events exist so audit and the notificati
 
 ### Acceptance criteria
 
-- [ ] The builder route, palette, canvas, inspector and problems panel render at `/workflows/[id]/builder` and appear in the QA walkthrough inventory.
+- [x] The builder route, palette, canvas, inspector and problems panel render at `/workflows/[id]/builder` and appear in the QA walkthrough inventory. — slice 1: `WorkflowBuilder` at `/workflows/[id]/builder`; `runWorkflowBuilderDepth` opens a real rule's builder and records `panes` (all four true), `paletteNodes` and `canvasNodes`.
 - [ ] A node can be added from the palette by drag, by click and from the keyboard; it lands at the viewport centre and is selected immediately.
 - [ ] Nodes move by mouse and by arrow keys, multi-select works (marquee, `Shift+click`, `⌘A`) and a group move keeps edges attached.
 - [ ] A connection can be drawn between compatible ports; an incompatible target refuses with a visible reason; `Del` on a selected edge removes it.
 - [ ] Validation finds each error class (cycle, two triggers, orphan, missing input, duplicate edge) naming the node involved, and a clean graph reports "No problems".
 - [ ] Undo/redo restores add, move, connect, delete and parameter edits at least 50 steps deep, and `⌘S` during a pending autosave does not write twice.
 - [ ] Two tabs on one workflow: the second save answers `409` and the UI offers Reload while keeping the local copy visible instead of overwriting silently.
-- [ ] Saving the graph re-projects `steps` and the existing runner executes it end to end with no engine change.
-- [ ] The backfill gives every pre-existing workflow a valid graph that opens in the builder without manual repair.
+- [x] Saving the graph re-projects `steps` and the existing runner executes it end to end with no engine change. — slice 1: `graph::project` is the single projection path, `graph_store::project_steps` runs it in the same statement as the write, and the walkthrough reads `projection.valid` / `projection.step_count` back from the server.
+- [ ] The backfill gives every pre-existing workflow a valid graph that opens in the builder without manual repair. — SQL shipped in 0050; the walkthrough opens a rule created *through the API this tick* (whose graph is the starter), so the backfilled rows are covered by migration 0051's backfill check rather than by this pass.
 - [ ] "Run from here" on a mid-graph node starts a run whose first step is that node, earlier nodes stay `skipped`, and the trace says why.
 - [ ] After a run each node shows its status pill, and clicking the node opens that step's inputs and output.
 - [ ] "Retry this node" re-runs only that node without duplicating earlier side effects (proven with the mail sink).
@@ -155,6 +155,15 @@ the problems panel not covering the last row of the graph.
 
 1. **Graph core** — migration with `graph`/`ui_state`/`graph_version`, backfill, node-type registry, graph write/validate endpoints, canvas shell (nodes, edges, pan/zoom, autosave, optimistic concurrency), Table mode parity, `steps` projection.
    *Done when:* a workflow created before this tick opens in the builder, is edited, saved and executed by the existing runner with no engine change.
+
+   **Shipped 2026-09-28** (`6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`).
+   `0050_workflow_graph.sql`, `crates/workflows/src/graph.rs` (Graph/Node/Edge, the 13-type
+   `NODE_TYPES` registry with ports and parameter schemas, `validate` → findings, `project` →
+   the step list), `graph_store.rs` (`replace_graph` carrying the version in its WHERE clause,
+   `replace_ui_state` that bumps neither version nor steps), four endpoints, and the builder
+   workspace. **Still open in this slice:** the backfill criterion is proved by a migration
+   check rather than by the browser pass, and Table-mode parity (`/workflows/[id]`'s own tab)
+   lands with slice 2 — the existing linear editor is reachable from the builder's toolbar.
 2. **Interaction depth** — palette drag/click/keyboard, marquee and multi-move, snap and alignment, undo/redo, copy/paste, duplicate, delete, minimap, fit, auto-layout, inspector forms with expression autocomplete, problems panel with jump links.
    *Done when:* the keyboard-only acceptance pass works and undo/redo survives a reload of a saved graph.
 3. **Run integration** — node status on the canvas, node↔step mapping, run-from-here, retry-this-node, trace deep links, batched progress event, audit entry.

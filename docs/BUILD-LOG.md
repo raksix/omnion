@@ -3083,3 +3083,54 @@ slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
 - **Next.** **REQ-004**, the visual workflow builder — the next pending request in the wave-3 order and
   still no code. Carried over and untouched: the "welcome e-mail on signup" walk, the inbound-hook run
   walk, the "paused rule does not replay" walk, and the loop guard's message on the trace.
+
+## 2026-09-28 — REQ-004 slice 1 · the graph a builder draws, and the projection the runner executes
+
+**What shipped.** **`0050_workflow_graph.sql`**, `crates/workflows/src/graph.rs`,
+`crates/workflows/src/graph_store.rs`, `apps/api/src/routes/workflow_graph.rs`,
+`apps/admin/features/workflows/builder-view.tsx`, `/workflows/[id]/builder`, and
+`runWorkflowBuilderDepth` in the walkthrough. Commits: `6c3f43b`, `775947a`, `f6d6a68`,
+`66442e9`, `b0dad65`, `97a071e`.
+
+**The shape of it.** One definition, two representations: the graph is authoritative for the
+builder and the ordered step list stays what the engine runs, with `graph::project` as the
+only function that derives one from the other. The projection is a *linearisation* and says
+so — the v0 engine has exactly one branching step, so a `condition` node becomes a `branch`
+step, the true edge is the next step and the false edge is the run ending. That honesty is
+what makes "the existing runner executes a saved graph with no engine change" true rather
+than aspirational.
+
+`validate` answers with **findings, not a verdict**, because the panel shows them all at once
+with a jump link each. Six error classes are found and each names its node: cycle, second
+trigger, orphan, missing required input, duplicate edge, and an edge on a port its source
+does not export. A test caught a contradiction I had written into my own assertions — it
+claimed a stray note was not an error and then asserted the graph was invalid; the note is
+decoration and `valid` stays true.
+
+**Two things the shape of the code got wrong, both about a parameter that was passed and not
+read.** `step_for` took the whole graph and used none of it; giving the condition's false-edge
+label to the projected step closed the gap the signature was advertising. And the inspector
+offered a Remove control that was `sr-only` and wired to a no-op — a dead button is worse than
+none, because the accessibility tree promises it exists.
+
+**The tick was really spent on the backfill, and the QA stack is what found it.** 0050 failed
+at boot with `column s.kind does not exist`, and behind that were four defects the SQL's shape
+hid completely: the first edge pointed at `n1` when the first step becomes `n0`; every edge
+left on `source_port: out` when a `condition` exports `true`/`false` and a task exports
+`success`/`error`; a `manual` workflow was written as `trigger.event`, which has a required
+field it can never have; and a task's `action` is a column beside its params, not a key inside
+them. Node count, edge count and the statement's syntax were all correct throughout — **a proof
+that checks counts cannot see a wrong name.**
+
+**Proof.**
+- `cargo test -p omnion-workflows --lib` — **84 passed, 0 failed** (graph + graph_store).
+- `cargo test -p omnion-api --lib` — **167 passed, 0 failed**.
+- `pnpm typecheck` (admin) — clean.
+- Backfill proved on a scratch database: 35 migrations, then three rules seeded in the *old*
+  shape (a four-step linear one, a schedule with no steps, a manual one with no steps), all
+  backfilling to exactly one trigger with no dangling edge, no edge on a port the source does
+  not export, no orphan and no missing required parameter.
+
+**Next.** REQ-004 slice 2 — interaction depth: palette drag and keyboard add, marquee and
+multi-move, undo/redo, copy/paste, duplicate, minimap, auto-layout, expression autocomplete,
+and Table-mode parity as a tab on the builder rather than a link out of it.
