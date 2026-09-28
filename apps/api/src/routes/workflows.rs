@@ -382,6 +382,11 @@ pub async fn create_workflow(
             schedule: definition.trigger.cron.clone(),
             trigger_event: definition.trigger.event.clone(),
             conditions: definition.conditions_json()?,
+            // The two rule bounds are not this surface's vocabulary: a workflow a person
+            // starts by hand is not a rule that fires on its own, so nothing is sent and
+            // the column defaults stand.
+            rate_limit_per_hour: None,
+            concurrency: None,
             // The manual/scheduled surface has no run-as picker: those workflows are run by
             // the people who manage them, so they follow their author. The field is
             // automation's (`crates/automation::authority`), and a second way to set it here
@@ -464,6 +469,10 @@ pub async fn update_workflow(
             schedule: definition.trigger.cron.clone(),
             trigger_event: definition.trigger.event.clone(),
             conditions: definition.conditions_json()?,
+            // As on create: `None` leaves whatever a rule handed to this workflow already
+            // has alone, rather than resetting a bound nobody on this surface can see.
+            rate_limit_per_hour: None,
+            concurrency: None,
             // Carried through rather than cleared: a workflow that was an event rule and is
             // being converted back must not silently lose the account it was handed.
             run_as_user_id: existing.run_as_user_id,
@@ -711,6 +720,9 @@ mod tests {
             hook_token_hash: None,
             on_error: "stop".to_owned(),
             hook_secret: None,
+            rate_limit_per_hour: 60,
+            concurrency: "queue".to_owned(),
+            last_error: None,
             next_run_at: Some(OffsetDateTime::UNIX_EPOCH),
             steps: serde_json::json!([
                 { "name": "prepare", "kind": "task", "action": "noop", "params": {}, "max_attempts": 1 }

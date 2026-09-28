@@ -26,8 +26,9 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
     let sql = format!(
         "insert into workflows (organization_id, site_id, name, description, enabled, \
          trigger_kind, schedule, trigger_event, conditions, on_error, run_as_user_id, \
-         next_run_at, steps, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) returning {}",
+         rate_limit_per_hour, concurrency, next_run_at, steps, created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                 coalesce($12, 60), coalesce($13, 'queue'), $14, $15, $16) returning {}",
         workflow_columns()
     );
 
@@ -43,6 +44,13 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.conditions)
         .bind(new.on_error.as_str())
         .bind(new.run_as_user_id)
+        // The two bounds are written as `coalesce` on a nullable bind rather than as a
+        // required value: a caller outside the automation layer (a scheduled workflow
+        // created through the workflows surface) sends nothing and gets the column
+        // default, so the bound is something a rule opts into rather than something
+        // every workflow must supply.
+        .bind(new.rate_limit_per_hour)
+        .bind(new.concurrency)
         .bind(new.next_run_at)
         .bind(new.steps)
         .bind(new.created_by)
@@ -108,6 +116,11 @@ pub struct WorkflowUpdate {
     /// Whose authority the rule's host actions run with (REQ-003 slice 3). `None` means the
     /// author, so a whole-rule write cannot silently leave a run-as nobody.
     pub run_as_user_id: Option<Uuid>,
+    /// The rule's rolling-hour run limit (REQ-003 slice 4). `None` leaves the stored value
+    /// alone, so a write from outside the rule editor never moves a bound the author set.
+    pub rate_limit_per_hour: Option<i32>,
+    /// The rule's concurrency policy (REQ-003 slice 4). `None` leaves it alone, as above.
+    pub concurrency: Option<String>,
     /// New step definitions as stored JSON.
     pub steps: serde_json::Value,
 }
@@ -121,7 +134,9 @@ pub async fn update_workflow(
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
          trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
-         conditions = $11, on_error = $12, run_as_user_id = $13, updated_at = now() \
+         conditions = $11, on_error = $12, run_as_user_id = $13, \
+         rate_limit_per_hour = coalesce($14, rate_limit_per_hour), \
+         concurrency = coalesce($15, concurrency), updated_at = now() \
          where id = $1 returning {}",
         workflow_columns()
     );
@@ -140,6 +155,11 @@ pub async fn update_workflow(
         .bind(update.conditions)
         .bind(update.on_error.as_str())
         .bind(update.run_as_user_id)
+        // `coalesce(column, column)` is "leave it alone": a write that did not come from
+        // the rule editor (arming, renaming, pausing) must not silently reset a bound the
+        // author set deliberately. Same reasoning as `run_as_user_id` above.
+        .bind(update.rate_limit_per_hour)
+        .bind(update.concurrency)
         .fetch_optional(pool)
         .await?;
 

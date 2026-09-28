@@ -16,6 +16,7 @@ use crate::approval;
 use crate::branch;
 use crate::definition::{MAX_ATTEMPTS, wait_seconds_from};
 use crate::error::{Result, WorkflowError};
+use crate::guard::{GuardStep, NoRunGuard, RunGuard};
 use crate::handler::{ActionContext, ActionHandler, NoActionHandler};
 use crate::model::{ExecutionStatus, OnError, StepKind, TriggerKind, Workflow, WorkflowExecution};
 use crate::store::{self, ClaimedStep};
@@ -114,14 +115,20 @@ struct StepOutcome {
 /// The process installs no host action handler here: a definition that names a host action
 /// fails its step with that reason. Use [`tick_with`] when the process can run them.
 pub async fn tick(pool: &PgPool, config: &RunnerConfig) -> Result<TickReport> {
-    tick_with(pool, config, &NoActionHandler).await
+    tick_with(pool, config, &NoActionHandler, &NoRunGuard).await
 }
 
-/// Run one tick with the process's host action handler.
+/// Run one tick with the process's host action handler and its run guard.
+///
+/// The guard is a *second* `&dyn` rather than a second method on the handler because the
+/// two answer different questions and a process legitimately has only one of them: a
+/// content worker that runs synthetic steps needs no loop guard, and a process that runs
+/// automations needs both. See [`crate::guard`] for where the call sits and why.
 pub async fn tick_with(
     pool: &PgPool,
     config: &RunnerConfig,
     handler: &dyn ActionHandler,
+    guard: &dyn RunGuard,
 ) -> Result<TickReport> {
     let mut report = TickReport::default();
 
@@ -150,7 +157,7 @@ pub async fn tick_with(
         };
         report.steps_run += 1;
 
-        let outcome = advance_step(pool, config, handler, &claimed).await?;
+        let outcome = advance_step(pool, config, handler, guard, &claimed).await?;
         if outcome.waited {
             report.waits_parked += 1;
         }
@@ -507,6 +514,7 @@ async fn advance_step(
     pool: &PgPool,
     config: &RunnerConfig,
     handler: &dyn ActionHandler,
+    guard: &dyn RunGuard,
     claimed: &ClaimedStep,
 ) -> Result<StepOutcome> {
     let kind = StepKind::parse(&claimed.kind).ok_or_else(|| {
@@ -809,6 +817,41 @@ async fn advance_step(
             match outcome {
                 Ok(output) => {
                     store::complete_step(pool, claimed.id, &output).await?;
+
+                    // The one place a run guard is consulted: the step has succeeded and
+                    // the run is not settled yet. A verdict of "stop" ends the run *here*,
+                    // the same write the `stop` step and a failed step do, so a guard that
+                    // fires cannot leave a claimable step behind it.
+                    let verdict = crate::guard::check_run(
+                        guard,
+                        GuardStep {
+                            execution_id: claimed.execution_id,
+                            step_no: claimed.step_no,
+                            kind: claimed.kind.as_str(),
+                            action: claimed.action.as_deref(),
+                            params: &claimed.params,
+                        },
+                    )
+                    .await;
+
+                    if verdict.stop {
+                        let reason = verdict.reason.unwrap_or_else(|| {
+                            "a run guard stopped this run after the step".to_owned()
+                        });
+                        store::fail_step(pool, claimed.id, &reason).await?;
+                        store::end_run_after_branch(pool, claimed.execution_id, claimed.id).await?;
+                        tracing::warn!(
+                            step_id = %claimed.id,
+                            step = %claimed.name,
+                            step_no = claimed.step_no,
+                            "a run guard stopped the run after the step succeeded"
+                        );
+                        return Ok(StepOutcome {
+                            settled: settle_after_step(pool, claimed).await?,
+                            ..StepOutcome::default()
+                        });
+                    }
+
                     Ok(StepOutcome {
                         settled: settle_after_step(pool, claimed).await?,
                         ..StepOutcome::default()

@@ -328,6 +328,23 @@ pub struct Workflow {
     /// is the case the copy could not express: a shared "content publisher" identity that
     /// keeps working after its human leaves.
     pub run_as_user_id: Option<Uuid>,
+    /// Runs this workflow may start in a rolling hour (REQ-003 slice 4).
+    ///
+    /// The column is the workflow engine's because the engine owns the table; the
+    /// *meaning* belongs to the automation layer (`omnion_automation::limits`), which is
+    /// the only thing that consults it. A scheduled workflow a human started by hand is
+    /// not rate-limited by it — the bound is a property of a rule that fires on its own.
+    pub rate_limit_per_hour: i32,
+    /// What a second trigger does while a run of this workflow is still going:
+    /// `queue` (it waits) or `skip` (the trigger is dropped). Read by
+    /// `omnion_automation::limits`, like the rate limit above.
+    pub concurrency: String,
+    /// The last message one of this workflow's bounds produced when it refused a run.
+    ///
+    /// `None` is the ordinary state — a workflow that has never been refused. It is
+    /// cleared the moment a run is admitted again, so the line answers "the last thing
+    /// that went wrong", not "something once went wrong".
+    pub last_error: Option<String>,
     /// Next time the scheduler should start this workflow.
     pub next_run_at: Option<OffsetDateTime>,
     /// Ordered step definitions, as stored JSON.
@@ -365,8 +382,8 @@ impl Workflow {
 /// Columns of `workflows`, in the order [`Workflow`] expects.
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
      trigger_kind, schedule, trigger_event, conditions, hook_token_hash, on_error, hook_secret, \
-     run_as_user_id, next_run_at, steps, last_triggered_at, trigger_count, created_by, \
-     created_at, updated_at";
+     run_as_user_id, rate_limit_per_hour, concurrency, last_error, next_run_at, steps, \
+     last_triggered_at, trigger_count, created_by, created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]
@@ -393,6 +410,14 @@ pub struct NewWorkflow {
     pub on_error: OnError,
     /// Whose authority the rule's host actions run with. `None` means the author.
     pub run_as_user_id: Option<Uuid>,
+    /// Runs this workflow may start in a rolling hour; `None` takes the column default.
+    ///
+    /// `None` here rather than a required number so a caller outside the automation layer
+    /// — a person creating a scheduled workflow through the workflows surface — cannot
+    /// have to learn a bound that only rules on a trigger care about.
+    pub rate_limit_per_hour: Option<i32>,
+    /// What a second trigger does while a run is going; `None` takes the column default.
+    pub concurrency: Option<String>,
     /// First due time when scheduled.
     pub next_run_at: Option<OffsetDateTime>,
     /// Step definitions as stored JSON.

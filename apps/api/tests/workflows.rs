@@ -1431,6 +1431,12 @@ fn the_definition_rules_are_the_engine_rules() {
         trigger_event: None,
         conditions: json!([]),
         next_run_at: None,
+        on_error: omnion_workflows::OnError::Stop,
+        run_as_user_id: None,
+        // Absent means "leave the stored bound alone" — the panel writes these, a whole-rule
+        // write that has not learned about them must not reset an author's rate limit.
+        rate_limit_per_hour: None,
+        concurrency: None,
         steps: definition.steps_json().expect("steps serialise"),
     };
     assert_eq!(workflow.trigger, TriggerKind::Manual);
@@ -1446,6 +1452,8 @@ fn the_definition_rules_are_the_engine_rules() {
         started_at: time::OffsetDateTime::UNIX_EPOCH,
         finished_at: None,
         error: None,
+        approval_id: None,
+        event_payload: None,
     };
     assert!(!execution.is_terminal());
 }

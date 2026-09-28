@@ -328,7 +328,12 @@ async fn drive_until_terminal(
     execution_id: Uuid,
 ) -> ExecutionStatus {
     for _ in 0..SETTLE_BUDGET {
-        engine::tick_with(harness.db.pool(), &runner_config(), actions)
+        engine::tick_with(
+            harness.db.pool(),
+            &runner_config(),
+            actions,
+            &omnion_workflows::guard::NoRunGuard,
+        )
             .await
             .expect("the engine tick must run");
 
@@ -351,7 +356,12 @@ async fn drive_until_terminal(
 /// prove that *nothing* happened.
 async fn drive(harness: &Harness, actions: &AutomationActions, ticks: usize) {
     for _ in 0..ticks {
-        engine::tick_with(harness.db.pool(), &runner_config(), actions)
+        engine::tick_with(
+            harness.db.pool(),
+            &runner_config(),
+            actions,
+            &omnion_workflows::guard::NoRunGuard,
+        )
             .await
             .expect("the engine tick must run");
         tokio::time::sleep(StdDuration::from_millis(20)).await;

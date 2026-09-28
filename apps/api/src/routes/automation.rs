@@ -75,6 +75,22 @@ pub struct AutomationBody {
     pub run_as_user_id: Option<Uuid>,
     /// Which of the two it is, in a sentence the panel shows beside the picker.
     pub run_as_description: &'static str,
+    /// Runs this rule may start in a rolling hour, and the closed policies a second
+    /// trigger may take — read from the layer rather than written into a `select`, so the
+    /// picker cannot offer something the guard does not implement.
+    pub rate_limit_per_hour: i32,
+    pub concurrency: &'static str,
+    pub concurrency_description: &'static str,
+    /// The rate window as it stands: runs counted in the current hour against the limit,
+    /// and when it rolls over. Read *without* the guard's lock — this is a counter for a
+    /// person to read, not a decision, and the decision is the one that locks.
+    pub window_used: i32,
+    pub window_limit: i32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_resets_at: OffsetDateTime,
+    /// The last message a bound produced when it refused a run, or `null` when the rule
+    /// has never been refused. Cleared the moment a run is admitted again.
+    pub last_error: Option<String>,
     /// What each host action of this platform needs, so the panel can show what a run-as
     /// account is being asked for rather than an opaque id.
     pub action_permissions: &'static [(&'static str, &'static str)],
@@ -117,7 +133,12 @@ pub struct HookBody {
 
 impl AutomationBody {
     /// Describe one rule.
-    fn build(rule: &AutomationRule, actions: Value, hook: Option<HookBody>) -> Self {
+    fn build(
+        rule: &AutomationRule,
+        actions: Value,
+        hook: Option<HookBody>,
+        window: (i32, OffsetDateTime),
+    ) -> Self {
         let condition_count = rule
             .condition_group()
             .map(|group| group.comparison_count())
@@ -142,6 +163,16 @@ impl AutomationBody {
             on_error: rule.on_error.as_str(),
             run_as_user_id: rule.run_as_user_id,
             run_as_description: rule.authority().describe(),
+            rate_limit_per_hour: rule.rate_limit_per_hour,
+            concurrency: rule.concurrency.as_str(),
+            concurrency_description: rule.concurrency.describe(),
+            window_used: window.0,
+            window_limit: rule.rate_limit_per_hour,
+            // The window rolls over a rolling hour from where it starts, so the answer is
+            // the *read* time plus the window — the same arithmetic the guard does, and
+            // the one the panel needs to say "try again after".
+            window_resets_at: window.1 + omnion_automation::limits::WINDOW,
+            last_error: rule.last_error.clone(),
             action_permissions: omnion_automation::authority::ACTION_PERMISSIONS,
             trigger_count: rule.trigger_count,
             last_triggered_at: rule.last_triggered_at,
@@ -336,8 +367,41 @@ pub struct AutomationInput {
     /// rule to an account changes what happens from the next run, not from a redeploy.
     #[serde(default)]
     pub run_as_user_id: Option<Uuid>,
+    /// Runs this rule may start in a rolling hour (REQ-003 slice 4).
+    ///
+    /// Absent takes the default. The bound is checked here, in words, rather than only by
+    /// the column's check constraint: a `0` is what an author reaches for when they mean
+    /// "off", and the switch is the thing that means off.
+    #[serde(default)]
+    pub rate_limit_per_hour: Option<i32>,
+    /// What a second trigger does while a run of this rule is going: `queue` or `skip`.
+    #[serde(default)]
+    pub concurrency: Option<RuleConcurrency>,
     /// Actions to run, in order.
     pub actions: Vec<StepDefinition>,
+}
+
+/// The concurrency policy, as the wire spells it.
+///
+/// A two-variant enum rather than a `String`, so a typo is a `400` from serde instead of a
+/// row the guard has to guess at — and the guard's fallback (`queue`) is then a repair path
+/// for a hand-edited row rather than a way to save one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleConcurrency {
+    /// Triggers that arrive while a run is going wait their turn.
+    Queue,
+    /// A trigger that arrives while a run is going is dropped and reported.
+    Skip,
+}
+
+impl From<RuleConcurrency> for omnion_automation::limits::Concurrency {
+    fn from(policy: RuleConcurrency) -> Self {
+        match policy {
+            RuleConcurrency::Queue => Self::Queue,
+            RuleConcurrency::Skip => Self::Skip,
+        }
+    }
 }
 
 /// Serde default for [`AutomationInput::on_error`]: v0's behaviour, a failure ends the run.
@@ -392,6 +456,16 @@ impl AutomationInput {
             hook_triggered: self.hook_triggered,
             on_error: self.on_error.into(),
             run_as_user_id: self.run_as_user_id,
+            // Both bounds are checked here rather than only by the column's constraint, so
+            // a rule with a limit the panel cannot explain is refused with the *bound's*
+            // message instead of with whatever the definition check notices first.
+            rate_limit_per_hour: match self.rate_limit_per_hour {
+                Some(limit) => {
+                    Some(omnion_automation::limits::Policy::check_rate_limit(limit)?)
+                }
+                None => None,
+            },
+            concurrency: self.concurrency.map(Into::into),
         };
 
         // The definition check is the full one: the event name against the bus's rule, the
@@ -557,10 +631,27 @@ pub async fn list_automations(
             continue;
         };
         let hook = hook_body(state.db().pool(), &rule).await?;
-        automations.push(AutomationBody::build(&rule, workflow.steps.clone(), hook));
+        let window = rate_window(state.db().pool(), &rule).await;
+        automations.push(AutomationBody::build(
+            &rule,
+            workflow.steps.clone(),
+            hook,
+            window,
+        ));
     }
 
     Ok(Json(AutomationListResponse { automations }))
+}
+
+/// The rule's rate window as it stands: runs counted against the limit.
+///
+/// Read without the guard's lock and deliberately so — the guard's decision is the one
+/// that has to be exact, and this is a number a person is reading off a list. Adding the
+/// lock here would put a `for update` on every row of the rule list for a counter.
+async fn rate_window(pool: &sqlx::PgPool, rule: &AutomationRule) -> (i32, OffsetDateTime) {
+    omnion_automation::limits::window_state(pool, rule.id)
+        .await
+        .unwrap_or((0, OffsetDateTime::now_utc()))
 }
 
 /// The hook surface of a rule, or `None` for a rule that is not webhook-triggered.
@@ -617,6 +708,8 @@ pub async fn create_automation(
             trigger_event: definition.trigger.event.clone(),
             conditions: definition.conditions_json()?,
             run_as_user_id: rule.run_as_user_id,
+            rate_limit_per_hour: rule.rate_limit_per_hour,
+            concurrency: rule.concurrency.map(|policy| policy.as_str().to_owned()),
             next_run_at: None,
             steps: definition.steps_json()?,
             created_by: Some(current.user.id),
@@ -643,7 +736,12 @@ pub async fn create_automation(
     let hook = hook_body(state.db().pool(), &stored).await?;
     Ok((
         StatusCode::CREATED,
-        Json(AutomationBody::build(&stored, workflow.steps.clone(), hook)),
+        Json(AutomationBody::build(
+            &stored,
+            workflow.steps.clone(),
+            hook,
+            rate_window(state.db().pool(), &stored).await,
+        )),
     ))
 }
 
@@ -656,10 +754,12 @@ pub async fn get_automation(
     let workflow = automation_in_scope(&state, &current, automation_id).await?;
     let rule = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
     let hook = hook_body(state.db().pool(), &rule).await?;
+    let window = rate_window(state.db().pool(), &rule).await;
     Ok(Json(AutomationBody::build(
         &rule,
         workflow.steps.clone(),
         hook,
+        window,
     )))
 }
 
@@ -688,6 +788,16 @@ pub async fn update_automation(
     let definition = rule.definition()?;
     check_outbound_hosts(&state, &rule.actions).await?;
 
+    // The concurrency policy is the one bound that has to be resolved *before* the rule is
+    // built, because the rule carries a settled policy while the request may carry none.
+    // An absent policy keeps what the rule already had, so a `PUT` from a client that has
+    // not learned about the bound cannot silently reset it to the default — the fallback
+    // reads the stored text, and the stored text is a repair path for a hand-edited row
+    // rather than a way to save one.
+    let concurrency = rule.concurrency.unwrap_or_else(|| {
+        omnion_automation::limits::Concurrency::parse_or_default(&existing.concurrency)
+    });
+
     let update = update_from_rule(&AutomationRule {
         id: existing.id,
         organization_id: existing.organization_id,
@@ -703,6 +813,15 @@ pub async fn update_automation(
         hook_configured: existing.hook_token_hash.is_some(),
         on_error: rule.on_error,
         run_as_user_id: rule.run_as_user_id,
+        // The bounds the request sent, or the ones the rule already had: a `PUT` from a
+        // client that has not learned about them yet must not reset them to the default.
+        rate_limit_per_hour: rule.rate_limit_per_hour.unwrap_or(existing.rate_limit_per_hour),
+        // The two live on different types on purpose: the wire speaks the two-variant enum
+        // (a typo is a 400, not a row the guard has to guess at) while the row keeps the
+        // stored text, and the update takes the text. So the write converts once, here, and
+        // an absent policy keeps whatever the rule already had rather than resetting it.
+        concurrency,
+        last_error: existing.last_error.clone(),
         trigger_count: existing.trigger_count,
         last_triggered_at: existing.last_triggered_at,
         created_at: existing.created_at,
@@ -733,10 +852,12 @@ pub async fn update_automation(
     let stored = AutomationRule::from_workflow(&workflow)?.ok_or_else(automation_not_found)?;
     let _ = definition;
     let hook = hook_body(state.db().pool(), &stored).await?;
+    let window = rate_window(state.db().pool(), &stored).await;
     Ok(Json(AutomationBody::build(
         &stored,
         workflow.steps.clone(),
         hook,
+        window,
     )))
 }
 
@@ -1285,6 +1406,8 @@ mod tests {
             conditions: equals("status", "published"),
             hook_triggered: false,
             on_error: RuleOnError::Stop,
+            rate_limit_per_hour: None,
+            concurrency: None,
             actions: vec![StepDefinition::task(
                 "tell the editor",
                 "send_email",
@@ -1484,6 +1607,8 @@ mod tests {
             conditions,
             hook_triggered: false,
             on_error: RuleOnError::Stop,
+            rate_limit_per_hour: None,
+            concurrency: None,
             actions,
         };
         let action = || {

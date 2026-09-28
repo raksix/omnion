@@ -508,9 +508,16 @@ async fn drive_until_settled(
     execution_id: Uuid,
 ) -> ExecutionStatus {
     for _ in 0..SETTLE_BUDGET {
-        engine::tick_with(harness.db.pool(), &runner_config(), actions)
-            .await
-            .expect("the engine tick must run");
+        // `NoRunGuard`: these walks drive the engine's own steps, so the endless-loop guard
+        // under test elsewhere has nothing to say about them and is left out on purpose.
+        engine::tick_with(
+            harness.db.pool(),
+            &runner_config(),
+            actions,
+            &omnion_workflows::guard::NoRunGuard,
+        )
+        .await
+        .expect("the engine tick must run");
 
         let execution = store::find_execution(harness.db.pool(), execution_id)
             .await
