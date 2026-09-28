@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** in-progress (slice 4 · `b130f0b`, `684741e`, `49f7ac2`, `50902cc`, `aaac3c0`, `5e9264a`, `8aede17`, `881b8b4`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** done (slice 4 · `b130f0b`, `684741e`, `49f7ac2`, `50902cc`, `aaac3c0`, `5e9264a`, `8aede17`, `881b8b4`, `cdfb970`, `658d522`, `8e3bb23`, `04bd7c1`, `b8b834a`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -241,12 +241,26 @@ the payload; the rule id is the only identifier returned to the caller.
       *Proved in part:* the matcher only reads armed rules (`store::list_event_rules` filters `enabled`), and a paused webhook rule's token
       stops resolving (`hooks::find_rule` filters `enabled`), so its URL answers 404 like a wrong one. The "does not replay while paused"
       walk is not written yet.
-- [ ] Every definition change is audited with actor, diff summary and timestamp, and the Audit tab lists those entries.
+- [x] Every definition change is audited with actor, diff summary and timestamp, and the Audit tab lists those entries.
       *Slice 1 audited every change* (`automation.created` / `.updated` / `.deleted` / `.tested` / `.listener_armed` / `.hook_rotated`, each
-      with the actor and a metadata summary; the hook token is deliberately never audited). The **Audit tab** that lists those entries is
-      slice 4's, so this line stays open.
-- [ ] All six templates load, validate and save without edits beyond their missing credentials.
-      *Slice 4* (the templates gallery). Not started.
+      with the actor and a metadata summary; the hook token is deliberately never audited). The **Audit tab** is slice 4's, and it took two
+      defects to make it answer at all.
+      **The first was a decode.** `rule_audit_entries` selected the bare `ip_address` column — an `inet` in Postgres — into an
+      `Option<String>`. Every read of the trail failed with "mismatched types", the endpoint answered **500**, and the panel drew its
+      error. The screen said "nothing has been recorded yet" because that is the one thing it was told, on a rule with a full trail.
+      `crates/audit` already casts on the way *in* (`ip_address::text`); the read needed the same cast on the way out.
+      **The second was the walk, not the product** — and it is the reason the first was invisible. The integration walk's requests carry
+      no `ConnectInfo`, so its audit rows all had a NULL `ip_address` and never exercised the decode at all: the test passed while
+      every browser request 500'd. The walk now creates its rule from a request with a connection address and asserts that the row it
+      writes has one; with the cast removed, the walk fails with the browser's exact 500, and with it, all six walks pass.
+      The pass now reads `audit rows 4 · automation.version_restored, automation.updated, automation.run_started, automation.created`
+      with `listsTheCreate` and `listsTheEdit` both true.
+- [x] All six templates load, validate and save without edits beyond their missing credentials.
+      *Slice 4* (the templates gallery). The pass reads `cards 6 · categories 6 · offersSix true`, presses the first *installable*
+      card — a template whose own credential is missing says so on the card and refuses, so pressing the first card would prove
+      nothing — and reads the install notice back. The installed starter is then found on the ordinary list, which is what makes it a
+      rule rather than a gallery object, and `apps/api/tests/automation_operations.rs` carries a walk that saves all six through the
+      ordinary create.
 - [ ] Empty, loading and error states exist on every screen; no dead buttons and no "coming soon" text.
       **Slice 3** adds the pending panel (visually distinct from the table, Approve/Reject, both
       disabled once the gate has expired), the run-as picker with the account list and the
@@ -317,6 +331,22 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
    satisfied for them. The next tick extends `scripts/qa/walkthrough.cjs`'s routes and closes with
    a full `run.sh` pass — that pass is the gate, and until it runs the slice is not done.
    Migration `0032_automation_versions`.
+   **Slice 4 is done** (`8e3bb23`, `04bd7c1`, `b8b834a`). The gate was a w3 pass that had to answer three questions this tick could not:
+   is the stack still up, is the Versions tab listing anything, and what does the Audit tab say. Each had been a phantom rather than a
+   finding, so each got a fix before the answer was believable — a pass that lost its stack now reports **no result** instead of a red
+   report, a panel with no rows says *which* no rows, and `openRuleByName` proves the editor opened by reading the rule's name out of
+   the loaded form instead of assuming a click worked. With those in place the pass reads: run history `1` row, the trace on its own
+   route with `1 of 1 attempts`, the payload disclosure opening, Retry accepted, Versions `1 → 2 → 3` across create/edit/restore with
+   `appended: true`, the Audit tab listing `automation.created`, `automation.updated` and `automation.version_restored`, six templates
+   with the first installable one installed, and `NET_FAILURES=0`.
+
+   **The one product defect this pass found was the audit read** (`8e3bb23`) — the `inet` decode described in the acceptance list
+   above. Everything else it found was in the pass, and that is the honest split: three of the four "empty" screens this REQ had been
+   carrying were never empty, they were unmeasured.
+
+   **Still open, and deliberately so:** the "welcome e-mail on signup", inbound-hook-run, "a paused rule does not replay" walks, and the
+   loop guard's trace message — all carried over from earlier slices, all unchanged by this tick, all part of a later close-out pass
+   rather than of slice 4.
 
 ### Risks / notes
 

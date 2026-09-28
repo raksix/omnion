@@ -2678,3 +2678,67 @@ Slice 2 — preview, metadata, versions. The version table already exists; the v
   **REQ-004**, the visual workflow builder. Carried over from earlier slices and still open:
   the "welcome e-mail on signup" walk, the inbound-hook run walk, the "paused rule does not
   replay" walk, and the loop guard's test shown to fail with the guard removed.
+
+## 2026-09-28 — REQ-003 slice 4 closes: an `inet` decode, and three phantoms that hid it
+
+- **What.** Merged `origin/main` (25 commits) at the top of the tick, then spent the tick making one
+  QA pass trustworthy enough to close a slice on. The pass had been reporting three screens as empty.
+  Two of them were empty; one was a 500 behind an error message; and the *reason* two of them read as
+  empty was that the pass was looking at the wrong page. Slice 4 is now `done`.
+- **Proof.**
+  - `cargo test -p omnion-automation --lib` → **115 passed, 0 failed**.
+  - `cargo test -p omnion-api --test automation_operations -- --test-threads=1` → **6 passed, 0 failed**.
+    With the audit cast removed, `every_definition_change_is_listed_in_the_audit_tab` **fails** with the
+    browser's exact 500 — so the walk covers the bug instead of passing beside it.
+  - `pnpm typecheck` (apps/admin) → clean.
+  - The operations pass, verbatim: `run-history rows 1` · `trace /automations/<id>/runs/<run_id>, steps 1,
+    "1 of 1 attempts · 8 ms"` · `trace-payload opened true` · `retry offered true accepted true` ·
+    `versions rowsAfterCreate 1, rowsAfterEdit 2, rowsAfterRestore 3, restoreOffered 1, appended true,
+    reachedTheTab true` · `audit rows 4 — automation.version_restored, automation.updated,
+    automation.run_started, automation.created; listsTheCreate true; listsTheEdit true` ·
+    `templates cards 6, categories 6, offersSix true, installed true` · `installed-listed rows 10` ·
+    `cleanup removed` · `NET_FAILURES=0`, exit 0.
+- **The one product defect.**
+  - `8e3bb23` — **the Audit tab 500'd on every real request.** `rule_audit_entries` selected the bare
+    `ip_address` column, an `inet` in Postgres, into an `Option<String>`; every read failed with
+    "mismatched types". The panel drew its error, and the screen said "nothing has been recorded yet" on
+    a rule with a full trail. `crates/audit` already casts `ip_address::text` on the way *in*; the read
+    needed the same cast on the way *out*.
+  - **Why the test passed anyway, which is the part worth keeping:** the walk's requests carry no
+    `ConnectInfo`, so every audit row it wrote had a NULL `ip_address` and never reached the decode. The
+    fixture could not express the bug. The walk now creates its rule from a request with a connection
+    address and *asserts that the row has one* before it reads the trail — a walk that cannot reach a
+    failure is not evidence about it.
+- **The three phantoms, each a defect in the pass.**
+  - `cdfb970` — **a pass that lost its stack reported a red run, not a no-result run.** At 17:28 a
+    sibling's pm2 action SIGINT'd every QA stack (main, w2, w3, w4, w5, w6, w7) mid-pass. Every
+    navigation after that landed on `chrome-error://`, every click "succeeded" because an error page
+    cannot refuse, and the roll-up produced a confident list of console errors and empty screens — all
+    artifacts. A gate that looks red when it is dead sends the next tick to fix a screen that was fine.
+    The pass now asks the admin origin once at the end and reports `stack-gone` with **exit 4** and
+    `QA_FINDINGS=0`: a no-result run, to be re-run, not acted on.
+  - `04bd7c1` — **`openRuleByName` returned `true` for a click that did nothing.** The click's promise
+    resolving and a `.catch`ed wait both fell through to an unconditional success, so the pass went on
+    to read Versions and Audit **on the list page** and reported both empty. The two screenshots came
+    out byte-identical (`4c1b9b43c18b3e5a4d8d899056de392c`) because they were literally the same page —
+    that md5 is what finally made the phantom visible, and hashing a screenshot is cheaper than a tick.
+    The helper now always starts from the list and proves the editor opened by reading the rule's *name*
+    out of the loaded form. A URL is not proof: the route is client-side, and a run's trace also lives
+    under `/automations/`, so a URL test waits out the whole deadline on a page with no name field.
+  - `658d522`, `b8b834a` — **a row count is not a diagnosis.** `rows: 0` means loading, empty, or failed,
+    and the Versions and Audit panels render all three differently. `readPanelState` reads the panel's
+    own error and empty-state hooks and records *which* zero it is, which is what turned "the Audit tab
+    lists nothing" into the decode error the endpoint was actually returning. A restore appends its
+    version after the click returns, so that row is polled for like the edit's.
+- **Environment — three separate ways this box ate the tick, none of them a code problem.**
+  - The box **rebooted at 16:54**, and the pm2 resurrect brought back the production list but no QA
+    stack, so the first pass walked a dead server for twenty minutes before the guard caught it.
+  - `/mnt/apopic` sat at **94–100%** and a sibling's `disk-guard` deleted this worktree's `target/`
+    *mid-build*, so `cargo` died writing `.rcgu.o` files into a directory that no longer existed. The
+    build now runs in `/dev/shm/w3-target` (a symlink at `target/`, which is git-ignored), where a
+    guard cannot reach it.
+  - `qa-slot.sh` only reaps a place once it is also older than `WAIT + 900`, so a place left by a dead
+    pass blocks the queue for fifteen minutes. Two dead places were cleared by hand.
+- **Next.** **REQ-004**, the visual workflow builder — the next pending request in the wave-3 order and
+  still no code. Carried over and untouched: the "welcome e-mail on signup" walk, the inbound-hook run
+  walk, the "paused rule does not replay" walk, and the loop guard's message on the trace.
