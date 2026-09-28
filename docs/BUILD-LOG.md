@@ -3299,3 +3299,32 @@ the raw route and a retention run removes exactly the eligible rows.
   so a suite pointed at a database another branch built is asserting that branch's history. Against
   `omnion_w4_fresh`: **56 passed; 0 failed** in 422s (`OMNION_DATABASE_URL=… cargo test -p
   omnion-api --test crm -- --test-threads=1`).
+
+## 2026-09-28 · wave4 · REQ-051 slice 4 — the board claimed to load forever, beside a refusal
+
+**What.** The state/empty/loading/error box. The next hint named two places still drawing a bare
+paragraph instead of `EmptyState` (the board's per-column body, the activities filter bar) — both
+were already done by an earlier tick, so the remaining work came from auditing the six screens.
+That audit found a worse defect: **`deals-view.tsx` had the only body in the module that did not
+gate on its read.** A refused board read set `error`, and the body went on taking the
+`board === null` branch — a four-column skeleton, permanently, printed directly beneath the
+refusal. Two incompatible claims on one screen, neither true, and the visible one described a load
+that had already given up. The list mode had the same gap, so both views of the same record were
+affected.
+
+**The trap inside the fix.** `error` was shared with *action* refusals — a refused drag, a refused
+archive — and those deliberately keep the board on screen under a strip, because the card has
+already moved back and the board is the answer. Gating the body on the shared state would have
+blanked the whole pipeline on every refused drag. The state is split: `error` = action refusal
+(strip above a good board), `loadError` = the screen's own read (replaces the body). A refused
+board also offers "Read as a list", because the two are views of one record.
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `tsc --noEmit` **0 errors** ·
+`node --check scripts/qa/walkthrough.cjs` parses. Four new sweep steps assert the state, the
+request id, **no `[aria-busy]` element anywhere on the page**, and the other view still offered —
+the third is the one the old strip could never have passed, because the defect *was* a screen
+claiming to load.
+
+**Next.** The 390×844 mobile pass and the keyboard sheet (`/`, `j`/`k`, `enter`, `e`, `?`) — the
+last two boxes. The full QA pass is queued behind three sibling writers; four browsers is the
+configuration that OOM'd this host, so the slot waits rather than barging.

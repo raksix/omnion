@@ -207,6 +207,35 @@ Payloads carry ids and the changed field list only — never a rendered document
   *What is left is the **empty state** on the two screens that still fall back to a bare paragraph
   rather than `EmptyState`: the board's per-column body and the activities filter bar. Both exist;
   both need the sentence-and-action shape the other four have.*
+
+  *Both were already done, and the box was pointing at stale text.* The board's per-column body
+  carries a stage-specific sentence, an action on the first column and a drop target on the rest;
+  the activities feed and the record timeline both draw `EmptyState`. The instruction above named
+  two places that an earlier tick had already fixed, so the remaining work was found by auditing
+  the six screens rather than by re-reading the note.
+
+  *What the audit found was a worse defect than the one being hunted (`fed62b5`).* The deals
+  screen — **the** screen of this request — had the only body in the module that did **not** gate
+  on its read. A refused board read set `error`, and the body went on rendering the
+  `board === null` branch: a four-column skeleton, permanently, printed directly beneath a refusal.
+  Two incompatible claims on one screen, neither of them true, and the one the reader was looking
+  at was a loading state for a load that had already given up. The list mode had the same gate
+  missing, so both views of the same record were affected.
+
+  The fix had a trap in it that the obvious patch would have sprung. `error` was **shared** with
+  action failures — a refused drag, a refused archive — and those deliberately keep the board on
+  screen with a strip above it, because the card has already moved back and the board is the
+  answer. Gating the body on the shared state would have blanked the entire pipeline every time
+  someone moved a card the server would not accept. So the state is split: `error` stays the
+  action refusal (a strip above a good board), `loadError` is the screen's own read (the body
+  itself), and each of the six screens now has exactly the one shape its failure warrants. A
+  refused board also offers the list, because the two are views of one record and losing one
+  must not take the other away.
+
+  The walkthrough grew four steps that the strip could not have passed — the state, the request
+  id, **no `[aria-busy]` element left anywhere on the page**, and the other view still on offer.
+  The third is the assertion that matters: the defect was a screen claiming to load, so the proof
+  is that nothing claims to load any more.
 - [ ] Mobile 390×844: lists are usable, the board scrolls horizontally with sticky stage headers, and forms are single-column.
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
 
