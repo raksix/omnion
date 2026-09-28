@@ -2428,3 +2428,51 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+## 2026-09-28 — REQ-126 slice 1: the log schema, the edge, and the redaction pass
+
+- **What shipped.** `crates/telemetry` (`schema` / `context` / `redact` / `store`), migration
+  `0035_observability_logs.sql`, the `request_context` middleware on the outer router, the guard's
+  actor binding, the `observability.*` permission family, and `/api/v1/observability/logs` with
+  `/logs/requests/{id}` and `GET|PUT /logs/settings`. **`c7d17e6` · `5c7b06e` · `e3f1209`**.
+- **Proof.** `cargo test -p omnion-telemetry` 35/35 · `cargo test -p omnion-permissions` 63/63 ·
+  `cargo test -p omnion-api --lib` 125/125 · `cargo test -p omnion-api --test observability_logs`
+  3/3 against `omnion_w6_dev` · `pnpm typecheck` 2/2.
+- **The three defects only the integration walk could see, and the fourth GitHub found:**
+  1. **`user_id` was structurally null on every row.** The route guard inserts the resolved
+     session into the **request's** extensions, and the request is consumed by the time the edge
+     middleware can look — a mutation made deep in the chain never propagates up to an outer
+     layer. Both the obvious sources were wrong (`response.extensions()` and a pre-call snapshot
+     of `request.extensions()`), and cargo, typecheck and the unit tests were all green
+     throughout. The context is now a shared cell the guard *writes into* and the middleware
+     *reads back*, which is also what the request describes when it says the actor is bound
+     "after authentication".
+  2. **`route` was null too, for the same reason** — `MatchedPath` is inserted the same way, so
+     a template column that is always empty is a filter nobody can select. The route is now read
+     from the request before `next.run` consumes it.
+  3. **Reading the context back *outside* the scope** produced a line with a null request id that
+     no response header could ever match. A task-local only exists while its scope is installed;
+     25 seconds of bounded retrying found nothing before that was spotted as the cause rather
+     than treated as a flake.
+  4. **GitHub's push protection rejected the whole branch** over an `xoxb-…` literal in a test
+     fixture. The block was correct: nothing distinguishes a redacted fixture from a live key by
+     inspection, and "allow this secret once" is precisely the decision not to make casually. The
+     fixtures are now *built* from a prefix and a filler. The fix had to be an **amend of the
+     original commit** — a later commit does not remove a literal that is already in the history,
+     and `752b8e9` had to be rewritten because it had never been pushed.
+- **Why `git reset --soft origin/wave6` was the wrong instinct here.** It un-staged the merge of
+  `origin/main` and the working tree then held the main writer's uncommitted REQ-010 files
+  (`media_settings`, `media_transform`, `0028`/`0029`), which a careless `git add -A` would have
+  committed into my branch. Recovery was: back up my 18 files, `reset --hard` back to the merge
+  commit, restore the other writer's files *from that commit* (deleting them would have reverted
+  his work), then recommit only my paths. **A soft reset is not a "undo the last commits"
+  operation once a merge is in the history — check what the tree gained, not what it lost.**
+- **Environment.** `/mnt/apopic` 95% (six writers live), `/` at 99% (2.1 G). `target/` stayed
+  symlinked into `/dev/shm/omnion-w6-target` (14 G free), which is the only reason the Rust gates
+  ran at all. Migration slot 0035, because wave 4 holds 0034.
+- **Not in this slice, and said so in the request file rather than ticked:** the panel's log
+  explorer screen, and the temporary per-module level raise with its automatic expiry. The
+  criteria for the settings screen stay unticked for the same reason.
+- **Next.** REQ-126 slice 2 — the metric registry with the documented families, the cardinality
+  budget enforced at registration, `GET /metrics` in the Prometheus text format, the catalogue
+  seeded from the registry, and the catalogue and chart screen.

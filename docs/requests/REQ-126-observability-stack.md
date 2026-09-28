@@ -1,6 +1,6 @@
 # REQ-126 — Observability Stack
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress · **Captured:** 2026-09-26 · **Layer:** infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -107,9 +107,9 @@ Migration: `database/migrations/0027_observability.sql` (next free slot at tick 
 
 ### Acceptance criteria
 
-- [ ] `database/migrations/0027_observability.sql` applies on a fresh and a populated database, and its down script reverses it.
-- [ ] Every request emits one JSON log line to stdout with `request_id`, and authenticated requests also carry `user_id` and `organization_id`.
-- [ ] A worker log line carries the `trace_id` of the request that enqueued the job.
+- [x] `database/migrations/0035_observability_logs.sql` applies on a fresh and a populated database, and its down script reverses it. *(Slot 0035: 0034 was already taken by wave 4 at write time. The file is additive — two new tables, no change to an existing one — and the reversal is written as executable statements per the REQ-129 policy. Applied by `Db::migrate` against `omnion_w6_dev`; the store read/write/prune walk runs against it.)*
+- [x] Every request emits one JSON log line to stdout with `request_id`, and authenticated requests also carry `user_id` and `organization_id`. *(Proved over the real router: the `x-request-id` header and the stored row carry the same uuid, and an authenticated request's row carries both the user and the organization. The actor is bound by the route guard into the task-local context, because a mutation to the request's extensions never propagates back up to an outer layer — the integration walk is what proves it, since every other gate was green while `user_id` was structurally null.)*
+- [x] A worker log line carries the `trace_id` of the request that enqueued the job. *(Proved by writing two worker lines under the producer's context and reading them back, in order, through `/observability/logs/requests/{id}`.)*
 - [ ] `GET /metrics` exposes the documented families with real values after traffic; route labels are templates (`/api/v1/secrets/{id}`, not the literal id).
 - [ ] Registering a metric that would exceed the cardinality budget is reported and labelled, not silently dropped.
 - [ ] A traced request produces spans for HTTP → SQLx → queue publish, and the consumer span links back to the producer.
@@ -120,7 +120,7 @@ Migration: `database/migrations/0027_observability.sql` (next free slot at tick 
 - [ ] The alert preview endpoint reports firing state against live data without saving anything.
 - [ ] Enabling an exporter with an unreachable backend does not stall a single request; the drop counter rises and the exporter flips to `degraded`.
 - [ ] The syslog or webhook log exporter sends redacted fields only (asserted by a test against a fixture secret value and a fixture e-mail address).
-- [ ] Settings reject out-of-range sampling, retention beyond the cap and unknown level names with field-level messages.
+- [ ] Settings reject out-of-range sampling, retention beyond the cap and unknown level names with field-level messages. *(Partly done in slice 1: retention beyond the 30-day cap is a `422` naming the field and the cap, an unknown level is a `422` naming the accepted set, and a misspelled field is refused rather than silently ignored. Sampling ratio and the per-module level override with its expiry are slice 4's settings, so this line stays open.)*
 - [ ] A temporary log-level raise expires back to the configured default without a restart.
 - [ ] SIGTERM flips `/readyz` to `503`, `/healthz` stays `200`, in-flight requests finish, telemetry flushes, and the process exits 0 with a shutdown summary line.
 - [ ] Retention prunes log rows and trace-index rows past the window without touching audit or incident data.
@@ -136,6 +136,8 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
 ### Slices
 
 1. **Logging + request id + redaction.** Log schema crate, middleware binding request id and user/org context, worker propagation, the shared redaction pass on fields, log explorer screen. *Done when:* one request produces ordered lines across API and worker, findable by request id, with the redaction test green.
+   — **Shipped** (`c7d17e6`, `5c7b06e`, `e3f1209`): `crates/telemetry` with `schema` / `context` / `redact` / `store`, migration `0035_observability_logs.sql`, the `request_context` middleware, the guard's actor binding, and `/api/v1/observability/logs` + `/logs/requests/{id}` + `/logs/settings`.
+   **Not yet in this slice, deliberately:** the admin log-explorer *screen* (the API is complete; the panel view, its empty/loading/error states and the walkthrough route land with the screens) and the temporary per-module log-level raise with its automatic expiry (slice 4's settings, which is where the behaviour that honours the expiry belongs).
 2. **Metrics.** Registry, families for HTTP/DB/queue/workflow/AI, cardinality guard, `/metrics`, metric catalogue and chart screen. *Done when:* a scrape returns every documented family and the catalogue matches the registry.
 3. **Tracing + exporter pipeline.** Span coverage, W3C propagation, queue span links, sampling policy, OTLP/remote-write/syslog exporters with bounded buffers, trace search screen and deep links. *Done when:* a request id finds its trace, and a dead exporter degrades without blocking traffic.
 4. **Lifecycle + bundle + alerts.** Graceful shutdown sequence, probes and their contract, Grafana/Prometheus bundle in `infra/observability/`, alert rules, evaluator with silences and notifications, settings screen, deployment wiring for probes and preStop. *Done when:* an alert fires and resolves through a real dependency outage, the bundle imports, and SIGTERM drains cleanly.
