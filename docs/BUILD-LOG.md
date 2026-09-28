@@ -3289,3 +3289,13 @@ the raw route and a retention run removes exactly the eligible rows.
   the two places that draw a bare paragraph instead of `EmptyState` (the board's per-column body
   and the activities filter bar) — those are the next slice. Then the 390×844 mobile pass and the
   keyboard sheet (`/`, `j`/`k`, `enter`, `e`, `?`), which are the last two boxes.
+
+- **The suite's 56/0 needed a database this branch built.** Run against the shared dev database it
+  reported 56 failures — every one of them `Migration(VersionMissing(19))` at the first migration
+  call. It is a **shared-number collision**, not a regression: w2, w5, w6 and w7 each carry their
+  own `19_*.sql` on their own branch (cms blocks / organization memberships / secret hierarchy / ai
+  provider runtime), the shared database has w2's 19 recorded, and this worktree has **no** 19 —
+  its sequence runs 18, 21, 22. A migration number is one global namespace shared by seven writers,
+  so a suite pointed at a database another branch built is asserting that branch's history. Against
+  `omnion_w4_fresh`: **56 passed; 0 failed** in 422s (`OMNION_DATABASE_URL=… cargo test -p
+  omnion-api --test crm -- --test-threads=1`).
