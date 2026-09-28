@@ -21,6 +21,7 @@ import type { BlockRegistry, ContentPattern } from "@/lib/types";
 import { Check, X } from "lucide-react";
 
 import { ApiError, savePattern, updatePattern } from "@/lib/api";
+import { useContentTenant } from "@/lib/tenant";
 import {
   countBlocks,
   describeTree,
@@ -47,6 +48,11 @@ const EMPTY_JSON = "[]";
 
 /** Create or edit one pattern. */
 export function PatternEditor({ pattern, draft, registry, onCancel, onSaved }: Props) {
+  // A pattern is tenant-owned, so a *create* has to name the tenant — `POST /api/v1/patterns`
+  // answers `400 organization_required` without it. The reads were taught this in `9226e21` and
+  // the write was not, which is why the library listed fine and the create still refused.
+  const tenant = useContentTenant();
+  const organizationId = tenant.organizationId ?? undefined;
   const [name, setName] = useState(pattern?.name ?? draft?.name ?? "");
   const [key, setKey] = useState(pattern?.key ?? draft?.key ?? "");
   const [keyTouched, setKeyTouched] = useState(Boolean(pattern?.key));
@@ -109,6 +115,7 @@ export function PatternEditor({ pattern, draft, registry, onCancel, onSaved }: P
             category: category.trim() || "general",
             description,
             blocks: parsed.blocks as never,
+            organizationId,
           });
       onSaved(saved);
     } catch (cause: unknown) {

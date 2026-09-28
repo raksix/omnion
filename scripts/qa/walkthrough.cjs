@@ -3450,6 +3450,45 @@ async function main() {
   }
   await shot(page, "11-overview-after-login");
 
+  // `--only=block-editor` runs this wave's own depth passes and nothing else.
+  //
+  // A full pass is ~45 minutes on a box five writers share, and it dies in the middle: the box
+  // reboots, or another writer's pass prunes the shared pm2 daemon, and everything after the
+  // cut is lost — including this wave's depth passes, which sit at the very end. The symptom is
+  // unmistakable and easy to misread: `block editor: {"created":false,"blocked":"no page row
+  // carried an editor link"}` with a `block-editor-page-form` screenshot showing Chrome's
+  // ERR_CONNECTION_REFUSED, because the admin server was gone by the time the pass navigated.
+  // That is a dead server, not a product defect, and reading it as one costs a tick.
+  //
+  // So the depth passes get their own entry point: sign in, run them, report, exit. Minutes
+  // instead of an hour, and it cannot be taken down by what happens on another stack.
+  if (process.argv.includes("--only=block-editor")) {
+    report.blockEditor = await runBlockEditorDepth(page, report);
+    log(`block editor: ${JSON.stringify(report.blockEditor)}`);
+    report.patterns = await runPatternDepth(page, report);
+    log(`patterns: ${JSON.stringify(report.patterns)}`);
+    const be = report.blockEditor;
+    // The names are the pass's own `steps.*` keys, read off the function rather than guessed:
+    // a summary that asks for a flag the pass never sets reports "missing" for a check that
+    // simply does not exist, which is worse than no summary at all.
+    const flags = [
+      "created", "path", "insertCategories", "outlineRows", "blockCount",
+      "publishDisabledOnError", "publishEnabledAfterFix", "reordered", "duplicated",
+      "deleted", "saved", "published", "publicRendered", "historyCoversFifty",
+      "outlineWarningCleared", "warningReachable", "columnsInserted", "breadcrumbReachesNested",
+    ];
+    const missing = flags.filter((f) => be[f] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ mode: "block-editor-only", netFailures, blockEditor: be, patterns: report.patterns, missing }, null, 2),
+    );
+    console.log(`BLOCK_EDITOR_JSON=${JSON.stringify(be)}`);
+    console.log(`BLOCK_EDITOR_MISSING=${missing.length === 0 ? "none" : missing.join(",")}`);
+    console.log(`BLOCK_EDITOR_CREATED=${be.created === true} PUBLIC_RENDERED=${be.publicRendered === true}`);
+    await browser.close();
+    process.exit(0);
+  }
+
   // The analytics batch goes in before the routes are walked: the report screens read it, and the
   // history fixture gives their series more than one bucket to draw.
   report.analytics = await seedAnalytics(report);
