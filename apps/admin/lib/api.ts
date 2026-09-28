@@ -3553,7 +3553,7 @@ export type IamAuthProvider = {
   id: string;
   organization_id: string;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml";
+  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
   name: string;
   config: Record<string, unknown>;
   secret_ref: string | null;
@@ -3563,6 +3563,19 @@ export type IamAuthProvider = {
   default_role_id: string | null;
   jit_enabled: boolean;
   enabled: boolean;
+  /**
+   * `null` on `last_test_ok` is *never tested* — a third state, not a failure. The chip renders
+   * it differently because a brand-new provider and a broken one call for different actions.
+   */
+  last_test_at: string | null;
+  last_test_ok: boolean | null;
+  /** 0 means "not on a schedule", which is a real choice for an interactive-only directory. */
+  sync_interval_minutes: number;
+  last_sync_at: string | null;
+  last_sync_status: "ok" | "partial" | "failed" | null;
+  plugin_key: string | null;
+  /** Derived by the server, so the list and the drawer can never disagree about it. */
+  status: "enabled" | "disabled" | "degraded";
   created_at: string;
   updated_at: string;
   sign_in_count: number;
@@ -3580,15 +3593,42 @@ export type IamProviderEvent = {
   created_at: string;
 };
 
-/** The answer of the discovery test — a failed test is a `200` with `status: "failed"`. */
+/**
+ * One step of a directory connection test.
+ *
+ * The ladder is the answer, not a decoration on one: a directory fails at exactly one of these
+ * and "connection failed" leaves an operator with nothing to act on.
+ */
+export type IamTestStep = {
+  step: "dns" | "tcp" | "tls" | "bind" | "search" | "attributes";
+  status: "pending" | "ok" | "failed";
+  detail: string;
+};
+
+/** A configuration problem, attached to the field the wizard should underline. */
+export type IamTestProblem = {
+  field: string;
+  message: string;
+  kind: "missing" | "invalid" | "conflict";
+};
+
+/**
+ * The answer of a connection test. A failed test is a `200`, not a transport error.
+ *
+ * `status` is three-valued on purpose: `incomplete` means the form is sound and nothing has
+ * asked the directory anything yet, which is NOT a pass and does not unlock the enable button.
+ */
 export type IamProviderTest = {
   provider_id: string;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml";
-  status: "ok" | "failed";
+  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
+  status: "ok" | "failed" | "incomplete";
   detail: string;
   endpoints?: Record<string, unknown> | null;
   secret_present: boolean;
+  /** Present for a directory only; the protocol kinds report one result rather than a walk. */
+  steps?: IamTestStep[] | null;
+  problems?: IamTestProblem[] | null;
 };
 
 /** The provider list, with the kinds the form offers. */
@@ -3597,7 +3637,13 @@ export function fetchIamProviders(
 ): Promise<{
   organization_id: string;
   providers: IamAuthProvider[];
-  kinds: { value: string; label: string; default_scopes: string[] }[];
+  kinds: {
+    value: string;
+    label: string;
+    default_scopes: string[];
+    /** A directory is configured and proved differently, so the form branches on this. */
+    family: "protocol" | "directory";
+  }[];
 }> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
   return request(`/api/v1/iam/providers${query}`);
@@ -3614,6 +3660,7 @@ export function createIamProvider(input: {
   groupClaim?: string | null;
   jitEnabled?: boolean;
   organizationId?: string | null;
+  syncIntervalMinutes?: number | null;
 }): Promise<IamAuthProvider> {
   return request("/api/v1/iam/providers", {
     method: "POST",
@@ -3627,6 +3674,9 @@ export function createIamProvider(input: {
       ...(input.groupClaim ? { group_claim: input.groupClaim } : {}),
       ...(typeof input.jitEnabled === "boolean" ? { jit_enabled: input.jitEnabled } : {}),
       ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+      ...(typeof input.syncIntervalMinutes === "number"
+        ? { sync_interval_minutes: input.syncIntervalMinutes }
+        : {}),
     }),
   });
 }
@@ -3642,6 +3692,7 @@ export function updateIamProvider(
     groupClaim?: string | null;
     jitEnabled?: boolean;
     enabled?: boolean;
+    syncIntervalMinutes?: number;
   },
 ): Promise<IamAuthProvider> {
   return request(`/api/v1/iam/providers/${id}`, {
@@ -3666,6 +3717,27 @@ export function deleteIamProvider(id: string): Promise<null> {
 /** Ask the provider what it actually is. A broken provider is a result, not a transport error. */
 export function testIamProvider(id: string): Promise<IamProviderTest> {
   return request(`/api/v1/iam/providers/${id}/test`, { method: "POST" });
+}
+
+/**
+ * Switch a provider on. Refused with `provider_not_ready` until a test has passed — which is why
+ * this is a verb of its own rather than a PATCH, and why the button stays disabled until then.
+ */
+export function enableIamProvider(id: string): Promise<{
+  id: string;
+  enabled: boolean;
+  gate_passed: boolean;
+}> {
+  return request(`/api/v1/iam/providers/${id}/enable`, { method: "POST" });
+}
+
+/** Switch a provider off. Never gated: stopping something broken must always be possible. */
+export function disableIamProvider(id: string): Promise<{
+  id: string;
+  enabled: boolean;
+  gate_passed: boolean;
+}> {
+  return request(`/api/v1/iam/providers/${id}/disable`, { method: "POST" });
 }
 
 /** A provider's sign-in log, newest first. */

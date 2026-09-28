@@ -5272,11 +5272,106 @@ async function runIamAuthenticationDepth(page, report) {
   note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
   await shot(page, "page-iam-authentication-log");
 
-  // ---- Remove it and prove the list goes back to its empty state ---------------------------
+  // ---- A directory provider: its own fields, its own ladder, its own gate -------------------
+  // The protocol half above cannot prove the directory half. A directory needs a service
+  // account, has no client secret at all, and its test is a *ladder* — so connecting one and
+  // reading the steps is the only way the screen is actually exercised rather than rendered.
   await page.locator(`[data-provider-delete="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(400);
   await page.locator(`[data-provider-delete-confirm="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
+  const dstamp = Date.now().toString().slice(-6);
+  await page.locator("[data-kind=active_directory]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const dirFields = await page.locator("[data-provider-field=host]").count();
+  // A directory's credential is the bind reference, so the client-secret input must be gone —
+  // two secret fields on one provider is how a password ends up in the wrong box.
+  const clientSecretFields = await page.locator("[data-provider-secret-ref]").count();
+  note({
+    step: "directory-kind",
+    fieldsShown: dirFields > 0,
+    noClientSecretField: clientSecretFields === 0,
+    // The template must arrive with a filter that is already safe, not an empty box.
+    filterHasPlaceholder: (await page.locator("[data-provider-field=user_filter]").first().inputValue().catch(() => "")).includes("{username}"),
+  });
+  await shot(page, "page-iam-provider-wizard");
+
+  await page.locator("[data-provider-slug-input]").first().fill(`qa-dir-${dstamp}`).catch(() => {});
+  await page.locator("[data-provider-name]").first().fill(`QA directory ${dstamp}`).catch(() => {});
+  await page.locator("[data-provider-field=host]").first().fill("ldaps://dir.qa.invalid").catch(() => {});
+  await page.locator("[data-provider-field=base_dn]").first().fill("ou=people,dc=qa,dc=invalid").catch(() => {});
+  await page.locator("[data-provider-field=bind_dn]").first().fill("cn=omnion,ou=svc,dc=qa,dc=invalid").catch(() => {});
+  await page.locator("[data-provider-field=bind_secret_ref]").first().fill("OMNION_QA_LDAP_BIND_ABSENT").catch(() => {});
+  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(2500);
+
+  await page.locator(`[data-provider-test="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector(`[data-test-steps="qa-dir-${dstamp}"]`, { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const stepStatuses = await page
+    .locator(`[data-test-steps="qa-dir-${dstamp}"] [data-test-step]`)
+    .evaluateAll((nodes) => nodes.map((n) => `${n.getAttribute("data-test-step")}:${n.getAttribute("data-test-step-status")}`))
+    .catch(() => []);
+  const dirTestStatus = await page
+    .locator(`[data-provider-test-result="qa-dir-${dstamp}"]`)
+    .first()
+    .getAttribute("data-test-status")
+    .catch(() => null);
+  note({
+    step: "directory-test-ladder",
+    // A sound configuration with an unreachable host is `incomplete`, never `ok` — the gate
+    // below depends on that, and a screen that said "ok" here would be lying.
+    status: dirTestStatus,
+    steps: stepStatuses,
+    hasLadder: stepStatuses.length > 0,
+    notAPass: dirTestStatus !== "ok",
+  });
+  await shot(page, "page-iam-provider-mapping");
+
+  // ---- A provider that has never passed cannot be switched on -----------------------------
+  // The button is *disabled*, not merely erroring: a control that only says no after the click
+  // is a control people click twice.
+  const toggleDisabled = await page
+    .locator(`[data-provider-toggle="qa-dir-${dstamp}"]`)
+    .first()
+    .isDisabled()
+    .catch(() => false);
+  const untestedBadge = await page.locator(`[data-provider-untested="qa-dir-${dstamp}"]`).count();
+  note({ step: "enable-gated", toggleDisabled, showsNeverTested: untestedBadge > 0 });
+
+  // ---- A configuration problem is named against its field, not as a generic failure ---------
+  await page.locator(`[data-provider-edit="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-provider-field=user_filter]").first().fill("(objectClass=person)").catch(() => {});
+  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  await page.locator(`[data-provider-test="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const problemFields = await page
+    .locator(`[data-test-problems="qa-dir-${dstamp}"] [data-test-problem]`)
+    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-test-problem")))
+    .catch(() => []);
+  note({
+    step: "field-level-problem",
+    problems: problemFields,
+    // A filter without the placeholder is refused BY NAME, because that is the mistake that
+    // would otherwise return every person in the directory for every sign-in.
+    namesTheFilter: problemFields.includes("user_filter"),
+  });
+
+  await page.locator("[data-provider-drawer-close]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator(`[data-provider-delete="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator(`[data-provider-delete-confirm="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  // ---- Both providers gone: the list is back to its real empty state ------------------------
+  // Checked with the drawer CLOSED. Opening it first would leave the list covered and this
+  // would assert an empty state nobody can see.
   const afterRemove = await page.locator("[data-provider-row]").count();
   const emptyVisible = await page.locator("[data-providers-empty]").count();
   note({ step: "provider-removed", afterRemove, emptyStateVisible: emptyVisible > 0 });
