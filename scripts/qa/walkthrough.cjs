@@ -1089,10 +1089,23 @@ async function runAiProviderDepth(page, report) {
     note({ step: "protocols", options: protocolOptions.join(", "), count: protocolOptions.length });
 
     // A malformed base URL is refused in the field, not by a bare banner.
+    //
+    // This submit is refused **on purpose**, so its refusal is registered. The panel validates
+    // the URL client-side and shows a field error, but the form still posts once — and that 400
+    // was the single high finding in every pass of this request. It went unnoticed because the
+    // step asserts the *field* error and reads as though the whole refusal is client-side, while
+    // the request that produced the report entry was this one. Registering it is the honest form:
+    // 4xx only, so a 500 here is the API crashing on a URL it should have rejected.
+    expectRefusal(
+      "/api/v1/ai/providers",
+      "ai-providers: a malformed base URL is submitted on purpose and refused in the field",
+      [400, 422],
+    );
     await page.locator("[data-provider-name]").fill("QA Refused").catch(() => {});
     await page.locator("[data-provider-url]").fill("not-a-url").catch(() => {});
     await page.locator('[data-testid="connect-submit"], form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1600);
+    endRefusalWindow("/api/v1/ai/providers");
     const fieldError = await page.locator("[data-field-error]").count();
     const fieldErrorText = await page.locator("[data-field-error]").first().innerText().catch(() => "");
     note({ step: "refusal", fieldError, text: fieldErrorText.replace(/\s+/g, " ").slice(0, 140) });
