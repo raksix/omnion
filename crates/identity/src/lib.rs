@@ -36,10 +36,11 @@ pub use authentication::{AuthOutcome, authenticate};
 pub use error::{IdentityError, Result};
 pub use memberships::{
     AccountMembership, CreatedInvitation, Invitation, Membership, MembershipChanges, NewInvitation,
-    NewMembership, accept_invitation, add_member, address_is_member, count_active_members,
-    create_invitation, find_invitation_by_token, find_member, find_pending_invitation,
-    list_account_memberships, list_invitations, list_members, make_primary, remove_member,
-    revoke_invitation, update_membership, validate_member_status, validate_message,
+    NewMembership, accept_invitation, add_member, address_is_member, approve_invitation,
+    count_active_members, create_invitation, find_invitation_by_token, find_member,
+    find_pending_invitation, list_account_memberships, list_invitations, list_members,
+    list_queued_invitations, make_primary, remove_member, revoke_invitation, update_membership,
+    validate_member_status, validate_message,
 };
 pub use organizations::{
     NewOrganization, Organization, OrganizationChanges, create_organization, delete_organization,

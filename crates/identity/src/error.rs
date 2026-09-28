@@ -65,6 +65,13 @@ pub enum IdentityError {
     /// The token is past its expiry.
     #[error("this invitation has expired")]
     InvitationExpired,
+    /// The token is real but its organization runs the `owner_approval` policy, so nobody has
+    /// released it yet. This is deliberately its own answer rather than a generic "not valid":
+    /// the holder is somebody a manager invited, and telling them "not valid" would send them
+    /// back to the person who just invited them for no reason. It reveals nothing about any
+    /// *other* organization, because a token nobody issued answers `InvitationNotFound`.
+    #[error("this invitation is waiting for an owner to release it")]
+    InvitationAwaitingApproval,
     /// The address already holds a live invitation in this organization; the row is carried so
     /// the API can name the existing invitation instead of mailing the address twice.
     #[error("this address already has a pending invitation")]

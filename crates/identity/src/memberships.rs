@@ -24,7 +24,18 @@ const MAX_KEY_LENGTH: usize = 64;
 pub const MEMBER_STATUSES: [&str; 3] = ["active", "invited", "suspended"];
 
 /// Invitation statuses a row may carry.
-pub const INVITATION_STATUSES: [&str; 4] = ["pending", "accepted", "revoked", "expired"];
+///
+/// `awaiting_approval` is the `owner_approval` queue: a live invitation that nobody has released
+/// yet. It is deliberately *not* `pending` — a queued invitation is not a working invitation, and
+/// `Invitation::is_usable` already requires `pending`, so a queued token answers the public
+/// preview and the acceptance path as unusable without either handler learning about the queue.
+pub const INVITATION_STATUSES: [&str; 5] = [
+    "pending",
+    "awaiting_approval",
+    "accepted",
+    "revoked",
+    "expired",
+];
 
 /// Longest accepted personal message on an invitation.
 pub const MAX_INVITATION_MESSAGE: usize = 400;
@@ -456,6 +467,13 @@ pub struct NewInvitation {
     pub message: String,
     /// When the token stops working; the default lifetime when `None`.
     pub expires_at: Option<OffsetDateTime>,
+    /// Start the row in the `owner_approval` queue instead of handing out a working link.
+    ///
+    /// `None` is the ordinary `pending` invitation. The queue is not a *mode* of the
+    /// organization — the route decides it from `organization_settings.invite_policy` and the
+    /// inviter's role, and says so in the parameter, so this function never has to re-read a
+    /// policy it might disagree with.
+    pub queued: bool,
 }
 
 /// Create an invitation and return it with its raw token.
@@ -469,6 +487,11 @@ pub async fn create_invitation(pool: &PgPool, new: NewInvitation) -> Result<Crea
     let expires_at = new
         .expires_at
         .unwrap_or(OffsetDateTime::now_utc() + Duration::days(DEFAULT_INVITATION_TTL_DAYS));
+    let status = if new.queued {
+        "awaiting_approval"
+    } else {
+        "pending"
+    };
 
     if let Some(pending) = find_pending_invitation(pool, new.organization_id, &email).await? {
         if pending.expires_at > OffsetDateTime::now_utc() {
@@ -482,7 +505,7 @@ pub async fn create_invitation(pool: &PgPool, new: NewInvitation) -> Result<Crea
     let invitation: Invitation = sqlx::query_as(
         "insert into organization_invitations \
             (organization_id, email, role_id, token_hash, invited_by, status, message, expires_at) \
-         values ($1, $2, $3, $4, $5, 'pending', $6, $7) \
+         values ($1, $2, $3, $4, $5, $8, $6, $7) \
          returning id, organization_id, email, role_id, token_hash, invited_by, status, message, \
                    expires_at, accepted_by, accepted_at, created_at",
     )
@@ -493,6 +516,7 @@ pub async fn create_invitation(pool: &PgPool, new: NewInvitation) -> Result<Crea
     .bind(new.invited_by)
     .bind(&message)
     .bind(expires_at)
+    .bind(status)
     .fetch_one(pool)
     .await
     .map_err(map_invitation_insert_error)?;
@@ -501,6 +525,12 @@ pub async fn create_invitation(pool: &PgPool, new: NewInvitation) -> Result<Crea
 }
 
 /// The live invitation this address holds in this organization, when there is one.
+///
+/// "Live" means *either* `pending` or `awaiting_approval`. A queued invitation already occupies
+/// the address: the unique index covers both states, so a second invite for the same person would
+/// be refused by the database anyway. Narrowing this query to `pending` would make the API
+/// answer "invited" with a fresh row and then lose the race to a `already pending` error — the
+/// same refusal, with a dead link in the response.
 pub async fn find_pending_invitation(
     pool: &PgPool,
     organization_id: Uuid,
@@ -510,7 +540,8 @@ pub async fn find_pending_invitation(
         "select id, organization_id, email, role_id, token_hash, invited_by, status, message, \
                 expires_at, accepted_by, accepted_at, created_at \
            from organization_invitations \
-          where organization_id = $1 and lower(email) = lower($2) and status = 'pending' \
+          where organization_id = $1 and lower(email) = lower($2) \
+            and status in ('pending', 'awaiting_approval') \
           order by created_at desc limit 1",
     )
     .bind(organization_id)
@@ -548,10 +579,14 @@ pub async fn list_invitations(pool: &PgPool, organization_id: Uuid) -> Result<Ve
 }
 
 /// Revoke a live invitation. `false` when the row was already decided or gone.
+///
+/// A queued (`awaiting_approval`) invitation is revocable: "decline" and "revoke" are the same
+/// act seen from two sides, and making them different statuses would give the Members tab two
+/// buttons that do one thing. The queue's *reason* lives in the audit row, not in a status.
 pub async fn revoke_invitation(pool: &PgPool, id: Uuid) -> Result<bool> {
     let revoked = sqlx::query(
-        "update organization_invitations set status = 'revoked' \
-         where id = $1 and status = 'pending'",
+        "update organization_invitations set status = 'revoked', decided_by = null, decided_at = now() \
+         where id = $1 and status in ('pending', 'awaiting_approval')",
     )
     .bind(id)
     .execute(pool)
@@ -561,6 +596,60 @@ pub async fn revoke_invitation(pool: &PgPool, id: Uuid) -> Result<bool> {
     Ok(revoked)
 }
 
+/// Release a queued invitation: it becomes an ordinary `pending` one and its link works.
+///
+/// `None` when the row is not in the queue — a live invitation has nothing to release, and an
+/// already-decided one must not be resurrected. The caller answers that case by name.
+///
+/// **The token is rotated here, and it has to be.** A queued invitation's token was never handed
+/// to anybody — the create path returns no token for a queued row precisely so a manager who
+/// cannot release it has nothing to forward — and the stored value is a *hash*, which cannot be
+/// turned back into a link. So the release mints the link instead: the old hash stops matching
+/// (it was dead anyway) and the new raw token is returned once, by this call. The alternative,
+/// handing out the token at create time and hoping the queue-holder ignores it, is the feature
+/// working by trust instead of by construction.
+pub async fn approve_invitation(
+    pool: &PgPool,
+    id: Uuid,
+    decided_by: Uuid,
+) -> Result<Option<(Invitation, String)>> {
+    let token = generate_token();
+    let token_hash = hash_token(&token);
+
+    let released: Option<Invitation> = sqlx::query_as(
+        "update organization_invitations \
+            set status = 'pending', token_hash = $3, decided_by = $2, decided_at = now() \
+          where id = $1 and status = 'awaiting_approval' \
+          returning id, organization_id, email, role_id, token_hash, invited_by, status, message, \
+                    expires_at, accepted_by, accepted_at, created_at",
+    )
+    .bind(id)
+    .bind(decided_by)
+    .bind(&token_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(released.map(|invitation| (invitation, token)))
+}
+
+/// The invitations waiting for an owner, oldest first — the queue is a work list, not a feed.
+pub async fn list_queued_invitations(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<Vec<Invitation>> {
+    let invitations = sqlx::query_as::<_, Invitation>(
+        "select id, organization_id, email, role_id, token_hash, invited_by, status, message, \
+                expires_at, accepted_by, accepted_at, created_at \
+           from organization_invitations \
+          where organization_id = $1 and status = 'awaiting_approval' \
+          order by created_at asc",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(invitations)
+}
+
 /// Accept an invitation: it becomes `accepted`, the account joins the organization as an
 /// `active` member and — when the organization is the account's only home — the membership
 /// becomes primary.
@@ -568,6 +657,11 @@ pub async fn revoke_invitation(pool: &PgPool, id: Uuid) -> Result<bool> {
 /// A `pending` invitation whose token has expired is marked `expired` and refused with
 /// [`IdentityError::InvitationExpired`], so the second attempt sees the same answer as the
 /// first instead of a fresh acceptance.
+///
+/// A queued (`awaiting_approval`) token is refused with
+/// [`IdentityError::InvitationAwaitingApproval`] and left exactly as it is — releasing it is
+/// the owner's decision, and an invitee who guesses the token out of an e-mail thread must not
+/// be able to release it by clicking the link twice.
 pub async fn accept_invitation(pool: &PgPool, token: &str, user_id: Uuid) -> Result<Invitation> {
     let invitation = find_invitation_by_token(pool, token)
         .await?
@@ -578,6 +672,9 @@ pub async fn accept_invitation(pool: &PgPool, token: &str, user_id: Uuid) -> Res
     }
     if invitation.status == "revoked" {
         return Err(IdentityError::InvitationRevoked);
+    }
+    if invitation.status == "awaiting_approval" {
+        return Err(IdentityError::InvitationAwaitingApproval);
     }
     if invitation.status == "expired" || invitation.expires_at <= OffsetDateTime::now_utc() {
         if invitation.status == "pending" {
