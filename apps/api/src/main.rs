@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+    ai_health_runner, analytics_runner, automation_runner, event_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -122,6 +123,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
+    }
+
+    // The AI health probe runner samples every enabled provider on its own cadence (REQ-097,
+    // slice 3). It calls the same `probe_now` the "Probe now" button calls, so the background
+    // sample and the manual one are the same measurement rather than two implementations of it.
+    if state.config().ai_hub.runner_enabled {
+        let _probes = ai_health_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the AI health probe runner is disabled (OMNION_AI_HEALTH_RUNNER=false)");
     }
 
     let app = routes::router(state);
