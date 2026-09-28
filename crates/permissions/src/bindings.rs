@@ -295,9 +295,11 @@ pub async fn bindings_for_in_context(
 ) -> Result<Vec<RoleBinding>> {
     let mut bindings = bindings_for(pool, subject).await?;
 
-    if let (Subject::User(user_id), Some(organization_id), Some(department)) =
-        (subject, context.organization_id, context.department.as_deref())
-    {
+    if let (Subject::User(user_id), Some(organization_id), Some(department)) = (
+        subject,
+        context.organization_id,
+        context.department.as_deref(),
+    ) {
         // Membership is the gate, not an optimization: a role bound to a department is a grant
         // to the people *in* it, so somebody who merely asks about a department they are not in
         // must not pick its roles up. Without this check the department context alone would be

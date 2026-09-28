@@ -218,21 +218,27 @@ pub struct AuditFilter {
 /// The count is a second statement rather than a window function because the two are used
 /// differently: the list is a page, the count is a "showing 50 of 812" that has to be right even
 /// when the page is short.
-pub async fn filtered(pool: &PgPool, filter: &AuditFilter, limit: i64) -> Result<(Vec<AuditEntry>, i64)> {
+pub async fn filtered(
+    pool: &PgPool,
+    filter: &AuditFilter,
+    limit: i64,
+) -> Result<(Vec<AuditEntry>, i64)> {
     let where_clause = "($1::uuid is null or organization_id = $1) \
         and ($2::text is null or lower(action) = lower($2)) \
         and ($3::uuid is null or actor_user_id = $3) \
         and ($4::text is null or actor_type = $4) \
         and ($5::timestamptz is null or created_at >= $5::timestamptz)";
 
-    let total: i64 = sqlx::query_scalar(&format!("select count(*) from audit_log where {where_clause}"))
-        .bind(filter.organization_id)
-        .bind(filter.action.as_deref())
-        .bind(filter.actor_user_id)
-        .bind(filter.actor_type.as_deref())
-        .bind(filter.since)
-        .fetch_one(pool)
-        .await?;
+    let total: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from audit_log where {where_clause}"
+    ))
+    .bind(filter.organization_id)
+    .bind(filter.action.as_deref())
+    .bind(filter.actor_user_id)
+    .bind(filter.actor_type.as_deref())
+    .bind(filter.since)
+    .fetch_one(pool)
+    .await?;
 
     let rows: Vec<AuditEntry> = sqlx::query_as(&format!(
         "select {AUDIT_COLUMNS} from audit_log where {where_clause} \
@@ -300,14 +306,13 @@ pub async fn purge_before(
     organization_id: Uuid,
     cutoff: OffsetDateTime,
 ) -> Result<i64> {
-    let removed = sqlx::query(
-        "delete from audit_log where organization_id = $1 and created_at < $2",
-    )
-    .bind(organization_id)
-    .bind(cutoff)
-    .execute(pool)
-    .await?
-    .rows_affected() as i64;
+    let removed =
+        sqlx::query("delete from audit_log where organization_id = $1 and created_at < $2")
+            .bind(organization_id)
+            .bind(cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected() as i64;
 
     Ok(removed)
 }
@@ -324,6 +329,44 @@ pub async fn distinct_actions(pool: &PgPool, organization_id: Uuid) -> Result<Ve
     .fetch_all(pool)
     .await?;
     Ok(actions)
+}
+
+/// Every entry recorded **against one record**, newest first.
+///
+/// `target_types` is a list rather than one string because a platform surfaces legitimately
+/// disagree about what a record's target is called: the media library writes `media` for the
+/// bytes of a file and `media_file` for a grant placed on it, and both are things that happened
+/// *to that file*. A single target type would therefore answer half the story, and the half it
+/// dropped is the half about access — which is the part a reader asks the trail for.
+///
+/// `target_id` is text, not a uuid, because `audit_log.target_id` deliberately is (it may hold a
+/// slug). Binding a `&str` against a uuid column fails at runtime rather than at compile time on
+/// sqlx's untyped path, so the cast is written here once rather than by every caller.
+pub async fn for_target(
+    pool: &PgPool,
+    target_id: &str,
+    target_types: &[&str],
+    limit: i64,
+) -> Result<Vec<AuditEntry>> {
+    if target_types.is_empty() {
+        // An empty `any()` is `false`, so this would answer "nothing happened" — a plausible
+        // empty list for a screen that is about to render it as an empty state. Say so instead.
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "select {AUDIT_COLUMNS} from audit_log \
+         where target_id = $1 and target_type = any($2) \
+         order by created_at desc, id desc limit $3"
+    );
+
+    let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
+        .bind(target_id)
+        .bind(target_types)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(entries)
 }
 
 #[cfg(test)]

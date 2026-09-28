@@ -428,8 +428,7 @@ pub async fn effective_permissions_for(
         .into_iter()
         .filter(|binding| binding.is_active_at(now))
         .filter(|binding| {
-            matches!(binding.scope, Scope::Department { .. })
-                && context_names_a_department
+            matches!(binding.scope, Scope::Department { .. }) && context_names_a_department
                 || binding.scope.applies_to(context)
         })
         .collect::<Vec<_>>();

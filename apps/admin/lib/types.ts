@@ -463,6 +463,79 @@ export type MediaVersionList = {
 };
 
 /**
+ * One place a file is used (REQ-010, slice 4).
+ *
+ * `resolved` is the field the whole tab exists for. A reference whose referent the platform
+ * cannot see is a row that will refuse a purge for ever, and the reader has to be able to see
+ * *which* row is stale before deciding between repointing the record and running the repair
+ * scan — so it travels on every row, not only as a total.
+ */
+export type MediaUsageEntry = {
+  id: string;
+  /** What kind of record points here (`page`, `theme`, …). */
+  resource_kind: string;
+  /** The referent's id, as text — it may be a slug, so it is never parsed in the panel either. */
+  resource_id: string;
+  /** Which field of that record points here; empty when the record *is* the file. */
+  field: string;
+  /** A name for the referent, when the platform can resolve one. */
+  label: string | null;
+  /** The referent's lifecycle state, for a page. */
+  status: string | null;
+  /** Where the referent lives in the panel, when it can be resolved. */
+  path: string | null;
+  /** Whether the platform can still see the referent. */
+  resolved: boolean;
+  created_at: string;
+};
+
+/**
+ * One file's usage.
+ *
+ * `records` and `rows` disagree in ordinary use — a page naming the same hero in three fields is
+ * one record and three rows — and "used in 3 places" beside one page is the number that makes
+ * somebody delete a page. `summary` is the API's sentence rather than something the panel builds
+ * out of two integers, so the screen and the API cannot disagree about what the numbers mean.
+ */
+export type MediaUsage = {
+  media_id: string;
+  /** Distinct records naming this file. */
+  records: number;
+  /** Of those, the ones the platform can still see. */
+  resolved: number;
+  /** Reference rows. */
+  rows: number;
+  /** Whether the read was cut short by the screen's bound. */
+  truncated: boolean;
+  /** One sentence saying what the numbers mean. */
+  summary: string;
+  usage: MediaUsageEntry[];
+};
+
+/** One audited action against a file. */
+export type MediaActivityEntry = {
+  id: number;
+  /** The stable action name (`media.deleted`, …) — never rendered raw. */
+  action: string;
+  /** The same action as a sentence, so the panel never builds a label out of a verb. */
+  summary: string;
+  /** Who did it, when the account still exists. */
+  actor: string | null;
+  /** `user`, `agent`, `service` or `system`. */
+  actor_type: string;
+  metadata: unknown;
+  occurred_at: string;
+};
+
+/** One file's activity, newest first. */
+export type MediaActivity = {
+  media_id: string;
+  total: number;
+  truncated: boolean;
+  activity: MediaActivityEntry[];
+};
+
+/**
  * One share link, as the panel reads it (REQ-010, slice 3).
  *
  * There is no `token` field here, and that is not an oversight: the API cannot return one after
@@ -778,3 +851,83 @@ export type OwnerSetupResult = {
   user: User;
   onboarding: OnboardingStatus;
 };
+
+
+// ---------------------------------------------------------------------------------------------
+// Notifications (docs/requests/REQ-021, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** One notification as the panel reads it. */
+export type NotificationRow = {
+  id: string;
+  category: string;
+  priority: string;
+  title: string;
+  body: string;
+  /** Where its link goes; `null` means the panel must not render a link. */
+  url: string | null;
+  source_type: string | null;
+  source_id: string | null;
+  payload: unknown;
+  read_at: string | null;
+  archived_at: string | null;
+  created_at: string;
+};
+
+/** One grouped line of the bell. */
+export type NotificationCategoryCount = {
+  category: string;
+  count: number;
+};
+
+/** The bell's numbers: one total, and one line per category including the empty ones. */
+export type NotificationSummary = {
+  unread: number;
+  by_category: NotificationCategoryCount[];
+};
+
+/** A page of the list, with the cursor for the next one. */
+export type NotificationPage = {
+  notifications: NotificationRow[];
+  has_more: boolean;
+  next_before: string | null;
+};
+
+/** What one bulk action really changed, and the unread count after it. */
+export type NotificationBulkResult = {
+  action: string;
+  changed: number;
+  unread: number;
+};
+
+/** The filters the list accepts; every field is optional and every one is shareable in a URL. */
+export type NotificationFilters = {
+  category?: string;
+  read?: "unread" | "read";
+  priority?: string;
+  channel?: string;
+  archived?: boolean;
+  with_read?: boolean;
+  before?: string;
+  limit?: number;
+};
+
+/** The closed vocabulary, so the panel never hard-codes what the server already knows. */
+export const NOTIFICATION_CATEGORIES = [
+  "approval",
+  "security",
+  "update",
+  "ticket",
+  "system",
+  "mention",
+] as const;
+
+export const NOTIFICATION_PRIORITIES = ["low", "normal", "high", "critical"] as const;
+
+export const NOTIFICATION_CHANNELS = [
+  "in_app",
+  "email",
+  "web_push",
+  "webhook",
+  "chat",
+] as const;

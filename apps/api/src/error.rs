@@ -293,6 +293,37 @@ impl From<IdentityError> for ApiError {
                     .with_details(serde_json::json!({ "field": field }))
             }
             IdentityError::InvalidNetwork(message) => Self::bad_request("invalid_network", message),
+            // The department tree (REQ-005, the org chart). Four variants, each with the
+            // status the state actually implies, and none of them is a server fault: a client
+            // that reads a `500` here retries a move that can never succeed and shows the
+            // operator an error page instead of the one field they have to change.
+            //   * a shape the store refuses (blank key, unknown status) is the caller's -> 400
+            //   * a key already used in this organization is a state conflict    -> 409
+            //   * a move that would make a node its own ancestor is a state conflict, not a
+            //     bad request: the request is well-formed, the tree is what refuses it
+            //   * a delete refused because role bindings still name the department is the
+            //     same: nothing is malformed, the caller has to revoke or archive first
+            IdentityError::InvalidDepartment(message) => {
+                Self::bad_request("invalid_department", message)
+            }
+            IdentityError::DepartmentKeyTaken => Self::new(
+                StatusCode::CONFLICT,
+                "department_key_taken",
+                "department key is already taken in this organization",
+            ),
+            IdentityError::DepartmentCycle => Self::new(
+                StatusCode::CONFLICT,
+                "department_cycle",
+                "a department cannot be moved inside itself",
+            ),
+            // Refused on purpose, not merely unhandled: the walks assert this one reads as a
+            // `400` while the two above are conflicts, because a department that is still
+            // named by a role binding is a shape the caller sent, not a state that changed.
+            IdentityError::DepartmentNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "department_not_found",
+                "no such department",
+            ),
             // The organization settings screen (REQ-005): a refused field is a `400`, and the
             // message names the rule that refused it so the panel can put it under the input
             // instead of in a banner. These two fell through to the catch-all below, which
@@ -1230,6 +1261,34 @@ mod tests {
 
         let unavailable = ApiError::from(AiHubError::Database(sqlx::Error::PoolTimedOut));
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The department tree (REQ-005). These four had no arm and fell into the catch-all, so a
+    /// blank key, a taken key, a refused move and a delete of an occupied department all
+    /// answered `500 internal_error` — the one status that tells a client the platform broke
+    /// and offers a retry for a request that can never succeed. The test pins the status each
+    /// state implies, because the difference between them is the whole point: `400` names a
+    /// field the caller fixes, `409` names a state somebody has to change first, `404` means
+    /// there is nothing to act on at all.
+    #[test]
+    fn department_errors_map_onto_the_state_they_describe() {
+        let shape = ApiError::from(IdentityError::InvalidDepartment(
+            "name is required".to_owned(),
+        ));
+        assert_eq!(shape.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(shape.code(), "invalid_department");
+
+        let taken = ApiError::from(IdentityError::DepartmentKeyTaken);
+        assert_eq!(taken.status(), StatusCode::CONFLICT);
+        assert_eq!(taken.code(), "department_key_taken");
+
+        let cycle = ApiError::from(IdentityError::DepartmentCycle);
+        assert_eq!(cycle.status(), StatusCode::CONFLICT);
+        assert_eq!(cycle.code(), "department_cycle");
+
+        let missing = ApiError::from(IdentityError::DepartmentNotFound);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.code(), "department_not_found");
     }
 
     #[test]

@@ -3391,3 +3391,135 @@ the raw route and a retention run removes exactly the eligible rows.
   it failed its own walk in the same workspace run. Fixed to compare the instants directly
   (commit `3988995`); `cargo test -p omnion-api --test media_settings` goes 1/2 -> 2/2. The other
   two `whole_seconds()` uses in the tree are a file age and a lease duration, and are correct.
+
+## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
+
+**What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
+readable: `GET /api/v1/media/{id}/references` (where a file is used) and `/activity` (what has
+been done to it), `crates/media/src/usage.rs`, `omnion_audit::for_target`,
+`features/media/{usage,activity}-tab.tsx`, and the two tabs on `/media/files/{id}`. Both reads are
+`media.read`, and both load the file through its own site scope — including a **trashed** file,
+because "what happened to this" is asked precisely after the deletion.
+
+Five decisions, each a shortcut that produces a plausible wrong answer:
+
+  1. **Records and rows are reported apart, and the sentence says which it means.** A page
+     naming one hero in three fields is one record and three rows. The summary is the server's,
+     not the panel's, so the two cannot disagree about what the integers mean.
+  2. **A reference whose record is gone is rendered unresolved, with no link, and names its own
+     fix.** It refuses a purge for ever; a list that dropped it would shorten every week with no
+     way to tell a quiet file from a broken one.
+  3. **Only the kinds that exist today are resolved.** `page` is a closed list, not a match over
+     `resource_kind` — a module arriving tomorrow registers its own kind without a migration, and
+     a lookup that switched on the kind would have to grow a branch for ever.
+  4. **A file's story is written under two target names.** `media` for the bytes, `media_file`
+     for a grant. A filter naming only the first answers "who could see this file in March" with
+     a list of uploads — the most reassuring possible wrong answer. A folder rename is *not* in
+     it, and that exclusion is as much a part of the claim as the inclusions.
+  5. **The action arrives as a sentence beside its token**, and an action the server has not seen
+     is shown in its own words rather than dropped: a trail with a hole in it is worse than one
+     with an unfamiliar entry. A deleted account reads as "an account that has since been
+     removed", never as "the platform".
+
+**Proof.** `bash scripts/qa/run-media-walk.sh media_usage` → **6 walks, 0 failures** against the
+real router. Four of the six exist because the shortcut gives a plausible wrong answer rather
+than an error: the three-fields/one-record split; the stale reference being reported *and* the
+repair scan really clearing it; the label coming from the **published** revision rather than the
+newest one (a draft's title on a list answering "which published pages use this" is a confident
+wrong answer); and a grant appearing on the trail under its other target name. The other two are
+the permission (a reader holding `media.read` alone opens both screens) and the trash (a trashed
+file still answers both). `cargo test -p omnion-api --lib` → **152 passed, 0 failed**;
+`-p omnion-media -p omnion-audit` → **181 passed, 0 failed**; `pnpm typecheck` → 2 successful, 0
+errors.
+
+**Three defects, all of them in the test rather than the code** — and that is the honest report.
+The fixture lacked `media.settings.manage` and `media.delete`; and it asserted a `404` for
+another tenant's file where the whole media surface answers `403 cross_organization`. The route's
+own doc comment had made the same wrong claim and now says what the platform does and why the
+convention is the safer of the two: a `404` here would have made these the only two screens where
+a foreign file is *invisible* rather than forbidden.
+
+**Also fixed: the QA slot could be held hostage for 75 minutes.** `qa-slot.sh` names its place
+file after `$$` — its own pid — and exits the instant it takes the place, so the reaper's
+`kill -0` tested a pid that is dead within milliseconds of a *healthy* pass and fell back on age
+alone. One crashed pass then held every later pass at "waiting for a QA slot" until each died at
+its own timeout with no report. The reaper now reads the holder pid, which lives exactly as long
+as the pass. Proved both ways against a synthetic slot dir with a real sleep as the live holder:
+it spared the live place and reclaimed both dead ones. This is the second time this loop has hit a
+stale-lock class, and the tell is the same both times — a symptom that reads as "the machine is
+busy" rather than "a lock file is lying".
+
+**Gate.** `bash scripts/qa/run.sh` was started first, as slice 4's outstanding condition, and is
+**still queued behind siblings** — five concurrent walkthroughs from the w2/w3/w4/w7 worktrees
+hold the one place `QA_SLOTS=1` allows. The walkthrough now drives both new tabs
+(`checkUsageTab` / `checkActivityTab`), so the harness that finally gets the slot is already
+extended; the retention tab's own pass (`runMediaRetention`) has now been queued for two
+consecutive ticks and remains unrun.
+
+**Next.** Re-run `bash scripts/qa/run.sh` and require zero high findings from `runMediaUsage`
+alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
+first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
+slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
+
+## Tick 45 — REQ-021 slice 1: the in-app inbox
+
+**What.** The platform's fourth feedback loop, and the only one that says *you*. The event bus
+records facts, the audit trail records privileged work, the search index records documents —
+and this one reaches a person. `omnion-notifications` (the record, the vocabulary, the store),
+migration 0050 (six tables: the record, the preference matrix, the digest settings, the
+delivery queue, the push devices and the channel config), the owner-scoped HTTP surface, the
+bell in the header of every route, `/notifications`, and the walkthrough pass that drives both.
+
+**Four decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **Owner-scoped always.** No store function takes a user id the caller chooses — every one
+   takes the owning id. "List somebody else's notifications" is not a parameter a handler can
+   get wrong; it is a function that does not exist.
+2. **Another person's notification is a `404`, never a `403`.** A `403` is the difference
+   between "that is not yours" and "that is not real", and this surface is the one a curious
+   panel is most tempted to poke at.
+3. **The badge and the grouped lines are one query.** A bell that says 12 above four lines
+   adding up to 9 is a screen nobody believes afterwards, and the fix is not a UI change: it is
+   that both come from `store::summary`, which is the only place the unread count is computed.
+4. **The vocabulary is compile-time, and the SQL duplication is a test.** SQL cannot import a
+   Rust constant, so the category/priority/channel lists are written twice. The test
+   `the_migration_agrees_with_the_lists` reads the migration file itself, because a category
+   added to Rust and not to SQL passes every unit test in the crate and then the database
+   refuses the row in production — which reads as "nothing happened".
+
+**Two bugs the tests caught in the first draft, both quiet.** `include_read: false` together
+with `unread: Some(false)` pushed both `read_at is null` and `read_at is not null` — a query
+that is *always* empty, on exactly the path the panel's "show read" filter takes, so it would
+have reported that nobody had ever read anything. And `priority_rank`'s doc said "lower is
+more urgent" while the list it indexes is written the other way round; the doc was wrong, and
+it is now explicit about which way and why.
+
+**Proof.** `cargo test -p omnion-notifications -p omnion-permissions` → **62 passed**;
+`-p omnion-api --lib` → **159 passed**; `pnpm typecheck` → 2 successful, 0 errors.
+`scripts/qa/run-notifications.sh` → **PASS**: 31 migrations applied in order, 6 tables, a
+repeated `dedupe_key` collapses to one row, and both `notifications_category_check` and
+`notification_deliveries_channel_check` refuse exactly the values the crate refuses.
+`scripts/qa/run-notifications-http.sh` → **PASS, 9/9** over a real socket with two real
+sessions.
+
+**The HTTP gate found three ways a gate can lie, which is worth more than the nine passes.**
+It built into `$CARGO_TARGET_DIR` and ran a hard-coded `./target/debug` binary — so it started
+a build that predated the feature and read *its* answers under this build's name. A failed run
+left the API holding the port, and the next run's instance exited on `EADDRINUSE` while the
+gate went on reading the orphan. And pre-applying the migrations let the API double-apply
+them, which kills it at boot — the same orphan one step earlier. All three are fixed at the
+root and the reason is in the file, because "the gate passed" is worth nothing while it is
+reading someone else's process.
+
+**And one assertion that was itself wrong.** The gate expected a `404` from the member and
+got a `403` — correctly, because an account with no role never reaches the handler. A `404`
+from a forbidden caller proves nothing about scoping, and conflating "you may not" with "it is
+not yours" is exactly how a real leak survives a review. It now proves both, and binds the
+member to the base role before making the scoping claims.
+
+**Gate.** `bash scripts/qa/run.sh` is **running** — the QA slot cleared after ~55 minutes of
+queueing behind the w6 pass, so the browser pass is in flight rather than merely queued.
+Slice 1 is not closed until it reports zero high findings from `runNotificationsDepth`.
+
+**Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
+hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.

@@ -6,13 +6,14 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { BarChart3, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
+import { BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
 import { OrganizationSwitcher } from "@/components/organization-switcher";
 import { GlobalSearch } from "@/components/global-search";
+import { NotificationBell } from "@/components/notification-bell";
 import { TenantStatusBanner } from "@/components/tenant-status-banner";
 import { useSession } from "@/lib/session";
 import { useTenantStatus } from "@/lib/tenant-status";
@@ -30,6 +31,7 @@ const NAV: readonly NavItem[] = [
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images, module: "media" },
   { href: "/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
+  { href: "/notifications", label: "Notifications", icon: Bell },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
   { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },
@@ -250,6 +252,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
             {/* The one search box: beside the site switcher on large screens, its own full-width
                 row under the header on small ones. */}
             <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
+            <NotificationBell />
             <OrganizationSwitcher />
             <SiteSwitcher />
           </div>
