@@ -1024,9 +1024,14 @@ pub fn router(state: AppState) -> Router {
             "/observability/exporters",
             post(observability_traces::create_exporter),
         )
+        // PATCH, not PUT: the request's API table documents `PATCH /exporters/{id}` and the panel
+        // sends exactly that, so registering only `put` left the exporters screen's Edit button
+        // answering 405 on a method the router does not have. `apps/api/tests/observability_permissions.rs`
+        // now drives every mutating route with the method the CLIENT sends, which is the only
+        // check that can see this class of defect.
         .route(
             "/observability/exporters/{id}",
-            put(observability_traces::update_exporter)
+            axum::routing::patch(observability_traces::update_exporter)
                 .delete(observability_traces::delete_exporter),
         )
         .route(
