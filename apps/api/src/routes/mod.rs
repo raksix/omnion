@@ -118,6 +118,7 @@ pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod sales;
+pub mod sales_quotes;
 pub mod scim;
 pub mod search;
 pub mod sso;
@@ -1169,12 +1170,47 @@ pub fn router(state: AppState) -> Router {
         .route("/sales/settings", put(sales::update_settings))
         .route_layer(guards::require(&state, "sales.quotes.send"));
 
+    // The quote surface (docs/requests/REQ-052, slice 2). `send` is the one that both freezes
+    // the document and issues the customer's link, so it is a permission of its own rather than
+    // part of `sales.quotes.update`: being able to rewrite a draft is not the same power as being
+    // able to put a company's name on a document.
+    let sales_quotes_read = Router::new()
+        .route("/sales/quotes", get(sales_quotes::list_quotes))
+        .route("/sales/quotes/vocabulary", get(sales_quotes::quote_vocabulary))
+        .route("/sales/quotes/{id}", get(sales_quotes::get_quote))
+        .route_layer(guards::require(&state, "sales.quotes.read"));
+    let sales_quotes_create = Router::new()
+        .route("/sales/quotes", post(sales_quotes::create_quote))
+        .route_layer(guards::require(&state, "sales.quotes.create"));
+    let sales_quotes_update = Router::new()
+        .route("/sales/quotes/{id}", patch(sales_quotes::update_quote))
+        .route("/sales/quotes/{id}/cancel", post(sales_quotes::cancel_quote))
+        .route("/sales/quotes/{id}/duplicate", post(sales_quotes::duplicate_quote))
+        .route("/sales/quotes/{id}/lines", put(sales_quotes::replace_lines))
+        .route_layer(guards::require(&state, "sales.quotes.update"));
+    let sales_quotes_send = Router::new()
+        .route("/sales/quotes/{id}/send", post(sales_quotes::send_quote))
+        .route("/sales/quotes/{id}/link", post(sales_quotes::issue_link))
+        .route_layer(guards::require(&state, "sales.quotes.send"));
+    // The customer's copy: no session, no permission, the token is the credential. `post` is the
+    // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
+    // a document would be prefetched by a crawler and accepted on the customer's behalf.
+    let sales_quotes_public = Router::new()
+        .route("/sales/public/quotes/{token}", get(sales_quotes::public_quote))
+        .route("/sales/public/quotes/{token}/accept", post(sales_quotes::accept_quote))
+        .route("/sales/public/quotes/{token}/decline", post(sales_quotes::decline_quote));
+
     let sales = sales_products_read
         .merge(sales_products_manage)
         .merge(sales_pricelists_read)
         .merge(sales_pricelists_manage)
         .merge(sales_settings_read)
-        .merge(sales_settings_write);
+        .merge(sales_settings_write)
+        .merge(sales_quotes_read)
+        .merge(sales_quotes_create)
+        .merge(sales_quotes_update)
+        .merge(sales_quotes_send)
+        .merge(sales_quotes_public);
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))

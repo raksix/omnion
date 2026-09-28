@@ -10,6 +10,9 @@
 //!   there, a name that is taken, and a conflict with the immutability rules.
 //! * [`model`] — the shared vocabulary: statuses, units and the settings row.
 //! * [`dates`] — how a day and a timestamp cross the wire, in the two shapes a browser sends.
+//! * [`quotes`] — the document a seller writes: the grid, the totals computed from the stored
+//!   lines, the versions the customer saw, the per-organization numbering, and the public link
+//!   whose token is stored only as a hash.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature the platform can carry behind the
 //! `sales.*` permission family, not infrastructure the core depends on. It talks to PostgreSQL
@@ -22,11 +25,16 @@ pub mod dates;
 pub mod error;
 pub mod model;
 pub mod money;
+pub mod quotes;
 pub mod store;
 
 pub use error::{Result, SalesError};
 pub use model::{QuoteStatus, Settings, Unit};
 pub use money::{LineTotals, QuoteTotals};
+pub use quotes::{
+    NewQuote, NewQuoteLine, PublicQuote, QuoteDetail, QuoteLineView, QuotePatch, QuoteQuery,
+    QuoteTotalsView, QuoteView,
+};
 pub use store::{
     CatalogQuery, CatalogVocabulary, NewPriceList, NewPriceRow, NewProduct, Page, PriceListDetail,
     PriceListPatch, PriceListView, PriceRowView, ProductPatch, ProductView, SettingsPatch,
