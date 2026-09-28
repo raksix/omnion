@@ -293,11 +293,7 @@ pub async fn emit_for_organization(
 /// Returns whether the row was written. Every production caller uses this: a loop that returns
 /// `Err` because the bus is down would log an error every interval and — worse — a route that
 /// returned `Err` would answer `500` for a settings save that had already been written.
-pub async fn try_emit(
-    pool: &PgPool,
-    name: &str,
-    payload: serde_json::Value,
-) -> bool {
+pub async fn try_emit(pool: &PgPool, name: &str, payload: serde_json::Value) -> bool {
     match emit(pool, name, payload).await {
         Ok(report) => {
             tracing::debug!(
@@ -369,10 +365,7 @@ mod tests {
             eprintln!("SKIP: {} is not readable from here", path.display());
             return;
         };
-        let Some(line) = text
-            .lines()
-            .find(|line| line.starts_with("- **Emitted:**"))
-        else {
+        let Some(line) = text.lines().find(|line| line.starts_with("- **Emitted:**")) else {
             eprintln!("SKIP: the request has no `**Emitted:**` line");
             return;
         };
@@ -574,7 +567,9 @@ mod tests {
         assert_eq!(payload["rule_name"], "QueueBacklog");
         assert_eq!(payload["ends_at"], "2026-09-28T19:00:00Z");
         assert!(
-            payload["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+            payload["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
             "a silence with no reason is one nobody dares to remove, and the payload is where \
              that text has to travel"
         );
