@@ -1127,33 +1127,53 @@ async function runAiProviderDepth(page, report) {
     note({ step: "verdict", dots: dots.join(" | "), rowErrors: rowError });
     await shot(page, "ai-providers-verdict");
   } finally {
-    fake.close();
+    // The steps are published from `note`, not at the end of the function. A throw between here
+    // and the end used to lose the whole result: the pass wrote its steps to `clicks.jsonl`, the
+    // caller read `report.aiProviders` and got `undefined`, and the log printed
+    // `ai providers: undefined` — eleven assertions visible in the artifact and absent from the
+    // report. A depth pass that fails halfway has proved *something*, and the report is the place
+    // that says so.
+    report.aiProviders = steps;
   }
-
-  report.aiProviders = steps;
 
   // Slice 2 lives on the same screen, so it rides in the same pass: the model rows open their
   // flag editor, one flag is switched off and on again, and Discover is asked twice — once to
   // see a diff, once to see the empty diff that proves the first apply did what it said.
-  const capabilities = await readCapabilityEditor(page);
-  note({ step: "capabilities", ...capabilities });
-  await shot(page, "ai-capability-editor");
+  //
+  // **Discovery runs before the endpoint is closed.** The local endpoint is the only thing that
+  // can answer `list-models`, so a pass that closes it and *then* discovers is talking to a dead
+  // port: the diff is null, no model is registered, and every model-dependent assertion after it —
+  // the capability editor, the flag toggle — reads an empty list and reports `editor: 0`. Three
+  // "the screen is broken" results that were really "the pass shut its own fixture down first".
+  // The endpoint lives until every assertion that needs it has run.
+  try {
+    const firstDiff = await discoverTwice(page, fake);
+    note({ step: "discovery", ...firstDiff });
+    await shot(page, "ai-discovery-diff");
 
-  const toggled = await toggleOneCapability(page);
-  note({ step: "capability-toggle", ...toggled });
-  await shot(page, "ai-capability-toggled");
+    const capabilities = await readCapabilityEditor(page);
+    note({ step: "capabilities", ...capabilities });
+    await shot(page, "ai-capability-editor");
 
-  const firstDiff = await discoverTwice(page, fake);
-  note({ step: "discovery", ...firstDiff });
-  await shot(page, "ai-discovery-diff");
+    const toggled = await toggleOneCapability(page);
+    note({ step: "capability-toggle", ...toggled });
+    await shot(page, "ai-capability-toggled");
 
-  // Slice 3 rides in the same pass: the three panels are opened and clicked, so a panel that
-  // renders empty because its call failed is caught here rather than by a person noticing.
-  const panels = await exerciseHealthPanels(page);
-  note({ step: "panels", ...panels });
-  await shot(page, "ai-health-panels");
-
-  report.aiProviders = steps;
+    // Slice 3 rides in the same pass: the three panels are opened and clicked, so a panel that
+    // renders empty because its call failed is caught here rather than by a person noticing.
+    const panels = await exerciseHealthPanels(page);
+    note({ step: "panels", ...panels });
+    await shot(page, "ai-health-panels");
+  } catch (cause) {
+    const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    // The second half failing is a finding, not a shrug: the screen is half-tested and the report
+    // must not read as if the whole pass ran.
+    note({ step: "failed", reason });
+    aiStateFindings.push(`the AI provider depth pass stopped at the slice-2/3 half: ${reason}`);
+  } finally {
+    report.aiProviders = steps;
+    fake.close();
+  }
 }
 
 /**
