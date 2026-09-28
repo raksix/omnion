@@ -713,6 +713,12 @@ export function MediaView() {
               {busy ? "Working…" : "Upload"}
             </button>
             <Link
+              href="/media/duplicates"
+              className="rounded-lg border border-line px-2.5 py-1.5 text-[12.5px] text-muted transition hover:text-ink"
+            >
+              Duplicates
+            </Link>
+            <Link
               href="/media/trash"
               className="rounded-lg border border-line px-2.5 py-1.5 text-[12.5px] text-muted transition hover:text-ink"
             >

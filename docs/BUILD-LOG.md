@@ -2594,3 +2594,73 @@ collector example and the exporter configuration ship together and neither is te
 silences and notifications, the settings screen, and the `infra/observability/` bundle (Grafana
 dashboards, Prometheus rules, the collector example) whose mapping the now-fixed metric families
 give it a contract to import against.
+
+## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
+
+- **What.** The third third of slice 3: `0036_media_shares.sql`,
+  `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
+  `apps/api/tests/media_shares.rs`, `features/media/shares-tab.tsx` (a **Share** tab on
+  `/media/files/{id}`), the client methods and the `MediaShare`/`CreatedMediaShare` types, and a
+  walkthrough depth pass. Six design decisions, each a shortcut that produces a plausible wrong
+  answer:
+  1. **The token is stored hashed and nowhere else.** The row holds `sha256(token)` under a
+     unique index, so a backup, a replica log or a support engineer with read access comes away
+     with a list of *dead* tokens, and the lookup is still one probe. The round trip runs one way
+     only, and the row type has no field the plaintext could occupy.
+  2. **A share reaches a file; it does not bypass what the file is.** Servability is decided at
+     *serve* time, not at creation — a link made yesterday must not keep serving a file the
+     scanner has since flagged.
+  3. **`revoked` and `expired` are the same answer (410), `password_required` is 403.** Telling
+     the two dead states apart would hand a token prober a free oracle; answering "type the
+     password" with 410 would send the owner a pointless request.
+  4. **The counter counts bytes that were served**, in its own statement, so a failure after the
+     bytes went out cannot roll it back.
+  5. **Revocation is a write, not a delete** — the row is kept with its reason forever, because
+     that is the only thing that makes a leaked link investigable.
+  6. **The screen has no `Copy` on an existing row, and cannot.** The token is returned once;
+     a copy button there would silently copy nothing.
+- **Proof.** Five walks over the real router in `--test media_shares` → **0 failures**. The
+  stored value is read **out of the database** rather than inferred from a response that hid the
+  token; the list is scanned over its raw bytes for the token and for a field named `token`; the
+  served bytes are compared as bytes and `no-store`/`nosniff`/`attachment` are each checked; the
+  counter moves once and survives the revocation; the revoked row keeps its reason and instant; a
+  reader may read the list and may neither create nor revoke; anonymous is refused on both; a
+  share id on another file is a 404, not a 403. `cargo test -p omnion-media --lib` → **98**,
+  `cargo test -p omnion-api --lib` → **116**, and `--test media` (11), `--test media_settings`
+  (2), `--test media_transform` (5) are unchanged and green. `pnpm --filter @omnion/admin
+  typecheck` green.
+- **Three defects the walks found, none of which a unit test on `servable` could see.**
+  `find_media` returns the *base* `Media`, which has no `deleted_at` and no `scan_status` — the
+  two columns the whole "a share does not bypass the file" rule depends on, so the first draft
+  asked the wrong struct and the compiler found the fields missing. `POST /shares` with no body
+  answered **415**, because the handler demanded a JSON body for the most ordinary call anybody
+  makes ("give me a link until I revoke it"); the same for the `DELETE`. And `rand` is a
+  *dev*-dependency of `apps/api`, so token minting moved into the crate, which is where the
+  width and the source belong anyway.
+- **A test that reaches for a state the platform forbids.** The expiry walk set
+  `expires_at = now() - 1s` and the `media_shares_expiry_sane` check refused it — a link whose
+  expiry precedes its own creation is nonsense. The walk now ages the row by moving `created_at`
+  back instead, which is the only way to reach the same state and the reason the check is there.
+- **Environment.** `/mnt/apopic` hit **100 %** (89 MB free) mid-tick and MinIO refused every
+  object write with `XMinioStorageFull`, which reads as a storage bug and was none. The cause is
+  this worktree's own `target/`: **8.3 GB of rebuildable test binaries** plus 874 MB of `.tmp`
+  leftovers from interrupted linkers. Reclaiming *only this worktree's* artifacts returned 8.5 GB
+  (86 %). **Owner action:** the seven worktrees under `/mnt/apopic` hold ~30 GB of `target/`; a
+  shared `CARGO_TARGET_DIR` is the structural fix, and this is the third tick to have had to
+  delete its own build cache before it could run a test.
+- **Next.** Slice 3 closes with duplicate detection and the merge (checksum groups, reclaimable
+  size, `Keep this one` + `Merge group`, references repointed and the copies trashed), then the
+  CDN purge hook to REQ-011. Still open: EXIF (slice 2), HTTP range requests on the serve path,
+  and the Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+- **The QA pass did not complete this tick — and not because of this slice.** The pass got its
+  QA slot after ~30 minutes of waiting behind sibling stacks, walked 434 clicks through
+  `/media` (40 elements), `/media/trash` (26), `/media/settings` (30) and the IAM screens, and
+  then stopped advancing at `iam-service-accounts` with the walkthrough process at 0 % CPU. The
+  cause is the machine, not the code: **seven QA stacks are running at once** — 40 Chromium
+  processes, load average **36**, and **127 MB free of 33 GB**. The walkthrough outlived the
+  browser context, which is the "tab died under parallel passes" case already documented for
+  this box, so no findings were produced and none are claimed. The share walk added this tick
+  (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
+  next tick runs it. The storage walk from the previous tick was committed for the same reason
+  and the API-level proof for both is the Rust suite, which is green.

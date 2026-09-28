@@ -694,6 +694,19 @@ impl From<MediaError> for ApiError {
                     None => Self::bad_request("invalid_preset", message),
                 }
             }
+            // A merge that cannot happen is a `409`, not a `400`: every value in the request was
+            // legal and the library simply does not have the group the caller believes it has —
+            // usually because a colleague merged it a minute ago. A `400` would tell an operator
+            // their form was wrong when their *click* was late.
+            MediaError::MergeRefused { reason } => {
+                Self::new(StatusCode::CONFLICT, "duplicate_merge_refused", reason)
+                    .with_details(serde_json::json!({ "field": "keep" }))
+            }
+            MediaError::TooManySites { limit, requested } => Self::bad_request(
+                "too_many_sites",
+                format!("a cross-site report may cover at most {limit} sites; {requested} were \
+                         named"),
+            ),
             // Every storage field error names the field that caused it, and carries it as a
             // detail — the settings form puts the message under that input, and a *save* and a
             // *connection test* of the same bad value produce the same field, so a person is
