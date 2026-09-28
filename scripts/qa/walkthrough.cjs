@@ -3662,13 +3662,30 @@ async function runNotificationsDepth(page, report) {
   steps.bulkNoticeIsHonest = /\d+ of \d+/.test(steps.bulkNotice);
   await shot(page, "page-notifications-bulk");
 
-  // 4. The keyboard path.
-  await page.locator("[data-notification-table] tbody").click({ timeout: 3000 }).catch(() => {});
+  // 4. The keyboard path. The shortcuts are bound on the table body, so the table has to be
+  //    there and the body has to have focus — clicking a row opens the drawer and then every
+  //    key press lands in the drawer instead. An earlier version clicked `tbody` and hoped;
+  //    this one focuses the body explicitly and asserts the row count first, because a
+  //    keyboard pass over an empty list reports every shortcut as broken and that is the
+  //    single most misleading way for this gate to fail.
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.keyboardRows = await page.locator("[data-notification-row]").count();
+  if (steps.keyboardRows === 0) {
+    steps.keyboard = "no rows to drive — the list did not load";
+    return steps;
+  }
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.locator("[data-notification-table] tbody").click({ position: { x: 2, y: 2 } }).catch(() => {});
+  // `Escape` first, so a drawer left open by the previous step cannot swallow the presses.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
   await page.keyboard.press("j");
   await page.waitForTimeout(250);
   await page.keyboard.press("j");
   await page.waitForTimeout(400);
-  steps.cursorMoved = await page.locator("[data-notification-row][data-cursor=true]").count() > 0;
+  steps.cursorMoved = (await page.locator("[data-notification-row][data-cursor=true]").count()) > 0;
   await page.keyboard.press("x");
   await page.waitForTimeout(300);
   steps.keyboardSelected = (await page.locator("[data-notification-bulk]").innerText().catch(() => ""))
@@ -3681,7 +3698,24 @@ async function runNotificationsDepth(page, report) {
   await page.waitForTimeout(600);
   steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;
 
-  await page.locator("[data-notification-table] tbody").click({ timeout: 3000 }).catch(() => {});
+  // `e` toggles read and `Shift+E` marks the visible rows — the second one is the shortcut
+  // most likely to be documented and missing, so it is asserted rather than assumed.
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.keyboard.press("j");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("e");
+  await page.waitForTimeout(900);
+  steps.eToggledRead =
+    (await page.locator("[data-notification-row][data-read=false]").count()) > 0 ||
+    (await page.locator("[data-notification-notice]").count()) > 0;
+
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.keyboard.press("Shift+E");
+  await page.waitForTimeout(1000);
+  steps.shiftEMarkedVisible =
+    (await page.locator("[data-notification-notice]").innerText().catch(() => "")).includes("read");
+
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
   await page.keyboard.press("/");
   await page.waitForTimeout(400);
   steps.slashFocusedFilter =
@@ -3694,7 +3728,14 @@ async function runNotificationsDepth(page, report) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     await route.continue();
   });
-  await page.goto(`${URL_ADMIN}/notifications?read=read&archived=1`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  // The empty state needs a filter that genuinely matches nothing. An earlier version asked
+  // for `?read=read` — which by this point in the pass holds the very rows the bulk action
+  // just marked read, so the list was correctly NOT empty and the assertion was measuring the
+  // test's own ordering rather than the component. A category nobody was ever addressed is the
+  // honest way in: the API answers 200 with zero rows, which is the state under test.
+  await page.goto(`${URL_ADMIN}/notifications?category=mention&read=read&archived=1`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
   await page.waitForTimeout(700);
   steps.skeleton = (await page.locator("[data-notification-skeleton]").count()) > 0;
   await page.waitForTimeout(1800);
@@ -3705,13 +3746,26 @@ async function runNotificationsDepth(page, report) {
   // The error state, provoked the honest way: a route that answers 500. The panel must show a
   // retry line, not an empty table — an inbox that says "all caught up" after a failure is the
   // one state that makes people stop trusting it.
-  await page.route("**/api/v1/notifications/summary", (route) =>
-    route.fulfill({ status: 500, contentType: "application/json", body: '{"error":{"code":"boom","message":"deliberate"}}' }),
+  //
+  // The route that is failed is the **list**, not the summary. An earlier version fulfilled
+  // `…/notifications/summary` with a 500 and then asserted on the list's error element, which
+  // the summary cannot affect — the bell degrades on its own and the list stays healthy, so
+  // the assertion could only ever have passed by accident. The element under test belongs to
+  // the call that has to fail.
+  await page.route("**/api/v1/notifications?*", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: '{"error":{"code":"boom","message":"deliberate"}}',
+    }),
   );
-  await page.locator("[data-notification-refresh]").click({ timeout: 4000 }).catch(() => {});
-  await page.waitForTimeout(900);
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
   steps.errorState = (await page.locator("[data-notification-error]").count()) > 0;
-  await page.unroute("**/api/v1/notifications/summary").catch(() => {});
+  // A retry the reader can actually press: an error banner with no way forward is a dead end.
+  steps.errorOffersRetry =
+    (await page.locator("[data-notification-error] button").count()) > 0;
+  await page.unroute("**/api/v1/notifications?*").catch(() => {});
   await shot(page, "page-notifications-error");
 
   return steps;
