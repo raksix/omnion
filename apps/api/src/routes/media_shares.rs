@@ -129,7 +129,12 @@ pub struct CreatedShareBody {
 }
 
 /// What a caller asks for when creating a link.
-#[derive(Debug, Deserialize)]
+///
+/// Every field is optional, and so is the *body*: the common case is "give me a link that
+/// lasts until I revoke it", which is a `POST` with nothing in it. A handler that demands a
+/// JSON body for that answers `415 Unsupported Media Type` to the most ordinary call anybody
+/// makes, and the client has to send `{}` to work around a rule that was never the point.
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateShareInput {
     /// How many days the link lives; `None` (or absent) means "until revoked".
     #[serde(default)]
@@ -139,7 +144,18 @@ pub struct CreateShareInput {
     pub password: Option<String>,
 }
 
+impl CreateShareInput {
+    /// Read the posted body, treating an absent one as "no choices made".
+    fn from_optional(body: Option<Json<CreateShareInput>>) -> Self {
+        body.map(|Json(input)| input).unwrap_or_default()
+    }
+}
+
 /// What a caller may send when revoking.
+///
+/// Like the create body, optional: revoking a link is something anybody does without thinking
+/// about it, and a reason is a nicety. Requiring a body for the bare case would make the
+/// common call fail for the sake of the uncommon one.
 #[derive(Debug, Default, Deserialize)]
 pub struct RevokeShareInput {
     /// Why the link was closed, kept for the audit trail.
@@ -183,8 +199,9 @@ pub async fn create(
     current: CurrentSession,
     address: ClientAddress,
     Path(media_id): Path<Uuid>,
-    Json(input): Json<CreateShareInput>,
+    body: Option<Json<CreateShareInput>>,
 ) -> std::result::Result<(StatusCode, Json<CreatedShareBody>), ApiError> {
+    let input = CreateShareInput::from_optional(body);
     let media = media_site_in_scope(&state, &current, media_id).await?;
 
     // A link over a file that is already unservable would be created and immediately useless,
@@ -288,8 +305,9 @@ pub async fn revoke(
     current: CurrentSession,
     address: ClientAddress,
     Path((media_id, share_id)): Path<(Uuid, Uuid)>,
-    Json(input): Json<RevokeShareInput>,
+    body: Option<Json<RevokeShareInput>>,
 ) -> std::result::Result<StatusCode, ApiError> {
+    let input = body.map(|Json(input)| input).unwrap_or_default();
     let media = media_site_in_scope(&state, &current, media_id).await?;
     let share = omnion_media::find_share(state.db().pool(), share_id)
         .await?
