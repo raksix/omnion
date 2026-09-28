@@ -488,6 +488,7 @@ pub async fn create_invitation(
     Json(body): Json<CreateInvitationRequest>,
 ) -> Result<(StatusCode, Json<InvitationCreatedResponse>), ApiError> {
     let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let decision = invite_policy_decision(&state, &current, organization.id).await?;
 
     if let Some(member_id) =
         memberships::address_is_member(state.db().pool(), organization.id, &body.email).await?
@@ -516,6 +517,7 @@ pub async fn create_invitation(
             invited_by: Some(current.user.id),
             message: body.message.unwrap_or_default(),
             expires_at: None,
+            queued: decision.queues,
         },
     )
     .await
@@ -556,33 +558,60 @@ pub async fn create_invitation(
 
     bus::emit(
         state.db().pool(),
-        NewEvent::new("organization.member.invited")
-            .organization(organization.id)
-            .actor(current.user.id)
-            .payload(json!({
-                "organization_id": organization.id,
-                "invitation_id": created.invitation.id,
-                // The address never leaves the tenant in an event payload: an integration that
-                // subscribes to the tenant's events must not learn who was invited.
-                "email_masked": mask_email(&created.invitation.email),
-                "role_id": created.invitation.role_id,
-                "expires_at": created.invitation.expires_at,
-            })),
+        NewEvent::new(if decision.queues {
+            "organization.member.invitation_queued"
+        } else {
+            "organization.member.invited"
+        })
+        .organization(organization.id)
+        .actor(current.user.id)
+        .payload(json!({
+            "organization_id": organization.id,
+            "invitation_id": created.invitation.id,
+            // The address never leaves the tenant in an event payload: an integration that
+            // subscribes to the tenant's events must not learn who was invited.
+            "email_masked": mask_email(&created.invitation.email),
+            "role_id": created.invitation.role_id,
+            "expires_at": created.invitation.expires_at,
+            "invite_policy": decision.policy,
+        })),
     )
     .await?;
 
     record(
         &state,
-        NewAuditEntry::by_user(current.user.id, "organization.member.invited")
-            .target("organization_invitation", created.invitation.id.to_string())
-            .metadata(json!({
-                "organization_id": organization.id,
-                "email_masked": mask_email(&created.invitation.email),
-            }))
-            .ip_address(address.as_text())
-            .organization(organization.id),
+        NewAuditEntry::by_user(
+            current.user.id,
+            if decision.queues {
+                "organization.member.invitation_queued"
+            } else {
+                "organization.member.invited"
+            },
+        )
+        .target("organization_invitation", created.invitation.id.to_string())
+        .metadata(json!({
+            "organization_id": organization.id,
+            "email_masked": mask_email(&created.invitation.email),
+            "invite_policy": decision.policy,
+        }))
+        .ip_address(address.as_text())
+        .organization(organization.id),
     )
     .await?;
+
+    // A queued invitation has no working link, so it has no token to hand out. Returning one
+    // would give the invitee a code that answers "waiting for an owner" — a dead credential that
+    // looks alive, and a second one to lose. The owner gets the token when they release it.
+    if decision.queues {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(InvitationCreatedResponse {
+                invitation,
+                token: String::new(),
+                accept_url: String::new(),
+            }),
+        ));
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -590,6 +619,115 @@ pub async fn create_invitation(
             invitation,
             token: created.token.clone(),
             accept_url: format!("/invite/{}", created.token),
+        }),
+    ))
+}
+
+/// The invitations waiting for an owner, oldest first.
+///
+/// The same rows the ordinary listing already returns, in the order a queue is worked: the
+/// `owner_approval` policy is only meaningful if the panel can show what is piling up, and a
+/// filter on the client would need the whole (unbounded) listing to find it.
+pub async fn list_queued_invitations(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(organization_id): Path<Uuid>,
+) -> Result<Json<InvitationsResponse>, ApiError> {
+    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let invitations =
+        memberships::list_queued_invitations(state.db().pool(), organization.id).await?;
+
+    Ok(Json(InvitationsResponse {
+        organization_id: organization.id,
+        invitations: invitation_bodies(state.db().pool(), invitations).await,
+    }))
+}
+
+/// Release a queued invitation: it becomes live and its single-use link is returned *once*.
+///
+/// Only the tenant's owner may do this. A manager who queued an invitation cannot release it —
+/// that is the whole difference between `owner_approval` and `self_serve`, and letting the
+/// queuer approve would make the queue advisory.
+///
+/// The link returned here is minted by the release, not recovered from the create: the queued
+/// row's token was never shown to anybody, and the stored hash is one-way. So the old link never
+/// existed and this is the only time a working one is ever visible.
+pub async fn approve_invitation(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path((organization_id, invitation_id)): Path<(Uuid, Uuid)>,
+    address: ClientAddress,
+) -> Result<(StatusCode, Json<InvitationCreatedResponse>), ApiError> {
+    let organization = organization_in_scope(&state, &current, organization_id).await?;
+
+    if !caller_is_organization_owner(&state, &current, organization.id).await? {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_an_organization_owner",
+            "only an owner of this organization can release a queued invitation",
+        )
+        .with_details(json!({ "invite_policy": "owner_approval" })));
+    }
+
+    let released = memberships::approve_invitation(state.db().pool(), invitation_id, current.user.id)
+        .await?;
+
+    let Some((released, raw_token)) = released else {
+        let invitations = memberships::list_invitations(state.db().pool(), organization.id).await?;
+        let existing = invitations
+            .into_iter()
+            .find(|invitation| invitation.id == invitation_id)
+            .ok_or_else(invitation_not_found)?;
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "invitation_not_queued",
+            format!(
+                "this invitation is {}, not waiting for approval",
+                existing.status
+            ),
+        ));
+    };
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("organization.member.invitation_released")
+            .organization(organization.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "organization_id": organization.id,
+                "invitation_id": released.id,
+                "email_masked": mask_email(&released.email),
+                "role_id": released.role_id,
+            })),
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "organization.member.invitation_released")
+            .target("organization_invitation", released.id.to_string())
+            .metadata(json!({
+                "organization_id": organization.id,
+                "email_masked": mask_email(&released.email),
+                "invited_by": released.invited_by,
+            }))
+            .ip_address(address.as_text())
+            .organization(organization.id),
+    )
+    .await?;
+
+    let invitation = invitation_bodies(state.db().pool(), vec![released])
+        .await
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| unreachable!("the invitation was just released"));
+
+    Ok((
+        StatusCode::OK,
+        Json(InvitationCreatedResponse {
+            invitation,
+            token: raw_token.clone(),
+            accept_url: format!("/invite/{raw_token}"),
         }),
     ))
 }
@@ -1198,6 +1336,103 @@ async fn member_display_name(pool: &sqlx::PgPool, user_id: Uuid) -> Option<Strin
         .await
         .ok()
         .flatten()
+}
+
+/// What the organization's invite policy says about *this* invitation.
+///
+/// The three policies are not three permissions, which is the point: `self_serve` needs no new
+/// check at all, because the route's existing `organizations.manage` guard already is the rule.
+/// Only `closed` (a refusal) and `owner_approval` (a queue) need anything computed here, and both
+/// need the *inviter's* role as well as the policy — an owner inviting into their own tenant is
+/// the one case where `owner_approval` cannot deadlock on itself.
+struct InviteDecision {
+    /// Whether the new row starts in the queue rather than as a live invitation.
+    queues: bool,
+    /// The policy that produced the decision, for the event, the audit row and the panel.
+    policy: String,
+}
+
+/// Read `organization_settings.invite_policy` and apply it to this caller.
+///
+/// A `closed` tenant refuses by name and with the policy in `details`, so the panel can explain
+/// *why* the button did nothing instead of showing a generic failure. The refusal happens before
+/// the duplicate-member check on purpose: a closed tenant does not need to confirm that the
+/// address exists to tell you it will not invite anybody.
+async fn invite_policy_decision(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+) -> Result<InviteDecision, ApiError> {
+    let policy = omnion_identity::tenancy_limits::load_settings(state.db().pool(), organization_id)
+        .await?
+        .invite_policy;
+
+    if policy == "closed" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invitations_closed",
+            "this organization is closed to new invitations — an owner has to open it again in \
+             Settings first",
+        )
+        .with_details(json!({ "invite_policy": policy })));
+    }
+
+    let queues = policy == "owner_approval" && !caller_is_organization_owner(state, current, organization_id).await?;
+
+    Ok(InviteDecision { queues, policy })
+}
+
+/// Whether the caller owns *this* tenant — the one fact that releases a queued invitation.
+///
+/// The seed binds `owner` at **platform** scope (`roles.organization_id is null`), so "is an
+/// owner" is two questions: does the account hold an `owner` binding, and does that binding
+/// reach this organization? Ignoring the second question would let the owner of tenant A release
+/// tenant B's queue, which is the exact over-grant a per-tenant policy exists to prevent.
+///
+/// The scopes that reach a tenant are `global` (a platform operator) and `organization` *at this
+/// tenant*; a `site`-scoped binding deliberately does not, because a site lead is not the owner
+/// of the whole organization.
+///
+/// The last fallback is the account with no membership at all — the panel's first-run owner,
+/// which `users.organization_id = null` and is therefore invisible to the membership check. It
+/// is the same shape the `organization_in_scope` helper already treats as a platform account, so
+/// the two agree instead of disagreeing about the same person.
+async fn caller_is_organization_owner(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+) -> Result<bool, ApiError> {
+    let role_id: Option<Uuid> = sqlx::query_scalar(
+        "select id from roles where key = 'owner' and organization_id is null limit 1",
+    )
+    .fetch_optional(state.db().pool())
+    .await
+    .map_err(store)?;
+
+    if let Some(role_id) = role_id {
+        let reaches: bool = sqlx::query_scalar(
+            "select exists (
+                 select 1 from role_bindings
+                  where subject_type = 'user' and subject_id = $1 and role_id = $3
+                    and (expires_at is null or expires_at > now())
+                    and (scope_type = 'global'
+                         or (scope_type = 'organization' and organization_id = $2))
+             )",
+        )
+        .bind(current.user.id)
+        .bind(organization_id)
+        .bind(role_id)
+        .fetch_one(state.db().pool())
+        .await
+        .map_err(store)?;
+
+        if reaches {
+            return Ok(true);
+        }
+    }
+
+    let memberships = memberships::list_account_memberships(state.db().pool(), current.user.id).await?;
+    Ok(memberships.is_empty())
 }
 
 /// Refuse a role that belongs to another organization (or to the platform) as a tenant role.
