@@ -5452,9 +5452,30 @@ async function openRuleByName(page, ruleName, timeout = 15000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if ((await row.count()) > 0) {
-      await row.click({ timeout: 5000 }).catch(() => {});
-      await page.locator("[data-automation-run-now]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
-      return true;
+      // Clicking a row the list is about to replace is the failure this loop has to survive:
+      // a save returns to the list, the list re-reads, and the click lands in a row that is
+      // torn out from under the pointer. So the click is retried while the editor refuses to
+      // appear, re-resolving the row each time — a locator captured before the re-read points
+      // at a node that is no longer there, so the loop asks for it again on every pass.
+      while (Date.now() < deadline) {
+        await row.click({ timeout: 4000 }).catch(() => {});
+        await page
+          .locator("[data-automation-run-now]")
+          .first()
+          .waitFor({ state: "visible", timeout: 4000 })
+          .catch(() => {});
+        if ((await page.locator("[data-automation-run-now]").count()) > 0) return true;
+        await page.waitForTimeout(400);
+      }
+      // The click's own promise resolving is not evidence the editor opened, and the wait
+      // above is `.catch`ed, so a failed click and a failed wait both fell through to an
+      // unconditional `true`. That is the phantom this helper was written to end, reopened
+      // one layer up: the pass went on to read Versions and Audit **on the list page** and
+      // reported both as empty, and the two screenshots came out byte-identical because they
+      // were literally the same page. So the answer is what is on screen now, not whether a
+      // click was attempted.
+      log(`openRuleByName: the editor did not open for "${ruleName}" (still on ${page.url()})`);
+      return false;
     }
     await page.waitForTimeout(500);
   }
@@ -5646,7 +5667,7 @@ async function runAutomationsOperationsDepth(page, report) {
   // ---- The Versions tab: a restore appends, it does not rewind ----------------------------
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1000);
-  await openRuleByName(page, ruleName);
+  const openedForVersions = await openRuleByName(page, ruleName);
   await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
   await page
@@ -5704,7 +5725,11 @@ async function runAutomationsOperationsDepth(page, report) {
     // The history is a line, not a rewind: a restore adds a version rather than removing one.
     appended: versionsAfterRestore > versionsAfterEdit,
     // Which screen answered, when no row did.
-    stateWhenEmpty: versionsState.state,
+    // If the editor never opened, every number here is read off the list page. Saying so is
+    // the difference between "the Versions tab is empty" and "the pass was looking at the
+    // wrong screen", and only the first one is a product finding.
+    reachedTheTab: openedForVersions,
+    stateWhenEmpty: openedForVersions ? versionsState.state : "not-reached",
     message: (versionsState.message || restoreNotice).slice(0, 130),
     notice: restoreNotice.slice(0, 130),
   });
