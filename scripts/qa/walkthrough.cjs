@@ -2727,7 +2727,16 @@ async function main() {
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
     executablePath: CHROME,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`],
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      // A page that renders one big image can ask for a heap the box has not got, and the tab
+      // dies with `Page crashed` — which used to end the run. Capping the renderer heap turns
+      // that into a slower render and a GC instead of a dead tab.
+      "--js-flags=--max-old-space-size=512",
+      "--disable-gpu",
+      `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`,
+    ],
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
