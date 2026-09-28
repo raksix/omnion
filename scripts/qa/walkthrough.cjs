@@ -5566,14 +5566,32 @@ async function runCrmStateSweep(page, report) {
   // under test and nothing else.
   const REQUEST_ID = "qa9f2c1d4e7b84a3c5d6e8f0a1b2c3d4e";
   let failNext = true;
+  // **The read that has to fail, per screen, by its own path.**
+  //
+  // The first version of this pass stubbed "the first CRM list read it sees" and reported the
+  // contacts and companies screens as having no error state. They have one: the list's own read
+  // renders it. What had actually happened is that each of those screens fires four reads at once
+  // — the column catalogue, the saved views, the company picker and the list — and the stub
+  // answered whichever one the network happened to deliver first. On contacts and companies that
+  // was the company picker, whose failure is *supposed* to be absorbed (the list still works), so
+  // the list loaded and there was nothing to see. The pass was measuring a race.
+  //
+  // Naming the path removes the race: the read under test is the one the screen renders its state
+  // from, and the others are answered by the live stack. Which read that is differs per screen,
+  // which is why the table is here rather than a single regex.
+  const LIST_READ = {
+    contacts: "/api/v1/crm/contacts",
+    companies: "/api/v1/crm/companies",
+    deals: "/api/v1/crm/deals",
+    activities: "/api/v1/crm/activities",
+    leads: "/api/v1/crm/leads",
+  };
+
+  let failPath = "";
   const stub = async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    const isCrmListRead =
-      request.method() === "GET" &&
-      (/\/api\/v1\/crm\/(contacts|companies|deals|activities|leads)$/.test(path) ||
-        path === "/api/v1/crm/deals");
-    if (!isCrmListRead || !failNext) {
+    if (failPath === "" || path !== failPath || request.method() !== "GET" || !failNext) {
       return route.continue();
     }
     failNext = false;
@@ -5603,6 +5621,7 @@ async function runCrmStateSweep(page, report) {
 
   for (const screen of screens) {
     failNext = true;
+    failPath = LIST_READ[screen.label];
     await page.goto(`${URL_ADMIN}${screen.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     // The strip and the block are two shapes of the same state: a screen that keeps its own body
     // shows a strip, a screen that replaced its list shows a block. Both count.
@@ -5624,8 +5643,13 @@ async function runCrmStateSweep(page, report) {
   }
 
   // ---- the retry actually retries ------------------------------------------------------------
-  // Pressed on the last screen, where the stub has already fired once and the next read is the
-  // live stack. A retry wired to nothing leaves the strip up, and that is the assertion.
+  // Pressed on the contacts screen, where the stub has already fired once and the next read is the
+  // live stack. A retry wired to nothing leaves the block up, and that is the assertion.
+  //
+  // `failPath` is re-armed here on purpose: it still holds the *last* screen's path after the loop
+  // above, and a stub that only matches `/crm/leads` would leave the contacts screen healthy, so
+  // the assertion would pass without ever having been under failure.
+  failPath = LIST_READ.contacts;
   failNext = false;
   await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
   failNext = true;
@@ -5651,14 +5675,19 @@ async function runCrmStateSweep(page, report) {
   // printed a made-up id would look more useful than it is and point an operator at the wrong log
   // line. The id is shown when there is one and absent when there is not.
   await page.unroute("**/api/v1/crm/**");
+  // Pinned to the list read, for the same reason as the table above: this screen also reads the
+  // company picker, and a glob that answered both would fail the picker (whose state the reader is
+  // not looking at) instead of the list the assertion reads.
   await page.route("**/api/v1/crm/contacts*", (route) =>
-    route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({
-        error: { code: "dependency_unavailable", message: "The CRM store is not answering." },
-      }),
-    }),
+    new URL(route.request().url()).pathname === LIST_READ.contacts
+      ? route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({
+            error: { code: "dependency_unavailable", message: "The CRM store is not answering." },
+          }),
+        })
+      : route.continue(),
   );
   await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
   const anonymous = page.locator("[data-qa='crm-contacts-error']").first();
@@ -5666,6 +5695,53 @@ async function runCrmStateSweep(page, report) {
   const anonymousText = (await anonymous.innerText().catch(() => ""));
   steps.noIdIsInventedWhenTheServerNamedNone = !/request\s+[0-9a-f]{8}/i.test(anonymousText);
   await page.unroute("**/api/v1/crm/contacts*");
+
+  // ---- and a dependency the screen survives losing does not lie about it ---------------------
+  // The company picker is a different failure from the list: the list still works, so the screen
+  // must not fall over — but a picker that silently holds one option ("No company") is a control
+  // that refuses every real choice and never says why. The state is the sentence where the choice
+  // was, the id to quote, and a way to ask again. This is the same refusal, aimed at one read.
+  await page.route("**/api/v1/crm/**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    return path === "/api/v1/crm/companies" && route.request().method() === "GET"
+      ? route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          headers: { "x-request-id": REQUEST_ID },
+          body: JSON.stringify({
+            error: {
+              code: "dependency_unavailable",
+              message: "The company list is not answering right now.",
+              request_id: REQUEST_ID,
+            },
+          }),
+        })
+      : route.continue();
+  });
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  // Open the form: the picker lives in it, not on the list. `data-qa-guard` is the shell's own
+  // hook and the first match on this screen is "Create contact" (the row above named it).
+  await page
+    .locator("[data-qa-guard='crm-depth']")
+    .first()
+    .click({ timeout: 10000 })
+    .catch(() => {});
+  await page.locator("#crm-first-name").first().waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
+  const pickerState = page.locator("[data-qa='crm-contact-company-error']").first();
+  await pickerState.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  const pickerText = (await pickerState.innerText().catch(() => "")).trim();
+  steps.theCompanyPickerSaysWhyItIsEmpty = pickerText.length > 10;
+  steps.theCompanyPickerNamesTheRequest = pickerText.includes(REQUEST_ID);
+  steps.theCompanyPickerOffersARetry =
+    (await page.locator("[data-qa='crm-contact-company-error-retry']").count()) > 0;
+  // The list behind it is untouched: a screen that survives one lost dependency is still a screen.
+  steps.theListSurvivedTheLostDependency =
+    (await page.locator("[data-qa='crm-contacts-error']").count()) === 0;
+  // And the form is still a form — the person can save a contact without a company.
+  steps.theFormIsStillUsableWithoutThePicker =
+    (await page.locator("#crm-first-name").count()) > 0;
+  await shot(page, "page-crm-contacts-company-picker-error");
+  await page.unroute("**/api/v1/crm/**");
 
   report.crmStates = steps;
   log(`crm state sweep: ${JSON.stringify(steps)}`);

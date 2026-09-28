@@ -21,11 +21,16 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Check, Download, Pencil, Plus, Upload, X } from "lucide-react";
+import { Check, Download, Pencil, Plus, RotateCcw, Upload, X } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
-import { ErrorState, toScreenError, type ScreenErrorValue } from "@/components/error-state";
+import {
+  ErrorState,
+  describeError,
+  toScreenError,
+  type ScreenErrorValue,
+} from "@/components/error-state";
 import { LoadingTable } from "@/components/loading-table";
 import { ApiError } from "@/lib/api";
 import {
@@ -105,12 +110,16 @@ export function ContactsView() {
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
+  // The company picker reads on its own token, not the screen's: a person who lost the picker
+  // should be able to ask for the companies again without re-reading the list they are looking at.
+  const [companyPickerToken, setCompanyPickerToken] = useState(0);
 
   const [catalogue, setCatalogue] = useState<{ columns: string[]; statuses: string[] } | null>(
     null,
   );
   const [views, setViews] = useState<CrmView[]>([]);
   const [companies, setCompanies] = useState<CrmCompany[]>([]);
+  const [companyPickerError, setCompanyPickerError] = useState<ScreenErrorValue>(null);
 
   const [form, setForm] = useState<ContactForm | null>(null);
   const [fieldError, setFieldError] = useState<{ field: string; message: string } | null>(null);
@@ -211,23 +220,34 @@ export function ContactsView() {
   }, [reloadToken]);
 
   // The companies the form's picker offers. Capped: a person picks from the ones they can see.
+  //
+  // A failed read here is *not* the same failure as a failed list: the list above still works, so
+  // the screen must not fall over. But swallowing it leaves a picker whose only option is "No
+  // company" — a control that looks like a choice, refuses every real one, and says nothing about
+  // why. The picker's own state is the honest shape: the sentence, and a way to ask again.
   useEffect(() => {
     let cancelled = false;
+    setCompanyPickerError(null);
     fetchCrmCompanies({ limit: 200, sort: "name", direction: "asc", organization_id: organizationId ?? undefined })
       .then((page) => {
         if (!cancelled) {
           setCompanies(page.items);
         }
       })
-      .catch(() => {
+      .catch((cause: unknown) => {
         if (!cancelled) {
           setCompanies([]);
+          setCompanyPickerError(
+            toScreenError(cause, "The company list could not be loaded."),
+          );
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [reloadToken]);
+  }, [reloadToken, organizationId, companyPickerToken]);
+
+  const retryCompanyPicker = useCallback(() => setCompanyPickerToken((n) => n + 1), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -808,20 +828,52 @@ export function ContactsView() {
               id="crm-company"
               label="Company"
               error={fieldError?.field === "company_id" ? fieldError.message : null}
+              hint={
+                companyPickerError
+                  ? undefined
+                  : "The contact is not tied to a company when this is left empty."
+              }
             >
-              <select
-                id="crm-company"
-                value={form.company_id}
-                onChange={(event) => setForm({ ...form, company_id: event.target.value })}
-                className={inputClass(fieldError?.field === "company_id")}
-              >
-                <option value="">No company</option>
-                {companies.map((company) => (
-                  <option key={company.id} value={company.id}>
-                    {company.name}
-                  </option>
-                ))}
-              </select>
+              {companyPickerError ? (
+                // The picker's own failure, shown where the choice would have been. The field is
+                // still usable — "No company" is a real answer — but a person who wanted a company
+                // is told why the list is empty and can ask again without losing the form.
+                <div
+                  role="alert"
+                  data-qa="crm-contact-company-error"
+                  className="flex flex-col gap-1.5 rounded-lg border border-line bg-surface-2 px-3 py-2"
+                >
+                  <span className="text-[11.5px] text-accent-strong">
+                    The company list could not be loaded, so a company cannot be picked right now.
+                  </span>
+                  <span className="font-mono text-[11px] break-all text-muted">
+                    {describeError(companyPickerError).requestId ?? "no request id"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={retryCompanyPicker}
+                    data-qa="crm-contact-company-error-retry"
+                    className="flex w-fit items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[11.5px] font-medium transition hover:bg-surface-2"
+                  >
+                    <RotateCcw className="size-3" aria-hidden />
+                    Load companies again
+                  </button>
+                </div>
+              ) : (
+                <select
+                  id="crm-company"
+                  value={form.company_id}
+                  onChange={(event) => setForm({ ...form, company_id: event.target.value })}
+                  className={inputClass(fieldError?.field === "company_id")}
+                >
+                  <option value="">No company</option>
+                  {companies.map((company) => (
+                    <option key={company.id} value={company.id}>
+                      {company.name}
+                    </option>
+                  ))}
+                </select>
+              )}
             </CrmField>
 
             <CrmField
