@@ -157,7 +157,7 @@ the problems panel not covering the last row of the graph.
    *Done when:* a workflow created before this tick opens in the builder, is edited, saved and executed by the existing runner with no engine change.
 
    **Shipped 2026-09-28** (`6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`).
-   `0050_workflow_graph.sql`, `crates/workflows/src/graph.rs` (Graph/Node/Edge, the 13-type
+   `0051_workflow_graph.sql`, `crates/workflows/src/graph.rs` (Graph/Node/Edge, the 13-type
    `NODE_TYPES` registry with ports and parameter schemas, `validate` → findings, `project` →
    the step list), `graph_store.rs` (`replace_graph` carrying the version in its WHERE clause,
    `replace_ui_state` that bumps neither version nor steps), four endpoints, and the builder

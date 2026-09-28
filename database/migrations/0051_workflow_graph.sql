@@ -1,4 +1,4 @@
--- Omnion · 0050 · the visual workflow builder's graph (REQ-004 slice 1)
+-- Omnion · 0051 · the visual workflow builder's graph (REQ-004 slice 1)
 --
 -- REQ-003 stored one definition as an *ordered list* of steps. That list is what the runner
 -- executes and it stays the execution model — this migration does not touch it. What it adds is

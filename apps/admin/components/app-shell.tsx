@@ -6,12 +6,13 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Workflow, X } from "lucide-react";
+import { BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Workflow, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
 import { GlobalSearch } from "@/components/global-search";
+import { NotificationBell } from "@/components/notification-bell";
 import { useSession } from "@/lib/session";
 
 const NAV = [
@@ -20,6 +21,7 @@ const NAV = [
   { href: "/media", label: "Media", icon: Images },
   { href: "/automations", label: "Automations", icon: Workflow },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
+  { href: "/notifications", label: "Notifications", icon: Bell },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
@@ -202,6 +204,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
             {/* The one search box: beside the site switcher on large screens, its own full-width
                 row under the header on small ones. */}
             <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
+            <NotificationBell />
             <SiteSwitcher />
           </div>
         </header>
