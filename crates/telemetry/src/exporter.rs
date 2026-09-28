@@ -484,6 +484,100 @@ pub fn global() -> &'static Collector {
     &COLLECTOR
 }
 
+/// A one-shot connectivity probe — the exporter screen's `Test` button.
+///
+/// This sends a real request. That is the point: the request asks the form to "send a synthetic
+/// batch and reports the backend's response", and a `Test` that only validates the form is a dead
+/// button that tells the operator their endpoint is fine right up until telemetry silently does
+/// not arrive. The batch it sends is a fixed, obviously-synthetic document — it names no host, no
+/// user and no measurement of the instance.
+///
+/// Two properties are deliberate. It never carries a credential, because the probe has no
+/// authenticated secret to hand and inventing one is how a test endpoint ends up in a real
+/// receiver's log with a token attached. And it never fails loudly: the caller records the outcome
+/// and reports it, because a `Test` that renders an error page has told the operator nothing they
+/// could not have learned by waiting.
+#[derive(Debug, Clone, Copy)]
+pub struct Probe {
+    /// How long one attempt may take.
+    pub timeout_ms: i64,
+}
+
+impl Probe {
+    /// The document every probe sends.
+    #[must_use]
+    pub fn synthetic_batch(exporter: &str) -> Value {
+        serde_json::json!({
+            "omnion_probe": true,
+            "exporter": exporter,
+            "note": "a connectivity test from the Omnion exporter screen; carries no telemetry",
+        })
+    }
+
+    /// Send one probe and report what the backend said.
+    pub async fn send(&self, endpoint: &str) -> FlushOutcome {
+        // An unparseable endpoint is answered rather than attempted: a request to a string that
+        // is not a URL fails with a DNS error that names the wrong thing entirely.
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return FlushOutcome::Failed {
+                error: format!("`{endpoint}` is not an http or https URL"),
+            };
+        }
+
+        let timeout = std::time::Duration::from_millis(self.timeout_ms.clamp(100, 600_000) as u64);
+        let client = match reqwest::Client::builder()
+            .timeout(timeout)
+            .user_agent(concat!("omnion-exporter-probe/", env!("CARGO_PKG_VERSION")))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                return FlushOutcome::Failed {
+                    error: format!("the probe client could not be built: {error}"),
+                };
+            }
+        };
+
+        // The body is serialised here rather than with `RequestBuilder::json`, because the
+        // workspace's `reqwest` is declared without the `json` feature and enabling it for one
+        // call site would add a dependency every other crate on the box would then inherit.
+        let body = serde_json::to_vec(&Self::synthetic_batch("probe")).unwrap_or_default();
+        match client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                // The body is read (a receiver that has to consume the request before answering
+                // would otherwise see a reset) but truncated: an operator needs the receiver's
+                // verdict, not its entire response.
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>();
+                if status.is_success() {
+                    FlushOutcome::Accepted {
+                        response: format!("{} {}", status.as_u16(), body.trim()),
+                    }
+                } else {
+                    FlushOutcome::Failed {
+                        error: format!("{} {}", status.as_u16(), body.trim()),
+                    }
+                }
+            }
+            Err(error) => FlushOutcome::Failed {
+                error: format!("{error}"),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,4 +17,5 @@ tracing.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 omnion-secrets = { path = "../secrets" }
