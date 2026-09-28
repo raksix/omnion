@@ -1,6 +1,6 @@
 # REQ-125 — Secrets & Credential Management
 
-> **Status:** in-progress (slices 1–4 of 4 shipped · audit depth + SIEM + anomalies · commit e0ab121) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slices 1–4 of 4 shipped · audit depth + SIEM + anomalies · commit 2ab97e1 · last gate = the private-stack walkthrough, not yet run) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -126,7 +126,7 @@ Migration: `database/migrations/0026_secrets_depth.sql` (next free slot at tick 
 - [x] Audit rows exist for read, write, rotate, reveal, deny, lease, redeem, slot change and deployment key use, with actor, address and request id. *(Proved by `apps/api/tests/secret_audit.rs` over the real router: the trail is read back, every row carries a request id and a peer address, and the issue+revoke pair joins on `lease_id`. Two defects were found and fixed on the way — the four 0032 columns had no setter on `NewAuditEntry` and were structurally always null, and the screen filtered on `secret.lease` while the handlers wrote `secret.lease.issued`/`.revoked`, so every lease row was invisible.)*
 - [x] Anomaly detection flags an off-hours reveal and a reveal burst in a scripted test, and the acknowledge action persists. *(The off-hours raise and the acknowledge persistence are proved over the router; the burst threshold is unit-tested as a pure function in the crate, and a burst by definition needs N reveals against a real history, which is the one the walk would have to seed deliberately.)*
 - [x] The SIEM export contains metadata only (asserted by a test that greps the payload for the fixture value). *(`secret_audit.rs` greps the raw NDJSON bytes for the fixture value and for a masked fragment, and asserts the allowlist itself — a record that carried `metadata` or `envelope` would fail — because a field check would pass against a redaction pass that had not yet heard of the next column added to `audit_log`.)*
-- [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings.
+- [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings. *(The Rust gates and `pnpm typecheck` are green; the private-stack walkthrough on ports 18085/3105/3205 has not been run since the four fixes below landed, so this box stays open. The previous run reported 247 high findings, all of them `400`s on the panel's own screens traced to the two filter/serialization defects now fixed — it is re-run evidence this box needs, not a re-read.)*
 
 ### QA plan
 

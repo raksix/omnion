@@ -2154,3 +2154,56 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
 - **Environment note.** Six worktrees compiled concurrently on this box: load average 223, 32 G
   of RAM with ~1 G available, `/mnt/apopic` at 96% (2.4 G free). The test compile itself is
   fine; the wall-clock cost is contention, not a failure.
+
+## wave6 · REQ-125 · the interrupted tick's gate, run honestly (2026-09-28, iter 5)
+
+- **What.** The tree carried an uncommitted fix from an interrupted tick, and the last acceptance
+  box needed the private-stack walkthrough. So this tick ran the gate rather than reading the
+  previous report — and the walk found four defects, three of them real ones a green suite had been
+  sitting next to.
+- **Four defects, in the order the walk hit them.**
+  1. `acknowledge_anomaly` selected `count(*)::int` into an `i64` decoder. Postgres reported
+     `INT4` against a Rust `INT8` expectation and the acknowledge answered **500** — on a
+     perfectly healthy database, after writing the row and computing the right count. The cast is
+     the right instinct for an `i32` and the wrong one here; the siblings in the same file cast
+     because theirs are `i32`.
+  2. `?action=one` was a **400**. A `Vec` in a query struct only deserializes the repeated form,
+     so the panel's own multi-select worked and every other caller — a link, a bookmark, a
+     hand-typed URL, and the walk's own click — did not. A filter only its own client can satisfy
+     is not a filter. `one_or_many` takes both; a unit test covers the single, repeated and absent
+     cases.
+  3. The acknowledge wrote **no `request_id`**, so a flag an operator cleared could not be joined
+     to from the trail. This is the same structurally-dead-column mistake slice 4 already fixed
+     once, in a different action — which is the argument for asserting the column, not the idea of
+     the column.
+  4. `json!` renders an `OffsetDateTime` as a nine-element array, so the stored lease metadata —
+     and the SIEM export built from it — carried `[2026, 271, 6, 14, 57, …]` where a timestamp
+     belongs.
+- **And the test itself was green for the wrong reason, twice.** `oneshot` bypasses the connect
+  layer `main.rs` installs, so `ClientAddress` saw no extension, every row was written with a null
+  `ip_address` — and the suite passed on that. It was asserting the row carried a peer address
+  while proving the opposite. The "no masked fragment" check grepped for
+  `wrapping-key-id-not-a-value`, a key id the suite itself wrote into `metadata` on purpose: a
+  stand-in that could never fail. Both now assert the real thing (the peer `ConnectInfo`, the hint
+  `hint_for` computes). The address assertion asserts the *host*, not the string — the column is
+  `inet`, so a bare IPv4 reads back `198.51.100.7/32`, and pinning the rendering would break the
+  day the column type changes.
+- **Proof.** `cargo test -p omnion-api --lib --test secret_audit` → **117 + 1 passed, 0 failed**
+  (the walk asserts: the trail is readable and every action in it is offered as a filter chip; the
+  issue and revoke join by `lease_id` with actor, address and request id; a scripted 03:00 reveal
+  raises an advisory that joins back; the acknowledge persists and a second answers
+  `already_acknowledged`; the NDJSON carries neither the value nor its hint, and every line is one
+  allowlisted object). `cargo test -p omnion-secrets -p omnion-audit --lib` → **55 passed**.
+  `pnpm typecheck` green.
+- **The box stays open.** The walkthrough has not been re-run on the private stack since these four
+  fixes, so the last acceptance line is unticked rather than ticked on a re-read of a report that
+  predates them. The 247 high findings in the previous run were all `400`s on this wave's own
+  screens; two of the three causes are fixed here and the third is the report itself being stale.
+- **Environment.** `/mnt/apopic` was at 99% and a `cargo` incremental write died with
+  `No such file or directory` — the `target/` symlink into `/dev/shm` had been replaced by a real
+  directory at some point, so the build was writing to the full loop image. Moved it back
+  (`/dev/shm/omnion-w6-target`, 3.7 G) and the volume went 99% → 88%. **Check `readlink -f target`
+  at tick start** — a symlink that silently became a directory is a slow disk failure, not a
+  loud one.
+- **Next.** The private-stack walkthrough on 18085/3105/3205. Green, and REQ-125 closes; then
+  REQ-126 (observability stack).
