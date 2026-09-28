@@ -731,8 +731,12 @@ export function AutomationTemplatesView() {
   // gallery does the same instead of handing the button a null it cannot use. An account
   // that belongs to an organization never pays for this.
   const [platformOrganization, setPlatformOrganization] = useState<string | null>(null);
+  // `false` until the organizations read has answered, so "there are none" and "we have not
+  // asked" do not look the same for the length of one round trip.
+  const [tenantResolved, setTenantResolved] = useState(false);
   useEffect(() => {
     if (!user || user.organization_id !== null) {
+      setTenantResolved(true);
       return;
     }
     let live = true;
@@ -740,17 +744,28 @@ export function AutomationTemplatesView() {
       .then((list) => {
         if (live) {
           setPlatformOrganization(list[0]?.id ?? null);
+          setTenantResolved(true);
         }
       })
       .catch(() => {
-        /* the card below says why nothing can be installed */
+        if (live) {
+          setTenantResolved(true);
+        }
       });
     return () => {
       live = false;
     };
   }, [user]);
   const organizationId = user?.organization_id ?? platformOrganization;
-  const needsOrg = Boolean(user) && user?.organization_id === null && organizationId === null;
+  // "Which tenant" is a question with three answers, and two of them are the same button
+  // state: not yet known, and none. Both have to read as *not pressable*, because the
+  // difference between them is a network round trip and a pass that clicks inside it sends
+  // a create with no tenant and reads a 400 off a control that works.
+  const resolvingTenant =
+    Boolean(user) && user?.organization_id === null && platformOrganization === null &&
+    tenantResolved === false;
+  const needsOrg =
+    Boolean(user) && user?.organization_id === null && tenantResolved && organizationId === null;
   const [templates, setTemplates] = useState<AutomationTemplate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [using, setUsing] = useState<string | null>(null);
@@ -909,16 +924,19 @@ export function AutomationTemplatesView() {
                     disabled={
                       using === template.key ||
                       template.installable === false ||
-                      organizationId === null
+                      organizationId === null ||
+                      resolvingTenant
                     }
                   >
                     {using === template.key
                       ? "Installing…"
                       : template.installable === false
                         ? "Not available on this installation"
-                        : organizationId === null
-                          ? "Choose a tenant to install"
-                          : "Use this template"}
+                        : resolvingTenant
+                          ? "Finding the tenant…"
+                          : organizationId === null
+                            ? "Choose a tenant to install"
+                            : "Use this template"}
                   </button>
                 </div>
               </li>
