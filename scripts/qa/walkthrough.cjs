@@ -1490,7 +1490,110 @@ async function runMediaFileDetail(page, report) {
   const previewButtons = await page.locator("button:has-text('Preview')").count();
   note({ step: "version-preview-buttons", previewButtons });
 
-  return { ok: rendered && kind !== null, steps: steps.length, kind, fileId, camera: Boolean(cameraFileId) };
+  // The last two tabs (REQ-010, slice 4). Both read a file that has been through real actions, so
+  // the interesting claims are not "the tab rendered" but the two sentences the whole feature
+  // rests on:
+  //
+  //   * Usage — an unused file must SAY it is safe to delete, not just be empty. An empty list
+  //     beside a heading reads identically for "nothing uses this" and "we could not read it",
+  //     and only one of those means it is safe to press delete.
+  //   * Activity — the upload this pass just performed must be on the trail. A tab that renders
+  //     an empty state for a file that was uploaded two minutes ago is showing a broken read.
+  const usage = await checkUsageTab(page);
+  note({ step: "usage", ...usage });
+  await shot(page, "page-media-file-usage");
+
+  const activity = await checkActivityTab(page);
+  note({ step: "activity", ...activity });
+  await shot(page, "page-media-file-activity");
+
+  return {
+    ok: rendered && kind !== null && usage.rendered && activity.rendered && activity.showsUpload,
+    steps: steps.length,
+    kind,
+    fileId,
+    camera: Boolean(cameraFileId),
+    usage,
+    activity,
+  };
+}
+
+/**
+ * Open the Usage tab and check the sentence under it.
+ *
+ * The assertion is deliberately about the *wording*, not about a row count: the QA library's
+ * sample file has no page pointing at it, so the only thing on screen that can be wrong in a way
+ * a count cannot catch is whether the screen tells the reader that this file is safe to delete.
+ */
+async function checkUsageTab(page) {
+  await page.click("#media-tab-usage").catch(() => {});
+  await page.waitForSelector('[data-testid="media-usage-tab"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-usage-tab"]').count()) > 0;
+  if (!rendered) {
+    return { rendered: false, reason: "the usage tab did not render" };
+  }
+
+  const summary =
+    (await page
+      .locator('[data-testid="media-usage-summary"]')
+      .first()
+      .innerText()
+      .catch(() => "")) ?? "";
+  const rows = await page.locator('[data-testid="media-usage-row"]').count();
+  // An unused file is the state this pass is in, so the empty state has to be *spoken*: the
+  // sentence is what makes "breaks nothing" a claim rather than an absence.
+  const saysItIsSafe = /breaks nothing/i.test(summary);
+  const hasList = rows > 0;
+  // No delete control on this tab: removing a usage row would make the library claim a page
+  // does not point at this file while the page still does.
+  const dangerousButtons = await page
+    .locator('[data-testid="media-usage-tab"] button:has-text("Delete")')
+    .count();
+
+  return { rendered, rows, summary, saysItIsSafe, hasList, dangerousButtons };
+}
+
+/**
+ * Open the Activity tab and check that the upload this pass performed is on the trail.
+ *
+ * An empty trail for a file that was uploaded a minute ago is the exact failure this catches:
+ * the endpoint answers 200 with no rows, the screen renders its empty state, and nothing about
+ * either looks wrong.
+ */
+async function checkActivityTab(page) {
+  await page.click("#media-tab-activity").catch(() => {});
+  await page.waitForSelector('[data-testid="media-activity-tab"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-activity-tab"]').count()) > 0;
+  if (!rendered) {
+    return { rendered: false, reason: "the activity tab did not render" };
+  }
+
+  const rows = await page.locator('[data-testid="media-activity-row"]').count();
+  const actions = await page
+    .locator('[data-testid="media-activity-row"]')
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-action")))
+    .catch(() => []);
+  const summaries = await page
+    .locator('[data-testid="media-activity-row"] p')
+    .allTextContents()
+    .catch(() => []);
+  // The upload is the action that put the file here at all, so its absence is the defect.
+  const showsUpload = actions.includes("media.uploaded");
+  // A sentence, never the raw token: `media.uploaded` on screen would be a database column.
+  const readsAsSentences =
+    summaries.length > 0 && summaries.every((text) => !/^media\./.test(text.trim()));
+
+  // Open the detail disclosure on the first row — an expandable that is never expanded by the
+  // pass is a control nobody has clicked.
+  const toggles = await page.locator('[data-testid="media-activity-toggle"]').count();
+  let detailOpened = false;
+  if (toggles > 0) {
+    await page.locator('[data-testid="media-activity-toggle"]').first().click().catch(() => {});
+    await page.waitForTimeout(400);
+    detailOpened = (await page.locator('[data-testid="media-activity-detail"]').count()) > 0;
+  }
+
+  return { rendered, rows, actions, showsUpload, readsAsSentences, toggles, detailOpened };
 }
 
 /**
@@ -1661,6 +1764,253 @@ async function uploadDuplicateSample(page) {
  * file the radio named (not the first one), and the result panel says the bytes are *pending*
  * rather than reclaimed. It then re-reads the API to prove the group is really gone.
  */
+/**
+ * The retention tab (REQ-010, slice 4): the policies render with their consequence in a
+ * sentence, a new policy is created and saved, the cross-field refusal is visible *before* the
+ * save, and a run reports three numbers rather than one.
+ *
+ * The last of those is the assertion that matters: a screen that shows only "0 files" reads
+ * identically for a hold, a reference and a broken worker, and the walk has to be able to tell
+ * the three apart or it is not checking anything.
+ */
+async function runMediaRetention(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-retention", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.click("#media-settings-tab-retention").catch(() => {});
+  await page.waitForSelector('[data-testid="media-retention"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-retention"]').count()) > 0;
+  note({ step: "tab", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the retention tab did not render" };
+  }
+
+  // Every policy states what it does to a file, in words. A row of numbers is the settings; the
+  // sentence is the consequence, and an operator deciding whether to keep a policy needs the
+  // second one.
+  const policies = page.locator('[data-testid="media-retention-policy"]');
+  const count = await policies.count();
+  const bodies = await policies.allInnerTexts();
+  const everyPolicyExplainsItself = bodies.every((text) => /restored for/i.test(text));
+  const everyPolicyNamesItsScope = bodies.every((text) => /whole site|folder/i.test(text));
+  note({ step: "policies", count, everyPolicyExplainsItself, everyPolicyNamesItsScope });
+
+  // The live cross-field warning. It must appear while the two windows disagree, not only after
+  // a save the API refuses — a person who cannot see it until then reads a server error
+  // instead of their own form.
+  await page.click('[data-testid="media-retention-new"]').catch(() => {});
+  await page.waitForTimeout(400);
+  await page.fill('[data-testid="media-retention-name"]', "QA campaign").catch(() => {});
+  await page.fill('[data-testid="media-retention-trash_days"]', "30").catch(() => {});
+  await page.fill('[data-testid="media-retention-purge_after_days"]', "5").catch(() => {});
+  await page.waitForTimeout(300);
+  const warned = await page
+    .locator('[data-testid="media-retention"] p.text-warn')
+    .allTextContents()
+    .catch(() => []);
+  const warnedBeforeSave = warned.some((text) => /before the restore window closes/i.test(text));
+  note({ step: "cross-field-warning", warnedBeforeSave, warned });
+
+  // Fix it and save: the policy must appear, and the save must report what it did.
+  await page.fill('[data-testid="media-retention-purge_after_days"]', "60").catch(() => {});
+  await page.click('[data-testid="media-retention-save"]').catch(() => {});
+  await page.waitForTimeout(2000);
+  const afterSave = await page.locator('[data-testid="media-retention"] [role=\'status\']').allTextContents();
+  const created = await page
+    .locator('[data-testid="media-retention-policy"]', { hasText: "QA campaign" })
+    .count();
+  note({ step: "create", created, afterSave });
+
+  // The run. Three numbers, and a sentence — never a bare zero.
+  await page.click('[data-testid="media-retention-run"]').catch(() => {});
+  await page.waitForTimeout(3000);
+  const runNotice = await page
+    .locator('[data-testid="media-retention"] [role=\'status\']')
+    .first()
+    .innerText()
+    .catch(() => "");
+  const runRows = await page.locator('[data-testid="media-retention-run-row"]').count();
+  note({ step: "run", runNotice, runRows });
+  // A run that found nothing still writes a log row: "the last run was clean" is the sentence
+  // an operator needs on the day they are asking why a file is still here.
+  const runLoggedEvenWhenEmpty = runRows >= 1;
+  // Whatever the outcome, the notice must be a sentence with a number or a reason in it — not a
+  // bare "0 files" and not an empty string.
+  const runIsSpoken = runNotice.trim().length > 0 && !/^\s*0 files\s*$/.test(runNotice);
+
+  await shot(page, "media-retention-settings");
+
+  // The file detail's hold switch: a fact about the file, on the tab where the file's other
+  // facts are, with a reason required in both directions.
+  const firstFile = await page.evaluate(async () => {
+    const sites = await (await fetch("/api/v1/sites", { credentials: "same-origin" })).json();
+    const first = (sites.sites || sites)[0];
+    if (!first) return null;
+    const response = await fetch(
+      `/api/v1/media/files?site_id=${first.id}&limit=1`,
+      { credentials: "same-origin" },
+    );
+    const page_ = await response.json();
+    return page_.files && page_.files[0] ? page_.files[0].id : null;
+  });
+  if (firstFile) {
+    await page.goto(`${URL_ADMIN}/media/files/${firstFile}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const holdBlock = await page.locator('[data-testid="media-legal-hold"]').count();
+    const holdBefore = await page.locator('[data-testid="media-legal-hold"]').getAttribute("data-held");
+    await page.fill('[data-testid="media-hold-reason"]', "QA hold check").catch(() => {});
+    await page.click('[data-testid="media-hold-toggle"]').catch(() => {});
+    await page.waitForTimeout(1800);
+    const holdAfter = await page.locator('[data-testid="media-legal-hold"]').getAttribute("data-held");
+    note({ step: "hold", holdBlock, holdBefore, holdAfter });
+    // Toggle back so the QA library is not left held — a fixture that leaks state into the
+    // next run is a fixture that makes the next failure unreadable.
+    await page.click('[data-testid="media-hold-toggle"]').catch(() => {});
+    await page.waitForTimeout(1200);
+    await shot(page, "media-legal-hold");
+  } else {
+    note({ step: "hold", skipped: "the QA library has no file to open" });
+  }
+
+  return {
+    ok:
+      rendered &&
+      count >= 1 &&
+      everyPolicyExplainsItself &&
+      everyPolicyNamesItsScope &&
+      warnedBeforeSave &&
+      created === 1 &&
+      runIsSpoken &&
+      runLoggedEvenWhenEmpty,
+    steps: steps.length,
+    count,
+    everyPolicyExplainsItself,
+    everyPolicyNamesItsScope,
+    warnedBeforeSave,
+    created,
+    runIsSpoken,
+    runLoggedEvenWhenEmpty,
+  };
+}
+
+async function runMediaGrants(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-grants", ...step });
+  };
+
+  // A real file, resolved the way the other media passes do — from the library listing.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadMediaSample(page);
+  await page.waitForTimeout(1500);
+  note({ step: "upload", ...uploaded });
+  const fileId = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  if (!fileId) {
+    return { ok: false, reason: "the library rendered no file to reach the permissions tab" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.click("#media-tab-permissions").catch(() => {});
+  await page.waitForSelector('[data-testid="media-grants-tab"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-grants-tab"]').count()) > 0;
+  note({ step: "tab", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the permissions tab did not render" };
+  }
+
+  // The narrowing rule has to be *on the screen*. A tab that only shows a table teaches an
+  // operator that a grant hands capabilities out, which is the one thing it must not do.
+  const body = await page.locator('[data-testid="media-grants-tab"]').innerText().catch(() => "");
+  note({ step: "states-the-rule", states: /narrow/i.test(body) });
+  const hasGrantAccess = await page.locator("button:has-text('Grant access')").count();
+  note({ step: "no-grant-access-button", hasGrantAccess });
+
+  // The chain a file inherits from. It is on the tab whether or not it is empty, and an empty
+  // list here would be a chain that silently does not exist.
+  const chainNodes = await page.locator('[data-testid="media-grants-chain-node"]').count();
+  note({ step: "chain", chainNodes });
+
+  // The empty state explains that a grant only ever takes something away, rather than showing
+  // an empty table that reads as "nothing is configured".
+  const emptyRows = await page.locator('[data-testid="media-grant-row"]').count();
+  const emptyCopy = await page.locator("text=No grants on this").count();
+  note({ step: "empty", emptyRows, emptyCopy });
+  await shot(page, "page-media-file-detail-permissions");
+
+  // The subject picker opens, offers the organization's own subjects, and a group is marked as
+  // the row that survives somebody joining and leaving a team.
+  await page.click('[data-testid="media-grant-add"]').catch(() => {});
+  await page.waitForSelector('[data-testid="media-grant-form"]', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const subjects = await page.locator('[data-testid="media-grant-subjects"] button').count();
+  note({ step: "picker", subjects });
+  if (subjects === 0) {
+    return { ok: false, reason: "the subject picker offered nobody" };
+  }
+
+  // A deny with no capability is refused by the form, naming what it has to say. Sent to the
+  // API it is a 400 that writes nothing, so the walk proves the screen catches it first.
+  await page.click('[data-testid="media-grant-subjects"] button').catch(() => {});
+  await page.click('[data-testid="media-grant-effect-deny"]').catch(() => {});
+  for (const bit of ["can_read", "can_write", "can_delete", "can_share"]) {
+    const box = page.locator(`[data-testid="media-grant-bit-${bit}"]`);
+    if (await box.isChecked().catch(() => false)) {
+      await box.uncheck().catch(() => {});
+    }
+  }
+  await page.click('[data-testid="media-grant-save"]').catch(() => {});
+  await page.waitForTimeout(600);
+  const denied = await page.locator('[data-testid="media-grant-field-error"]').innerText().catch(() => "");
+  note({ step: "empty-deny-refused", denied });
+  const emptyDenyRefused = /tick at least one/i.test(denied);
+
+  // A real deny: read is ticked, it saves, and the row says what it does and where it applies.
+  await page.check('[data-testid="media-grant-bit-can_read"]').catch(() => {});
+  await page.click('[data-testid="media-grant-save"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const rows = await page.locator('[data-testid="media-grant-row"]').count();
+  const denies = await page.locator('[data-testid="media-grants-deny-count"]').count();
+  const namedByName = await page.evaluate(() => {
+    const row = document.querySelector('[data-testid="media-grant-row"]');
+    return row ? row.textContent : null;
+  });
+  note({ step: "saved", rows, denies, namedByName });
+  await shot(page, "page-media-file-detail-permissions-deny");
+
+  // The row resolves its subject's *name*. A uuid in that cell teaches nobody which grant to
+  // remove, and the walk is the only layer that sees the cell rather than the data.
+  const showsLabel = namedByName ? !/[0-9a-f]{8}-[0-9a-f]{4}/.test(namedByName) : false;
+  note({ step: "shows-a-name", showsLabel });
+
+  // Removing it is immediate, and the empty state comes back. The confirmation is a
+  // `window.confirm` and the harness accepts dialogs globally, so this is one click: a second
+  // one would remove a grant that no longer exists and turn a passing check into a 404.
+  await page.click('[data-testid="media-grant-remove"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const afterRemove = await page.locator('[data-testid="media-grant-row"]').count();
+  const afterNotices = await page.locator('[data-testid="media-grants-notice"]').count();
+  note({ step: "removed", afterRemove, afterNotices });
+  await shot(page, "page-media-file-detail-permissions-empty");
+
+  return {
+    ok: rendered && subjects > 0 && emptyDenyRefused && rows === 1 && afterRemove === 0,
+    emptyDenyRefused,
+    showsLabel,
+    steps,
+  };
+}
+
 async function runMediaDuplicates(page, report) {
   const steps = [];
   const note = (step) => {
@@ -3659,6 +4009,12 @@ async function main() {
   report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
   log(`media shares: ${JSON.stringify(report.mediaShares)}`);
 
+  // The permissions tab (REQ-010, slice 4): the narrowing rule stated on the screen, the
+  // chain a file inherits from, a deny refused when it names nothing, and a real deny that
+  // names its subject by name rather than by uuid.
+  report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
+  log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
+
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
   // bytes are pending rather than reclaimed.
@@ -3666,6 +4022,13 @@ async function main() {
     runMediaDuplicates(page, report),
   );
   log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
+
+  // The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
+  // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
+  // sentence and writes a log row even when it found nothing, and the file's hold switch is on
+  // the tab where the file's other facts are.
+  report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
+  log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);

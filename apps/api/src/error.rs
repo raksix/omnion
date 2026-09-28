@@ -117,10 +117,15 @@ impl ApiError {
 
     /// The sentence a client reads.
     ///
-    /// Public because a refusal's wording is part of its contract: a test that asserts
-    /// "this 404 does not name the gate" cannot reach a private field, and a test that only
-    /// asserts the *code* would not notice a sentence that started leaking the id. It is
-    /// never used to build a response — `IntoResponse` reads the field directly.
+    /// The companion of [`ApiError::code`]: the code is what a client branches on and the
+    /// message is what a person reads, so a test that checks one without the other pins half
+    /// the contract — and it is the message that has to name the field and the three legal
+    /// values, which is the part a client cannot reconstruct.
+    ///
+    /// Public for the same reason it is worth asserting: a test that asserts "this 404 does
+    /// not name the gate" cannot reach a private field, and a test that only asserts the
+    /// *code* would not notice a sentence that started leaking the id. It is never used to
+    /// build a response — `IntoResponse` reads the field directly.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -715,6 +720,46 @@ impl From<MediaError> for ApiError {
                 Self::bad_request("invalid_storage_setting", message)
                     .with_details(serde_json::json!({ "field": field }))
             }
+            // Same rule for the scanning settings, with its own code so a client can tell a
+            // bad scanner endpoint from a bad storage endpoint — they are different screens
+            // and different people fix them.
+            MediaError::InvalidScanSetting { field, reason } => {
+                Self::bad_request("invalid_scan_setting", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
+            // A release with no reason is a `400`, not a `409`: the request was well-formed and
+            // the refusal is about an empty field, so the caller can fix it and try again
+            // without a state having changed underneath them.
+            MediaError::InvalidReleaseReason => {
+                Self::bad_request("release_reason_required", MediaError::InvalidReleaseReason.to_string())
+                    .with_details(serde_json::json!({ "field": "reason" }))
+            }
+            // Same rule for the retention settings, with its own code so a client can tell a
+            // bad window from a bad scanner endpoint — they are two tabs of one screen, and
+            // the message is rendered under the input that caused it.
+            MediaError::InvalidRetentionSetting { field, reason } => {
+                Self::bad_request("invalid_retention_setting", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
+            // A missing policy is a `404`, and the tenancy scope lives *inside* the lookup
+            // rather than being applied afterwards — the same lesson `media_grants::delete_one`
+            // learned from a walk that got a `403` for another tenant's grant id and thereby
+            // confirmed the id exists.
+            MediaError::RetentionPolicyNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "retention_policy_not_found",
+                "no such retention policy on this site",
+            ),
+            MediaError::PolicyNameTaken { name } => Self::new(
+                StatusCode::CONFLICT,
+                "retention_policy_name_taken",
+                format!("a retention policy named `{name}` already exists on this site"),
+            )
+            .with_details(serde_json::json!({ "field": "name" })),
+            // A purge that cannot happen: the request was legal, the file is past its window,
+            // and something in the platform still resolves to it. A `400` would send an
+            // operator to fix a form that was never wrong — the fix is to repoint a page.
+            MediaError::PurgeRefused { reason } => Self::new(StatusCode::CONFLICT, "purge_refused", reason),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

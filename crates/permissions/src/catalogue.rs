@@ -97,6 +97,16 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "media",
         description: "Create public share links for files",
     },
+    // Slice 4's third separation. Releasing a quarantined file is the action that undoes a
+    // safety decision, so it is not `media.manage` (organising a library) and not
+    // `media.delete` (removing one): an editor who may rearrange the whole library and a
+    // colleague who may clear an icon out of it are both wrong for this button, and the
+    // person who holds it is exactly the person a security review asks about.
+    PermissionDef {
+        key: "media.scan.manage",
+        category: "media",
+        description: "Configure scanning and release quarantined files",
+    },
     // AI Hub (docs/06-AI-HUB.md §1, §7): connecting providers is an administrator-level power,
     // while using the platform's AI chat is an everyday one — the AI Hub's own permission sets
     // (§8) build on these keys in later phases.

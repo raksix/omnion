@@ -131,4 +131,55 @@ pub enum MediaError {
         /// What the caller asked for.
         requested: usize,
     },
+    /// A scanning setting is out of range or malformed, and names itself.
+    ///
+    /// The message carries the *field*, because the settings screen renders it under that
+    /// input; a bare "constraint violation" is a message under nothing and an operator has to
+    /// guess which of the six inputs they got wrong.
+    #[error("`{field}`: {reason}")]
+    InvalidScanSetting {
+        /// Wire name of the setting.
+        field: String,
+        /// What is wrong with it, in a sentence.
+        reason: String,
+    },
+    /// A release or a deletion of a quarantined file carried no reason.
+    ///
+    /// Refused rather than defaulted. The quarantine row is the only record the file was ever
+    /// held, so an empty reason is the whole record being empty — and a default would be a
+    /// lie the audit trail would carry for ever.
+    #[error("say why the file is being released or deleted — the quarantine record keeps it")]
+    InvalidReleaseReason,
+    /// A retention setting is out of range or malformed, and names itself.
+    ///
+    /// The same rule as `InvalidScanSetting`, for the same reason: the retention form renders
+    /// the message under the input that caused it, and a bare check-constraint violation
+    /// arrives as a `500` whose only clue is a constraint name.
+    #[error("`{field}`: {reason}")]
+    InvalidRetentionSetting {
+        /// Wire name of the setting.
+        field: String,
+        /// What is wrong with it, in a sentence.
+        reason: String,
+    },
+    /// No retention policy with that id on this site.
+    #[error("no such retention policy on this site")]
+    RetentionPolicyNotFound,
+    /// A sibling policy already has that name.
+    #[error("a retention policy named `{name}` already exists on this site")]
+    PolicyNameTaken {
+        /// The name that is taken.
+        name: String,
+    },
+    /// A purge cannot happen, and says what holds the file.
+    ///
+    /// A `409` at the wire: the request was well-formed, the file is in the trash, its window
+    /// has closed — and something in the platform still resolves to it. A `400` would tell an
+    /// operator their click was wrong when their *data* is what is in the way, and the fix is
+    /// to repoint a page, not to fill in a form differently.
+    #[error("{reason}")]
+    PurgeRefused {
+        /// The whole refusal, in one sentence, naming the referrers.
+        reason: String,
+    },
 }

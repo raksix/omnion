@@ -17,14 +17,18 @@ pub mod error;
 pub mod exif;
 pub mod folder_store;
 pub mod folders;
+pub mod grants;
 pub mod library;
 pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod retention;
+pub mod scanning;
 pub mod shares;
 pub mod storage_settings;
 pub mod transform;
+pub mod usage;
 pub mod validation;
 pub mod versions;
 
@@ -32,6 +36,14 @@ pub use browser::{
     FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
     purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+};
+pub use scanning::{
+    MAX_SCAN_MB, MAX_TIMEOUT_SECONDS, MIN_SCAN_MB, MIN_TIMEOUT_SECONDS, NewSiteScan,
+    PendingScan, Quarantine, ScanRequest, ScanResponse, ScanRun, ServeRefusal, SiteScan,
+    SweepCounts, Verdict, apply_verdict, begin_run, claim_pending, close_quarantine, finish_run,
+    interpret, is_quarantined, list_quarantines, list_runs, may_serve, parse_response,
+    quarantine_totals,
+    read_scan_settings, scan_identity, write_scan_settings,
 };
 pub use duplicates::{
     CrossSiteCopy, CrossSiteGroup, DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES,
@@ -44,6 +56,10 @@ pub use exif::{EXIF_HEADER_BYTES, Exif, ORIENTATION_TAG, oriented_size, read as 
 pub use folder_store::{
     count_files_in_folder, delete_empty_folder, find_folder, insert_folder, list_folders,
     move_folder, root_folder,
+};
+pub use grants::{
+    Capabilities, Chain, ChainNode, Decision, Grant, GrantTarget, MAX_CHAIN_DEPTH, NewGrant,
+    SUBJECT_KINDS, delete_grant, group_ids_of, list_grants, load_chain, put_grant, resolve,
 };
 pub use folders::{
     Folder, FolderMove, MAX_FOLDER_NAME_LENGTH, MAX_FOLDER_PATH_LENGTH, NewFolder,
@@ -60,6 +76,16 @@ pub use preset_store::{
     list_presets, require_preset, require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
+pub use retention::{
+    DanglingReference, MAX_POLICY_NAME_LENGTH, MAX_WINDOW_DAYS, MIN_WINDOW_DAYS,
+    NewRetentionPolicy, PolicyChanges, PurgeOutcome, PurgeRefusal, RetentionPolicy, RetentionRun,
+    RunTotals, SWEEP_BATCH as RETENTION_SWEEP_BATCH, VersionSweep, Window, all_keys_of,
+    begin_run as begin_retention_run, create_policy, dangling_references, delete_policy,
+    enabled_policies, find_policy, finish_run as finish_retention_run, governing_window, last_run,
+    list_policies, list_runs as list_retention_runs, past_restore_window, policy_scope_paths,
+    purge_candidates, purge_eligible, repair_references, set_hold, site_policy, sites_with_media,
+    sweep_versions, update_policy, validate_new as validate_retention,
+};
 pub use shares::{
     CreatedShare, MAX_EXPIRY_DAYS, MIN_EXPIRY_MINUTES, NewShare, Share, ShareRefusal, TOKEN_BYTES,
     count_download, create_share, find_by_token, find_share, hash_token, is_password_protected,
@@ -74,6 +100,9 @@ pub use transform::{
     Derivative, Fit, ImageFormat, MAX_PRESET_DIMENSION, MAX_PRESET_NAME_LENGTH, NewPreset, Preset,
     Recipe, derivative_prefix, validate_dimensions, validate_new, validate_preset_name,
     validate_quality,
+};
+pub use usage::{
+    MAX_USAGE_ROWS, RESOLVABLE_KINDS, UsageCounts, UsageEntry, count_usage, list_usage,
 };
 pub use validation::{
     INLINE_CONTENT_TYPES, ServePlan, normalize_content_type, object_key, sanitize_filename,
