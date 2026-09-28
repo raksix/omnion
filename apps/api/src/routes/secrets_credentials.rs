@@ -262,11 +262,20 @@ pub struct AssignSlotInput {
 }
 
 /// `GET /api/v1/secrets/credentials` — the typed profiles.
+///
+/// A *list* is not a read of one row, so it does not resolve the caller's organization the way
+/// `read_credential` does. `list_credentials` already takes `Option<Uuid>`, where `None` means
+/// "every organization" — a platform operator's whole estate — and a write is still scoped by
+/// `in_organization` on the single-row routes. Wrapping the result in `Some(...)` here made the
+/// screen a `400 organization_required` for exactly the accounts that administer the platform:
+/// the QA owner is a platform account (`organization_id` is null), so the panel spent the whole
+/// walkthrough rendering an error state on a route that has data, and the pass reported 247 high
+/// findings from one missing `Option`.
 pub async fn read_credentials(
     State(state): State<AppState>,
     session: CurrentSession,
 ) -> Result<Json<CredentialsResponse>, ApiError> {
-    let organization_id = Some(resolve_organization(&session, None)?);
+    let organization_id = organization_scope(&session);
     let pool = state.db().pool();
     let rows = credentials::list_credentials(pool, organization_id)
         .await
@@ -720,6 +729,18 @@ fn map_credential_error(error: omnion_secrets::SecretsError) -> ApiError {
     map_error(error)
 }
 
+/// The scope a *listing* runs at: the caller's own organization, or every organization for a
+/// platform account.
+///
+/// This is deliberately not `resolve_organization`. That function answers "which organization
+/// does this action apply to", and for a platform account with no request to name one, the honest
+/// answer is a `400` — which is right for a write and wrong for a list. A platform operator's
+/// job *is* the whole estate, so the list reads across and the single-row routes keep enforcing
+/// `in_organization`.
+fn organization_scope(session: &CurrentSession) -> Option<Uuid> {
+    session.user.organization_id
+}
+
 /// Refuse a secret that belongs to another organization.
 fn in_organization(row: &Option<Uuid>, caller: Option<Uuid>) -> Result<(), ApiError> {
     match (row, caller) {
@@ -750,5 +771,77 @@ async fn emit(state: &AppState, event: NewEvent) {
 async fn audit(state: &AppState, entry: NewAuditEntry) {
     if let Err(error) = omnion_audit::entries::record(state.db().pool(), entry).await {
         tracing::warn!(error = %error, "the audit row could not be written");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnion_identity::sessions::Session;
+    use omnion_identity::users::User;
+    use time::OffsetDateTime;
+
+    fn session_for(organization_id: Option<Uuid>) -> CurrentSession {
+        CurrentSession {
+            user: User {
+                id: Uuid::nil(),
+                organization_id,
+                email: "ada@example.com".to_owned(),
+                display_name: "Ada".to_owned(),
+                status: "active".to_owned(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            session: Session {
+                id: Uuid::nil(),
+                user_id: Uuid::nil(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                expires_at: OffsetDateTime::UNIX_EPOCH,
+                last_seen_at: None,
+                absolute_expires_at: None,
+                device_id: None,
+                auth_methods: Vec::new(),
+                revoked_at: None,
+                revoke_reason: None,
+                step_up_at: None,
+            },
+            token: "token".to_owned(),
+        }
+    }
+
+    /// A platform account lists every organization; an organization account lists only its own.
+    ///
+    /// This is the regression test for a defect the browser pass found and no unit test could:
+    /// `read_credentials` wrapped `resolve_organization` in `Some(...)`, so the one account kind
+    /// that administers the whole estate got `400 organization_required` from a *list* — 247 high
+    /// findings in one walkthrough, all of them one missing `Option`. The scope helper is the
+    /// contract, so the helper is what the test pins.
+    #[test]
+    fn a_platform_account_lists_across_organizations() {
+        let organization = Uuid::new_v4();
+        assert_eq!(
+            organization_scope(&session_for(Some(organization))),
+            Some(organization),
+            "an organization account sees its own estate and nothing else"
+        );
+        assert_eq!(
+            organization_scope(&session_for(None)),
+            None,
+            "a platform account has no primary organization, so the list reads every organization"
+        );
+    }
+
+    /// And the two are genuinely different decisions, so the first test is not passing by
+    /// accident: the same platform account that may *list* is still refused a *write* that names
+    /// no organization.
+    #[test]
+    fn a_list_is_not_a_write_when_the_organization_is_missing() {
+        let platform = session_for(None);
+        assert!(organization_scope(&platform).is_none(), "the list resolves");
+        let refused = resolve_organization(&platform, None);
+        assert!(refused.is_err(), "the write still refuses, and must");
+        assert_eq!(
+            refused.expect_err("a write needs an organization").code(),
+            "organization_required"
+        );
     }
 }
