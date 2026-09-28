@@ -3180,3 +3180,63 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
+
+### REQ-126 · slice 4d · the permissions line — and two of my own "proofs" turned out to be vacuous
+
+- **What.** `apps/api/tests/observability_permissions.rs` — four walks over the real router, driving
+  every mutating observability route with the method `apps/admin/lib/api.ts` actually sends. Commits
+  `2db3ad2`, `1acd851`, `117b21f`, `7d42185`, plus the `c122976` main merge.
+- **The defect the walk found in shipped code.** The exporters screen's Edit button sends `PATCH`;
+  `/observability/exporters/{id}` registered only `put`. The button answered **405** against a live
+  panel — a dead control that no screenshot finds, because the screen renders its error state
+  correctly. The method in the test table is lifted from the client rather than from the router
+  precisely so that a router that drifts from the client fails the walk rather than agreeing with
+  itself.
+- **The `403` is not the assertion.** The walk also requires `error.code == "permission_denied"` and
+  `details.permission == "observability.manage"`. A guard that refused for an unrelated reason — a
+  cross-scope check, a missing row — satisfies a bare status check and proves nothing about the
+  permission. Hence real fixture rows, and a refusal count compared against `mutations().len()` so a
+  route cannot be dropped from the table unnoticed.
+- **Two of my own proofs in earlier ticks were vacuous, and this is the part worth reading.** The
+  suite's `state_or_skip` returned `None` and every test returned early, so it reported
+  **`ok. 4 passed` while asserting nothing**. libtest *captures* stderr from a passing test, so the
+  `SKIP:` line was printed and shown only under `--nocapture` — while the one line every reader and
+  every gate looks at said green. The cause was a sibling wave's `0047_media_grants.sql`, which
+  declared `unique (coalesce(...), coalesce(...))` as a table constraint; PostgreSQL accepts
+  expressions in an index but not inside a `unique` constraint, so every migration in the set died
+  with `syntax error at or near "("` and no wave's QA stack could boot. `state_or_fail` now exits 101,
+  or panics under `OMNION_REQUIRE_DB=1`.
+- **Closing the guard turned the suite red, and the red was three more defects that had been living
+  inside the green.** (1) `cookie_header` returned the `Cookie: ` prefix *and* was passed to
+  `.header(header::COOKIE, …)`, so every authenticated call sent `Cookie: Cookie: …` and answered
+  `401`. (2) The read-only account was asked to create its own fixtures, but the write surface is
+  guarded by `observability.manage` — the walk now has a second account that owns the fixtures and a
+  read-only one that is refused. (3) One alert rule was shared by the create-then-delete rows and the
+  silence, so the silence addressed a deleted row and died with `404 no alert rule with the id …`,
+  which reads as a broken foreign key rather than a shared fixture with two different lifetimes.
+- **A count is only comparable to a count.** The preview's baseline was `0` for the no-action case and
+  was compared against the actor's absolute row count, so it reported `left: 8, right: 0` — "the
+  preview wrote a row" — when those eight rows belonged to the mutations before it. Both sides are
+  now the actor's total, and the per-action count is asserted separately: "one row added" and "one
+  row for THIS action" are different claims, and only the first survives a route that writes one
+  right row and one wrong one.
+- **A unit target that has not compiled for a whole slice.** `AlertRuleInput` had no `Clone`, and the
+  only uses of it are `..base.clone()` inside `#[cfg(test)]`, so `cargo test -p omnion-api --lib` did
+  not build — the binary compiled, the walks passed, the panel worked, and the *test* profile of the
+  lib target had been broken since `4229721`. It is in this log because the gate that would have
+  caught it is step 4 of every tick and was not run on the tick that landed the change.
+- **The merge, and the one fix a union cannot make mechanically.** `c122976` resolved both conflicts
+  as unions (the `pub mod` list and the `Config` struct/reader/`Default` pairs), which duplicated
+  `pub mod media_duplicates;` — caught by `sort | uniq -d` rather than by a build. It then needed one
+  hand fix: the two struct literals each ended with `};`, so keeping both bodies kept one `};` too
+  few, and cargo reported "unclosed delimiter" at line 1317, 500 lines from the cause. A union script
+  is right for an append-only journal and wrong for syntax that closes.
+- **Proof.** `OMNION_REQUIRE_DB=1 bash scripts/qa/run-media-walk.sh observability_permissions
+  --nocapture` → **4 passed, 0 failed**, no `SKIP` line, disposable database. `cargo test -p
+  omnion-api --lib` → **173** (166 before the merge), `-p omnion-core --lib` → **35**, `-p
+  omnion-telemetry --lib` → **160**. The sibling walks are unchanged against the new route table:
+  `observability_alerts` 8/8, `observability_events` 6/6. `pnpm typecheck` 2/2.
+- **Next.** The Grafana/Prometheus bundle import check and the shipped rule's fire-through-a-real-outage
+  walk — both need a Prometheus in the QA stack, which is why they have been deferred rather than
+  faked — then the REQ close gate: `cargo test --workspace`, `pnpm build` and the private-stack
+  walkthrough.
