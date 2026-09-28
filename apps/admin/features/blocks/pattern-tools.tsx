@@ -213,6 +213,13 @@ function SaveSelectionForm({
   onSaved,
   onError,
 }: SaveProps) {
+  // The hook lives *here* rather than in `PatternTools`, and that placement is the whole bug
+  // this fixes. The parent needed it for the library list; the save form is a separate component
+  // several hundred lines below, and the value never reached it. So the screen listed patterns
+  // and refused to save one — the two halves of one rule kept in two places, and only the half
+  // that had been noticed was correct.
+  const tenant = useContentTenant();
+  const organizationId = tenant.organizationId ?? undefined;
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
   const [keyTouched, setKeyTouched] = useState(false);
@@ -235,6 +242,10 @@ function SaveSelectionForm({
         category: category.trim() || "general",
         description,
         blocks: source,
+        // The fourth copy of the tenant rule, and the one the walkthrough still caught. The hook
+        // was already in this file for the *read* above; the create beside it was never given
+        // the value, so "save as pattern" answered 400 while the list beside it rendered fine.
+        organizationId,
       });
       setName("");
       setKeyTouched(false);
