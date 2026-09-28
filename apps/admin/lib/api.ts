@@ -6,6 +6,7 @@
  */
 import type {
   CreatedMediaShare,
+  NewMediaGrant,
   Media,
   MediaBulkResult,
   MediaCrossSiteReport,
@@ -17,6 +18,9 @@ import type {
   MediaFolderTree,
   MediaMergeResult,
   MediaPreset,
+  MediaGrant,
+  MediaGrantSubject,
+  MediaGrantsResponse,
   MediaShare,
   MediaStorageProbe,
   MediaStorageSettings,
@@ -572,6 +576,58 @@ export function revokeAllMediaShares(mediaId: string): Promise<{ revoked: number
     `/api/v1/media/${encodeURIComponent(mediaId)}/shares/revoke-all`,
     { method: "POST" },
   );
+}
+
+// --------------------------------------------------------------------------------------------
+// Folder and file grants (docs/requests/REQ-010, slice 4)
+// --------------------------------------------------------------------------------------------
+
+/** The grants on one node — a folder or a file — with the chain a file inherits from. */
+export function fetchMediaGrants(
+  targetKind: "file" | "folder",
+  targetId: string,
+): Promise<MediaGrantsResponse> {
+  const path = targetKind === "folder" ? "folders" : "media";
+  return request<MediaGrantsResponse>(
+    `/api/v1/${path}/${encodeURIComponent(targetId)}/grants`,
+  );
+}
+
+/** What a grant is written with. The four bits are separate, so a caller that sends only
+ * `can_read` gets exactly `can_read`. */
+export function createMediaGrant(
+  targetKind: "file" | "folder",
+  targetId: string,
+  grant: NewMediaGrant,
+): Promise<MediaGrant> {
+  const path = targetKind === "folder" ? "folders" : "media";
+  return request<MediaGrant>(`/api/v1/${path}/${encodeURIComponent(targetId)}/grants`, {
+    method: "PUT",
+    body: JSON.stringify(grant),
+  });
+}
+
+/**
+ * Remove one grant, by its own id.
+ *
+ * The node is deliberately **not** in the URL: the row already knows what it was written on,
+ * and a path with two parameters and a one-parameter handler is the shape axum rejects with a
+ * bare `500` and no body. The server answers `404` for a grant of another organization, so an
+ * id that is not yours is indistinguishable from one that does not exist.
+ */
+export function removeMediaGrant(grantId: string): Promise<void> {
+  return request<void>(`/api/v1/media/grants/${encodeURIComponent(grantId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** The subjects this site's organization can name: its own users, groups and roles. */
+export function fetchGrantSubjects(siteId: string, search = ""): Promise<MediaGrantSubject[]> {
+  const query = new URLSearchParams({ site_id: siteId });
+  if (search) {
+    query.set("search", search);
+  }
+  return request<MediaGrantSubject[]>(`/api/v1/media/grant-subjects?${query.toString()}`);
 }
 
 // --------------------------------------------------------------------------------------------

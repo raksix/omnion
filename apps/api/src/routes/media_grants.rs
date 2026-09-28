@@ -281,6 +281,15 @@ fn validate_effect_and_bits(effect: &str, capabilities: Capabilities) -> Result<
     Ok(effect.to_owned())
 }
 
+/// The one "not a grant" answer, for every site that has to refuse one.
+///
+/// One function rather than four `ApiError::new` calls: the share suite's rule is that a `404`
+/// must be *identical* everywhere, because two different "no such grant" messages are a free
+/// oracle for a caller walking ids.
+fn grant_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "grant_not_found", "no such grant")
+}
+
 // ---------------------------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------------------------
@@ -377,41 +386,53 @@ pub async fn delete_one(
     Path(grant_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let pool = state.db().pool();
+
+    // The lookup is **scoped by the caller's organization in the same `where` clause**. Reading
+    // the row unscoped and checking afterwards — which is what this first did — produces a
+    // `403` for another tenant's grant, and a `403` is exactly the difference between "that is
+    // not yours" and "that is not real". Grant ids are walkable, so the answer has to be the
+    // second one. The join does the scoping, so there is no window in which an id's existence
+    // leaks.
+    let organization_id: Option<Uuid> = current.user.organization_id;
     let grant: Grant = sqlx::query_as(
-        "select id, folder_id, media_id, subject_kind, subject_id, can_read, can_write, \
-                can_delete, can_share, effect, created_by, created_at \
-         from media_grants where id = $1",
+        "select g.id, g.folder_id, g.media_id, g.subject_kind, g.subject_id, g.can_read, \
+                g.can_write, g.can_delete, g.can_share, g.effect, g.created_by, g.created_at \
+         from media_grants g \
+         left join media_folders f on f.id = g.folder_id \
+         left join media m on m.id = g.media_id \
+         where g.id = $1 \
+           and (coalesce(f.site_id, m.site_id) is not null and exists ( \
+                  select 1 from sites s \
+                  where s.id = coalesce(f.site_id, m.site_id) \
+                    and (s.organization_id = $2 or s.organization_id is null)))",
     )
     .bind(grant_id)
+    .bind(organization_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::from(omnion_media::MediaError::Database(e)))?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "grant_not_found",
-            "no such grant",
-        )
-    })?;
+    .ok_or_else(grant_not_found)?;
 
-    let (site_id, organization_id, label) = match grant.target() {
+    // The node is resolved for the audit entry only — the tenancy check already happened in
+    // the lookup above, and repeating it here would refuse a platform-level reader whose own
+    // account carries no organization, which is not the same question.
+    let (site_id, label) = match grant.target() {
         Some(GrantTarget::Folder(id)) => {
-            let folder = folder_in_scope(&state, &current, id).await?;
-            let site = site_in_scope(&state, &current, folder.site_id).await?;
-            (folder.site_id, site.organization_id, format!("folder {}", folder.path))
+            let Some(folder) = omnion_media::find_folder(pool, id).await.map_err(ApiError::from)?
+            else {
+                return Err(grant_not_found());
+            };
+            (folder.site_id, format!("folder {}", folder.path))
         }
         Some(GrantTarget::File(id)) => {
-            let file = file_any_state_in_scope(&state, &current, id).await?;
-            let site = site_in_scope(&state, &current, file.site_id).await?;
-            (file.site_id, site.organization_id, format!("file {}", file.filename))
+            let Some(file) =
+                omnion_media::find_file_any_state(pool, id).await.map_err(ApiError::from)?
+            else {
+                return Err(grant_not_found());
+            };
+            (file.site_id, format!("file {}", file.filename))
         }
-        None => {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                "grant_not_found",
-                "no such grant",
-            ));
-        }
+        None => return Err(grant_not_found()),
     };
 
     let removed = delete_grant(pool, grant_id).await.map_err(ApiError::from)?;
@@ -627,10 +648,17 @@ async fn write_grant(
     .await
     .map_err(ApiError::from)?;
 
+    let audit_target = match grant.target() {
+        Some(GrantTarget::Folder(_)) => "media_folder",
+        Some(GrantTarget::File(_)) => "media_file",
+        // Unreachable behind the XOR constraint; the row type still has to be total.
+        None => "media_grant",
+    };
+    let _ = node_kind;
     omnion_audit::record(
         state.db().pool(),
         NewAuditEntry::by_user(current.user.id, "media.grant_changed")
-            .target(node_kind, grant_target_id(&grant).to_string())
+            .target(audit_target, grant_target_id(&grant).to_string())
             .metadata(json!({
                 "site_id": site_id,
                 "grant_id": grant.id,

@@ -576,12 +576,12 @@ pub fn router(state: AppState) -> Router {
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
     let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
         .layer(guards::require(&state, "media.manage"));
-    // Two independent routers rather than one value mounted twice: `MethodRouter` is moved
-    // into each `.route()` call, so sharing it would move out of the first and fail the second
-    // at runtime rather than at compile time.
-    let media_folder_grant_delete: MethodRouter<AppState, Infallible> =
-        delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
-    let media_file_grant_delete: MethodRouter<AppState, Infallible> =
+    // A grant is removed by its own id alone — the row knows the node it was written on, so
+    // putting the node in the URL as well would make a two-parameter path with a one-parameter
+    // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
+    // both *static* segments under `/media/`, so they rank ahead of `/media/{id}/…` and are
+    // never read as a media id.
+    let media_grant_delete: MethodRouter<AppState, Infallible> =
         delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
     let media_subjects: MethodRouter<AppState, Infallible> =
         get(media_grants::subjects).layer(guards::require(&state, "media.read"));
@@ -1003,10 +1003,10 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        .route("/media/folders/{id}/grants/{grant_id}", media_folder_grant_delete)
+        
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
-        .route("/media/{id}/grants/{grant_id}", media_file_grant_delete)
+        .route("/media/grants/{grant_id}", media_grant_delete)
         .route("/media/grant-subjects", media_subjects)
         .route("/media/{id}/grant-effective", media_grant_effective)
         .route("/media/transformation-presets", media_preset_create)

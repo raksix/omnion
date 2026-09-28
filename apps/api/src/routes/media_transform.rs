@@ -326,7 +326,7 @@ pub async fn raw_with_preset(
     // one are the same file, and a derivative of a quarantined file is still a quarantined
     // file. Putting the check inside `serve_original` instead would leave the *cached* path
     // (the one a published page actually fetches, served with `max-age=31536000`) open.
-    crate::routes::media::ensure_servable(&state, &media).await?;
+    crate::routes::media::ensure_servable(&state, &current, &media).await?;
 
     let Some(requested) = query
         .preset

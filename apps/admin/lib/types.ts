@@ -375,6 +375,77 @@ export type MediaShare = {
  * `token` and `url` exist on this type and on no other — which is how the screen knows to put
  * the one-time copy panel on screen and to never try to show a link it cannot re-derive.
  */
+/**
+ * One grant on a folder or a file (docs/requests/REQ-010, slice 4).
+ *
+ * `subject_label` is `null` for a subject that has since been deleted. The panel prints
+ * "Deleted subject" rather than a raw uuid: a stale row refuses nobody and grants nobody, and
+ * the only action that matters on it is removal — a line showing a uuid teaches nobody which
+ * grant to remove.
+ */
+export type MediaGrant = {
+  id: string;
+  subject_kind: "user" | "group" | "role";
+  subject_id: string;
+  subject_label: string | null;
+  can_read: boolean;
+  can_write: boolean;
+  can_delete: boolean;
+  can_share: boolean;
+  effect: "allow" | "deny";
+  created_by: string | null;
+  created_at: string;
+  /** The capability words, for a summary line. */
+  capabilities: string[];
+};
+
+/** One folder on a file's chain, nearest first, with what it contributes. */
+export type MediaGrantChainNode = {
+  id: string;
+  /** The folder's materialised path, which is already the breadcrumb. */
+  path: string;
+  grant_count: number;
+  /** Whether it carries a deny that reaches this file's subject set. */
+  has_deny: boolean;
+};
+
+/** What the permissions tab reads: the rows on one node, and the chain above a file. */
+export type MediaGrantsResponse = {
+  target_kind: "file" | "folder";
+  target_id: string;
+  grants: MediaGrant[];
+  /** Whether a grant on this node reaches what is inside it. Always true for a folder. */
+  inherits: boolean;
+  chain: MediaGrantChainNode[];
+};
+
+/** What a grant is written with. Absent bits are `false`, never "unchanged". */
+export type NewMediaGrant = {
+  subject_kind: "user" | "group" | "role";
+  subject_id: string;
+  can_read?: boolean;
+  can_write?: boolean;
+  can_delete?: boolean;
+  can_share?: boolean;
+  effect?: "allow" | "deny";
+};
+
+/**
+ * One subject the picker may offer.
+ *
+ * `suggested` marks a group: it is the row that survives somebody joining and leaving a team,
+ * so a grant given to a person has to be rewritten when the person changes roles and a grant
+ * given to a group does not.
+ */
+export type MediaGrantSubject = {
+  id: string;
+  kind: "user" | "group" | "role";
+  label: string;
+  /** An email, a member count, or a role key — the second line of the picker's row. */
+  detail: string;
+  suggested: boolean;
+};
+
 export type CreatedMediaShare = {
   share: MediaShare;
   url: string;
