@@ -2427,3 +2427,57 @@
   record it. A REQ cannot close on a pass that did not run, so the next tick starts with the
   mobile pass and a retry, and checks `MemAvailable` and the sibling-pass count *before* launching
   one rather than interpreting the failure afterwards.
+
+## The member drawer (REQ-005, slice 4)
+
+- **What this tick found, by reading the spec before writing code.** The Members bullet names a
+  drawer and the QA plan opens one ("open a member drawer and extend a binding"). Neither
+  existed. Reading the sentence closely turned up a second gap worth its own line: the spec lists
+  **three** operations — *add / extend / revoke* — and the platform had verbs for two.
+  `POST /iam/bindings` granted, `DELETE /iam/bindings/{id}` revoked, and nothing could *lengthen*
+  a temporary grant, so giving somebody another month meant revoking and re-granting.
+- **Why "extend" must not be revoke-then-grant.** That implementation passes every assertion a
+  person can make by eye and leaves two live bindings for one role and scope. The
+  effective-permissions screen then renders the same role twice with two different windows,
+  neither of which is the truth. `bindings::extend_expiry` updates **the same row**, and the
+  statement carries `revoked_at is null` so a grant the trail already recorded as revoked cannot
+  come back to life. The walk that proves it is
+  `a_temporary_grant_is_extended_in_place_and_never_into_a_second_row`, and the assertion that
+  catches it is a **count** — `bindingRowsAfter == bindingRowsBefore`.
+- **One read for the whole panel.** Four parallel requests would let the identity render over an
+  empty binding list, and an empty list under a colleague's name is a statement about that
+  colleague, not about a spinner. `GET /organizations/{id}/members/{user_id}` answers everything
+  the drawer renders.
+- **Isolation.** Another tenant's member is a `404`, not a `403` — the second answer confirms the
+  id exists. A grant is refused when the subject is not a member here, when the role belongs to
+  another tenant (`cross_organization`), and for a `global` scope by name rather than quietly
+  downgraded to `organization`: a tenant administrator asking for a platform grant is asking for
+  something the platform owns, and a silent downgrade makes the grant do something other than
+  what the panel said.
+- **Proof.** `cargo check -p omnion-api --tests` → clean. `pnpm typecheck` in `apps/admin` →
+  clean (the LSP caught two real nullability errors in the drawer before the gate did: a revoked
+  row's `revoked_at` and an extended binding's `expires_at` are both nullable, and both were
+  being formatted as though they were not).
+  `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **23 passed, 5 failed**;
+  three of the five are the baseline cross-test interference the ledger already records
+  (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
+  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`), and the two new walks' own
+  first run failed for the reasons corrected below.
+- **Two failures that were wrong *assertions*, not wrong code — and one of them was the better
+  answer.** The first run asserted that extending a revoked grant is a `404`. It is a `400
+  binding_revoked`, and the `400` is right: the row exists, the operator can see it in the drawer,
+  and "there is no such grant" would send them hunting for a typo instead of reading the sentence
+  that states the rule. The second asserted that the subject's drawer shows the grant. It must
+  not: the grant was performed by the *administrator*, so it belongs on the grantor's trail and
+  in the organization's Audit tab, and putting an administrator's acts inside a panel about a
+  colleague is the wrong half of a privacy decision made by accident. Both assertions now pin the
+  intended behaviour rather than the one that happened.
+- **The QA pass was deferred, by a number, before it was launched.** `MemAvailable` 4G against a
+  `>8G` precondition, **eight** sibling `qa/run.sh` processes, load average 34. Those are the
+  conditions the last six attempts on this branch died in, and they were readable in one `free`
+  and one `pgrep` a minute before starting. The walkthrough pass for the drawer is written
+  (`runOrganizationMemberDrawer`, wired after the departments pass) and `node --check` clean; it
+  runs when the box has room. The REQ stays open.
+- **Next.** The mobile pass at 390×844 (member drawer, Settings/Modules/Billing/Audit tabs, the
+  organization detail), then the QA walkthrough. Then the platform-account criterion, the last
+  unticked line on this REQ.

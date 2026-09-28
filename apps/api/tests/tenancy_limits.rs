@@ -3282,7 +3282,7 @@ async fn grant_drawer_permissions(db: &Db, organization_id: Uuid, user_id: Uuid)
 /// perfectly and be wrong, so the walk grants first and reads after.
 #[tokio::test]
 async fn the_member_drawer_answers_with_everything_it_renders() {
-    let Some(mut fixture) = Fixture::new().await else {
+    let Some(fixture) = Fixture::new().await else {
         return;
     };
     let admin = fixture.admin_token().await;
@@ -3344,16 +3344,43 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
     assert_eq!(bindings[0]["id"], binding_id);
     assert_eq!(bindings[0]["role_id"], role_id.to_string());
 
-    // The grant is on this tenant's trail, naming the member and the role.
-    let trail = after.body["recent_audit"].as_array().expect("an audit array");
-    let role_changed = trail
+    // Whose trail is this? The subject's own acts. The grant was performed by the
+    // *administrator*, so it belongs on the administrator's drawer and in the organization's
+    // Audit tab — and showing an administrator's private trail inside a panel about a colleague
+    // would be the wrong half of a privacy decision made by accident. Asserting the subject's
+    // trail is empty therefore pins the boundary down rather than leaving it to whichever side
+    // of the line the implementation happened to land on.
+    let subject_trail = after.body["recent_audit"].as_array().expect("an audit array");
+    assert!(
+        !subject_trail
+            .iter()
+            .any(|row| row["action"] == "organization.member.role_changed"),
+        "the subject's drawer must not carry the administrator's own acts: {subject_trail:?}"
+    );
+
+    // The grant is on the *grantor's* trail, in this tenant, naming the member and the role.
+    let grantor_uri = format!(
+        "/api/v1/organizations/{}/members/{}",
+        fixture.org_a, fixture.accounts[0]
+    );
+    let grantor = call(
+        &fixture.state,
+        request(Method::GET, &grantor_uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(grantor.status, StatusCode::OK, "grantor: {}", grantor.body);
+    let grantor_trail = grantor.body["recent_audit"]
+        .as_array()
+        .expect("an audit array");
+    let role_changed = grantor_trail
         .iter()
         .find(|row| row["action"] == "organization.member.role_changed");
     assert!(
         role_changed.is_some(),
-        "the drawer must show the grant it just made: {:?}",
-        after.body["recent_audit"]
+        "the grant must be on the grantor's own trail: {grantor_trail:?}"
     );
+    // And a human name, not a blank — the Audit tab resolves it and so must this.
+    assert_eq!(role_changed.expect("the grant row")["actor_name"], "Tenant Test");
 
     // The other tenant's administrator may not open this member at all — a `404`, because a
     // `403` would confirm that the user id exists somewhere.
@@ -3379,7 +3406,7 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
 /// replaced.
 #[tokio::test]
 async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
-    let Some(mut fixture) = Fixture::new().await else {
+    let Some(fixture) = Fixture::new().await else {
         return;
     };
     let admin = fixture.admin_token().await;
@@ -3504,8 +3531,11 @@ async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
         ),
     )
     .await;
-    assert_eq!(reopen.status, StatusCode::NOT_FOUND);
-    assert_eq!(code_of(&reopen.body), "binding_not_found");
+    // A revoked grant is refused *by name* rather than answered as a 404. The row exists, the
+    // caller can see it in the drawer, and "there is no such grant" would send them looking for
+    // a typo instead of reading the sentence that explains the rule.
+    assert_eq!(reopen.status, StatusCode::BAD_REQUEST, "reopen: {}", reopen.body);
+    assert_eq!(code_of(&reopen.body), "binding_revoked");
 
     fixture.cleanup().await;
 }
