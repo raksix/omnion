@@ -3365,3 +3365,27 @@ of this worker's files.
 **Next.** The mobile pass and the keyboard sheet, now against a gate that is known to run. The
 keyboard sheet is written last and only lists bindings the six screens actually implement — a sheet
 naming a binding no screen has is a dead list.
+
+**A second defect, found by waiting for the first one.** Once the build was fixed the pass still did
+not start, and the reason was in the queue: the only QA place on the box was held by pid 2347379,
+which was dead. The lock file is *named* after the process that takes a place, but that process exits
+immediately after handing the place to a background holder — so the liveness check always answered
+"gone", and a genuinely live pass looked abandoned. Only the 45-minute age floor stood between that
+and a reaper stealing a place that is in use; conversely a pass that died without running its trap
+blocked the whole queue for 45 minutes. `qa-slot.sh` now asks about the **holder** pid, and treats a
+holder-less place as reclaimable only once it is 120s old, so the few hundred milliseconds between
+taking a place and writing its holder file are not mistaken for an orphan.
+
+Verified with a throwaway lock directory rather than by inspection: a live holder survives, a dead
+holder is reclaimed, a fresh holder-less place is kept, and a dead+old place is reclaimed — **4/4**.
+
+The orphaned place was then cleared by hand (both pids confirmed dead, no live pass owning it) and a
+sibling writer's pass took the slot within seconds, which is the correct outcome: the fix lets the
+queue move instead of stranding it.
+
+**State of the two remaining boxes.** The mobile pass and the keyboard sheet are still open. The pass
+that will prove tick 14's four sweep steps is queued behind a live sibling, so this tick ends with the
+gate fixed and running-but-waiting rather than with a new screen.
+
+**Next.** Re-run the w4 pass and read the four sweep steps; then the 390×844 mobile pass and the
+keyboard sheet, written only from bindings the six screens actually implement.
