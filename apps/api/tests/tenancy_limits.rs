@@ -3662,3 +3662,148 @@ async fn a_grant_stays_inside_the_tenant_that_makes_it() {
 
     fixture.cleanup().await;
 }
+
+
+/// A platform account has no tenant of its own, so a write that does not name one has no
+/// subject. The criterion for this walk is the *whole* sentence: "a platform account can list
+/// every organization and must send `organization_id` on a write; omitting it is a 400 naming
+/// the field". Each clause is asserted separately, and the order matters — the list first, so
+/// the later assertions are known to be about a platform account rather than about a session
+/// that failed to sign in.
+#[tokio::test]
+async fn a_platform_account_names_the_tenant_every_write_needs() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // A platform account: no membership, no primary organization, holding the permissions at
+    // global scope. `seed::bind_owner` is the same door the real installer walks through, so
+    // the account is not a special case assembled out of parts.
+    let (platform_id, platform_email) = create_account(&fixture.db).await;
+    fixture.track_account(platform_id).await;
+    seed::bind_owner(fixture.db.pool(), platform_id)
+        .await
+        .expect("the platform owner binding must be created");
+    let platform = login(&fixture.state, &platform_email).await;
+
+    // First clause: it sees every organization, not just one.
+    let listed = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/organizations", Some(&platform), None),
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "list: {}", listed.body);
+    let ids: Vec<String> = listed.body["organizations"]
+        .as_array()
+        .expect("organizations is an array")
+        .iter()
+        .map(|row| row["id"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        ids.contains(&fixture.org_a.to_string()),
+        "the platform sees tenant A: {ids:?}"
+    );
+    assert!(
+        ids.contains(&fixture.org_b().to_string()),
+        "the platform sees tenant B: {ids:?}"
+    );
+
+    // Second clause: the write without `organization_id`. This is a *different* refusal from
+    // the permission guard, and that distinction is the whole point of the assertion — an
+    // account without `sites.create` would answer `403 permission_denied` and a walk that only
+    // checked the status would record the platform's rule as proven while proving the
+    // permission instead.
+    let no_tenant = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/sites",
+            Some(&platform),
+            Some(json!({ "key": "no-tenant", "name": "No tenant" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        no_tenant.status,
+        StatusCode::BAD_REQUEST,
+        "a write without a tenant is a 400: {}",
+        no_tenant.body
+    );
+    assert_eq!(code_of(&no_tenant.body), "organization_required");
+    // "Naming the field" is the clause people leave out: the sentence already contains the
+    // string `organization_id`, so an assertion on the message passes against an error a
+    // client cannot act on. The structured `field` is what a panel needs to put a picker next
+    // to the input that is missing, so that is what is asserted.
+    assert_eq!(
+        no_tenant.body["error"]["details"]["field"], "organization_id",
+        "the refusal names the field to send: {}",
+        no_tenant.body
+    );
+    assert_eq!(
+        no_tenant.body["error"]["details"]["reason"], "no_primary_organization",
+        "the refusal says why the tenant is required: {}",
+        no_tenant.body
+    );
+    assert!(
+        no_tenant.body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("organization_id"),
+        "the sentence is readable without the details: {}",
+        no_tenant.body["error"]["message"]
+    );
+
+    // Nothing was written: a refused create must not leave a site behind, or the next walk to
+    // read this tenant's sites finds a row that no request ever asked for.
+    let sites = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/sites?organization_id={}", fixture.org_a),
+            Some(&platform),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sites.status, StatusCode::OK, "sites: {}", sites.body);
+    let keys: Vec<String> = sites.body["sites"]
+        .as_array()
+        .expect("sites is an array")
+        .iter()
+        .map(|site| site["key"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        !keys.contains(&"no-tenant".to_owned()),
+        "a refused create wrote nothing: {keys:?}"
+    );
+
+    // Third clause: the same write *with* the field goes through — which is what makes the 400
+    // a requirement rather than a prohibition.
+    let with_tenant = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/sites",
+            Some(&platform),
+            Some(json!({
+                "key": "platform-site",
+                "name": "Platform site",
+                "organization_id": fixture.org_a,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        with_tenant.status,
+        StatusCode::CREATED,
+        "naming the tenant makes the same write work: {}",
+        with_tenant.body
+    );
+    assert_eq!(
+        with_tenant.body["organization_id"],
+        fixture.org_a.to_string(),
+        "the site belongs to the tenant it named"
+    );
+
+    fixture.cleanup().await;
+}

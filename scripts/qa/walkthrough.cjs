@@ -1784,6 +1784,13 @@ async function runIamSubjectsDepth(page, report) {
     await pickFirstOption("[data-user-binding-role]");
   });
   await page.selectOption("[data-user-binding-scope]", "organization").catch(() => {});
+  // A subject that has no organization of its own — a platform account — is the only case
+  // where the grant form has to ask which tenant it applies to. The QA account is an
+  // organization member, so the picker is *absent* here, and asserting its absence is the
+  // point: a control that renders for everybody would invite an operator to narrow a grant
+  // that the session already decides.
+  const pickerPresent = await page.locator("[data-testid='user-binding-organization']").count();
+  note({ step: "binding-tenant-picker", presentForMember: pickerPresent > 0 });
   await page.locator("[data-user-binding-add]").first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1600);
   const bindingRows = await page.locator("[data-user-binding-row]").count();

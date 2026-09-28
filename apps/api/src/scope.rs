@@ -80,6 +80,14 @@ pub fn platform_only(current: &CurrentSession) -> Result<(), ApiError> {
 }
 
 /// The organization an action applies to: the caller's own unless a platform account picks one.
+///
+/// The fourth arm is the one the panel has to be able to *act* on. An account without a primary
+/// organization holds no tenant of its own, so a write that does not name one has no subject:
+/// answering `400 organization_required` with the sentence alone leaves the panel printing
+/// "organization_id is required" in a banner above a form that has no organization control on
+/// it. `field: "organization_id"` is what lets a client put a picker next to the failing field
+/// instead of guessing, and it is the difference between a refusal that is *actionable* and one
+/// that is merely correct.
 pub fn resolve_organization(
     current: &CurrentSession,
     requested: Option<Uuid>,
@@ -88,11 +96,24 @@ pub fn resolve_organization(
         (Some(own), Some(target)) if own != target => Err(cross_organization()),
         (Some(own), _) => Ok(own),
         (None, Some(target)) => Ok(target),
-        (None, None) => Err(ApiError::bad_request(
-            "organization_required",
-            "organization_id is required for an account without a primary organization",
-        )),
+        (None, None) => Err(organization_required()),
     }
+}
+
+/// The `400` handed out when an account without a primary organization writes without naming a
+/// tenant. Shared so every route that resolves a scope answers with the same code, the same
+/// message and the same `field` — a walk that catches one route answering it and passes while a
+/// sibling answers a bare sentence has proved the shape, not the rule.
+#[must_use]
+pub fn organization_required() -> ApiError {
+    ApiError::bad_request(
+        "organization_required",
+        "organization_id is required for an account without a primary organization",
+    )
+    .with_details(serde_json::json!({
+        "field": "organization_id",
+        "reason": "no_primary_organization",
+    }))
 }
 
 /// The `403` handed out when an account reaches outside its own organization.
@@ -200,6 +221,39 @@ mod tests {
                 .expect_err("another tenant is out of scope")
                 .code(),
             "cross_organization"
+        );
+    }
+
+    #[test]
+    fn a_missing_tenant_names_the_field_a_client_has_to_send() {
+        // The criterion is "a 400 naming the field", and "naming" is the part that is easy to
+        // leave out: a bare sentence contains the string `organization_id` too, so an assertion
+        // on `message.contains("organization_id")` passes against an error a client cannot act
+        // on. The structured `field` is the contract.
+        let refusal = resolve_organization(&session_for(None), None)
+            .expect_err("a platform account has to name a tenant");
+
+        assert_eq!(refusal.code(), "organization_required");
+        assert_eq!(refusal.status(), axum::http::StatusCode::BAD_REQUEST);
+        let details = refusal
+            .details()
+            .unwrap_or_else(|| panic!("a missing tenant names the field it has to send"));
+        assert_eq!(details["field"], "organization_id");
+        assert_eq!(details["reason"], "no_primary_organization");
+
+        // The two failures a client renders differently: a missing tenant is *its* problem to
+        // fix (ask for one), while reaching into another tenant is a refusal it must not offer
+        // a way around. If the second ever carried a `field` too, a client could be talked into
+        // showing a picker that only ever produces this same error.
+        let out_of_scope =
+            resolve_organization(&session_for(Some(Uuid::new_v4())), Some(Uuid::new_v4()))
+                .expect_err("another tenant is out of scope");
+        assert_eq!(out_of_scope.code(), "cross_organization");
+        assert_eq!(out_of_scope.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            out_of_scope.details().is_none(),
+            "cross_organization names no field to fix: {:?}",
+            out_of_scope.details()
         );
     }
 
