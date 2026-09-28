@@ -4120,3 +4120,174 @@ export function testMediaStorageConnection(
     body: JSON.stringify(input),
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task routing and feature overrides (REQ-098, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which map a routing read or write addresses.
+ *
+ * The three cases are the three scopes the resolver walks, and they are spelled the way the
+ * endpoints spell them so the panel and the API cannot disagree about which map is on screen.
+ */
+export type AiRoutingScope =
+  | { kind: "installation" }
+  | { kind: "organization"; organizationId: string }
+  | { kind: "site"; siteId: string };
+
+/** One candidate in a task's ordered list. */
+export type AiRouteCandidate = {
+  /** 1-based; the primary is 1 and the order is the fallback order. */
+  position: number;
+  /** The model, or null when the row survives a model that was later removed. */
+  model_id: string | null;
+  /** The model key as the panel shows it. */
+  model_label: string | null;
+  /** True when the candidate cannot answer as it stands — the "needs attention" badge. */
+  needs_attention: boolean;
+  /** Why it cannot answer, when it cannot. */
+  refusal: string | null;
+  /** Capabilities this task's requests require here. */
+  requirements: string[];
+  /** Whether the model is switched off. */
+  enabled: boolean;
+};
+
+/** One task row of the routing screen. */
+export type AiTaskRoute = {
+  task: string;
+  description: string;
+  candidates: AiRouteCandidate[];
+  /** True when these candidates were inherited from a wider scope. */
+  inherited: boolean;
+  /** True when nothing is configured for this task anywhere in the chain. */
+  empty: boolean;
+};
+
+/** One feature pin. */
+export type AiFeatureOverride = {
+  feature: string;
+  model_id: string;
+  model_label: string;
+  scope: Record<string, string>;
+  updated_at: string;
+};
+
+/** A known feature key with its description, driving the override form. */
+export type AiFeatureInfo = { key: string; description: string };
+
+/** The whole routing screen in one response. */
+export type AiRouting = {
+  scope: Record<string, string>;
+  tasks: AiTaskRoute[];
+  overrides: AiFeatureOverride[];
+  chain: Record<string, string>[];
+  requirements: string[];
+  features: AiFeatureInfo[];
+  /** The resolution order, served so the legend cannot drift from the resolver. */
+  rules: string[];
+  /** Tasks that cannot resolve at this scope. */
+  unresolved: string[];
+};
+
+/** One line of a resolution walk. */
+export type AiWalkEntry = {
+  position: number | null;
+  model_id: string | null;
+  outcome: "chosen" | "skipped";
+  reason: string;
+  scope: Record<string, string>;
+  source: string;
+};
+
+/** The dry run's answer. */
+export type AiRoutingPreview = {
+  model: { model_id: string; position: number | null; source: string; scope: Record<string, string> } | null;
+  walk: AiWalkEntry[];
+  rule: string;
+  unresolved: boolean;
+  scope: Record<string, string>;
+  rules: string[];
+};
+
+/** The query parameters that select a scope, appended to a routing path. */
+function routingScopeParams(scope: AiRoutingScope): URLSearchParams {
+  const params = new URLSearchParams();
+  if (scope.kind === "organization") params.set("organization_id", scope.organizationId);
+  if (scope.kind === "site") params.set("site_id", scope.siteId);
+  return params;
+}
+
+/** The task map of one scope, with inherited rows marked. */
+export async function fetchAiRouting(scope: AiRoutingScope): Promise<AiRouting> {
+  const params = routingScopeParams(scope);
+  const suffix = params.toString();
+  return request<AiRouting>(
+    suffix ? `/api/v1/ai/routing?${suffix}` : "/api/v1/ai/routing",
+  );
+}
+
+/** Replace one task's candidate list at a scope. */
+export async function putAiTaskMap(
+  scope: AiRoutingScope,
+  task: string,
+  candidates: { modelId: string; requirements: string[] }[],
+): Promise<AiRouting> {
+  return request<AiRouting>("/api/v1/ai/routing", {
+    method: "PUT",
+    body: JSON.stringify({
+      task,
+      ...scopeParamsForBody(scope),
+      candidates: candidates.map((candidate) => ({
+        model_id: candidate.modelId,
+        requirements: candidate.requirements,
+      })),
+    }),
+  });
+}
+
+/** Pin (or unpin, with `null`) one feature at a scope. */
+export async function putAiFeatureOverride(
+  scope: AiRoutingScope,
+  feature: string,
+  modelId: string | null,
+): Promise<AiFeatureOverride[]> {
+  return request<AiFeatureOverride[]>("/api/v1/ai/routing/overrides", {
+    method: "PUT",
+    body: JSON.stringify({ feature, ...scopeParamsForBody(scope), model_id: modelId }),
+  });
+}
+
+/** Resolve a hypothetical request without calling a provider. */
+export async function previewAiRouting(input: {
+  scope: AiRoutingScope;
+  task?: string;
+  feature?: string;
+  requested?: string;
+  requires?: string[];
+}): Promise<AiRoutingPreview> {
+  return request<AiRoutingPreview>("/api/v1/ai/routing/preview", {
+    method: "POST",
+    body: JSON.stringify({
+      ...scopeParamsForBody(input.scope),
+      ...(input.task ? { task: input.task } : {}),
+      ...(input.feature ? { feature: input.feature } : {}),
+      ...(input.requested?.trim() ? { requested: input.requested.trim() } : {}),
+      requires: input.requires ?? [],
+    }),
+  });
+}
+
+/**
+ * The scope fields a JSON body carries.
+ *
+ * The same two keys as the query string, because the endpoints flatten one shape into both. A
+ * site carries only its id: the endpoint reads the site's organization from the database rather
+ * than trusting the payload, so a client cannot name a site and a different organization.
+ */
+function scopeParamsForBody(scope: AiRoutingScope): Record<string, string> {
+  if (scope.kind === "organization") return { organization_id: scope.organizationId };
+  if (scope.kind === "site") return { site_id: scope.siteId };
+  return {};
+}

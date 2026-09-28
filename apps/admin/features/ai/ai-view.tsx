@@ -59,6 +59,7 @@ import {
 import { formatTimestamp } from "@/lib/format";
 
 import { AiHealthPanels } from "./ai-health-panel";
+import { AiRoutingScreen } from "./ai-routing";
 import { ModelCatalog } from "./model-catalog";
 
 /**
@@ -1379,6 +1380,27 @@ export function AiView() {
         ) : (
           <ModelCatalog providers={providers} models={models} onReload={reload} />
         )}
+      </section>
+
+      {/* Routing (REQ-098 slice 2). It sits below the catalog on purpose: the catalog says what a
+          model can do, and routing is only meaningful once there is something to route to. The
+          section is its own, not a tab, because "which model answers a cheap request" is a
+          question an operator asks next to "what does the cheap model cost". */}
+      <section className="rounded-xl border border-line bg-surface">
+        <header className="border-b border-line px-4 py-3">
+          <h2 className="text-[13.5px] font-semibold">Routing</h2>
+          <p className="text-[12px] text-muted">
+            Which model answers each task, and why. A candidate that is switched off or cannot
+            claim a requirement is shown with its reason rather than quietly dropped.
+          </p>
+        </header>
+        <div className="px-4 py-4">
+          {models === null ? (
+            <LoadingTable columns={4} rows={3} />
+          ) : (
+            <AiRoutingScreen models={models} />
+          )}
+        </div>
       </section>
 
       {/* Try it */}
