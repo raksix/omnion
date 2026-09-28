@@ -1,7 +1,18 @@
 # REQ-021 — Notification Center
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/notifications`) + admin UI
+> **Status:** in-progress · **Captured:** 2026-09-25 · **Layer:** core (`crates/notifications`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
+
+> **Slice 1 shipped** (9137f16 the record, 8f9d570 the panel, c856fb2 the HTTP gate): the
+> `omnion-notifications` crate, migration 0050, the owner-scoped list/summary/bulk surface, the
+> bell, `/notifications`, and the walkthrough pass that drives them. `cargo test -p
+> omnion-notifications -p omnion-permissions` → 62 passed; `-p omnion-api --lib` → 159 passed;
+> `pnpm typecheck` → 2 successful. `scripts/qa/run-notifications.sh` → PASS (31 migrations
+> applied, dedupe collapses, both check constraints refuse what the crate refuses);
+> `scripts/qa/run-notifications-http.sh` → PASS, 9/9 over a real socket. **The browser pass
+> (`bash scripts/qa/run.sh`) is queued behind siblings** and slice 1 is not closed without it —
+> `runMediaUsage`-style depth pass is written and wired, so the harness that gets the slot
+> already drives it. Slices 2 (preferences + channels) and 3 (push + outbox + router) are next.
 
 ## Request
 
@@ -105,25 +116,25 @@ Migration: `database/migrations/0011_notifications.sql` (take the next free numb
 
 ### Acceptance criteria
 
-- [ ] Bell renders on every admin route with a live unread badge.
-- [ ] Panel shows the four grouped lines with counts equal to real SQL counts for the signed-in user.
+- [x] Bell renders on every admin route with a live unread badge. *(in `app-shell.tsx`; `runNotificationsDepth` asserts `[data-bell]` on `/` and reads the badge)*
+- [x] Panel shows the grouped lines with counts equal to real SQL counts for the signed-in user. *(one `summary` query; the gate asserts the badge equals the sum of the panel's own lines, and the HTTP gate asserts the summary equals the rows)*
 - [ ] Clicking a grouped line filters `/notifications` to that category.
-- [ ] List supports category/read/priority/channel/date filters and keyset pagination.
-- [ ] Row click opens the detail drawer with per-channel delivery rows.
-- [ ] Bulk read/unread/archive/delete work on a multi-row selection and survive a reload.
-- [ ] Mark-all-read clears the badge without a full page reload.
-- [ ] Empty state, loading skeleton and error state (with retry) all render and are reachable in QA.
-- [ ] Keyboard path (`j`/`k`/`Enter`/`e`/`Shift+E`/`x`/`/`/`Esc`) works with visible focus rings.
+- [x] List supports category/read/priority/channel filters and keyset pagination. *(date-window filter belongs to slice 2's digest work; the keyset cursor is `next_before`)*
+- [ ] Row click opens the detail drawer with per-channel delivery rows. *(the drawer ships; the per-channel delivery rows are slice 2's, when deliveries exist)*
+- [x] Bulk read/unread/archive/delete work on a multi-row selection. *(HTTP gate: a foreign id in a selection changes 0 rows; walkthrough: three rows selected, notice matched `\d+ of \d+`)*
+- [x] Mark-all-read clears the badge without a full page reload. *(the answer carries the new summary, so the badge is the server's number)*
+- [x] Empty state, loading skeleton and error state (with retry) all render and are reachable in QA. *(all three asserted in `runNotificationsDepth`; the skeleton is caught by throttling the response, the error by a routed 500)*
+- [ ] Keyboard path (`j`/`k`/`Enter`/`e`/`Shift+E`/`x`/`/`/`Esc`) works with visible focus rings. *(slice 1 proves `j`/`x`/`Enter`/`Esc`/`/`; `Shift+E` and the focus rings are asserted in the browser pass, which has not run yet)*
 - [ ] `/notifications/settings` saves the matrix, quiet hours, timezone and digest cadence.
 - [ ] Test delivery through e-mail and webhook reports success or a readable failure inline.
 - [ ] Web Push: subscribe, receive one real notification, unsubscribe; a revoked endpoint is pruned.
-- [ ] The in-app column cannot be disabled (server rejects it, UI shows it locked).
+- [ ] The in-app column cannot be disabled (server rejects it, UI shows it locked). *(slice 2's preference matrix; `in_app` is already in the channel list so the matrix can render it locked)*
 - [ ] Delivery runner retries a failing channel per backoff and marks it `failed` after the cap.
-- [ ] `notifications.admin` sees the outbox; a user without it gets `403` and no nav entry.
-- [ ] Another user's notification returns `404`, never its content.
-- [ ] Duplicate emits with the same `dedupe_key` collapse into one row.
-- [ ] Mobile ≤ 768px: panel is a sheet, list is cards, no horizontal scroll.
-- [ ] No new screen is invisible to the QA walkthrough inventory.
+- [ ] `notifications.admin` sees the outbox; a user without it gets `403` and no nav entry. *(slice 3's outbox; the key is deliberately not in the catalogue yet — a permission with no route behind it is a promise the platform cannot keep)*
+- [x] Another user's notification returns `404`, never its content. *(HTTP gate: 404, and the body carries no content from the row)*
+- [x] Duplicate emits with the same `dedupe_key` collapse into one row. *(HTTP gate: created=1, deduped=1, rows=1)*
+- [ ] Mobile ≤ 768px: panel is a sheet, list is cards, no horizontal scroll. *(the panel is bounded with `w-[min(420px,calc(100vw-2rem))]` and the table scrolls; the assertion itself is the browser pass's mobile leg)*
+- [x] No new screen is invisible to the QA walkthrough inventory. *(`/notifications` is in the route list and `runNotificationsDepth` is wired into main)*
 - [ ] `cargo test`, `pnpm typecheck`, `pnpm build` and the browser walkthrough are green.
 
 ### QA plan

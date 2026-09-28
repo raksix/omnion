@@ -46,6 +46,11 @@ import type {
   Organization,
   OwnerSetupResult,
   Page,
+  NotificationBulkResult,
+  NotificationFilters,
+  NotificationPage,
+  NotificationRow,
+  NotificationSummary,
   Site,
   User,
 } from "./types";
@@ -3954,4 +3959,103 @@ export function releaseMediaQuarantine(
     `/api/v1/media/quarantine/${quarantineId}/release`,
     { method: "POST", body: JSON.stringify({ reason }) },
   );
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Notifications (docs/requests/REQ-021, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build the list's query string from the filters that are actually set.
+ *
+ * Only the *set* filters are sent. A `category=""` in the query string is a filter nobody
+ * meant to apply, and forwarding it would ask the server for the empty category — which the
+ * server refuses with a 400, so a cleared `<select>` would turn the list into an error screen
+ * instead of an unfiltered one.
+ */
+function notificationQuery(filters: NotificationFilters = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === "" || value === false) continue;
+    params.set(key, String(value));
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+/** One page of the caller's own notifications. */
+export function fetchNotifications(
+  filters: NotificationFilters = {},
+): Promise<NotificationPage> {
+  return request<NotificationPage>(`/api/v1/notifications${notificationQuery(filters)}`);
+}
+
+/** The bell's grouped counts. */
+export function fetchNotificationSummary(): Promise<NotificationSummary> {
+  return request<NotificationSummary>("/api/v1/notifications/summary");
+}
+
+/** One notification, or the 404 the API answers for a row that is not the caller's. */
+export function fetchNotification(id: string): Promise<NotificationRow> {
+  return request<NotificationRow>(`/api/v1/notifications/${encodeURIComponent(id)}`);
+}
+
+/** Mark one read or unread; the answer carries the summary so the badge needs no second read. */
+export function setNotificationRead(
+  id: string,
+  read: boolean,
+): Promise<NotificationSummary> {
+  return request<NotificationSummary>(
+    `/api/v1/notifications/${encodeURIComponent(id)}/read`,
+    { method: "POST", body: JSON.stringify({ read }) },
+  );
+}
+
+/** Clear the whole badge in one action. */
+export function markAllNotificationsRead(): Promise<NotificationSummary> {
+  return request<NotificationSummary>("/api/v1/notifications/mark-all-read", { method: "POST" });
+}
+
+/**
+ * One action over a selection: `read`, `unread`, `archive` or `delete`.
+ *
+ * The answer's `changed` is what the API really changed, which is not always the size of the
+ * selection — a row that was already archived is not archived again. The panel reports that
+ * number rather than the selection length, so the message matches what happened.
+ */
+export function bulkNotifications(
+  action: "read" | "unread" | "archive" | "delete",
+  ids: string[],
+): Promise<NotificationBulkResult> {
+  return request<NotificationBulkResult>("/api/v1/notifications/bulk", {
+    method: "POST",
+    body: JSON.stringify({ action, ids }),
+  });
+}
+
+/** Delete one notification. */
+export function deleteNotification(id: string): Promise<null> {
+  return request<null>(`/api/v1/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/**
+ * Send a notification to accounts.
+ *
+ * The panel does not use this — it is the route a module calls — but the developer portal
+ * (REQ-022) does, and a client function that only exists when a screen needs it is a client
+ * function that gets written twice.
+ */
+export function emitNotification(input: {
+  category: string;
+  title: string;
+  body?: string;
+  priority?: string;
+  url?: string;
+  user_ids: string[];
+  dedupe_key?: string;
+}): Promise<{ created: number; deduped: number }> {
+  return request<{ created: number; deduped: number }>("/api/v1/notifications/emit", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }

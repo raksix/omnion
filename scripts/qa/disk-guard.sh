@@ -1,87 +1,73 @@
 #!/usr/bin/env bash
-# Omnion — keep the worktrees from filling the disk.
+# Omnion — bound what a single worktree may hold on disk.
 #
-# Seven writers each own a Rust target/ and a Next.js .next/, and a full disk stops the
-# agent from even starting ("cron external worker exited before ownership
-# acknowledgement"). Two cheap rules keep it bounded without touching a live build:
+# Seven writers, six cores, one disk. Each worktree's target/ grows without limit
+# until the disk is full, and a full disk is not a slow day: the agent cannot even
+# start ("cron external worker exited before ownership acknowledgement"). That happened
+# twice, so the ceiling is enforced here rather than left to chance.
 #
-#   1. incremental compilation caches are pure build speed, never correctness — drop the
-#      ones older than a day.
-#   2. QA artifact directories (screenshots per pass) — keep the two newest per worktree.
-#   3. If the disk is still tight, drop target/ in the worktrees that are furthest from
-#      their next build. Cargo rebuilds in about 90 seconds; the next tick pays it.
+#   WORKTREE_TARGET_MAX_MB  how large one worktree's target/ may get (default 6000)
+#   MIN_FREE_GB            below this, drop the fattest target/ (default 10)
 #
-# Usage: disk-guard.sh [--check]   (--check only reports, never deletes)
+# A cold target/ is not a loss: cargo rebuilds the workspace in about ninety seconds.
+# What matters is never being the reason the loop cannot run.
 set -uo pipefail
 
 ROOT="${OMNION_ROOT:-/mnt/apopic}"
-LOOP_W="${LOOP_W:-40}"
-MIN_FREE_GB="${MIN_FREE_GB:-8}"
-MODE="${1:-run}"
+MAX_MB="${WORKTREE_TARGET_MAX_MB:-6000}"
+MIN_FREE_GB="${MIN_FREE_GB:-10}"
+
+dir_mb() { du -sm "$1" 2>/dev/null | cut -f1; }
+free_gb() { df -BG --output=avail "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 
 say() { printf '%s\n' "$*"; }
-free_gb() { df -BG --output=avail "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9'; }
-dir_mb() { du -sm "$1" 2>/dev/null | cut -f1; }
 
-if [ "$MODE" = "--check" ]; then
-  say "free: $(free_gb)G (need ${MIN_FREE_GB}G)"
-  for d in "$ROOT"/omnion "$ROOT"/omnion-w*; do
-    [ -d "$d/target" ] || continue
-    say "$(basename "$d"): target $(dir_mb "$d/target")M"
-  done
-  exit 0
-fi
-
+# 1. incremental compilation cache is pure speed — always safe, do it first
 freed=0
-
-# 1. incremental caches older than a day
-while read -r inc; do
-  [ -n "$inc" ] || continue
-  m=$(dir_mb "$inc"); freed=$((freed + m))
-  say "rm incremental $(du -sm --dereference "$inc" 2>/dev/null | cut -f1)M: $inc"
-  rm -rf "$inc"
-done < <(find "$ROOT"/omnion*/target/debug/incremental -maxdepth 0 -type d -mtime +1 2>/dev/null)
-
-# 2. old QA artifact folders
-#
-# A folder a pass is *writing into* is skipped, and the skip is decided by mtime rather than by
-# a marker file. `run.sh` creates its directory at the start of the pass and appends
-# `clicks.jsonl` to it throughout, so a directory touched in the last hour is one a live
-# walkthrough owns. Without this the guard deleted the folder a pass had just created: the
-# walkthrough's next `appendFileSync` then failed with `ENOENT ... clicks.jsonl`, the whole
-# pass died, and the run reported no findings at all — a cleanup script taking out the quality
-# gate it was making room for.
-#
-# `-mmin -60` rather than an age comparison against the loop count, because the loop already
-# keeps the newest N and the race is specifically with a pass that started *after* the ordering
-# was taken.
-while read -r art; do
-  [ -n "$art" ] || continue
-  recent=$(find "$art" -maxdepth 1 -mmin -60 -print -quit 2>/dev/null)
-  if [ -n "$recent" ]; then
-    say "keep qa-artifacts (a pass is writing it): $art"
-    continue
+for inc in "$ROOT"/omnion*/target/debug/incremental; do
+  [ -d "$inc" ] || continue
+  m=$(dir_mb "$inc")
+  if [ "$m" -gt 300 ]; then
+    say "drop incremental ${m}M: $(dirname "$(dirname "$inc")")"
+    freed=$((freed + m)); rm -rf "$inc"
   fi
-  m=$(dir_mb "$art"); freed=$((freed + m))
-  say "rm qa-artifacts $(du -sh "$art" 2>/dev/null | cut -f1): $art"
-  rm -rf "$art"
-done < <(find "$ROOT"/omnion*/qa-artifacts -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | head -n -${LOOP_W})
+done
 
-# 3. last resort: a cold target/ in the worktree with the most to lose
+# 2. keep the newest QA artifacts only (each pass writes ~90 MB of screenshots)
+for art in "$ROOT"/omnion*/qa-artifacts; do
+  [ -d "$art" ] || continue
+  while read -r old; do
+    [ -n "$old" ] || continue
+    m=$(dir_mb "$old")
+    say "drop old qa-artifacts ${m}M: $(basename "$old")"
+    freed=$((freed + m)); rm -rf "$old"
+  done < <(find "$art" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | head -n -2)
+done
+
+# 3. per-worktree ceiling: never let one target/ grow past the cap
+for t in "$ROOT"/omnion*/target; do
+  [ -d "$t" ] || continue
+  m=$(dir_mb "$t")
+  if [ "$m" -gt "$MAX_MB" ]; then
+    w="$(dirname "$t")"
+    say "target ${m}M over the ${MAX_MB}M ceiling — dropping: $(basename "$w")"
+    freed=$((freed + m)); rm -rf "$t"
+  fi
+done
+
+# 4. last resort while the disk is still tight: the fattest one that is not main
 while [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; do
-  victim=""
-  best=0
-  for d in "$ROOT"/omnion "$ROOT"/omnion-w*; do
-    [ -d "$d/target" ] || continue
-    m=$(dir_mb "$d/target")
-    # never pick the main checkout: its binary is what the deploy script runs
-    [ "$d" = "$ROOT/omnion" ] && continue
-    if [ "$m" -gt "$best" ]; then best=$m; victim="$d"; fi
+  victim=""; best=0
+  for t in "$ROOT"/omnion*/target; do
+    [ -d "$t" ] || continue
+    w="$(dirname "$t")"
+    [ "$w" = "$ROOT/omnion" ] && continue      # the deploy script runs this binary
+    m=$(dir_mb "$t")
+    [ "$m" -gt "$best" ] && { best=$m; victim="$t"; }
   done
   [ -n "$victim" ] || break
-  say "disk tight ($(free_gb)G) — dropping $(du -sh "$victim/target" | cut -f1) target: $victim"
-  freed=$((freed + best))
-  rm -rf "$victim/target"
+  say "disk at $(free_gb)G — dropping $(basename "$(dirname "$victim")") target (${best}M)"
+  freed=$((freed + best)); rm -rf "$victim"
 done
 
 say "freed ~${freed}M — free now $(free_gb)G"

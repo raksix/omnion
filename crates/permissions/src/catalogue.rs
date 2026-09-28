@@ -396,6 +396,34 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "events",
         description: "Read the platform's event feed",
     },
+    // Notifications (docs/requests/REQ-021). Three powers, split by *who is affected* rather
+    // than by what the button does:
+    //
+    // * `notifications.read` is a person's own inbox, which every account holds — it is
+    //   owner-scoped in the store, so it grants nothing about anybody else.
+    // * `notifications.send` is writing to *other* people's inboxes, and it is the one worth
+    //   guarding: an account that may only notify itself cannot be used to reach the rest of
+    //   the organization, and a module that legitimately needs to says so in its manifest.
+    // * `notifications.manage` is the reader's own channel configuration and preferences.
+    //
+    // `notifications.admin` (the org-wide outbox, slice 3) is deliberately not here yet — a
+    // permission with no route behind it is a role entry that grants a promise the platform
+    // cannot keep.
+    PermissionDef {
+        key: "notifications.read",
+        category: "notifications",
+        description: "Read and clear your own notifications",
+    },
+    PermissionDef {
+        key: "notifications.send",
+        category: "notifications",
+        description: "Send notifications to other accounts",
+    },
+    PermissionDef {
+        key: "notifications.manage",
+        category: "notifications",
+        description: "Change your notification channels and preferences",
+    },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each
     // provider's own read permission; `search.manage` is index maintenance, not searching.
