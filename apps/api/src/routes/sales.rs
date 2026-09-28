@@ -298,9 +298,10 @@ pub struct OrganizationParam {
 pub async fn get_product(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
     Path(product_id): Path<Uuid>,
 ) -> Result<Json<ProductView>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     Ok(Json(
         store::get_product(state.db().pool(), organization_id, product_id).await?,
     ))
@@ -311,9 +312,10 @@ pub async fn create_product(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     body: Json<NewProduct>,
 ) -> Result<(StatusCode, Json<ProductView>), ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let created = store::create_product(state.db().pool(), organization_id, &body.0).await?;
 
     record(
@@ -346,10 +348,11 @@ pub async fn update_product(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     Path(product_id): Path<Uuid>,
     body: Json<ProductPatch>,
 ) -> Result<Json<ProductView>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let before = store::get_product(pool, organization_id, product_id).await?;
     let after = store::patch_product(pool, organization_id, product_id, &body.0).await?;
@@ -389,9 +392,10 @@ pub async fn archive_product(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     Path(product_id): Path<Uuid>,
 ) -> Result<Json<ProductView>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let before = store::get_product(pool, organization_id, product_id).await?;
     let after = store::archive_product(pool, organization_id, product_id).await?;
@@ -430,10 +434,11 @@ pub async fn archive_product(
 pub async fn resolve_product_price(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
     Path(product_id): Path<Uuid>,
     Query(params): Query<ResolveParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let product = store::get_product(pool, organization_id, product_id).await?;
 
@@ -498,9 +503,10 @@ pub async fn list_price_lists(
 pub async fn get_price_list(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<PriceListDetail>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     Ok(Json(
         store::get_price_list(state.db().pool(), organization_id, list_id).await?,
     ))
@@ -511,9 +517,10 @@ pub async fn create_price_list(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     body: Json<NewPriceList>,
 ) -> Result<(StatusCode, Json<PriceListView>), ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let created = store::create_price_list(state.db().pool(), organization_id, &body.0).await?;
 
     record(
@@ -546,10 +553,11 @@ pub async fn update_price_list(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     Path(list_id): Path<Uuid>,
     body: Json<PriceListPatch>,
 ) -> Result<Json<PriceListView>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let before = store::get_price_list(pool, organization_id, list_id).await?;
     let after = store::patch_price_list(pool, organization_id, list_id, &body.0).await?;
@@ -589,9 +597,10 @@ pub async fn archive_price_list(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     Path(list_id): Path<Uuid>,
 ) -> Result<Json<PriceListView>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let before = store::get_price_list(pool, organization_id, list_id).await?;
     let after = store::archive_price_list(pool, organization_id, list_id).await?;
@@ -633,10 +642,11 @@ pub async fn replace_price_list_items(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     Path(list_id): Path<Uuid>,
     body: Json<ReplacePriceRows>,
 ) -> Result<Json<PriceListDetail>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let before = store::get_price_list(pool, organization_id, list_id).await?;
     let after = store::replace_price_list_items(pool, organization_id, list_id, &body.0.items).await?;
@@ -713,9 +723,10 @@ pub async fn update_settings(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
     body: Json<SettingsPatch>,
 ) -> Result<Json<omnion_module_sales::Settings>, ApiError> {
-    let organization_id = organization_of(&state, &current, None).await?;
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let before = store::get_settings(pool, organization_id).await?;
     let after = store::update_settings(pool, organization_id, &body.0).await?;
