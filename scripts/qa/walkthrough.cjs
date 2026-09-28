@@ -5246,14 +5246,84 @@ async function runIamAuthenticationDepth(page, report) {
     .first()
     .innerText()
     .catch(() => "")).trim();
+
+  // A protocol provider walks a ladder too. The old shape gave OIDC a single result on the
+  // argument that it "fails in exactly one place"; it fails in four, and an operator staring at
+  // "connection failed" for an issuer that is somebody else's has nothing to act on. So the
+  // ladder must be *present*, must refuse at the first step against an unreachable host, and the
+  // steps after the failure must stay pending — a claim read against an issuer that was never
+  // trusted is not a claim about anything.
+  const protocolSteps = await page
+    .locator(`[data-test-steps="qa-${stamp}"] [data-test-step]`)
+    .evaluateAll((nodes) =>
+      nodes.map((n) => `${n.getAttribute("data-test-step")}:${n.getAttribute("data-test-step-status")}`),
+    )
+    .catch(() => []);
+  const failedStep = protocolSteps.findIndex((row) => row.endsWith(":failed"));
   note({
     step: "discovery-test",
     testStatus,
     // An unreachable host must still produce a *result* the panel can render.
     renderedAVerdict: testStatus === "ok" || testStatus === "failed",
     explainsItself: testText.length > 20,
+    // The ladder, and the refusal naming the step that refused.
+    protocolLadder: protocolSteps,
+    hasLadder: protocolSteps.length > 0,
+    failedAtTheFirstStep: protocolSteps[0] === "discovery:failed",
+    // Nothing after the failure may claim to have run.
+    stoppedAtTheFailure: failedStep >= 0 && protocolSteps.slice(failedStep + 1).every((row) => row.endsWith(":pending")),
+    // The step name has to reach the panel as a *name*, not as `discovery` in lowercase.
+    namesTheStep: /discovery/i.test(testText),
   });
   await shot(page, "page-iam-authentication-tested");
+
+  // ---- A SAML provider walks its own ladder, starting at the certificate -------------------
+  // SAML publishes no discovery document, so padding its ladder with a discovery row would make
+  // the two look alike while reporting different things. The first row is the certificate, and a
+  // provider whose certificate is a broken paste is refused *there* rather than at a discovery
+  // that does not exist.
+  const sstamp = Date.now().toString().slice(-6);
+  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
+  await page.locator("[data-kind=saml]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-provider-slug-input]").first().fill(`qa-saml-${sstamp}`).catch(() => {});
+  await page.locator("[data-provider-name]").first().fill(`QA saml ${sstamp}`).catch(() => {});
+  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/saml").catch(() => {});
+  await page.locator("[data-provider-field=audience]").first().fill("https://omnion.qa.invalid").catch(() => {});
+  await page.locator("[data-provider-field=certificate_pem]").first().fill(
+    "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n",
+  ).catch(() => {});
+  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  await page.locator(`[data-provider-test="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector(`[data-test-steps="qa-saml-${sstamp}"]`, { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const samlSteps = await page
+    .locator(`[data-test-steps="qa-saml-${sstamp}"] [data-test-step]`)
+    .evaluateAll((nodes) =>
+      nodes.map((n) => `${n.getAttribute("data-test-step")}:${n.getAttribute("data-test-step-status")}`),
+    )
+    .catch(() => []);
+  const samlText = (await page
+    .locator(`[data-provider-test-result="qa-saml-${sstamp}"]`)
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  note({
+    step: "saml-test-ladder",
+    steps: samlSteps,
+    hasLadder: samlSteps.length > 0,
+    // The first step is the certificate, and a certificate nobody can read is refused there.
+    refusesAtTheCertificate: samlSteps[0] === "certificate:failed",
+    namesTheProblem: /certificate/i.test(samlText),
+    // And it must not claim a claims step that never ran.
+    claimsStepPending: samlSteps.includes("claims:pending"),
+  });
+  await page.locator(`[data-provider-delete="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator(`[data-provider-delete-confirm="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1500);
 
   // ---- A new provider is created switched off --------------------------------------------
   const enabledAttr = await page
