@@ -33,6 +33,7 @@ omnion-identity = { path = "../../crates/identity" }
 omnion-media = { path = "../../crates/media" }
 omnion-notifications = { path = "../../crates/notifications" }
 omnion-module-analytics = { path = "../../modules/analytics" }
+omnion-module-crm-intake = { path = "../../modules/crm-intake" }
 omnion-onboarding = { path = "../../crates/onboarding" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }

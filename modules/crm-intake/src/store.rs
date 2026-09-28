@@ -850,7 +850,7 @@ async fn insert_lead(
 }
 
 /// Whether the submission carried the consent the source demands.
-fn consent_satisfied(source: &IntakeSource, payload: &serde_json::Value) -> bool {
+pub fn consent_satisfied(source: &IntakeSource, payload: &serde_json::Value) -> bool {
     if !source.consent_required {
         return true;
     }
@@ -1292,6 +1292,185 @@ pub async fn set_status(
             "status_changed",
             actor_user_id,
             serde_json::json!({ "status": status, "reason": reason }),
+        )
+        .await?;
+    }
+    Ok(updated)
+}
+
+/// The fields a lead edit may carry. `None` means "leave it alone".
+///
+/// There is no `received_at`, no `payload` and no `spam_score` here, and that is the point:
+/// a panel edit fixes what a human can see on the row, and the capture-time facts (when it
+/// arrived, exactly what was submitted, what the heuristics scored) are the evidence the
+/// verdicts rest on. An editor that could rewrite them would make every earlier verdict
+/// unfalsifiable.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LeadPatch {
+    /// Given name.
+    pub first_name: Option<String>,
+    /// Family name.
+    pub last_name: Option<String>,
+    /// E-mail.
+    pub email: Option<String>,
+    /// Phone.
+    pub phone: Option<String>,
+    /// Company name.
+    pub company_name: Option<String>,
+    /// Job title.
+    pub job_title: Option<String>,
+    /// What they asked about.
+    pub product_interest: Option<String>,
+    /// Their message.
+    pub message: Option<String>,
+    /// New status — refused unless the platform knows it.
+    pub status: Option<String>,
+    /// The contact this lead is linked to.
+    pub contact_id: Option<Uuid>,
+}
+
+/// Edit a lead.
+///
+/// The `crm_leads_contactable_check` constraint is the backstop: an edit that removes both
+/// the e-mail and the phone is refused by the database with the constraint's own message, and
+/// the platform prefers that to a lead nobody can answer.
+pub async fn patch_lead(
+    pool: &PgPool,
+    organization_id: Uuid,
+    id: Uuid,
+    patch: &LeadPatch,
+) -> Result<Option<Lead>> {
+    if let Some(status) = patch.status.as_deref() {
+        if !is_status(status) {
+            return Err(CrmIntakeError::invalid(format!(
+                "status \"{status}\" is not one of {}",
+                crate::vocabulary::STATUSES.join(", ")
+            )));
+        }
+    }
+    let Some(existing) = find_lead(pool, organization_id, id).await? else {
+        return Ok(None);
+    };
+
+    // A lead with no e-mail and no phone cannot be worked, so a `null` on both is refused
+    // here with a message that names the rule rather than surfacing a constraint violation.
+    let email = patch.email.clone().or(existing.email.clone()).or(None);
+    let phone = patch.phone.clone().or(existing.phone.clone()).or(None);
+    if !contactable(email.as_deref(), phone.as_deref()) {
+        return Err(CrmIntakeError::invalid(
+            "a lead needs an e-mail or a phone — an edit that clears both is refused",
+        ));
+    }
+
+    let query = format!(
+        "update crm_leads set first_name = $3, last_name = $4, email = $5, phone = $6, \
+         company_name = $7, job_title = $8, product_interest = $9, message = $10, \
+         status = $11, contact_id = $12, updated_at = now() \
+         where organization_id = $1 and id = $2 returning {LEAD_COLUMNS}"
+    );
+    let updated = sqlx::query_as::<_, Lead>(&query)
+        .bind(organization_id)
+        .bind(id)
+        .bind(patch.first_name.clone().or(existing.first_name.clone()))
+        .bind(patch.last_name.clone().or(existing.last_name.clone()))
+        .bind(email)
+        .bind(phone)
+        .bind(patch.company_name.clone().or(existing.company_name.clone()))
+        .bind(patch.job_title.clone().or(existing.job_title.clone()))
+        .bind(
+            patch
+                .product_interest
+                .clone()
+                .or(existing.product_interest.clone()),
+        )
+        .bind(patch.message.clone().or(existing.message.clone()))
+        .bind(patch.status.clone().unwrap_or(existing.status.clone()))
+        .bind(patch.contact_id.or(existing.contact_id))
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some(lead) = &updated {
+        // Only the lines that actually changed go on the trail: a trail that records every
+        // field of every save is a trail nobody reads.
+        let mut changed: Vec<&str> = Vec::new();
+        if patch.first_name.is_some() {
+            changed.push("first_name");
+        }
+        if patch.last_name.is_some() {
+            changed.push("last_name");
+        }
+        if patch.email.is_some() {
+            changed.push("email");
+        }
+        if patch.phone.is_some() {
+            changed.push("phone");
+        }
+        if patch.company_name.is_some() {
+            changed.push("company_name");
+        }
+        if patch.job_title.is_some() {
+            changed.push("job_title");
+        }
+        if patch.product_interest.is_some() {
+            changed.push("product_interest");
+        }
+        if patch.message.is_some() {
+            changed.push("message");
+        }
+        if patch.status.is_some() {
+            changed.push("status");
+        }
+        if patch.contact_id.is_some() {
+            changed.push("contact_id");
+        }
+        if !changed.is_empty() {
+            append_event(
+                pool,
+                lead.id,
+                "edited",
+                None,
+                serde_json::json!({ "changed": changed }),
+            )
+            .await?;
+        }
+    }
+    Ok(updated)
+}
+
+/// Record the first response, which is what stops the SLA clock.
+///
+/// **Idempotent on the instant.** A second call on a lead that already has
+/// `first_response_at` keeps the first one and answers with the same row: "when did we first
+/// answer this" has exactly one answer, and a panel that answered `200` with a *newer* time
+/// would quietly rewrite the measurement a whole SLA report rests on. The caller may pass
+/// `None` for the actor, because a quotation sent from REQ-052 counts as a response and that
+/// path has no panel session.
+pub async fn record_response(
+    pool: &PgPool,
+    organization_id: Uuid,
+    id: Uuid,
+    actor_user_id: Option<Uuid>,
+) -> Result<Option<Lead>> {
+    let query = format!(
+        "update crm_leads set first_response_at = coalesce(first_response_at, now()), \
+         status = case when first_response_at is null and status in ('new', 'assigned') \
+                       then 'contacted' else status end, updated_at = now() \
+         where organization_id = $1 and id = $2 returning {LEAD_COLUMNS}"
+    );
+    let updated = sqlx::query_as::<_, Lead>(&query)
+        .bind(organization_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    if let Some(lead) = &updated {
+        append_event(
+            pool,
+            lead.id,
+            "responded",
+            actor_user_id,
+            serde_json::json!({
+                "first_response_at": lead.first_response_at.map(|at| at.to_string()),
+            }),
         )
         .await?;
     }
