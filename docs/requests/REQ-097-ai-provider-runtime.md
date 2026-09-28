@@ -1,6 +1,9 @@
 # REQ-097 — AI Provider Runtime & Local Models
 
 > **Status:** in-progress · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> Slice 1 · 2 shipped, slice 3 in progress (`71e4e58`): the storage, the HTTP surface and the
+> Health / Usage / Failover panels are in and walked. The background probe runner and the failover
+> substitution are what remain.
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request

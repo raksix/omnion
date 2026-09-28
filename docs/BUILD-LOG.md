@@ -2003,8 +2003,20 @@
     asserts the two permission splits (a member may read health and the chain but gets `403` on
     probe and reorder), that one button press is one row, and that an empty chain is refused.
   - `pnpm typecheck` → clean · `pnpm build` → clean.
-  - `QA_STACK=w7 … bash scripts/qa/run.sh` → see below.
+  - `QA_STACK=w7 QA_API_PORT=18086 … QA_SLOTS=0 bash scripts/qa/run.sh` — the panel pass ran and
+    recorded: Health renders `status=Never probed, uptime=—, p95=—, samples=0` with its empty
+    state, Usage renders zeros with its empty state, and the failover chain lists both providers
+    with their own health. **"Probe now" pressed → 1 sample, `grew: true`, and the notice
+    `QA Dead moved from down to degraded.`** — a real transition, from the real transition the
+    store returned, with the sample count agreeing with the header. Screenshots
+    `ai-health-panel.png`, `ai-usage-panel.png`, `ai-failover-panel.png`.
 - **Not yet, and named in the REQ.** The background probe runner (the per-tick loop over the
   enabled providers, which calls the same `probe_now` and prunes) and the substitution logic: a
   task-routed call that falls over to the next provider and records `ai.provider.failover_used`.
   Those are the last two halves of slice 3, and the slice closes when they are in.
+
+- **The harness, not the slice, ended the pass.** After the panel pass, the file-manager depth
+  pass — a screen this writer does not own — read its footer with an unguarded locator and threw a
+  30 s timeout, so the vision review, the summary and every later depth pass never ran. Fixed in
+  `71e4e58`: a missing pager is now recorded as an empty footer instead of thrown, so one wave's
+  screen can no longer silently un-test another's. The next full pass re-runs end to end.
