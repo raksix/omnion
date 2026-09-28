@@ -82,6 +82,14 @@ pub const DEFAULT_ANALYTICS_POLL_MS: u64 = 15_000;
 /// Default beacon budget of one site and caller per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
 pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
 
+/// Default delay between two AI health probe ticks (`OMNION_AI_HEALTH_POLL_MS`).
+///
+/// 60 s is the interval the request asks for: often enough that three consecutive failures (the
+/// window in which a provider reads as `down`) arrive within five minutes, rarely enough that a
+/// provider the operator just connected is not dialled five times before they can read the Health
+/// tab.
+pub const DEFAULT_AI_HEALTH_POLL_MS: u64 = 60_000;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -503,6 +511,36 @@ impl std::fmt::Debug for MailConfig {
     }
 }
 
+/// AI Hub knobs (docs/requests/REQ-097, slice 3).
+///
+/// The probe runner of `apps/api` reads these: every `poll_ms` it runs the **same** connection
+/// test the "Probe now" button runs, once per enabled provider, and prunes the history that fell
+/// out of the retention window. Turning the runner off (`OMNION_AI_HEALTH_RUNNER=false`) leaves
+/// the samples untouched — the Health tab then shows only what an operator probed by hand, which
+/// is a real history, just a sparse one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiHubConfig {
+    /// Whether this process samples provider health (`OMNION_AI_HEALTH_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two probe ticks (`OMNION_AI_HEALTH_POLL_MS`).
+    pub poll_ms: u64,
+    /// How many days of samples and usage rows are kept (`OMNION_AI_HEALTH_RETENTION_DAYS`).
+    ///
+    /// Unsigned on purpose: a negative retention is not a shorter history, it is a `make_interval`
+    /// that deletes everything, and the reader refuses it rather than trusting the spelling.
+    pub retention_days: u64,
+}
+
+impl Default for AiHubConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_AI_HEALTH_POLL_MS,
+            retention_days: 30,
+        }
+    }
+}
+
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -526,6 +564,8 @@ pub struct Config {
     pub search: SearchConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
+    /// AI provider health probe knobs (REQ-097).
+    pub ai_hub: AiHubConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -690,6 +730,16 @@ impl Config {
             )?,
         };
 
+        let ai_hub = AiHubConfig {
+            runner_enabled: read_flag(&read, "OMNION_AI_HEALTH_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_AI_HEALTH_POLL_MS", DEFAULT_AI_HEALTH_POLL_MS)?,
+            retention_days: read_positive(
+                &read,
+                "OMNION_AI_HEALTH_RETENTION_DAYS",
+                AiHubConfig::default().retention_days,
+            )?,
+        };
+
         let mail = MailConfig {
             enabled: read_flag(&read, "OMNION_MAIL_ENABLED", true)?,
             host: read("OMNION_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.to_owned()),
@@ -711,6 +761,7 @@ impl Config {
             automation,
             search,
             analytics,
+            ai_hub,
             mail,
             log,
         };
@@ -749,6 +800,7 @@ impl Default for Config {
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
             analytics: AnalyticsConfig::default(),
+            ai_hub: AiHubConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
@@ -1090,6 +1142,40 @@ mod tests {
         assert!(config.mail.authenticates());
         assert_eq!(config.mail.timeout_ms, 1_500);
         assert!(!config.mail.is_usable(), "switched off is not usable");
+    }
+
+    #[test]
+    fn the_ai_health_probe_has_development_defaults_and_is_configurable() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.ai_hub.runner_enabled);
+        assert_eq!(config.ai_hub.poll_ms, DEFAULT_AI_HEALTH_POLL_MS);
+        assert_eq!(
+            config.ai_hub.retention_days,
+            AiHubConfig::default().retention_days
+        );
+
+        let tuned = config_from(&[
+            ("OMNION_AI_HEALTH_RUNNER", "false"),
+            ("OMNION_AI_HEALTH_POLL_MS", "5000"),
+            ("OMNION_AI_HEALTH_RETENTION_DAYS", "7"),
+        ])
+        .expect("the AI Hub settings are valid");
+        assert!(!tuned.ai_hub.runner_enabled);
+        assert_eq!(tuned.ai_hub.poll_ms, 5_000);
+        assert_eq!(tuned.ai_hub.retention_days, 7);
+    }
+
+    #[test]
+    fn the_probe_interval_may_not_be_zero() {
+        // A zero interval would spin the runner against every provider as fast as the box
+        // allows; the read helper refuses it rather than letting a typo become a self-inflicted
+        // denial of service on the operator's own API keys.
+        let error = config_from(&[("OMNION_AI_HEALTH_POLL_MS", "0")])
+            .expect_err("a zero probe interval must be refused");
+        assert!(
+            error.to_string().contains("OMNION_AI_HEALTH_POLL_MS"),
+            "got {error}"
+        );
     }
 
     #[test]
