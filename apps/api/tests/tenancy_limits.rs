@@ -35,11 +35,22 @@ use uuid::Uuid;
 const PASSWORD: &str = "correct horse battery";
 
 /// What the administrator of this suite holds.
-const ADMIN_PERMISSIONS: [&str; 4] = [
+///
+/// `sites.update`, `sites.delete` and `domains.manage` are here because the suspend/archive rule
+/// has to be proven on the *site* surface as well as the tenancy one, and a walk that reaches a
+/// 403 for "you do not hold this permission" has proved nothing about the freeze — the guard
+/// never ran. Every permission the walks touch belongs in this list for that reason: a refusal
+/// from the wrong layer is a refusal that passes for the right one. I found that twice in one
+/// tick (`sites.update`, then `domains.manage`), each time on the assertion *after* the one
+/// that had been waiting silently.
+const ADMIN_PERMISSIONS: [&str; 7] = [
     "organizations.read",
     "organizations.manage",
     "sites.read",
     "sites.create",
+    "sites.update",
+    "sites.delete",
+    "domains.manage",
 ];
 
 /// What the Audit tab needs on top of that, and what a tenancy administrator deliberately does
@@ -2081,6 +2092,405 @@ async fn one_tenants_queue_is_another_tenants_invisible_row() {
     .await;
     assert_eq!(release.status, StatusCode::NOT_FOUND, "body: {}", release.body);
     assert_eq!(code_of(&release.body), "organization_not_found");
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Suspend and archive: reads stay, writes go, and the status change itself is escapable
+// ---------------------------------------------------------------------------------------------
+
+/// The settings payload the route expects.
+///
+/// `PUT /settings` is a whole-row replace, not a patch: `timezone`, `invite_policy` and
+/// `audit_retention_days` are *required* fields, so a body carrying only the field under test
+/// answers `422` and the walk fails for a reason that has nothing to do with the freeze. The
+/// values are the backfilled defaults, so a refused write still leaves the row untouched.
+fn settings_body(locale: &str) -> Value {
+    json!({
+        "locale": locale,
+        "timezone": "UTC",
+        "invite_policy": "self_serve",
+        "default_invite_role_id": null,
+        "logo_media_id": null,
+        "accent_color": null,
+        "audit_retention_days": 365,
+    })
+}
+
+/// Suspend or re-activate one organization through the route the panel's button uses.
+async fn set_status(fixture: &Fixture, token: &str, status: &str) -> TestResponse {
+    call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{}", fixture.org_a),
+            Some(token),
+            Some(json!({ "status": status })),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_suspended_organization_keeps_reads_and_refuses_writes_by_name() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+
+    // A tenant with a site in it, so the site and domain write paths have something to act on.
+    let site = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/sites",
+            Some(&admin),
+            Some(json!({ "key": "before", "name": "Before the freeze" })),
+        ),
+    )
+    .await;
+    assert_eq!(site.status, StatusCode::CREATED, "body: {}", site.body);
+    let site_id = site.body["id"].as_str().expect("a created site carries an id");
+
+    // While it is active, the same writes work. A walk that only ever exercises the frozen state
+    // cannot tell "the guard refused" from "this endpoint was always broken".
+    let settings_uri = format!("/api/v1/organizations/{}/settings", fixture.org_a);
+    let warm = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &settings_uri,
+            Some(&admin),
+            Some(settings_body("en-GB")),
+        ),
+    )
+    .await;
+    assert_eq!(warm.status, StatusCode::OK, "body: {}", warm.body);
+
+    // Suspend it. This is a status change, so it is the one write that gets through.
+    let suspended = set_status(&fixture, &admin, "suspended").await;
+    assert_eq!(suspended.status, StatusCode::OK, "body: {}", suspended.body);
+    assert_eq!(suspended.body["status"], "suspended");
+
+    // ---- reads stay available ----------------------------------------------------------------------------
+    // Every one of these is a *read* of a suspended tenant, and every one must answer. A guard
+    // placed on the resolver rather than on the write would turn them into 404s and leave an
+    // operator unable to find out why the tenant stopped working.
+    for uri in [
+        format!("/api/v1/organizations/{}", fixture.org_a),
+        format!("/api/v1/organizations/{}/members", fixture.org_a),
+        format!("/api/v1/organizations/{}/departments", fixture.org_a),
+        format!("/api/v1/organizations/{}/settings", fixture.org_a),
+        format!("/api/v1/organizations/{}/modules", fixture.org_a),
+        format!("/api/v1/organizations/{}/limits", fixture.org_a),
+        format!("/api/v1/organizations/{}/usage", fixture.org_a),
+        format!("/api/v1/sites/{}", site_id),
+        format!("/api/v1/sites/{}/domains", site_id),
+        "/api/v1/me/organizations".to_owned(),
+    ] {
+        let read = call(
+            &fixture.state,
+            request(Method::GET, &uri, Some(&admin), None),
+        )
+        .await;
+        assert_eq!(
+            read.status,
+            StatusCode::OK,
+            "a suspended tenant must stay readable at {uri}, body: {}",
+            read.body
+        );
+    }
+
+    // ---- writes are refused, by name, with the reason -----------------------------------------------------
+    // One walk over *every* write family. A guard that covers the tenancy surface and forgets
+    // the site surface is the defect this list exists to prevent, and each line is a separate
+    // endpoint so a hole in one shows up as a hole in one.
+    let writes: Vec<(&str, Method, String, Option<Value>)> = vec![
+        (
+            "settings",
+            Method::PUT,
+            settings_uri.clone(),
+            Some(settings_body("de-DE")),
+        ),
+        (
+            "modules",
+            Method::PUT,
+            format!("/api/v1/organizations/{}/modules", fixture.org_a),
+            Some(json!({ "modules": [] })),
+        ),
+        (
+            "limits",
+            Method::PUT,
+            format!("/api/v1/organizations/{}/limits", fixture.org_a),
+            Some(json!({ "plan": "enterprise" })),
+        ),
+        (
+            "departments",
+            Method::POST,
+            format!("/api/v1/organizations/{}/departments", fixture.org_a),
+            Some(json!({ "key": "new-team", "name": "New team" })),
+        ),
+        (
+            "invitations",
+            Method::POST,
+            format!("/api/v1/organizations/{}/invitations", fixture.org_a),
+            Some(json!({ "email": format!("frozen-{}@omnion.test", Uuid::new_v4().simple()) })),
+        ),
+        (
+            "sites",
+            Method::POST,
+            "/api/v1/sites".to_owned(),
+            Some(json!({ "key": "after", "name": "After the freeze" })),
+        ),
+        (
+            "site rename",
+            Method::PATCH,
+            format!("/api/v1/sites/{site_id}"),
+            Some(json!({ "name": "Renamed while frozen" })),
+        ),
+        (
+            "domains",
+            Method::POST,
+            format!("/api/v1/sites/{site_id}/domains"),
+            Some(json!({ "host": "frozen.example" })),
+        ),
+    ];
+
+    for (label, method, uri, body) in &writes {
+        let refused = call(
+            &fixture.state,
+            request(method.clone(), uri, Some(&admin), body.clone()),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::CONFLICT,
+            "a suspended tenant must refuse the {label} write, body: {}",
+            refused.body
+        );
+        assert_eq!(
+            code_of(&refused.body),
+            "organization_not_writable",
+            "the {label} refusal names the rule: {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["error"]["details"]["status"], "suspended",
+            "the {label} refusal names the status: {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["error"]["details"]["reads"], true,
+            "the refusal must say reads still work, or an operator reads it as a deletion: {}",
+            refused.body
+        );
+    }
+
+    // ---- and it really refused: nothing was written --------------------------------------------------------
+    // A refusal that leaves the row behind is a refusal that failed. The site's name and the
+    // settings' locale are the two writes above, read back from the database.
+    let stored_name: String =
+        sqlx::query_scalar("select name from sites where id = $1")
+            .bind(Uuid::parse_str(site_id).expect("a site id parses"))
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the site must still be there");
+    assert_eq!(
+        stored_name, "Before the freeze",
+        "the refused site rename must not have been written"
+    );
+
+    let stored_locale: String = sqlx::query_scalar(
+        "select locale from organization_settings where organization_id = $1",
+    )
+    .bind(fixture.org_a)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the settings row must still be there");
+    assert_eq!(
+        stored_locale, "en-GB",
+        "the refused settings write must not have been written"
+    );
+
+    let frozen_departments: i64 =
+        sqlx::query_scalar("select count(*) from departments where organization_id = $1")
+            .bind(fixture.org_a)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must run");
+    assert_eq!(
+        frozen_departments, 0,
+        "the refused department create must not have left a row"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn reactivating_restores_writes_and_archives_freeze_them_too() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+    let settings_uri = format!("/api/v1/organizations/{}/settings", fixture.org_a);
+
+    // ---- suspend, refuse, reactivate, write ----------------------------------------------------------------
+    assert_eq!(set_status(&fixture, &admin, "suspended").await.status, StatusCode::OK);
+
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &settings_uri,
+            Some(&admin),
+            Some(settings_body("fr-FR")),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "body: {}", refused.body);
+
+    // The escape hatch. If this is the step that fails, the feature has shipped a tenant that
+    // can be suspended and never brought back — a guard in front of the only control that undoes
+    // it, which reads in review as "correct" and is the worst possible outcome.
+    let reactivated = set_status(&fixture, &admin, "active").await;
+    assert_eq!(
+        reactivated.status,
+        StatusCode::OK,
+        "reactivating must work while the tenant is frozen, body: {}",
+        reactivated.body
+    );
+    assert_eq!(reactivated.body["status"], "active");
+
+    let restored = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &settings_uri,
+            Some(&admin),
+            Some(settings_body("fr-FR")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored.status,
+        StatusCode::OK,
+        "writes must work again after a reactivation, body: {}",
+        restored.body
+    );
+
+    // ---- archive: the same freeze, a quieter one ------------------------------------------------------------
+    assert_eq!(set_status(&fixture, &admin, "archived").await.status, StatusCode::OK);
+
+    let archived_write = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &settings_uri,
+            Some(&admin),
+            Some(settings_body("it-IT")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        archived_write.status,
+        StatusCode::CONFLICT,
+        "an archived tenant refuses writes too, body: {}",
+        archived_write.body
+    );
+    assert_eq!(
+        archived_write.body["error"]["details"]["status"], "archived",
+        "the refusal names the archived status: {}",
+        archived_write.body
+    );
+
+    // And an archived tenant is still readable — the audit trail of why it was archived is the
+    // one thing an operator needs, and it is behind the same reads.
+    let read = call(
+        &fixture.state,
+        request(Method::GET, &settings_uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "body: {}", read.body);
+
+    // A rename of a frozen tenant is a plain write and is refused: the escape hatch is for a
+    // *status change*, not for any request that happens to carry one.
+    let renamed = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{}", fixture.org_a),
+            Some(&admin),
+            Some(json!({ "name": "Renamed while archived" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        renamed.status,
+        StatusCode::CONFLICT,
+        "a rename is not a status change and must be refused, body: {}",
+        renamed.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_status_move_is_audited_and_announced_as_its_own_event() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+
+    assert_eq!(set_status(&fixture, &admin, "suspended").await.status, StatusCode::OK);
+
+    // The audit row is the *lifecycle* action, not a generic `organization.updated`: a trail that
+    // records "someone edited the organization" cannot answer "who suspended this tenant and
+    // when", which is the question the trail exists for.
+    let trail: Vec<String> = sqlx::query_scalar(
+        "select action from audit_log where organization_id = $1 order by created_at desc",
+    )
+    .bind(fixture.org_a)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the trail must read");
+    assert!(
+        trail.iter().any(|action| action == "organization.suspended"),
+        "the suspension must be audited as itself: {trail:?}"
+    );
+    assert!(
+        !trail.iter().any(|action| action == "organization.updated"),
+        "a status move must not be filed as a plain update: {trail:?}"
+    );
+
+    // The event bus carries it too, so a subscriber can freeze downstream work on the tenant
+    // without polling the organization row.
+    let emitted: Vec<String> = sqlx::query_scalar(
+        "select name from events where organization_id = $1 and name = $2",
+    )
+    .bind(fixture.org_a)
+    .bind("organization.suspended")
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the events must read");
+    assert_eq!(
+        emitted.len(),
+        1,
+        "exactly one organization.suspended event must be emitted"
+    );
+
+    // Reactivating is its own action rather than a second `suspended`, so a consumer can count
+    // the freezes a tenant went through.
+    assert_eq!(set_status(&fixture, &admin, "active").await.status, StatusCode::OK);
+    let reactivated: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where organization_id = $1 and action = $2",
+    )
+    .bind(fixture.org_a)
+    .bind("organization.reactivated")
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the count must run");
+    assert_eq!(reactivated, 1, "the reactivation must be audited as itself");
 
     fixture.cleanup().await;
 }

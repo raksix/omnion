@@ -2345,6 +2345,103 @@ async function runOrganizationTenantTabs(page, report, organizationId) {
   return out;
 }
 
+/**
+ * The suspend/archive pass (REQ-005, slice 3's last part).
+ *
+ * The API walks prove the rule; this proves the *panel*: the banner appears on a frozen tenant,
+ * a write control is refused with the reason on screen, and reactivating takes the banner away.
+ * The pass suspends the organization the earlier passes created, so it runs *after* them and
+ * always re-activates in a `finally`-equivalent tail — a pass that leaves the QA tenant frozen
+ * turns every later route into a 409 and the run that follows it fails for the wrong reason.
+ */
+async function runOrganizationSuspend(page, report, organizationId) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "organization-suspend", action: "organizations", ...step });
+  };
+
+  if (!organizationId) {
+    note({ step: "skip", reason: "no organization was created by an earlier pass" });
+    report.organizationSuspend = { steps, organizationId: null };
+    return report.organizationSuspend;
+  }
+
+  const listUrl = `${URL_ADMIN}/organizations`;
+  const settingsUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=settings`;
+
+  // The banner must be absent while the tenant is active — otherwise "the banner is there" is
+  // a statement about a strip that is always there.
+  await page.goto(listUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const bannerWhileActive = await page.locator("[data-qa-tenant-banner]").count();
+  note({ step: "active", banner: bannerWhileActive });
+
+  // Suspend through the list's own control, the way an operator does.
+  const suspendButton = page
+    .locator('[data-qa-guard="write"]')
+    .filter({ hasText: "Suspend" })
+    .first();
+  if ((await suspendButton.count()) === 0) {
+    note({ step: "skip", reason: "the list carries no Suspend control for this row" });
+    report.organizationSuspend = { steps, organizationId };
+    return report.organizationSuspend;
+  }
+  await suspendButton.click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const notice = (await page
+    .locator('[role="status"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "suspend", notice: notice.slice(0, 120) });
+  await shot(page, "page-organization-suspended-list");
+
+  // The banner is on a *frozen tenant* screen, not on the one that set the freeze.
+  await page.goto(settingsUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-organization-settings-save]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const banner = page.locator("[data-qa-tenant-banner]").first();
+  const bannerCount = await banner.count();
+  const bannerText = (await banner.innerText().catch(() => "")).replace(/\s+/g, " ");
+  const bannerStatus = await banner.getAttribute("data-qa-tenant-banner").catch(() => "");
+  note({ step: "banner", shown: bannerCount > 0, status: bannerStatus, text: bannerText.slice(0, 140) });
+
+  // A write against the frozen tenant is refused, and the panel says why rather than failing
+  // silently. The refusal is expected, so it is registered before the act or the correct 4xx is
+  // reported as a defect.
+  expectRefusal("/settings", "a suspended organization refuses a settings save");
+  await page.locator("[data-organization-settings-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const refusal = (await page
+    .locator('[role="alert"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "write-refused", refusal: refusal.slice(0, 160) });
+  await shot(page, "page-organization-suspended-refusal");
+
+  // Reactivate: the banner has to disappear, or the panel keeps claiming a tenant that works.
+  await page.goto(listUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const reactivate = page
+    .locator('[data-qa-guard="write"]')
+    .filter({ hasText: "Reactivate" })
+    .first();
+  if ((await reactivate.count()) > 0) {
+    await reactivate.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+  await page.goto(settingsUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const bannerAfter = await page.locator("[data-qa-tenant-banner]").count();
+  note({ step: "reactivated", banner: bannerAfter, reactivated: (await reactivate.count()) > 0 });
+  await shot(page, "page-organization-reactivated");
+
+  report.organizationSuspend = { steps, organizationId };
+  return report.organizationSuspend;
+}
+
 async function runIamRolesDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -3396,6 +3493,11 @@ async function main() {
   // the two screens that change what the API does. Runs straight after the tenant tabs because
   // it edits the same organization's policy and has to put it back.
   await runOrganizationInvitePolicy(page, report, organizationDepth.organizationId);
+
+  // The suspend/archive pass (REQ-005, slice 3's last part): the banner on a frozen tenant,
+  // a refused write with the reason on screen, and the reactivation that clears both.
+  await runOrganizationSuspend(page, report, organizationDepth.organizationId);
+  log(`organization suspend: ${JSON.stringify(report.organizationSuspend)}`);
   log(`organization invite policy: ${JSON.stringify(report.organizationInvitePolicy)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,

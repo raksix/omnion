@@ -34,7 +34,7 @@ use crate::auth::CurrentSession;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-use super::tenancy_members::organization_in_scope;
+use super::tenancy_members::{organization_in_scope, organization_in_scope_for_write};
 
 // ---------------------------------------------------------------------------------------------
 // Response bodies
@@ -313,7 +313,7 @@ pub async fn create_department(
     address: crate::client_ip::ClientAddress,
     Json(body): Json<CreateDepartmentRequest>,
 ) -> Result<(StatusCode, Json<DepartmentBody>), ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
     let created = departments::create_department(
@@ -372,7 +372,7 @@ pub async fn update_department(
     address: crate::client_ip::ClientAddress,
     Json(body): Json<UpdateDepartmentRequest>,
 ) -> Result<Json<DepartmentBody>, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
     let changes = body.changes();
 
@@ -426,7 +426,7 @@ pub async fn archive_department(
     Path((organization_id, department_id)): Path<(Uuid, Uuid)>,
     address: crate::client_ip::ClientAddress,
 ) -> Result<Json<DepartmentBody>, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
     let updated = departments::archive_department(pool, organization.id, department_id).await?;
@@ -473,7 +473,7 @@ pub async fn delete_department(
     current: CurrentSession,
     Path((organization_id, department_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let removed =
         departments::delete_department(state.db().pool(), organization.id, department_id).await?;
     Ok(if removed {
@@ -491,7 +491,7 @@ pub async fn add_department_member(
     address: crate::client_ip::ClientAddress,
     Json(body): Json<AddDepartmentMemberRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
     let added =
@@ -527,7 +527,7 @@ pub async fn remove_department_member(
     Path((organization_id, department_id, user_id)): Path<(Uuid, Uuid, Uuid)>,
     address: crate::client_ip::ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
     // The department is resolved first so another tenant's id is a 404 before anything is
@@ -593,7 +593,7 @@ pub async fn bind_department_role(
     address: crate::client_ip::ClientAddress,
     Json(body): Json<BindDepartmentRoleRequest>,
 ) -> Result<(StatusCode, Json<DepartmentRoleBody>), ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
     let department = departments::find_department(pool, organization.id, department_id)
@@ -682,7 +682,7 @@ pub async fn unbind_department_role(
     Path((organization_id, department_id, binding_id)): Path<(Uuid, Uuid, Uuid)>,
     address: crate::client_ip::ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
     let department = departments::find_department(pool, organization.id, department_id)

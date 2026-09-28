@@ -114,6 +114,18 @@ impl ApiError {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    /// The structured detail, when the refusal carried one.
+    ///
+    /// `ApiError` deliberately has no `Display`: the human sentence goes into the response body
+    /// and a client reads the *structure*, not a formatted string. That makes the structure
+    /// unreachable from outside the crate until a test or a client has to assert on it — and an
+    /// assertion that has to reach into a private field to check a refusal names its status is
+    /// an assertion that gets dropped instead of fixed.
+    #[must_use]
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
 }
 
 impl From<CoreError> for ApiError {

@@ -22,10 +22,12 @@ import {
   type AccountOrganization,
 } from "@/lib/api";
 import { useSession } from "@/lib/session";
+import { useTenantStatus } from "@/lib/tenant-status";
 
 /** Read the list once per mount and after every switch. */
 export function OrganizationSwitcher() {
   const { user, status: sessionStatus } = useSession();
+  const { reload: reloadTenantStatus } = useTenantStatus();
   const router = useRouter();
   const pathname = usePathname();
   const [organizations, setOrganizations] = useState<AccountOrganization[]>([]);
@@ -102,6 +104,10 @@ export function OrganizationSwitcher() {
       router.replace(pathname);
       router.refresh();
       await load();
+      // The freeze banner reads the *current* tenant, so a switch into a suspended one has to
+      // reach it. Without this the banner keeps reporting the tenant just left, which is worse
+      // than showing nothing: the panel looks writable while the API refuses every write.
+      reloadTenantStatus();
     } catch (cause) {
       setError(
         cause instanceof ApiError ? cause.message : "The organization could not be switched.",

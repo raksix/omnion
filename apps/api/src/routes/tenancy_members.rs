@@ -296,7 +296,7 @@ pub async fn add_member(
     address: ClientAddress,
     Json(body): Json<AddMemberRequest>,
 ) -> Result<(StatusCode, Json<MemberBody>), ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     let membership = memberships::add_member(
         state.db().pool(),
@@ -351,7 +351,7 @@ pub async fn update_member(
     address: ClientAddress,
     Json(body): Json<UpdateMemberRequest>,
 ) -> Result<Json<MemberBody>, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     if find_membership(&state, organization.id, user_id)
         .await?
@@ -413,7 +413,7 @@ pub async fn remove_member(
     Path((organization_id, user_id)): Path<(Uuid, Uuid)>,
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     let membership = find_membership(&state, organization.id, user_id)
         .await?
@@ -487,7 +487,7 @@ pub async fn create_invitation(
     address: ClientAddress,
     Json(body): Json<CreateInvitationRequest>,
 ) -> Result<(StatusCode, Json<InvitationCreatedResponse>), ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let decision = invite_policy_decision(&state, &current, organization.id).await?;
 
     if let Some(member_id) =
@@ -658,7 +658,7 @@ pub async fn approve_invitation(
     Path((organization_id, invitation_id)): Path<(Uuid, Uuid)>,
     address: ClientAddress,
 ) -> Result<(StatusCode, Json<InvitationCreatedResponse>), ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     if !caller_is_organization_owner(&state, &current, organization.id).await? {
         return Err(ApiError::new(
@@ -739,7 +739,7 @@ pub async fn revoke_invitation(
     Path((organization_id, invitation_id)): Path<(Uuid, Uuid)>,
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     let invitations = memberships::list_invitations(state.db().pool(), organization.id).await?;
     let invitation = invitations
@@ -1130,6 +1130,28 @@ pub(crate) async fn organization_in_scope(
     }
 
     Err(organization_not_found())
+}
+
+/// [`organization_in_scope`] for a route that *writes*, plus the suspend/archive rule
+/// (REQ-005, slice 3).
+///
+/// A suspended organization keeps every read — the operator has to be able to look at the
+/// tenant it just froze — and refuses every write with `409 organization_not_writable` naming
+/// the tenant and its status. Reads and writes therefore go through *different* helpers on
+/// purpose: one function that takes a flag is a function whose flag somebody will forget to
+/// pass, and a forgotten flag on a read path is a bug nobody notices, while a forgotten one on
+/// a write path is a suspended tenant that still accepts changes.
+///
+/// The escape hatch is [`organization_in_scope`] itself: the status change is applied by
+/// `tenancy::update_organization`, which has to be reachable *because* the tenant is frozen.
+pub(crate) async fn organization_in_scope_for_write(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+) -> Result<Organization, ApiError> {
+    let organization = organization_in_scope(state, current, organization_id).await?;
+    crate::scope::ensure_writable(&organization)?;
+    Ok(organization)
 }
 
 /// Every member of one organization, with their account row and the roles they hold there.

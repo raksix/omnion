@@ -20,6 +20,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { ApiError, createOrganization, fetchOrganizations, updateOrganization } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
 import { useSession } from "@/lib/session";
+import { useTenantStatus } from "@/lib/tenant-status";
 import type { Organization } from "@/lib/types";
 
 /** The statuses a filter offers — the three the schema allows. */
@@ -152,6 +153,7 @@ function CreateForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => 
 /** `/organizations`. */
 export function OrganizationsView() {
   const { user } = useSession();
+  const { reload: reloadTenantStatus } = useTenantStatus();
   const router = useRouter();
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -208,6 +210,10 @@ export function OrganizationsView() {
       await updateOrganization(organization.id, { status: next });
       setNotice(`${organization.name} is now ${next}.`);
       await load();
+      // The banner reads the same tenant's status from a different screen, so a suspend pressed
+      // here has to reach it — otherwise the notice says "is now suspended" and nothing else on
+      // the panel changes, which is the exact reading that sends somebody hunting for a bug.
+      reloadTenantStatus();
     } catch (cause) {
       setNotice(
         cause instanceof ApiError ? cause.message : "The status could not be changed.",

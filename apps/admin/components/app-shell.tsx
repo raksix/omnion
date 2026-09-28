@@ -13,6 +13,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { SiteSwitcher } from "@/components/site-switcher";
 import { OrganizationSwitcher } from "@/components/organization-switcher";
 import { GlobalSearch } from "@/components/global-search";
+import { TenantStatusBanner } from "@/components/tenant-status-banner";
 import { useSession } from "@/lib/session";
 
 const NAV = [
@@ -183,6 +184,10 @@ export function AppShell({ title, description, children }: AppShellProps) {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-30 border-b border-line bg-canvas/85 backdrop-blur">
+          {/* The freeze notice is *inside* the sticky header rather than beside it: a banner that
+              scrolls away is a banner a person reads once and then forgets, and the whole point
+              is that it stays until the tenant is reactivated. */}
+          <TenantStatusBanner />
           <div className="flex flex-wrap items-center gap-3 px-4 py-3 sm:px-6">
             <button
               type="button"

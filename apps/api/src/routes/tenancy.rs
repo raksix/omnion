@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
-use crate::scope::{ensure_same_organization, platform_only, resolve_organization};
+use crate::scope::{ensure_same_organization, is_status_change, platform_only, resolve_organization};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -324,17 +324,59 @@ pub async fn update_organization(
     ensure_same_organization(&current, Some(organization.id))?;
 
     let changes = body.changes();
+
+    // The suspend/archive rule (REQ-005, slice 3), and the one write it cannot cover: a tenant
+    // that could not be reactivated would be permanently frozen with no way out, so a change
+    // that carries a status skips the guard. A rename of a frozen tenant is still refused —
+    // `is_status_change` is about the *change*, not about the endpoint, so sending `status` in
+    // the same body as a rename is a rename that goes through. That is the deliberate trade: a
+    // payload that is genuinely only a status change is the panel's own button, and a caller
+    // who bundles a rename with it is a caller who is reactivating on purpose.
+    if !is_status_change(changes.status.as_deref()) {
+        crate::scope::ensure_writable(&organization)?;
+    }
+
     let updated =
         organizations::update_organization(state.db().pool(), organization.id, &changes).await?;
 
+    // The lifecycle events the spec names (REQ-005 §events): a status move is a distinct
+    // event from a rename, because a subscriber that wants to freeze downstream work on a
+    // suspended tenant cannot tell them apart otherwise.
+    let moved = organization.status != updated.status;
+    let action = if moved {
+        match updated.status.as_str() {
+            "suspended" => "organization.suspended",
+            "archived" => "organization.archived",
+            _ => "organization.reactivated",
+        }
+    } else {
+        "organization.updated"
+    };
+
+    if moved {
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new(action)
+                .organization(updated.id)
+                .actor(current.user.id)
+                .payload(json!({
+                    "organization_id": updated.id,
+                    "from": organization.status,
+                    "to": updated.status,
+                })),
+        )
+        .await?;
+    }
+
     record(
         &state,
-        NewAuditEntry::by_user(current.user.id, "organization.updated")
+        NewAuditEntry::by_user(current.user.id, action)
             .target("organization", updated.id.to_string())
             .metadata(json!({
                 "slug": updated.slug,
                 "name": updated.name,
                 "status": updated.status,
+                "previous_status": organization.status,
             }))
             .ip_address(address.as_text())
             .organization(updated.id),
@@ -417,16 +459,19 @@ pub async fn create_site(
 ) -> Result<(StatusCode, Json<SiteBody>), ApiError> {
     let organization_id = resolve_organization(&current, body.organization_id)?;
 
-    if organizations::find_organization(state.db().pool(), organization_id)
-        .await?
-        .is_none()
-    {
+    let Some(organization) = organizations::find_organization(state.db().pool(), organization_id).await?
+    else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "organization_not_found",
             "no such organization",
         ));
-    }
+    };
+
+    // A suspended tenant gets no new sites (REQ-005, slice 3), and this is checked *before* the
+    // ceiling below so the refusal a reader sees names the real reason: "plan full" for a tenant
+    // that is frozen would send somebody to buy a bigger plan when the fix is to reactivate.
+    crate::scope::ensure_writable(&organization)?;
 
     // The site ceiling (REQ-005, slice 3). A plan that says "5 sites" and quietly accepts a
     // sixth is a plan that decorates the UI without bounding anything, so the check happens
@@ -491,7 +536,7 @@ pub async fn update_site(
     address: ClientAddress,
     Json(body): Json<UpdateSiteRequest>,
 ) -> Result<Json<SiteBody>, ApiError> {
-    let site = site_in_scope(&state, &current, site_id).await?;
+    let site = site_in_scope_for_write(&state, &current, site_id).await?;
     let updated = sites::update_site(state.db().pool(), site.id, &body.changes()).await?;
 
     // A rename or a theme change is worth finding again: the index re-reads the site row.
@@ -536,7 +581,7 @@ pub async fn delete_site(
     Path(site_id): Path<Uuid>,
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let site = site_in_scope(&state, &current, site_id).await?;
+    let site = site_in_scope_for_write(&state, &current, site_id).await?;
 
     if !sites::delete_site(state.db().pool(), site.id).await? {
         return Err(site_not_found());
@@ -582,7 +627,7 @@ pub async fn add_domain(
     address: ClientAddress,
     Json(body): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainBody>), ApiError> {
-    let site = site_in_scope(&state, &current, site_id).await?;
+    let site = site_in_scope_for_write(&state, &current, site_id).await?;
     let domain = sites::add_domain(state.db().pool(), site.id, &body.host, body.is_primary).await?;
 
     record(
@@ -605,7 +650,7 @@ pub async fn set_primary_domain(
     Path((site_id, domain_id)): Path<(Uuid, Uuid)>,
     address: ClientAddress,
 ) -> Result<Json<DomainBody>, ApiError> {
-    let site = site_in_scope(&state, &current, site_id).await?;
+    let site = site_in_scope_for_write(&state, &current, site_id).await?;
     let domain = sites::set_primary_domain(state.db().pool(), site.id, domain_id).await?;
 
     record(
@@ -628,7 +673,7 @@ pub async fn remove_domain(
     Path((site_id, domain_id)): Path<(Uuid, Uuid)>,
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let site = site_in_scope(&state, &current, site_id).await?;
+    let site = site_in_scope_for_write(&state, &current, site_id).await?;
     let removed = sites::remove_domain(state.db().pool(), site.id, domain_id).await?;
     let Some(removed) = removed else {
         return Err(ApiError::new(
@@ -683,6 +728,24 @@ async fn site_in_scope(
 ) -> Result<Site, ApiError> {
     let site = load_site(state, id).await?;
     ensure_same_organization(current, Some(site.organization_id))?;
+    Ok(site)
+}
+
+/// [`site_in_scope`] for a write, plus the suspend/archive rule (REQ-005, slice 3).
+///
+/// A site is the loudest thing a frozen tenant owns, so this is where the rule earns its keep:
+/// a suspended tenant with a working site create is a tenant that was suspended in a script and
+/// a dashboard nobody expected. Sites and domains are reached through their own scope helper
+/// rather than the tenancy one, so the guard has to be applied here as well — a guard that only
+/// covers the paths that happen to share a resolver is a guard with a hole in it.
+async fn site_in_scope_for_write(
+    state: &AppState,
+    current: &CurrentSession,
+    id: Uuid,
+) -> Result<Site, ApiError> {
+    let site = site_in_scope(state, current, id).await?;
+    let organization = load_organization(state, site.organization_id).await?;
+    crate::scope::ensure_writable(&organization)?;
     Ok(site)
 }
 

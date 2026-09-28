@@ -42,7 +42,7 @@ use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-use super::tenancy_members::organization_in_scope;
+use super::tenancy_members::{organization_in_scope, organization_in_scope_for_write};
 
 /// Rows the Audit tab asks for when the panel does not say.
 const DEFAULT_ORGANIZATION_AUDIT_LIMIT: i64 = 50;
@@ -367,7 +367,7 @@ pub async fn update_settings(
     Path(organization_id): Path<Uuid>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
     let settings =
         tenancy_limits::update_settings(state.db().pool(), organization.id, body.into_changes())
             .await?;
@@ -418,7 +418,7 @@ pub async fn update_modules(
     Path(organization_id): Path<Uuid>,
     Json(body): Json<UpdateModulesRequest>,
 ) -> Result<Json<ModulesResponse>, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     // The whole set is validated before any of it is written: a request that switches one
     // module off and names a module the installation does not ship must not leave the first
@@ -526,7 +526,7 @@ pub async fn update_limits(
     Path(organization_id): Path<Uuid>,
     Json(body): Json<UpdateLimitsRequest>,
 ) -> Result<Json<LimitsResponse>, ApiError> {
-    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
     // Lowering a ceiling below what the organization already holds is refused, not silently
     // accepted: a plan that says "2 seats" while 12 people are members is a plan nobody can

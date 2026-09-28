@@ -8,6 +8,7 @@
 //! inside it; a platform-level account (primary organization `null`) may work on any target.
 //! Anything else is `403 cross_organization` — the same answer the IAM surface gives.
 
+use omnion_identity::organizations::Organization;
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
@@ -22,6 +23,45 @@ pub fn ensure_same_organization(
         (Some(own), Some(target)) if own != target => Err(cross_organization()),
         _ => Ok(()),
     }
+}
+
+/// Refuse a write to an organization that is not `active` (REQ-005, slice 3).
+///
+/// This is the *behaviour* half of the status column: a suspended organization keeps every read
+/// — the operator has to be able to inspect the tenant it just froze, and so does the tenant —
+/// but refuses every write, by name, with the reason in the body. Reads are deliberately not
+/// routed through here: a screen that has to be hidden because its tenant is frozen is a screen
+/// an operator cannot use to find out *why*.
+///
+/// The exception is the status change itself (`is_status_change`), because a tenant that cannot
+/// be reactivated can never be reactivated — the control that undoes the freeze cannot be
+/// subject to the freeze. Getting that backwards produces a tenant that is permanently stuck
+/// and a panel whose only visible option is the one that fails.
+pub fn ensure_writable(organization: &Organization) -> Result<(), ApiError> {
+    if organization.accepts_writes() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        axum::http::StatusCode::CONFLICT,
+        "organization_not_writable",
+        omnion_identity::organizations::write_refusal(organization),
+    )
+    .with_details(serde_json::json!({
+        "organization_id": organization.id,
+        "organization_slug": organization.slug,
+        "status": organization.status,
+        "writes": false,
+        "reads": true,
+    })))
+}
+
+/// `true` when a change only moves the organization between statuses.
+///
+/// Used by the update route to keep a suspended tenant escapable: a rename of a frozen tenant
+/// is refused, but setting its status back to `active` is the one write that must get through.
+#[must_use]
+pub fn is_status_change(status: Option<&str>) -> bool {
+    status.is_some()
 }
 
 /// Require a platform-level account: only an account without a primary organization may open
@@ -160,6 +200,52 @@ mod tests {
                 .expect_err("another tenant is out of scope")
                 .code(),
             "cross_organization"
+        );
+    }
+
+    fn organization_named(name: &str, status: &str) -> Organization {
+        Organization {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            slug: name.to_lowercase(),
+            status: status.to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn only_an_active_organization_accepts_writes() {
+        assert!(ensure_writable(&organization_named("Acme", "active")).is_ok());
+
+        // Reads are *not* the rule's business: the guard takes no read path at all, and the two
+        // frozen statuses are exactly as unfrozen to a `get` as `active` is.
+        for status in ["suspended", "archived"] {
+            let organization = organization_named("Acme", status);
+            let refusal =
+                ensure_writable(&organization).expect_err("a frozen organization refuses writes");
+            assert_eq!(refusal.code(), "organization_not_writable");
+            assert_eq!(refusal.status(), axum::http::StatusCode::CONFLICT);
+            // The details are what a panel reads: the status it has to render, and the flag that
+            // tells it reads still work. `ApiError` has no `Display`, which is the point of a
+            // structured error — assert on the structure, not on a formatted string.
+            let details = refusal.details().expect("the refusal carries details");
+            assert_eq!(details["status"], status);
+            assert_eq!(details["writes"], false);
+            assert_eq!(details["reads"], true);
+            assert_eq!(details["organization_slug"], "acme");
+        }
+    }
+
+    #[test]
+    fn the_status_change_is_never_itself_refused() {
+        // `is_status_change` is the escape hatch: without it a suspended tenant can never be
+        // reactivated, because the guard would sit in front of the only control that undoes it.
+        assert!(is_status_change(Some("active")), "reactivating is a status change");
+        assert!(is_status_change(Some("suspended")), "suspending is a status change");
+        assert!(
+            !is_status_change(None),
+            "a change that carries no status is a plain write and must be refused"
         );
     }
 }
