@@ -1,4 +1,51 @@
 
+## 2026-09-28 — REQ-125 slice 3 close · three defects a green test suite could not see
+
+- **What shipped.** `e4e97c7` — the repairs the slice-3 walkthrough found, committed after the
+  interrupted tick left them in the working tree. **`apps/api/src/routes/secrets_leases.rs`**:
+  `CreateDeploymentKeyInput::expires_at` grows `#[serde(with = "time::serde::rfc3339")]`, and two
+  unit tests pin the wire format in both directions. **`apps/api/src/routes/secrets.rs`**:
+  `SecretsError::ReadOnly` maps to `422` rather than `400`. **`crates/secrets/src/leases.rs`**:
+  `issue_lease` names every column of `LeaseRow` in its `returning` clause, with `name` and
+  `version` from a lateral join instead of a second round trip. **`apps/api/tests/`**: the
+  read-only walk (a `422` for a typed write *and* for a lease, the row listed and explained), and
+  two error-shape corrections. **`scripts/qa/walkthrough.cjs`**: the Chromium memory flags.
+- **Proof.** `cargo test -p omnion-secrets --lib` → **41 tests, 0 failures**. `cargo test -p
+  omnion-api --lib` → **106 tests, 0 failures**. `cargo test -p omnion-api --test secret_leases`
+  → **1 walk, 0 failures** and `--test secret_credentials` → **1 walk, 0 failures**, each against
+  its own fresh database (`omnion_w6_iter3`, `omnion_w6_cred`) rather than the shared dev
+  database, which refuses `db.migrate()` with `VersionMissing(19)`. `pnpm typecheck` → clean.
+  Browser pass: all five secrets screens — `/secrets/root-key`, `/secrets/credentials`,
+  `/secrets/slots`, `/secrets/leases`, `/secrets/deploy-keys` — visited and clicked, each with
+  its per-control screenshots and one console-error capture.
+- **The defect that matters most is the one the type system never sees.** The panel sends
+  `new Date(...).toISOString()`; `time::OffsetDateTime` deserialized from a *tuple*. So the single
+  required field of the create body was the single field the API could not read, and the create
+  drawer was a dead button for every operator. Cargo was green, `pnpm typecheck` was green, and
+  every test was green, because the tests asserted the shape the code produced. **A unit test on
+  a DTO must post the exact bytes the browser sends** — the round trip is the only thing that
+  notices a mismatch between what a client writes and what a server reads.
+- **`400` versus `422` is a contract, not a preference.** A read-only `file`/`env` bridge is a
+  well-formed request against a resource that will never accept the write, because the credential
+  is managed outside the platform. `400` invites a retry with different input, and no input would
+  help. The acceptance line already asked for `405`/`422`; the code answered `400` and the test
+  agreed with the code.
+- **A migration number is global, not per-branch, and sqlx keys on version *and* checksum.**
+  `0026` was already open in wave 7, so two files claiming it would make every database that
+  applied one refuse the other. Renumbered to `0027` from an `ls` of the sibling worktrees, not
+  from a counter that pretends the branch is alone.
+- **A partial index predicate may not call `now()`** — `42P17 functions in index predicate must be
+  marked IMMUTABLE`, because `STABLE` functions depend on the statement's timestamp rather than
+  its arguments. The index that migration wanted also already existed in `0019` under another
+  name, so the file kept neither.
+- **`Page crashed` is a memory signal, not a page defect.** Five writers' Chromiums on one 32 GB
+  box leave zero free, and the renderer is the process that dies — on a random screen, with a
+  message that reads exactly like a broken one. The launch args now cap the JS heap at 512 MB
+  and disable the GPU. A crashed walkthrough reports `summary.fatal` and writes no `pages`; the
+  screenshots already on disk are the tell.
+- **Next.** Slice 4 — audit depth, denial rows everywhere, the anomaly detectors with a
+  persisting acknowledge, and the filtered SIEM export that carries metadata only.
+
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
 - **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider

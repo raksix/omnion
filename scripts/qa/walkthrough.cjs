@@ -2481,9 +2481,21 @@ async function runAnalyticsSettingsDepth(page, report) {
 async function main() {
   const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
+  // The memory flags are load-bearing, not hygiene. Up to seven writers run a pass at once on
+  // one 32 GB box, each with its own Chromium, and the renderer is the process that dies: at
+  // zero free the walk dies on a random screen with `page.waitForTimeout: Page crashed`, which
+  // reads exactly like a broken page and is not one. Capping the JS heap and the GPU process
+  // costs nothing here — this walk screenshots pages, it does not run a 3D benchmark — and
+  // turns an OOM into a pass.
+  const MEMORY_ARGS = ["--js-flags=--max-old-space-size=512", "--disable-gpu"];
   const browser = await chromium.launch({
     executablePath: CHROME,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`],
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      `--host-resolver-rules=MAP ${SITE_HOST} 127.0.0.1`,
+      ...MEMORY_ARGS,
+    ],
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
