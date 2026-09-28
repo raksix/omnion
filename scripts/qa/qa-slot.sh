@@ -25,18 +25,34 @@ mine="$LOCKDIR/$$-$(date +%s)"
 
 count_places() { find "$LOCKDIR" -maxdepth 1 -type f | wc -l; }
 
-# A stale place from a killed pass would block the queue forever: reclaim one that is
-# older than the maximum wait and whose owning process is gone.
+# Reclaim a place whose holder is gone.
+#
+# The liveness test has to read the **holder** pid, and the reason is not a nicety: the place
+# file is named after `$$` — the pid of *this* script — and this script exits the moment it takes
+# the place. So the pid in the place file is dead within milliseconds of a perfectly healthy
+# pass, and a reaper that tested it would either reclaim every live place or, having learned
+# nothing, fall back on age alone. That is what it did: `age > WAIT + 900`, which is 75 minutes
+# on this box, so one crashed pass held the whole queue hostage for over an hour while every
+# later pass printed "waiting for a QA slot" and died at its own timeout with no report.
+#
+# The holder is the `while :; do sleep 30; done` child, whose pid is written beside the place and
+# killed by run.sh's EXIT trap — so it lives exactly as long as the pass that owns the place.
+# The short grace period covers the one race that remains: the place is created a moment before
+# the holder file, and a reaper running in that window must not decide the place is unowned.
 reap() {
-  local f pid age
+  local f pid holder age grace
+  grace="${QA_SLOT_REAP_GRACE:-120}"
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
-    pid="$(basename "$f" | cut -d- -f1)"
+    pid="$(basename "$f")"
+    holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
-    [ "$age" -gt $(( WAIT + 900 )) ] || continue
-    if ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$f" "${HOLDERDIR}/${f##*/}" 2>/dev/null || true
-      echo "[qa-slot] reclaimed a stale place from pid $pid (${age}s old)" >&2
+    [ "$age" -gt "$grace" ] || continue
+    # No holder file at all, this long after the place appeared, means the pass died between
+    # taking the place and writing the holder down.
+    if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$f" "${HOLDERDIR}/${pid}" 2>/dev/null || true
+      echo "[qa-slot] reclaimed a stale place from ${pid} (${age}s old, holder ${holder:-none})" >&2
     fi
   done
 }
