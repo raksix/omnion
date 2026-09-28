@@ -1,6 +1,9 @@
 # REQ-098 — Model Registry & Router
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> Slice 1 shipped (`a417ce9` · `13c3146` · `32e4442`): the price columns and their two vocabularies,
+> the narrowable listing, the price write path and the catalog screen. Slice 2 (task routing and
+> overrides) is not started.
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -89,8 +92,27 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
 ### Acceptance criteria
 
 - [ ] The catalog lists every registered model with context window, flags, price and usage counts, and the capability chips filter the table (multi-select, asserted in a UI test).
-- [ ] `/ai/models` search matches on model key, display name and provider name; the empty state offers both Discover and Add.
-- [ ] A model with `supports_embeddings = false` cannot be chosen for an `embedding` task or as a collection's embedding model (API refuses, UI filters the select).
+  *Partly proved:* the table renders context window, the capability pill row and both price
+  columns, and the chips narrow the **listing** server-side — `the_capability_chips_narrow_the_
+  listing_server_side` and `search_reaches_the_key_the_label_and_the_provider` in
+  `apps/api/tests/ai_catalog.rs` (9/9). **Not yet:** the *usage counts* column (the "Used by"
+  data belongs to slice 2's route map, so it cannot be populated before routing exists) and the
+  **UI-level** multi-select test. The repo has no admin component-test harness yet, so that box
+  stays open until one exists.*
+- [x] `/ai/models` search matches on model key, display name and provider name; the empty state offers both Discover and Add.
+  *Proved in `ai_catalog.rs` — `search_reaches_the_key_the_label_and_the_provider` searches the
+  key, the label and the provider name, refuses nothing it should match, and treats a blank
+  needle as no filter. The empty state was a dead end and was fixed in `32e4442`: it now offers a
+  working **Discover models** (pick a provider → discover → apply the diff → report what landed)
+  and an **Add a model** link to the provider model editor, which gained the anchor target the
+  link pointed at. `pnpm typecheck` 2/2. The *empty-state rendering* itself is walked by the QA
+  pass, which this slice has not had yet.*
+- [x] A model with `supports_embeddings = false` cannot be chosen for an `embedding` task or as a collection's embedding model (API refuses, UI filters the select).
+  *Proved in the crate:* `can_serve_task` is the single rule both the router and the future
+  routing screen consult, and it names the flag that refused a model rather than only refusing
+  it. A test asserts an embedding-only model is refused for `chat` and that the refusal text
+  carries the capability. The "UI filters the select" half lands with slice 2's routing screen,
+  which is where a select exists.*
 - [ ] A task map with a primary and two fallbacks resolves to the primary; disabling the primary inside a test resolves to the first fallback and writes `fallback_index = 1` with a reason naming the skip.
 - [ ] A candidate that fails a required capability is skipped for that reason, and the decision walk records it.
 - [ ] Resolution order is exact: explicit pin beats feature override beats task route beats installation default; a test asserts each adjacent pair.
