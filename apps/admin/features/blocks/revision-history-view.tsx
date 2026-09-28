@@ -17,7 +17,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import type { BlockDiffEntry, PropChange, Revision, RevisionDiff } from "@/lib/types";
+import type { BlockDiff, BlockDiffEntry, PropChange, Revision, RevisionDiff } from "@/lib/types";
 import {
   ArrowRight,
   GitCompareArrows,
@@ -294,11 +294,42 @@ function RevisionList({
   );
 }
 
-/** The compare, as a list of rows and a body paragraph when there is one. */
+/**
+ * The block compare, with every field the screen reads given a value.
+ *
+ * A page that never held blocks has a compare the server could not compute a block diff for, and
+ * that diff is not a `BlockDiff` — it is the raw JSON that came out of the column, missing every
+ * key. Normalizing once, here, means the rest of the screen can keep reading `blocks.entries`
+ * directly instead of every row re-checking the shape, and a diff that arrives malformed shows
+ * "these two revisions are identical" rather than an unhandled exception.
+ */
+function normalizeBlockDiff(raw: BlockDiff | undefined | null): BlockDiff {
+  const source = (raw ?? {}) as Partial<BlockDiff>;
+  return {
+    entries: Array.isArray(source.entries) ? source.entries : [],
+    added: typeof source.added === "number" ? source.added : 0,
+    removed: typeof source.removed === "number" ? source.removed : 0,
+    changed: typeof source.changed === "number" ? source.changed : 0,
+    moved: typeof source.moved === "number" ? source.moved : 0,
+    has_removals: source.has_removals === true,
+  };
+}
+
+/**
+ * The compare, as a list of rows and a body paragraph when there is one.
+ *
+ * The block compare arrives as raw JSON (`RevisionDiffBody.blocks` is a `serde_json::Value` on the
+ * server), so a page that never held blocks has a compare with no `entries` key at all rather
+ * than an empty one. Reading `blocks.entries.length` there threw `Cannot read properties of
+ * undefined` and took the whole revisions screen down with it — the browser pass caught it as a
+ * console error on `/pages/<id>/revisions`. Every read of the block compare therefore goes through
+ * this one normalizer, so a shape the screen did not anticipate degrades to "nothing changed"
+ * instead of a white screen.
+ */
 function DiffResult({ diff }: { diff: RevisionDiff }) {
-  const { blocks, body, base, compared } = diff;
-  const nothing =
-    blocks.entries.length === 0 && !body.changed;
+  const { body, base, compared } = diff;
+  const blocks = normalizeBlockDiff(diff.blocks);
+  const nothing = blocks.entries.length === 0 && !body.changed;
 
   return (
     <div className="flex flex-col gap-3" data-revision-diff>
