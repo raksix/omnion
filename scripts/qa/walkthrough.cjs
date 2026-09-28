@@ -1056,8 +1056,93 @@ async function runAiProviderDepth(page, report) {
   note({ step: "discovery", ...firstDiff });
   await shot(page, "ai-discovery-diff");
 
+  // Slice 3 rides in the same pass: the three panels are opened and clicked, so a panel that
+  // renders empty because its call failed is caught here rather than by a person noticing.
+  const panels = await exerciseHealthPanels(page);
+  note({ step: "panels", ...panels });
+  await shot(page, "ai-health-panels");
+
   report.aiProviders = steps;
 }
+
+/**
+ * Open Health, Usage and Failover in turn and read what each one rendered.
+ *
+ * The Health panel is the one that matters most for a defect: its header, its sample table and its
+ * "Probe now" button are checked against each other, because a header that disagrees with the rows
+ * under it is exactly the bug this slice exists to prevent.
+ */
+async function exerciseHealthPanels(page) {
+  const result = { health: null, usage: null, failover: null, probe: null };
+
+  await page.locator('[data-panel-toggle="health"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  result.health = await page.evaluate(() => {
+    const root = document.querySelector("[data-health-panel]");
+    if (!root) return { present: false };
+    return {
+      present: true,
+      figures: [...root.querySelectorAll("[data-figure]")].map((node) => `${node.getAttribute("data-figure")}=${node.textContent?.trim() ?? ""}`),
+      samples: root.querySelectorAll("[data-sample-row]").length,
+      sparkline: root.querySelectorAll("[data-spark-bar]").length,
+      empty: root.querySelectorAll("[data-health-empty]").length,
+      error: root.querySelectorAll("[data-health-error]").length,
+      lastError: root.querySelector("[data-health-last-error]")?.textContent?.trim() ?? "",
+    };
+  });
+  await shot(page, "ai-health-panel");
+
+  // "Probe now" must be a real button that answers: pressed, one sample added, header refreshed.
+  const before = result.health?.samples ?? 0;
+  await page.locator("[data-health-probe]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(4000);
+  result.probe = await page.evaluate((previous) => {
+    const root = document.querySelector("[data-health-panel]");
+    if (!root) return { pressed: false };
+    return {
+      pressed: true,
+      notice: root.querySelector("[data-health-notice]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      inlineError: root.querySelector("[data-health-inline-error]")?.textContent?.trim() ?? "",
+      samples: root.querySelectorAll("[data-sample-row]").length,
+      grew: root.querySelectorAll("[data-sample-row]").length > previous,
+    };
+  }, before);
+
+  await page.locator('[data-panel-toggle="usage"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  result.usage = await page.evaluate(() => {
+    const root = document.querySelector("[data-usage-panel]");
+    if (!root) return { present: false };
+    return {
+      present: true,
+      figures: [...root.querySelectorAll("[data-figure]")].map((node) => `${node.getAttribute("data-figure")}=${node.textContent?.trim() ?? ""}`),
+      days: root.querySelectorAll("[data-usage-day]").length,
+      empty: root.querySelectorAll("[data-usage-empty]").length,
+      missing: root.querySelector("[data-usage-missing]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      error: root.querySelectorAll("[data-usage-error]").length,
+    };
+  });
+  await shot(page, "ai-usage-panel");
+
+  await page.locator('[data-panel-toggle="failover"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  result.failover = await page.evaluate(() => {
+    const root = document.querySelector("[data-failover-panel]");
+    if (!root) return { present: false };
+    const rows = [...root.querySelectorAll("[data-failover-row]")].map((node) => node.textContent?.replace(/\s+/g, " ").trim() ?? "");
+    return {
+      present: true,
+      rows,
+      rowCount: rows.length,
+      empty: root.querySelectorAll("[data-failover-empty]").length,
+      error: root.querySelectorAll("[data-failover-error]").length,
+    };
+  });
+  await shot(page, "ai-failover-panel");
+
+  return result;
+}
+
 
 /** Open the first model's flag editor and read the catalog it renders. */
 async function readCapabilityEditor(page) {
