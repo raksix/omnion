@@ -131,4 +131,23 @@ pub enum MediaError {
         /// What the caller asked for.
         requested: usize,
     },
+    /// A scanning setting is out of range or malformed, and names itself.
+    ///
+    /// The message carries the *field*, because the settings screen renders it under that
+    /// input; a bare "constraint violation" is a message under nothing and an operator has to
+    /// guess which of the six inputs they got wrong.
+    #[error("`{field}`: {reason}")]
+    InvalidScanSetting {
+        /// Wire name of the setting.
+        field: String,
+        /// What is wrong with it, in a sentence.
+        reason: String,
+    },
+    /// A release or a deletion of a quarantined file carried no reason.
+    ///
+    /// Refused rather than defaulted. The quarantine row is the only record the file was ever
+    /// held, so an empty reason is the whole record being empty — and a default would be a
+    /// lie the audit trail would carry for ever.
+    #[error("say why the file is being released or deleted — the quarantine record keeps it")]
+    InvalidReleaseReason,
 }

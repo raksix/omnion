@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { useSites } from "@/lib/sites";
 import type { MediaPreset } from "@/lib/types";
+import { MediaScanningView } from "@/features/media/scanning-view";
 import { MediaStorageSettingsView } from "@/features/media/storage-settings-view";
 
 /** The fits a preset can use, with the label each one gets. */
@@ -94,10 +95,11 @@ function toDraft(preset: MediaPreset): Draft {
  * URL somebody will bookmark and then be confused by.
  */
 export function MediaSettingsTabs() {
-  const [tab, setTab] = useState<"storage" | "presets">("presets");
+  const [tab, setTab] = useState<"storage" | "presets" | "scanning">("presets");
   const tabs: [typeof tab, string][] = [
     ["presets", "Transformation"],
     ["storage", "Storage"],
+    ["scanning", "Scanning"],
   ];
 
   return (
@@ -144,6 +146,14 @@ export function MediaSettingsTabs() {
         hidden={tab !== "storage"}
       >
         <MediaStorageSettingsView />
+      </div>
+      <div
+        role="tabpanel"
+        id="media-settings-panel-scanning"
+        aria-labelledby="media-settings-tab-scanning"
+        hidden={tab !== "scanning"}
+      >
+        <MediaScanningView />
       </div>
     </div>
   );

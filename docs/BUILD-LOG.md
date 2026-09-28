@@ -73,76 +73,76 @@
   quarantine and release, retention policies with the daily worker, and the reference-based purge
   refusal — and with them the Usage and Activity tabs, which finally have rows to read.
 
-## 2026-09-28 — REQ-005 slice 4a · the module switch stops being a stored intention
 
-- **What shipped.** **`0d95b2d`** (five atomic commits) — the per-organization module switch now
-  *applies*. Slice 3 stored the decision in `organization_modules` and proved the toggle; nothing
-  consumed it, so a switch that changed a row and no observable behaviour was exactly the "limit
-  that only decorates the UI is a lie" the REQ warns about, one layer down.
-  - **`d89ddc2`** — `module_routes()` / `route_module()` / `navigation_without()` in
-    `crates/identity::tenancy_limits`. One table of which module owns which path, in the crate the
-    Modules tab already reads its list from.
-  - **`40fced2`** — `apps/api/src/module_guard.rs`, one layer over the whole `/api/v1` router.
-    Refuses with `403 organization.module.disabled` carrying `module` and `module_name`.
-  - **`8adb813`** — `/api/v1/me/organizations` grows `disabled_modules`, measured for the *current*
-    tenant only, so the shell hides the entry without a second request.
-  - **`66f86d7`** — the sidebar is filtered on those keys, a person already inside a switched-off
-    module is sent to the overview, and the Modules tab's consequence sentence names the screen
-    that disappears instead of repeating one now-true generic line.
-  - **`0d95b2d`** — `switching_a_module_off_hides_its_api_and_switching_it_back_restores_it`.
-- **Also.** **`644a129`** — `0028_organization_departments.sql` → `0029`. Merging `origin/main`
-  collided with main's own `0028_site_presets.sql`; git merged the files and sqlx then refused to
-  migrate with `duplicate key value violates unique constraint "_sqlx_migrations_pkey"`. It reads
-  as a schema bug and is only a numbering collision, so the fix is the *file*, never the database.
-- **Proof.** `cargo test -p omnion-identity --lib` → **144 passed** (9 new: path→module, the
-  `/api/v1` mount, the core-is-never-a-module list, `/public/*` survives, segment boundaries, no
-  installed module without a route). `cargo test -p omnion-api --lib` → **131 passed** (3 new).
-  `tsc -p apps/admin/tsconfig.json --noEmit` → **clean**.
-  `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **20 passed, 3 failed**,
-  and the same three fail at `644a129` with the change stashed — baseline proven by re-running, not
-  assumed (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
-  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`).
-- **Next.** The per-organization retention sweep (`organization_settings.audit_retention_days` is
-  stored and validated and read by nothing), then the `organization.member.joined` webhook-isolation
-  walk that closes the slice, then the mobile pass. The QA walkthrough still has not run green on
-  this branch; four other writers were mid-pass for most of the tick and the volume sat at 98–100%
-  (reclaimed a dangling docker volume, my own stale test binaries and `~/.npm/_cacache` to get
-  back to ~1G), so the full pass is the first thing the next quiet window should do.
+## 2026-09-28 — REQ-005 slice 4a · the module switch stops being a stored intention
 
 
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
+- **What shipped.** **`0d95b2d`** (five atomic commits) — the per-organization module switch now
 
+  *applies*. Slice 3 stored the decision in `organization_modules` and proved the toggle; nothing
 - **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
+  consumed it, so a switch that changed a row and no observable behaviour was exactly the "limit
   this process starts on a loopback port: a discovery document, a JWKS, an authorization endpoint
+  that only decorates the UI is a lie" the REQ warns about, one layer down.
   that answers `302` with a `Location`, a token endpoint that verifies the PKCE challenge itself and
+  - **`d89ddc2`** — `module_routes()` / `route_module()` / `navigation_without()` in
   spends a code exactly once, and a SAML endpoint that signs an assertion with both halves of the
+    `crates/identity::tenancy_limits`. One table of which module owns which path, in the crate the
   XML-signature binding — all under one freshly generated 2048-bit RSA key.
+    Modules tab already reads its list from.
   `apps/api/tests/sso_live.rs` drives the **real router** against it: the browser is sent to the
+  - **`40fced2`** — `apps/api/src/module_guard.rs`, one layer over the whole `/api/v1` router.
   provider's own endpoint, comes back with a code, the code is exchanged, the token is verified
+    Refuses with `403 organization.module.disabled` carrying `module` and `module_name`.
   against the *published* keys, the claim → role mapping attaches the role, JIT provisions the
+  - **`8adb813`** — `/api/v1/me/organizations` grows `disabled_modules`, measured for the *current*
   account, and `GET /me` with the resulting cookie names the directory person. The same file does
+    tenant only, so the shell hides the entry without a second request.
   SAML. Plus the fixes below.
+  - **`66f86d7`** — the sidebar is filtered on those keys, a person already inside a switched-off
 - **Why a stub and not more fixtures.** Every other proof of enterprise sign-in tested one layer:
+    module is sent to the overview, and the Modules tab's consequence sentence names the screen
   a verifier against a synthetic token, a reader against a hand-built assertion, the HTTP layer
+    that disappears instead of repeating one now-true generic line.
   against refusals it triggers itself. None of them proved that a *browser* can complete a round
+  - **`0d95b2d`** — `switching_a_module_off_hides_its_api_and_switching_it_back_restores_it`.
   trip, because that needs a provider on the other end. The stub shares nothing with the code it
+- **Also.** **`644a129`** — `0028_organization_departments.sql` → `0029`. Merging `origin/main`
   tests except the `rsa` crate, so agreement between the two sides is evidence rather than
+  collided with main's own `0028_site_presets.sql`; git merged the files and sqlx then refused to
   tautology.
+  migrate with `duplicate key value violates unique constraint "_sqlx_migrations_pkey"`. It reads
 - **Proof.** `cargo test --workspace --lib` → **598 unit tests, 0 failures**. `cargo test -p
+  as a schema bug and is only a numbering collision, so the fix is the *file*, never the database.
   omnion-api --test sso --test sso_live` → **3 walks, 0 failures**, all three in one database.
+- **Proof.** `cargo test -p omnion-identity --lib` → **144 passed** (9 new: path→module, the
   `pnpm typecheck` green. `cargo clippy --all-targets` adds no new warning.
+  `/api/v1` mount, the core-is-never-a-module list, `/public/*` survives, segment boundaries, no
 - **Four defects the walk found, and each is a thing no layer-by-layer test could see.**
+  installed module without a route). `cargo test -p omnion-api --lib` → **131 passed** (3 new).
   **(1) Every SAML sign-in was broken.** The relay page posted the *return path* as `RelayState`
+  `tsc -p apps/admin/tsconfig.json --noEmit` → **clean**.
   while the callback claims a **challenge** from `RelayState` — so the callback could never claim
+  `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **20 passed, 3 failed**,
   one and every SAML sign-in ended in `invalid_state`. The page now carries the challenge `start`
+  and the same three fail at `644a129` with the change stashed — baseline proven by re-running, not
   issued (and HTML-escapes it, because the route is public and a `state` query is attacker-supplied
+  assumed (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
   in the general case). **(2) `c_hash` was checked against the PKCE verifier's hash.** No provider
+  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`).
   has ever seen the verifier, so a real directory could not satisfy that rule: it refused every
+- **Next.** The per-organization retention sweep (`organization_settings.audit_retention_days` is
   legitimate sign-in while proving nothing. It is now the real code hash (OIDC Core §3.1.3.6), and
+  stored and validated and read by nothing), then the `organization.member.joined` webhook-isolation
   a *missing* `c_hash` is not a refusal, because the claim is a RECOMMENDED and an optional claim
+  walk that closes the slice, then the mobile pass. The QA walkthrough still has not run green on
   cannot be a mandatory rule. **(3) The SAML `test` button could never report success.** Its probe
+  this branch; four other writers were mid-pass for most of the tick and the volume sat at 98–100%
   was a self-closing `<saml:Assertion/>` that the reader never parses, and the verdict was
+  (reclaimed a dangling docker volume, my own stale test binaries and `~/.npm/_cacache` to get
   inferred from the error text — so every certificate read as broken. The certificate step is now
+  back to ~1G), so the full pass is the first thing the next quiet window should do.
   exposed on its own and the claim half is probed with a document the real reader accepts, which
   also catches a typo in an attribute name before the first real assertion. **(4) The claim → role
   mapping silently did nothing for every tenant.** It looked the role up with the tenant's
@@ -1817,214 +1817,214 @@
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
 
 ### Wave 5 · REQ-005 slice 1 — organization memberships, invitations and the switcher
-
-- **What.** The tenant layer becomes first class. A user belonged to exactly one organization
-  through `users.organization_id`, with no membership row, no way to invite anybody and no way
-  to hold a second tenant. Migration `0019` adds `organization_members` (status + a primary flag)
-  and `organization_invitations` (a hashed, single-use token with an expiry) and backfills one
-  primary membership per existing account with `on conflict do nothing`.
-  `crates/identity::memberships` carries the queries; every refusal is a typed `IdentityError`,
-  and an invalid token answers identically for unknown, revoked and used so a public link cannot
-  be used to discover a tenant. The API adds the member and invitation routes, the public preview
-  and acceptance, and the switcher's two `/me` routes — deliberately unguarded, because the
-  caller's binding lives in the organization they are leaving, so a permission guard would make
-  the second switch unreachable; the membership check inside the handler is the real
-  authorization. The panel gets `/organizations`, `/organizations/[id]`, the public
-  `/invite/[token]` page and the header switcher.
-- **Proof (Rust).** `cargo test -p omnion-api --test tenancy_members` → **7 passed** over the real
-  router: the invited address signs up, joins and lands in the organization; a used, expired and
-  revoked token each answer with their own reason; an existing member and a pending address are
-  both refused by name; the switcher moves the session and the data follows; a member of one
-  tenant cannot read another tenant's members; the backfill gives every home organization one
-  primary membership; a suspended member and a last primary are refused with their reason.
-  `cargo test -p omnion-identity` → **75 passed**. `cargo test -p omnion-api --test onboarding`
-  → **4 passed**. `pnpm typecheck && pnpm build` → exit 0, both apps.
-- **Proof (QA).** `QA_STACK=w5 … bash scripts/qa/run.sh` → 30 pages, 890 clicks, 76 fills, 926
-  screenshots. The new screens are clean: `/organizations` reports no overflow, no low contrast,
-  no unlabeled inputs, no duplicate ids, one `h1`, and the depth pass reads the empty search
-  state, refuses an unusable address in the field (`Enter a valid e-mail address — name@example.com`),
-  creates a real invitation, refuses the duplicate by name
-  (`this address already has a pending invitation in this organization`) and revokes it.
-- **The pass found two real defects, and both are fixed.** It reported `memberRows: 0` on the
-  only organization on the installation. Root cause: the first-run owner is platform-level by
-  design (`users.organization_id` stays null), so migration 0019's backfill skipped it and the
-  installation ended up with a tenant nobody belonged to. Creating the first organization now
-  writes the creator's primary membership, and the first-run test asserts it. It also reported a
-  400 on "Create organization": the form derived its slug from the raw name, so "QA sample" went
-  to the API and took a refusal the reader could not have predicted — it now normalizes to the
-  server's own rule, refuses an unusable slug in the field and shows the derived slug instead of
-  deriving it silently. Both fixes are in `b347de6`.
-- **The host, not the tree.** Three QA passes in a row died with `Page crashed` and the build
-  failed twice with `linking with cc failed` / `No space left on device`. The volume was at
-  literally 4K free: seven writers hold 1–17G of cargo targets each on one 60G `/mnt/apopic`.
-  Nothing in another writer's tree was touched; the reclaim was caches (`.next`, `target/debug/
-  incremental`, `target/debug/deps` of this worktree) plus `.npm`/`apt`/journal on `/`. A pass
-  that survives also needs the load to dip: with the load average above ~20 Chromium's renderer
-  is killed, and with `MemAvailable` above 8G the same pass completes end to end. A useful
-  habit for the next writer: watch `df` before a long build rather than after it fails.
-- **Next.** REQ-005 slice **2** — departments and scoped roles: `departments` and
-  `department_members`, `role_bindings` at department scope, the member drawer with binding
-  management and the Departments tab.
-
-
-- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
-  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
-  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
-  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
-  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
-  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
-  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
-  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
-  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
-  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
-  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
-  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
-  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
-  three unclaimed worktrees have already collided on 0019.
-- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
-  this part). The cryptography is tested against *real* cryptography, not against itself: the
-  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
-  the genuine signature and reject a tampered one.
-- **The SAML signature check is two checks, and the second one is the one that matters.** XML
-  Signature binds a document to a key in two independent steps, and my first implementation only
-  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
-  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
-  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
-  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
-  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
-  rewrite a claim, the signature alone signs the algorithm but not the document.
-- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
-  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
-  multi-valued attribute as several elements lost half a group membership and under-granted a
-  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
-  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
-  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
-  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
-  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
-  as text fails silently three frames deep.
-- **The disk is a blocker, and it is an environment problem rather than a code one.**
-  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
-  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
-  "No space left on device". The reclamation is deliberately conservative: only **derived**
-  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
-  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
-  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
-  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
-  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
-  `node_modules` each) should be pruned — no wave owns them yet.
-- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
-  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
-  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
-  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
-  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
-  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
-  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
-  REQ.
-
 ## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
 
+
+- **What.** The tenant layer becomes first class. A user belonged to exactly one organization
 - **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
+  through `users.organization_id`, with no membership row, no way to invite anybody and no way
   before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
+  to hold a second tenant. Migration `0019` adds `organization_members` (status + a primary flag)
   read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
+  and `organization_invitations` (a hashed, single-use token with an expiry) and backfills one
   challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
+  primary membership per existing account with `on conflict do nothing`.
   use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
+  `crates/identity::memberships` carries the queries; every refusal is a typed `IdentityError`,
   **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
+  and an invalid token answers identically for unknown, revoked and used so a public link cannot
   registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
+  be used to discover a tenant. The API adds the member and invitation routes, the public preview
   assertion reader and its two independent signature checks) and **the protocol-neutral identity**
+  and acceptance, and the switcher's two `/me` routes — deliberately unguarded, because the
   (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
+  caller's binding lives in the organization they are leaving, so a permission guard would make
   `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
+  the second switch unreachable; the membership check inside the handler is the real
   `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
+  authorization. The panel gets `/organizations`, `/organizations/[id]`, the public
   existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
+  `/invite/[token]` page and the header switcher.
   `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
+- **Proof (Rust).** `cargo test -p omnion-api --test tenancy_members` → **7 passed** over the real
   three unclaimed worktrees have already collided on 0019.
+  router: the invited address signs up, joins and lands in the organization; a used, expired and
 - **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
+  revoked token each answer with their own reason; an existing member and a pending address are
   this part). The cryptography is tested against *real* cryptography, not against itself: the
+  both refused by name; the switcher moves the session and the data follows; a member of one
   RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
+  tenant cannot read another tenant's members; the backfill gives every home organization one
   the genuine signature and reject a tampered one.
+  primary membership; a suspended member and a last primary are refused with their reason.
 - **The SAML signature check is two checks, and the second one is the one that matters.** XML
+  `cargo test -p omnion-identity` → **75 passed**. `cargo test -p omnion-api --test onboarding`
   Signature binds a document to a key in two independent steps, and my first implementation only
+  → **4 passed**. `pnpm typecheck && pnpm build` → exit 0, both apps.
   did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
+- **Proof (QA).** `QA_STACK=w5 … bash scripts/qa/run.sh` → 30 pages, 890 clicks, 76 fills, 926
   e-mail inside a validly signed assertion, keep the original signature — **passed**. The
+  screenshots. The new screens are clean: `/organizations` reports no overflow, no low contrast,
   `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
+  no unlabeled inputs, no duplicate ids, one `h1`, and the depth pass reads the empty search
   element with its own `<ds:Signature>` removed); with it, the tampered document is refused
+  state, refuses an unusable address in the field (`Enter a valid e-mail address — name@example.com`),
   because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
+  creates a real invitation, refuses the duplicate by name
   rewrite a claim, the signature alone signs the algorithm but not the document.
+  (`this address already has a pending invitation in this organization`) and revokes it.
 - **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
+- **The pass found two real defects, and both are fixed.** It reported `memberRows: 0` on the
   (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
+  only organization on the installation. Root cause: the first-run owner is platform-level by
   multi-valued attribute as several elements lost half a group membership and under-granted a
+  design (`users.organization_id` stays null), so migration 0019's backfill skipped it and the
   role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
+  installation ended up with a tenant nobody belonged to. Creating the first organization now
   *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
+  writes the creator's primary membership, and the first-run test asserts it. It also reported a
   the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
+  400 on "Create organization": the form derived its slug from the raw name, so "QA sample" went
   with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
+  to the API and took a refusal the reader could not have predicted — it now normalizes to the
   `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
+  server's own rule, refuses an unusable slug in the field and shows the derived slug instead of
   as text fails silently three frames deep.
+  deriving it silently. Both fixes are in `b347de6`.
 - **The disk is a blocker, and it is an environment problem rather than a code one.**
+- **The host, not the tree.** Three QA passes in a row died with `Page crashed` and the build
   `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
+  failed twice with `linking with cc failed` / `No space left on device`. The volume was at
   hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
+  literally 4K free: seven writers hold 1–17G of cargo targets each on one 60G `/mnt/apopic`.
   "No space left on device". The reclamation is deliberately conservative: only **derived**
+  Nothing in another writer's tree was touched; the reclaim was caches (`.next`, `target/debug/
   artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
+  incremental`, `target/debug/deps` of this worktree) plus `.npm`/`apt`/journal on `/`. A pass
   only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
+  that survives also needs the load to dip: with the load average above ~20 Chromium's renderer
   branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
+  is killed, and with `MemAvailable` above 8G the same pass completes end to end. A useful
   the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
+  habit for the next writer: watch `df` before a long build rather than after it fails.
   unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
+- **Next.** REQ-005 slice **2** — departments and scoped roles: `departments` and
   `node_modules` each) should be pruned — no wave owns them yet.
+  `department_members`, `role_bindings` at department scope, the member drawer with binding
 - **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
+  management and the Departments tab.
   `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
+
   the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
+
   claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
+- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
   panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
+  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
+  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
   REQ.
+  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
 
+  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
 ## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
+  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
 
+  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
 - **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
+  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
   that proves both. **`61ef619`** — `crates/identity/src/sso/provisioning.rs` (JIT: match on the
+  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
   stored subject index first, the address second, `JIT_PASSWORD_MARKER` in place of a password,
+  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
   and a *refusal* rather than a silent row when provisioning is off); the identity HTTP client
+  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
   grows the two calls the `code` flow needs; `/api/v1/iam/providers` (list, connect, patch, remove,
+  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
   `…/test` for the discovery check, `…/events` for the sign-in log); and `/api/v1/auth/sso`
+  three unclaimed worktrees have already collided on 0019.
   (the public `providers` list, `start`, the generated SAML panel page, and the `callback` that
+- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
   answers both a `code` query and a posted assertion). **`f599c3c`** — `/settings/iam/authentication`,
+  this part). The cryptography is tested against *real* cryptography, not against itself: the
   the nav entry, the API client and the `iam-authentication` pass in `scripts/qa/walkthrough.cjs`.
+  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
   **`apps/api/tests/sso.rs`** — the integration walk.
+  the genuine signature and reject a tampered one.
 - **Proof.** `cargo test -p omnion-identity --lib` → **107 tests, 0 failures**. `cargo test -p
+- **The SAML signature check is two checks, and the second one is the one that matters.** XML
   omnion-api --lib` → **97 tests, 0 failures**. `cargo test -p omnion-api --test sso` → **1 walk,
+  Signature binds a document to a key in two independent steps, and my first implementation only
   0 failures** over the real router: the management surface (401 without a session, an empty
+  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
   organization listing no provider and three kinds), a provider created **switched off with JIT
+  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
   off**, the secret answered as a *name* plus a boolean (`secret_present: false` for a variable
+  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
   this process does not define) and no `client_secret` field anywhere in the payload, a bad
+  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
   `secret_ref` refused with `details.field = secret_ref`, an unreadable role mapping refused at save
+  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
   time, the discovery test answering `200 {status: "failed", detail: …}` for an unreachable host, a
+  rewrite a claim, the signature alone signs the algorithm but not the document.
   disabled provider `404 provider_disabled` **and written to the sign-in log**, JIT refusing then
+- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
   provisioning the same identity to `Created` with the marker in `password_hash` and the subject
+  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
   indexed under `sso_subjects`, the second sign-in `Existing` on the same account, a deactivated
+  multi-valued attribute as several elements lost half a group membership and under-granted a
   account staying deactivated, the event log readable over HTTP, removal taking the log with it
+  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
   (`on delete cascade`), and an ambiguous host answered `501 organization_required` rather than
+  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
   guessed.
+  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
 - **The two design decisions this tick actually settled.** (1) **A public sign-in has to resolve
+  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
   its own organization.** My first version took "the installation's only organization", which is
+  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
   right for a first-run install and *silently wrong* for a second tenant — a sign-in link for one
+  as text fails silently three frames deep.
   organization could complete against another. The walk caught it by creating a second organization.
+- **The disk is a blocker, and it is an environment problem rather than a code one.**
   It now follows the same rule the public content surface uses: the browser's own host answers for
+  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
   its site, and a site belongs to an organization; several organizations and an unknown host is an
+  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
   honest `501` naming the fix. (2) **A refusal is a fact, not a silence.** A disabled provider
+  "No space left on device". The reclamation is deliberately conservative: only **derived**
   refusing to start wrote nothing, so an operator who switched a provider off and then wondered
+  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
   "is anybody still trying to sign in with it?" had no way to find out. `live_provider` now writes
+  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
   the `auth_provider_events` row before refusing.
+  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
 - **Two test-authoring bugs the walk caught in itself, both worth naming.** A group claim is only
+  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
   read when the provider *names* one, so a test provider with `group_claim: None` proved nothing
+  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
   about groups — the fixture was wrong, not the code. And a test fixture that registers a globally
+  `node_modules` each) should be pruned — no wave owns them yet.
   unique host has to clear a stale one first, or the second run fails on the first run's leftovers.
+- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
 - **The disk is still the constraint, and it is an environment problem rather than a code one.**
+  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
   `/mnt/apopic` (one 60 GB loop image shared by eight worktrees' `target/`) fell to **3.1 GB free**
+  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
   during this tick. Reclamation stayed conservative and derived-only: `target/debug/{deps,
+  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
   incremental,build}` in the **unclaimed** `omnion-w5` and `omnion-w7` worktrees, neither of which
+  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
   had a live `cargo`/`rustc`; no source, no branch, no running process touched. That returned
+  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   17 GB. **Owner action:** the box needs more room, or the unclaimed `omnion-w4`…`omnion-w7`
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   worktrees should be pruned — no wave owns them yet.
+  REQ.
 - **A note on where the walk runs.** The shared dev database `omnion` has migration **19** applied
+
   from a sibling branch that `main` does not have, so `db.migrate()` refuses with
   `VersionMissing(19)` and every integration test that migrates fails there. CI starts a clean
   database and is unaffected. The walk was proven against a fresh `omnion_sso_test` database.
@@ -2039,901 +2039,1044 @@
   REQ.
 
 
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
 ### Wave 5 · REQ-005 slice 2 — departments and department-scoped roles (`0c63b73`)
 
-- **What shipped.** The structure *inside* an organization. `crates/identity/src/departments.rs`
-  (the tree, validation, membership in a department, the ancestor expansion); the migration
-  `0028_organization_departments.sql` (`departments`, `department_members`, and the index the
-  department binding read needs); `/api/v1/organizations/{id}/departments` plus the member, role
-  and key sub-routes; the Departments tab in the panel, with its drawer, the
-  `?department=` parameter on `/iam/effective-permissions`, and the `organization-departments`
-  pass in `scripts/qa/walkthrough.cjs`. The tree is addressed by a **stable key**, because a
-  role binding stores a department as its `resource_id` string — a key that changed would
-  silently re-scope every role bound to it.
-- **Proof.** `cargo test -p omnion-identity -p omnion-permissions -p omnion-api --lib` →
-  **294 tests, 0 failures** (identity 123 · permissions 62 · api 109). `cargo test -p omnion-api
-  --test tenancy_departments` → **7 walks, 0 failures** against a live database
-  (`omnion_w5_dept_test`, the dev `omnion` database carries another branch's migration 19 and
-  refuses to migrate). `pnpm typecheck` → 2/2; `apps/admin` re-checked uncached with a direct
-  `tsc --noEmit` → 0 errors.
-- **Two defects the tests caught, both about the same word: inheritance.** The ancestor walk ran
-  *downward*, so a parent inherited its children's bindings instead of the other way round — the
-  exact opposite of what an operator binding a role at "division" means. And folding the
-  department load into `effective_permissions_for` had dropped the `scope.applies_to` filter
-  that `main` carried, which would have let a role bound to one site answer for a request
-  naming a different one. Both are now pinned by tests; the second by
-  `a_role_bound_to_one_site_never_answers_for_another`, because a unit test on `applies_to`
-  proves the matcher and not that the resolver still calls it.
-- **A third, found by reading the response rather than the assertion.** The tree read built its
-  parent map from each row's `parent_id`, which stored the *child's* key under the parent's id —
-  so every department reported itself as its own parent, and the row the test read said
-  `parent_key: "beta"`. A green `order` assertion sat right next to it and hid the problem.
-- **Next.** Slice 3: `organization_settings`, `organization_modules`, `organization_limits`, the
-  plan and usage endpoints, limit enforcement on invite/site/AI, and the Settings, Modules and
-  Billing tabs. That slice also closes the "backfill is proven" line, whose settings and limits
-  half is still open.
-
-### 2026-09-28 · wave5 · REQ-005 slice 3 — settings, modules, limits and the ceilings that bind
-
-- **What.** The tenant layer could not be configured, could not be restricted and could not be
-  bounded. This slice adds `organization_settings`, `organization_modules` and
-  `organization_limits` (migration `0030`, with a defaults backfill for existing tenants);
-  `crates/identity::tenancy_limits` (validators, the three stores, the usage aggregate and the
-  limit checks); four routes under `/api/v1/organizations/{id}` with `?format=csv` on usage; the
-  enforcement call sites in `create_site` and invitation acceptance; and the Settings, Modules
-  and Billing tabs with the `organization-tenant-tabs` walkthrough pass.
-- **Proof.** `cargo test -p omnion-identity -p omnion-api --lib` → **257 tests, 0 failures**
-  (identity 136 · api 121). `cargo test -p omnion-api --test tenancy_limits` → **12 walks, 0
-  failures** against `omnion_w5_tenant_test` (the dev `omnion` database refuses to migrate with
-  `VersionMismatch(19)`, another branch's migration). `pnpm typecheck` → 2/2.
-- **Two decisions worth naming.** A missing module row reads as **enabled**, not disabled: the
-  table records a decision and a fresh tenant has made none, so reading it as off would ship
-  every new organization with the platform switched off. And usage is *computed* at read time
-  rather than denormalised into counters — a seat count that drifts is worse than a cheap
-  `count(*)`, and the CSV is served from the same call the bars render so the two cannot differ.
-- **The defect the walk caught, and the walk that caught it.** The lowering guard compared two
-  `Option`s directly, so `Some(1) < None` read as false and *putting a ceiling on an unlimited
-  tenant was never checked* — the transition a plan makes the moment somebody starts bounding a
-  tenant. `None` now maps to `i64::MAX` first. The unit test that had been asserting "raising is
-  always allowed" then failed, and it was the test that was wrong: it set a 1 MB storage ceiling
-  against 4 MB in use, which the guard refuses, correctly.
-- **Enforcement sits where the REQ puts it.** The site ceiling is checked in `create_site`; the
-  seat ceiling in invitation acceptance, and *before* the sign-up account is created — a refused
-  acceptance must not strand a new account holding no membership that cannot get in. Inviting
-  is deliberately **not** refused: the plan is charged for people who have joined.
-- **The browser pass, and the two defects only it could find.** The full walkthrough stalled in
-  its `search-depth` section for ~25 minutes with four QA passes and 50 Chrome processes on the
-  box, so the slice was proved with a focused Playwright probe against the same w5 stack instead
-  (the API endpoints were also exercised directly: modules, settings, limits, usage, the CSV
-  and a module toggle all answer). That probe found what typecheck cannot:
-  * `locator("select").first()` matches the **header's site switcher**, not the locale picker, so
-    the pass wrote the locale into the site dropdown and then waited 30s for an option that was
-    never there. The tabs now carry `data-organization-settings-{locale,timezone,accent}` and
-    `data-organization-billing-plan`.
-  * A bar with no ceiling had no `aria-valuemax`, which announces as *indeterminate* — honest
-    about the ceiling, silent about the figure. It now always carries `aria-valuenow` and an
-    `aria-valuetext` of "3 of unlimited".
-- **Proof, after the fix.** Probe against the w5 stack: 5 module rows, a switch that changes and
-  persists across a reload, settings saved and read back (locale `tr`, accent `#2f6f4f`,
-  `Europe/Istanbul`), 4 usage bars at 1440×900 **and** 390×844 with real values
-  (`now: 1 / 1 / 1018 / 0`), 0 console errors.
-- **Environment note.** `/mnt/apopic` hit 100% mid-pass and a failed build *deleted*
-  `target/debug/omnion-api`, so the pass then failed for a reason that had nothing to do with the
-  code (`relation "workflows" does not exist` from an empty QA database). Reclaiming
-  `qa-artifacts/*` and `apps/admin/.next` — both regenerated by the pass itself — freed 8.1G.
-- **Next.** The rest of slice 3: the Audit tab with its CSV, the suspend/archive flows and the
-  invite-policy behaviours (`closed` refusing, `self_serve` allowing, `owner_approval` queueing)
-  in the create-invitation path.
-## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
 
 - **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+- **What shipped.** The structure *inside* an organization. `crates/identity/src/departments.rs`
   were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  (the tree, validation, membership in a department, the ancestor expansion); the migration
   filtered listing against a real database — the walk that asserts the audit rows for
+  `0028_organization_departments.sql` (`departments`, `department_members`, and the index the
   `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  department binding read needs); `/api/v1/organizations/{id}/departments` plus the member, role
   made the walk real and then fixed what it found.
+  and key sub-routes; the Departments tab in the panel, with its drawer, the
 - **Six defects, none of them visible to the layer that owned them.**
+  `?department=` parameter on `/iam/effective-permissions`, and the `organization-departments`
   1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+  pass in `scripts/qa/walkthrough.cjs`. The tree is addressed by a **stable key**, because a
      the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+  role binding stores a department as its `resource_id` string — a key that changed would
      answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+  silently re-scope every role bound to it.
      earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+- **Proof.** `cargo test -p omnion-identity -p omnion-permissions -p omnion-api --lib` →
      only exist where the value beside it was pushed.
+  **294 tests, 0 failures** (identity 123 · permissions 62 · api 109). `cargo test -p omnion-api
   2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+  --test tenancy_departments` → **7 walks, 0 failures** against a live database
      arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+  (`omnion_w5_dept_test`, the dev `omnion` database carries another branch's migration 19 and
      decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  refuses to migrate). `pnpm typecheck` → 2/2; `apps/admin` re-checked uncached with a direct
   3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+  `tsc --noEmit` → 0 errors.
      trash summary answered 500. Cast back to `bigint`.
+- **Two defects the tests caught, both about the same word: inheritance.** The ancestor walk ran
   4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+  *downward*, so a parent inherited its children's bindings instead of the other way round — the
      every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+  exact opposite of what an operator binding a role at "division" means. And folding the
      row against the pre-update snapshot, so no ordering is needed.
+  department load into `effective_permissions_for` had dropped the `scope.applies_to` filter
   5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+  that `main` carried, which would have let a role bound to one site answer for a request
      new path, so `parent_id` became the folder itself on every move, and the first move of a
+  naming a different one. Both are now pinned by tests; the second by
      top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+  `a_role_bound_to_one_site_never_answers_for_another`, because a unit test on `applies_to`
      *parent's* path.
+  proves the matcher and not that the resolver still calls it.
   6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+- **A third, found by reading the response rather than the assertion.** The tree read built its
      the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+  parent map from each row's `parent_id`, which stored the *child's* key under the parent's id —
      is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+  so every department reported itself as its own parent, and the row the test read said
 - **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  `parent_key: "beta"`. A green `order` assertion sat right next to it and hid the problem.
   folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+- **Next.** Slice 3: `organization_settings`, `organization_modules`, `organization_limits`, the
   and a move to where a folder already is is a no-op.
+  plan and usage endpoints, limit enforcement on invite/site/AI, and the Settings, Modules and
 - **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  Billing tabs. That slice also closes the "backfill is proven" line, whose settings and limits
   and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  half is still open.
   once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+
   --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+### 2026-09-28 · wave5 · REQ-005 slice 3 — settings, modules, limits and the ceilings that bind
   `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+
   session and to an account with no media permission, a site created after the migration still
+- **What.** The tenant layer could not be configured, could not be restricted and could not be
   materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  bounded. This slice adds `organization_settings`, `organization_modules` and
   back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  `organization_limits` (migration `0030`, with a defaults backfill for existing tenants);
   a file moves between folders without its storage key changing, a filter narrows the listing and
+  `crates/identity::tenancy_limits` (validators, the three stores, the usage aggregate and the
   the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  limit checks); four routes under `/api/v1/organizations/{id}` with `?format=csv` on usage; the
   deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  enforcement call sites in `create_site` and invitation acceptance; and the Settings, Modules
   well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  and Billing tabs with the `organization-tenant-tabs` walkthrough pass.
   no new warning.
+- **Proof.** `cargo test -p omnion-identity -p omnion-api --lib` → **257 tests, 0 failures**
 - **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  (identity 136 · api 121). `cargo test -p omnion-api --test tenancy_limits` → **12 walks, 0
   so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  failures** against `omnion_w5_tenant_test` (the dev `omnion` database refuses to migrate with
   `target/debug/incremental` in this worktree returned 2.9 GB.
+  `VersionMismatch(19)`, another branch's migration). `pnpm typecheck` → 2/2.
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+- **Two decisions worth naming.** A missing module row reads as **enabled**, not disabled: the
   history, the preview pipeline and the file detail screen do not.
+  table records a decision and a fresh tenant has made none, so reading it as off would ship
 ### Wave 5 · REQ-005 slice 3 remainder — the invite policy gets teeth, and the Audit tab (`337c5bc`)
 
-- **What shipped.** The invite policy was a stored, validated, *offered* value that bounded
-  nothing; this tick makes all three modes real, and adds the tenant-scoped audit feed the REQ's
-  last tab asks for. Migration `0031_invitation_approval_queue.sql` adds one status
-  (`awaiting_approval`) and two decision columns. The queue is a **state of an existing live
-  invitation, not a second table** — the unique index on `(organization_id, lower(email))` then
-  keeps refusing a duplicate for a queued address, and a queued and a released invitation cannot
-  both exist for one person.
-- **The queue hands out no link at the create.** A queued create answers `202` with an **empty
-  token**, so the manager who cannot release it has nothing to forward. The release **mints** the
-  link, because the stored value is a one-way hash and a token that was never shown is a token
-  that cannot be recovered. The alternative — hand the link out at create time and trust the
-  queue-holder — makes the feature work by trust instead of by construction. A *second* release is
-  refused `invitation_not_queued` rather than minting a different link and silently orphaning the
-  first, and the panel shows the released link in a `role="status"` region rather than a toast,
-  because a toast takes the only copy with it.
-- **The owner check asks whether the binding *reaches this tenant*.** The seed binds `owner` at
-  platform scope (`roles.organization_id is null`), so asking only "does an owner binding exist"
-  would let tenant A's owner release tenant B's queue. `global` and this-organization's
-  `organization` scope qualify; a `site` scope deliberately does not, because a site lead is not
-  the owner of the whole tenant. `self_serve` needs no new check at all — the route's existing
-  `organizations.manage` guard already *is* that rule, which is the cheapest correct
-  implementation and the one that cannot drift.
-- **The Audit tab is guarded by `audit.read`, not `organizations.read`.** A trail names every
-  privileged act in the tenant; "can see the member list" is not a reason to see it. The walk
-  asserts the refusal *first*, because a tab that worked for everyone would leave the split
-  untested and still look green. The action filter is a picker built from the tenant's own rows
-  (it cannot offer a filter that matches nothing, and cannot drift as actions are added), the
-  count is the *filtered* count from the same statement as the rows, and a typo'd actor is
-  refused `invalid_actor_filter` rather than answered as an empty history.
-- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **19 walks, 0 failures**
-  (7 new). `cargo test -p omnion-identity -p omnion-audit` → **136 unit tests, 0 failures**.
-  `tenancy` (5), `tenancy_members` (7) and `tenancy_departments` (7) all green against the same
-  per-writer database. `tsc --noEmit` in `apps/admin` → clean. A new QA pass
-  (`runOrganizationInvitePolicy`) walks all three policies, the queue panel and the Audit tab.
-- **Live proof, 24 steps, 0 failures** (`scripts/qa/probe-tenant-invite-policy.cjs`), because the
-  full pass could not run: `closed` → `403 invitations_closed` with the policy in `details`;
-  `self_serve` → `201` whose link previews `usable: true`; a **manager**'s invite → `202` with
-  `tokenLength: 0`; the manager's own release → `403 not_an_organization_owner`; the owner's
-  release → `200` minting a link that previews usable; a second release → `409
-  invitation_not_queued`. On screen: the queue panel shows the row with *Release* and *Revoke* and
-  the sentence explaining the policy; the Audit tab lists 22 rows, its action filter is built from
-  14 distinct actions this tenant has actually performed, narrowing to one action moves the count
-  from `22 of 22` to `1 of 1`, 0 px horizontal overflow at 390×844, and 0 console errors.
-- **The probe had to create a *manager*, and that is the point.** The QA owner holds `owner` at
-  **global** scope, so the policy must *not* queue it — driving the queue with that account
-  answers `201` with a link, correctly, and proves nothing. The only account the queue exists for
-  is somebody with `organizations.manage` who is not an owner. Its password hash is copied from
-  the owner rather than re-implemented, because a second argon2 in a probe is a second
-  implementation of the thing being verified.
-- **A defect only the reviewer's eye found, which no assertion would have.** The status badge
-  rendered `awaiting_approval` as **`Awaiting_approval`** — a raw enum token. `statusLabel` had
-  only ever capitalised the first letter, which is correct for every value the panel had seen
-  (`active`, `pending`, `archived`) and wrong for the first one with an underscore. The *value*
-  was right, so the DOM was right, so every automated check passed: `53fc50d` splits on `_` and
-  `-` and gives the queued state the attention tone. The general rule: a formatter that has
-  never been shown a value it does not recognise is a formatter that has never been tested.
-- **A defect the QA stack's own start-up found, not my code.** The walkthrough read `/` after a
-  fixed 900ms to decide whether setup was needed. But a fresh installation does not answer `/`
-  with the wizard: the request gate sends an anonymous visitor to `/login`, and *that* screen asks
-  the API and replaces itself with `/setup` — a client-side redirect. So the pass decided "an
-  installation already exists" about an **empty database**, and then failed to sign in to the
-  account it never created. `c83af9b` waits for one of the two URLs to be true instead. The
-  general rule: a URL read after a sleep is a guess about a *redirect chain*, and the client-side
-  half of that chain is not observable from the server.
-- **The full walkthrough did not complete, and the REQ is not being closed on this tick.** Two
-  attempts. The first died at `media-trash` with `Page crashed`; the second got seven routes
-  further and then failed with `Execution context was destroyed` after stalling on `/search` for
-  roughly six minutes. Both are host, not code: at that point the box was running **six**
-  concurrent `qa/run.sh` passes (main, w2, w4, w7×2, w5) with 50 Chrome processes and a 4.3 GB
-  `java`, and the 1-minute load average reached **437**. This is the saturation the ledger warns
-  about, one order of magnitude past it. The evidence recorded above is therefore the tiered
-  gates (19 API walks, 136 unit tests, `tsc`) plus the focused probe — which is *not* a
-  substitute for the gate, and the slice still has the suspend/archive work outstanding, so no
-  REQ closes here. Re-run the full pass when the box is quiet; `c83af9b` (the wizard race) and
-  the new `runOrganizationInvitePolicy` are both unexercised end-to-end until it does.
-- **Environment note.** `/mnt/apopic` was at 100% twice mid-tick and a `rustc` link died with
-  "No space left on device" — the known shared-volume failure with seven writers. Reclaimed what
-  is mine and regenerable (`.rcgu.o`, the stale test binaries, `~/.npm/_cacache`, the cargo
-  registry cache) and four **dangling** docker volumes nobody references (2.4G, checked with
-  `docker volume ls -f dangling=true` — Omnion's own volumes are named and were untouched).
-  `CARGO_PROFILE_DEV_DEBUG=0` cut the linker's peak disk use enough to finish the suite on a
-  volume this contended.
-- **Next.** The last of slice 3: the **suspend/archive behaviour**. The `organizations.status`
-  column and the list's Suspend/Reactivate/Archive controls exist, but suspending a tenant does not
-  yet *block writes with the reason* — the acceptance line wants a suspended tenant to keep reads
-  available and refuse every write by name, and reactivating to restore them. That is one guard
-  applied across the tenancy write paths plus the banner, which the panel already renders.
+  every new organization with the platform switched off. And usage is *computed* at read time
 
 ## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
+  rather than denormalised into counters — a seat count that drifts is worse than a cheap
+- **What shipped.** The invite policy was a stored, validated, *offered* value that bounded
 
+  `count(*)`, and the CSV is served from the same call the bars render so the two cannot differ.
+  nothing; this tick makes all three modes real, and adds the tenant-scoped audit feed the REQ's
 - **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
+- **The defect the walk caught, and the walk that caught it.** The lowering guard compared two
+  last tab asks for. Migration `0031_invitation_approval_queue.sql` adds one status
   replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
+  `Option`s directly, so `Some(1) < None` read as false and *putting a ceiling on an unlimited
+  (`awaiting_approval`) and two decision columns. The queue is a **state of an existing live
   one back *as a new version* rather than by rewriting history.
+  tenant was never checked* — the transition a plan makes the moment somebody starts bounding a
+  invitation, not a second table** — the unique index on `(organization_id, lower(email))` then
 - **The migration the plan assumed already existed.** The last tick's handover note said
+  tenant. `None` now maps to `i64::MAX` first. The unit test that had been asserting "raising is
+  keeps refusing a duplicate for a queued address, and a queued and a released invitation cannot
   "the `media_versions` table exists". It did not — `0025` created folders, browser columns and
+  always allowed" then failed, and it was the test that was wrong: it set a 1 MB storage ceiling
+  both exist for one person.
   the trash, and nothing had ever written a version row. So slice 2 ships `0026`, which creates
+  against 4 MB in use, which the guard refuses, correctly.
+- **The queue hands out no link at the create.** A queued create answers `202` with an **empty
   the table and backfills version 1 for every existing file, **copying `created_at`** rather than
+- **Enforcement sits where the REQ puts it.** The site ceiling is checked in `create_site`; the
+  token**, so the manager who cannot release it has nothing to forward. The release **mints** the
   stamping `now()`. A history that starts at the migration date is a lie about when the file
+  seat ceiling in invitation acceptance, and *before* the sign-up account is created — a refused
+  link, because the stored value is a one-way hash and a token that was never shown is a token
   arrived, and it is exactly the kind of lie that is invisible for a year.
+  acceptance must not strand a new account holding no membership that cannot get in. Inviting
+  that cannot be recovered. The alternative — hand the link out at create time and trust the
 - **Three rules, each a place a shortcut produces a plausible wrong answer.**
+  is deliberately **not** refused: the plan is charged for people who have joined.
+  queue-holder — makes the feature work by trust instead of by construction. A *second* release is
   1. **A version is append-only.** A restore *copies* the old bytes to a new key and appends the
+- **The browser pass, and the two defects only it could find.** The full walkthrough stalled in
+  refused `invitation_not_queued` rather than minting a different link and silently orphaning the
      copy. Rewriting a row would make "what did this file look like on day 3" depend on whether
+  its `search-depth` section for ~25 minutes with four QA passes and 50 Chrome processes on the
+  first, and the panel shows the released link in a `role="status"` region rather than a toast,
      anybody took a shortcut in between.
+  box, so the slice was proved with a focused Playwright probe against the same w5 stack instead
+  because a toast takes the only copy with it.
   2. **The number comes from the database.** `next_version` reads `max(version)` under
+  (the API endpoints were also exercised directly: modules, settings, limits, usage, the CSV
+- **The owner check asks whether the binding *reaches this tenant*.** The seed binds `owner` at
      `for update` on the `media` row — a *scalar subquery*, because `FOR UPDATE` on an aggregate
+  and a module toggle all answer). That probe found what typecheck cannot:
+  platform scope (`roles.organization_id is null`), so asking only "does an owner binding exist"
      is a no-op in PostgreSQL. Reading the max in Rust would open a window between two reads and
+  * `locator("select").first()` matches the **header's site switcher**, not the locale picker, so
+  would let tenant A's owner release tenant B's queue. `global` and this-organization's
      let two concurrent replaces both claim 4, which surfaces as a "duplicate key" error that
+    the pass wrote the locale into the site dropdown and then waited 30s for an option that was
+  `organization` scope qualify; a `site` scope deliberately does not, because a site lead is not
      names the index and not the cause.
+    never there. The tabs now carry `data-organization-settings-{locale,timezone,accent}` and
+  the owner of the whole tenant. `self_serve` needs no new check at all — the route's existing
   3. **A number is never reused.** A pruned version leaves a hole.
+    `data-organization-billing-plan`.
+  `organizations.manage` guard already *is* that rule, which is the cheapest correct
 - **The transaction is opened by the crate, not the route.** This was fought out with the
+  * A bar with no ceiling had no `aria-valuemax`, which announces as *indeterminate* — honest
+  implementation and the one that cannot drift.
   compiler: a route-held `sqlx::Transaction` surfaces `sqlx::Error` where everything else in
+    about the ceiling, silent about the figure. It now always carries `aria-valuenow` and an
+- **The Audit tab is guarded by `audit.read`, not `organizations.read`.** A trail names every
   `omnion_media` is a `MediaError`, and `ApiError` has `From` for the latter but deliberately
+    `aria-valuetext` of "3 of unlimited".
+  privileged act in the tenant; "can see the member list" is not a reason to see it. The walk
   **not** for the former. `omnion_media::begin_version` / `commit_version` hand back only
+- **Proof, after the fix.** Probe against the w5 stack: 5 module rows, a switch that changes and
+  asserts the refusal *first*, because a tab that worked for everyone would leave the split
   `MediaError`, which is the honest boundary: the library owns the transaction because the
+  persists across a reload, settings saved and read back (locale `tr`, accent `#2f6f4f`,
+  untested and still look green. The action filter is a picker built from the tenant's own rows
   guarantee rule 2 exists for spans it.
+  `Europe/Istanbul`), 4 usage bars at 1440×900 **and** 390×844 with real values
+  (it cannot offer a filter that matches nothing, and cannot drift as actions are added), the
 - **The header probe reads 64 KB, not the file.** `crates/media/probe.rs` pulls dimensions,
+  (`now: 1 / 1 / 1018 / 0`), 0 console errors.
+  count is the *filtered* count from the same statement as the rows, and a typo'd actor is
   duration and page count out of the *header* for PNG, GIF, JPEG, BMP, TIFF, WebP (all three
+- **Environment note.** `/mnt/apopic` hit 100% mid-pass and a failed build *deleted*
+  refused `invalid_actor_filter` rather than answered as an empty history.
   containers), MP4/QuickTime, WebM, WAV, MP3, Ogg and PDF. A 4 GB video upload must not cost a
+  `target/debug/omnion-api`, so the pass then failed for a reason that had nothing to do with the
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **19 walks, 0 failures**
   full read to learn it is 12 minutes long. Every extractor answers "I do not know" rather than
+  code (`relation "workflows" does not exist` from an empty QA database). Reclaiming
+  (7 new). `cargo test -p omnion-identity -p omnion-audit` → **136 unit tests, 0 failures**.
   guessing — a wrong dimension breaks every layout that reads it and is not obviously wrong once
+  `qa-artifacts/*` and `apps/admin/.next` — both regenerated by the pass itself — freed 8.1G.
+  `tenancy` (5), `tenancy_members` (7) and `tenancy_departments` (7) all green against the same
   it is stored. Two findings the unit tests forced out: a WebP canvas stored as `0` is a corrupt
+- **Next.** The rest of slice 3: the Audit tab with its CSV, the suspend/archive flows and the
+  per-writer database. `tsc --noEmit` in `apps/admin` → clean. A new QA pass
   header, **not** a one-pixel image (reading `0 + 1` would put a 1×1 box on screen for a file
+  invite-policy behaviours (`closed` refusing, `self_serve` allowing, `owner_approval` queueing)
+  (`runOrganizationInvitePolicy`) walks all three policies, the queue panel and the Audit tab.
   that has no size), and one blanket 30-byte minimum across the three WebP containers refuses a
+  in the create-invitation path.
+- **Live proof, 24 steps, 0 failures** (`scripts/qa/probe-tenant-invite-policy.cjs`), because the
   short-but-complete `VP8L` header.
+  full pass could not run: `closed` → `403 invitations_closed` with the policy in `details`;
 - **The walk corrected a test that had been asserting a route which never existed.** The walk
+  `self_serve` → `201` whose link previews `usable: true`; a **manager**'s invite → `202` with
   read the current bytes from `/api/v1/media/files/{id}/raw` and got an empty body: the file
+  `tokenLength: 0`; the manager's own release → `403 not_an_organization_owner`; the owner's
   manager's *listing* is `/media/files`, the read is `/media/{id}/raw`, and no route was ever
+  release → `200` minting a link that previews usable; a second release → `409
   registered at the address the test used. Three more corrections came out of the same run — the
+  invitation_not_queued`. On screen: the queue panel shows the row with *Release* and *Revoke* and
   404 is `media_not_found` (not `file_not_found`), an empty upload answers `invalid_request`
+  the sentence explaining the policy; the Audit tab lists 22 rows, its action filter is built from
   (not `file_empty`), and the history reads **newest first**, so a check written against an
+  14 distinct actions this tenant has actually performed, narrowing to one action moves the count
   assumed oldest-first order fails on a correct response.
+  from `22 of 22` to `1 of 1`, 0 px horizontal overflow at 390×844, and 0 console errors.
 - **The fixture leaked objects until it read the union.** Cleanup read `media.storage_key`, but a
+- **The probe had to create a *manager*, and that is the point.** The QA owner holds `owner` at
   replace *moves* that column to the new key — the old one is named only by the history, so every
+  **global** scope, so the policy must *not* queue it — driving the queue with that account
   replaced version's object stayed in the bucket. A test cleanup that misses them is a slow leak
+  answers `201` with a link, correctly, and proves nothing. The only account the queue exists for
   that nobody notices for a month.
+  is somebody with `organizations.manage` who is not an owner. Its password hash is copied from
 - **Proof.** `cargo test -p omnion-media --lib` → **46 tests, 0 failures** (24 new, mostly header
+  the owner rather than re-implemented, because a second argon2 in a probe is a second
   probes and the version key rules). `cargo test -p omnion-api --lib` → **109 tests, 0 failures**.
+  implementation of the thing being verified.
   `cargo test -p omnion-api --test media` against `omnion_test_main` → **11 walks, 0 failures**,
+- **A defect only the reviewer's eye found, which no assertion would have.** The status badge
   over the real router: a replace leaves version 1 downloadable and **byte-identical** (compared
+  rendered `awaiting_approval` as **`Awaiting_approval`** — a raw enum token. `statusLabel` had
   as bytes, not as a length — a length check would pass by accident on an overwrite), the row
+  only ever capitalised the first letter, which is correct for every value the panel had seen
   points at the version it serves, the three versions own three keys, a download of an old
+  (`active`, `pending`, `archived`) and wrong for the first one with an underscore. The *value*
   version is an attachment named `hero-v1.png`, a restore appends version 3 with version 1's
+  was right, so the DOM was right, so every automated check passed: `53fc50d` splits on `_` and
   checksum while version 2 is untouched, and the routes refuse without a session, without
+  `-` and gives the queued state the attention tone. The general rule: a formatter that has
   `media.read`, and name a missing version by number. `pnpm --filter @omnion/admin typecheck`
+  never been shown a value it does not recognise is a formatter that has never been tested.
   green. The QA pass ran on the default stack.
+- **A defect the QA stack's own start-up found, not my code.** The walkthrough read `/` after a
 - **Environment note.** `/mnt/apopic` was at 99 % (610 MB free) when the tests finished; this
+  fixed 900ms to decide whether setup was needed. But a fresh installation does not answer `/`
   worktree's `target/debug/incremental` returned 1.2 GB and the unclaimed `omnion-w5`/`omnion-w6`
+  with the wizard: the request gate sends an anonymous visitor to `/login`, and *that* screen asks
   worktrees' `target/` returned a further 2.7 GB. **Owner action:** those worktrees hold build
+  the API and replaces itself with `/setup` — a client-side redirect. So the pass decided "an
   artefacts for waves nobody has started; they will fill the image again.
+  installation already exists" about an **empty database**, and then failed to sign in to the
 - **Next.** Slice 3 — transformation presets with a content-addressed cache, per-site storage
+  account it never created. `c83af9b` waits for one of the two URLs to be true instead. The
   settings with a connection test, the CDN purge hook, share links and duplicate detection with
+  general rule: a URL read after a sleep is a guess about a *redirect chain*, and the client-side
   merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
+  half of that chain is not observable from the server.
   serve path, and EXIF extraction.
+- **The full walkthrough did not complete, and the REQ is not being closed on this tick.** Two
 ## 2026-09-28 — REQ-005 slice 3, closed · the suspend/archive *behaviour*, and the panel that says so
 
-- **What.** The `organizations.status` column and the list's Suspend/Reactivate controls had
-  existed since slice 1, and nothing read the status: a suspended tenant accepted every write.
-  This tick makes the column mean something. `Organization::accepts_writes` in
-  `crates/identity` says which statuses are frozen; `scope::ensure_writable` turns that into a
-  `409 organization_not_writable` whose message names the tenant and its status and whose
-  `details` carry `reads: true`, because a refusal that reads like a deletion sends an operator
-  looking for a backup instead of for a reactivation. The routes reach the guard through
-  `organization_in_scope_for_write` (members, invitations, departments, settings, modules,
-  limits) and `site_in_scope_for_write` (site rename, site delete, all three domain routes) plus
-  the explicit check in `create_site`. Eighteen write paths, one rule.
-- **The exception is the point.** A tenant that could not be reactivated could be suspended and
-  never brought back, so `scope::is_status_change` lets a payload carrying a status through the
-  guard. A *rename* of a frozen tenant is still refused — the escape hatch is for a status change,
-  not for any request that happens to include one — and the walk proves both halves.
-- **The audit action is not a rename.** A status move files `organization.suspended` /
-  `.archived` / `.reactivated` and emits the matching event, instead of `organization.updated`.
-  "Who suspended this tenant, and when" is a question the trail exists to answer, and a trail
-  that says "someone edited the organization" cannot answer it.
-- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **19 walks, 3 failures, and the 3
-  are the pre-existing baseline** — confirmed by stashing this tick's changes and re-running at
-  HEAD (`16 passed; 3 failed`, the same three: `a_ceiling_really_bounds_accepting_an_invitation`,
-  `a_queued_link_never_works_and_says_so`, `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`,
-  all three a cross-test interference between parallel walks sharing one database).
-  `cargo test -p omnion-identity -p omnion-audit -p omnion-api --lib` → **261 unit tests, 0
-  failures** (123 + 2 + 136), including the two new `scope` tests. `pnpm typecheck` in
-  `apps/admin` → clean. The three new walks each prove something a single assertion cannot:
-  ten reads of a suspended tenant all answering 200 while eight writes across every family answer
-  409; the three refused writes read back out of the database to prove the refusal left nothing
-  behind; and the suspend → reactivate → archive round trip with the rename staying refused.
-- **The panel half.** `TenantStatusProvider` + a banner inside the sticky header, so a frozen
-  tenant says so on *every* screen rather than letting a person find out one refused Save at a
-  time. `role="status"`, not `role="alert"`: a standing condition re-announcing itself on every
-  navigation is noise. The list's Suspend and the switcher's change both reload it. The walkthrough
-  gained `runOrganizationSuspend`, which proves the banner on screen and always re-activates in
-  its tail.
-- **A 403 from the wrong layer passes for a 403 from the right one — twice.** The fixture's
-  administrator had `sites.create` and not `sites.update`, so the site-rename assertion read
-  `403 permission_denied` where it expected `409`; the guard never ran. Adding `sites.update`
-  moved the failure one line down, to `domains.manage`. A walk that stops at the first 403 is a
-  walk that cannot tell "refused" from "never got there", and the fix is to grant the fixture
-  *every* permission the walks touch rather than to discover them one run at a time.
-- **A `PUT` that is not a patch.** `PUT /organizations/{id}/settings` is a whole-row replace:
-  `timezone`, `invite_policy` and `audit_retention_days` are required, so a body carrying only the
-  field under test answers `422` and the walk fails for a reason that has nothing to do with the
-  freeze. The three walks share a `settings_body()` helper so the full shape lives in one place.
-- **Environment.** The box rebooted mid-tick and `/mnt/apopic` has been between 100% and 96% all
-  tick: a `rustc` link died with "No space left on device" and a QA pass cannot start on 496M.
-  Reclaimed what is mine and regenerable (`apps/*/.next` = 1.4G, `qa-artifacts`, `target/debug/
-  {build,incremental}`, `*.rcgu.o`); the rest of the volume belongs to the other six writers.
-  `CARGO_PROFILE_DEV_DEBUG=0` kept the linker's peak low enough to finish.
-- **Next.** Slice 4: events and hardening — the per-organization audit retention sweep, the module
-  toggle events, and the mobile pass. The lifecycle events a status move emits are already in
-  place here, which is one item of that slice already done.
-
-## 2026-09-28 — REQ-005 slice 4, second unit · the retention sweep, so the stored number means something
-
-- **What.** `organization_settings.audit_retention_days` had been stored, validated (30–3650) and
-  rendered on the Settings tab since slice 3, and nothing read it: there was no sweep that purged
-  anything, so the field was a number an operator could change and never see anything happen. This
-  tick makes the platform enforce it. `omnion_audit::purge_before` is the only place an audit row
-  leaves the trail, and the tenant is scoped **in the statement** (`where organization_id = $1`)
-  rather than by a filter the caller passed — a retention sweep that deleted another tenant's row
-  would be the worst bug this platform could ship, and the only place that cannot go wrong is the
-  `where`. `apps/api/src/retention_runner.rs` reads each tenant's own stored window, computes that
-  tenant's cutoff, removes what fell out of it, then files a **system** `organization.retention.swept`
-  audit row and announces the same event with `rows_removed` and `cutoff`.
-- **A sweep that removed nothing files nothing.** The receipt is about a deletion that happened. A
-  nightly `rows_removed: 0` row on a two-hundred-tenant platform is two hundred rows a day in the
-  trail, and a trail full of its own housekeeping is a trail nobody reads — so a tenant with nothing
-  expired is skipped entirely, and the walk asserts the second sweep returns 0 and files 0.
-- **A tenant with no settings row is swept, not spared.** The `left join` on `organization_settings`
-  matters: a tenant created after the backfill has no row, and reading that as "no window" would keep
-  its history forever — the exact opposite of what the tab promises. It falls back to the schema's 365.
-- **The cadence is a day, not a minute.** The shortest window a tenant can ask for is 30 days, so a
-  minute-cadence sweep would re-read every tenant 1440 times a day to delete rows that are at least a
-  month old. The first tick fires at boot, so a process restarted more often than daily still sweeps.
-  `OMNION_AUDIT_RETENTION_SWEEP{,_SECONDS,_BATCH}` are the knobs; the sweep is **on by default**,
-  because retention that only runs when somebody remembers is not retention.
-- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **22 passed, 3 failed**, and the three
-  are the pre-existing baseline BUILD-LOG already records (`a_ceiling_really_bounds_accepting_an_invitation`,
-  `a_queued_link_never_works_and_says_so`, `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows` —
-  cross-test interference between parallel walks sharing one database, reproduced at HEAD). The two new
-  walks pass on their own: `the_retention_sweep_applies_each_tenants_own_window` (two tenants, two
-  windows, rows at 2/60/100/400 days; 3 removed, the 365-day tenant **keeps** its 100-day row, the
-  receipt repeats `rows_removed: 2` / `retention_days: 30` as `system`, the bus event matches, and the
-  second sweep is a no-op that files nothing) and
-  `a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept`.
-  `cargo test -p omnion-audit -p omnion-core --lib` → **36 unit tests, 0 failures** (2 + 34, including
-  the two new `RetentionConfig` tests). `cargo test -p omnion-api --lib` → **133 passed, 0 failures**.
-  `pnpm typecheck` in `apps/admin` → clean.
-- **The panel says what the number now does.** The Settings tab's helper line grew from "Between 30 and
-  3650 days." to say the platform enforces it, that each sweep files a row here, and that the trail
-  therefore explains its own gaps. A setting that is enforced but described as if it were not is the same
-  dead feature one layer down, and the field also got the `data-organization-settings-retention` hook the
-  walkthrough needs.
-- **Environment.** `/mnt/apopic` opened the tick at 99% with 882M free, so the build target moved to
-  `/dev/shm/w5-target` (32G tmpfs, already holding w6's and w7's targets) and this writer's 2.4G
-  `target/` was reclaimed after a `cp -a` warm start. `/mnt/apopic` went 99% → 95% without touching a
-  single file that belongs to another writer.
-- **Next.** The last item of slice 4 is the `organization.member.joined` webhook-isolation walk — an
-  org-scoped webhook endpoint subscribed to that event must receive **only** its own tenant's
-  deliveries, which is the slice's done-when — then the mobile pass, then the REQ can close.
-
-## 2026-09-28 — REQ-005 slice 4, third unit · the webhook-isolation walk (the slice's done-when)
-
-- **What.** Slice 4's stated done-when is *"an org-scoped webhook endpoint subscribed to
-  `organization.member.joined` delivers only that organization's events"*, and nothing executed
-  it. This tick makes it a real walk over real receivers — `apps/api/tests/events.rs`,
-  `a_members_join_reaches_only_the_tenant_it_belongs_to`. Three loopback receivers, three real
-  endpoints, two tenants, and **both** routes that emit the name: the administrative
-  `POST /organizations/{id}/members` and the invitation acceptance (which is why the walk opens
-  the tenant's invite policy to `self_serve` first — under the default `owner_approval` the
-  create answers `202` with no token, which is the *correct* behaviour and useless here).
-- **The third endpoint is the point of the walk.** Tenant A gets a second endpoint subscribed to
-  `organization.module.disabled`. Subscription filtering and organization filtering are two
-  different rules, and a walk that only exercises the first will pass an implementation that
-  ignores the second — the two tenants' endpoints are then the only evidence, and they are the
-  *same* evidence. With the quiet endpoint, "A got its own and not B's" and "A's other endpoint
-  got nothing" are separate facts, so a fan-out that ignored the subscription list fails for its
-  own reason.
-- **The direction that catches a name-only fan-out.** "B receives nothing" is a weak assertion:
-  an implementation that matched on the event *name* alone would still satisfy it, because the
-  event carries its own organization. The last third emits a fact belonging to **no** tenant —
-  a platform fact — with both tenants' endpoints already subscribed to that exact name, and
-  requires `deliveries == 0` and a following tick that claims 0. That is the case where the two
-  rules come apart.
-- **Delivery order is the runner's, not the walk's.** The first draft indexed `captured[0]` and
-  asserted the acceptance's `payload.via`; it failed with `left: Null` because the *administrative
-  add* was the delivery that arrived first — the runner claims `order by next_attempt_at, created_at`
-  and both rows were due in the same batch. The deliveries are now selected by what they carry
-  (`find(|body| body["payload"]["via"] == "invitation")`), which is a statement about the platform
-  rather than about a queue's tie-break. A test that asserts an ordering the code does not promise
-  passes until a batch changes, and then fails for a reason that has nothing to do with the thing
-  under test.
-- **Proof.** `cargo test -p omnion-api --test events` → **3 passed, 0 failed** (the two
-  pre-existing walks plus the new one). `cargo test -p omnion-api --test tenancy_limits` →
-  **22 passed, 3 failed**, unchanged from the baseline BUILD-LOG records
-  (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
-  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows` — cross-test interference
-  between parallel walks sharing one database, reproduced at HEAD and unrelated to this change;
-  this tick touched no production code at all). `pnpm typecheck` in `apps/admin` → clean.
-- **Environment.** `/mnt/apopic` opened the tick at 94% (3.5G free) with load 6.4, so the build ran
-  on `CARGO_TARGET_DIR=/dev/shm/w5-target` as established. A dedicated `omnion_w5_events_test`
-  database was created for the suite's own walks; the suite creates and drops its own
-  throwaway databases, so this one only carries the connection.
-- **Next.** The mobile pass — the member drawer and the settings/audit tabs at 390×844 — then
-  the full QA walkthrough (`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104 QA_WEB_PORT=3204
-  bash scripts/qa/run.sh`), which has not yet run green on this branch: seven writers on one 60G
-  mount have had the volume between 94% and 100% all tick, and the last several attempts died on
-  `Page crashed` and `Execution context was destroyed` under host load rather than on anything in
-  the code. The REQ stays open until the real pass runs.
-- **The QA pass, and an honest reading of it.** `QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104
-  QA_WEB_PORT=3204 bash scripts/qa/run.sh` was run and **did not complete**: the API built and the
-  stack came up clean (`/healthz` 200, admin 307, web 404 before the first request), and the
-  walkthrough visited **33 pages and 18 interaction passes** — overview, pages, media,
-  media-trash, media-settings, sites, ai, search, search-settings and eight IAM screens — before
-  the browser tab died at `iam-authentication` with `Target page, context or browser has been
-  closed`, and every later route reported the same. It never reached the organization routes, so
-  it says **nothing** about the screens this REQ is about, and the REQ stays open: this is the
-  sixth consecutive pass on this branch to die the same way, and the ledger's earlier entries
-  name the same two errors. The host reading, taken at the time of the failure: `MemAvailable`
-  4.5G (the precondition is >8G), **six** other `qa/run.sh` processes live (w2, w4, w7 and
-  friends), 40 Chrome processes, load 8.5. The tab did not die *at* the failing route — it died
-  before it, and every subsequent route failed identically, which is the signature of a killed
-  browser rather than a broken page. The `qa-artifacts` run directory (43M) was removed after
-  reading `summary.json`, which contains only the fatal line and no findings; `/mnt/apopic` went
-  95% → 83% on that and on the other writers finishing.
-- **What this tick changed, precisely.** No production code. The walk lives in
-  `apps/api/tests/events.rs` and runs against a live database over the real router; the docs
-  record it. A REQ cannot close on a pass that did not run, so the next tick starts with the
-  mobile pass and a retry, and checks `MemAvailable` and the sibling-pass count *before* launching
-  one rather than interpreting the failure afterwards.
-
-## The member drawer (REQ-005, slice 4)
-
-- **What this tick found, by reading the spec before writing code.** The Members bullet names a
-  drawer and the QA plan opens one ("open a member drawer and extend a binding"). Neither
-  existed. Reading the sentence closely turned up a second gap worth its own line: the spec lists
-  **three** operations — *add / extend / revoke* — and the platform had verbs for two.
-  `POST /iam/bindings` granted, `DELETE /iam/bindings/{id}` revoked, and nothing could *lengthen*
-  a temporary grant, so giving somebody another month meant revoking and re-granting.
-- **Why "extend" must not be revoke-then-grant.** That implementation passes every assertion a
-  person can make by eye and leaves two live bindings for one role and scope. The
-  effective-permissions screen then renders the same role twice with two different windows,
-  neither of which is the truth. `bindings::extend_expiry` updates **the same row**, and the
-  statement carries `revoked_at is null` so a grant the trail already recorded as revoked cannot
-  come back to life. The walk that proves it is
-  `a_temporary_grant_is_extended_in_place_and_never_into_a_second_row`, and the assertion that
-  catches it is a **count** — `bindingRowsAfter == bindingRowsBefore`.
-- **One read for the whole panel.** Four parallel requests would let the identity render over an
-  empty binding list, and an empty list under a colleague's name is a statement about that
-  colleague, not about a spinner. `GET /organizations/{id}/members/{user_id}` answers everything
-  the drawer renders.
-- **Isolation.** Another tenant's member is a `404`, not a `403` — the second answer confirms the
-  id exists. A grant is refused when the subject is not a member here, when the role belongs to
-  another tenant (`cross_organization`), and for a `global` scope by name rather than quietly
-  downgraded to `organization`: a tenant administrator asking for a platform grant is asking for
-  something the platform owns, and a silent downgrade makes the grant do something other than
-  what the panel said.
-- **Proof.** `cargo check -p omnion-api --tests` → clean. `pnpm typecheck` in `apps/admin` →
-  clean (the LSP caught two real nullability errors in the drawer before the gate did: a revoked
-  row's `revoked_at` and an extended binding's `expires_at` are both nullable, and both were
-  being formatted as though they were not).
-  `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **23 passed, 5 failed**;
-  three of the five are the baseline cross-test interference the ledger already records
-  (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
-  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`), and the two new walks' own
-  first run failed for the reasons corrected below.
-- **Two failures that were wrong *assertions*, not wrong code — and one of them was the better
-  answer.** The first run asserted that extending a revoked grant is a `404`. It is a `400
-  binding_revoked`, and the `400` is right: the row exists, the operator can see it in the drawer,
-  and "there is no such grant" would send them hunting for a typo instead of reading the sentence
-  that states the rule. The second asserted that the subject's drawer shows the grant. It must
-  not: the grant was performed by the *administrator*, so it belongs on the grantor's trail and
-  in the organization's Audit tab, and putting an administrator's acts inside a panel about a
-  colleague is the wrong half of a privacy decision made by accident. Both assertions now pin the
-  intended behaviour rather than the one that happened.
-- **The QA pass was deferred, by a number, before it was launched.** `MemAvailable` 4G against a
-  `>8G` precondition, **eight** sibling `qa/run.sh` processes, load average 34. Those are the
-  conditions the last six attempts on this branch died in, and they were readable in one `free`
-  and one `pgrep` a minute before starting. The walkthrough pass for the drawer is written
-  (`runOrganizationMemberDrawer`, wired after the departments pass) and `node --check` clean; it
-  runs when the box has room. The REQ stays open.
-- **Next.** The mobile pass at 390×844 (member drawer, Settings/Modules/Billing/Audit tabs, the
-  organization detail), then the QA walkthrough. Then the platform-account criterion, the last
-  unticked line on this REQ.
+  attempts. The first died at `media-trash` with `Page crashed`; the second got seven routes
 
 ## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
+  further and then failed with `Execution context was destroyed` after stalling on `/search` for
+- **What.** The `organizations.status` column and the list's Suspend/Reactivate controls had
 
+  roughly six minutes. Both are host, not code: at that point the box was running **six**
+  existed since slice 1, and nothing read the status: a suspended tenant accepted every write.
 - **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
+  concurrent `qa/run.sh` passes (main, w2, w4, w7×2, w5) with 50 Chrome processes and a 4.3 GB
+  This tick makes the column mean something. `Organization::accepts_writes` in
   gave it *derivatives*: a page asks for `?preset=card` and gets the same pixels every time,
+  `java`, and the 1-minute load average reached **437**. This is the saturation the ledger warns
+  `crates/identity` says which statuses are frozen; `scope::ensure_writable` turns that into a
   built on the first request and addressed by a hash of its inputs.
+  about, one order of magnitude past it. The evidence recorded above is therefore the tiered
+  `409 organization_not_writable` whose message names the tenant and its status and whose
 - **The dependency the plan did not mention.** A preset has to *produce* pixels, which means
+  gates (19 API walks, 136 unit tests, `tsc`) plus the focused probe — which is *not* a
+  `details` carry `reads: true`, because a refusal that reads like a deletion sends an operator
   decoding, resampling and re-encoding. The workspace had no image crate, so this tick adds
+  substitute for the gate, and the slice still has the suspend/archive work outstanding, so no
+  looking for a backup instead of for a reactivation. The routes reach the guard through
   `image` (png/jpeg/webp only — the three codecs a preset can emit). Shelling out to a binary
+  REQ closes here. Re-run the full pass when the box is quiet; `c83af9b` (the wizard race) and
+  `organization_in_scope_for_write` (members, invitations, departments, settings, modules,
   was the alternative and was rejected: it makes the API's correctness depend on what happens to
+  the new `runOrganizationInvitePolicy` are both unexercised end-to-end until it does.
+  limits) and `site_in_scope_for_write` (site rename, site delete, all three domain routes) plus
   be installed on the host, and the test suite would skip itself on a machine without it.
+- **Environment note.** `/mnt/apopic` was at 100% twice mid-tick and a `rustc` link died with
+  the explicit check in `create_site`. Eighteen write paths, one rule.
 - **Two fits are not one fit.** `cover` crops and `contain` letterboxes, and the first version
+  "No space left on device" — the known shared-volume failure with seven writers. Reclaimed what
+- **The exception is the point.** A tenant that could not be reactivated could be suspended and
   gave both the same resampler. It produced a correctly-sized *crop*: it passes a square-crop
+  is mine and regenerable (`.rcgu.o`, the stale test binaries, `~/.npm/_cacache`, the cargo
+  never brought back, so `scope::is_status_change` lets a payload carrying a status through the
   assertion and is wrong on every non-square source, which is most of them. A `contain` result is
+  registry cache) and four **dangling** docker volumes nobody references (2.4G, checked with
+  guard. A *rename* of a frozen tenant is still refused — the escape hatch is for a status change,
   now pasted onto a canvas of the box's size, so a thumbnail is a stable 320×320 rather than a
+  `docker volume ls -f dangling=true` — Omnion's own volumes are named and were untouched).
+  not for any request that happens to include one — and the walk proves both halves.
   320×180 that shifts the layout every time a differently-shaped image is uploaded.
+  `CARGO_PROFILE_DEV_DEBUG=0` cut the linker's peak disk use enough to finish the suite on a
+- **The audit action is not a rename.** A status move files `organization.suspended` /
 - **A request never enlarges.** A 2400px request against a 1200px source is refused with an
+  volume this contended.
+  `.archived` / `.reactivated` and emits the matching event, instead of `organization.updated`.
   explanation instead of being answered with a blurry upscale that is *larger* than the original.
+- **Next.** The last of slice 3: the **suspend/archive behaviour**. The `organizations.status`
+  "Who suspended this tenant, and when" is a question the trail exists to answer, and a trail
   The check is `>`, not `>=`: asking for exactly the source's own size is the identity, and a
+  column and the list's Suspend/Reactivate/Archive controls exist, but suspending a tenant does not
+  that says "someone edited the organization" cannot answer it.
   template that names the same number twice is not a mistake. The unit test forced this — the
+  yet *block writes with the reason* — the acceptance line wants a suspended tenant to keep reads
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **19 walks, 3 failures, and the 3
   first version refused the identity too, which would have broken the seeded `standard` preset on
+  available and refuse every write by name, and reactivating to restore them. That is one guard
+  are the pre-existing baseline** — confirmed by stashing this tick's changes and re-running at
   a 1200×630 hero.
+  applied across the tenancy write paths plus the banner, which the panel already renders.
+  HEAD (`16 passed; 3 failed`, the same three: `a_ceiling_really_bounds_accepting_an_invitation`,
 - **The cache key is a hash of the definition, not of (file, preset).** A pair lookup would serve
+  `a_queued_link_never_works_and_says_so`, `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`,
   stale pixels after an edit, because the pair is unchanged while the definition moved. With a
+  all three a cross-test interference between parallel walks sharing one database).
   key lookup, an edit produces a key nobody has seen, so the old entry becomes *unreachable*
+  `cargo test -p omnion-identity -p omnion-audit -p omnion-api --lib` → **261 unit tests, 0
   rather than *wrong* — and the response may honestly say `max-age=31536000, immutable`.
+  failures** (123 + 2 + 136), including the two new `scope` tests. `pnpm typecheck` in
   Quality is in the key, and that is the field people forget.
+  `apps/admin` → clean. The three new walks each prove something a single assertion cannot:
 - **Three defects the real router found that a unit test on `transform_bytes` could not.**
+  ten reads of a suspended tenant all answering 200 while eight writes across every family answer
   1. The derivative header carried the **object key** where the identity belongs. The two are
+  409; the three refused writes read back out of the database to prove the refusal left nothing
      different strings that both appear in the module, and the response builder took one
+  behind; and the suspend → reactivate → archive round trip with the rename staying refused.
      parameter where it needed two — so a caller that read the header and looked it up in
+- **The panel half.** `TenantStatusProvider` + a banner inside the sticky header, so a frozen
      `media_derivatives.cache_key` found nothing. A header that looks like an identifier and is
+  tenant says so on *every* screen rather than letting a person find out one refused Save at a
      not one is worse than none. Both are now fields of a struct, because three positional
+  time. `role="status"`, not `role="alert"`: a standing condition re-announcing itself on every
      `&str`s is the shape that produced the bug.
+  navigation is noise. The list's Suspend and the switcher's change both reload it. The walkthrough
   2. **A site created after the migration got no `standard` preset.** The `0027` seed covers the
+  gained `runOrganizationSuspend`, which proves the banner on screen and always re-activates in
      sites that existed when it ran, so a page already asking for `?preset=standard` would
+  its tail.
      silently fall back to full-size originals — on new sites only, which is exactly where nobody
+- **A 403 from the wrong layer passes for a 403 from the right one — twice.** The fixture's
      is looking. It cannot be fixed in the migration, because the gap is between "the migration
+  administrator had `sites.create` and not `sites.update`, so the site-rename assertion read
      ran" and "somebody creates a site", and it cannot be fixed in the create path either:
+  `403 permission_denied` where it expected `409`; the guard never ran. Adding `sites.update`
      onboarding, the tenancy API and a future import all insert the row themselves. It is a
+  moved the failure one line down, to `domains.manage`. A walk that stops at the first 403 is a
      trigger (`0028`), which is the only place guaranteed to see every site.
+  walk that cannot tell "refused" from "never got there", and the fix is to grant the fixture
   3. A test asserting **"the first call builds" passes once and fails for ever after.** The row
+  *every* permission the walks touch rather than to discover them one run at a time.
      is keyed by the source bytes, and a re-run reproduces them exactly, so the second run is a
+- **A `PUT` that is not a patch.** `PUT /organizations/{id}/settings` is a whole-row replace:
      cache hit. The assertion now checks the answer is correct either way and that the key is
+  `timezone`, `invite_policy` and `audit_retention_days` are required, so a body carrying only the
      stable — the property that actually matters.
+  field under test answers `422` and the walk fails for a reason that has nothing to do with the
 - **Proof.** `cargo test -p omnion-media --lib` → **78 tests, 0 failures** (32 new). Five walks
+  freeze. The three walks share a `settings_body()` helper so the full shape lives in one place.
   over the real router in `--test media_transform` → **0 failures**: the bytes are compared *as
+- **Environment.** The box rebooted mid-tick and `/mnt/apopic` has been between 100% and 96% all
   bytes* and decoded again (a length check passes by accident on an overwrite), the second
+  tick: a `rustc` link died with "No space left on device" and a QA pass cannot start on 496M.
   request is byte-identical to the first, the object is read back out of the store and compared
+  Reclaimed what is mine and regenerable (`apps/*/.next` = 1.4G, `qa-artifacts`, `target/debug/
   against what was served, the old row survives an edit, a delete cascades the cache away, an
+  {build,incremental}`, `*.rcgu.o`); the rest of the volume belongs to the other six writers.
   unknown preset returns the original *byte for byte* with no derivative key, an SVG answers
+  `CARGO_PROFILE_DEV_DEBUG=0` kept the linker's peak low enough to finish.
   `not_transformable` naming its type, and every preset field error names the field that caused
+- **Next.** Slice 4: events and hardening — the per-organization audit retention sweep, the module
   it. The pre-existing `--test media` → **11 walks, 0 failures**, unchanged, against the raw route
+  toggle events, and the mobile pass. The lifecycle events a status move emits are already in
   that now takes a query parameter. `cargo test -p omnion-permissions --lib` → 62 pass.
+  place here, which is one item of that slice already done.
   `pnpm --filter @omnion/admin typecheck` green.
+
 - **The QA pass (`bash scripts/qa/run.sh`, default stack) — clean for this slice.** 954 clicks,
+## 2026-09-28 — REQ-005 slice 4, second unit · the retention sweep, so the stored number means something
   988 screenshots, the new `/media/settings` route walked and clicked (28 elements), and the depth
+
   pass drove it: created a preset, submitted an out-of-range quality and **the field error named
+- **What.** `organization_settings.audit_retention_days` had been stored, validated (30–3650) and
   it**. Vision review returned **0 high / 0 medium / 0 low**. The page's own diagnostics read
+  rendered on the Settings tab since slice 3, and nothing read it: there was no sweep that purged
   *overflow: no · offscreen: 0 · broken images: 0 · low contrast: 0 · unlabeled inputs: 0 ·
+  anything, so the field was a number an operator could change and never see anything happen. This
   duplicate ids: 0 · h1: 1*. The four high findings the run reports are the walkthrough's **own
+  tick makes the platform enforce it. `omnion_audit::purge_before` is the only place an audit row
   deliberate error-state probes** — `/media?folder=nonexistent-folder` and the 400/404 they
+  leaves the trail, and the tenant is scoped **in the statement** (`where organization_id = $1`)
   produce — none of them from this slice.
+  rather than by a filter the caller passed — a retention sweep that deleted another tenant's row
 - **Two things the pass taught about this slice's own screen.** The seeded `standard` preset *is*
+  would be the worst bug this platform could ship, and the only place that cannot go wrong is the
   present on a QA site (checked directly in `omnion_qa`, and the trigger in `0028` fires for a
+  `where`. `apps/api/src/retention_runner.rs` reads each tenant's own stored window, computes that
   site created afterwards), so the walkthrough's `seeded: 0` was its own text match, not a gap —
+  tenant's cutoff, removes what fell out of it, then files a **system** `organization.retention.swept`
   which is why the number was checked against the database rather than believed. And the preset
+  audit row and announces the same event with `rows_removed` and `cutoff`.
   example URL is a `<code>`, not an anchor: the first depth pass looked for `a[href^="/api/v1/
+- **A sweep that removed nothing files nothing.** The receipt is about a deletion that happened. A
   media/"]`, found none, and reported "no preset example URL" for a screen that had one on it. An
+  nightly `rows_removed: 0` row on a two-hundred-tenant platform is two hundred rows a day in the
   `<a>` pointing at a placeholder id would only have proven a 404 — the same mistake the route
+  trail, and a trail full of its own housekeeping is a trail nobody reads — so a tenant with nothing
   inventory already made once with `/media/files`. The pass now reads the query the screen
+  expired is skipped entirely, and the walk asserts the second sweep returns 0 and files 0.
   actually renders and builds a real URL with a real file id.
+- **A tenant with no settings row is swept, not spared.** The `left join` on `organization_settings`
 - **A compiler lesson, fought out over a long wrong turn.** Every guarded route in this codebase
+  matters: a tenant created after the backfill has no row, and reading that as "no window" would keep
   is written `get(handler).layer(guards::require(...))`, and the new routes refused to compile
+  its history forever — the exact opposite of what the tab promises. It falls back to the schema's 365.
   with a bare `type annotations needed for MethodRouter<AppState, _>`. The guard's service impl
+- **The cadence is a day, not a minute.** The shortest window a tenant can ask for is 30 days, so a
   requires the inner service's `Error = Infallible`, and inference cannot pick `Infallible` out of
+  minute-cadence sweep would re-read every tenant 1440 times a day to delete rows that are at least a
   the several `From<Infallible>` impls in scope. Every existing route gets away with it because
+  month old. The first tick fires at boot, so a process restarted more often than daily still sweeps.
   the *later* `.merge()`/`.route()` calls in the same chain pin the type. The fix is a
+  `OMNION_AUDIT_RETENTION_SWEEP{,_SECONDS,_BATCH}` are the knobs; the sweep is **on by default**,
   `MethodRouter<AppState, Infallible>` annotation on the three new bindings — the same fix the
+  because retention that only runs when somebody remembers is not retention.
   compiler suggested and that reading the guard's own bound would have given in one minute.
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **22 passed, 3 failed**, and the three
 - **Environment.** `/` was at 99 % and `/mnt/apopic` at 100 % during the run — MinIO refused
+  are the pre-existing baseline BUILD-LOG already records (`a_ceiling_really_bounds_accepting_an_invitation`,
   writes with `XMinioStorageFull` and three walks failed on a storage error that had nothing to do
+  `a_queued_link_never_works_and_says_so`, `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows` —
   with the code. Reclaiming `omnion-live/target` and `omnion-w5/target` (worktrees for waves
+  cross-test interference between parallel walks sharing one database, reproduced at HEAD). The two new
   nobody has started) plus this one's stale `deps` binaries returned ~4 GB. **Owner action:** the
+  walks pass on their own: `the_retention_sweep_applies_each_tenants_own_window` (two tenants, two
   eight worktrees under `/mnt/apopic` hold ~30 GB of `target/`, and this is the second tick in a
+  windows, rows at 2/60/100/400 days; 3 removed, the 365-day tenant **keeps** its 100-day row, the
   row that has had to delete another loop's build cache to finish its own tests.
+  receipt repeats `rows_removed: 2` / `retention_days: 30` as `system`, the bus event matches, and the
 - **Next.** Slice 3 continues — per-site storage settings with a connection test and public base
+  second sweep is a no-op that files nothing) and
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
+  `a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept`.
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
+  `cargo test -p omnion-audit -p omnion-core --lib` → **36 unit tests, 0 failures** (2 + 34, including
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+  the two new `RetentionConfig` tests). `cargo test -p omnion-api --lib` → **133 passed, 0 failures**.
 
+  `pnpm typecheck` in `apps/admin` → clean.
 ## 2026-09-28 — REQ-005 slice 4, last criterion · and the duplicate migration that was faking a total regression
+## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
+- **The panel says what the number now does.** The Settings tab's helper line grew from "Between 30 and
 
+
+  3650 days." to say the platform enforces it, that each sweep files a row here, and that the trail
 - **What shipped.** **`9195e18`** (migration numbering) and **`e00c53c`** (the
+- **What.** The third third of slice 3: `0036_media_shares.sql`,
+  therefore explains its own gaps. A setting that is enforced but described as if it were not is the same
   platform-account criterion) plus **`cb1b839`** (the tick). Two branches had
+  `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
+  dead feature one layer down, and the field also got the `data-organization-settings-retention` hook the
   independently claimed `0029`: main for per-site media storage settings
+  `apps/api/tests/media_shares.rs`, `features/media/shares-tab.tsx` (a **Share** tab on
+  walkthrough needs.
   (`9973268`) and this branch for organization departments, which `644a129` had
+  `/media/files/{id}`), the client methods and the `MediaShare`/`CreatedMediaShare` types, and a
+- **Environment.** `/mnt/apopic` opened the tick at 99% with 882M free, so the build target moved to
   itself moved onto `0029` to escape an earlier `0028` collision with site
+  walkthrough depth pass. Six design decisions, each a shortcut that produces a plausible wrong
+  `/dev/shm/w5-target` (32G tmpfs, already holding w6's and w7's targets) and this writer's 2.4G
   presets. The number was free when that fix was written and is taken now. Git
+  answer:
+  `target/` was reclaimed after a `cp -a` warm start. `/mnt/apopic` went 99% → 95% without touching a
   merged both files without comment and sqlx refused to start:
+  1. **The token is stored hashed and nowhere else.** The row holds `sha256(token)` under a
+  single file that belongs to another writer.
 
+     unique index, so a backup, a replica log or a support engineer with read access comes away
+- **Next.** The last item of slice 4 is the `organization.member.joined` webhook-isolation walk — an
       migrations must apply: Migration(VersionMismatch(29))
+     with a list of *dead* tokens, and the lookup is still one probe. The round trip runs one way
+  org-scoped webhook endpoint subscribed to that event must receive **only** its own tenant's
 
+     only, and the row type has no field the plaintext could occupy.
+  deliveries, which is the slice's done-when — then the mobile pass, then the REQ can close.
   Every walk in the tenancy suite dies in `live_state` before reaching a single
+  2. **A share reaches a file; it does not bypass what the file is.** Servability is decided at
+
   assertion, so the suite printed **0 passed / 29 failed** and read as a total
+     *serve* time, not at creation — a link made yesterday must not keep serving a file the
+## 2026-09-28 — REQ-005 slice 4, third unit · the webhook-isolation walk (the slice's done-when)
   regression. It was one duplicated version number. Renumbered to `0037`-`0039`,
+     scanner has since flagged.
+
   clear of main (`0036`), wave4 (`0034`) and wave3 (`0030`).
+  3. **`revoked` and `expired` are the same answer (410), `password_required` is 403.** Telling
+- **What.** Slice 4's stated done-when is *"an org-scoped webhook endpoint subscribed to
 - **Proof.** `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1`
+     the two dead states apart would hand a token prober a free oracle; answering "type the
+  `organization.member.joined` delivers only that organization's events"*, and nothing executed
   → **26 passed / 3 failed**, and `a_platform_account_names_the_tenant_every_write_needs`
+     password" with 410 would send the owner a pointless request.
+  it. This tick makes it a real walk over real receivers — `apps/api/tests/events.rs`,
   passes alone (`1 passed`). The 3 failures are **pre-existing and were not
+  4. **The counter counts bytes that were served**, in its own statement, so a failure after the
+  `a_members_join_reaches_only_the_tenant_it_belongs_to`. Three loopback receivers, three real
   interference**: each of them fails on its own with `--test-threads=1`. They had
+     bytes went out cannot roll it back.
+  endpoints, two tenants, and **both** routes that emit the name: the administrative
   been mislabelled as cross-test interference by an earlier tick, and the reason
+  5. **Revocation is a write, not a delete** — the row is kept with its reason forever, because
+  `POST /organizations/{id}/members` and the invitation acceptance (which is why the walk opens
   that went unnoticed for so long is the migration panic — it killed all 29 walks
+     that is the only thing that makes a leaked link investigable.
+  the tenant's invite policy to `self_serve` first — under the default `owner_approval` the
   before any of them could be seen failing for its own reason. Established by
+  6. **The screen has no `Copy` on an existing row, and cannot.** The token is returned once;
+  create answers `202` with no token, which is the *correct* behaviour and useless here).
   stashing only this tick's work on top of the migration fix: the baseline is
+     a copy button there would silently copy nothing.
+- **The third endpoint is the point of the walk.** Tenant A gets a second endpoint subscribed to
   **25 passed / 3 failed**, the same three names, so nothing here regressed and
+- **Proof.** Five walks over the real router in `--test media_shares` → **0 failures**. The
+  `organization.module.disabled`. Subscription filtering and organization filtering are two
   one walk was added. `tsc --noEmit` in `apps/admin` exits 0 (a `pnpm typecheck`
+  stored value is read **out of the database** rather than inferred from a response that hid the
+  different rules, and a walk that only exercises the first will pass an implementation that
   cache hit is not evidence — the new `tenant-picker.tsx` was untracked, so the
+  token; the list is scanned over its raw bytes for the token and for a field named `token`; the
+  ignores the second — the two tenants' endpoints are then the only evidence, and they are the
   real check was run directly).
+  served bytes are compared as bytes and `no-store`/`nosniff`/`attachment` are each checked; the
+  *same* evidence. With the quiet endpoint, "A got its own and not B's" and "A's other endpoint
 - **The criterion, and what "naming the field" actually meant.** The sentence
+  counter moves once and survives the revocation; the revoked row keeps its reason and instant; a
+  got nothing" are separate facts, so a fan-out that ignored the subscription list fails for its
   already contained the string `organization_id`, so an assertion on the message
+  reader may read the list and may neither create nor revoke; anonymous is refused on both; a
+  own reason.
   would have passed against an error no client could act on. The missing part was
+  share id on another file is a 404, not a 403. `cargo test -p omnion-media --lib` → **98**,
+- **The direction that catches a name-only fan-out.** "B receives nothing" is a weak assertion:
   the structured `details.field`, which is what lets a panel put a control *next
+  `cargo test -p omnion-api --lib` → **116**, and `--test media` (11), `--test media_settings`
+  an implementation that matched on the event *name* alone would still satisfy it, because the
   to the failing input*. `organization_required()` is now the single refusal every
+  (2), `--test media_transform` (5) are unchanged and green. `pnpm --filter @omnion/admin
+  event carries its own organization. The last third emits a fact belonging to **no** tenant —
   scope-resolving route shares, and the two refusals a client renders differently
+  typecheck` green.
+  a platform fact — with both tenants' endpoints already subscribed to that exact name, and
   are kept apart deliberately and unit-proved: a missing tenant names a field
+- **Three defects the walks found, none of which a unit test on `servable` could see.**
+  requires `deliveries == 0` and a following tick that claims 0. That is the case where the two
   (it is the caller's problem to fix), `cross_organization` names none (a picker
+  `find_media` returns the *base* `Media`, which has no `deleted_at` and no `scan_status` — the
+  rules come apart.
   there would only reproduce the same refusal). `TenantPicker` renders a labelled
+  two columns the whole "a share does not bypass the file" rule depends on, so the first draft
+- **Delivery order is the runner's, not the walk's.** The first draft indexed `captured[0]` and
   organization select only for a subject with no organization of its own, and is
+  asked the wrong struct and the compiler found the fields missing. `POST /shares` with no body
+  asserted the acceptance's `payload.via`; it failed with `left: Null` because the *administrative
   absent in `global` scope, where "no tenant" is the point.
+  answered **415**, because the handler demanded a JSON body for the most ordinary call anybody
+  add* was the delivery that arrived first — the runner claims `order by next_attempt_at, created_at`
 - **Environment, twice over.** `rustc` was missing from the box — the
+  makes ("give me a link until I revoke it"); the same for the `DELETE`. And `rand` is a
+  and both rows were due in the same batch. The deliveries are now selected by what they carry
   `0-byte`/vanish class of bug again, with `/root/.rustup/toolchains/` empty and
+  *dev*-dependency of `apps/api`, so token minting moved into the crate, which is where the
+  (`find(|body| body["payload"]["via"] == "invitation")`), which is a statement about the platform
   `rustup toolchain install` reporting "unchanged" and doing nothing. `rustup
+  width and the source belong anyway.
+  rather than about a queue's tie-break. A test that asserts an ordering the code does not promise
   component add rustc` restored 1.98.1 (first attempt died on a download rename).
+- **A test that reaches for a state the platform forbids.** The expiry walk set
+  passes until a batch changes, and then fails for a reason that has nothing to do with the thing
   **A suite database persists between runs**, so renumbering migrations orphans
+  `expires_at = now() - 1s` and the `media_shares_expiry_sane` check refused it — a link whose
+  under test.
   what the old numbering recorded and produces a second, phantom failure
+  expiry precedes its own creation is nonsense. The walk now ages the row by moving `created_at`
+- **Proof.** `cargo test -p omnion-api --test events` → **3 passed, 0 failed** (the two
   (`VersionMissing(30)`) until the database is dropped.
+  back instead, which is the only way to reach the same state and the reason the check is there.
+  pre-existing walks plus the new one). `cargo test -p omnion-api --test tenancy_limits` →
 - **Owner action.** `/mnt/apopic` reached **100 % (215 M free)** with eight
+- **Environment.** `/mnt/apopic` hit **100 %** (89 MB free) mid-tick and MinIO refused every
+  **22 passed, 3 failed**, unchanged from the baseline BUILD-LOG records
   sibling `qa/run.sh` processes running. The QA pass was deferred for the second
+  object write with `XMinioStorageFull`, which reads as a storage bug and was none. The cause is
+  (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
   time in three ticks and the work was committed and pushed first. This branch
+  this worktree's own `target/`: **8.3 GB of rebuildable test binaries** plus 874 MB of `.tmp`
+  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows` — cross-test interference
   reclaimed only its own `target/debug/{incremental,build}` (~1.9 G). The eight
+  leftovers from interrupted linkers. Reclaiming *only this worktree's* artifacts returned 8.5 GB
+  between parallel walks sharing one database, reproduced at HEAD and unrelated to this change;
   worktrees still hold ~25 GB of `target/` between them; writers reclaiming each
+  (86 %). **Owner action:** the seven worktrees under `/mnt/apopic` hold ~30 GB of `target/`; a
+  this tick touched no production code at all). `pnpm typecheck` in `apps/admin` → clean.
   other's caches is not a sustainable answer.
+  shared `CARGO_TARGET_DIR` is the structural fix, and this is the third tick to have had to
+- **Environment.** `/mnt/apopic` opened the tick at 94% (3.5G free) with load 6.4, so the build ran
 - **Next.** The last unticked criterion (line 222) is the whole-`cargo test
+  delete its own build cache before it could run a test.
+  on `CARGO_TARGET_DIR=/dev/shm/w5-target` as established. A dedicated `omnion_w5_events_test`
   --workspace` + `pnpm build` + QA walkthrough gate, and the mobile pass at
+- **Next.** Slice 3 closes with duplicate detection and the merge (checksum groups, reclaimable
+  database was created for the suite's own walks; the suite creates and drops its own
   390x844 over the member drawer, the Members card list and the
+  size, `Keep this one` + `Merge group`, references repointed and the copies trashed), then the
+  throwaway databases, so this one only carries the connection.
   Settings/Modules/Billing/Audit tabs is still unproven. Both are blocked on the
+  CDN purge hook to REQ-011. Still open: EXIF (slice 2), HTTP range requests on the serve path,
+- **Next.** The mobile pass — the member drawer and the settings/audit tabs at 390×844 — then
   same thing: **run the pass when `/mnt/apopic` has real headroom and few sibling
+  and the Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+  the full QA walkthrough (`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104 QA_WEB_PORT=3204
   passes.** Then REQ-005 closes and the queue moves to REQ-011 (CDN/edge).
 
-## 2026-09-28 — The three "pre-existing" failures, and two product defects behind them
-
-- **What shipped.** `bd53c2f` (three invitation-path defects), `e2a711c` (the panel follows
-  the new preview contract) and `00e36fb` (three walks driving the API the way a person
-  would). The suite is **29 passed / 0 failed**, up from 26/3 — no walk was deleted or
-  skipped, and the 3 were not interference.
-- **They were not one bug.** Run alone with `--test-threads=1`, each failed for its own
-  reason, and reading the *status it actually got* is what found them:
-  `202` (not `201`), `415` (not `409`), and a trail missing a row nobody wrote.
-  - **A bodyless accept was a `415`.** `accept_invitation` took `Json<AcceptInvitationRequest>`
-    and axum refuses a bodyless POST in the extractor, so the ceiling and queue checks — both
-    *inside* the handler, one line apart — were never reached. The panel sends `{}`; a signed-in
-    member has nothing to say. Body is now `Option<Json<…>>` + `Default`.
-  - **A queued accept was a `500`.** `IdentityError::InvitationAwaitingApproval` had no arm in
-    the HTTP mapping and fell through to `internal_error`: the invitee was told the platform was
-    broken, and sent back to the manager who cannot fix it. Now `409 invitation_awaiting_approval`.
-  - **The preview was a token oracle.** Its own doc comment promised that an unusable token
-    answers with the same shape and `usable: false`; the code answered `404` for an unknown one
-    and `200` naming the organization for a queued one. A leaked or guessed token could
-    therefore map which organizations exist — the exact thing the endpoint exists to prevent. An
-    unknown token is now `200` with the same body, `usable: false` and one coarse `reason`
-    (`"unusable"`, never `"queued"`/`"expired"` — "why" is the question a token-walker is asking).
-- **Two walks were asking the wrong question.** The ceiling walk inherited the invite policy
-  instead of choosing one, so migration `0038`'s `default 'owner_approval'` queued the invite and
-  the walk blamed the seat ceiling for a refusal it never reached. The audit walk wrote settings
-  **straight to the store**, bypassing the route whose `omnion_audit::record` is the very thing
-  under test, then asserted the row was in the trail — the trail was right; no settings change
-  had ever gone through the product. Its cross-tenant check was weaker still: the other
-  administrator held no `audit.read` anywhere, so the guard answered `403` before the handler
-  resolved the tenant and the assertion proved nothing about isolation. Granted the permission in
-  *their own* tenant, the `404` is what a real auditor gets.
-- **Proof.** `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **29 passed /
-  0 failed** (257 s). `cargo test -p omnion-api --lib` → **134 passed / 0 failed**.
-  `tsc --noEmit` in `apps/admin` exits 0. Tree clean, `wave5` pushed to `00e36fb`.
-- **Environment.** `/mnt/apopic` opened at 95 % with 8 sibling `qa/run.sh` processes, so the
-  build moved to `CARGO_TARGET_DIR=/dev/shm/w5-target` (mine, 2.2 G of the 32 G tmpfs) with
-  `CARGO_INCREMENTAL=0` — reclaiming my own disk to build on a box that has none was not available.
-- **Next.** The only unticked criterion (line 222) is still the whole-workspace gate plus the QA
-  walkthrough, and the 390×844 mobile pass over the member drawer is still unproven. Both need
-  `/mnt/apopic` headroom and few sibling passes. Then REQ-005 closes and the queue moves to
-  REQ-011 (CDN/edge).
-## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
-
-- **What.** The third third of slice 3: `0036_media_shares.sql`,
-  `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
-  `apps/api/tests/media_shares.rs`, `features/media/shares-tab.tsx` (a **Share** tab on
-  `/media/files/{id}`), the client methods and the `MediaShare`/`CreatedMediaShare` types, and a
-  walkthrough depth pass. Six design decisions, each a shortcut that produces a plausible wrong
-  answer:
-  1. **The token is stored hashed and nowhere else.** The row holds `sha256(token)` under a
-     unique index, so a backup, a replica log or a support engineer with read access comes away
-     with a list of *dead* tokens, and the lookup is still one probe. The round trip runs one way
-     only, and the row type has no field the plaintext could occupy.
-  2. **A share reaches a file; it does not bypass what the file is.** Servability is decided at
-     *serve* time, not at creation — a link made yesterday must not keep serving a file the
-     scanner has since flagged.
-  3. **`revoked` and `expired` are the same answer (410), `password_required` is 403.** Telling
-     the two dead states apart would hand a token prober a free oracle; answering "type the
-     password" with 410 would send the owner a pointless request.
-  4. **The counter counts bytes that were served**, in its own statement, so a failure after the
-     bytes went out cannot roll it back.
-  5. **Revocation is a write, not a delete** — the row is kept with its reason forever, because
-     that is the only thing that makes a leaked link investigable.
-  6. **The screen has no `Copy` on an existing row, and cannot.** The token is returned once;
-     a copy button there would silently copy nothing.
-- **Proof.** Five walks over the real router in `--test media_shares` → **0 failures**. The
-  stored value is read **out of the database** rather than inferred from a response that hid the
-  token; the list is scanned over its raw bytes for the token and for a field named `token`; the
-  served bytes are compared as bytes and `no-store`/`nosniff`/`attachment` are each checked; the
-  counter moves once and survives the revocation; the revoked row keeps its reason and instant; a
-  reader may read the list and may neither create nor revoke; anonymous is refused on both; a
-  share id on another file is a 404, not a 403. `cargo test -p omnion-media --lib` → **98**,
-  `cargo test -p omnion-api --lib` → **116**, and `--test media` (11), `--test media_settings`
-  (2), `--test media_transform` (5) are unchanged and green. `pnpm --filter @omnion/admin
-  typecheck` green.
-- **Three defects the walks found, none of which a unit test on `servable` could see.**
-  `find_media` returns the *base* `Media`, which has no `deleted_at` and no `scan_status` — the
-  two columns the whole "a share does not bypass the file" rule depends on, so the first draft
-  asked the wrong struct and the compiler found the fields missing. `POST /shares` with no body
-  answered **415**, because the handler demanded a JSON body for the most ordinary call anybody
-  makes ("give me a link until I revoke it"); the same for the `DELETE`. And `rand` is a
-  *dev*-dependency of `apps/api`, so token minting moved into the crate, which is where the
-  width and the source belong anyway.
-- **A test that reaches for a state the platform forbids.** The expiry walk set
-  `expires_at = now() - 1s` and the `media_shares_expiry_sane` check refused it — a link whose
-  expiry precedes its own creation is nonsense. The walk now ages the row by moving `created_at`
-  back instead, which is the only way to reach the same state and the reason the check is there.
-- **Environment.** `/mnt/apopic` hit **100 %** (89 MB free) mid-tick and MinIO refused every
-  object write with `XMinioStorageFull`, which reads as a storage bug and was none. The cause is
-  this worktree's own `target/`: **8.3 GB of rebuildable test binaries** plus 874 MB of `.tmp`
-  leftovers from interrupted linkers. Reclaiming *only this worktree's* artifacts returned 8.5 GB
-  (86 %). **Owner action:** the seven worktrees under `/mnt/apopic` hold ~30 GB of `target/`; a
-  shared `CARGO_TARGET_DIR` is the structural fix, and this is the third tick to have had to
-  delete its own build cache before it could run a test.
-- **Next.** Slice 3 closes with duplicate detection and the merge (checksum groups, reclaimable
-  size, `Keep this one` + `Merge group`, references repointed and the copies trashed), then the
-  CDN purge hook to REQ-011. Still open: EXIF (slice 2), HTTP range requests on the serve path,
-  and the Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+  bash scripts/qa/run.sh`), which has not yet run green on this branch: seven writers on one 60G
 
 - **The QA pass did not complete this tick — and not because of this slice.** The pass got its
+  mount have had the volume between 94% and 100% all tick, and the last several attempts died on
+## 2026-09-28 — The three "pre-existing" failures, and two product defects behind them
   QA slot after ~30 minutes of waiting behind sibling stacks, walked 434 clicks through
+  `Page crashed` and `Execution context was destroyed` under host load rather than on anything in
+
   `/media` (40 elements), `/media/trash` (26), `/media/settings` (30) and the IAM screens, and
+  the code. The REQ stays open until the real pass runs.
+- **What shipped.** `bd53c2f` (three invitation-path defects), `e2a711c` (the panel follows
   then stopped advancing at `iam-service-accounts` with the walkthrough process at 0 % CPU. The
+- **The QA pass, and an honest reading of it.** `QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104
+  the new preview contract) and `00e36fb` (three walks driving the API the way a person
   cause is the machine, not the code: **seven QA stacks are running at once** — 40 Chromium
+  QA_WEB_PORT=3204 bash scripts/qa/run.sh` was run and **did not complete**: the API built and the
+  would). The suite is **29 passed / 0 failed**, up from 26/3 — no walk was deleted or
   processes, load average **36**, and **127 MB free of 33 GB**. The walkthrough outlived the
+  stack came up clean (`/healthz` 200, admin 307, web 404 before the first request), and the
+  skipped, and the 3 were not interference.
   browser context, which is the "tab died under parallel passes" case already documented for
+  walkthrough visited **33 pages and 18 interaction passes** — overview, pages, media,
+- **They were not one bug.** Run alone with `--test-threads=1`, each failed for its own
   this box, so no findings were produced and none are claimed. The share walk added this tick
+  media-trash, media-settings, sites, ai, search, search-settings and eight IAM screens — before
+  reason, and reading the *status it actually got* is what found them:
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
+  the browser tab died at `iam-authentication` with `Target page, context or browser has been
+  `202` (not `201`), `415` (not `409`), and a trail missing a row nobody wrote.
   next tick runs it. The storage walk from the previous tick was committed for the same reason
+  closed`, and every later route reported the same. It never reached the organization routes, so
+  - **A bodyless accept was a `415`.** `accept_invitation` took `Json<AcceptInvitationRequest>`
   and the API-level proof for both is the Rust suite, which is green.
+  it says **nothing** about the screens this REQ is about, and the REQ stays open: this is the
+    and axum refuses a bodyless POST in the extractor, so the ceiling and queue checks — both
 
 
+  sixth consecutive pass on this branch to die the same way, and the ledger's earlier entries
+    *inside* the handler, one line apart — were never reached. The panel sends `{}`; a signed-in
+
+## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
+  name the same two errors. The host reading, taken at the time of the failure: `MemAvailable`
+    member has nothing to say. Body is now `Option<Json<…>>` + `Default`.
 - **The mobile pass, and a QA failure that was the machine's and the harness's, not the code's.**
+
+  4.5G (the precondition is >8G), **six** other `qa/run.sh` processes live (w2, w4, w7 and
+  - **A queued accept was a `500`.** `IdentityError::InvitationAwaitingApproval` had no arm in
   - **What.** The spec's own `Mobile (<1024px)` line was the last unbuilt acceptance item in
+- **What.** The last open item of slice 3: what the *camera* said about its own picture. The
+  friends), 40 Chrome processes, load 8.5. The tab did not die *at* the failing route — it died
+    the HTTP mapping and fell through to `internal_error`: the invitee was told the platform was
     REQ-005, and it turned out to be *six* surfaces rather than the three the sentence names.
+  geometry probe already read a file's size from its header; this reads the other half of what an
+  before it, and every subsequent route failed identically, which is the signature of a killed
+    broken, and sent back to the manager who cannot fix it. Now `409 invitation_awaiting_approval`.
     Every table in the tenant surface (organizations, members, invitations, the department tree
+  editor asks about a photograph — which body took it, at what shutter speed, with which lens, on
+  browser rather than a broken page. The `qa-artifacts` run directory (43M) was removed after
+  - **The preview was a token oracle.** Its own doc comment promised that an unusable token
     and the audit trail) now renders as cards below `md`; the organization switcher becomes a
+  which day. `crates/media/src/exif.rs` (the reader), `0042_media_exif.sql` (the column), the
+  reading `summary.json`, which contains only the fatal line and no findings; `/mnt/apopic` went
+    answers with the same shape and `usable: false`; the code answered `404` for an unknown one
     bottom sheet under `sm`; the member drawer takes the whole screen below `sm`. Each card
+  `exif` column on `media` plus the `display_width`/`display_height` pair on the file response, and
+  95% → 83% on that and on the other writers finishing.
+    and `200` naming the organization for a queued one. A leaked or guessed token could
     carries the **same `data-*` hooks as the row it replaces** — the part that is easy to get
+  the Metadata tab's **Camera** block.
+- **What this tick changed, precisely.** No production code. The walk lives in
+    therefore map which organizations exist — the exact thing the endpoint exists to prevent. An
     wrong, because a `data-organization-suspend` that lives in only one of the two renderings
+- **Six decisions, each a shortcut that produces a plausible wrong answer.**
+  `apps/api/tests/events.rs` and runs against a live database over the real router; the docs
+    unknown token is now `200` with the same body, `usable: false` and one coarse `reason`
     silently halves what the desktop depth passes can drive, and the mobile pass then photographs
+  1. *A TIFF header is not EXIF.* The IFD format is shared by TIFF, GeoTIFF and half a dozen
+  record it. A REQ cannot close on a pass that did not run, so the next tick starts with the
+    (`"unusable"`, never `"queued"`/`"expired"` — "why" is the question a token-walker is asking).
     a layout no interaction has ever reached.
+     makers' proprietary blocks; what makes the block EXIF is the `Exif\0\0` signature inside a
+  mobile pass and a retry, and checks `MemAvailable` and the sibling-pass count *before* launching
+- **Two walks were asking the wrong question.** The ceiling walk inherited the invite policy
   - **Why the switcher is a sheet.** A dropdown anchored to the right edge of a 390px screen puts
+     JPEG `APP1`, an `EXIF` chunk in a WebP or an `eXIf` chunk in a PNG. The container is checked
+  one rather than interpreting the failure afterwards.
+  instead of choosing one, so migration `0038`'s `default 'owner_approval'` queued the invite and
     the longest organization name in the one place a thumb cannot reach it. The sheet is anchored
+     before any TIFF parsing runs.
+
+  the walk blamed the seat ceiling for a refusal it never reached. The audit walk wrote settings
     to the bottom edge, carries a backdrop and a close control, and its rows have a 44px floor —
+  2. *Nothing is read from outside the prefix.* Every field's value may be an *offset*, and an
+## The member drawer (REQ-005, slice 4)
+  **straight to the store**, bypassing the route whose `omnion_audit::record` is the very thing
     and the pass reads that geometry rather than asserting that it opened, because "it opens" is
+     offset is attacker-controlled. Every read is a range request whose failure is the answer.
+
+  under test, then asserted the row was in the trail — the trail was right; no settings change
     not a claim and a sheet can be open and still be wrong in four ways (rows under 44px, not
+  3. *A zero denominator is absent; `1/200` is not.* The first guard refused the normal case
+- **What this tick found, by reading the spec before writing code.** The Members bullet names a
+  had ever gone through the product. Its cross-tenant check was weaker still: the other
     anchored, no backdrop, page scrolls sideways underneath it). Each is a finding.
+     (`den > num`) and kept the corrupt one — the exact inversion, which is how a reader ends up
+  drawer and the QA plan opens one ("open a member drawer and extend a binding"). Neither
+  administrator held no `audit.read` anywhere, so the guard answered `403` before the handler
   - **Proof.** `cargo test -p omnion-identity --lib` → **144**, `cargo test -p omnion-api --lib`
+     with no shutter speed on every photograph and a divide-by-zero on the one broken file.
+  existed. Reading the sentence closely turned up a second gap worth its own line: the spec lists
+  resolved the tenant and the assertion proved nothing about isolation. Granted the permission in
     → **146**, both green. `pnpm --filter @omnion/admin typecheck` clean and
+  4. *Orientation changes the box, not the file.* Values 5–8 store the picture sideways and
+  **three** operations — *add / extend / revoke* — and the platform had verbs for two.
+  *their own* tenant, the `404` is what a real auditor gets.
     `pnpm --filter @omnion/admin build` completes (the 44 routes, `ƒ Proxy (Middleware)`). The
+     browsers rotate it themselves, so a grid reserving `width × height` reserves the wrong box and
+  `POST /iam/bindings` granted, `DELETE /iam/bindings/{id}` revoked, and nothing could *lengthen*
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **29 passed /
     walkthrough parses (`vm.Script`) and now walks `/organizations` and four tenant tabs at
+     shifts every image below it. The stored columns carry the oriented pair, the raw value stays
+  a temporary grant, so giving somebody another month meant revoking and re-granting.
+  0 failed** (257 s). `cargo test -p omnion-api --lib` → **134 passed / 0 failed**.
     390×844, plus the sheet's geometry, each recorded as a finding.
+     in the record, and the API sends both readings.
+- **Why "extend" must not be revoke-then-grant.** That implementation passes every assertion a
+  `tsc --noEmit` in `apps/admin` exits 0. Tree clean, `wave5` pushed to `00e36fb`.
   - **The QA pass failed, and the reason is worth more than the screens.** The first run walked
+  5. *A GPS fix is a flag, never coordinates.* There is no field in the type a coordinate could
+  person can make by eye and leaves two live bindings for one role and scope. The
+- **Environment.** `/mnt/apopic` opened at 95 % with 8 sibling `qa/run.sh` processes, so the
     every route on schedule and reported `interact: iam-devices → 3 elements`,
+     occupy, so a media library cannot quietly file an operator's home address into a row that
+  effective-permissions screen then renders the same role twice with two different windows,
+  build moved to `CARGO_TARGET_DIR=/dev/shm/w5-target` (mine, 2.2 G of the 32 G tmpfs) with
     `interact: organizations → 3 elements`, and the same for all ten analytics screens. Three
+     search, an API key and a share link can all read.
+  neither of which is the truth. `bindings::extend_expiry` updates **the same row**, and the
+  `CARGO_INCREMENTAL=0` — reclaiming my own disk to build on a box that has none was not available.
     elements is the *sign-in form*. The cause is in the harness, not the panel: the generic
+  6. *A replacement replaces the record.* A screenshot over a camera original must not keep
+  statement carries `revoked_at is null` so a grant the trail already recorded as revoked cannot
+- **Next.** The only unticked criterion (line 222) is still the whole-workspace gate plus the QA
     filler writes a sample value into every input, and on the sign-in form a sample address is a
+     claiming to have been shot on a body it was never near.
+  come back to life. The walk that proves it is
+  walkthrough, and the 390×844 mobile pass over the member drawer is still unproven. Both need
     real failed attempt — after ten, `sign_in_attempts` records `blocked / "10 recent failures
+- **The QA pass did not complete, and it found the tick's one real bug anyway.** The full pass ran
+  `a_temporary_grant_is_extended_in_place_and_never_into_a_second_row`, and the assertion that
+  `/mnt/apopic` headroom and few sibling passes. Then REQ-005 closes and the queue moves to
     from this address"` and the address is refused. From that moment every later page renders the
+  629 clicks and then died with `Target page, context or browser has been closed` — the
+  catches it is a **count** — `bindingRowsAfter == bindingRowsBefore`.
+  REQ-011 (CDN/edge).
     login screen and the pass measures three elements, **with no error anywhere**. The failure is
+  "browser context dies under parallel passes" case already documented for this box, with 21
+- **One read for the whole panel.** Four parallel requests would let the identity render over an
     silent because the sign-out is deferred and the session is renewed, so the run looks healthy
+  sibling QA processes and 0 GB free at the moment it failed. So the gate is **not** claimed as
+  empty binding list, and an empty list under a colleague's name is a statement about that
     right up until it is not; the media depth passes after it all reported "no file to share"
+  green this tick. What *did* run is `scripts/qa/probe-media-camera.cjs`, a one-screen probe added
+  colleague, not about a spinner. `GET /organizations/{id}/members/{user_id}` answers everything
     because the session was gone. `b2a4e33` fills the sign-in form with the account that exists,
+  because "the full pass crashed" and "the screen is broken" must not read the same in a log: it
+  the drawer renders.
     detected by the *path* rather than by the field's label — an `email` input is also how a
+  signs in, uploads a JPEG that really carries a block, reads the block's rows and reads the
+- **Isolation.** Another tenant's member is a `404`, not a `403` — the second answer confirms the
     stranger's invite form asks for an address, and the QA owner must never be submitted into one.
+  API's own response — **13/13 checks pass**.
+  id exists. A grant is refused when the subject is not a member here, when the role belongs to
   - **Next.** Run the pass again on the fixed harness for the green walkthrough that closes slice
+- **The bug it found: the rotation was applied twice.** The writer already stores the *oriented*
+  another tenant (`cross_organization`), and for a `global` scope by name rather than quietly
     4, then the last acceptance line (`cargo test --workspace` + `pnpm build` + zero high
+  geometry (an orientation-6 4000×3000 frame is written as 3000×4000), and `display_size()` then
+  downgraded to `organization`: a tenant administrator asking for a platform grant is asking for
     findings) and REQ-005's close. After that, the queue moves to REQ-017 (sandbox/staging).
+  applied the swap again on the way out — so the panel reported a landscape picture for a portrait
+  something the platform owns, and a silent downgrade makes the grant do something other than
 
+  photograph, and the facts list read `4000 × 3000` for a file every browser draws tall. The unit
+  what the panel said.
   - **The pass, run on the fixed harness.** 991 clicks, 1,039 shots, every route reporting a
+  test on `oriented_size` passed the whole time, because the function was correct; it was being
+- **Proof.** `cargo check -p omnion-api --tests` → clean. `pnpm typecheck` in `apps/admin` →
     full element count — `iam-policies` 40, and all ten analytics screens 40 where the first run
+  called on the wrong input. This is the case the QA pass exists for and the Rust suite cannot
+  clean (the LSP caught two real nullability errors in the drawer before the gate did: a revoked
     said 3. `sign_in_attempts` held **one** row, `success`, against eleven `blocked` before: the
+  see, and it is why the fix ships with a regression test shaped like the bug: a row carrying the
+  row's `revoked_at` and an extended binding's `expires_at` are both nullable, and both were
     lockout is not merely bypassed, it no longer happens. The mobile switcher reads 390px wide,
+  oriented columns *and* the record that produced them.
+  being formatted as though they were not).
     anchored, a 59px row, a backdrop and no page overflow, and the palette still 44px per row.
+- **Proof.** 19 new unit tests in `exif.rs`, 5 in `model.rs` and two walks over the real router →
+  `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **23 passed, 5 failed**;
   - **78 findings, 72 high — and the count is the wrong thing to read.** 28 are `422`s and 33
+  0 failures. Both
+  three of the five are the baseline cross-test interference the ledger already records
     their console errors: the generic filler submitting sample data to forms it does not own, on
+  walks read the column **out of PostgreSQL**, because a response that omits a field is
+  (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
     every writer's screens. Three findings were mine and two of those were the harness measuring
+  indistinguishable from one that stored it and chose not to say so. An orientation-6 frame of
+  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`), and the two new walks' own
     the wrong thing (`1818c50`): the sheet's bottom-anchoring was asserted against a component
+  4000×3000 stores 3000 and 4000; a text file grows no record; a replacement in a format with no
+  first run failed for the reasons corrected below.
     that is a *panel* from `sm` up, and a tab strip inside a horizontal scroller was reported as
+  block clears it and the geometry falls back to the frame's own; a restore brings version 1's
+- **Two failures that were wrong *assertions*, not wrong code — and one of them was the better
     unreachable when the spec asks for a scroller. The third — two 500s on `/members` — is the
+  record back; the serialised object is scanned for `lat`, `lon`, `GPSLatitude`, `GPSLongitude` and
+  answer.** The first run asserted that extending a revoked grant is a `404`. It is a `400
     shared box, not the code: the API log for the window shows `pool timed out while waiting for
+  `altitude`. `cargo test -p omnion-media --lib` → **122** (was 98), `-p omnion-api --lib` → **122**,
+  binding_revoked`, and the `400` is right: the row exists, the operator can see it in the drawer,
     an open connection`, which is what seven concurrent QA stacks do to one Postgres. So the
+  and `--test media` (13, was 11), `--test media_transform` (5), `--test media_settings` (2),
+  and "there is no such grant" would send them hunting for a typo instead of reading the sentence
     honest count of findings **caused by this change** is zero, and the pass is not green.
+  `--test media_duplicates` (6), `--test media_shares` (5) are unchanged and green. `pnpm
+  that states the rule. The second asserted that the subject's drawer shows the grant. It must
   - **Next.** Re-run the pass with the corrected assertions for a run whose findings are only
+  --filter @omnion/admin typecheck` clean. The migration applies across the whole set on a fresh
+  not: the grant was performed by the *administrator*, so it belongs on the grantor's trail and
     the pre-existing 422/console-error family, then the last acceptance line and REQ-005's close.
+  database.
+  in the organization's Audit tab, and putting an administrator's acts inside a panel about a
     The two remaining known-pre-existing items are named here so the next tick does not
+- **The QA pass had to grow a screen before it could test one.** The library pass uploads a PNG,
+  colleague is the wrong half of a privacy decision made by accident. Both assertions now pin the
     rediscover them: the media depth passes report "no file to open" although the upload step
+  and a PNG carries no EXIF — so the Camera block would only ever have been seen in its empty
+  intended behaviour rather than the one that happened.
     reports success, and the IAM sessions screen answers 401 for a scoped read.
+  state, which the "no untested screen" rule forbids. The pass now *builds* a JPEG that carries a
+- **The QA pass was deferred, by a number, before it was launched.** `MemAvailable` 4G against a
 
+  real block, uploads it, opens its detail screen and asserts the body, `ISO 400`, `1/200 s`,
+  `>8G` precondition, **eight** sibling `qa/run.sh` processes, load average 34. Those are the
 
+  `f/1.8` and the rotated dimensions.
+  conditions the last six attempts on this branch died in, and they were readable in one `free`
 ## Wave 5 · REQ-005 slice 4 — the switcher's phone sheet, and a gate that could not run
+- **Four bugs the walkthrough's own JPEG builder had, each of which produced a file that read as a
+  and one `pgrep` a minute before starting. The walkthrough pass for the drawer is written
 
+  parser bug and was really a builder writing the format wrong.** The TIFF block is little-endian
+  (`runOrganizationMemberDrawer`, wired after the departments pass) and `node --check` clean; it
 - **What.** The last high finding of the previous pass was a `position: fixed` bottom sheet whose
+  while the JPEG framing around it is big-endian, so a segment length written with the block's
+  runs when the box has room. The REQ stays open.
   bottom edge measured **738px above the floor of a 390×844 phone**. A `fixed` box resolves against
+  `u16` reads as a 57 KB segment in a 253-byte file and the block is then unreachable; a directory
+- **Next.** The mobile pass at 390×844 (member drawer, Settings/Modules/Billing/Audit tabs, the
   its nearest containing block, and an ancestor with a `filter` — `backdrop-filter` included, which
+  is a count plus its entries plus a four-byte next-directory pointer, and the two that get
+  organization detail), then the QA walkthrough. Then the platform-account criterion, the last
   `getComputedStyle` reports as `filter` — or a transform *becomes* that block. The panel's own
+  forgotten put every later offset on the wrong field; a value offset is measured from the start of
+  unticked line on this REQ.
   header is `sticky` with `backdrop-blur`, so the sheet rendered beside its own trigger was
+  the *block*, not from the directory that holds the entry, so a value laid down before the
   anchored to the header's box. The class list was correct and said nothing about any of this; only
+  sub-directory exists is overwritten by it; and a RATIONAL is two words wide rather than four
   a measurement of the rendered box caught it. The sheet is now portalled to `<body>` on a phone,
+  bytes, so a cursor that steps by the entry's width lands every rational after the first on the
   where no ancestor establishes a containing block, and it stays `absolute` beside its trigger from
+  wrong field. None of the four would have been found by a screenshot — the file simply had no
   `sm` up. The click-outside handler tests the sheet separately, because a portalled sheet is no
+  camera record and the screen showed its empty state, correctly.
   longer inside the trigger's ref and the first click inside it would otherwise close the control
+- **Environment.** `/mnt/apopic` sat at **94 %** (3.6 GB free) on entry, and this worktree's own
   under the finger.
+  `target/` was 9.9 GB of it. Reclaiming *only this worktree's* `target/debug/incremental`
 - **Proof, measured, not asserted.** `node scripts/qa/probe-tenant-mobile.cjs` → **5 passed, 0
+  (verified first: no live `cargo` holds it) returned 1.7 GB. **Owner action:** the worktrees under
   failed**: `gapToBottom 0` (was 738), `position fixed`, `blockers []` — the walk up from the sheet
+  `/mnt/apopic` still hold ~30 GB of `target/`; a shared `CARGO_TARGET_DIR` is the structural fix.
   names every ancestor that would capture it, and there are none. The walkthrough now also accepts
+- **Next.** Slice 4 — folder and file grants with inheritance, the scanning pipeline with
   the redirect an organization account gets from `/organizations` and starts the tenant depth pass
+  quarantine and release, retention policies with the daily worker, and reference-based purge
   from there, instead of concluding there is no organization to open; both entry points share one
+  refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   body so they cannot drift.
+  and releasable, and a retention run removes exactly the eligible rows.
 - **Every fast gate is green and the numbers are real.** `cargo test --workspace` → **979 passed /
+
   0 failed** (exit 0, isolated database, `--test-threads=1`). `pnpm build` → 2/2 tasks, 44 admin
+## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
   routes. `pnpm typecheck` clean. `cargo test -p omnion-identity --lib` → 144.
+
 - **Two walks were asking the wrong question, and one was born broken.**
+**What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
   - `tenancy::only_the_platform_opens_tenants_and_reads_across_them` bundled a rename and a freeze
+could render a badge and the badge could only ever read `pending`. This tick gives that column a
     into one PATCH and asserted `organization.updated` — true only before slice 3 made a status
+pipeline behind it — `0044_media_scanning.sql` (a per-site policy, a quarantine table with a
     move its own lifecycle action. It had been failing since. Split into the two claims it was
+history, a run log, plus the two `media` columns the pipeline needs and `0025` never created), the
     really making, and the freeze is now proved to be a real freeze (a rename of a frozen tenant is
+crate module `crates/media/src/scanning.rs`, the API in `apps/api/src/routes/media_scan.rs`, and
     refused with `organization_not_writable`) before the walk thaws the tenant and carries on.
+the **Scanning** tab on `/media/settings`. Seven routes; the gate is on *every* serve path, not
   - `onboarding::the_first_run_walks_a_fresh_database_to_a_signed_in_owner` read
+just the one the spec names: the panel raw route, the public renderer, the preset path **including
     `body["organization"]["id"]` from an endpoint that answers a `StatusBody` and has never carried
+its cached derivatives**, both version paths, and the share token route.
     the created row — the admin client types the reply `Promise<OnboardingStatus>` and never looks
+
     for an id either. The assertion came from `b347de6` and failed the first time it ever ran. The
+**Seven decisions, each a shortcut that produces a plausible wrong answer.** An unrecognised
     walk reads the id from the database, which is what it actually wanted. **Adding a field to the
+scanner answer is an *error*, never a pass (pinned against a scanner that answers
     API to satisfy a test would have been changing the contract to fit the assertion.**
+`{"verdict_code": 3}` over a real socket); a file above the size ceiling is `skipped` and never
 - **The pass itself could not run, and twice, for reasons that are the box and the harness.**
+`clean`; a clean scan leaves `scan_detail` **empty** so a report that greps it cannot find a
   - `run.sh` hardcoded `target/debug/omnion-api` in three places while the standing practice on
+positive on every file; a quarantine row is closed and never deleted, so a file flagged twice has
     this box is `CARGO_TARGET_DIR=/dev/shm/<writer>-target` (seven writers, one 60G mount). A writer
+two events; a release requires a reason and lands the row on `skipped`, not `clean`, because
     who followed that practice could not start a pass at all: the build wrote 332MB of good binary
+nobody has said the file is *safe*; another tenant's quarantine is a `404` and not a `403`; and a
     into `/dev/shm`, the gate concluded there was none, and the pass died at `wait_http` reporting
+**flag is a fact rather than a policy question** — `on_error` speaks to the *absent* verdict
     nothing about the code under test. Fixed, and the gate now prints the path it is about to
+(`pending`, `error`) and never overrules a `flagged` row.
     start. The second half of the same bug: once a pass registers the API from tmpfs, the pm2
+
     entry's script path *is* the tmpfs copy, and a later pass that builds elsewhere inherits an
+**Three defects found by the walks, none of which a unit test could have seen.** The claim query
     entry that can only fail — so the gate compares the registered path with the one it just
+selected `id` while the row type called the field `media_id`, and sqlx's `FromRow` maps by
     built and re-registers when they differ. (Extracting that path from `pm2 describe` is its own
+*column name* — so the sweep died with `no column found for name: media_id` on the first file,
     small trap: the table uses a box character followed by a **non-breaking** space, so a sed
+which reads as a broken query rather than a missing alias. `0025` never created `media.scanned_at`
     pattern matching an ordinary space extracts nothing and the comparison silently never fires.)
+at all, so **every verdict write failed**, and because the route counted the error both as a
   - The next attempt reached **620 clicks** and then the shared pm2 daemon restarted and wiped
+verdict and as a write failure, a one-file run reported `errors = 2` — a number with no reading
     `omnion-qa-*-w5` mid-run. No `summary.json` was written. A missing summary is not a product
+an operator can act on. And `sum(bigint)` decodes as NUMERIC, so the quarantine byte total could
     result, and a `chrome-error://chromewebdata` navigation in the click log is the tell.
+not be listed at all.
 - **13 "failures" that were never failures.** `cargo test --workspace` with no
+
   `OMNION_DATABASE_URL` runs against the **shared default database**, where a sibling branch's
+**The one that matters was found by a suite I did not write.** `media_shares.rs`'s
   `0019_cms_blocks` is already applied while this branch's `0019_organization_memberships` is a
+`a_link_stops_serving_when_its_file_stops_being_servable` failed on my change: the first gate had
   different migration at the same number. Isolated, the analytics suite is **13/13 green**. This
+an early return for a site with scanning *disabled*, and the walk switches the scanner off before
   is the second time this branch has lost a gate to a shared migration number; the fix is a
+flagging a file by hand. The regression was real and it was the shape of the bug: a flag is a fact
   writer-owned database and `--test-threads=1`, never a code change.
+about the bytes, and turning the scanner off is a decision about *future* uploads, not a way of
 - **Next.** The one unticked box is the walkthrough with zero high findings, and it is **not
+forgetting a verdict somebody already reached. Fixed in the crate (`may_serve` now reads
   ticked**: three passes on this box ended in a harness bug, a daemon restart and a 100% disk, and
+`enabled` itself, with a test that runs all four `enabled`×`on_error` combinations) rather than at
   a REQ is never closed on a partial run. Gate the numbers first — `df -h /mnt/apopic` with real
+the call site, so the panel and the share link cannot drift apart again.
   headroom, `pgrep -cf 'qa/run.sh'` at 1, `free -g` MemAvailable over 8 — and defer rather than
+
   report a pass that measured a box under pressure. Then the queue moves to **REQ-011 (CDN/edge)**.
+**Proof.** `--test media_scan` → **10 walks, 0 failures**, each against a **hand-rolled scanner on
+a real loopback socket** rather than a stubbed function: the client is where an outage lives, and
+a sub-app would share every assumption the client makes. A **dead port** proves the ingest rule
+(upload succeeds, row reads `error`, `hold` refuses with `file_scan_failed`, and flipping
+`on_error` to `serve` changes the answer on the *next* request because the policy is read per
+request, not cached). A `Nonsense` scanner proves fail-closed. A clean scanner proves a clean file
+serves with its real bytes and an empty sweep still writes a run. A trashed file is never claimed.
+Both walks that assert a row read it **out of PostgreSQL**, because a response that omits a field
+is indistinguishable from one that stored it and chose not to say so. `cargo test -p omnion-media
+--lib` → **148** (was 122), `-p omnion-api --lib` → **127** (was 122); `--test media` (13),
+`--test media_shares` (5) and `--test media_transform` (5) are green against the routes this
+touches. `apps/admin` `tsc --noEmit` clean.
+
+**Environment.** Two things worth recording. The shared development database has a sibling wave's
+migrations applied, so `cargo test --test media_*` dies with `VersionMissing(19)` before it reaches
+a single assertion — `scripts/qa/run-media-walk.sh` gives each suite its own disposable database,
+which is what a suite that must be *believed* to have run needs. And `reqwest` was a **dev**
+dependency of the API crate: the scanner client needs it at runtime, so it is now a real one.
+
+**Next.** Slice 4's remaining half — folder and file grants with inheritance, a deny beating an
+inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
+and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
+the raw route and a retention run removes exactly the eligible rows.

@@ -20,6 +20,12 @@ import type {
   MediaShare,
   MediaStorageProbe,
   MediaStorageSettings,
+  MediaQuarantineList,
+  MediaScanProbe,
+  MediaScanRunList,
+  MediaScanSettings,
+  MediaScanSettingsInput,
+  MediaSweepResult,
   MediaStorageSettingsInput,
   MediaReplaceResult,
   MediaTrash,
@@ -4529,4 +4535,81 @@ export function testMediaStorageConnection(
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scanning (docs/requests/REQ-010, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** A site's scanning policy. */
+export function fetchMediaScanSettings(siteId: string): Promise<MediaScanSettings> {
+  return request<MediaScanSettings>(`/api/v1/media/scan-settings?${mediaQuery(siteId)}`);
+}
+
+/**
+ * Save a site's scanning policy.
+ *
+ * A `PUT` folded onto the row field by field, like every other settings save here: a form that
+ * sends four of six fields does not reset the other two, which is how a site loses its scanner
+ * endpoint on the day somebody edits the timeout.
+ */
+export function saveMediaScanSettings(
+  siteId: string,
+  input: MediaScanSettingsInput,
+): Promise<MediaScanSettings> {
+  return request<MediaScanSettings>(`/api/v1/media/scan-settings?${mediaQuery(siteId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Prove a scanner answers, by posting a real generated payload to it.
+ *
+ * A health check proves the port is open; it does not prove the scanner accepts bytes, and a
+ * scanner that answers `/health` and refuses actual uploads is exactly the configuration that
+ * leaves a library where every file reads `error`.
+ */
+export function testMediaScanner(
+  siteId: string,
+  input: MediaScanSettingsInput,
+): Promise<MediaScanProbe> {
+  return request<MediaScanProbe>(`/api/v1/media/scan/test?${mediaQuery(siteId)}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Sweep a site's pending files now and return what the pass wrote. */
+export function runMediaScan(siteId: string): Promise<MediaSweepResult> {
+  return request<MediaSweepResult>(`/api/v1/media/scan/run?${mediaQuery(siteId)}`, {
+    method: "POST",
+  });
+}
+
+/** The run log of a site, newest first. */
+export function fetchMediaScanRuns(siteId: string): Promise<MediaScanRunList> {
+  return request<MediaScanRunList>(`/api/v1/media/scan/runs?${mediaQuery(siteId)}`);
+}
+
+/** The open quarantines of a site, with their totals. */
+export function fetchMediaQuarantine(siteId: string): Promise<MediaQuarantineList> {
+  return request<MediaQuarantineList>(`/api/v1/media/quarantine?${mediaQuery(siteId)}`);
+}
+
+/**
+ * Let a held file go back into circulation.
+ *
+ * The reason is required by the API and not merely by this signature: the quarantine row is the
+ * only record the file was ever held, and a release with no stated reason is a release nobody
+ * can review afterwards.
+ */
+export function releaseMediaQuarantine(
+  quarantineId: string,
+  reason: string,
+): Promise<{ released: boolean; reason: string }> {
+  return request<{ released: boolean; reason: string }>(
+    `/api/v1/media/quarantine/${quarantineId}/release`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
 }

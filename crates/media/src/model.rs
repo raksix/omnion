@@ -108,6 +108,10 @@ pub struct MediaFile {
     pub scan_status: String,
     /// What the scanner reported.
     pub scan_detail: String,
+    /// When the scanner last wrote `scan_status`; null means it never has.
+    pub scanned_at: Option<OffsetDateTime>,
+    /// The engine name the scanner reported for the last verdict.
+    pub scan_engine: Option<String>,
     /// How many versions the file has.
     pub version_count: i32,
     /// Whether the public renderer may read it without a session.
@@ -128,13 +132,18 @@ impl MediaFile {
     }
 
     /// The dimensions a layout should reserve, with the stored rotation applied.
+    ///
+    /// The columns already *are* the rotated pair — [`crate::versions::fill_exif`] wrote them
+    /// oriented — so a layout that reads them reserves the box a browser draws. This returns them
+    /// unchanged, and says so at length, because the obvious version of this function applies the
+    /// rotation a second time: the stored width is 3000 for an orientation-6 4000×3000 frame, the
+    /// swap runs again, and the panel reports a landscape picture for a portrait photograph. A
+    /// helper whose name says "apply the rotation" is exactly where a double application hides,
+    /// because a unit test on the *function* still passes — the bug is in which function the
+    /// *column* has already been through.
     #[must_use]
     pub fn display_size(&self) -> (Option<i32>, Option<i32>) {
-        crate::exif::oriented_size(
-            self.width,
-            self.height,
-            self.exif().and_then(|e| e.orientation),
-        )
+        (self.width, self.height)
     }
 
     /// Size in bytes as an unsigned number.
@@ -154,9 +163,9 @@ impl MediaFile {
 
     /// A compact description for a `description` list — the two lines a list row shows.
     ///
-    /// The size a reader sees, not the size the pixels are stored at: a portrait photograph
-    /// stored sideways is `3000×4000` on screen, and a list that prints `4000×3000` sends an
-    /// editor looking for a landscape crop of a picture that has none.
+    /// The size a reader sees, which is what the columns hold: they were written oriented, so a
+    /// portrait photograph stored sideways reads `3000×4000`, and a list printing the stored
+    /// `4000×3000` would send an editor looking for a landscape crop of a picture that has none.
     #[must_use]
     pub fn dimensions(&self) -> Option<String> {
         match self.display_size() {
@@ -183,4 +192,124 @@ pub struct NewMedia {
     pub checksum: String,
     /// Account that uploaded the file.
     pub created_by: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exif::Exif;
+    use serde_json::json;
+
+    /// A file row with a rotated camera record and the oriented columns the writer stored.
+    fn rotated_file() -> MediaFile {
+        MediaFile {
+            id: Uuid::new_v4(),
+            site_id: Uuid::new_v4(),
+            storage_key: "sites/a/b.jpg".to_owned(),
+            filename: "b.jpg".to_owned(),
+            content_type: "image/jpeg".to_owned(),
+            size_bytes: 1,
+            checksum: "0".repeat(64),
+            created_by: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            folder_id: None,
+            updated_at: None,
+            deleted_at: None,
+            deleted_by: None,
+            purged_at: None,
+            alt_text: String::new(),
+            caption: String::new(),
+            description: String::new(),
+            metadata: serde_json::Value::Null,
+            tags: Vec::new(),
+            // The writer already applied the rotation: an orientation-6 4000x3000 frame is
+            // stored as 3000x4000, because that is the box a browser draws.
+            width: Some(3000),
+            height: Some(4000),
+            duration_ms: None,
+            page_count: None,
+            exif: Some(json!({ "orientation": 6 })),
+            scan_status: "clean".to_owned(),
+            scan_detail: String::new(),
+            scanned_at: Some(OffsetDateTime::UNIX_EPOCH),
+            scan_engine: Some("stub".to_owned()),
+            version_count: 1,
+            is_public: false,
+        }
+    }
+
+    /// The rotation is applied once, when the column is written — not again on the way out.
+    ///
+    /// This is the bug the browser probe found: `display_size` re-applied the swap to columns
+    /// that had already been through it, so the panel reported a landscape picture for a portrait
+    /// photograph. A unit test on `oriented_size` still passed throughout, because the function was
+    /// correct — it was being called on the wrong input.
+    #[test]
+    fn the_rotation_is_applied_once_not_twice() {
+        let file = rotated_file();
+        assert_eq!((file.width, file.height), (Some(3000), Some(4000)));
+        assert_eq!(file.display_size(), (Some(3000), Some(4000)));
+        assert_eq!(file.dimensions().as_deref(), Some("3000×4000"));
+    }
+
+    /// A file with no rotation is what it always was.
+    #[test]
+    fn an_upright_file_reports_its_own_size() {
+        let mut file = rotated_file();
+        file.width = Some(4000);
+        file.height = Some(3000);
+        file.exif = None;
+        assert_eq!(file.display_size(), (Some(4000), Some(3000)));
+        assert!(file.exif().is_none(), "no record is not an empty record");
+    }
+
+    /// The record round-trips through the column, and a record with nothing in it is `None`.
+    #[test]
+    fn a_record_survives_the_column_and_an_empty_one_is_none() {
+        let file = rotated_file();
+        let parsed = file.exif().expect("the record reads back");
+        assert_eq!(parsed.orientation, Some(6));
+
+        let mut plain = rotated_file();
+        plain.exif = Some(serde_json::json!({}));
+        assert!(plain.exif().is_none(), "an empty object is not a record");
+
+        // A row written by a future release with a key this one does not know is still a file.
+        let mut future = rotated_file();
+        future.exif = Some(json!({ "orientation": 6, "lens_serial": "ABC" }));
+        assert_eq!(
+            future.exif().expect("unknown keys are ignored").orientation,
+            Some(6)
+        );
+    }
+
+    /// A column whose values are the wrong json type is absent, not a panic.
+    #[test]
+    fn a_hand_edited_column_does_not_break_a_listing() {
+        let mut file = rotated_file();
+        file.exif = Some(json!({ "iso": "four hundred", "make": 7 }));
+        assert!(
+            file.exif().is_none(),
+            "nothing that reads as what it claims to be"
+        );
+    }
+
+    /// A record with a body and a shutter prints the line the tab shows.
+    #[test]
+    fn the_summary_line_names_the_camera_and_the_exposure() {
+        let record = Exif {
+            make: Some("Canon".to_owned()),
+            model: Some("EOS R5".to_owned()),
+            iso: Some(400),
+            exposure_ms: Some(5),
+            aperture_x100: Some(180),
+            focal_length_mm: Some(50),
+            ..Exif::default()
+        };
+        assert_eq!(
+            record.headline().as_deref(),
+            Some("Canon EOS R5 · ISO 400 · 1/200 s · f/1.8 · 50 mm")
+        );
+        assert!(Exif::default().headline().is_none());
+    }
 }
