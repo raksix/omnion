@@ -32,6 +32,7 @@ omnion-secrets = { path = "../../crates/secrets" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
+omnion-telemetry = { path = "../../crates/telemetry" }
 omnion-workflows = { path = "../../crates/workflows" }
 
 # Enterprise sign-in (REQ-006, slice 4b-2): the authorization URL is assembled with a real

@@ -114,6 +114,17 @@ impl ApiError {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    /// The human-readable message.
+    ///
+    /// Read-only by design: the message is what a screen shows and what a test asserts on when it
+    /// needs to know that a refusal *names* the thing it refused over (a cap, an accepted set).
+    /// There is deliberately no setter — a message that can be rewritten after construction is a
+    /// message no longer derived from the code that produced it.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl From<CoreError> for ApiError {

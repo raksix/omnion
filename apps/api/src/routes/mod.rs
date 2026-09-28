@@ -89,6 +89,7 @@ pub mod media_files;
 pub mod media_settings;
 pub mod media_transform;
 pub mod media_versions;
+pub mod observability;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -851,6 +852,28 @@ pub fn router(state: AppState) -> Router {
     // deployment key in the header instead, so it lives on its own router and is never
     // reachable by a cookie: a browser cannot redeem a lease, which is the property the whole
     // request rests on.
+    // The observability surface (`/observability/*`, docs/requests/REQ-126). Reading telemetry is
+    // `observability.read`; changing what the platform records, and for how long, is
+    // `observability.manage` — a different power on purpose, because "see what happened" and
+    // "decide what gets recorded" are not the same authority. Slice 1 ships the log explorer and
+    // its settings; the exporters, alert rules and trace search arrive in slices 3 and 4.
+    let observability_read = Router::new()
+        .route("/observability/logs", get(observability::read_logs))
+        .route(
+            "/observability/logs/requests/{request_id}",
+            get(observability::read_request_lines),
+        )
+        .route(
+            "/observability/logs/settings",
+            get(observability::read_settings),
+        )
+        .route_layer(guards::require(&state, "observability.read"));
+
+    let observability_write = Router::new().route(
+        "/observability/logs/settings",
+        put(observability::save_settings),
+    );
+
     let secrets_lease_redeem = Router::new().route(
         "/secret-leases/{id}/redeem",
         post(secrets_leases::redeem_lease),
@@ -901,6 +924,8 @@ pub fn router(state: AppState) -> Router {
         .merge(secrets_lease_write)
         .merge(secrets_deploy_key_write)
         .merge(secrets_lease_redeem)
+        .merge(observability_read)
+        .merge(observability_write.layer(guards::require(&state, "observability.manage")))
         .route("/commands", commands_route)
         .route("/commands/{id}/run", command_run)
         .route("/command-center/context", command_context)
@@ -1089,5 +1114,17 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         .nest("/api/v1", v1)
+        // The request id, the trace and the one line per request (REQ-126 slice 1). Installed on
+        // the OUTER router, not on `v1`, so the probes are described too — a probe that fails is
+        // the first thing an operator looks for, and a line with no request id is one they cannot
+        // join to anything.
+        //
+        // `from_fn_with_state` inline rather than behind a helper that returns an `impl Layer`:
+        // `Router::layer` needs the layer's concrete service to be `Clone + Service<Request<Body>>`,
+        // and an `impl Layer<Route>` erases exactly the bounds it needs to check.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::request_log::request_context,
+        ))
         .with_state(state)
 }
