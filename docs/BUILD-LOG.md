@@ -2722,3 +2722,61 @@ zero high findings from those steps.
 
 **Next.** Run the QA pass, then REQ-065 slice 2: the start/callback round trip, discovery, JIT
 provisioning and the attribute mapping editor.
+
+---
+
+## 2026-09-28 · omnion-w9 · REQ-065 slice 2, part 1 — the attribute map
+
+**What.** The wizard's third step, as a real thing rather than a section of the provider form.
+`0052` gives `provider_attribute_mappings` its own rows; `crates/identity/src/sso/attributes.rs`
+is the configuration language (eight panel fields, six transforms, the projection);
+`sso/mappings.rs` stores it, atomically; `apps/api/src/routes/iam_attribute_mappings.rs` exposes
+read / replace / preview; `apps/admin/features/iam/attribute-map-editor.tsx` edits it, with the
+pickers built from the catalogue the server sends.
+
+**Why a table rather than more config JSON.** `config.role_mappings` already carries the
+claim → role rules from REQ-006, and a second differently-shaped document in the same blob is how
+"save the attribute map" ends up rewriting the role rules nobody was looking at.
+
+**Why the replacement is a transaction.** The map is read by the sign-in path. A
+delete-then-insert without a transaction opens a window in which a provider has no email
+mapping — which is a window in which a real person is refused a sign-in for a reason nobody can
+see from the panel. A transaction is atomic by construction; a lock would be the worse answer.
+
+**Three things the tests caught, and which of them were mine.** Two were real:
+`Transform::Static` promises to supply a default for a claim the payload does not carry, and it
+did not, because the lookup ran first and short-circuited; and `split` with an empty argument is
+a documented default (a comma) rather than a missing argument, so treating it as required would
+have pushed an operator to type `,` to get the behaviour they wanted. The third was my test's
+mistake and the test was fixed, not the code: `apply()` reads out of a *document*, and a bare
+JSON string is not one.
+
+**Why the preview is worth its endpoint.** It runs `map.project()` — the sign-in path's own
+function — so the rehearsal and the callback cannot disagree. A display-only "what would happen"
+is a second implementation of the mapping rules, guaranteed to agree with reality right up until
+the day it does not. A missing required field refuses *by name* and withholds its values, which
+is what a real sign-in does; a cheerful partial table here would go on to create a half account.
+
+**Why the audit entry records the shape and not the rows.** A person's department, title and
+employee number *are* the rows. An audit entry carrying a diff of them is a second copy of the
+directory in a log nobody audits, and the walk asserts their absence rather than their presence.
+
+**Proof.** `cargo test -p omnion-identity --lib` → **146 passed** (was 131; 15 new).
+`pnpm --filter @omnion/admin typecheck` → clean.
+`scripts/qa/run-iam-attribute-map.sh` → **PASS 14/14**: 33 migrations applied in filename order,
+all eight columns present, a *populated* `auth_providers` table, both rows accepted, and each
+constraint asserted as a **refusal** — a second row writing `email`, an unknown `target_field`, an
+unknown `transform`, and an orphan row. It also re-proves slice 1's widened `kind` check by
+connecting an `active_directory` provider and mapping it, because a gate that only ever exercises
+OIDC would hide a map that quietly breaks for the one directory kind everybody actually uses.
+
+**Not claimed.** `cargo check -p omnion-api --tests` is still compiling (the workspace build is
+the bottleneck on a box with nine writers), and the integration walk
+(`apps/api/tests/iam_attribute_map.rs`) is written but unrun. The **browser pass has not run**:
+the QA slot has been held by another writer for most of this tick and the box sat at load 25–35
+with 0 MB free, so starting one would have been starved into a false negative rather than a
+result. Part 2 is that walk plus the browser pass.
+
+**Next.** Land the API check, run `iam_attribute_map.rs` against the development database, extend
+`runIamAuthenticationDepth` to open the mapping editor and paste a sample, then the
+`QA_STACK=w9` pass — and only then close the slice.

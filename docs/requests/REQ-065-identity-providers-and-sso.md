@@ -1,4 +1,12 @@
-# REQ-065 — Identity Providers & SSO
+> **Status:** in-progress (slice 1 code complete and gated: `a546d01` the directory
+> configuration language and its step ladder, `f94f5d8` the panel, `e0ac90a` the enable gate
+> and the HTTP surface, `245951e` the live-database gate. Slice 2 part 1: `80ed5c6` the attribute
+> map — `0052`, the configuration language, the atomic replace, the preview that runs the
+> sign-in function, the API and the editor. **Neither browser pass has run**: the QA slot has
+> been held by another writer and the box sat at load 25–35 with no free memory, so a pass
+> started now would be starved into a false negative. The API integration walk is written but
+> unrun) · **Captured:** 2026-09-26 · **Layer:** core (`crates/identity`, `crates/auth`) + admin
+> **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 > **Status:** in-progress (slice 1 code complete and gated: `a546d01` the directory
 > configuration language and its step ladder, `f94f5d8` the panel, `e0ac90a` the enable gate
@@ -116,7 +124,7 @@ Consumed: `iam.role_permissions_changed` (mapping previews and cached rule resul
 - [ ] An LDAP/AD provider binds with a service account, searches the configured base and resolves nested groups to the depth cap; a wrong bind DN produces a field-level error naming the bind step.
 - [ ] Discovery or metadata validation refuses a wrong issuer or an invalid certificate naming the failed check, then succeeds against the fixture.
 - [ ] A start → callback round trip signs in a user that exists in the fixture; the failure page for an unknown user is indistinguishable from a wrong-password failure.
-- [ ] JIT provisioning creates the user with only the mapped attributes; a missing required attribute refuses the login naming the field instead of creating a half account.
+- [ ] JIT provisioning creates the user with only the mapped attributes; a missing required attribute refuses the login naming the field instead of creating a half account. *(Partly proven by slice 2 part 1: the mapping itself, the transform, the required-flag enforcement and the refusal **by name** are in place and gated, and the preview runs the *same* projection the callback runs — `map.project()` — so what an operator rehearses is what a sign-in does. A refused projection withholds its values rather than returning a half account. What is **not** claimed: the live OIDC round trip that actually consumes the map, which is the rest of slice 2.)*
 - [ ] Role rules apply first-match-wins; the dry run predicts the same role and scope that a real login assigns for the same sample identity, and the user's audit shows `role via rule #N`.
 - [ ] An account disabled in the directory is refused at the next sync and its active sessions are revoked.
 - [ ] Local sign-in still works while an enabled SSO provider is misconfigured — a provider failure never locks local accounts out.
