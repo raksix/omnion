@@ -7,6 +7,10 @@ build/
 .next/
 out/
 target/
+# The box-wide disk guard spares a per-worktree target, so the build lives here. `target/` above
+# does not match it, and a careless `git add -A` would try to commit 30 GB of build output.
+.tmp-target/
+.cargo/
 
 # Env / secrets
 .env
