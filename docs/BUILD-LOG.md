@@ -2657,3 +2657,66 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+---
+
+## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
+
+**What.** The half of the notification centre that decides **how** a record reaches somebody.
+`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
+`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
+`runNotificationSettingsDepth` in the walkthrough.
+
+**Three decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
+   user per channel and would make a channel added in slice 3 a backfill instead of a
+   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
+   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
+   valid form, not an empty one.
+2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
+   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
+   guarantee, and the panel's own form is a client like any other.
+3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
+   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
+   of them is either never quiet or always quiet, and both are silent. A window that leaves no
+   waking hours is refused by name rather than stored as "e-mail is on".
+
+**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
+`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
+legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
+`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
+
+```text
+invalid type: string "approval", expected a sequence
+```
+
+for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
+priority filter on this surface had never worked, and every filtered list fell through to the
+error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
+the list read now takes `RawQuery` and parses the string itself.
+
+**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
+`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
+bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
+its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
+error element, which that call cannot affect: the assertion could only ever have passed by
+accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
+shortcut into the drawer. All three are the class of defect this harness exists to catch —
+in itself — and none of them is visible from the report, which only says `false`.
+
+**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
+gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
+takes an explicit id list, so it does not require a selection the reader never made — and rows
+carry `data-read` so the state is assertable rather than a shade of grey.
+
+**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
+**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
+Browser pass: **running**.
+
+**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
+`report.notificationSettings` to be green and **zero high findings** from this change — in
+particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
+signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
+behind `notifications.admin`, the event router turning existing bus events into notifications,
+and the per-channel delivery rows in the drawer.
