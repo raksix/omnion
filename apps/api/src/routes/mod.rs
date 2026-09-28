@@ -1123,6 +1123,11 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
-        .nest("/api/v1", v1)
+        // The per-organization module switch (REQ-005, slice 4). One layer on the whole API
+        // rather than a guard per module: the layer asks the same path table the panel's
+        // navigation is built from which module owns the matched route, so a screen cannot be
+        // added to a module without the switch governing it, and the core (tenancy, identity,
+        // content, search) is never a module and can never be switched off.
+        .nest("/api/v1", v1.layer(crate::module_guard::RequireModules::new(state.clone())))
         .with_state(state)
 }
