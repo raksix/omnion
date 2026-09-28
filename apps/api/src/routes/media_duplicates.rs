@@ -251,10 +251,19 @@ impl MergeBody {
                 }
             ));
         }
+        // The subject changes with the count, and a sentence that ignores it reads as broken
+        // English on exactly the screen an operator reads while deciding. The walkthrough caught
+        // this in the plural case: "their bytes are is only reclaimed", because the verb phrase
+        // and the "is" were both carried by one branch.
+        let (subject, verb) = if outcome.trashed.len() == 1 {
+            ("is in the trash and its".to_owned(), "is")
+        } else {
+            ("are in the trash and their".to_owned(), "are")
+        };
         notice.push_str(&format!(
-            " The {} are in the trash and their {} is only reclaimed when the trash is purged.",
+            " The {} {subject} {bytes} {} {verb} only reclaimed when the trash is purged.",
             plural(outcome.trashed.len() as i64, "copy", "copies"),
-            if bytes == 1 { "byte is" } else { "bytes are" },
+            if bytes == 1 { "byte" } else { "bytes" },
         ));
         if shares > 0 {
             notice.push_str(&format!(
@@ -600,6 +609,47 @@ mod tests {
         // The moved count is the *net* one: a collapsed row is not a second link moved.
         assert_eq!(body.references_moved, 1);
         assert_eq!(body.references_collapsed, 1);
+    }
+
+    #[test]
+    fn the_notice_is_grammatical_in_both_numbers() {
+        // The first draft carried the verb phrase and the "is" on the same branch, so the plural
+        // case read "their bytes are is only reclaimed" — caught by the walkthrough screenshot
+        // path, not by an assertion, because every word was present and only the grammar was
+        // wrong. Both numbers are pinned here.
+        let one = MergeBody::build(
+            &MergeOutcome {
+                kept: Uuid::nil(),
+                trashed: vec![Uuid::nil()],
+                references_moved: 0,
+                references_collapsed: 0,
+            },
+            1,
+            0,
+        );
+        assert!(
+            one.notice.contains("is in the trash and its 1 byte is only reclaimed"),
+            "{}",
+            one.notice
+        );
+        assert!(!one.notice.contains("is is"), "{}", one.notice);
+
+        let many = MergeBody::build(
+            &MergeOutcome {
+                kept: Uuid::nil(),
+                trashed: vec![Uuid::nil(); 5],
+                references_moved: 0,
+                references_collapsed: 0,
+            },
+            5000,
+            0,
+        );
+        assert!(
+            many.notice.contains("are in the trash and their 5000 bytes are only reclaimed"),
+            "{}",
+            many.notice
+        );
+        assert!(!many.notice.contains("are is"), "{}", many.notice);
     }
 
     #[test]
