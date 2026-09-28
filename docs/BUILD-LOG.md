@@ -2273,3 +2273,66 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
   settings with a connection test, the CDN purge hook, share links and duplicate detection with
   merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
   serve path, and EXIF extraction.
+
+## 2026-09-28 — REQ-125 closes: a merge made the branch unbootable, and the gate found four real defects
+
+- **What this tick was.** The close gate for REQ-125, plus everything the gate had been hiding.
+  Two things blocked it before it could run at all, and once it ran it found four defects in the
+  audit screen that the Rust suite and the panel build were both green through.
+- **The branch could not boot, and no single branch was at fault.** This file carried
+  `0027_deployment_lease_revocation.sql`; `origin/main` shipped `0027_media_transforms.sql` for
+  REQ-010. Each branch was internally consistent and the union was not — sqlx keys a migration on
+  version *and* checksum, so the API refused to start with `migration 27 was previously applied but
+  has been modified`. Renumbered to `0033`, the first slot free in all seven worktrees. The
+  duplicate check is one line and has to run after every merge, not only when a file is written:
+  `ls database/migrations/*.sql | sed 's/_.*//' | sort | uniq -d`.
+- **A crashed API is a race with the next pass.** `run.sh` dropped the database and restarted the
+  API *afterwards*, and the crash-looping process reconnected the instant the database returned,
+  applying the migration set it had been compiled with. The rebuilt binary then found its
+  predecessor's checksums. The symptom reads like a corrupt database; it is a race. One line —
+  stop this stack's API before the reset — and `pm2 stop` rather than `delete` so the existing
+  restart branch keeps the right environment.
+- **The whole-box walk is not evidence on a shared box.** It ran twice and died both times at the
+  same place (`analytics-*`, then the palette) with `Target page, context or browser has been
+  closed` and **no summary.json** — an infrastructure abort, not a verdict. Three other writers were
+  driving their own Chromium at the time (30 chrome processes, 1 G free of 32 G). The screen was
+  therefore measured by a scoped depth pass, which is a harness addition rather than a copy: the
+  walkthrough's depth passes are now exported behind a `require.main` guard and
+  `secrets-audit-depth.cjs` drives the same assertions for one screen in a minute.
+- **The four defects the depth pass found, none of which any other gate could see:**
+  1. **Three filters that were dead.** The action pills, the request-id box and the address box each
+     kept their own state; the row list read none of them. A pill turned `aria-pressed` on and the
+     table underneath did not move. Only the text search was wired — the walk's own numbers show
+     it: `before 0, after 0, pressed true`.
+  2. **Escape stranded the keyboard.** It closed the drawer but left focus in the filter input, so
+     the handler's `typing` guard swallowed `f`, `a` and `/` for the rest of the visit. The first
+     sequence a keyboard user tries — `/`, Escape, `f` — silently did nothing after the first key.
+  3. **A refusal that wrote no row.** `POST /secret-leases/{id}/redeem` with no deployment key
+     answered 401 with a request id and wrote nothing, while every other refusal in that handler
+     wrote a denial row. The operator holding that id had no row to land on — the one case the
+     request id exists to prevent. It cannot use `record_use` (that needs a key id), so it writes
+     the audit row directly, with the id in the COLUMN.
+  4. **My own driver measured the wrong server first.** The walkthrough resolves its base URL from
+     `--url` and silently defaults to :3100 — the main writer's stack. The first two depth runs
+     reported "0 rows, export 404, no fixture leaked" and looked like a pass against a broken
+     screen; they were a 404 page and another branch's API. The driver now compares the port it was
+     given against the port the module resolved and refuses to run when they differ.
+- **Proof.** `cargo test -p omnion-secrets` 53/53 · `cargo test -p omnion-api --test secret_audit`
+  2/2 (the second test is the denial row, asserting both that it exists and that the screen's own
+  `?request_id=` filter returns it — a row the filter cannot reach is as useless as no row) ·
+  `pnpm typecheck` 2/2 · depth pass on 18085/3105/3205: 5 rows, action filter **5 → 1**, request-id
+  join lands on the denial row (36-char id), export 200 with no fixture value and no masked
+  fragment in the feed, 0 console errors, and the screenshot shows the chip selected with the one
+  matching row beneath it.
+- **The acknowledge is proved over the router, not in the browser.** Clearing a flag needs one to
+  exist, and a flag is raised by a real reveal, which needs the operator key — the one thing a
+  walkthrough has no legitimate way to hold. `secret_audit.rs` proves the raise and that the
+  acknowledge persists and reports `already_acknowledged` on a second click.
+- **Environment.** `/mnt/apopic` sat at 99–100% (779 M); freed only this worktree's own
+  `qa-artifacts/`. `target/` is still a symlink into `/dev/shm/omnion-w6-target`, which is why the
+  Rust gates survived the incident at all. `omnion_w6_dev` had to be dropped and recreated after
+  the renumber: it held the old 0027 checksum and every test failed with `VersionMismatch(27)`
+  before reaching an assertion.
+- **Next.** REQ-126 (observability stack), slice 1: the log schema crate, the middleware that binds
+  request id and user/org context, worker propagation, the shared redaction pass and the bounded
+  log explorer screen.
