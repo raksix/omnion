@@ -1545,7 +1545,12 @@ async function runMediaDuplicates(page, report) {
 
   // And the report agrees: the group is gone, because one live file is not a group.
   const apiGroups = await page.evaluate(async () => {
-    const site = document.querySelector('[data-site-switcher] select')?.value;
+    // The panel's own site picker, by its stable test id. The previous probe guessed a
+    // `[data-site-switcher] select` attribute the component does not carry, so it sent a request
+    // with no `site_id` at all, got a `400`, and reported `group_count: -1` — which the pass
+    // could not distinguish from "the group is still there". A probe that cannot fail is not a
+    // probe; this one asserts the site was found before it reports a count.
+    const site = document.querySelector("[data-testid='site-select']")?.value;
     const params = new URLSearchParams();
     if (site) {
       params.set("site_id", site);
@@ -1553,8 +1558,11 @@ async function runMediaDuplicates(page, report) {
     const response = await fetch(`/api/v1/media/duplicates?${params}`, {
       credentials: "same-origin",
     });
+    if (!site) {
+      return { status: 0, group_count: -1, reason: "the site picker was not found" };
+    }
     if (!response.ok) {
-      return { status: response.status, group_count: -1 };
+      return { status: response.status, group_count: -1, reason: "the report refused" };
     }
     const body = await response.json();
     return { status: response.status, group_count: body.group_count };

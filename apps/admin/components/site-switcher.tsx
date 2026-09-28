@@ -27,6 +27,7 @@ export function SiteSwitcher() {
       <Globe className="size-3.5 text-muted" aria-hidden />
       <span className="sr-only">Current site</span>
       <select
+        data-testid="site-select"
         value={selectedSite?.id ?? ""}
         onChange={(event) => selectSite(event.target.value)}
         className="max-w-44 bg-transparent text-[12.5px] font-medium text-ink outline-none"
