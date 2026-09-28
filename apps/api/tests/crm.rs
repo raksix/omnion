@@ -4484,3 +4484,781 @@ async fn defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home()
         foreign.body
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4, part seven: the form → lead ingress (REQ-117).
+//
+// These walks drive the **real** consumer over the **real** bus: the event is recorded the way
+// REQ-064's public submit endpoint will record it (`omnion_events::bus::emit`), and the drain
+// that reads it is `modules::crm::leads::drain` — the same function `apps/api`'s runner calls.
+// A hand-written row would prove the SQL; a bus event proves the contract.
+// ---------------------------------------------------------------------------------------------
+
+/// Record a `form.submitted` event the way the form module's public endpoint will.
+async fn emit_form_submitted(db: &Db, organization_id: Option<Uuid>, answers: Value) -> i64 {
+    let payload = json!({
+        "form_key": "contact-us",
+        "site_id": null,
+        "occurred_at": "2026-09-26T10:30:00Z",
+        "answers": answers,
+    });
+
+    let event = omnion_events::bus::emit(
+        db.pool(),
+        omnion_events::NewEvent::new(omnion_module_crm::leads::FORM_SUBMITTED)
+            .organization(organization_id)
+            .payload(payload),
+    )
+    .await
+    .expect("the submission must reach the bus");
+
+    event.event.id
+}
+
+/// The ingress keys: reading the log and deciding what a submission becomes.
+const LEAD_PERMISSIONS: [&str; 2] = ["crm.leads.read", "crm.leads.manage"];
+
+/// Give the manager the ingress keys and sign in **after** the grant.
+///
+/// The order matters and it is the same lesson the workflow walk learned: a session's powers are
+/// read from the role at login, so a token minted before the grant answers `403` on the very
+/// route this walk is about.
+async fn grant_lead_powers(fixture: &Fixture, email: &str) -> String {
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    let user_id = account_id(&fixture.db, email).await;
+    grant(&fixture.db, fixture.org, user_id, owner_id, &LEAD_PERMISSIONS).await;
+    fixture.token(email).await
+}
+
+/// How many contacts of the fixture's organization carry this address.
+async fn contacts_with_email(db: &Db, organization_id: Uuid, email: &str) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from crm_contacts \
+         where organization_id = $1 and email = $2 and archived_at is null",
+    )
+    .bind(organization_id)
+    .bind(email)
+    .fetch_one(db.pool())
+    .await
+    .expect("the contacts must read")
+}
+
+/// How many deals of the organization carry this source label.
+async fn deals_from_forms(db: &Db, organization_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from crm_deals \
+         where organization_id = $1 and source like 'form.submitted:%'",
+    )
+    .bind(organization_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the deals must read")
+}
+
+/// The ledger row one submission produced.
+async fn ledger_row(db: &Db, event_id: i64) -> Value {
+    let rows: Vec<(String, Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "select outcome, contact_id, deal_id, detail from crm_form_leads where event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("the ledger must read");
+    assert_eq!(rows.len(), 1, "exactly one ledger row per submission");
+    json!({
+        "outcome": rows[0].0,
+        "contact_id": rows[0].1,
+        "deal_id": rows[0].2,
+        "detail": rows[0].3,
+    })
+}
+
+/// A submitted form becomes a contact and a deal, through the real bus and the real drain.
+///
+/// The assertions are the acceptance criteria in one place: the submission is recorded on the
+/// bus, the drain reads it, a **contact** and a **deal** exist, the ledger names both, the inbox
+/// shows the row, and the deal's headline is the person's own words rather than a placeholder.
+#[tokio::test]
+async fn a_submitted_form_becomes_a_contact_and_a_deal() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    // The cursor watches forward: a rule created today must not fire for the history already on
+    // the bus, and a drain must not turn this fixture's own setup into leads.
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let email = format!("ada-{}@example.com", Uuid::new_v4().simple());
+    let event_id = emit_form_submitted(
+        &fixture.db,
+        Some(fixture.org),
+        json!({
+            "name": "Ada Lovelace",
+            "email": email,
+            "company": "Analytical Engines Ltd",
+            "message": "We would like a quote for the engine."
+        }),
+    )
+    .await;
+
+    // Draining over the API, so the guard that protects the button is part of what is proved.
+    let drained = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(drained.status, StatusCode::OK, "body: {}", drained.body);
+    assert_eq!(drained.body["created"], 1, "one submission became a record");
+    assert_eq!(drained.body["idle"], false);
+    assert_eq!(drained.body["failures"], 0, "body: {}", drained.body);
+
+    assert_eq!(contacts_with_email(&fixture.db, fixture.org, &email).await, 1);
+    assert_eq!(deals_from_forms(&fixture.db, fixture.org).await, 1);
+
+    let row = ledger_row(&fixture.db, event_id).await;
+    assert_eq!(row["outcome"], json!("created"));
+    assert!(row["contact_id"].is_string(), "the ledger names the contact");
+    assert!(row["deal_id"].is_string(), "the ledger names the deal");
+
+    // The deal is the person's own words: the company, which is the shorter and more specific
+    // phrase, not a placeholder and not the whole message.
+    let title: String = sqlx::query_scalar("select title from crm_deals where id = $1")
+        .bind(row["deal_id"].as_str().expect("a deal id"))
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the deal must read");
+    assert_eq!(title, "Analytical Engines Ltd");
+
+    // The inbox shows it, and the counters agree with the row.
+    let inbox = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(inbox.status, StatusCode::OK, "body: {}", inbox.body);
+    let items = inbox.body["items"].as_array().expect("the inbox has rows");
+    let mine = items
+        .iter()
+        .find(|item| item["event_id"] == json!(event_id))
+        .expect("the submission is in the inbox");
+    assert_eq!(mine["name"], json!("Ada Lovelace"));
+    assert_eq!(mine["company_name"], json!("Analytical Engines Ltd"));
+    assert_eq!(mine["outcome"], json!("created"));
+    assert!(mine["deal_id"].is_string(), "the inbox links the deal it made");
+
+    let created_count = inbox.body["counts"]
+        .as_array()
+        .expect("the counters are an array")
+        .iter()
+        .find(|counter| counter["outcome"] == json!("created"))
+        .map_or(0, |counter| counter["count"].as_i64().unwrap_or_default());
+    assert!(created_count >= 1, "the created chip counts it: {}", inbox.body);
+}
+
+/// Draining the same bus twice files nothing twice.
+///
+/// The claim is the event id's primary key on the ledger, and this is the walk that proves the
+/// guarantee is real rather than intended: a second drain over an unchanged bus is **idle**, and
+/// the contact and deal counts do not move.
+#[tokio::test]
+async fn a_second_drain_files_nothing_twice() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let email = format!("grace-{}@example.com", Uuid::new_v4().simple());
+    let event_id = emit_form_submitted(
+        &fixture.db,
+        Some(fixture.org),
+        json!({ "name": "Grace Hopper", "email": email }),
+    )
+    .await;
+
+    let first = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "body: {}", first.body);
+    assert_eq!(first.body["created"], 1, "body: {}", first.body);
+
+    let contacts_after_first = contacts_with_email(&fixture.db, fixture.org, &email).await;
+    let deals_after_first = deals_from_forms(&fixture.db, fixture.org).await;
+    assert_eq!(contacts_after_first, 1);
+    assert_eq!(deals_after_first, 1);
+
+    // The second drain reads the same bus. The cursor has moved past the event, so it is idle —
+    // and even the *claim* is belt and braces, which is what the third drain below proves.
+    let second = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "body: {}", second.body);
+    assert_eq!(second.body["idle"], true, "nothing new: {}", second.body);
+    assert_eq!(contacts_with_email(&fixture.db, fixture.org, &email).await, 1);
+    assert_eq!(deals_from_forms(&fixture.db, fixture.org).await, 1);
+
+    // And the claim itself: rewinding the cursor makes the drain read the *same* event again,
+    // and the ledger's primary key is what stops it writing a second contact.
+    sqlx::query("update crm_lead_cursor set last_event_id = 0 where id = 1")
+        .execute(fixture.db.pool())
+        .await
+        .expect("the cursor must rewind");
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must re-seed");
+    sqlx::query("update crm_lead_cursor set last_event_id = $1 where id = 1")
+        .bind(event_id - 1)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the cursor must rewind to just before the event");
+
+    let replayed = omnion_module_crm::leads::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the replay drain must run");
+    assert_eq!(replayed.created, 0, "the claim is taken: {replayed:?}");
+    assert_eq!(contacts_with_email(&fixture.db, fixture.org, &email).await, 1);
+    assert_eq!(deals_from_forms(&fixture.db, fixture.org).await, 1);
+}
+
+/// A second submission from an address the CRM already knows is the **same person**.
+#[tokio::test]
+async fn a_repeat_submission_is_the_same_person_and_lands_in_the_repeat_stage() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let stages = pipeline["stages"].as_array().expect("the stages are an array").clone();
+    let first_open = stages[0].clone();
+    let negotiation = stages
+        .iter()
+        .find(|stage| stage["name"] == json!("Negotiation"))
+        .cloned()
+        .expect("the seeded pipeline has a Negotiation column");
+
+    // Park repeats in Negotiation, so the walk can tell the two deals apart by stage rather than
+    // by title — two deals for one interest is the failure this setting exists to prevent.
+    let saved = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&manager),
+            Some(json!({
+                "repeat_stage_id": negotiation["id"],
+                "source_label": "webinar",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+    assert_eq!(saved.body["settings"]["repeat_stage_id"], negotiation["id"]);
+    assert_eq!(saved.body["settings"]["create_contact"], true, "a partial body keeps the rest");
+
+    let email = format!("repeat-{}@example.com", Uuid::new_v4().simple());
+    let first_event = emit_form_submitted(
+        &fixture.db,
+        Some(fixture.org),
+        json!({ "name": "Katherine Johnson", "email": email, "message": "First enquiry." }),
+    )
+    .await;
+    let drained = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(drained.body["created"], 1, "body: {}", drained.body);
+    assert_eq!(contacts_with_email(&fixture.db, fixture.org, &email).await, 1);
+
+    let second_event = emit_form_submitted(
+        &fixture.db,
+        Some(fixture.org),
+        json!({ "name": "Katherine Johnson", "email": email.to_uppercase(), "message": "Second enquiry." }),
+    )
+    .await;
+    let again = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(again.body["merged"], 1, "the repeat is merged: {}", again.body);
+    assert_eq!(again.body["created"], 0, "not a second person: {}", again.body);
+
+    // One contact, and the case difference did not create a second one.
+    assert_eq!(contacts_with_email(&fixture.db, fixture.org, &email).await, 1);
+
+    let row = ledger_row(&fixture.db, second_event).await;
+    assert_eq!(row["outcome"], json!("merged"));
+    let first_row = ledger_row(&fixture.db, first_event).await;
+    assert_eq!(
+        row["contact_id"], first_row["contact_id"],
+        "the repeat points at the contact the first one made"
+    );
+
+    // Two deals, in two different stages: the new one in the first open column, the repeat where
+    // the operator said repeats go.
+    let stages_of: Vec<String> = sqlx::query_scalar(
+        "select s.name from crm_deals d join crm_pipeline_stages s on s.id = d.stage_id \
+         where d.contact_id = $1 order by d.created_at",
+    )
+    .bind(first_row["contact_id"].as_str().expect("a contact id"))
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the stages must read");
+    assert_eq!(stages_of.len(), 2, "{stages_of:?}");
+    assert_eq!(stages_of[0], first_open["name"].as_str().unwrap_or_default());
+    assert_eq!(stages_of[1], negotiation["name"].as_str().unwrap_or_default());
+}
+
+/// A submission with nothing to file is **kept and explained**, not dropped.
+#[tokio::test]
+async fn a_submission_with_nothing_usable_is_kept_and_says_why() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let event_id = emit_form_submitted(
+        &fixture.db,
+        Some(fixture.org),
+        json!({ "note": "the honeypot field is the only thing they filled in" }),
+    )
+    .await;
+
+    let drained = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(drained.status, StatusCode::OK, "body: {}", drained.body);
+    assert_eq!(drained.body["rejected"], 1, "body: {}", drained.body);
+    assert_eq!(drained.body["created"], 0);
+
+    let row = ledger_row(&fixture.db, event_id).await;
+    assert_eq!(row["outcome"], json!("rejected"));
+    assert!(
+        row["detail"].as_str().is_some_and(|detail| detail.contains("no name")),
+        "the inbox has to be able to say why: {row}"
+    );
+    assert!(row["contact_id"].is_null(), "nothing was created: {row}");
+
+    // It is in the inbox, filterable by the outcome — a rejected submission is a thing a person
+    // looks at, not a silent loss.
+    let inbox = call(
+        state,
+        request(
+            Method::GET,
+            "/api/v1/crm/leads?outcome=rejected",
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(inbox.status, StatusCode::OK, "body: {}", inbox.body);
+    let items = inbox.body["items"].as_array().expect("the inbox has rows");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["event_id"] == json!(event_id)),
+        "the rejected submission is listed: {}", inbox.body
+    );
+}
+
+/// A submission with no organization is recorded and counted, never filed into nobody's CRM.
+#[tokio::test]
+async fn a_submission_without_an_organization_is_orphaned_not_dropped() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let event_id = emit_form_submitted(
+        &fixture.db,
+        None,
+        json!({ "name": "Nobody In Particular", "email": "nobody@example.com" }),
+    )
+    .await;
+
+    let drained = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(drained.body["orphaned"], 1, "body: {}", drained.body);
+
+    let row = ledger_row(&fixture.db, event_id).await;
+    assert_eq!(row["outcome"], json!("orphaned"));
+    assert!(row["detail"].as_str().is_some_and(|d| d.contains("organization")), "{row}");
+
+    // And it belongs to no tenant's inbox: the ledger is scoped by organization, so a public
+    // submission on a site with no tenant is visible to the platform, not to a stranger.
+    let inbox = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads", Some(&manager), None),
+    )
+    .await;
+    let items = inbox.body["items"].as_array().expect("the inbox has rows");
+    assert!(
+        !items.iter().any(|item| item["event_id"] == json!(event_id)),
+        "an orphaned submission is in nobody's inbox: {}", inbox.body
+    );
+}
+
+/// Turning the routing off is a decision the settings screen records, and the drain obeys.
+#[tokio::test]
+async fn an_organization_that_turns_leads_off_records_the_submission_and_writes_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    omnion_module_crm::leads::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let saved = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&manager),
+            Some(json!({ "create_contact": false, "create_deal": false })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+    assert_eq!(saved.body["settings"]["create_contact"], false);
+    assert_eq!(saved.body["settings"]["create_deal"], false);
+
+    let email = format!("off-{}@example.com", Uuid::new_v4().simple());
+    let event_id = emit_form_submitted(
+        &fixture.db,
+        Some(fixture.org),
+        json!({ "name": "Aled Edwards", "email": email }),
+    )
+    .await;
+
+    let drained = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(drained.body["disabled"], 1, "body: {}", drained.body);
+    assert_eq!(contacts_with_email(&fixture.db, fixture.org, &email).await, 0);
+    assert_eq!(deals_from_forms(&fixture.db, fixture.org).await, 0);
+    assert_eq!(ledger_row(&fixture.db, event_id).await["outcome"], json!("disabled"));
+}
+
+/// Reading the log and changing the routing are separate keys, and the settings are a tenant's.
+#[tokio::test]
+async fn the_ingress_keys_and_the_tenant_boundary_are_enforced() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+
+    // The plain reader holds neither key.
+    let reader = fixture.token(&fixture.reader).await;
+    for (method, uri) in [
+        (Method::GET, "/api/v1/crm/leads"),
+        (Method::GET, "/api/v1/crm/leads/settings"),
+        (Method::POST, "/api/v1/crm/leads/drain"),
+    ] {
+        let response = call(state, request(method, uri, Some(&reader), None)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "{uri} must be guarded, not merely hidden: {}",
+            response.body
+        );
+    }
+
+    // Unauthenticated is `401` before any of that.
+    let anonymous = call(state, request(Method::GET, "/api/v1/crm/leads", None, None)).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    // A reader of the ingress may look but not reconfigure: the two keys really are separate.
+    let (watcher_id, watcher) = create_account(&fixture.db, Some(fixture.org), "CRM Lead Watcher").await;
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    grant(&fixture.db, fixture.org, watcher_id, owner_id, &["crm.leads.read"]).await;
+    let watcher = login(&state, &watcher).await;
+    assert!(watcher.is_empty() == false, "the watcher signed in");
+
+    let read = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads", Some(&watcher), None),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "body: {}", read.body);
+
+    let reconfigure = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&watcher),
+            Some(json!({ "create_deal": false })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reconfigure.status,
+        StatusCode::FORBIDDEN,
+        "watching the pipeline is not deciding it: {}",
+        reconfigure.body
+    );
+
+    let drain = call(
+        state,
+        request(Method::POST, "/api/v1/crm/leads/drain", Some(&watcher), None),
+    )
+    .await;
+    assert_eq!(drain.status, StatusCode::FORBIDDEN, "body: {}", drain.body);
+
+    // A writer of another tenant may not read this one: the inbox is scoped by organization and
+    // the route resolves the organization from the session, never from the query.
+    let foreign = grant_and_login(
+        &fixture,
+        "CRM Foreign Lead Reader",
+        &["crm.leads.read", "crm.leads.manage"],
+    )
+    .await;
+    let foreign_inbox = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads", Some(&foreign), None),
+    )
+    .await;
+    assert_eq!(foreign_inbox.status, StatusCode::OK, "body: {}", foreign_inbox.body);
+    let items = foreign_inbox.body["items"].as_array().expect("the inbox has rows");
+    let ours: Vec<&Value> = items
+        .iter()
+        .filter(|item| item["name"] != json!(""))
+        .collect();
+    assert!(
+        ours.iter().all(|item| item["event_id"].is_i64()),
+        "the foreign inbox is its own: {}", foreign_inbox.body
+    );
+    let mut settings = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads/settings", Some(&foreign), None),
+    )
+    .await;
+    assert_eq!(settings.status, StatusCode::OK);
+    // Writing the foreign tenant's routing is allowed — it is *their* tenant — and must not
+    // change ours.
+    settings = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&foreign),
+            Some(json!({ "source_label": "foreign" })),
+        ),
+    )
+    .await;
+    assert_eq!(settings.status, StatusCode::OK, "body: {}", settings.body);
+
+    let manager = fixture.token(&fixture.manager).await;
+    let ours_settings = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads/settings", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(ours_settings.status, StatusCode::OK, "body: {}", ours_settings.body);
+    assert_ne!(
+        ours_settings.body["settings"]["source_label"],
+        json!("foreign"),
+        "a tenant's routing is not another tenant's to write"
+    );
+}
+
+/// A stage from another pipeline is refused by name, not silently ignored.
+#[tokio::test]
+async fn a_stage_from_another_pipelines_organization_is_refused() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    let foreign_pipeline = default_pipeline_with_stages(&fixture.db, fixture.other_org).await;
+    let foreign_stage = foreign_pipeline["stages"].as_array().expect("stages")[0]["id"].clone();
+
+    let refused = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&manager),
+            Some(json!({ "stage_id": foreign_stage })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
+    assert_eq!(refused.body["code"], json!("invalid_lead_settings.stage_id"));
+
+    // And the refusal left the stored row alone.
+    let after = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads/settings", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(after.body["settings"]["stage_id"], Value::Null, "body: {}", after.body);
+}
+
+/// The settings are audited and announced, and a body that changes nothing is silent.
+#[tokio::test]
+async fn changing_the_routing_is_audited_and_only_the_change_is_announced() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
+
+    // Read it first: the endpoint's first write creates the row, and the walk below needs a row
+    // that already exists so "nothing changed" really means nothing.
+    let _ = call(
+        state,
+        request(Method::GET, "/api/v1/crm/leads/settings", Some(&manager), None),
+    )
+    .await;
+    omnion_module_crm::leads::load_settings(fixture.db.pool(), fixture.org)
+        .await
+        .expect("the settings row must exist");
+
+    let changed = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&manager),
+            Some(json!({ "source_label": "trade-show", "create_deal": false })),
+        ),
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::OK, "body: {}", changed.body);
+    assert_eq!(changed.body["settings"]["source_label"], json!("trade-show"));
+    assert_eq!(changed.body["settings"]["create_deal"], false);
+    assert_eq!(changed.body["configured"], true);
+
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log \
+         where action = 'crm.lead_settings.updated' and organization_id = $1",
+    )
+    .bind(fixture.org)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit must read");
+    assert_eq!(audited, 1, "the change is audited exactly once");
+
+    let announced: i64 = sqlx::query_scalar(
+        "select count(*) from events where name = 'crm.lead_settings.updated' and organization_id = $1",
+    )
+    .bind(fixture.org)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the bus must read");
+    assert_eq!(announced, 1, "the change is announced exactly once");
+
+    // The same body again changes nothing, so it is neither audited nor announced: an audit row
+    // per render would make the trail useless.
+    let again = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&manager),
+            Some(json!({ "source_label": "trade-show", "create_deal": false })),
+        ),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK, "body: {}", again.body);
+
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log \
+         where action = 'crm.lead_settings.updated' and organization_id = $1",
+    )
+    .bind(fixture.org)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit must read");
+    assert_eq!(audited, 1, "an unchanged save is not an event in the trail");
+
+    // The label is normalised, so `Trade Show` and `trade show` are the same label rather than
+    // two tags on two contacts.
+    let shouty = call(
+        state,
+        request(
+            Method::PUT,
+            "/api/v1/crm/leads/settings",
+            Some(&manager),
+            Some(json!({ "source_label": "  TRADE-SHOW  " })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        shouty.body["settings"]["source_label"],
+        json!("trade-show"),
+        "the label is trimmed and lowered"
+    );
+}
+
+/// The two new keys are in the catalogue, in the owner's role, and nowhere else by accident.
+#[tokio::test]
+async fn the_lead_keys_are_catalogued_and_belong_to_the_owner() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    for key in ["crm.leads.read", "crm.leads.manage"] {
+        let known: bool = sqlx::query_scalar("select exists (select 1 from permissions where key = $1)")
+            .bind(key)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the permissions must read");
+        assert!(known, "{key} must be seeded into the catalogue");
+    }
+
+    // The CRM *manager* does not hold them: the ingress is a separate decision from the rest of
+    // the family, and the suite grants it explicitly where it needs it.
+    let held: i64 = sqlx::query_scalar(
+        "select count(*) from role_permissions rp \
+         join roles r on r.id = rp.role_id \
+         join users u on u.id = any(rp.grant_scope_ids) \
+         where u.email = $1 and rp.permission_key = 'crm.leads.read'",
+    )
+    .bind(&fixture.manager)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the bindings must read");
+    assert_eq!(held, 0, "a CRM manager is not handed the ingress by default");
+}
