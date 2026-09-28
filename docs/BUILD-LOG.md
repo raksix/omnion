@@ -2710,3 +2710,51 @@
 - **Next.** REQ-098 slice 1 — the model catalog. The registry screen exists and is walked, but the
   catalog's own rules (which model is default, what a task resolves to, the routing decision) are
   REQ-098 and are not started.
+
+## 2026-09-28 · REQ-098 slice 1 — the model catalog (`a417ce9`, `13c3146`, `32e4442`)
+
+REQ-097 is closed; this tick opens REQ-098 with its first slice, on a tree that already held the
+work uncommitted from the previous run.
+
+- **What.** `crates/ai-hub/src/catalog.rs` gives a model row the number it never had — what a
+  million input and a million output tokens cost, in micros, with `price_source` and
+  `price_updated_at` beside it. It also carries the vocabularies slices 2 and 3 need: seven
+  routing tasks, eight feature keys, four route requirements, and `can_serve_task`. The listing
+  narrows server-side (`q`, `capability`, `status`, `sort`), `PATCH /ai/models/{id}` writes both
+  price halves or neither, and `/ai/models` renders the table with chips, filters, sortable
+  columns and bulk enable/disable. Migration `0043_ai_model_prices.sql` — the namespace re-read
+  at commit time: main was still at `0042`, and no duplicate exists in the directory.
+
+- **The bug a price column has by default.** `Option`'s derived `Ord` ranks `None` **first**, so
+  sorting the two price columns directly printed every *unpriced* model at the top of a column
+  headed "cheapest first" — the exact inversion the catalog exists to prevent, and the one an
+  operator reads as "these are free". The comment above the sort already said `None` last; the
+  code said the opposite, which is why the comment and the code disagreed. Fixed once in
+  `cmp_price`, and the test asserts the trap is real (`None.cmp(&Some(10)) == Less`) so nobody
+  simplifies it back. The SQL path spells the same rule as `nulls last` because Postgres does not
+  share Rust's ordering, so the rule had to be written twice; the test asserts both paths agree.
+
+- **A test that asserted the opposite of its own message.** `the_status_filter_and_the_price_
+  order_behave` expected `mock-small` before `mock-large` while its failure message said "with no
+  price at all the key order is the tiebreak". With both models unpriced the tiebreak *is*
+  alphabetical, so the expectation contradicted the rule printed beside it — and it had been
+  passing only by accident, because the inverted sort returned insertion order that happened to
+  match. Corrected to the rule, with the reason recorded next to the assertion.
+
+- **The empty state was a dead end wearing the wording of a call to action.** It said "Add models
+  to a provider — or pull them from the provider itself with Discover" and rendered no button.
+  Fixed in `32e4442`: a provider picker, a working **Discover** (discover → apply the diff →
+  report what landed) and an **Add a model** link. The link pointed at an anchor that did not
+  exist, so the provider model section gained the id — the same dead control in a second place.
+
+- **Proof.** `cargo test -p omnion-ai-hub` **118 passed**; `cargo test -p omnion-api --test
+  ai_catalog` **9 passed** (9 new: price write, history immutability, half-priced cost, bad-price
+  refusal, server-side capability chips, search, status/sort, unpriced-last, session guard);
+  `pnpm typecheck` **2/2** with the turbo cache bypassed. Two boxes ticked with their evidence;
+  the catalog criterion stays open because its *usage counts* column needs slice 2's route map and
+  the repo has no admin component-test harness.
+
+- **Next.** REQ-098 **slice 2** — `ai_task_routes` and `ai_feature_overrides`, the `/ai/routing`
+  screen with its scope selector, the resolution order, the dry-run preview and the refusal on an
+  incompatible candidate. This slice has not had a QA pass yet; the pass is owed before REQ-098
+  closes, and the next tick merges `origin/main` first (it has moved past `0042`).
