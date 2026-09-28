@@ -73,9 +73,19 @@ fn map_store(error: omnion_notifications::NotificationError) -> ApiError {
 
 /// The query of the list read.
 ///
-/// `category` repeats rather than being comma-separated: a comma inside a value is then
-/// impossible, and a panel that sends `category=a,b` gets a `400` naming the field instead of
-/// a filter that silently matched nothing.
+/// `category` and `priority` repeat rather than being comma-separated: a comma inside a value
+/// is then impossible, and a panel that sends `category=a,b` gets a `400` naming the field
+/// instead of a filter that silently matched nothing.
+///
+/// **This type is not what axum's `Query` extractor deserializes.** It is built by
+/// [`parse_list_params`] from the raw query string, because `serde_urlencoded` — which backs
+/// `Query<T>` in axum 0.8 — cannot put a repeated key into a `Vec`: it answers
+/// `invalid type: string "approval", expected a sequence` for *both* `?category=approval` and
+/// `?category=approval&category=ticket`, so every category and priority filter on this
+/// surface was a `400` and the list fell back to its error state. The QA pass found it as two
+/// `request-failed` findings against values that are perfectly legal; the fix is here rather
+/// than in the client, because a client that comma-joins its filters would then be unable to
+/// express a category and a priority together with the same escaping rules.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
     /// Keep only this category. Repeat for several.
@@ -98,6 +108,87 @@ pub struct ListParams {
     pub before: Option<String>,
     /// Page size.
     pub limit: Option<i64>,
+}
+
+/// Parse the list read's query string by hand, keeping every repetition of a repeated key.
+///
+/// Three rules, all of them things a generic deserializer gets wrong for this shape:
+///
+/// * **A repeated key accumulates.** `?category=approval&category=ticket` is two categories,
+///   not one and an error.
+/// * **A single value is a one-element list.** `?category=approval` is one category — the case
+///   `serde_urlencoded` refuses outright, which is what broke the filter.
+/// * **A valueless key is a flag, not a malformed pair.** `?archived` is legal URI syntax and
+///   means "on"; only a key that is *neither* valueless nor `name=value` — impossible, in fact,
+///   which is why the third case below exists — is a refusal. The refusal that does happen is
+///   for a **non-numeric `limit`**, because "lots" has no second sensible reading and a page
+///   size that silently defaulted would be a list that lies about how much of it there is.
+///
+/// Percent-decoding failures are the one thing tolerated rather than refused: a `cursor` that
+/// arrived unreadable is a `400` from `build_query` a moment later with a better message.
+fn parse_list_params(raw: Option<&str>) -> Result<ListParams, ApiError> {
+    let mut params = ListParams::default();
+    let Some(raw) = raw else {
+        return Ok(params);
+    };
+
+    for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
+        // A key with no `=` is a bare flag (`?archived`), which is legal URI syntax and means
+        // "on" — so `split_once` yielding nothing is not an error here, it is a valueless key.
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = decode(key);
+        let value = decode(value);
+        match name.as_str() {
+            "category" if !value.is_empty() => params.category.push(value),
+            "priority" if !value.is_empty() => params.priority.push(value),
+            "read" if !value.is_empty() => params.read = Some(value),
+            "channel" if !value.is_empty() => params.channel = Some(value),
+            "before" if !value.is_empty() => params.before = Some(value),
+            "limit" if !value.is_empty() => {
+                params.limit = Some(value.parse().map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_notification",
+                        format!("limit=\"{value}\" is not a whole number"),
+                    )
+                })?);
+            }
+            // The flags are *present*, not true: a checkbox that was ticked sends `archived=1`
+            // and one that was not sends nothing at all, so a bare `?archived` is the same
+            // answer as `?archived=true`. Anything else is ignored rather than refused, so a
+            // client that adds a filter this build does not know still gets its list — and so
+            // does a valueless key that is not a flag at all (`?category`, `?sort`).
+            "archived" => params.archived = parse_flag(&value),
+            "with_read" => params.with_read = parse_flag(&value),
+            _ => {}
+        }
+    }
+    Ok(params)
+}
+
+/// A flag that is present is on unless it explicitly says otherwise.
+///
+/// `1`, `true`, `yes` and `on` are on; `0`, `false`, `no` and `off` are off. **An empty value
+/// is on**, because an empty value is what a *bare* `?archived` carries and a bare flag means
+/// "present" — the same answer as `?archived=true`. The unit test caught this: the first
+/// version listed `""` among the "off" values, which is the one reading that makes `?archived`
+/// do the opposite of what a bare flag means, and the failure is silent because a filtered
+/// list is still a list.
+///
+/// An unrecognised value is **on** too, because a client that sent `?archived=maybe` meant to
+/// filter and the reader's next question would otherwise be "why is my filter being ignored".
+fn parse_flag(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Percent-decode one query-string token, `+` meaning a space.
+fn decode(value: &str) -> String {
+    let bytes = value.replace('+', " ");
+    percent_encoding::percent_decode_str(&bytes)
+        .decode_utf8_lossy()
+        .to_string()
 }
 
 /// A list read's answer.
@@ -259,9 +350,9 @@ pub struct EmitResult {
 pub async fn list(
     State(state): State<AppState>,
     session: CurrentSession,
-    Query(params): Query<ListParams>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Result<Json<ListBody>, ApiError> {
-    let query = build_query(params)?;
+    let query = build_query(parse_list_params(raw.as_deref())?)?;
 
     let page = omnion_notifications::store::list(state.db().pool(), session.user.id, &query)
         .await
@@ -944,6 +1035,108 @@ mod tests {
         let query = build_query(ListParams::default()).expect("valid");
         assert!(query.before.is_none());
         assert!(query.unread.is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The query-string parser
+    //
+    // These exist because of a real 400: `Query<Vec<String>>` under axum 0.8 refuses both
+    // `?category=approval` and `?category=approval&category=ticket`, so the whole category
+    // filter was broken and every assertion below would have passed against a parser that
+    // silently returned an empty list.
+    // -----------------------------------------------------------------------------------------
+
+    fn parse(raw: &str) -> Result<ListParams, ApiError> {
+        parse_list_params(Some(raw))
+    }
+
+    #[test]
+    fn one_category_is_one_category() {
+        // The exact case the QA pass caught as a 400 against a perfectly legal value.
+        let params = parse("category=approval").expect("valid");
+        assert_eq!(params.category, ["approval"]);
+    }
+
+    #[test]
+    fn a_repeated_category_accumulates_rather_than_replacing() {
+        let params = parse("category=approval&category=ticket").expect("valid");
+        assert_eq!(params.category, ["approval", "ticket"]);
+    }
+
+    #[test]
+    fn a_category_and_a_priority_travel_together() {
+        let params =
+            parse("category=approval&priority=high&category=ticket&limit=25").expect("valid");
+        assert_eq!(params.category, ["approval", "ticket"]);
+        assert_eq!(params.priority, ["high"]);
+        assert_eq!(params.limit, Some(25));
+        // And they survive into the store query — the parser is not a second, looser filter.
+        let query = build_query(params).expect("valid");
+        assert_eq!(query.categories, ["approval", "ticket"]);
+        assert_eq!(query.priorities, ["high"]);
+    }
+
+    #[test]
+    fn a_percent_encoded_value_is_decoded() {
+        // The panel's own links put the category in the query string, so a category that ever
+        // needs escaping must not arrive at the store as its encoded form.
+        let params = parse("before=2026-09-28T10%3A00%3A00Z").expect("valid");
+        assert_eq!(params.before.as_deref(), Some("2026-09-28T10:00:00Z"));
+    }
+
+    #[test]
+    fn a_plus_is_a_space() {
+        assert_eq!(decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn a_bare_flag_is_on_and_an_explicit_zero_is_off() {
+        // The two shapes a checkbox produces: a ticked one sends `archived=1`, a cleared one
+        // sends nothing. `?archived=0` has to mean off, or "show me everything including the
+        // archived rows" cannot be asked for.
+        assert!(parse("archived=1").expect("valid").archived);
+        assert!(parse("archived").expect("valid").archived);
+        assert!(!parse("archived=0").expect("valid").archived);
+        assert!(!parse("archived=false").expect("valid").archived);
+        assert!(!parse("with_read=off").expect("valid").with_read);
+    }
+
+    #[test]
+    fn an_unknown_parameter_is_ignored_rather_than_refused() {
+        // A client that adds a filter this build does not know should still get its list. The
+        // refusal is reserved for a *malformed* pair, not an unrecognised name.
+        let params = parse("category=approval&sort=newest").expect("valid");
+        assert_eq!(params.category, ["approval"]);
+    }
+
+    #[test]
+    fn a_valueless_non_flag_key_is_ignored_rather_than_refused() {
+        // `?category` with no value is a client that meant to filter and gave up halfway.
+        // Refusing it would be defensible; ignoring it is friendlier and cannot make the list
+        // wrong, because an empty category matches nothing and an absent one matches
+        // everything — so the honest answer is the unfiltered list plus no error banner.
+        let params = parse("category").expect("not an error");
+        assert!(params.category.is_empty());
+    }
+
+    #[test]
+    fn a_non_numeric_limit_is_a_bad_request_naming_the_field() {
+        let error = parse("limit=lots").expect_err("not a number");
+        assert!(error.message().contains("limit="));
+    }
+
+    #[test]
+    fn an_absent_query_string_is_an_empty_parameter_set() {
+        let params = parse_list_params(None).expect("valid");
+        assert!(params.category.is_empty());
+        assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn an_empty_query_string_is_the_same_as_none() {
+        let params = parse("").expect("valid");
+        assert!(params.category.is_empty());
+        assert!(!params.archived);
     }
 
     // -----------------------------------------------------------------------------------------

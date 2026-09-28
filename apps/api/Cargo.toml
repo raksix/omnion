@@ -18,6 +18,10 @@ tokio.workspace = true
 tower.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The list read parses its own query string (see `parse_list_params`): `serde_urlencoded`, which
+# backs axum's `Query` extractor, cannot put a repeated key into a `Vec` and answers 400 for
+# every category and priority filter.
+percent-encoding.workspace = true
 sqlx.workspace = true
 time.workspace = true
 tracing.workspace = true
