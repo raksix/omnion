@@ -58,6 +58,18 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import { ApiError, fetchGraphNodeTypes, fetchWorkflowGraph, saveWorkflowGraph, saveWorkflowUiState, validateWorkflowGraph, type GraphEdge, type GraphFinding, type GraphNode, type GraphNodeType, type GraphNodeTypes, type WorkflowGraph } from "@/lib/api";
+import {
+  capabilities,
+  emptyHistory,
+  record,
+  redo,
+  redoTarget,
+  snapshotOf,
+  undo,
+  undoTarget,
+  type History,
+  type HistorySnapshot,
+} from "./builder-history";
 
 /** The snap grid the canvas draws and drops onto. */
 const GRID = 8;
@@ -131,6 +143,18 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   // the change that armed it, and by then the state it would have closed over is stale.
   const graphRef = useRef<{ nodes: GraphNode[]; edges: GraphEdge[] }>({ nodes: [], edges: [] });
   graphRef.current = { nodes, edges };
+  // The multi-selection, held in a ref so a marquee drag does not re-render the canvas on
+  // every pointer move; `selected` is the single-selection answer the inspector reads.
+  const selectionRef = useRef<Set<string>>(new Set());
+  const [selectionCount, setSelectionCount] = useState(0);
+  // The in-tab clipboard. Deliberately not the system clipboard — see `copySelection`.
+  const clipboardRef = useRef<{ nodes: GraphNode[]; edges: GraphEdge[] }>({ nodes: [], edges: [] });
+  const [clipboardCount, setClipboardCount] = useState(0);
+  // The graph as it was when the current drag began, so one press of undo removes the whole
+  // gesture instead of one pointer sample of it.
+  const dragOriginRef = useRef<HistorySnapshot | null>(null);
+  // A marble? No: the minimap's own rectangle, and whether the author wants to see it.
+  const [minimapOpen, setMinimapOpen] = useState(true);
 
   const nodeTypes = useMemo(() => {
     const map = new Map<string, GraphNodeType>();
@@ -254,17 +278,81 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   // ---- graph editing ----------------------------------------------------------------------
 
+  /**
+   * The undo history, in a ref because it is not render state.
+   *
+   * A `useState` history would re-render the canvas on every pointer move just to hold a
+   * cursor, and the *reason* the history exists is to make those moves cheap.
+   */
+  const historyRef = useRef<History>(emptyHistory());
+  // Re-render on history change alone, so the toolbar's undo/redo buttons can be enabled from
+  // what is actually undoable rather than from "an entry has ever existed".
+  const [historyTick, setHistoryTick] = useState(0);
+
+  const pushHistory = useCallback((key: string, before: HistorySnapshot) => {
+    const current = graphRef.current;
+    historyRef.current = record(historyRef.current, {
+      key,
+      before,
+      after: snapshotOf(current.nodes, current.edges),
+    });
+    setHistoryTick((n) => n + 1);
+  }, []);
+
+  /**
+   * Apply a change, recording it as one undoable step.
+   *
+   * `before` is captured by the caller *before* it touches the graph — the state object at
+   * that instant — because after `setNodes` the previous array is already gone, and a history
+   * that records the new graph as "before" is an undo that does nothing.
+   */
   const commit = useCallback(
-    (nextNodes: GraphNode[], nextEdges: GraphEdge[]) => {
+    (key: string, before: HistorySnapshot, nextNodes: GraphNode[], nextEdges: GraphEdge[]) => {
+      graphRef.current = { nodes: nextNodes, edges: nextEdges };
       setNodes(nextNodes);
       setEdges(nextEdges);
+      pushHistory(key, before);
       queueSave();
     },
-    [queueSave],
+    [pushHistory, queueSave],
   );
+
+  const currentSnapshot = useCallback(
+    (): HistorySnapshot => snapshotOf(graphRef.current.nodes, graphRef.current.edges),
+    [],
+  );
+
+  const doUndo = useCallback(() => {
+    const target = undoTarget(historyRef.current);
+    if (!target) {
+      return;
+    }
+    historyRef.current = undo(historyRef.current);
+    const restored = target as { nodes: GraphNode[]; edges: GraphEdge[] };
+    setNodes(restored.nodes);
+    setEdges(restored.edges);
+    setHistoryTick((n) => n + 1);
+    queueSave();
+  }, [queueSave]);
+
+  const doRedo = useCallback(() => {
+    const target = redoTarget(historyRef.current);
+    if (!target) {
+      return;
+    }
+    historyRef.current = redo(historyRef.current);
+    const restored = target as { nodes: GraphNode[]; edges: GraphEdge[] };
+    setNodes(restored.nodes);
+    setEdges(restored.edges);
+    setHistoryTick((n) => n + 1);
+    queueSave();
+  }, [queueSave]);
+
+  const { canUndo, canRedo } = capabilities(historyRef.current);
 
   const addNode = useCallback(
     (nodeType: GraphNodeType) => {
+      const before = currentSnapshot();
       const position = viewportCentre(canvasRef.current, viewport);
       const node: GraphNode = {
         id: uniqueId(nodeType.key, nodes),
@@ -275,10 +363,112 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       };
       setNodes((current) => [...current, node]);
       setSelected(node.id);
+      // The graph ref is written directly as well as through state: `pushHistory` reads the
+      // ref, and a ref updated in a render body would be one render behind the change.
+      graphRef.current = { nodes: [...graphRef.current.nodes, node], edges: graphRef.current.edges };
+      pushHistory(`add:${node.id}`, before);
       queueSave();
     },
-    [nodes, queueSave, viewport],
+    [currentSnapshot, nodes, pushHistory, queueSave, viewport],
   );
+
+  /**
+   * Duplicate the selected node, offset so the copy is visibly a copy.
+   *
+   * The id has to be fresh: reusing the source's id would produce two nodes with one identity,
+   * and the edge list cannot then say which of them an edge means.
+   */
+  const duplicateSelected = useCallback(() => {
+    if (!selected) {
+      return;
+    }
+    const source = nodes.find((node) => node.id === selected);
+    if (!source) {
+      return;
+    }
+    const before = currentSnapshot();
+    const copy: GraphNode = {
+      ...source,
+      id: uniqueId(source.type, nodes),
+      label: `${source.label} copy`,
+      position: {
+        x: clampCoord(snap(source.position.x + CARD_W + GRID * 2)),
+        y: clampCoord(snap(source.position.y + GRID * 2)),
+      },
+      params: { ...source.params },
+    };
+    const nextNodes = [...nodes, copy];
+    commit(`duplicate:${copy.id}`, before, nextNodes, edges);
+    setSelected(copy.id);
+  }, [commit, currentSnapshot, edges, nodes, selected]);
+
+  /**
+   * Copy the selection to the clipboard slot.
+   *
+   * The system clipboard is not used on purpose: it would need a permission the browser
+   * withholds until a real user gesture, and the paste then fails silently. An in-tab slot
+   * cannot be read by the page the user is about to visit, which is the trade this screen
+   * wants — a workflow graph is not something you paste into a text field.
+   */
+  const copySelection = useCallback(() => {
+    const wanted = selectionRef.current.size > 0 ? selectionRef.current : new Set(selected ? [selected] : []);
+    const chosen = nodes.filter((node) => wanted.has(node.id));
+    if (chosen.length === 0) {
+      return;
+    }
+    const ids = new Set(chosen.map((node) => node.id));
+    clipboardRef.current = {
+      nodes: chosen.map((node) => ({ ...node, position: { ...node.position }, params: { ...node.params } })),
+      // Only the edges *within* the selection survive: an edge to a node that was not copied
+      // would dangle, and validation would then refuse the whole pasted graph.
+      edges: edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)),
+    };
+    setClipboardCount(clipboardRef.current.nodes.length);
+  }, [edges, nodes, selected]);
+
+  const pasteClipboard = useCallback(() => {
+    const source = clipboardRef.current;
+    if (source.nodes.length === 0) {
+      return;
+    }
+    const before = currentSnapshot();
+    // A fresh id per pasted node, mapped from the old one so the internal edges still connect.
+    const remap = new Map<string, string>();
+    const nextNodes = [...nodes];
+    for (const node of source.nodes) {
+      const fresh = uniqueId(node.type, nextNodes);
+      remap.set(node.id, fresh);
+      nextNodes.push({
+        ...node,
+        id: fresh,
+        position: {
+          x: clampCoord(snap(node.position.x + GRID * 4)),
+          y: clampCoord(snap(node.position.y + GRID * 4)),
+        },
+        params: { ...node.params },
+      });
+    }
+    const nextEdges = [...edges];
+    for (const edge of source.edges) {
+      const source_id = remap.get(edge.source);
+      const target_id = remap.get(edge.target);
+      if (!source_id || !target_id) {
+        continue;
+      }
+      nextEdges.push({
+        id: uniqueEdgeId(nextEdges),
+        source: source_id,
+        source_port: edge.source_port,
+        target: target_id,
+      });
+    }
+    commit("paste", before, nextNodes, nextEdges);
+    const first = [...remap.values()][0];
+    setSelected(first ?? null);
+    if (first) {
+      selectionRef.current = new Set([first]);
+    }
+  }, [commit, currentSnapshot, edges, nodes]);
 
   const moveNode = useCallback(
     (id: string, x: number, y: number) => {
