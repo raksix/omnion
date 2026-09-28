@@ -527,6 +527,20 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Ask the CRM copilot to summarize a deal or draft a follow-up",
     },
+    // The form → lead ingress. Reading the log of submissions that arrived and deciding what a
+    // submission becomes are separate decisions with separate consequences, so they are separate
+    // keys: a role that watches the pipeline fill up should not be able to silence it, and the
+    // person who configures routing is rarely the person who reads it.
+    PermissionDef {
+        key: "crm.leads.read",
+        category: "crm",
+        description: "Read the CRM lead inbox: form submissions and what became of them",
+    },
+    PermissionDef {
+        key: "crm.leads.manage",
+        category: "crm",
+        description: "Configure form → lead routing and run the ingress drain",
+    },
 ];
 
 /// Look a permission up by key.
@@ -740,6 +754,11 @@ mod tests {
             "crm.deals.update",
             "crm.deals.delete",
             "crm.pipelines.manage",
+            "crm.activities.read",
+            "crm.activities.create",
+            "crm.copilot.use",
+            "crm.leads.read",
+            "crm.leads.manage",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),

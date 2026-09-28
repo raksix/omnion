@@ -90,6 +90,7 @@ pub mod crm;
 pub mod crm_activities;
 pub mod crm_copilot;
 pub mod crm_deals;
+pub mod crm_leads;
 pub mod crm_views;
 pub mod health;
 pub mod iam;
@@ -862,7 +863,26 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "crm.copilot.use"));
 
+    // The form → lead ingress (slice 4 part seven). Two keys and not one: **reading** the log of
+    // submissions that arrived and **deciding what a submission becomes** are separate decisions
+    // with separate consequences, and a role that can silence the pipeline should not be the
+    // same role that merely watches it fill up. The settings route is a `GET` *and* a `PUT` on
+    // one path, split by method into two layers so the read does not need the manage key.
+    let crm_leads_read = Router::new()
+        .route("/crm/leads", get(crm_leads::list_leads))
+        .route_layer(guards::require(&state, "crm.leads.read"));
+
+    let crm_leads_manage = Router::new()
+        .route(
+            "/crm/leads/settings",
+            get(crm_leads::get_lead_settings).put(crm_leads::update_lead_settings),
+        )
+        .route("/crm/leads/drain", post(crm_leads::drain_now))
+        .route_layer(guards::require(&state, "crm.leads.manage"));
+
     let crm = crm_read
+        .merge(crm_leads_read)
+        .merge(crm_leads_manage)
         .merge(crm_activities_read)
         .merge(crm_activities_create)
         .merge(crm_copilot)

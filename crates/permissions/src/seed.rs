@@ -126,6 +126,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "crm.activities.read",
             "crm.activities.create",
             "crm.copilot.use",
+            "crm.leads.read",
+            "crm.leads.manage",
         ]),
     },
     BaseRole {

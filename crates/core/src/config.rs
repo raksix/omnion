@@ -73,6 +73,15 @@ pub const DEFAULT_AUTOMATION_BATCH: usize = 100;
 /// Default delay between two search-indexer ticks (`OMNION_SEARCH_POLL_MS`).
 pub const DEFAULT_SEARCH_POLL_MS: u64 = 2_000;
 
+/// Default delay between two form → lead drain ticks (`OMNION_LEAD_POLL_MS`).
+///
+/// Longer than the search indexer's on purpose: a submission is read by a person, not indexed
+/// for a keystroke, and the drain *writes* two rows per submission — a contact and a deal.
+pub const DEFAULT_LEAD_POLL_MS: u64 = 5_000;
+
+/// Default number of submissions one drain tick files (`OMNION_LEAD_BATCH`).
+pub const DEFAULT_LEAD_BATCH: usize = 100;
+
 /// Default number of events one search-indexer tick applies (`OMNION_SEARCH_BATCH`).
 pub const DEFAULT_SEARCH_BATCH: usize = 200;
 
@@ -377,6 +386,31 @@ impl Default for AutomationConfig {
     }
 }
 
+/// CRM lead-ingress knobs (docs/requests/REQ-051 slice 4, REQ-117): the background task that
+/// turns `form.submitted` into contacts and deals.
+///
+/// It is here, in the core config, rather than in the module because the *process* decides
+/// whether the loop runs; the module decides what one submission becomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrmConfig {
+    /// Whether this process drains the ingress (`OMNION_LEAD_RUNNER`).
+    pub lead_runner_enabled: bool,
+    /// Delay between two drain ticks (`OMNION_LEAD_POLL_MS`).
+    pub lead_poll_ms: u64,
+    /// Submissions one tick may file (`OMNION_LEAD_BATCH`).
+    pub lead_batch: usize,
+}
+
+impl Default for CrmConfig {
+    fn default() -> Self {
+        Self {
+            lead_runner_enabled: true,
+            lead_poll_ms: DEFAULT_LEAD_POLL_MS,
+            lead_batch: DEFAULT_LEAD_BATCH,
+        }
+    }
+}
+
 /// Search indexer knobs (docs/requests/REQ-002): the background task that applies the event
 /// bus to the search index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +558,8 @@ pub struct Config {
     pub automation: AutomationConfig,
     /// Search indexer knobs (REQ-002).
     pub search: SearchConfig,
+    /// CRM lead-ingress knobs (REQ-051 slice 4, REQ-117).
+    pub crm: CrmConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
     /// Email settings of the `send_email` action (P13).
@@ -674,6 +710,12 @@ impl Config {
             batch: read_count(&read, "OMNION_AUTOMATION_BATCH", DEFAULT_AUTOMATION_BATCH)?,
         };
 
+        let crm = CrmConfig {
+            lead_runner_enabled: read_flag(&read, "OMNION_LEAD_RUNNER", true)?,
+            lead_poll_ms: read_positive(&read, "OMNION_LEAD_POLL_MS", DEFAULT_LEAD_POLL_MS)?,
+            lead_batch: read_count(&read, "OMNION_LEAD_BATCH", DEFAULT_LEAD_BATCH)?,
+        };
+
         let search = SearchConfig {
             runner_enabled: read_flag(&read, "OMNION_SEARCH_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_SEARCH_POLL_MS", DEFAULT_SEARCH_POLL_MS)?,
@@ -710,6 +752,7 @@ impl Config {
             events,
             automation,
             search,
+            crm,
             analytics,
             mail,
             log,
@@ -748,6 +791,7 @@ impl Default for Config {
             events: EventsConfig::default(),
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
+            crm: CrmConfig::default(),
             analytics: AnalyticsConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),

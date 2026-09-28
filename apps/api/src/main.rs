@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+    analytics_runner, automation_runner, event_runner, lead_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -104,6 +105,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _matcher = automation_runner::spawn(state.clone());
     } else {
         tracing::info!("the automation matcher is disabled (OMNION_AUTOMATION_RUNNER=false)");
+    }
+
+    // The CRM lead drain reads the bus in this process too (REQ-051 slice 4, REQ-117): each
+    // tick turns the `form.submitted` events above its cursor into a contact and a deal. The
+    // producer is the forms module (REQ-064); the contract is the event name, not a table, so
+    // the CRM does not need the form builder to exist to be correct about what it receives.
+    if state.config().crm.lead_runner_enabled {
+        let _leads = lead_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the CRM lead drain is disabled (OMNION_LEAD_RUNNER=false)");
     }
 
     // The search indexer applies the bus to the search index in this process (REQ-002): each
