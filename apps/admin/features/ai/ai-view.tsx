@@ -1050,27 +1050,49 @@ export function AiView() {
                     >
                       Models
                     </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `Remove ${provider.name} and the models it serves? AI features that point at it stop working.`,
-                          )
-                        ) {
-                          void run(
-                            () => removeAiProvider(provider.id),
-                            `${provider.name} removed.`,
-                          );
-                        }
-                      }}
-                      data-provider-remove={provider.name}
-                      className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-caution transition hover:bg-caution-soft disabled:opacity-60"
-                    >
-                      <Trash2 className="size-3" aria-hidden />
-                      Remove
-                    </button>
+                    {/* The default provider is not removable, and the button says so instead of
+                        failing: a control that refuses with a reason is a control the operator
+                        can act on, a dead one is not. The API refuses it too — this only spares
+                        the round trip and says which provider to move first. */}
+                    {provider.is_default ? (
+                      <span className="flex flex-col items-start gap-1">
+                        <button
+                          type="button"
+                          disabled
+                          data-provider-remove-guard={provider.name}
+                          title="Make another provider the default before removing this one."
+                          className="flex cursor-not-allowed items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-muted opacity-70"
+                        >
+                          <Trash2 className="size-3" aria-hidden />
+                          Remove
+                        </button>
+                        <span className="max-w-[13rem] text-[11px] text-muted">
+                          This is the default. Make another provider the default first.
+                        </span>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Remove ${provider.name} and the models it serves? AI features that point at it stop working.`,
+                            )
+                          ) {
+                            void run(
+                              () => removeAiProvider(provider.id),
+                              `${provider.name} removed.`,
+                            );
+                          }
+                        }}
+                        data-provider-remove={provider.name}
+                        className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-caution transition hover:bg-caution-soft disabled:opacity-60"
+                      >
+                        <Trash2 className="size-3" aria-hidden />
+                        Remove
+                      </button>
+                    )}
                   </span>
                 </div>
                 <p className="font-mono text-[11.5px] break-all text-muted">{provider.base_url}</p>
