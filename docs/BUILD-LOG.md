@@ -2528,3 +2528,69 @@ bundle has a contract to import against.
 queue publish, W3C `traceparent` propagation, parent-based sampling with the error bias, and the
 bounded exporter buffers with `omnion_exporter_dropped_total`.
 
+
+## 2026-09-28 · REQ-126 slice 3 — the trace index, W3C propagation and the exporter pipeline
+
+**What.** A request now produces a tree of spans. `crates/telemetry::tracing_span` owns the model
+and the propagation: a strict `traceparent` parser, a parent-based sampling decision with an error
+bias, and a `TraceRecord` that folds spans under a cap and says so when the cap bit.
+`tracing_spine` owns the plumbing — the root span is started at the edge, the guard writes the whole
+trace once, and the SQLx / queue-publish / AI helpers hang off the task-local. `trace_store` persists
+and searches. `exporter` is the pipeline: a bounded drop-oldest ring per exporter, a health chip
+derived from the failure counter, and a `Test` probe that really sends.
+
+The consumer link is a column (`webhook_deliveries.trace_context`), written at enqueue. The
+producer and the consumer are different processes, possibly minutes apart, and the link cannot be
+reconstructed after the fact — which is why it is stored on the job row and not inferred.
+
+**Proof.**
+- `cargo test -p omnion-telemetry` → **91 passed, 0 failed** (30 new).
+- `cargo test -p omnion-api --test observability_traces` → **8 passed, 0 failed** against
+  `omnion_w6_dev`: the request-id walk, the consumer link round-tripped through the jsonb column,
+  the 5xx-at-ratio-0.0 error bias, the exporter drop counter, the span redaction, the span cap, the
+  permission split and the filter validation.
+- Regression: `observability_logs` 3/3, `observability_metrics` 11/11, `secret_audit` 2/2.
+- `pnpm typecheck` → 2/2. Migration 0040 applies on a fresh database; verified against
+  `omnion_w6_dev` after a drop-and-recreate.
+
+**Four defects the walk found, all of them mine.**
+
+1. **An all-zero span id is invalid, and the parser accepted it.** W3C declares it invalid for the
+   same reason it does for the trace id: it is the value that means "no span". A header carrying it
+   has said nothing, and accepting it produces a parent that joins to nothing.
+2. **The forward-compatibility rule was implemented backwards.** The 55-character cap and the
+   extra-field refusal applied to *every* version, so a future version's extra fields — exactly the
+   headers W3C's rule exists to allow — were rejected. Both now apply only to a known version.
+3. **FNV-1a has no spread where the test looked.** Sampling 1000 sequential request ids at a ratio
+   of 0.5 sampled **1000 of 1000**: the entropy sits in the high bits after the final multiply and a
+   sequential uuid differs only in its last byte. The finalizer is now splitmix64's, and the test
+   asserts the *range* rather than a single outcome.
+4. **`on conflict` did not refresh the request id.** A consumer process appends its spans to a
+   trace the producer opened; without the update the first request id stayed on the row forever, so a
+   request-id search missed a trace that genuinely was that request's — the one lookup the screen
+   exists for. This is the slice-4 "an id inside a JSON blob is not an id" lesson again, one level
+   up: an id in a row is not an id either, unless the row is updated when the answer changes.
+
+**Two test bugs, both of which would have taught the next reader to distrust the assertion.**
+`f64::from(u64)` does not exist, and the fix was a cast — but the *first* version of the spread
+test asserted a single outcome and passed on a correct hash, so the ratio was never actually under
+test until the assertion described a range. And the first exporter test used the process-global
+collector: a drop counter is cumulative, so the assertion would have depended on which test ran
+first. It uses a private one now.
+
+**A test whose premise contradicted the feature.** The request-id walk asserted that its own
+request would be in the index — and at the documented default ratio of 0.1, nine requests in ten
+are correctly *not* indexed. The walk was asserting the opposite of the sampling policy it was
+named after, and the "bug" it found was the policy working. The ratio is now a runtime setting the
+edge reads (the middleware was pinned to the compile-time default, so a settings save would have
+been ignored by every request) and the test forces it, restoring the previous value afterwards.
+
+**Not in this slice, and said so in the request file rather than ticked:** the `/observability/traces`
+and `/observability/exporters` screens, the flush loop that drains the buffers on `batch_ms`, and the
+OTLP/syslog transport — which arrives with the `infra/observability/` bundle in slice 4, because the
+collector example and the exporter configuration ship together and neither is testable alone.
+
+**Next.** REQ-126 slice 4 — graceful shutdown and the probe contract, the alert-rule evaluator with
+silences and notifications, the settings screen, and the `infra/observability/` bundle (Grafana
+dashboards, Prometheus rules, the collector example) whose mapping the now-fixed metric families
+give it a contract to import against.
