@@ -1536,6 +1536,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-module-crm-intake"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-notifications"
 version = "0.1.0"
 dependencies = [
