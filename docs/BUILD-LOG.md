@@ -2630,3 +2630,45 @@
   Settings/Modules/Billing/Audit tabs is still unproven. Both are blocked on the
   same thing: **run the pass when `/mnt/apopic` has real headroom and few sibling
   passes.** Then REQ-005 closes and the queue moves to REQ-011 (CDN/edge).
+
+## 2026-09-28 — The three "pre-existing" failures, and two product defects behind them
+
+- **What shipped.** `bd53c2f` (three invitation-path defects), `e2a711c` (the panel follows
+  the new preview contract) and `00e36fb` (three walks driving the API the way a person
+  would). The suite is **29 passed / 0 failed**, up from 26/3 — no walk was deleted or
+  skipped, and the 3 were not interference.
+- **They were not one bug.** Run alone with `--test-threads=1`, each failed for its own
+  reason, and reading the *status it actually got* is what found them:
+  `202` (not `201`), `415` (not `409`), and a trail missing a row nobody wrote.
+  - **A bodyless accept was a `415`.** `accept_invitation` took `Json<AcceptInvitationRequest>`
+    and axum refuses a bodyless POST in the extractor, so the ceiling and queue checks — both
+    *inside* the handler, one line apart — were never reached. The panel sends `{}`; a signed-in
+    member has nothing to say. Body is now `Option<Json<…>>` + `Default`.
+  - **A queued accept was a `500`.** `IdentityError::InvitationAwaitingApproval` had no arm in
+    the HTTP mapping and fell through to `internal_error`: the invitee was told the platform was
+    broken, and sent back to the manager who cannot fix it. Now `409 invitation_awaiting_approval`.
+  - **The preview was a token oracle.** Its own doc comment promised that an unusable token
+    answers with the same shape and `usable: false`; the code answered `404` for an unknown one
+    and `200` naming the organization for a queued one. A leaked or guessed token could
+    therefore map which organizations exist — the exact thing the endpoint exists to prevent. An
+    unknown token is now `200` with the same body, `usable: false` and one coarse `reason`
+    (`"unusable"`, never `"queued"`/`"expired"` — "why" is the question a token-walker is asking).
+- **Two walks were asking the wrong question.** The ceiling walk inherited the invite policy
+  instead of choosing one, so migration `0038`'s `default 'owner_approval'` queued the invite and
+  the walk blamed the seat ceiling for a refusal it never reached. The audit walk wrote settings
+  **straight to the store**, bypassing the route whose `omnion_audit::record` is the very thing
+  under test, then asserted the row was in the trail — the trail was right; no settings change
+  had ever gone through the product. Its cross-tenant check was weaker still: the other
+  administrator held no `audit.read` anywhere, so the guard answered `403` before the handler
+  resolved the tenant and the assertion proved nothing about isolation. Granted the permission in
+  *their own* tenant, the `404` is what a real auditor gets.
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **29 passed /
+  0 failed** (257 s). `cargo test -p omnion-api --lib` → **134 passed / 0 failed**.
+  `tsc --noEmit` in `apps/admin` exits 0. Tree clean, `wave5` pushed to `00e36fb`.
+- **Environment.** `/mnt/apopic` opened at 95 % with 8 sibling `qa/run.sh` processes, so the
+  build moved to `CARGO_TARGET_DIR=/dev/shm/w5-target` (mine, 2.2 G of the 32 G tmpfs) with
+  `CARGO_INCREMENTAL=0` — reclaiming my own disk to build on a box that has none was not available.
+- **Next.** The only unticked criterion (line 222) is still the whole-workspace gate plus the QA
+  walkthrough, and the 390×844 mobile pass over the member drawer is still unproven. Both need
+  `/mnt/apopic` headroom and few sibling passes. Then REQ-005 closes and the queue moves to
+  REQ-011 (CDN/edge).
