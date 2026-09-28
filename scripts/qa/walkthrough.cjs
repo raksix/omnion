@@ -1343,6 +1343,14 @@ async function runAiProviderDepth(page, report) {
         "the routing section did not render on /ai, so no route was configured or previewed",
       );
     } else {
+      for (const row of routing.tasks) {
+        if (row.candidates === 0 && row.primary === 0) {
+          aiStateFindings.push(
+            `the ${row.task} route row has neither a candidate nor a primary control, so it \
+cannot be configured at all`,
+          );
+        }
+      }
       if (routing.tasks.length !== 7) {
         aiStateFindings.push(
           `the routing screen rendered ${routing.tasks.length} task rows instead of all seven`,
@@ -1555,6 +1563,10 @@ async function exerciseRouting(page) {
         task: node.getAttribute("data-routing-task") ?? "",
         inherited: node.getAttribute("data-routing-inherited") === "true",
         candidates: node.querySelectorAll("[data-routing-candidate]").length,
+        // The primary control is counted separately from the candidate selects: on a fresh
+        // install the chain is empty, so "this row has no way to be configured" is a dead
+        // control and the two must not be counted as one number.
+        primary: node.querySelectorAll("[data-routing-primary]").length,
         selects: node.querySelectorAll("select").length,
         save: node.querySelectorAll("button").length,
       })),
@@ -1572,8 +1584,14 @@ async function exerciseRouting(page) {
   await shot(page, "ai-routing-tasks");
 
   // Set a primary for `cheap`, then ask the dry run what that request would do.
+  //
+  // The selector is `[data-routing-primary]`, not "the first select in the row": on a fresh
+  // install the chain is empty, and the empty state is what renders the control. Targeting the
+  // candidate list instead found nothing, the save never fired, and the pass reported "the save
+  // did not take effect" — a finding about a screen that was working, caused by the walkthrough
+  // looking for a control that only exists in the *configured* state.
   const saved = await page
-    .locator('[data-routing-task="cheap"] select')
+    .locator('[data-routing-task="cheap"] [data-routing-primary]')
     .first()
     .selectOption({ index: 1 })
     .catch(() => null);

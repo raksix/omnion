@@ -225,9 +225,40 @@ function TaskRow({
       </header>
 
       {draft.length === 0 ? (
-        <p className="mt-3 text-[12.5px] text-muted">
-          No primary model. This task falls through to the installation default.
-        </p>
+        /* An empty chain still needs a control. Without one, "set a primary" is impossible on a
+           fresh install: the only way to get a select is to already have a candidate, which is
+           the state the operator is trying to leave. The empty state therefore carries the
+           same primary select the chain renders, so the first step of configuring a task is the
+           same action as every step after it. */
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            aria-label={`${row.task} primary model`}
+            data-routing-primary
+            value=""
+            disabled={!canWrite}
+            onChange={(event) => {
+              if (!event.target.value) return;
+              update([{ modelId: event.target.value, requirements: [] }]);
+            }}
+            className="rounded-md border border-line bg-surface px-2 py-1.5 text-[12.5px]"
+          >
+            <option value="">Choose a primary model…</option>
+            {models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.model_key}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            data-routing-clear
+            onClick={onClear}
+            disabled={!canWrite}
+            className="rounded-md border border-line px-2 py-1.5 text-[12.5px] hover:bg-canvas disabled:opacity-50"
+          >
+            Reset to inherited
+          </button>
+        </div>
       ) : (
         <ul className="mt-3 space-y-1.5">
           {draft.map((entry, index) => {
@@ -460,7 +491,7 @@ function PreviewPanel({
         type="button"
         onClick={run}
         disabled={busy || (!task && !feature)}
-        className="mt-3 inline-flex items-center gap-1.5 rounded bg-accent px-2.5 py-1.5 text-[12.5px] text-accent-fg disabled:opacity-40"
+        className="mt-3 inline-flex items-center gap-1.5 rounded bg-accent px-2.5 py-1.5 text-[12.5px] font-medium text-white disabled:opacity-40"
       >
         {busy ? <Loader2 size={13} className="animate-spin" /> : null}
         {busy ? "Resolving…" : "Resolve"}
