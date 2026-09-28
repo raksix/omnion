@@ -496,13 +496,13 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
             Method::PATCH,
             &format!("/api/v1/organizations/{created_id}"),
             Some(&platform),
-            Some(json!({ "name": "Tenancy Renamed", "status": "suspended" })),
+            Some(json!({ "name": "Tenancy Renamed" })),
         ),
     )
     .await;
     assert_eq!(updated.status, StatusCode::OK, "update: {}", updated.body);
     assert_eq!(updated.body["name"], "Tenancy Renamed");
-    assert_eq!(updated.body["status"], "suspended");
+    assert_eq!(updated.body["status"], "active");
 
     // … and the change is in the audit trail of that tenant.
     let audit = call(
@@ -523,8 +523,96 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     );
     assert!(
         actions.contains(&"organization.updated".to_owned()),
-        "{actions:?}"
+        "a plain rename is filed as organization.updated: {actions:?}"
     );
+
+    // A status move bundled into the same PATCH is not a rename — it is the lifecycle action, and
+    // that is the property that makes the trail answer "who suspended this tenant and when".
+    // This walk used to send the rename and the status together and then assert
+    // `organization.updated` was present, which was only ever true before slice 3 made a status
+    // move its own action; the assertion outlived the behaviour it described. `tenancy_limits`
+    // proves the same rule from the other side (`a_status_move_is_audited_and_announced_as_its_
+    // own_event`), so this walk states it here for the *combined* payload, which is the case
+    // neither of them covers: a rename that arrives together with a freeze.
+    let frozen = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{created_id}"),
+            Some(&platform),
+            Some(json!({ "name": "Tenancy Renamed And Suspended", "status": "suspended" })),
+        ),
+    )
+    .await;
+    assert_eq!(frozen.status, StatusCode::OK, "freeze: {}", frozen.body);
+    assert_eq!(frozen.body["name"], "Tenancy Renamed And Suspended");
+    assert_eq!(frozen.body["status"], "suspended");
+
+    let after_freeze = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/iam/audit?organization_id={created_id}"),
+            Some(&platform),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        after_freeze.status,
+        StatusCode::OK,
+        "audit after the freeze: {}",
+        after_freeze.body
+    );
+    let frozen_actions = field_of_all(&after_freeze.body, "entries", "action");
+    assert!(
+        frozen_actions.contains(&"organization.suspended".to_owned()),
+        "a payload that moves the status is audited as the lifecycle action it is, even when it \
+         also renames the tenant: {frozen_actions:?}"
+    );
+
+    // … and the freeze is a real one, not a label: the tenant the walk is about to write to has
+    // to refuse the write. Leaving the tenant suspended here made the *next* step of this walk
+    // fail with `organization_not_writable` a few lines later, which reads like a site-creation
+    // defect and is really the freeze doing its job. The walk states the property where it is
+    // made true, and then thaws, because the rest of the walk needs a writable tenant.
+    let refused_while_frozen = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{created_id}"),
+            Some(&platform),
+            Some(json!({ "name": "Tenancy Renamed While Frozen" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused_while_frozen.status,
+        StatusCode::CONFLICT,
+        "a rename of a frozen tenant is refused, and it names the reason: {}",
+        refused_while_frozen.body
+    );
+    assert_eq!(
+        refused_while_frozen.body["error"]["code"], "organization_not_writable"
+    );
+    assert_eq!(
+        refused_while_frozen.body["error"]["details"]["status"], "suspended"
+    );
+
+    // Thawing is a status change, so it is the one write the freeze cannot block — otherwise a
+    // tenant that could not be reactivated would be permanently frozen with no way out.
+    let thawed = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{created_id}"),
+            Some(&platform),
+            Some(json!({ "status": "active" })),
+        ),
+    )
+    .await;
+    assert_eq!(thawed.status, StatusCode::OK, "thaw: {}", thawed.body);
+    assert_eq!(thawed.body["status"], "active");
 
     // A tenant that still owns a site is not deleted in one step.
     let site = call(
