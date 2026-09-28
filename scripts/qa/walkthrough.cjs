@@ -3430,6 +3430,36 @@ async function main() {
     process.exit(2);
   }
 
+  // A pass that loses its stack must say so.
+  //
+  // The stack is disposable: every `run.sh` starts it, and anything on the box that restarts
+  // pm2 (a sibling's pass, a `pm2 save`/`resurrect`, a reboot) can SIGINT it while this
+  // walkthrough is twenty minutes in. Every navigation after that lands on
+  // `chrome-error://chromewebdata/`, every click is "ok" because clicking an error page
+  // cannot fail, and the roll-up reports a confident list of console errors, failed requests
+  // and empty screens — all of them artifacts of the dead server, none of them a product
+  // defect. That is the worst possible outcome for a gate: it looks like a red pass and it
+  // is really a dead server, so the next tick goes and "fixes" a screen that was fine.
+  //
+  // The check is the cheap one — is the admin origin answering? — taken at the end of the
+  // pass, next to the roll-up, so the cost is one request and the answer is unambiguous.
+  // A pass whose stack died reports `fatal: the QA stack stopped answering` and exits
+  // non-zero, which is the opposite of a red pass: it is a no-result run, and a no-result
+  // run is re-run rather than acted on.
+  const stackGone = async () => {
+    try {
+      const res = await context.request.get(`${URL_ADMIN}/login`, { timeout: 8000 });
+      return !res || res.status() >= 500;
+    } catch {
+      return true;
+    }
+  };
+  report.assertStackAlive = async () => {
+    if (await stackGone()) {
+      throw new Error("stack-gone: the QA stack stopped answering mid-pass; every finding after that point is a dead server, not a product defect");
+    }
+  };
+
   await runWizard(page, report);
 
   // `--only=wizard` re-checks the first-run flow on its own (reset the database first): it drives
@@ -3445,6 +3475,18 @@ async function main() {
   if (only && DEPTH_PASSES[only]) {
     await ensureSignedIn(page, report);
     await DEPTH_PASSES[only](page, report);
+    // The depth passes are the ones a REQ close depends on, so the stack check matters most
+    // here: a pass that lost its stack halfway through a depth pass produces a *confident*
+    // report (`rows: 0`, `listsTheCreate: false`) that reads exactly like a broken screen.
+    if (await stackGone()) {
+      fs.writeFileSync(
+        path.join(OUT, "summary.json"),
+        JSON.stringify({ only, fatal: "stack-gone: the QA stack stopped answering mid-pass; this pass proved nothing", ...report, netFailures }, null, 2),
+      );
+      console.error("[walk] FATAL: the QA stack stopped answering mid-pass — re-run, do not act on this report");
+      await browser.close();
+      process.exit(4);
+    }
     fs.writeFileSync(
       path.join(OUT, "summary.json"),
       JSON.stringify({ only, ...report, netFailures, netExpected, onboardingFailures: netFailures.filter((f) => String(f.url || "").includes("/onboarding/")) }, null, 2),
@@ -3956,7 +3998,22 @@ async function main() {
   md.push("## Screenshots");
   for (const s of shots) md.push(`- ${s.name} — \`${s.file.replace(OUT + "/", "")}\` (${Math.round(s.bytes / 1024)} KB)`);
   md.push("");
-  fs.writeFileSync(path.join(OUT, "report.md"), md.join("\n"));
+
+  // The gate the whole pass exists to feed, asked last: is the stack still there? A pass that
+  // lost it has no findings worth reading, so it is reported as a no-result run and exits
+  // non-zero — the caller re-runs it instead of "fixing" dead-server artifacts.
+  const alive = !(await stackGone());
+  summary.stackAliveAtEnd = alive;
+  if (!alive) {
+    summary.fatal = "stack-gone: the QA stack stopped answering mid-pass; findings from this run are not product defects";
+    fs.writeFileSync(path.join(OUT, "report.md"), `${md.join("\n")}\n\n## FATAL — the QA stack stopped answering mid-pass\n\nEvery finding above this line was recorded against a server that was no longer running.\nRe-run the pass; do not act on this report.\n`);
+    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 2));
+    log("FATAL: the QA stack stopped answering mid-pass — this run reports nothing usable");
+    console.log(`QA_STACK_GONE=1 QA_FINDINGS=0 QA_CLICKS=${clicks.length}`);
+    await browser.close();
+    process.exit(4);
+  }
+  fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 2));
 
   log(`done: ${findings.length} findings (high ${bySeverity.high}), ${clicks.length} clicks, ${shots.length} shots`);
   console.log(`QA_OUT=${OUT}`);
