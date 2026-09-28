@@ -22,6 +22,8 @@ const fs = require("fs");
 
 const NODE_PATH = process.env.NODE_PATH || "/root/test-hermes/node_modules";
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
+// 3105 is this wave's PRIVATE stack (invariant 2). The default is deliberately not the main
+// writer's 3100: a driver that reached it would be measuring someone else's build.
 const ADMIN = process.env.QA_ADMIN_URL || `http://127.0.0.1:${process.env.QA_ADMIN_PORT || 3105}`;
 const OUT = path.resolve(
   process.env.QA_DEPTH_OUT ||
@@ -36,6 +38,13 @@ async function main() {
   // same place, which is how the steps survive a crash.
   process.env.QA_OUT = OUT;
   process.argv.push("--out", OUT);
+  // The walk reads its base URLs from its OWN CLI flags, not from the environment, so the flag
+  // has to be pushed before the require. Without this the driver silently talks to whatever is on
+  // the DEFAULT port - for this wave that is the main writer's stack, the one thing a per-stack
+  // pass must never touch. The first run of this driver proved it: it signed in successfully
+  // against :3100 and then timed out on a selector that does not exist there, which reads like a
+  // broken screen and is a driver pointed at the wrong build.
+  process.argv.push("--url", ADMIN);
 
   const { chromium } = require(path.join(NODE_PATH, "playwright-core"));
   const walk = require("./walkthrough.cjs");
