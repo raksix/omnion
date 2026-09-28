@@ -1037,16 +1037,19 @@ export type CdnSettingsInput = {
   max_attempts?: number;
 };
 
-/** One shipped provider adapter, as the catalogue describes it. */
+/**
+ * One shipped provider adapter, as the catalogue describes it.
+ *
+ * The list contains only adapters that are actually implemented: an adapter that is listed
+ * but not shipped is a dead button, and the whole point of the catalogue is that choosing
+ * from it is a real choice.
+ */
 export type CdnAdapterInfo = {
   key: string;
-  name: string;
+  label: string;
   /** One line saying what the adapter actually does, in the adapter's own terms. */
   description: string;
-  /** Fields the adapter needs before it can work; empty for `origin`. */
-  config_fields: { name: string; label: string; required: boolean; write_only: boolean }[];
-  /** Whether the adapter can invalidate by surrogate key rather than by URL. */
-  supports_tags: boolean;
-  /** Whether the adapter can invalidate its whole zone in one call. */
-  supports_zone_purge: boolean;
+  needs_endpoint: boolean;
+  needs_zone: boolean;
+  needs_credential: boolean;
 };

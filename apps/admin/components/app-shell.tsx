@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, ListOrdered, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
+import { BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -32,7 +32,10 @@ const NAV: readonly NavItem[] = [
   { href: "/media", label: "Media", icon: Images, module: "media" },
   { href: "/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
   { href: "/notifications", label: "Notifications", icon: Bell },
-  { href: "/cdn/rules", label: "CDN rules", icon: ListOrdered },
+  // Exact-match only: `/cdn` is the overview and `/cdn/rules` is a different screen, so the
+  // overview would otherwise light up for the whole section and the active entry would be
+  // whichever the reader happened to be furthest from.
+  { href: "/cdn", label: "CDN", icon: Gauge },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
   { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },
@@ -54,7 +57,7 @@ const NAV: readonly NavItem[] = [
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
-const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam"]);
+const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam", "/cdn"]);
 
 /** `true` when a navigation entry belongs to the screen that is open. */
 function isActive(href: string, pathname: string): boolean {

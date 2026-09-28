@@ -5223,7 +5223,11 @@ async function main() {
     // The cache rules (REQ-011, slice 1) — walked here and driven by the depth pass below,
     // which creates a rule, watches the live match tester answer both ways, submits a TTL
     // above the cap to capture the field error, reorders the table and deletes what it made.
+    // The overview and the settings screen are walked for the same reason: a screen that is
+    // reachable only by clicking is a screen that is never visited.
+    { path: "/cdn", name: "cdn-overview" },
     { path: "/cdn/rules", name: "cdn-rules" },
+    { path: "/cdn/settings", name: "cdn-settings" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
