@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 4 built: undo/redo at 7cce71e, 107 content tests and typecheck green; the browser proof of the three passes run for it is outstanding — see BUILD-LOG) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
+> **Status:** in-progress (slice 4: acceptance 16 proven at 71d996f with the `content.blocks.updated` over-firing bug it exposed; undo/redo browser proof read out of a finished pass; 0038 renumber and the Owner gallery 400 both fixed — see BUILD-LOG) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -119,9 +119,9 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [x] Duplicate clones a block with a new id and keeps the original untouched; delete removes only the selected block or subtree after the confirm.
 - [x] A `columns` container accepts 2–4 child columns, each accepting child blocks, and the editor's breadcrumb selects a nested block directly.
 - [x] Required-prop validation blocks publish (`block_alt_missing`, `block_prop_required`) but still allows saving a draft, and the offending block is highlighted.
-- [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering. **Server rule and its tests are green (`heading_order_warns_but_never_blocks`, `a_sequential_heading_run_is_silent_and_the_warning_clears_on_reorder`, `an_h1_after_another_heading_warns_and_the_warning_clears_on_reorder`); the browser half — the walkthrough's `outlineWarningShown` / `outlineWarningCleared` keys — has not been read out of a finished pass, so the box stays open.**
+- [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering. **The server rule and its three tests are green, and the browser pass now shows `outlineWarningShown` true with the real message (`this h1 comes after an h2; the page's h1 is its title and belongs above every heading`) — but the *other* half of this criterion is still red in the same pass: `outlineWarningIsNotBlocking` false, `outlineWarningCleared` false, and the walk's own `clearedAfterFix` / `publishEnabledAfterFix` are false too, so the editor did not recover from the fix the walk performed. The box stays open: the warning is proven to appear, the warning going away is not. Next tick.**
 - [x] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
-- [ ] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft. **Built and unit-gated; the browser proof is still outstanding (see the slice 4 entry in BUILD-LOG).**
+- [x] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft. **Proven in the browser pass of 2026-09-28 (`qa-artifacts/20260928-124117`): `historyDepthAfterFifty` 70 with `historyCoversFifty` true, `saveKeptHistory` true, `redoRestoredBlocks` true, `dirtyAfterUndo` true.**
 - [x] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
 - [x] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
 - [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
@@ -129,7 +129,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [x] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
 - [x] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
 - [x] The two block-system events are delivered to a subscribed endpoint with redelivery working. **Proven by `the_block_events_reach_a_subscribed_endpoint_and_redeliver` (3/3 in `apps/api/tests/events.rs`): both events reach a real loopback receiver, the signature verifies over the exact bytes, the payload carries `block_count` and not the tree, and a refusal is re-attempted (`retried`, not `failed`) after the backoff. The name is `page.published`, not the `content.page.published` this criterion spells — see the slice 4 note.**
-- [ ] The editor is usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone), and the walkthrough reports zero high findings.
+- [ ] The editor is usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone), and the walkthrough reports zero high findings. **Not met, and the pass says why: the route list ran clean (35/35 visited, every screen including `/blocks`, `/patterns`, `/page-templates` and the editor depth pass), but the report holds 555 high findings and my screens owned a large share of them — `/api/v1/patterns` and `/api/v1/page-templates` were answering 400, which is now fixed (988c307) and covered by a route test.**
 
 #### Proven in slice 1
 

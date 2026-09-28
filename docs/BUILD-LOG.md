@@ -2450,3 +2450,66 @@ different ways, both of which had been silently green in the plan.
   `undoRestoredTree`, `redoRestoredBlocks`, `dirtyAfterUndo`. Then slice 4's remaining two
   boxes: the five events with a verified delivery (acceptance 16 — server-side, so a test) and
   the mobile read-only notice (acceptance 17 — a UI guard).
+
+## 2026-09-28 · REQ-063 slice 4 — acceptance 16 proven, and the merge defect that had every database refusing to start
+
+**What.** Merged `origin/main` first (three conflicts: two same-intent code blocks where main's version
+was the more defensive one, plus the append-only `docs/BUILD-LOG.md` spliced and verified by multiset
+so no entry is lost). Then worked the events half of slice 4, which was the last box with no proof at
+all, and found two defects on the way.
+
+**Three defects, in the order they surfaced.**
+
+1. **Two migrations numbered `0026`.** Slice 3 took `0026_content_patterns.sql` because it was free on
+   `wave2-cms`; main took `0026_media_versions.sql` while that slice was in flight. The merge reported
+   *no conflict* — the filenames differ, so git has nothing to say — and every database then refused:
+   `duplicate key value violates unique constraint "_sqlx_migrations_pkey" · Key (version)=(26)`.
+   main keeps the number (renumbering a trunk migration rewrites a checksum a deployed database has
+   recorded; a branch migration has been applied nowhere). `SELECT max(version)` was 25, so nothing
+   had to be repaired. Mine is now `0038`, the first number free across all six `origin/*` branches,
+   which run to `0037`. Three of the four numbers that looked free locally were already claimed by
+   branches I never look at.
+
+2. **`content.blocks.updated` fired on every page PATCH, including a rename.** The handler gated on a
+   draft existing, and a title rename leaves a draft — so every rename announced a block change with
+   `block_count: 0`, and every subscriber would have rebuilt media, re-run a diff and invalidated a
+   CDN for a page whose blocks never moved. The audit entry in the same handler recorded
+   `blocks_changed: false`, so the two halves of one request disagreed in one log line. Gate is now
+   `changes.blocks.is_some()`. This also fixed the *existing* fan-out walk, whose four-event feed
+   assertion had been counting the phantom.
+
+3. **The pattern and template galleries answered the platform Owner with `400 organization_required`.**
+   Both fell back to `user.organization_id` and nothing else — and the Owner is *defined* by having no
+   primary organization, so the account the wizard creates on first run could not open the two screens
+   that are its first content work. This is the largest single cause of the pass's 555 high findings:
+   several hundred 400s on `/api/v1/patterns` and `/api/v1/page-templates`. The reads now take the
+   tenant as a selector the way `fetchSites` already did, and the panel passes the session's own.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test events` — **3/3**. New walk
+  `the_block_events_reach_a_subscribed_endpoint_and_redeliver`: both block events reach a real
+  loopback receiver, the signature verifies over the exact bytes, the payload carries `block_count` and
+  asserts it does *not* carry the tree, and a refusal is re-attempted after the backoff. Asserts
+  `retried`, not `failed` — a refusal is not an exhausted ladder.
+- `cargo test -p omnion-api --test content_blocks` — **19/19**. New walk
+  `the_galleries_answer_the_owner_and_still_refuse_a_foreign_tenant` proves the Owner reads both
+  galleries, that an account with a primary tenant still needs no selector, and that naming a
+  *foreign* tenant is still refused and returns no patterns — a selector, not a door.
+- `cargo test -p omnion-content` — **107/107**. `pnpm typecheck` — **2/2**.
+- `bash scripts/qa/run.sh` (`QA_STACK=w2`, 20260928-124117) — 35/35 routes visited, 1091 clicks, 1154
+  screenshots, sign-in/out/re-login and the mobile pass all green. **555 high findings remain** and the
+  REQ is not closeable: 2 above are mine and now fixed, the rest belong to main's media screens
+  (422 on `media/*/raw?preset=…`, 404 on `media/files?folder_id=…`). The undo/redo keys are green
+  (`historyCoversFifty` 70, `saveKeptHistory`, `redoRestoredBlocks`, `dirtyAfterUndo`).
+
+**Two boxes did not close, and one of them is a real problem.** Acceptance 7 (heading-order linting) is
+proven to *appear* — `outlineWarningShown` true with the real message — but `outlineWarningCleared`,
+`outlineWarningIsNotBlocking`, `clearedAfterFix` and `publishEnabledAfterFix` are all false in the same
+pass, so the editor did not recover from the fix the walk performed. Acceptance 17 stays open on the
+555 findings. The same pass shows `publicRendered: false` on a page that reports `published: true`,
+which is the next thing to look at.
+
+**Next.** Fix the recovery path the heading-order walk exercises — the warning not clearing, and the
+Publish button not re-enabling after a fix — then re-run for the acceptance-7 half. Then chase
+`publicRendered`, which is a published page that does not render publicly.
