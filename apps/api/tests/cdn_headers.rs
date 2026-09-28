@@ -1052,12 +1052,17 @@ async fn a_file_the_scanner_has_not_cleared_is_refused_before_any_cache_header()
     assert_eq!(response.status, StatusCode::OK, "scanning is off by default");
     assert_eq!(response.header("cache-control"), Some("private, no-store"));
 
-    // Now a site that *has* asked for scanning, and a file nobody has looked at.
+    // Now a site that *has* asked for scanning, and a file nobody has looked at. The
+    // endpoint is set because the table refuses to enable scanning without one — a site
+    // that has not said where its scanner is has not asked for scanning, and the
+    // constraint is what keeps the two apart. The endpoint is never contacted here: the
+    // claim under test is the *order* of the refusal, not the scanner's verdict.
     sqlx::query(
-        "insert into media_scan_settings (site_id, enabled) values ($1, true) \
-         on conflict (site_id) do update set enabled = true",
+        "insert into media_scan_settings (site_id, enabled, endpoint) values ($1, true, $2) \
+         on conflict (site_id) do update set enabled = true, endpoint = excluded.endpoint",
     )
     .bind(fixture.site)
+    .bind("https://scanner.invalid")
     .execute(fixture.db.pool())
     .await
     .expect("the site's scanning switch must save");
