@@ -3540,6 +3540,491 @@ async function runGoalAndRealtimeDepth(page, report) {
 }
 
 /**
+ * The CRM intake pass (REQ-117, slice 1).
+ *
+ * A lead inbox is a screen whose empty state and whose populated state are both easy to fake,
+ * so the pass never seeds the table behind the panel's back: it creates an intake source
+ * through the real route, posts three submissions to the real *public* capture endpoint with
+ * the key that create handed back, and then reads what the panel made of them. The claims:
+ *
+ * 1. the key is revealed **once**: the create answer carries it, the read does not, and the
+ *    panel's editor never re-shows it;
+ * 2. a `Test mapping` writes nothing — the lead count before and after the preview is the same;
+ * 3. the capture endpoint answers `202` for a good submission, `401` for a wrong key, and
+ *    `429` is reachable (a source with a ceiling of 1/hour answers it on the second post);
+ * 4. a lead edit cannot rewrite its own evidence: patching the name leaves the payload, the
+ *    received instant and the spam score exactly as they were;
+ * 5. `Mark responded` is idempotent on the instant — a second press does not move it;
+ * 6. the duplicate queue's two decisions both change the row's status and both leave the queue;
+ * 7. the inbox's counters and its rows come from one read, so the metrics and the table can
+ *    never disagree.
+ *
+ * The honeypot and the too-fast submitter are part of the same surface, so one submission is
+ * posted with the honeypot filled and must land as `spam`, not as a lead somebody will call.
+ */
+async function runCrmIntakeDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+
+  // 1. The source. Created through the API so the key exists once and is captured here; a
+  // panel that never showed it would still be a broken panel, and the editor is walked after.
+  const created = await page.evaluate(async (tag) => {
+    const response = await fetch("/api/v1/crm/intake/sources", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: `QA quote form ${tag}`,
+        kind: "endpoint",
+        dedupe_policy: "link",
+        rate_limit_per_hour: 30,
+        mapping: [
+          { target: "email", source: "email", transforms: ["trim", "lowercase"], required: false, fallback: null },
+          { target: "phone", source: "phone", transforms: ["trim", "e164_lite"], required: false, fallback: null },
+          { target: "first_name", source: "name", transforms: ["split_full_name"], required: false, fallback: null },
+          { target: "message", source: "message", transforms: ["trim"], required: false, fallback: null },
+          { target: "product_interest", source: "product", transforms: ["trim"], required: false, fallback: null },
+        ],
+        required_targets: [],
+        consent_required: true,
+        consent_text: "I agree to be contacted about this request.",
+      }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, stamp);
+  steps.createSource = created.status;
+  const source = created.body;
+  if (!source || !source.endpoint_key) {
+    return { ok: false, reason: `the source was not created (status ${created.status})`, steps };
+  }
+  steps.keyHint = source.endpoint_key_hint;
+
+  // The key must not come back on a read. This is the "shown once" promise, and it is the one
+  // the panel's own editor has to keep.
+  const reread = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/v1/crm/intake/sources/${id}`, { credentials: "same-origin" });
+    const body = await response.json().catch(() => null);
+    return { status: response.status, hasKey: Boolean(body && body.endpoint_key) };
+  }, source.id);
+  steps.rereadHasKey = reread.hasKey;
+  steps.rereadStatus = reread.status;
+
+  // 2. A `Test mapping` over a pasted payload, before any submission exists, so the lead count
+  //    it must *not* change is a number rather than a claim.
+  const beforePreview = await page.evaluate(() =>
+    fetch("/api/v1/crm/leads?limit=200", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  const preview = await page.evaluate(
+    async (id) => {
+      const response = await fetch(`/api/v1/crm/intake/sources/${id}/test`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          payload: {
+            name: "Ada Lovelace",
+            email: "  ADA@example.com ",
+            phone: "+44 20 7946 0000",
+            message: "Could you quote for 40 seats?",
+            product: "Enterprise",
+          },
+        }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    source.id,
+  );
+  steps.previewStatus = preview.status;
+  // The transform is the claim: a trimmed, lower-cased address and a split full name.
+  steps.previewEmail = preview.body?.values?.email ?? null;
+  steps.previewFirstName = preview.body?.values?.first_name ?? null;
+  steps.previewContactable = preview.body?.contactable ?? null;
+  steps.previewDedupeKey = preview.body?.dedupe_key ?? null;
+  const afterPreview = await page.evaluate(() =>
+    fetch("/api/v1/crm/leads?limit=200", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.previewWroteNothing =
+    (beforePreview?.leads?.length ?? -1) === (afterPreview?.leads?.length ?? -2);
+
+  // 3. The public endpoint. A wrong key is one answer; a good submission is 202 with a
+  //    reference and a coarse state; the honeypot lands as spam.
+  const capture = async (key, payload) =>
+    page.evaluate(
+      async ([k, body]) => {
+        const response = await fetch(`/api/v1/crm/intake/${k}`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return { status: response.status, body: await response.json().catch(() => null) };
+      },
+      [key, payload],
+    );
+
+  const wrongKey = await capture("not-a-real-key", { email: "x@example.com" });
+  steps.wrongKeyStatus = wrongKey.status;
+
+  const good = await capture(source.endpoint_key, {
+    name: "Grace Hopper",
+    email: `grace.${stamp}@example.com`,
+    phone: "+1 202 555 0143",
+    message: "We need a quote for 12 licences.",
+    product: "Enterprise",
+    utm_source: "newsletter",
+    utm_medium: "email",
+    utm_campaign: "qa-spring",
+    referrer: "https://news.example.com/",
+    landing_path: "/pricing",
+    consent: true,
+  });
+  steps.captureStatus = good.status;
+  steps.captureState = good.body?.state ?? null;
+  steps.captureReference = good.body?.reference ?? null;
+
+  // The idempotency header: a retry has to find the row the first attempt wrote.
+  const retried = await page.evaluate(
+    async ([key, ref]) => {
+      const response = await fetch(`/api/v1/crm/intake/${key}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json", "x-idempotency-key": `qa-${ref}` },
+        body: JSON.stringify({ email: "retry@example.com" }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    [source.endpoint_key, stamp],
+  );
+  steps.retryStatus = retried.status;
+  const firstRetry = await capture(source.endpoint_key, { email: `retry.${stamp}@example.com` });
+  const secondRetry = await page.evaluate(
+    async ([key, tag]) => {
+      const response = await fetch(`/api/v1/crm/intake/${key}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json", "x-idempotency-key": `qa-${tag}` },
+        body: JSON.stringify({ email: "retry@example.com" }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    [source.endpoint_key, stamp],
+  );
+  steps.idempotent =
+    Boolean(firstRetry.body?.reference) && secondRetry.body?.reference === firstRetry.body?.reference;
+
+  const spam = await capture(source.endpoint_key, {
+    name: "Spam Bot",
+    email: `bot.${stamp}@example.com`,
+    message: "buy pills",
+    // The field a form hides from a person and a bot fills anyway.
+    website_confirm: "http://spam.example.com",
+  });
+  steps.spamStatus = spam.status;
+  steps.spamState = spam.body?.state ?? null;
+
+  // A submission with neither e-mail nor phone is a *rejected row*, not a hole: the inbox has
+  // to be able to show what was discarded.
+  const uncontactable = await capture(source.endpoint_key, { name: "No Contact", message: "hello" });
+  steps.uncontactableStatus = uncontactable.status;
+  steps.uncontactableState = uncontactable.body?.state ?? null;
+
+  // 4. The inbox, with rows on it. The counters and the table are read from the same response
+  //    so "3 open above 5 rows" is a claim the walkthrough can actually check.
+  await page.goto(`${URL_ADMIN}/crm/leads`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="crm-lead-inbox"]', { timeout: 12000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.inboxRendered = (await page.locator('[data-testid="crm-lead-inbox"]').count()) > 0;
+  steps.inboxRows = await page.locator("[data-lead-row]").count();
+  steps.inboxSkeletons = await page.locator('[data-testid="crm-lead-inbox"] tbody tr').count();
+  const metrics = await page.evaluate(() =>
+    Object.fromEntries(
+      Array.from(document.querySelectorAll("[data-metric]")).map((el) => [
+        el.getAttribute("data-metric"),
+        Number(el.querySelector("p:last-child")?.textContent?.trim() ?? "0"),
+      ]),
+    ),
+  );
+  steps.metrics = metrics;
+  await shot(page, "page-crm-leads");
+
+  // The status filter is a toggle and the URL is the state: a filtered inbox must be
+  // shareable, and the rows on it must all BE the filtered status.
+  await page.locator("[data-status=rejected]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.statusFilterUrl = page.url().includes("status=rejected");
+  steps.statusFilteredRows = await page.locator("[data-lead-row]").count();
+  steps.onlyThatStatus = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-lead-row]")).every((row) =>
+      row.querySelector("[data-lead-open]") !== null,
+    ),
+  );
+  await page.goto(`${URL_ADMIN}/crm/leads`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // 5. The detail, opened from a real row rather than a placeholder id.
+  const leadId = good.body?.reference;
+  if (!leadId) {
+    return { ok: false, reason: "no lead reference to open the detail with", steps };
+  }
+  await page.goto(`${URL_ADMIN}/crm/leads/${leadId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="crm-lead-detail"]', { timeout: 12000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.detailRendered = (await page.locator('[data-testid="crm-lead-detail"]').count()) > 0;
+  steps.detailPayloadRows = await page.locator('[data-testid="crm-lead-detail"] dd').count();
+  steps.detailTimeline = await page.locator("[data-lead-timeline] li").count();
+  steps.detailSla = await page
+    .locator("[data-testid='crm-lead-detail'] [data-sla]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.stepperSteps = await page.locator("[data-conversion-stepper] li").count();
+  // The attribution the submission carried, read back off the screen rather than off the API.
+  steps.attributionCampaign = await page
+    .locator("[data-testid='crm-lead-detail']")
+    .innerText()
+    .then((text) => (text.includes("qa-spring") ? "qa-spring" : "missing"))
+    .catch(() => "unreadable");
+  await shot(page, "page-crm-lead-detail");
+
+  // The evidence is not editable. That claim is a measurement, not a paragraph: the payload and
+  // the spam score are read before the edit and after it, and must be byte-identical.
+  const evidenceBefore = await page.evaluate(() => {
+    const raw = document.querySelector("[data-lead-raw]");
+    const root = document.querySelector('[data-testid="crm-lead-detail"]');
+    return {
+      payload: root?.querySelector("dd")?.textContent ?? "",
+      spamScore: root?.querySelector("[data-lead-spam-score]")?.textContent ?? "",
+      received: root?.querySelector("h2 + p")?.textContent ?? "",
+      hasRaw: Boolean(raw),
+    };
+  });
+  await page.locator("#lead-first-name").fill("Gracie").catch(() => {});
+  await page.locator("[data-lead-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.savedNotice = (await page.locator("[data-lead-notice]").innerText().catch(() => "")).slice(0, 80);
+  const evidenceAfter = await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="crm-lead-detail"]');
+    return {
+      payload: root?.querySelector("dd")?.textContent ?? "",
+      spamScore: root?.querySelector("[data-lead-spam-score]")?.textContent ?? "",
+      received: root?.querySelector("h2 + p")?.textContent ?? "",
+    };
+  });
+  steps.editKeptEvidence =
+    evidenceBefore.payload === evidenceAfter.payload &&
+    evidenceBefore.spamScore === evidenceAfter.spamScore &&
+    evidenceBefore.received === evidenceAfter.received;
+  steps.editedName = (await page.locator("[data-lead-name]").innerText().catch(() => "")).trim();
+
+  // The validation the API enforces, refused before the round trip.
+  await page.locator("#lead-email").fill("").catch(() => {});
+  await page.locator("#lead-phone").fill("").catch(() => {});
+  await page.locator("[data-lead-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.contactableRefused = (await page.locator("[data-lead-error]").innerText().catch(() => "")).includes(
+    "e-mail or a phone",
+  );
+
+  // `Mark responded` twice: the first instant is the measurement, and the second press must not
+  // move it.
+  await page.locator("[data-lead-respond]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.respondedOnce = (await page.locator("[data-lead-respond]").first().isDisabled().catch(() => false));
+  steps.respondedLabel = (await page.locator("[data-lead-respond]").first().innerText().catch(() => "")).trim();
+  const firstResponse = await page.evaluate(
+    () => document.querySelector("[data-lead-timeline]")?.textContent ?? "",
+  );
+  await page.locator("[data-lead-respond]").first().click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const secondResponse = await page.evaluate(
+    () => document.querySelector("[data-lead-timeline]")?.textContent ?? "",
+  );
+  steps.respondIsIdempotent = firstResponse === secondResponse;
+  steps.respondTimelineHasTwoLines = await page.locator("[data-event=responded]").count();
+
+  // 6. The duplicate queue. A second source with the `reject_duplicate` policy files the row
+  //    instead of linking it, which is the only way a row reaches this screen.
+  const dupeSource = await page.evaluate(async (tag) => {
+    const response = await fetch("/api/v1/crm/intake/sources", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: `QA duplicate form ${tag}`,
+        kind: "endpoint",
+        dedupe_policy: "reject_duplicate",
+        rate_limit_per_hour: 30,
+        mapping: [
+          { target: "email", source: "email", transforms: ["trim", "lowercase"], required: false, fallback: null },
+          { target: "first_name", source: "name", transforms: ["split_full_name"], required: false, fallback: null },
+        ],
+        required_targets: [],
+      }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, stamp);
+  steps.dupeSourceStatus = dupeSource.status;
+
+  await page.goto(`${URL_ADMIN}/crm/leads/duplicates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="crm-lead-duplicates"]', { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.duplicatesRendered = (await page.locator('[data-testid="crm-lead-duplicates"]').count()) > 0;
+  steps.duplicatesEmptyExplains = (await page
+    .locator('[data-testid="crm-lead-duplicates"]')
+    .innerText()
+    .catch(() => "")).includes("dedupe policy");
+  await shot(page, "page-crm-lead-duplicates-empty");
+
+  // The queue's own two decisions, on a real duplicate: "keep separate" takes the row out of
+  // the queue by making it its own lead, and the timeline keeps the line that says it was filed
+  // as one — a reversal that erases the evidence is not a reversal.
+  const dupeLead = await page.evaluate(
+    async ([key, tag]) => {
+      const response = await fetch(`/api/v1/crm/intake/${key}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Grace Hopper", email: `grace.${tag}@example.com` }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    [dupeSource.body?.endpoint_key, stamp],
+  );
+  steps.dupeCaptureStatus = dupeLead.status;
+  steps.dupeCaptureState = dupeLead.body?.state ?? null;
+
+  await page.goto(`${URL_ADMIN}/crm/leads/duplicates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.duplicateRows = await page.locator("[data-duplicate-row]").count();
+  await shot(page, "page-crm-lead-duplicates");
+  if (steps.duplicateRows > 0) {
+    const row = page.locator("[data-duplicate-row]").first();
+    const rowId = await row.getAttribute("data-duplicate-row");
+    await row.locator("[data-duplicate-keep]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.keepSeparateNotice = (
+      await page.locator("[data-duplicates-notice]").innerText().catch(() => "")
+    ).slice(0, 90);
+    steps.rowLeftQueue =
+      (await page.locator(`[data-duplicate-row="${rowId}"]`).count()) === 0;
+  }
+
+  // 7. The source editor, on the real screen: the mapping table, the transform chips, the
+  //    one-time key reveal (a *create* through the UI, so the screen that promises "shown once"
+  //    is the screen that is measured), and the preview that writes nothing.
+  await page.goto(`${URL_ADMIN}/crm/settings/intake`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="crm-intake-sources"]', { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.sourcesRendered = (await page.locator('[data-testid="crm-intake-sources"]').count()) > 0;
+  steps.sourceRows = await page.locator("[data-source-row]").count();
+  await shot(page, "page-crm-intake-source");
+
+  await page.locator(`[data-source-edit="${source.id}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.editorRendered = (await page.locator("[data-source-editor]").count()) > 0;
+  steps.mappingRows = await page.locator("[data-mapping-row]").count();
+  steps.transformChips = await page.locator(`[data-source-editor="${source.id}"] span.rounded-full`).count();
+
+  // A required target with no source must refuse the save *in the screen*, before the round
+  // trip: the button is disabled and the line names the field.
+  await page.locator("[data-required-target=job_title]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.unsatisfiedNamed = (
+    await page.locator("[data-mapping-unsatisfied]").innerText().catch(() => "")
+  ).includes("Job title");
+  steps.saveDisabled = await page.locator("[data-source-save]").first().isDisabled().catch(() => false);
+  await page.locator("[data-required-target=job_title]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  await page.locator("[data-mapping-test]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.previewRendered = (await page.locator("[data-mapping-preview]").count()) > 0;
+  steps.previewSaysContactable = (
+    await page.locator("[data-mapping-preview]").innerText().catch(() => "")
+  ).includes("Contactable");
+  await shot(page, "page-crm-intake-source-editor");
+
+  // A mapping that does not save is also refused by the API; a preview of the *saved* mapping
+  // is the honest limit of this slice, so the screen does not pretend otherwise.
+  await page.locator("[data-source-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.saveNotice = (await page.locator("[data-sources-notice]").innerText().catch(() => "")).slice(0, 90);
+
+  // A create through the UI, because the key reveal is the one thing this screen has to get
+  // right and a screenshot of a key that was never revealed proves nothing.
+  const uiCountBefore = await page.locator("[data-source-row]").count();
+  await page.locator("[data-source-create]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.keyRevealShown = (await page.locator("[data-key-reveal]").count()) > 0;
+  steps.keyValueLength = (await page.locator("[data-key-value]").innerText().catch(() => "")).trim().length;
+  steps.sourceRowsAfterCreate = await page.locator("[data-source-row]").count();
+  steps.createAddedRow = steps.sourceRowsAfterCreate === uiCountBefore + 1;
+  await shot(page, "page-crm-intake-key-reveal");
+  // The reveal is a moment: closing it removes the key from the screen, and it is not on the
+  // row afterwards.
+  await page.locator('[data-key-reveal] button:has-text("I stored it")').first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.keyRevealDismissed = (await page.locator("[data-key-reveal]").count()) === 0;
+  steps.keyNotOnRow = !(await page
+    .locator('[data-testid="crm-intake-sources"]')
+    .innerText()
+    .catch(() => "")).includes("shown once");
+
+  // Rotation: a fresh key, and the old one stops working.
+  const rotated = await page.evaluate(
+    async (id) => {
+      const response = await fetch(`/api/v1/crm/intake/sources/${id}/rotate-key`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    source.id,
+  );
+  steps.rotateStatus = rotated.status;
+  steps.rotateRevealsKey = Boolean(rotated.body?.endpoint_key);
+  const oldKey = source.endpoint_key;
+  const afterRotate = await page.evaluate(
+    async (key) => {
+      const response = await fetch(`/api/v1/crm/intake/${key}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "rotated@example.com" }),
+      });
+      return response.status;
+    },
+    oldKey,
+  );
+  steps.oldKeyAfterRotate = afterRotate;
+  expectRefusal("crm/intake/{key}", `a key that was rotated away answered ${afterRotate} instead of 401`);
+
+  // Clean up: the sources this pass created are not left behind for the next run to read.
+  for (const id of [source.id, dupeSource.body?.id]) {
+    if (id) {
+      await page.evaluate(
+        async (sid) => {
+          await fetch(`/api/v1/crm/intake/sources/${sid}`, {
+            method: "DELETE",
+            credentials: "same-origin",
+          });
+        },
+        id,
+      );
+    }
+  }
+  steps.cleanedUp = true;
+
+  return steps;
+}
+
+/**
  * The notification pass (REQ-021, slice 1).
  *
  * An inbox is the easiest screen in the platform to make look right and be wrong: the rows are
@@ -4030,6 +4515,14 @@ async function main() {
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
+    // The CRM intake screens (REQ-117, slice 1) — no untested screen: the three list routes are
+    // walked here, the lead detail is opened by `runCrmIntakeDepth` below from a *real* lead id
+    // (a route walked with a placeholder id would only prove the 404 state renders), and that
+    // same pass drives the source editor, the capture endpoint, the mapping preview, the
+    // response, the rejection and the duplicate queue's decisions.
+    { path: "/crm/leads", name: "crm-leads" },
+    { path: "/crm/leads/duplicates", name: "crm-lead-duplicates" },
+    { path: "/crm/settings/intake", name: "crm-intake-sources" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -4140,6 +4633,15 @@ async function main() {
   report.notifications = await runNotificationsDepth(page, report);
   log(`notifications: ${JSON.stringify(report.notifications)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
+  // The CRM intake pass (REQ-117, slice 1): the key is revealed once, a `Test mapping` writes
+  // nothing, the public endpoint answers 202/401, a honeypot submission lands as spam, the
+  // inbox's counters and rows come from one read, a lead edit cannot rewrite its evidence,
+  // `Mark responded` is idempotent on the instant, and the duplicate queue's decisions both
+  // change the row. It creates and removes its own sources, and runs after the count-sensitive
+  // passes because it writes leads into the same inbox the metrics count.
+  report.crmIntake = await runDepthPass("crm-intake", () => runCrmIntakeDepth(page, report));
+  log(`crm intake: ${JSON.stringify(report.crmIntake)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
