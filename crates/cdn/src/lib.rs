@@ -1,0 +1,34 @@
+//! `omnion-cdn` — the CDN / edge layer (docs/requests/REQ-011).
+//!
+//! The crate holds everything about caching that is a *decision* rather than an
+//! I/O: whether a request may be cached, under which rule, for how long, under
+//! which key, and what the response headers must therefore say. Persistence and
+//! the purge worker live in `apps/api` on top of these types, so the policy can be
+//! tested without a database or a network — which is the reason it is a crate.
+//!
+//! Layout:
+//!
+//! * [`matcher`] — the path-pattern language, the request shape and cache-key
+//!   derivation.
+//! * [`rule`] — a cache rule, its validation, and the ordered evaluation that
+//!   turns a request into a [`rule::Decision`].
+//! * [`headers`] — a decision rendered into `Cache-Control`, `CDN-Cache-Control`
+//!   and surrogate keys.
+//! * [`provider`] — the adapter seam the purge worker dispatches through, and the
+//!   catalogue of adapters that actually ship.
+//!
+//! Slice 1 of REQ-011 is rules plus headers; the purge queue, worker and history
+//! (slice 2) are the persistence layer above [`provider`].
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod headers;
+pub mod matcher;
+pub mod provider;
+pub mod rule;
+
+pub use headers::{headers_for, surrogate_keys};
+pub use matcher::{CacheKey, PathPattern, PatternError, RequestShape};
+pub use provider::{AdapterInfo, Provider, Purge, PurgeOutcome, catalogue, is_shipped};
+pub use rule::{Bypass, CacheRule, Decision, RuleError, decide};
