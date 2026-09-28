@@ -26,10 +26,10 @@ use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use omnion_notifications::push::{
-    MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow,
-    PushSubscription, RegisterOutcome, RegisterReport, RetryOutcome,
+    MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow, PushSubscription,
+    RegisterOutcome, RegisterReport, RetryOutcome,
 };
-use omnion_notifications::router::{RecipientRule, RouteRule, RoutedEvent, RouteReport};
+use omnion_notifications::router::{RecipientRule, RouteReport, RouteRule, RoutedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -89,13 +89,17 @@ pub async fn register_push(
     .await
     .map_err(map_push)?;
 
-    let subscriptions = omnion_notifications::push::list_subscriptions(state.db().pool(), session.user.id)
-        .await
-        .map_err(map_push)?;
+    let subscriptions =
+        omnion_notifications::push::list_subscriptions(state.db().pool(), session.user.id)
+            .await
+            .map_err(map_push)?;
     let hint = subscriptions
         .iter()
         .find(|row| row.id == report.id)
-        .map_or_else(String::new, omnion_notifications::push::PushSubscription::endpoint_hint);
+        .map_or_else(
+            String::new,
+            omnion_notifications::push::PushSubscription::endpoint_hint,
+        );
 
     Ok(Json(RegisterPushResult {
         id: report.id,
@@ -201,12 +205,10 @@ pub async fn list_outbox(
     )
     .await
     .map_err(map_push)?;
-    let counts = omnion_notifications::push::outbox_counts(
-        state.db().pool(),
-        session.user.organization_id,
-    )
-    .await
-    .map_err(map_push)?;
+    let counts =
+        omnion_notifications::push::outbox_counts(state.db().pool(), session.user.organization_id)
+            .await
+            .map_err(map_push)?;
 
     Ok(Json(OutboxBody {
         rows: rows.iter().map(OutboxRowBody::from).collect(),
@@ -407,7 +409,8 @@ pub struct CreateRouteBody {
     pub event_name: String,
     /// The category the notification carries.
     pub category: String,
-    /// The priority, `normal` when absent.
+    /// The priority, `normal` when absent — the same default the store's own builder uses, so
+    /// a rule that omits it and a rule that says `normal` are the same row.
     #[serde(default = "default_priority")]
     pub priority: String,
     /// `actor`, `permission:<key>`, `role:<slug>` or `payload_user:<field>`.
@@ -459,8 +462,9 @@ pub async fn create_route(
         ));
     }
 
-    let created =
-        omnion_notifications::router::create_rule(state.db().pool(), &rule).await.map_err(map_push)?;
+    let created = omnion_notifications::router::create_rule(state.db().pool(), &rule)
+        .await
+        .map_err(map_push)?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -556,20 +560,29 @@ pub async fn channels(
     State(state): State<AppState>,
     session: CurrentSession,
 ) -> Result<Json<Vec<ChannelBody>>, ApiError> {
+    // The crate already answers with one row per channel *and* the reason for it. This loop
+    // only adds the two booleans the settings matrix needs, and it takes `ready` from the
+    // crate rather than re-deriving it — a second derivation is a second opinion that will
+    // disagree with the first one the day somebody edits one of them.
     let readiness = omnion_notifications::push::channel_readiness(state.db().pool()).await;
     Ok(Json(
         omnion_notifications::CHANNELS
             .iter()
             .map(|channel| {
-                let detail = readiness
-                    .iter()
-                    .find(|entry| entry.channel == *channel)
-                    .map_or("not configured", |entry| entry.reason);
+                // `channel_readiness` iterates the same closed list, so a channel it did not
+                // answer for would be a bug in the crate rather than a state. The fallback
+                // says so instead of dropping the row: a `filter_map` here would answer with
+                // four channels and the settings matrix would render four columns, with the
+                // missing one indistinguishable from a channel the reader turned off.
+                let entry = readiness.iter().find(|entry| entry.channel == *channel);
                 ChannelBody {
                     channel: (*channel).to_owned(),
-                    available: channel == "in_app",
-                    locked: channel == "in_app",
-                    detail: detail.to_owned(),
+                    available: entry.is_some_and(|entry| entry.ready),
+                    locked: *channel == omnion_notifications::IN_APP,
+                    detail: entry.map_or_else(
+                        || "the platform did not report on this channel".to_owned(),
+                        |entry| entry.reason.clone(),
+                    ),
                 }
             })
             .collect(),
@@ -603,10 +616,22 @@ fn map_push(error: omnion_notifications::NotificationError) -> ApiError {
             "notification_rate_limited",
             "too many notifications from this actor — try again in a minute",
         ),
-        omnion_notifications::NotificationError::Database(inner) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", inner.to_string())
-        }
+        omnion_notifications::NotificationError::Database(inner) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            inner.to_string(),
+        ),
     }
+}
+
+/// The priority a rule gets when the body omits it.
+///
+/// `normal` is the schema's own default (`0051_notification_routes.sql`), so a rule that
+/// omits the field and a rule that spells it out are the same row — spelled here rather than
+/// reused from another module's `default_priority`, which is an `i32` for a different field
+/// and would compile into the wrong answer.
+fn default_priority() -> String {
+    "normal".to_owned()
 }
 
 #[cfg(test)]
@@ -618,7 +643,10 @@ mod tests {
         // The bug slice 1 shipped: serde_urlencoded cannot put a repeated key into a Vec, so
         // this parse is hand-written and this test is the regression for the reason it is.
         let query = parse_outbox_query(Some("status=failed&status=pending&limit=10"));
-        assert_eq!(query.statuses, vec!["failed".to_owned(), "pending".to_owned()]);
+        assert_eq!(
+            query.statuses,
+            vec!["failed".to_owned(), "pending".to_owned()]
+        );
         assert_eq!(query.limit, 10);
     }
 
@@ -640,7 +668,10 @@ mod tests {
     fn the_page_is_clamped_to_the_same_cap_the_inbox_uses() {
         // `limit=99999` answered as 99 999 rows is a page that times out, and it would be the
         // only endpoint in the notification family with a different rule.
-        assert_eq!(parse_outbox_query(Some("limit=99999")).limit, MAX_OUTBOX_PAGE);
+        assert_eq!(
+            parse_outbox_query(Some("limit=99999")).limit,
+            MAX_OUTBOX_PAGE
+        );
         assert_eq!(parse_outbox_query(Some("limit=0")).limit, 1);
         assert_eq!(parse_outbox_query(Some("limit=-5")).limit, 1);
         assert_eq!(parse_outbox_query(Some("limit=nonsense")).limit, 50);
@@ -705,7 +736,10 @@ mod tests {
         };
         let json = serde_json::to_string(&OutboxRowBody::from(&row)).expect("serialises");
         assert!(json.contains("\"attempts\":3"));
-        assert!(json.contains("\"max_attempts\":3"), "the cap is not the count");
+        assert!(
+            json.contains("\"max_attempts\":3"),
+            "the cap is not the count"
+        );
         assert!(!json.contains("\"title\""));
         assert!(!json.contains("\"body\""));
     }
@@ -740,7 +774,10 @@ mod tests {
         assert!(error.is_none());
         let message = "recipient \"group:everyone\" is not one of: actor, permission:<key>, \
                        role:<slug>, payload_user:<field>";
-        assert!(message.contains("payload_user"), "the four shapes are named");
+        assert!(
+            message.contains("payload_user"),
+            "the four shapes are named"
+        );
     }
 
     #[test]
