@@ -1734,7 +1734,7 @@ async fn health_samples_compute_a_status_and_the_order_is_a_permutation() {
             None,
         ))
         .await;
-    let owner_token = bearer(&owner.body["token"]);
+    let owner_token = token_of(&owner);
 
     let created = harness
         .call(post(
@@ -1793,7 +1793,7 @@ async fn health_samples_compute_a_status_and_the_order_is_a_permutation() {
     // caller knows when to emit `ai.provider.health_changed`.
     let mut seen: Vec<(&'static str, &'static str)> = Vec::new();
     for _ in 0..2 {
-        let (_, transition) = omnion_ai_hub::health_store::probe_now(
+        let transition = omnion_ai_hub::health_store::probe_now(
             harness.db.pool(),
             provider_uuid,
             omnion_ai_hub::health_store::NewSample {
@@ -1965,12 +1965,12 @@ async fn health_samples_compute_a_status_and_the_order_is_a_permutation() {
     let removed = harness
         .call(request(
             Method::DELETE,
-            &format!("api/v1/ai/providers/{provider_id}"),
+            &format!("/api/v1/ai/providers/{provider_id}"),
             Some(&owner_token),
             None,
         ))
         .await;
-    assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.body);
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{:?}", removed.body);
 
     let orphan_samples: (i64,) =
         sqlx::query_as("select count(*) from ai_provider_health where provider_id = $1")

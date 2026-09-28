@@ -1930,3 +1930,42 @@
   it, and once more for the empty diff that proves the first apply did what it said.
 - **Next.** REQ-097 slice 3 — the health table, the probe runner with pruning, the status
   computation, the Health and Usage tabs, the failover order UI and the substitution logic.
+
+## 2026-09-28 — REQ-097 slice 3 · Health samples, a computed status, and an order that is a permutation
+
+- **What.** The health half of the provider runtime: migration `0027_ai_provider_health.sql` adds
+  `ai_provider_health` (one row per probe) and `ai_provider_usage` (one row per completed call),
+  both cascading on the provider, both indexed for the two questions the panel asks ("what
+  happened to this provider" and "what did this provider serve"). `health.rs` is the status
+  computation as pure functions — `down` after three consecutive failures, `degraded` on any
+  failure inside 24 h or a latency over 1.5× the provider's **own** 7-day median, `ok` after two
+  clear successes, `unknown` when there is nothing to compute from. `health_store.rs` writes a
+  sample and the verdict it produced **in one transaction** and hands back the `(from, to)`
+  transition, so `ai.provider.health_changed` fires on a change rather than on every tick.
+- **The two numbers are deliberately different.** A sample row carries what that one probe saw
+  (`ok` or `down`); `last_health` carries what the last samples *mean* (a provider whose last
+  probe succeeded can still read `degraded` because of the three failures before it). Collapsing
+  them into one column is how a Health tab ends up showing a green dot over an outage.
+- **Failover order is a permutation, not a wish.** `set_failover_order` refuses an empty list, a
+  repeated id and any id that is not an enabled provider, in the same transaction as the write,
+  and stores spaced ranks (10, 20, 30) so an operator can insert a provider between two
+  neighbours later. `failover_preview` is built from the same ordering function the router walks,
+  so the chain on screen is the chain that runs.
+- **Usage that cannot lie.** `usage_summary` sums the rows the runtime recorded — no in-memory
+  counter a restart would reset. A call that reported no tokens is counted in `missing_usage` and
+  contributes nothing to the totals, because a stream that ends without a usage frame must not
+  silently become a real zero in the cost view.
+- **Proof (Rust).** `cargo test -p omnion-ai-hub` → **73 units** (57 before, 16 new: the stored
+  status vocabulary round-trips, one failure is degraded and three are down, the 24 h window beats
+  a two-sample recovery and expires two days later, a 5× latency is degraded against the
+  provider's own median and a first probe with no median is not, uptime is `None` rather than
+  100% for an unprobed provider, p95 ignores a single outlier). `cargo test -p omnion-api --test
+  ai_hub --test-walkthrough-slice-3` — the new walk takes samples through the store and reads the
+  verdict back out of the row: `unknown` → `degraded` → `down` with one reported transition per
+  change, 0% uptime over three failures, a stranger's order and an empty order both refused, the
+  usage sum equal to the rows, and the samples and counters gone with the provider.
+- **Next.** The probe runner (`OMNION_AI_HEALTH_RUNNER`, 60 s, pruning at 30 days), the HTTP
+  surface (`GET /ai/providers/{id}/health`, `…/usage`, `POST …/probe`, `PUT …/order`), the seven
+  provider events, the Health and Usage tabs, the drag-order UI and the substitution logic that
+  reroutes a task-addressed call and refuses to reroute a pinned one.
+

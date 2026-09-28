@@ -22,10 +22,6 @@ use crate::health::{HealthStatus, Sample, health_status, p95_latency_ms, uptime_
 /// Columns read back from `ai_provider_health`.
 const SAMPLE_COLUMNS: &str = "id, provider_id, status, latency_ms, http_status, error, checked_at";
 
-/// Columns read back from `ai_provider_usage`.
-const USAGE_COLUMNS: &str = "id, provider_id, model_key, task, outcome, http_status, \
-     prompt_tokens, completion_tokens, latency_ms, substituted_from, first_byte_at, created_at";
-
 /// One probe sample, as the Health tab reads it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HealthSample {
@@ -229,7 +225,7 @@ pub async fn recent_samples(
 ) -> Result<Vec<HealthSample>> {
     let sql = format!(
         "select {SAMPLE_COLUMNS} from ai_provider_health \
-         where provider_id = $1 and checked_at >= now() - make_interval(hours => $2) \
+         where provider_id = $1 and checked_at >= now() - make_interval(hours => $2::int) \
          order by checked_at desc limit $3"
     );
     let samples: Vec<HealthSample> = sqlx::query_as(&sql)
@@ -249,7 +245,7 @@ async fn recent_samples_in(
 ) -> Result<Vec<Sample>> {
     let sql = format!(
         "select {SAMPLE_COLUMNS} from ai_provider_health \
-         where provider_id = $1 and checked_at >= now() - make_interval(hours => $2) \
+         where provider_id = $1 and checked_at >= now() - make_interval(hours => $2::int) \
          order by checked_at desc limit 50"
     );
     let rows: Vec<HealthSample> = sqlx::query_as(&sql)
@@ -271,7 +267,7 @@ async fn baseline_latency(
     let row: Option<(Option<f64>,)> = sqlx::query_as(
         "select percentile_cont(0.5) within group (order by latency_ms) from ai_provider_health \
          where provider_id = $1 and status <> 'down' \
-         and checked_at >= now() - make_interval(days => $2)",
+         and checked_at >= now() - make_interval(days => $2::int)",
     )
     .bind(provider_id)
     .bind(crate::health::BASELINE_DAYS)
@@ -307,7 +303,7 @@ pub async fn health_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Res
     let baseline = sqlx::query_as::<_, (Option<f64>,)>(
         "select percentile_cont(0.5) within group (order by latency_ms) from ai_provider_health \
          where provider_id = $1 and status <> 'down' \
-         and checked_at >= now() - make_interval(days => $2)",
+         and checked_at >= now() - make_interval(days => $2::int)",
     )
     .bind(provider_id)
     .bind(crate::health::BASELINE_DAYS)
@@ -335,7 +331,7 @@ pub async fn health_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Res
 /// Usage range is always answerable from what is on disk.
 pub async fn prune(pool: &PgPool, days: i64) -> Result<u64> {
     let health = sqlx::query(
-        "delete from ai_provider_health where checked_at < now() - make_interval(days => $1)",
+        "delete from ai_provider_health where checked_at < now() - make_interval(days => $1::int)",
     )
     .bind(days)
     .execute(pool)
@@ -343,7 +339,7 @@ pub async fn prune(pool: &PgPool, days: i64) -> Result<u64> {
     .rows_affected();
 
     let usage = sqlx::query(
-        "delete from ai_provider_usage where created_at < now() - make_interval(days => $1)",
+        "delete from ai_provider_usage where created_at < now() - make_interval(days => $1::int)",
     )
     .bind(days)
     .execute(pool)
@@ -433,7 +429,7 @@ pub async fn usage_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Resu
          sum(prompt_tokens), sum(completion_tokens), \
          count(*) filter (where prompt_tokens is null and completion_tokens is null) \
          from ai_provider_usage \
-         where provider_id = $1 and created_at >= now() - make_interval(hours => $2)",
+         where provider_id = $1 and created_at >= now() - make_interval(hours => $2::int)",
     )
     .bind(provider_id)
     .bind(hours)
@@ -444,7 +440,7 @@ pub async fn usage_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Resu
         "select to_char(date_trunc('day', created_at), 'YYYY-MM-DD'), count(*), \
          count(*) filter (where outcome <> 'ok'), sum(prompt_tokens), sum(completion_tokens) \
          from ai_provider_usage \
-         where provider_id = $1 and created_at >= now() - make_interval(hours => $2) \
+         where provider_id = $1 and created_at >= now() - make_interval(hours => $2::int) \
          group by 1 order by 1",
     )
     .bind(provider_id)
@@ -454,7 +450,7 @@ pub async fn usage_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Resu
 
     let latencies: Vec<(i32,)> = sqlx::query_as(
         "select latency_ms from ai_provider_usage \
-         where provider_id = $1 and created_at >= now() - make_interval(hours => $2) \
+         where provider_id = $1 and created_at >= now() - make_interval(hours => $2::int) \
          order by latency_ms",
     )
     .bind(provider_id)
