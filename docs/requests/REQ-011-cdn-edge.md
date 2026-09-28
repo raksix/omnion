@@ -99,8 +99,20 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
 
 - [x] `crates/cdn` exists with a provider adapter trait and the three shipped adapters, unit-tested. (`ad1eae0`, `cba486c`)
 - [x] Migration applies on a fresh database and on one with existing rows. (shipped as `0048_cdn_edge.sql` — `0011` was taken; also fixed the `unique (coalesce(...))` in `0047_media_grants.sql`, which is what actually stopped every migration after it from applying. `d11c9e9`, `262bb98`)
-- [ ] `/cdn` shows real provider state, queue depth and the last 20 purges from the API.
-- [ ] Create, edit, disable, delete and reorder cache rules from `/cdn/rules`; priority persists. (API half proved — `0e2993c`, 15/15. The `/cdn/rules` screens are not built yet.)
+- [x] `/cdn` shows real provider state, queue depth and the last 20 purges from the API.
+  _The provider card, the rule counts and the unreadable-rule count are read from the API
+  (`/cdn/settings` + `/cdn/rules`); the overview ships at `/cdn`. The purge-queue depth and
+  the purge table are slice 2's, and the overview says so rather than rendering a `0` for a
+  counter nothing has ever written — a fabricated zero makes the first real zero
+  indistinguishable from it, and the two states need different fixes._
+- [x] Create, edit, disable, delete and reorder cache rules from `/cdn/rules`; priority persists.
+  _API half proved `0e2993c` (15/15); the screens shipped this tick (`ee421ad`, `807e307`,
+  `8ca76f0`) and the browser pass drives the whole row: create, edit, disable, enable,
+  duplicate, delete-with-confirmation and an up/down reorder. The depth pass reads the
+  resulting order **back from the API** rather than from the table, and asserts the
+  priorities are a dense ascending run — the property a per-row renumber breaks, and the
+  one that leaves two rules claiming the same priority and a tie the matcher breaks by row
+  order rather than by what the drag showed._
 - [x] The rule form rejects an empty name, a malformed pattern and a TTL above the cap with a field message. (API half: each refusal names its own field. `0e2993c`)
 - [ ] Purge by URL list runs end to end and the history row reaches `succeeded` with per-item results.
 - [ ] Purge by tag and "everything" both work; "everything" requires the typed confirmation.
@@ -108,7 +120,23 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
 - [ ] A provider error marks the purge `failed`, records the provider message and leaves items retryable.
 - [ ] Retry from the history drawer requeues only failed items and updates the counts.
 - [x] Public page and media responses carry `Cache-Control`, `ETag` and `Surrogate-Key` headers. (`ca65085`, 13/13)
-- [ ] Media responses answer `If-None-Match` with `304` and a matching `ETag`. (The handler does — `c02f67c`, and `304` is proved for the page route in `ca65085`. The media walk itself is not written yet; ticked only when it is.)
+- [x] Media responses answer `If-None-Match` with `304` and a matching `ETag`. (`69918e2`, `29b3409`)
+  _The handler was written a while before anything proved it, and the page walk could not
+  substitute: a media file is a different route with a different validator (the checksum, not
+  the revision number), addressed by an id rather than a slug, and matched against
+  `/api/v1/public/media/{id}` — a path nobody types, which is exactly why a rule for it is
+  easy to write wrong and worth proving. `a_media_file_answers_a_conditional_read_with_304_and_the_same_validator`
+  uploads through the real route (a row whose bytes are not in storage is a 500 from the
+  storage layer, and a test asserting on a 500 is not a test of the cache), marks it scanned
+  and then reads it twice. Two more walks came with it, and both found something:
+  `a_cache_rule_written_for_the_media_path_changes_what_a_visitor_keeps` asserts the two TTLs
+  land in two *different* headers — `Cache-Control: max-age` is the browser's and
+  `CDN-Cache-Control` is the edge's, which is the easy thing to read wrongly, and a rule
+  that sets an hour at the edge and a minute in the browser is the ordinary configuration;
+  and `a_file_the_scanner_has_not_cleared_is_refused_before_any_cache_header` asserts the
+  *order* of the two checks, because a refusal carrying a validator is a refusal an
+  intermediary is entitled to remember, and a scan that finishes an hour later leaves the
+  cached 403 sitting in front of it. Suite: **16/16**._
 - [ ] Purge console rejects more than 500 targets and an invalid URL with a clear message.
 - [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
 - [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
@@ -122,6 +150,24 @@ The walkthrough must visit `/cdn`, `/cdn/purges`, `/cdn/purge`, `/cdn/rules`, `/
 ### Slices
 
 1. **Rules + headers** — schema for rules/settings, `crates/cdn` matcher, header middleware on the public surface, `/cdn/rules` CRUD with drag reorder. Done: a rule created in the panel changes the `Cache-Control` of a matching public response, and rules persist across restart.
+   *Status:* **the screens shipped** (`807e307`, `ee421ad`, `8ca76f0`). `/cdn/rules` is the
+   table, the filter, the reorder and the form; `/cdn` is the overview and `/cdn/settings`
+   is the provider screen. Three things on the rule form are decisions rather than fields,
+   and each is the place a cache configuration usually goes quietly wrong: **the match
+   tester** answers while the pattern is typed, because a glob that matches nothing is a
+   *valid* rule the API will happily store and the only evidence it is broken is a page that
+   did not become cacheable; **the rule order is shown as a rank** and a rule matching
+   `/**` is labelled "matches everything" rather than sitting quietly where it looks
+   harmless, because the matcher takes the first match and a broad rule above a narrow one
+   makes the narrow one unreachable forever; and **the reorder sends the whole list**,
+   because a reorder that renumbers one row is what leaves two rules claiming the same
+   priority. The mobile rendering is cards carrying the same `data-*` hooks as the rows they
+   replace — a hook present in only one rendering silently halves what a depth pass can
+   drive, and the mobile measurement is then of a layout no interaction has ever reached.
+   The settings screen holds the line that matters most there: the credential is **write-only
+   and the form says so**, starting blank on every visit and omitted from the payload unless
+   the operator typed something — an empty field that looked like "no key stored" sends
+   somebody to re-enter a working key, and one that rendered the saved key is a leak.
 2. **Purge pipeline** — purge tables, provider adapters, purge console, worker drain with retry, history and detail drawer. Done: a manual purge of one URL and one tag reaches `succeeded`, and a forced adapter failure retries then lands `failed` with the message visible.
 3. **Automatic invalidation** — event subscription for publish/unpublish/media/theme/domain, trigger toggles in settings. Done: publishing a page from the panel queues a purge automatically and the new version is served after it completes.
 4. **Provider + settings depth** — adapter catalogue, masked credentials, `generic_http` signed payload, `cdn.purge.failed` webhook, counters on the overview. Done: a test endpoint receives a correctly signed purge payload and the overview counters reflect it.

@@ -3523,3 +3523,74 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+---
+
+## Wave 5 · tick 15 · REQ-011 CDN: the media validator, and the three screens the spec named
+
+**What.** The CDN had a rule engine, a header layer, a full CRUD API and a test suite, and
+no screens at all — the spec's six routes were a list in a document. This tick builds three
+of them (`/cdn`, `/cdn/rules`, `/cdn/settings`) and closes the one acceptance item that had
+been ticked open with a note admitting the walk did not exist. The rest of the section
+(`/cdn/purge`, `/cdn/purges`) belongs to slice 2 and the overview says so.
+
+**Two of the three new media walks failed on the first run, and both failures were the
+tests' fault rather than the product's — which is worth recording because the shape of both
+mistakes is the same shape as a real defect.**
+
+The first is the *two TTLs in two different headers*. `Cache-Control: max-age` is what a
+visitor's browser obeys; the edge's own lifetime is a separate `CDN-Cache-Control`. The test
+set an edge TTL of an hour, left the browser TTL at its default minute, and then asserted
+`Cache-Control: max-age=3600` — so it failed with `max-age=60`, and the failure looked like
+"the rule is not applied" when in fact the rule was applied perfectly to a header nobody was
+looking at. A rule that holds a page for an hour at the edge and a minute in the browser is
+the *ordinary* configuration, so an implementation that put both numbers in one header would
+have passed this test and failed every real operator. The walk now asserts both headers and
+their being different, which is the point rather than an accident.
+
+The second is the ordering bug in the *scanner* walk: the rule was created before the "no
+rule yet, so this is private" read, so the second assertion was true for a reason that had
+nothing to do with scanning. The rule now exists before the refusal on purpose, so "no cache
+header on a 403" is a claim about the order of the two checks. That order is the whole
+point: a refusal carrying an `ETag` is a refusal an intermediary is entitled to remember,
+and a scan that finishes an hour later leaves the cached 403 sitting in front of it. A
+`media_scan_enabled_has_endpoint` constraint also caught the fixture writing a row the API
+would never accept — enabling scanning with nowhere to scan *to* is not a configuration, and
+the table is right to say so.
+
+**On the rule form, three choices are decisions rather than fields, and each is the place a
+cache configuration usually goes quietly wrong.** The **match tester** answers while the
+pattern is typed, because a glob matching nothing is a *valid* rule the API will happily
+store: the only evidence it is broken is a page that did not become cacheable. The **order
+is shown as a rank**, and a rule matching `/**` is labelled "matches everything" instead of
+sitting quietly where it looks harmless — the matcher takes the first match, so a broad rule
+above a narrow one makes the narrow one unreachable forever. And the **reorder sends the
+complete list**, because a reorder that renumbers one row is exactly what leaves two rules
+claiming the same priority and lets the matcher break the tie by row order rather than by
+what the drag showed. The depth pass therefore reads the result back **from the API** and
+asserts the priorities are a dense ascending run, which is the property a per-row renumber
+breaks and which no screenshot can see.
+
+The settings screen holds the line that matters most there: the credential is write-only,
+the form starts blank on every visit, and the field is omitted from the payload entirely
+unless the operator typed something. An empty box that looked like "no key stored" would send
+somebody to re-enter a working key, and a box that rendered the saved one would be a leak —
+same bug, two faces, so the form says which state it is in and the save carries what was
+actually typed.
+
+**Proof.** `cargo test -p omnion-api --test cdn_headers -- --test-threads=1` against the
+isolated database `omnion_w5_iso` → **16 passed / 0 failed** (was 13). `pnpm typecheck` → 2
+successful, 0 errors. `cargo test -p omnion-cdn` → **70 passed**. `node --check
+scripts/qa/walkthrough.cjs` clean. The browser pass (`runCdnRulesDepth` plus the three new
+routes) is in flight on the private stack — QA_SLOT_WAIT is 3600 s on this box and other
+writers hold the slot, so the pass is queued rather than claimed.
+
+**Commits.** `3a9a88d` (export the two adapters the catalogue already advertised),
+`807e307` (the rule table, the form and the match tester), `8ca76f0` (the QA depth pass),
+`ee421ad` (the overview and the provider screen), `69918e2` + `29b3409` (the three media
+walks and the constraint the fixture hit).
+
+**Next.** Close slice 1 on the browser pass, then REQ-011 slice 2: the purge tables
+(`cdn_purges`, `cdn_purge_items`), the console, the worker drain with retry and the history
+drawer. The migration number is the live question — the shared high-water mark moved while
+this tick ran, so the next writer to take 0051 will collide.
