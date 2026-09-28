@@ -2933,7 +2933,6 @@ metric families give it a contract to import against.
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
 
-<<<<<<< HEAD
 ## 2026-09-28 · REQ-126 slice 4b — the retention sweep, and a prune that never ran once
 
 - **The finding.** Three of slice 4's components — the lifecycle, the alert evaluator and both
@@ -3032,7 +3031,7 @@ metric families give it a contract to import against.
 - **Next.** The bundle import check and the shipped rule's fire-through-a-real-outage walk (both
   need a Prometheus in the QA stack), then the `observability.read`-cannot-write line, then the
   close gate: `cargo test --workspace`, `pnpm build`, and the private-stack walkthrough.
-=======
+
 ## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
 
 **What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
@@ -3095,4 +3094,3 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
->>>>>>> origin/main
