@@ -220,19 +220,28 @@ export function VersionsPanel({
   return (
     <div className="flex flex-col gap-3 p-4">
       {notice ? (
-        <p role="status" className="rounded-md bg-positive-soft px-3 py-2 text-[12.5px] text-positive">
+        <p
+          role="status"
+          data-automation-versions-notice
+          className="rounded-md bg-positive-soft px-3 py-2 text-[12.5px] text-positive"
+        >
           {notice}
         </p>
       ) : null}
       {error ? (
-        <p role="alert" className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative">
+        <p
+          role="alert"
+          data-automation-versions-error
+          className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative"
+        >
           {error}
         </p>
       ) : null}
-      <ul className="flex flex-col gap-2">
+      <ul data-automation-versions className="flex flex-col gap-2">
         {history.versions.map((version) => (
           <li
             key={version.id}
+            data-automation-version-row={String(version.version)}
             className="flex flex-col gap-2 rounded-md border border-line px-3 py-2.5"
           >
             <div className="flex flex-wrap items-center gap-2 text-[12.5px]">
@@ -255,6 +264,7 @@ export function VersionsPanel({
               <div>
                 <button
                   type="button"
+                  data-automation-version-restore={String(version.version)}
                   className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-[12px] hover:bg-quiet-soft disabled:opacity-50"
                   onClick={() => restore(version)}
                   disabled={busy === version.id}
@@ -301,7 +311,7 @@ export function AuditPanel({ automationId }: { automationId: string }) {
 
   if (error) {
     return (
-      <p role="alert" className="px-4 py-6 text-[12.5px] text-negative">
+      <p role="alert" data-automation-audit-error className="px-4 py-6 text-[12.5px] text-negative">
         {error}
       </p>
     );
@@ -321,9 +331,13 @@ export function AuditPanel({ automationId }: { automationId: string }) {
   }
 
   return (
-    <ul className="flex flex-col divide-y divide-line">
+    <ul data-automation-audit className="flex flex-col divide-y divide-line">
       {entries.map((entry) => (
-        <li key={entry.id} className="flex flex-wrap items-baseline gap-x-2 px-4 py-2.5 text-[12.5px]">
+        <li
+          key={entry.id}
+          data-automation-audit-row={entry.action}
+          className="flex flex-wrap items-baseline gap-x-2 px-4 py-2.5 text-[12.5px]"
+        >
           <span className="font-mono text-[11.5px] text-muted">
             {formatTimestamp(entry.created_at)}
           </span>
@@ -375,18 +389,25 @@ function TraceStep({
   const duration = durationOf(step.started_at, step.finished_at);
 
   return (
-    <li className="flex flex-col gap-1.5 rounded-md border border-line px-3 py-2.5">
+    <li
+      data-automation-trace-step={String(step.step_no)}
+      data-automation-trace-status={step.status}
+      className="flex flex-col gap-1.5 rounded-md border border-line px-3 py-2.5"
+    >
       <div className="flex flex-wrap items-baseline gap-2 text-[12.5px]">
         <span className="font-mono text-[11.5px] text-muted">#{step.step_no}</span>
         <span className="font-medium">{step.name}</span>
         <StatusBadge status={step.status} />
         {step.action ? <span className="text-muted">{step.action}</span> : null}
-        <span className="ml-auto text-[11.5px] text-muted">
+        <span data-automation-trace-attempts className="ml-auto text-[11.5px] text-muted">
           {attempts} attempts · {duration}
         </span>
       </div>
       {step.error ? (
-        <p className="flex items-start gap-1.5 text-[12.5px] text-negative">
+        <p
+          data-automation-trace-step-error
+          className="flex items-start gap-1.5 text-[12.5px] text-negative"
+        >
           <AlertTriangle size={13} aria-hidden className="mt-0.5 shrink-0" />
           <span>{step.error}</span>
         </p>
@@ -395,6 +416,7 @@ function TraceStep({
         <div>
           <button
             type="button"
+            data-automation-trace-retry={String(step.step_no)}
             className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-[12px] hover:bg-quiet-soft disabled:opacity-50"
             onClick={() => onRerun(step.step_no)}
             disabled={busy === step.step_no}
@@ -505,7 +527,7 @@ export function RunTrace({
   const failed = run.steps.filter((step) => step.status === "failed").length;
 
   return (
-    <div className="flex flex-col gap-4 p-4">
+    <div data-automation-trace={run.id} className="flex flex-col gap-4 p-4">
       <header className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <Link
           href="/automations"
@@ -518,12 +540,13 @@ export function RunTrace({
         <span className="text-[12.5px] text-muted">
           started {formatTimestamp(run.started_at)} · {run.trigger_kind}
         </span>
-        <span className="text-[12.5px] text-muted">
+        <span data-automation-trace-summary className="text-[12.5px] text-muted">
           {succeeded} succeeded, {failed} failed of {run.steps.length}
         </span>
         {run.can_cancel ? (
           <button
             type="button"
+            data-automation-trace-cancel
             className="ml-auto rounded-md border border-line px-2 py-1 text-[12px] hover:bg-quiet-soft"
             onClick={cancel}
           >
@@ -533,18 +556,25 @@ export function RunTrace({
       </header>
 
       {error ? (
-        <p role="alert" className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative">
+        <p
+          role="alert"
+          data-automation-trace-error
+          className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative"
+        >
           {error}
         </p>
       ) : null}
       {run.error ? (
-        <p className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative">
+        <p
+          data-automation-trace-run-error
+          className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative"
+        >
           {run.error}
         </p>
       ) : null}
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
-        <ol className="flex flex-col gap-2">
+        <ol data-automation-trace-steps className="flex flex-col gap-2">
           {run.steps.map((step) => (
             <TraceStep
               key={step.step_no}
@@ -559,6 +589,7 @@ export function RunTrace({
         <aside className="flex flex-col gap-2">
           <button
             type="button"
+            data-automation-trace-payload
             className="flex items-center gap-1.5 text-[12.5px] text-muted hover:text-ink"
             aria-expanded={payloadOpen}
             onClick={() => setPayloadOpen((open) => !open)}
@@ -634,7 +665,7 @@ export function RunsPanel({ automationId }: { automationId: string }) {
   }
 
   return (
-    <table className="w-full text-[12.5px]">
+    <table data-automation-runs className="w-full text-[12.5px]">
       <thead>
         <tr className="border-b border-line text-left text-muted">
           {RUN_COLUMNS.map((column) => (
@@ -646,9 +677,13 @@ export function RunsPanel({ automationId }: { automationId: string }) {
       </thead>
       <tbody>
         {runs.map((run) => (
-          <tr key={run.id} className="border-b border-line last:border-0">
+          <tr key={run.id} data-automation-run-row={run.id} className="border-b border-line last:border-0">
             <td className="px-4 py-2">
-              <Link href={`/automations/${automationId}/runs/${run.id}`} className="hover:underline">
+              <Link
+                data-automation-run-open={run.id}
+                href={`/automations/${automationId}/runs/${run.id}`}
+                className="hover:underline"
+              >
                 {formatTimestamp(run.started_at)}
               </Link>
             </td>
@@ -742,7 +777,7 @@ export function AutomationTemplatesView() {
   }
 
   return (
-    <div className="flex flex-col gap-5 p-6">
+    <div data-automation-templates className="flex flex-col gap-5 p-6">
       <header className="flex flex-wrap items-baseline gap-3">
         <h1 className="text-[15px] font-medium">Templates</h1>
         <Link href="/automations" className="text-[12.5px] text-muted hover:text-ink">
@@ -751,22 +786,34 @@ export function AutomationTemplatesView() {
       </header>
 
       {notice ? (
-        <p role="status" className="rounded-md bg-positive-soft px-3 py-2 text-[12.5px] text-positive">
+        <p
+          role="status"
+          data-automation-templates-notice
+          className="rounded-md bg-positive-soft px-3 py-2 text-[12.5px] text-positive"
+        >
           {notice}
         </p>
       ) : null}
       {error ? (
-        <p role="alert" className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative">
+        <p
+          role="alert"
+          data-automation-templates-error
+          className="rounded-md bg-negative-soft px-3 py-2 text-[12.5px] text-negative"
+        >
           {error}
         </p>
       ) : null}
 
       {grouped.map(([category, items]) => (
-        <section key={category} className="flex flex-col gap-2">
+        <section key={category} data-automation-template-category={category} className="flex flex-col gap-2">
           <h2 className="text-[12.5px] font-medium text-muted">{category}</h2>
           <ul className="grid gap-3 md:grid-cols-2">
             {items?.map((template) => (
-              <li key={template.key} className="flex flex-col gap-2 rounded-md border border-line p-4">
+              <li
+                key={template.key}
+                data-automation-template-card={template.key}
+                className="flex flex-col gap-2 rounded-md border border-line p-4"
+              >
                 <div className="flex flex-wrap items-baseline gap-2">
                   <span className="text-[13.5px] font-medium">{template.name}</span>
                   <span className="rounded-full bg-quiet-soft px-2 py-0.5 text-[11px] text-muted">
@@ -794,6 +841,7 @@ export function AutomationTemplatesView() {
                 <div>
                   <button
                     type="button"
+                    data-automation-template-use={template.key}
                     className="rounded-md border border-line px-2.5 py-1 text-[12px] hover:bg-quiet-soft disabled:opacity-50"
                     onClick={() => install(template.key)}
                     disabled={using === template.key || template.installable === false}

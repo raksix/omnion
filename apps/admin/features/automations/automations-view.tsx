@@ -22,6 +22,7 @@ import {
   Check,
   Copy,
   FlaskConical,
+  LayoutGrid,
   Play,
   Plus,
   Radio,
@@ -810,6 +811,16 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {/* The gallery is its own screen, so it needs a way in: a route nothing links to is
+              a screen no person reaches and no pass can enter from the panel. */}
+          <Link
+            href="/automations/templates"
+            data-automation-templates-link
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] hover:bg-quiet-soft"
+          >
+            <LayoutGrid className="h-3.5 w-3.5" aria-hidden="true" />
+            Templates
+          </Link>
           <button
             type="button"
             data-automation-refresh

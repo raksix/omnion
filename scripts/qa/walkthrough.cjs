@@ -2691,6 +2691,11 @@ async function main() {
     // creates a rule, nests a condition group, runs a test event, mints a hook URL and
     // deletes the rule again.
     { path: "/automations", name: "automations" },
+    // The operations screens of REQ-003 slice 4 — no untested screen. The gallery is its own
+    // route, and the run detail is a route with the run's id in it, so neither can appear in a
+    // static list: both are opened by the slice-4 depth pass below, which also clicks Restore on
+    // a version row, Retry on a failed step and Use this on a template.
+    { path: "/automations/templates", name: "automations-templates" },
 
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -2839,6 +2844,13 @@ async function main() {
   await runAutomationsDepth(page, report);
   log(`automations: ${JSON.stringify(report.automations)}`);
 
+  // The operations pass (REQ-003, slice 4): the run history, the run's own route with its
+  // step trace, the Versions tab with a restore, the Audit tab and the templates gallery. It
+  // runs next to the other automation passes because it creates, runs and deletes its own
+  // rule, which the count-sensitive empty-state assertions above have already read.
+  await runAutomationsOperationsDepth(page, report);
+  log(`automations-operations: ${JSON.stringify(report.automationsOperations)}`);
+
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
   // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
@@ -2855,7 +2867,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/automations", name: "automations" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/automations", name: "automations" }, { path: "/automations/templates", name: "automations-templates" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -4500,6 +4512,274 @@ async function runAutomationsApprovalsDepth(page, report) {
 }
 
 /**
+ * The automations **slice 4** pass: the operations screens.
+ *
+ * Five screens arrived with this slice and none of them can be reached from a static route
+ * list: the run detail carries a run id in its URL, and the versions and audit tabs are
+ * behind a tab strip that is only drawn for a rule that already exists. So the pass builds
+ * the state each screen needs, in the panel, and then reads the screen:
+ *
+ * * a rule whose second step always fails, run once, so the run history has a **failed** row
+ *   and the trace a failed step with "1 of 3 attempts" on it;
+ * * that run's own route, where Retry re-queues the step and the trace reloads;
+ * * the Versions tab, where a Restore **appends** rather than rewinds;
+ * * the Audit tab, which lists the create, the edit and the restore;
+ * * the gallery, where a starter is installed through the ordinary create.
+ *
+ * The rule is deleted at the end, so a pass that died half way leaves a name the next pass's
+ * sweep removes.
+ */
+async function runAutomationsOperationsDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    record({ page: "automations-operations-depth", action: "automations", ...entry });
+  };
+
+  const ruleName = `QA operations rule ${Date.now().toString(36)}`;
+
+  // ---- A rule with a step that fails, so the trace has something to say --------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-new]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.locator("[data-automation-description]").first().fill("Created by the walkthrough").catch(() => {});
+  await page.waitForTimeout(400);
+
+  // The always-failing action, with the step's own budget raised so the trace has "attempts
+  // used against attempts allowed" to print rather than a bare 1/1.
+  const kindSelect = page.locator("[data-automation-step-kind='0']").first();
+  if ((await kindSelect.count()) > 0) {
+    await kindSelect.selectOption("task").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const actionSelect = page.locator("[data-automation-step-action='0']").first();
+  if ((await actionSelect.count()) > 0) {
+    await actionSelect.selectOption("fail").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const paramsBox = page.locator("[data-automation-step-params='0']").first();
+  if ((await paramsBox.count()) > 0) {
+    await paramsBox.fill(JSON.stringify({ message: "deliberate QA failure" }, null, 2)).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await page.locator("[data-automation-step-name='0']").first().fill("a step that always fails").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const savedNotice = (await page.locator("[data-automation-notice]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "rule-saved", saved: savedNotice.length > 0, notice: savedNotice.slice(0, 110) });
+  await shot(page, "page-automations-operations-editor");
+
+  // ---- Run it, and read the run history ---------------------------------------------------
+  await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .click({ timeout: 8000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+  const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
+  if (runNowVisible) {
+    await page.locator("[data-automation-run-now]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+  }
+  await page.locator("[data-automation-tab='runs']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const runRows = await page.locator("[data-automation-run-row]").count();
+  const runStatus = await page
+    .locator("[data-automation-run-row]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "run-history",
+    runNowVisible,
+    rows: runRows,
+    hasRun: runRows > 0,
+    showsFailure: /fail/i.test(runStatus),
+  });
+  await shot(page, "page-automations-operations-runs");
+
+  // ---- The run's own route: the trace ----------------------------------------------------
+  await page.locator("[data-automation-run-open]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const traceUrl = page.url();
+  const traceSteps = await page.locator("[data-automation-trace-step]").count();
+  const attemptsText = (await page.locator("[data-automation-trace-attempts]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  const stepError = (await page.locator("[data-automation-trace-step-error]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // The criterion the request names by name: the step prints its attempts used against
+  // attempts allowed. "1 of 3" is the shape; a bare number is not.
+  const showsAttempts = /\d+\s+of\s+\d+/.test(attemptsText);
+  note({
+    step: "trace",
+    route: traceUrl.replace(URL_ADMIN, ""),
+    steps: traceSteps,
+    attempts: attemptsText.slice(0, 60),
+    showsAttempts,
+    namesTheFailure: /deliberate QA failure/.test(stepError),
+  });
+  await shot(page, "page-automations-operations-trace");
+
+  // The payload disclosure, because a collapsed panel that never opens is a hidden feature.
+  const payloadButton = page.locator("[data-automation-trace-payload]").first();
+  if ((await payloadButton.count()) > 0) {
+    await payloadButton.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  note({
+    step: "trace-payload",
+    opened: await payloadButton.getAttribute("aria-expanded").catch(() => null),
+  });
+
+  // ---- Retry: the one control the trace offers, on the step that failed -------------------
+  const retry = page.locator("[data-automation-trace-retry]").first();
+  const retryVisible = (await retry.count()) > 0;
+  if (retryVisible) {
+    await retry.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+  }
+  const retryError = (await page.locator("[data-automation-trace-error]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({
+    step: "retry",
+    offered: retryVisible,
+    accepted: retryError.length === 0,
+    error: retryError.slice(0, 110),
+  });
+  await shot(page, "page-automations-operations-trace-after-retry");
+
+  // ---- The Versions tab: a restore appends, it does not rewind ----------------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .click({ timeout: 8000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+  await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const versionRows = await page.locator("[data-automation-version-row]").count();
+  // The rule has one write so far. A second one gives the restore something to restore.
+  await page.locator("[data-automation-description]").first().fill("Edited by the walkthrough").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const versionsAfterEdit = await page.locator("[data-automation-version-row]").count();
+  const restoreButtons = await page.locator("[data-automation-version-restore]").count();
+  let restoreNotice = "";
+  if (restoreButtons > 0) {
+    await page.locator("[data-automation-version-restore]").last().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+    restoreNotice = (
+      await page.locator("[data-automation-versions-notice]").first().innerText().catch(() => "")
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  const versionsAfterRestore = await page.locator("[data-automation-version-row]").count();
+  note({
+    step: "versions",
+    rowsAfterCreate: versionRows,
+    rowsAfterEdit: versionsAfterEdit,
+    rowsAfterRestore: versionsAfterRestore,
+    restoreOffered: restoreButtons,
+    // The history is a line, not a rewind: a restore adds a version rather than removing one.
+    appended: versionsAfterRestore > versionsAfterEdit,
+    notice: restoreNotice.slice(0, 130),
+  });
+  await shot(page, "page-automations-operations-versions");
+
+  // ---- The Audit tab: the create, the edit and the restore are all listed -------------------
+  await page.locator("[data-automation-tab='audit']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const auditRows = await page.locator("[data-automation-audit-row]").count();
+  const auditActions = await page
+    .locator("[data-automation-audit-row]")
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-automation-audit-row")).filter(Boolean));
+  note({
+    step: "audit",
+    rows: auditRows,
+    actions: [...new Set(auditActions)].join(", "),
+    listsTheCreate: auditActions.includes("automation.created"),
+    listsTheEdit: auditActions.includes("automation.updated"),
+  });
+  await shot(page, "page-automations-operations-audit");
+
+  // ---- The gallery: a starter installs through the ordinary create -------------------------
+  await page.goto(`${URL_ADMIN}/automations/templates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-templates]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const cards = await page.locator("[data-automation-template-card]").count();
+  const categories = await page.locator("[data-automation-template-category]").count();
+  // A template whose own credential is missing says so on the card and refuses to install, so
+  // the pass presses the first *installable* one rather than the first one it sees.
+  const installable = page.locator('[data-automation-template-use]:not([disabled])').first();
+  const installVisible = (await installable.count()) > 0;
+  if (installVisible) {
+    await installable.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+  }
+  const templateNotice = (
+    await page.locator("[data-automation-templates-notice]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  const templateError = (
+    await page.locator("[data-automation-templates-error]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  note({
+    step: "templates",
+    cards,
+    categories,
+    // Six starters is the request's own number; anything less means the gallery lost one.
+    offersSix: cards >= 6,
+    installOffered: installVisible,
+    installed: /is created and paused/.test(templateNotice),
+    notice: templateNotice.slice(0, 130),
+    error: templateError.slice(0, 110),
+  });
+  await shot(page, "page-automations-operations-templates");
+
+  // ---- And the installed starter is a real rule on the list, not a gallery-only object -----
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const listed = await page.locator("[data-automation-row]").count();
+  note({ step: "installed-listed", rows: listed });
+  await shot(page, "page-automations-operations-list");
+
+  // ---- Cleanup: this pass owns every rule it named, plus the one it installed -------------
+  for (const name of [ruleName]) {
+    const row = page.locator("[data-automation-row] a", { hasText: name }).first();
+    if ((await row.count()) === 0) continue;
+    await row.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-automation-delete-input]").first().fill(name).catch(() => {});
+    await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  note({ step: "cleanup", removed: ruleName });
+
+  report.automationsOperations = { steps, ruleName };
+  log(`automations-operations: ${JSON.stringify(steps)}`);
+}
+
+/**
  * The depth passes that `--only=<name>` can run on their own.
  *
  * The key is the pass's own name minus the `Depth` suffix (`automations` for
@@ -4511,6 +4791,9 @@ const DEPTH_PASSES = {
   automations: (page, report) => runAutomationsDepth(page, report),
   automationsactions: (page, report) => runAutomationsActionsDepth(page, report),
   automationsapprovals: (page, report) => runAutomationsApprovalsDepth(page, report),
+  // The operations pass (REQ-003, slice 4) — the five screens that cannot be reached from a
+  // static route list, so the pass builds the state they read and then reads them.
+  automationsoperations: (page, report) => runAutomationsOperationsDepth(page, report),
   analytics: (page, report) => runAnalyticsDepth(page, report),
   search: (page, report) => runSearchDepth(page, report),
   iamroles: (page, report) => runIamRolesDepth(page, report),
