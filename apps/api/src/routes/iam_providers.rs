@@ -255,10 +255,8 @@ pub async fn list_providers(
     let rows = list
         .iter()
         .map(|provider| {
-            let (sign_in_count, last_sign_in_at) = summaries
-                .get(&provider.id)
-                .cloned()
-                .unwrap_or((0, None));
+            let (sign_in_count, last_sign_in_at) =
+                summaries.get(&provider.id).cloned().unwrap_or((0, None));
             ProviderBody::new(provider, sign_in_count, last_sign_in_at)
         })
         .collect::<Vec<_>>();
@@ -308,7 +306,9 @@ pub async fn create_provider(
     })?;
     if let Some(reference) = body.secret_ref.as_deref().map(str::trim)
         && !reference.is_empty()
-        && !reference.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !reference
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
         return Err(ApiError::bad_request(
             "invalid_request",
@@ -318,7 +318,10 @@ pub async fn create_provider(
     }
 
     let scopes = if body.scopes.is_empty() {
-        default_scopes(kind).iter().map(|scope| (*scope).to_owned()).collect()
+        default_scopes(kind)
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect()
     } else {
         body.scopes
     };
@@ -372,7 +375,10 @@ pub async fn create_provider(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(ProviderBody::new(&created, 0, None))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ProviderBody::new(&created, 0, None)),
+    ))
 }
 
 /// Change a provider's mutable fields.
@@ -405,11 +411,13 @@ pub async fn update_provider(
         },
     )
     .await?
-    .ok_or_else(|| ApiError::new(
+    .ok_or_else(|| {
+        ApiError::new(
             StatusCode::NOT_FOUND,
             "provider_not_found",
             "no such provider",
-        ))?;
+        )
+    })?;
 
     record(
         &state,
@@ -497,7 +505,18 @@ pub async fn list_provider_events(
     let provider = load(&state, &current, id).await?;
     let limit = query.event_limit.unwrap_or(25).clamp(1, MAX_EVENT_PAGE);
 
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<Uuid>, String, Option<String>, Option<String>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<Uuid>,
+            String,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         "select outcome, reason, external_subject, user_id, \
                 array_to_string(roles_applied, ', '), ip_address::text, created_at::text \
          from auth_provider_events where provider_id = $1 \
@@ -511,20 +530,24 @@ pub async fn list_provider_events(
 
     let events = rows
         .into_iter()
-        .map(|(outcome, reason, subject, user_id, roles, ip, created_at)| {
-            json!({
-                "outcome": outcome,
-                "reason": reason,
-                "external_subject": subject,
-                "user_id": user_id,
-                "roles_applied": roles,
-                "ip_address": ip,
-                "created_at": created_at,
-            })
-        })
+        .map(
+            |(outcome, reason, subject, user_id, roles, ip, created_at)| {
+                json!({
+                    "outcome": outcome,
+                    "reason": reason,
+                    "external_subject": subject,
+                    "user_id": user_id,
+                    "roles_applied": roles,
+                    "ip_address": ip,
+                    "created_at": created_at,
+                })
+            },
+        )
         .collect::<Vec<_>>();
 
-    Ok(Json(json!({ "provider_id": provider.id, "events": events })))
+    Ok(Json(
+        json!({ "provider_id": provider.id, "events": events }),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -539,11 +562,13 @@ async fn load(
 ) -> Result<AuthProvider, ApiError> {
     let provider = providers::find_provider(state.db().pool(), id)
         .await?
-        .ok_or_else(|| ApiError::new(
-            StatusCode::NOT_FOUND,
-            "provider_not_found",
-            "no such provider",
-        ))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                "no such provider",
+            )
+        })?;
     resolve_organization(current, Some(provider.organization_id))?;
     Ok(provider)
 }
@@ -645,7 +670,9 @@ async fn test_oidc(
         Err(error) => {
             return (
                 "failed",
-                format!("the discovery document is fine, but its signing keys are not readable: {error}"),
+                format!(
+                    "the discovery document is fine, but its signing keys are not readable: {error}"
+                ),
                 Some(endpoints_json(&discovery)),
             );
         }
@@ -679,7 +706,10 @@ async fn test_oidc(
 /// SAML has no discovery: every endpoint is entered, so the test is a *parse* of what is
 /// configured — which is exactly the failure an operator hits first (a certificate copied with
 /// its BEGIN line missing, or a base64 blob that lost its wrapping).
-fn test_saml(provider: &AuthProvider, secret_present: bool) -> (&'static str, String, Option<Value>) {
+fn test_saml(
+    provider: &AuthProvider,
+    secret_present: bool,
+) -> (&'static str, String, Option<Value>) {
     let text = |field: &str| {
         provider
             .config
@@ -748,8 +778,7 @@ fn test_saml(provider: &AuthProvider, secret_present: bool) -> (&'static str, St
     let note = if secret_present {
         String::new()
     } else {
-        " (SAML usually needs no client secret — the certificate is the credential)"
-            .to_owned()
+        " (SAML usually needs no client secret — the certificate is the credential)".to_owned()
     };
     (
         "ok",
@@ -825,7 +854,10 @@ mod tests {
         };
         let body = ProviderBody::new(&provider, 0, None);
         assert_eq!(body.secret_ref.as_deref(), Some("OMNION_SSO_TEST_PRESENT"));
-        assert!(!body.secret_present, "the variable is not set in this process");
+        assert!(
+            !body.secret_present,
+            "the variable is not set in this process"
+        );
         let encoded = serde_json::to_string(&body).expect("the body serializes");
         assert!(!encoded.contains("client_secret"));
     }

@@ -80,13 +80,8 @@ pub fn hash_state(state: &str) -> String {
 fn random_token() -> String {
     let mut bytes = [0_u8; 64];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        bytes,
-    );
-    encoded[..STATE_BYTES * 2]
-        .trim_end_matches('=')
-        .to_owned()
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
+    encoded[..STATE_BYTES * 2].trim_end_matches('=').to_owned()
 }
 
 /// Write a challenge for a provider and hand back its `state`.
@@ -122,11 +117,8 @@ pub async fn issue(
     .fetch_optional(pool)
     .await?;
 
-    row.map(|challenge| IssuedChallenge {
-        challenge,
-        state,
-    })
-    .ok_or_else(|| IdentityError::InvalidProvider("the sign-in could not be started".into()))
+    row.map(|challenge| IssuedChallenge { challenge, state })
+        .ok_or_else(|| IdentityError::InvalidProvider("the sign-in could not be started".into()))
 }
 
 /// Find a live challenge for a provider by the state the browser presented.
@@ -135,13 +127,11 @@ pub async fn issue(
 /// to sign in: an expired challenge (they waited), an unknown one (the state was not ours — a
 /// forged or already-consumed callback) and a provider mismatch (a callback aimed at another
 /// provider) are three different problems.
-pub async fn claim(
-    pool: &PgPool,
-    provider_id: Uuid,
-    state: &str,
-) -> Result<SsoChallenge> {
+pub async fn claim(pool: &PgPool, provider_id: Uuid, state: &str) -> Result<SsoChallenge> {
     if state.trim().is_empty() {
-        return Err(IdentityError::InvalidProvider("the sign-in state is missing".into()));
+        return Err(IdentityError::InvalidProvider(
+            "the sign-in state is missing".into(),
+        ));
     }
 
     let row = sqlx::query_as::<_, SsoChallenge>(&format!(
@@ -155,7 +145,9 @@ pub async fn claim(
     .await?;
 
     let challenge = row.ok_or_else(|| {
-        IdentityError::InvalidProvider("this sign-in link is not valid any more — start again".into())
+        IdentityError::InvalidProvider(
+            "this sign-in link is not valid any more — start again".into(),
+        )
     })?;
 
     if challenge.consumed_at.is_some() {

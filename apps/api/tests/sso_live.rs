@@ -216,7 +216,9 @@ impl Fixture {
             }
         };
         db.migrate().await.expect("migrations must apply");
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
         let state = AppState::new(
@@ -294,7 +296,6 @@ impl Fixture {
         .fetch_one(db.pool())
         .await
         .expect("the test organization must be created");
-
 
         let owner = users::create_user(
             db.pool(),
@@ -462,11 +463,7 @@ async fn authorization_target(url: &str) -> String {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("a client");
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .expect("the stub must answer");
+    let response = client.get(url).send().await.expect("the stub must answer");
     assert_eq!(
         response.status().as_u16(),
         302,
@@ -484,9 +481,7 @@ async fn authorization_target(url: &str) -> String {
     let path_and_query = location
         .split_once("://")
         .and_then(|(_, rest)| rest.find('/').map(|index| &rest[index..]))
-        .unwrap_or_else(|| {
-            panic!("the provider did not redirect to an absolute URL: {location}")
-        });
+        .unwrap_or_else(|| panic!("the provider did not redirect to an absolute URL: {location}"));
     assert!(
         path_and_query.starts_with("/api/v1/auth/sso/"),
         "the provider must redirect to this application's own callback: {location}"
@@ -495,11 +490,7 @@ async fn authorization_target(url: &str) -> String {
 }
 
 /// Connect a provider, publish it, and return its id.
-async fn connect(
-    fixture: &Fixture,
-    cookie: &str,
-    body: Value,
-) -> (Uuid, Uuid) {
+async fn connect(fixture: &Fixture, cookie: &str, body: Value) -> (Uuid, Uuid) {
     let created = call(
         &fixture.state,
         session_request(
@@ -510,9 +501,20 @@ async fn connect(
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "connect: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "connect: {}",
+        created.body
+    );
     let provider_id: Uuid = Uuid::parse_str(created.body["id"].as_str().expect("an id")).unwrap();
-    (provider_id, created.body["organization_id"].as_str().and_then(|v| Uuid::parse_str(v).ok()).unwrap_or(fixture.organization_id))
+    (
+        provider_id,
+        created.body["organization_id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .unwrap_or(fixture.organization_id),
+    )
 }
 
 /// Turn a provider on, as an administrator does once the wiring is right.
@@ -527,7 +529,12 @@ async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "publish: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "publish: {}",
+        response.body
+    );
 }
 
 /// Walk a full OIDC sign-in: `start` → the provider's own authorization endpoint → `callback`.
@@ -559,7 +566,8 @@ async fn oidc_sign_in(fixture: &Fixture, idp: &StubIdp, slug: &str) -> TestRespo
 
     // The PKCE challenge is ours; the provider has to be told which identity to assert, so it is
     // told the challenge it was actually sent.
-    let challenge = query_value(&authorization_url, "code_challenge").expect("PKCE must ride the URL");
+    let challenge =
+        query_value(&authorization_url, "code_challenge").expect("PKCE must ride the URL");
     idp.expect_identity(
         "stub-user-1",
         "sso-live-subject@omnion.test",
@@ -687,7 +695,11 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     );
 
     // ---- 3. The session is real: it authenticates as the provisioned person ------------------
-    let value = session_value(&response.set_cookie.expect("a completed sign-in sets a session"));
+    let value = session_value(
+        &response
+            .set_cookie
+            .expect("a completed sign-in sets a session"),
+    );
     let me = call(
         &fixture.state,
         session_request(
@@ -698,7 +710,12 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(me.status, StatusCode::OK, "the session must work: {}", me.body);
+    assert_eq!(
+        me.status,
+        StatusCode::OK,
+        "the session must work: {}",
+        me.body
+    );
     assert_eq!(
         me.body["user"]["email"],
         json!("sso-live-subject@omnion.test"),
@@ -757,7 +774,10 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
         "the authorization request carried exactly one PKCE challenge"
     );
     assert!(
-        observations.challenges.iter().all(|value| !value.is_empty()),
+        observations
+            .challenges
+            .iter()
+            .all(|value| !value.is_empty()),
         "a `code` flow must use PKCE, and the challenge must be there"
     );
     assert!(
@@ -822,7 +842,12 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "replay: {}", replay.body);
+    assert_eq!(
+        replay.status,
+        StatusCode::BAD_REQUEST,
+        "replay: {}",
+        replay.body
+    );
     assert_eq!(
         replay.body["error"]["code"],
         json!("invalid_state"),
@@ -955,7 +980,11 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
         form_request(
             "/api/v1/auth/sso/stub-saml/callback",
             &fixture.host,
-            &format!("SAMLResponse={}&RelayState={}", form_encode(&encoded), form_encode(&posted_state)),
+            &format!(
+                "SAMLResponse={}&RelayState={}",
+                form_encode(&encoded),
+                form_encode(&posted_state)
+            ),
         ),
     )
     .await;
@@ -974,7 +1003,11 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
         "the session belongs to the person the assertion described"
     );
 
-    let value = session_value(&callback.set_cookie.expect("a completed sign-in sets a session"));
+    let value = session_value(
+        &callback
+            .set_cookie
+            .expect("a completed sign-in sets a session"),
+    );
     let me = call(
         &fixture.state,
         session_request(
@@ -985,7 +1018,12 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(me.status, StatusCode::OK, "the session must work: {}", me.body);
+    assert_eq!(
+        me.status,
+        StatusCode::OK,
+        "the session must work: {}",
+        me.body
+    );
     assert_eq!(me.body["user"]["email"], json!("sso-live-saml@omnion.test"));
     let user_id: Uuid = Uuid::parse_str(me.body["user"]["id"].as_str().unwrap()).unwrap();
 
@@ -1050,7 +1088,11 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
         form_request(
             "/api/v1/auth/sso/stub-saml/callback",
             &fixture.host,
-            &format!("SAMLResponse={}&RelayState={}", form_encode(&tampered), form_encode(&second_posted)),
+            &format!(
+                "SAMLResponse={}&RelayState={}",
+                form_encode(&tampered),
+                form_encode(&second_posted)
+            ),
         ),
     )
     .await;
@@ -1069,7 +1111,11 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
         form_request(
             "/api/v1/auth/sso/stub-saml/callback",
             &fixture.host,
-            &format!("SAMLResponse={}&RelayState={}", form_encode(&encoded), form_encode(&second_state)),
+            &format!(
+                "SAMLResponse={}&RelayState={}",
+                form_encode(&encoded),
+                form_encode(&second_state)
+            ),
         ),
     )
     .await;

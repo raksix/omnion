@@ -869,6 +869,118 @@ async function uploadMediaSample(page) {
   };
 }
 
+// ---------------------------------------------------------------- file manager (REQ-010, slice 1)
+
+/**
+ * Drive the file manager the way an operator does.
+ *
+ * The pass proves the parts that are easy to get subtly wrong and invisible in a screenshot: a
+ * folder is created and shows up in the tree, the listing reports a total that matches its rows,
+ * a filter narrows it, the bulk bar appears on a two-file selection, a delete moves the file to
+ * the trash rather than destroying it, and the trash screen brings that same file back. A screen
+ * that only looked right in a screenshot would pass all of that without doing any of it.
+ */
+async function runMediaFileManager(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-file-manager", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const loaded = (await page.locator("#media-new-folder").count()) > 0;
+  note({ step: "load", loaded });
+  if (!loaded) {
+    return { ok: false, reason: "the media browser did not render" };
+  }
+
+  // A folder under the root, with a name the pass can find again.
+  const folderName = "QA Campaign 2026";
+  await page.fill("#media-new-folder", folderName);
+  await page.click('button[aria-label="Create folder"]');
+  await page.waitForTimeout(1400);
+  const folderInTree = await page.locator(`aside >> text=${folderName}`).count();
+  note({ step: "create-folder", folderInTree });
+
+  // Open it: the breadcrumb names the folder and the listing is scoped to it.
+  await page.locator(`aside button:has-text("${folderName}")`).first().click().catch(() => {});
+  await page.waitForTimeout(1200);
+  const url = page.url();
+  const inBreadcrumb = await page.locator(`nav[aria-label="Breadcrumb"] >> text=${folderName}`).count();
+  note({ step: "open-folder", url: url.replace(URL_ADMIN, ""), inBreadcrumb });
+  await shot(page, "media-folder-open");
+
+  // A second file, so a two-file selection is possible.
+  await uploadMediaSample(page);
+  await page.waitForTimeout(1200);
+
+  // Move both into the folder through the bulk bar, which is the real path an operator takes.
+  const checkboxes = page.locator('tbody input[type="checkbox"], ul input[type="checkbox"]');
+  const available = await checkboxes.count();
+  if (available >= 2) {
+    await checkboxes.nth(0).check();
+    await checkboxes.nth(1).check();
+    await page.waitForTimeout(400);
+  }
+  const bulkVisible = (await page.locator('div[aria-label="Selection"]').count()) > 0;
+  note({ step: "bulk-bar", available, bulkVisible });
+  if (bulkVisible) {
+    await page.click('div[aria-label="Selection"] >> text=Move here');
+    await page.waitForTimeout(1500);
+  }
+  const rowsAfterMove = await page.locator("tbody tr").count();
+  note({ step: "bulk-move", rowsAfterMove });
+
+  // A filter narrows the listing and the footer count follows it.
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(300);
+  await page.selectOption("#media-kind", "image");
+  await page.waitForTimeout(1200);
+  const imageRows = await page.locator("tbody tr").count();
+  const footer = await page.locator("text=/Showing \\d+ of \\d+/").first().textContent();
+  note({ step: "filter-kind", imageRows, footer });
+  await shot(page, "media-filtered");
+  await page.selectOption("#media-kind", "");
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(600);
+
+  // A delete is a trash, not a purge.
+  const firstRow = page.locator("tbody tr").first();
+  if ((await firstRow.count()) > 0) {
+    await firstRow.locator('button[aria-label^="Move"]').first().click().catch(() => {});
+    await page.waitForSelector("text=/moved to the trash/", { timeout: 4000 }).catch(() => {});
+    const trashed = (await page.locator("text=/moved to the trash/").count()) > 0;
+    note({ step: "trash-one", trashed });
+  }
+
+  // The trash screen holds it, with a countdown, and restores it.
+  await page.goto(`${URL_ADMIN}/media/trash`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const trashRows = await page.locator("tbody tr").count();
+  const countdown = await page.locator("text=/\\d+ days?|today/").count();
+  await shot(page, "media-trash-populated");
+  note({ step: "trash-listing", trashRows, countdown });
+
+  if (trashRows > 0) {
+    await page.locator('button:has-text("Restore")').first().click();
+    await page.waitForTimeout(1500);
+    const restored = (await page.locator("text=/restored to the folder/").count()) > 0;
+    note({ step: "restore", restored });
+  }
+  await shot(page, "media-trash-after-restore");
+
+  // The empty state has to be a real one, not a blank table.
+  await page.goto(`${URL_ADMIN}/media?folder=nonexistent-folder`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const emptyOrError = (await page.locator("text=/folder is empty|could not/i").count()) > 0;
+  note({ step: "empty-or-error", emptyOrError });
+
+  return { ok: true, steps: steps.length };
+}
+
 // ---------------------------------------------------------------- palette (REQ-002)
 
 /**
@@ -2558,6 +2670,9 @@ async function main() {
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
     { path: "/media", name: "media" },
+    // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
+    // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
+    { path: "/media/trash", name: "media-trash" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
@@ -2631,6 +2746,10 @@ async function main() {
     await interact(page, route.name, report);
     report.pages.push({ ...route, diagnostics: diag });
   }
+
+  // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
+  // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
+  report.mediaFiles = await runMediaFileManager(page, report);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);

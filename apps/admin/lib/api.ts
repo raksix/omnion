@@ -6,6 +6,13 @@
  */
 import type {
   Media,
+  MediaBulkResult,
+  MediaFile,
+  MediaFilePage,
+  MediaFilters,
+  MediaFolder,
+  MediaFolderTree,
+  MediaTrash,
   OnboardingStatus,
   Organization,
   OwnerSetupResult,
@@ -320,6 +327,129 @@ export function deleteMedia(mediaId: string): Promise<null> {
 /** Browser URL of one file's bytes, read with the session cookie. */
 export function mediaRawUrl(mediaId: string): string {
   return `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// File manager (docs/requests/REQ-010, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build a query string from the filters that are actually set. */
+function mediaQuery(siteId: string, filters: MediaFilters = {}): string {
+  const params = new URLSearchParams({ site_id: siteId });
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "" || value === false) {
+      continue;
+    }
+    params.set(key, value === true ? "true" : String(value));
+  }
+  return params.toString();
+}
+
+/** The folder tree of a site, with the file count of every folder. */
+export function fetchMediaFolders(siteId: string): Promise<MediaFolderTree> {
+  return request<MediaFolderTree>(`/api/v1/media/folders?${mediaQuery(siteId)}`);
+}
+
+/** Create one folder under a parent (the root when `parentId` is omitted). */
+export function createMediaFolder(
+  siteId: string,
+  name: string,
+  parentId?: string,
+): Promise<MediaFolder> {
+  return request<MediaFolder>(`/api/v1/media/folders`, {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId, name, parent_id: parentId ?? null }),
+  });
+}
+
+/** Rename, move, or both — omit a field to leave it as it is. */
+export function moveMediaFolder(
+  folderId: string,
+  change: { name?: string; parent_id?: string | null },
+): Promise<MediaFolder> {
+  return request<MediaFolder>(`/api/v1/media/folders/${encodeURIComponent(folderId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(change),
+  });
+}
+
+/** Delete one empty folder; a folder that still holds something is refused. */
+export function deleteMediaFolder(folderId: string): Promise<null> {
+  return request<null>(`/api/v1/media/folders/${encodeURIComponent(folderId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** One page of the browser listing. */
+export function fetchMediaFiles(
+  siteId: string,
+  filters: MediaFilters = {},
+): Promise<MediaFilePage> {
+  return request<MediaFilePage>(`/api/v1/media/files?${mediaQuery(siteId, filters)}`);
+}
+
+/** Rename, move or edit the metadata of one file. */
+export function updateMediaFile(
+  fileId: string,
+  patch: {
+    filename?: string;
+    alt_text?: string;
+    caption?: string;
+    description?: string;
+    tags?: string[];
+    folder_id?: string | null;
+  },
+): Promise<MediaFile> {
+  return request<MediaFile>(`/api/v1/media/files/${encodeURIComponent(fileId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/** Move one file to the trash. The bytes stay until it is purged. */
+export function trashMediaFile(fileId: string): Promise<MediaFile> {
+  return request<MediaFile>(`/api/v1/media/files/${encodeURIComponent(fileId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Bring one file back from the trash. */
+export function restoreMediaFile(fileId: string): Promise<MediaFile> {
+  return request<MediaFile>(`/api/v1/media/files/${encodeURIComponent(fileId)}/restore`, {
+    method: "POST",
+  });
+}
+
+/** Purge one file for good: the bytes and the row. */
+export function purgeMediaFile(fileId: string): Promise<null> {
+  return request<null>(`/api/v1/media/files/${encodeURIComponent(fileId)}/purge`, {
+    method: "POST",
+  });
+}
+
+/** The trash of a site, with the countdown on every row. */
+export function fetchMediaTrash(siteId: string): Promise<MediaTrash> {
+  return request<MediaTrash>(`/api/v1/media/trash?${mediaQuery(siteId)}`);
+}
+
+/** Purge every trashed file of a site. */
+export function emptyMediaTrash(siteId: string): Promise<MediaBulkResult> {
+  return request<MediaBulkResult>(`/api/v1/media/trash/empty?${mediaQuery(siteId)}`, {
+    method: "POST",
+  });
+}
+
+/** One bulk action over a selection. */
+export function mediaBulkAction(
+  siteId: string,
+  action: "move" | "tag" | "delete" | "restore" | "purge",
+  ids: string[],
+  options: { folder_id?: string | null; tags?: string[] } = {},
+): Promise<MediaBulkResult> {
+  return request<MediaBulkResult>(`/api/v1/media/bulk`, {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId, action, ids, ...options }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------

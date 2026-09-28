@@ -80,7 +80,11 @@ pub struct Provisioned {
 /// names one the environment does not define, is a **configuration** error — never a silent
 /// "no secret", which would look like a signing failure at the provider.
 pub fn resolve_client_secret(provider: &AuthProvider) -> Result<Option<String>> {
-    let Some(reference) = provider.secret_ref.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    let Some(reference) = provider
+        .secret_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     else {
         return Ok(None);
     };
@@ -253,14 +257,12 @@ pub async fn mark_as_jit(pool: &PgPool, user_id: Uuid) -> Result<bool> {
 
 /// When a JIT account was last seen through a provider, for the user detail screen.
 pub async fn last_provider_seen(pool: &PgPool, user_id: Uuid) -> Result<Option<OffsetDateTime>> {
-    Ok(
-        sqlx::query_scalar::<_, OffsetDateTime>(
-            "select (attributes ->> 'sso_last_seen_at')::timestamptz from users where id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?,
+    Ok(sqlx::query_scalar::<_, OffsetDateTime>(
+        "select (attributes ->> 'sso_last_seen_at')::timestamptz from users where id = $1",
     )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 #[cfg(test)]
@@ -294,7 +296,11 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
-        assert!(resolve_client_secret(&provider).expect("no reference is not an error").is_none());
+        assert!(
+            resolve_client_secret(&provider)
+                .expect("no reference is not an error")
+                .is_none()
+        );
     }
 
     #[test]
@@ -340,6 +346,10 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
-        assert!(resolve_client_secret(&provider).expect("blank is not a reference").is_none());
+        assert!(
+            resolve_client_secret(&provider)
+                .expect("blank is not a reference")
+                .is_none()
+        );
     }
 }

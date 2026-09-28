@@ -118,9 +118,11 @@ fn resolve_email(
         }
     }
 
-    let email = candidate.map(|value| value.trim().to_owned()).ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion carries no email address".into())
-    })?;
+    let email = candidate
+        .map(|value| value.trim().to_owned())
+        .ok_or_else(|| {
+            IdentityError::InvalidProvider("the assertion carries no email address".into())
+        })?;
 
     if !email.contains('@') || email.starts_with('@') || email.ends_with('@') || email.contains(' ')
     {
@@ -366,7 +368,10 @@ mod tests {
             None,
             None,
         );
-        assert!(broken.is_err(), "a malformed address must not provision an account");
+        assert!(
+            broken.is_err(),
+            "a malformed address must not provision an account"
+        );
     }
 
     #[test]
@@ -389,7 +394,10 @@ mod tests {
     fn groups_arrive_in_every_shape_a_directory_sends_them() {
         assert_eq!(collect_groups(&json!(["a", "b"])), vec!["a", "b"]);
         assert_eq!(collect_groups(&json!("a b  c")), vec!["a", "b", "c"]);
-        assert_eq!(collect_groups(&json!([["a"], ["b", "c"]])), vec!["a", "b", "c"]);
+        assert_eq!(
+            collect_groups(&json!([["a"], ["b", "c"]])),
+            vec!["a", "b", "c"]
+        );
         assert_eq!(collect_groups(&json!([])), Vec::<String>::new());
         assert_eq!(collect_groups(&json!("a, b; c")), vec!["a", "b", "c"]);
     }
@@ -478,7 +486,11 @@ mod tests {
         assert!(RoleMapping::from_value(&json!({ "role_slug": "x" })).is_err());
         assert!(RoleMapping::from_value(&json!({ "claim_value": "x" })).is_err());
         assert!(mappings_from_config(&json!({ "role_mappings": {} })).is_err());
-        assert!(mappings_from_config(&json!({})).expect("no mappings is not an error").is_empty());
+        assert!(
+            mappings_from_config(&json!({}))
+                .expect("no mappings is not an error")
+                .is_empty()
+        );
     }
 
     #[test]

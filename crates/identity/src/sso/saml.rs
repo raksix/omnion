@@ -227,18 +227,16 @@ pub fn verify_response_unverified(document: &str, config: &SamlConfig) -> Result
 
 /// Read a verified assertion's claims, refusing anything that contradicts the configuration.
 fn read_claims(element: &Element, config: &SamlConfig) -> Result<SamlAssertion> {
-    let issuer = child_text(element, "Issuer").ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion names no issuer".into())
-    })?;
+    let issuer = child_text(element, "Issuer")
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion names no issuer".into()))?;
     if issuer.trim() != config.issuer.trim() {
         return Err(IdentityError::InvalidProvider(
             "the assertion comes from a different issuer".into(),
         ));
     }
 
-    let audience = read_audience(element).ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion names no audience".into())
-    })?;
+    let audience = read_audience(element)
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion names no audience".into()))?;
     if audience.trim() != config.audience.trim() {
         return Err(IdentityError::InvalidProvider(
             "the assertion is not for this application".into(),
@@ -247,9 +245,8 @@ fn read_claims(element: &Element, config: &SamlConfig) -> Result<SamlAssertion> 
 
     check_timestamps(element)?;
 
-    let subject = read_subject_id(element).ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion names no subject".into())
-    })?;
+    let subject = read_subject_id(element)
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion names no subject".into()))?;
 
     let attributes = read_attributes(element);
     let email = attributes
@@ -373,8 +370,9 @@ fn find_signature(element: &Element) -> Option<SignatureBlock<'_>> {
     let node = find_child(element, "Signature")?;
     // `<ds:SignatureMethod Algorithm="…"/>` is an empty element: the algorithm is its attribute,
     // never its text. Reading it as text is the classic SAML mis-parse.
-    let method = find_child(node, "SignatureMethod")
-        .or_else(|| find_child(node, "SignedInfo").and_then(|info| find_child(info, "SignatureMethod")))?;
+    let method = find_child(node, "SignatureMethod").or_else(|| {
+        find_child(node, "SignedInfo").and_then(|info| find_child(info, "SignatureMethod"))
+    })?;
     let algorithm = attr(method, "Algorithm")?.to_owned();
     if !ALLOWED_ALGORITHMS.contains(&algorithm.as_str()) {
         return None;
@@ -409,11 +407,9 @@ fn enveloped_bytes(raw: &str) -> Result<Vec<u8>> {
 
     // The qualified name, then the end of the opening tag.
     let name_end = open_at
-        + raw[open_at..]
-            .find([' ', '>', '/'])
-            .ok_or_else(|| {
-                IdentityError::InvalidProvider("the signature element is malformed".into())
-            })?;
+        + raw[open_at..].find([' ', '>', '/']).ok_or_else(|| {
+            IdentityError::InvalidProvider("the signature element is malformed".into())
+        })?;
     let name = raw[open_at..name_end].trim_start_matches('<');
     let body_start = raw[open_at..]
         .find('>')
@@ -449,8 +445,8 @@ fn signed_info_bytes(raw: &str) -> Option<Vec<u8>> {
 
 /// The `URI` of the reference the signature covers.
 fn signed_info_reference(signature: &Element) -> Option<String> {
-    let reference = find_child(signature, "SignedInfo")
-        .and_then(|info| find_child(info, "Reference"))?;
+    let reference =
+        find_child(signature, "SignedInfo").and_then(|info| find_child(info, "Reference"))?;
     Some(attr(reference, "URI")?.to_owned())
 }
 
@@ -460,8 +456,8 @@ fn signed_info_reference(signature: &Element) -> Option<String> {
 /// on its own is not well-formed XML (it uses the `ds:` prefix without declaring it), so parsing
 /// the fragment would fail on a perfectly valid assertion.
 fn signed_info_digest(signature: &Element) -> Option<Vec<u8>> {
-    let reference = find_child(signature, "SignedInfo")
-        .and_then(|info| find_child(info, "Reference"))?;
+    let reference =
+        find_child(signature, "SignedInfo").and_then(|info| find_child(info, "Reference"))?;
     let value = find_child(reference, "DigestValue")?;
     b64().decode(value.get_text()?.trim().as_bytes()).ok()
 }
@@ -471,8 +467,7 @@ fn signed_info_digest(signature: &Element) -> Option<Vec<u8>> {
 /// Read off the parsed opening tag rather than by scanning the raw text: the attribute map is
 /// already separated, so a value that merely contains `ID=` cannot be mistaken for the attribute.
 fn assertion_id(element: &Element) -> Option<String> {
-    attr(element, "ID")
-        .map(|value| value.trim_start_matches('#').to_owned())
+    attr(element, "ID").map(|value| value.trim_start_matches('#').to_owned())
 }
 
 /// Verify a posted assertion's signature — both halves of the binding.
@@ -482,9 +477,9 @@ fn verify_signature(
     element: &Element,
     config: &SamlConfig,
 ) -> Result<()> {
-    let signature = b64().decode(block.signature.as_bytes()).map_err(|_| {
-        IdentityError::InvalidProvider("the signature value is not base64".into())
-    })?;
+    let signature = b64()
+        .decode(block.signature.as_bytes())
+        .map_err(|_| IdentityError::InvalidProvider("the signature value is not base64".into()))?;
     let public_key = certificate_key(&config.certificate_pem)?;
 
     let padding = if block.algorithm == ALLOWED_ALGORITHMS[1] {
@@ -495,9 +490,8 @@ fn verify_signature(
 
     // The reference must name this assertion (or the whole document). A reference to some other
     // element would make the digest check meaningless.
-    let reference = signed_info_reference(block.node).ok_or_else(|| {
-        IdentityError::InvalidProvider("the signature references nothing".into())
-    })?;
+    let reference = signed_info_reference(block.node)
+        .ok_or_else(|| IdentityError::InvalidProvider("the signature references nothing".into()))?;
     if !(reference.is_empty()
         || assertion_id(element) == Some(reference.trim_start_matches('#').to_owned()))
     {
@@ -508,9 +502,8 @@ fn verify_signature(
 
     // 1. The declared digest must match the referenced element — this is what makes a changed
     //    claim fail.
-    let declared = signed_info_digest(block.node).ok_or_else(|| {
-        IdentityError::InvalidProvider("the signature declares no digest".into())
-    })?;
+    let declared = signed_info_digest(block.node)
+        .ok_or_else(|| IdentityError::InvalidProvider("the signature declares no digest".into()))?;
     let computed = digest_for(&block.algorithm, &enveloped_bytes(raw)?);
     if !bool::from(computed.ct_eq(&declared)) {
         return Err(IdentityError::InvalidProvider(
@@ -548,11 +541,9 @@ fn certificate_key(pem: &str) -> Result<RsaPublicKey> {
         .flat_map(|line| line.chars())
         .filter(|character| !character.is_whitespace())
         .collect();
-    let der = b64()
-        .decode(cleaned.as_bytes())
-        .map_err(|_| {
-            IdentityError::InvalidProvider("the signing certificate is not valid base64".into())
-        })?;
+    let der = b64().decode(cleaned.as_bytes()).map_err(|_| {
+        IdentityError::InvalidProvider("the signing certificate is not valid base64".into())
+    })?;
 
     // `der`/`spki` are not needed here: the reader below walks the fixed RFC 5280 shape directly,
     // and refusing anything that does not match is safer than a lenient parser.
@@ -717,17 +708,21 @@ fn check_timestamps(element: &Element) -> Result<()> {
     };
 
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    if let Some(not_before) = attr(conditions, "NotBefore").and_then(|value| value.parse::<i64>().ok())
+    if let Some(not_before) =
+        attr(conditions, "NotBefore").and_then(|value| value.parse::<i64>().ok())
         && not_before - CLOCK_SKEW_SECONDS > now
     {
         return Err(IdentityError::InvalidProvider(
             "the assertion is not valid yet".into(),
         ));
     }
-    if let Some(until) = attr(conditions, "NotOnOrAfter").and_then(|value| value.parse::<i64>().ok())
+    if let Some(until) =
+        attr(conditions, "NotOnOrAfter").and_then(|value| value.parse::<i64>().ok())
         && until + CLOCK_SKEW_SECONDS < now
     {
-        return Err(IdentityError::InvalidProvider("the assertion has expired".into()));
+        return Err(IdentityError::InvalidProvider(
+            "the assertion has expired".into(),
+        ));
     }
 
     if attr(conditions, "NotOnOrAfter").is_none() && attr(conditions, "NotBefore").is_none() {
@@ -999,7 +994,13 @@ mod tests {
     fn a_probe_survives_a_configuration_that_does_not_match() {
         // The point of the probe: a mismatched entity id or audience is refused *here*, at
         // configuration time, rather than at the first real assertion.
-        let probe = probe_document("https://idp.example/saml", "https://omnion.example", "email", None, None);
+        let probe = probe_document(
+            "https://idp.example/saml",
+            "https://omnion.example",
+            "email",
+            None,
+            None,
+        );
         let wrong_audience = SamlConfig {
             issuer: "https://idp.example/saml".into(),
             audience: "https://other.example".into(),
@@ -1010,17 +1011,18 @@ mod tests {
         };
         let error = verify_response_unverified(&probe, &wrong_audience)
             .expect_err("a different audience is a configuration error");
-        assert!(error.to_string().contains("not for this application"), "{error}");
+        assert!(
+            error.to_string().contains("not for this application"),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_certificate_is_readable_only_when_it_is_a_key() {
         assert!(
-            certificate_is_readable(&der_certificate(&rsa::RsaPrivateKey::new(
-                &mut rand::rngs::OsRng,
-                2048
-            )
-            .expect("entropy")))
+            certificate_is_readable(&der_certificate(
+                &rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("entropy")
+            ))
             .is_ok()
         );
         for broken in [
@@ -1059,7 +1061,8 @@ mod tests {
             ],
         );
 
-        let verified = verify_response(&document, &config(&certificate)).expect("a valid assertion");
+        let verified =
+            verify_response(&document, &config(&certificate)).expect("a valid assertion");
         assert_eq!(verified.subject_id, "alice-subject");
         assert_eq!(verified.email, "alice@example.com");
         assert_eq!(verified.display_name.as_deref(), Some("Alice Nguyen"));
@@ -1131,7 +1134,8 @@ mod tests {
         let unsigned = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Version="2.0" ID="id-1"><saml:Issuer>https://idp.example/saml</saml:Issuer></saml:Assertion></samlp:Response>"#;
         assert!(verify_response(unsigned, &config(&certificate)).is_err());
 
-        let bomb = r#"<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;">]><samlp:Response/>"#;
+        let bomb =
+            r#"<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;">]><samlp:Response/>"#;
         assert!(verify_response(bomb, &config(&certificate)).is_err());
     }
 
@@ -1169,11 +1173,16 @@ mod tests {
     #[test]
     fn an_element_name_is_read_before_its_prefix_is_dropped() {
         assert_eq!(
-            local_name_of(r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="1">"#),
+            local_name_of(
+                r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="1">"#
+            ),
             "Assertion",
             "a colon inside an attribute value is not a namespace separator"
         );
         assert_eq!(local_name_of("<Assertion>"), "Assertion");
-        assert_eq!(local_name_of(r#"<ds:SignatureMethod Algorithm="x"/>"#), "SignatureMethod");
+        assert_eq!(
+            local_name_of(r#"<ds:SignatureMethod Algorithm="x"/>"#),
+            "SignatureMethod"
+        );
     }
 }
