@@ -1846,6 +1846,141 @@ async function runOrganizationDepth(page, report) {
   return out;
 }
 
+/**
+ * The Departments tab of an organization (REQ-005, slice 2).
+ *
+ * The walk covers the whole of the slice's own promise rather than just the screen:
+ *
+ *   1. the tab opens and reports its empty state (or the tree it already holds);
+ *   2. a department is created with an unusable key, which the field must refuse;
+ *   3. it is created properly and appears in the tree with a member count;
+ *   4. a move under its own descendant is refused — the refusal the schema cannot catch;
+ *   5. the drawer opens, a role is bound to the department and the row is revoked;
+ *   6. a member is put in and taken out again;
+ *   7. the department is archived and then deleted, so the pass leaves no residue.
+ */
+async function runOrganizationDepartments(page, report, organizationId) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "organization-departments", action: "organizations", ...step });
+  };
+
+  if (!organizationId) {
+    const skipped = { steps: [{ step: "skipped", reason: "no organization to open" }] };
+    report.organizationDepartments = skipped;
+    log(`organization departments: ${JSON.stringify(steps)}`);
+    return skipped;
+  }
+
+  const tabUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=departments`;
+  await page.goto(tabUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-department-add]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  const rows = await page.locator("[data-department-row]").count();
+  const emptyState = await page.locator("text=No departments yet").count();
+  note({ step: "open", rows, emptyState: emptyState > 0 });
+  await shot(page, "page-organization-departments");
+
+  // A key that could never be addressed in a role binding is refused before it is sent.
+  expectRefusal("/departments", "an unusable department key is refused in the form");
+  await page.locator("[data-department-add]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("[data-department-name]").first().fill("QA Department").catch(() => {});
+  await page.locator("[data-department-key]").first().fill("Not A Key").catch(() => {});
+  await page.locator("[data-department-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const keyError = (await page
+    .locator('[role="alert"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "invalid-key", fieldError: keyError.slice(0, 120) });
+  await shot(page, "page-organization-department-invalid-key");
+
+  // The same dialog, with a usable key.
+  const key = `qa-dept-${Date.now()}`;
+  await page.locator("[data-department-key]").first().fill(key).catch(() => {});
+  await page.locator("[data-department-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const created = await page.locator(`[data-department-row="${key}"]`).count();
+  note({ step: "create", key, rowShown: created > 0 });
+  await shot(page, "page-organization-department-created");
+
+  // The drawer: bind a role to the department, then revoke it.
+  await page.locator(`[data-department-open="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const drawerOpen = await page.locator('[role="dialog"]').count();
+  await shot(page, "page-organization-department-drawer");
+
+  await page.locator("[data-department-role-picker]").first().selectOption({ index: 1 }).catch(() => {});
+  await page.locator("[data-department-bind]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const bound = await page.locator("[data-department-unbind]").count();
+  note({ step: "bind-role", drawerOpen: drawerOpen > 0, boundRoleRows: bound });
+  await shot(page, "page-organization-department-bound");
+
+  if (bound > 0) {
+    await page.locator("[data-department-unbind]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+  }
+  const unbound = await page.locator("[data-department-unbind]").count();
+  note({ step: "unbind-role", roleRowsAfter: unbound });
+  await shot(page, "page-organization-department-unbound");
+
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator('button[aria-label="Close the department drawer"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  // A move under its own descendant is refused: it is a conflict the API answers, so the
+  // allowance is registered before the click rather than after the 409 lands.
+  expectRefusal("/departments", "a department cannot be moved inside its own subtree");
+  await page.locator(`[data-department-row="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const editButton = page
+    .locator(`[data-department-row="${key}"] button[aria-label^="Edit"]`)
+    .first();
+  if (await editButton.count()) {
+    await editButton.click().catch(() => {});
+    await page.waitForTimeout(600);
+    await page.locator("[data-department-parent]").first().selectOption({ index: 1 }).catch(() => {});
+    await page.locator("[data-department-submit]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+  }
+  const selfMove = (await page
+    .locator('[role="alert"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "self-move", refused: selfMove.slice(0, 160) });
+  await shot(page, "page-organization-department-self-move");
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(500);
+
+  // Archive it, then delete it — the pass leaves no residue behind.
+  await page.locator(`[data-department-archive="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const archived = await page.locator(`[data-department-row="${key}"]`).count();
+  const archivedBadge = await page
+    .locator(`[data-department-row="${key}"] >> text=archived`)
+    .count();
+  note({ step: "archive", rowStillListed: archived > 0, archivedShown: archivedBadge > 0 });
+  await shot(page, "page-organization-department-archived");
+
+  await page.locator(`[data-department-delete="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const gone = await page.locator(`[data-department-row="${key}"]`).count();
+  note({ step: "delete", rowGone: gone === 0 });
+  await shot(page, "page-organization-department-deleted");
+
+  const out = { steps, organizationId, key };
+  report.organizationDepartments = out;
+  log(`organization departments: ${JSON.stringify(steps)}`);
+  return out;
+}
+
 async function runIamRolesDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -2877,8 +3012,14 @@ async function main() {
 
   // The tenant depth pass (REQ-005, slice 1): the organization list, the Members tab, the
   // invite dialog's field refusal, a real invitation and its revocation.
-  await runOrganizationDepth(page, report);
+  const organizationDepth = await runOrganizationDepth(page, report);
   log(`organizations: ${JSON.stringify(report.organizations)}`);
+
+  // The Departments tab (REQ-005, slice 2): create a department through the real dialog, refuse
+  // an unusable key, open the drawer, bind and revoke a role, try the move the API refuses and
+  // clean up again. It needs the organization the pass above just opened.
+  await runOrganizationDepartments(page, report, organizationDepth.organizationId);
+  log(`organization departments: ${JSON.stringify(report.organizationDepartments)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.

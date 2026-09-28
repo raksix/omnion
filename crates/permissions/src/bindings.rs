@@ -247,6 +247,98 @@ pub async fn active_for_context(
         .collect())
 }
 
+/// Every binding of a subject, live ones first, plus — for a person inside a department — the
+/// bindings that department itself carries.
+///
+/// This is the read that makes department scope mean something: a role bound to a department
+/// is a grant to *the people in it*, so resolving one person's permissions inside a department
+/// has to fold in the department's bindings exactly as it folds in the groups they belong to.
+/// Without this the binding would exist, count on the Departments tab, and grant nothing —
+/// the difference between a feature and a decoration.
+///
+/// The department is taken from `context.department` and expanded through the tree, so a
+/// binding on a parent department reaches the people of its children. A binding whose subject
+/// is *not* a person is never expanded: a group is not "in" a department by virtue of existing.
+pub async fn bindings_for_in_context(
+    pool: &PgPool,
+    subject: Subject,
+    context: &ResourceContext,
+) -> Result<Vec<RoleBinding>> {
+    let mut bindings = bindings_for(pool, subject).await?;
+
+    if let (Subject::User(user_id), Some(organization_id), Some(department)) =
+        (subject, context.organization_id, context.department.as_deref())
+    {
+        // Membership is the gate, not an optimization: a role bound to a department is a grant
+        // to the people *in* it, so somebody who merely asks about a department they are not in
+        // must not pick its roles up. Without this check the department context alone would be
+        // enough to widen anyone's permissions.
+        let keys = department_scope_keys(pool, organization_id, department, user_id).await?;
+        if !keys.is_empty() {
+            let sql = format!(
+                "select {BINDING_COLUMNS} from role_bindings \
+                 where scope_type = 'department' and organization_id = $1 \
+                   and resource_id = any($2) and revoked_at is null \
+                 order by created_at desc, id desc"
+            );
+            let rows: Vec<BindingRow> = sqlx::query_as(&sql)
+                .bind(organization_id)
+                .bind(&keys)
+                .fetch_all(pool)
+                .await?;
+            for row in rows {
+                bindings.push(row.into_binding()?);
+            }
+        }
+    }
+
+    bindings.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(bindings)
+}
+
+/// The department keys that count for `user_id` inside `department`: that department and the
+/// chain of ancestors above it, but only when the account actually sits in it.
+///
+/// The walk goes **upward**, and that direction is the whole contract. A role bound to a
+/// department is a grant to the people in it, so a person in "squad" must pick up what
+/// "division" carries — inheriting from above is what lets an operator bind once at the top
+/// instead of re-binding at every leaf. Walking downward would do the opposite (a parent's
+/// request context would absorb its children's bindings), which is how it was written first.
+///
+/// The `status = 'active'` filter is what makes an archived department stop granting, without
+/// the operator having to remember to revoke its bindings; the `exists` on the membership is
+/// what keeps the grant attached to the people in the department rather than to anybody who
+/// names it.
+async fn department_scope_keys(
+    pool: &PgPool,
+    organization_id: Uuid,
+    department: &str,
+    user_id: Uuid,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "with recursive tree as ( \
+             select d.id, d.key, d.parent_id from departments d \
+              where d.organization_id = $1 and d.key = $2 and d.status = 'active' \
+                and exists (select 1 from department_members dm \
+                             where dm.department_id = d.id and dm.user_id = $3) \
+             union all \
+             select p.id, p.key, p.parent_id from departments p join tree t on p.id = t.parent_id \
+              where p.organization_id = $1 and p.status = 'active' \
+         ) \
+         select key from tree",
+    )
+    .bind(organization_id)
+    .bind(department)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Every binding of an account, live ones first (the account's own rows only).
 pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<RoleBinding>> {
     bindings_of_subject(pool, Subject::User(user_id)).await

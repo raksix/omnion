@@ -93,6 +93,7 @@ pub mod scim;
 pub mod search;
 pub mod sso;
 pub mod tenancy;
+pub mod tenancy_departments;
 pub mod tenancy_members;
 pub mod webauthn;
 pub mod webhooks;
@@ -382,6 +383,46 @@ pub fn router(state: AppState) -> Router {
 
     let organization_invitation = delete(tenancy_members::revoke_invitation)
         .layer(guards::require(&state, "organizations.manage"));
+
+    // Departments (REQ-005, slice 2). Reads ride `organizations.read`, writes
+    // `organizations.manage`; binding a role to a department is an IAM change, so it asks for
+    // `iam.bindings.manage` as well rather than being reachable by a tenant administrator alone.
+    let organization_departments = get(tenancy_departments::list_departments)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            post(tenancy_departments::create_department)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+    let organization_department = get(tenancy_departments::get_department)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            patch(tenancy_departments::update_department)
+                .layer(guards::require(&state, "organizations.manage")),
+        )
+        .merge(
+            post(tenancy_departments::archive_department)
+                .layer(guards::require(&state, "organizations.manage")),
+        )
+        .merge(
+            delete(tenancy_departments::delete_department)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+    let department_members = post(tenancy_departments::add_department_member)
+        .layer(guards::require(&state, "organizations.manage"))
+        .merge(
+            delete(tenancy_departments::remove_department_member)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+    let department_roles = post(tenancy_departments::bind_department_role)
+        .layer(guards::require(&state, "organizations.manage"))
+        .layer(guards::require(&state, "iam.bindings.manage"))
+        .merge(
+            delete(tenancy_departments::unbind_department_role)
+                .layer(guards::require(&state, "organizations.manage"))
+                .layer(guards::require(&state, "iam.bindings.manage")),
+        );
+    let member_departments = get(tenancy_departments::list_member_departments)
+        .layer(guards::require(&state, "organizations.read"));
 
     // The switcher's two routes are session-scoped by design (the request's own table says
     // "session only"): they only ever return the caller's own memberships and switch to one
@@ -866,6 +907,37 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/organizations/{id}/invitations",
             organization_invitations,
+        )
+        .route(
+            "/organizations/{id}/departments",
+            organization_departments,
+        )
+        .route(
+            "/organizations/{id}/departments/{department_id}",
+            organization_department,
+        )
+        .route(
+            "/organizations/{id}/departments/{department_id}/members",
+            department_members,
+        )
+        .route(
+            "/organizations/{id}/departments/{department_id}/members/{user_id}",
+            delete(tenancy_departments::remove_department_member)
+                .layer(guards::require(&state, "organizations.manage")),
+        )
+        .route(
+            "/organizations/{id}/departments/{department_id}/roles",
+            department_roles,
+        )
+        .route(
+            "/organizations/{id}/departments/{department_id}/roles/{binding_id}",
+            delete(tenancy_departments::unbind_department_role)
+                .layer(guards::require(&state, "organizations.manage"))
+                .layer(guards::require(&state, "iam.bindings.manage")),
+        )
+        .route(
+            "/organizations/{id}/members/{user_id}/departments",
+            member_departments,
         )
         .route(
             "/organizations/{id}/invitations/{invitation_id}",

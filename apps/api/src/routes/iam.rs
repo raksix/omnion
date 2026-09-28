@@ -497,6 +497,10 @@ pub struct EffectivePermissionsQuery {
     /// Site scope override.
     #[serde(default)]
     pub site_id: Option<Uuid>,
+    /// Department the request relates to (`engineering`). A role bound to that department
+    /// reaches the account if — and only if — they are in it.
+    #[serde(default)]
+    pub department: Option<String>,
     /// Resource path the resolution should take into account (`/blog/hello`).
     #[serde(default)]
     pub path: Option<String>,
@@ -1540,11 +1544,17 @@ pub async fn effective_permissions(
         ensure_same_organization(&current, scope.organization_id())?;
     }
 
-    let effective = omnion_permissions::effective_permissions_in(
+    // The department is part of the context, not of the scope: a request inside a department
+    // resolves with that department's bindings folded in, which is what makes a role bound to
+    // a team reach the people in it.
+    let mut context = omnion_permissions::model::ResourceContext::from_scope(scope.clone());
+    context.department = query.department.clone();
+    context.path = query.path.clone();
+
+    let effective = omnion_permissions::evaluate::effective_permissions_for(
         pool,
-        user_id,
-        scope.clone(),
-        query.path.as_deref(),
+        omnion_permissions::Subject::User(user_id),
+        &context,
     )
     .await?;
     let denied_keys: Vec<String> = effective.denials().keys().cloned().collect();

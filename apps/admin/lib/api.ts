@@ -3432,6 +3432,201 @@ export async function revokeOrganizationInvitation(
   );
 }
 
+// ---------------------------------------------------------------------------------------------
+// Departments (REQ-005, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of the Departments tab. */
+export type OrganizationDepartment = {
+  id: string;
+  /** Stable address inside the organization — what a role binding stores. */
+  key: string;
+  name: string;
+  description: string;
+  status: string;
+  parent_id: string | null;
+  parent_key: string | null;
+  member_count: number;
+  role_count: number;
+  /** Depth in the tree, 0 for a root. */
+  depth: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** A role bound to a department as a whole. */
+export type DepartmentRole = {
+  binding_id: string;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  granted_by: string | null;
+  expires_at: string | null;
+};
+
+/** One account inside a department. */
+export type DepartmentMember = {
+  user_id: string;
+  display_name: string;
+  email: string;
+  user_status: string;
+  membership_status: string;
+  last_active_at: string | null;
+};
+
+/** One department in full. */
+export type DepartmentDetail = {
+  department: OrganizationDepartment;
+  members: DepartmentMember[];
+  roles: DepartmentRole[];
+};
+
+/** One department of one member — what the member drawer reads. */
+export type MemberDepartment = {
+  id: string;
+  key: string;
+  name: string;
+  status: string;
+};
+
+/** Filters of the Departments tab. */
+export type DepartmentFilters = {
+  status?: string;
+  q?: string;
+};
+
+/** The department tree, parents before children. */
+export async function fetchOrganizationDepartments(
+  organizationId: string,
+  filters: DepartmentFilters = {},
+): Promise<{ organization_id: string; departments: OrganizationDepartment[] }> {
+  const params = new URLSearchParams();
+  if (filters.status) params.set("status", filters.status);
+  if (filters.q) params.set("q", filters.q);
+  const query = params.toString();
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments${query ? `?${query}` : ""}`,
+  );
+}
+
+/** One department with its members and the roles bound to it. */
+export async function fetchDepartment(
+  organizationId: string,
+  departmentId: string,
+): Promise<DepartmentDetail> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+  );
+}
+
+/** Create a department. The key is normalized and never changes afterwards. */
+export async function createOrganizationDepartment(
+  organizationId: string,
+  input: { key: string; name: string; description?: string; parent_id?: string | null },
+): Promise<OrganizationDepartment> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/departments`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Rename, re-describe, re-parent or archive a department. */
+export async function updateOrganizationDepartment(
+  organizationId: string,
+  departmentId: string,
+  change: {
+    name?: string;
+    description?: string;
+    parent_id?: string | null;
+    status?: string;
+  },
+): Promise<OrganizationDepartment> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+    { method: "PATCH", body: JSON.stringify(change) },
+  );
+}
+
+/** Archive a department: it keeps its structure but stops granting. */
+export async function archiveOrganizationDepartment(
+  organizationId: string,
+  departmentId: string,
+): Promise<OrganizationDepartment> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Delete a department; refused while it still holds people, roles or children. */
+export async function deleteOrganizationDepartment(
+  organizationId: string,
+  departmentId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Put an account into a department. */
+export async function addDepartmentMember(
+  organizationId: string,
+  departmentId: string,
+  userId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/members`,
+    { method: "POST", body: JSON.stringify({ user_id: userId }) },
+  );
+}
+
+/** Take an account out of a department. */
+export async function removeDepartmentMember(
+  organizationId: string,
+  departmentId: string,
+  userId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The departments one account sits in. */
+export async function fetchMemberDepartments(
+  organizationId: string,
+  userId: string,
+): Promise<MemberDepartment[]> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/departments`,
+  );
+}
+
+/** Bind a role to a department as a whole, optionally until a date. */
+export async function bindDepartmentRole(
+  organizationId: string,
+  departmentId: string,
+  input: { role_id: string; expires_at?: string | null },
+): Promise<DepartmentRole> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/roles`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+/** Revoke a role bound to a department. */
+export async function unbindDepartmentRole(
+  organizationId: string,
+  departmentId: string,
+  bindingId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/roles/${encodeURIComponent(bindingId)}`,
+    { method: "DELETE" },
+  );
+}
+
 /** The public preview of an invitation link. */
 export async function fetchInvitationPreview(token: string): Promise<{
   organization_name: string;
@@ -3472,6 +3667,7 @@ export async function switchOrganization(
     method: "POST",
     body: JSON.stringify({ organization_id: organizationId }),
   });
+}
 
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)

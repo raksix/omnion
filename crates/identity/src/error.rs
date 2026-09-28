@@ -87,6 +87,18 @@ pub enum IdentityError {
     /// A domain host is not usable (shape or case).
     #[error("invalid host: {0}")]
     InvalidHost(String),
+    /// A department field is not usable (key shape, blank name, unknown status).
+    #[error("invalid department: {0}")]
+    InvalidDepartment(String),
+    /// No department carries this identifier.
+    #[error("no such department")]
+    DepartmentNotFound,
+    /// The department key is already taken inside the organization.
+    #[error("department key is already taken in this organization")]
+    DepartmentKeyTaken,
+    /// A move or re-parent would make a department its own ancestor.
+    #[error("a department cannot be moved inside itself")]
+    DepartmentCycle,
     /// A security-policy field is out of range or not usable.
     #[error("{field}: {message}")]
     InvalidPolicy {

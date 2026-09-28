@@ -14,6 +14,7 @@
 
 pub mod authentication;
 pub mod devices;
+pub mod departments;
 pub mod error;
 pub mod mfa;
 pub mod memberships;

@@ -1,17 +1,19 @@
 "use client";
 
 /**
- * `/organizations/[id]` — one tenant in full (REQ-005, slice 1).
+ * `/organizations/[id]` — one tenant in full (REQ-005, slices 1 and 2).
  *
- * The screen this slice delivers is the Members tab: the accounts that belong to the
- * organization with their roles and status, the invitations that are waiting for an answer, and
- * the invite dialog that starts one. Every tab keeps its own loading, empty and error state, and
- * the tab itself is readable from the URL (`?tab=`) so a deep link lands on the right one.
+ * Members (slice 1) answers who belongs to the organization, with the invitations waiting for
+ * an answer and the dialog that starts one. Departments (slice 2) answers how they are arranged
+ * and which roles a whole team carries. Every tab keeps its own loading, empty and error state,
+ * and the tab is readable from the URL (`?tab=`) so a deep link lands on the right one.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Check, MailPlus, RefreshCw, Search, Send, Trash2, UserMinus, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
+
+import { DepartmentsTab } from "@/features/organizations/departments-tab";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -648,8 +650,14 @@ function MembersTab({ organization }: { organization: Organization }) {
   );
 }
 
-/** The tabs this slice ships. The rest arrive with slices 2 and 3. */
-const TABS = [{ key: "members", label: "Members" }] as const;
+/**
+ * The tabs this slice ships. Roles, modules, API keys, billing, settings and audit arrive with
+ * slice 3; the Overview summary with it as well.
+ */
+const TABS = [
+  { key: "members", label: "Members" },
+  { key: "departments", label: "Departments" },
+] as const;
 
 /** `/organizations/[id]`. */
 export function OrganizationDetailView({ organizationId }: { organizationId: string }) {
@@ -736,6 +744,7 @@ export function OrganizationDetailView({ organizationId }: { organizationId: str
       </nav>
 
       {tab === "members" ? <MembersTab organization={organization} /> : null}
+      {tab === "departments" ? <DepartmentsTab organization={organization} /> : null}
     </div>
   );
 }

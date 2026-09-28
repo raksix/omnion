@@ -954,7 +954,10 @@ const MIN_SIGNUP_PASSWORD_LENGTH: usize = 12;
 /// A platform account (no membership) may act on any organization; an account with a
 /// membership may act only on the organizations it belongs to, and another tenant's id is
 /// `404` — never `403`, which would confirm that the id exists.
-async fn organization_in_scope(
+///
+/// Shared with the departments surface: every tenancy handler resolves the tenant through this
+/// one function, so the isolation rule is written once rather than per route.
+pub(crate) async fn organization_in_scope(
     state: &AppState,
     current: &CurrentSession,
     organization_id: Uuid,

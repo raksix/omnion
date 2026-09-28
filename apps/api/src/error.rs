@@ -296,6 +296,27 @@ impl From<IdentityError> for ApiError {
                 "invitation_already_pending",
                 "this address already has a pending invitation in this organization",
             ),
+            // Departments (REQ-005, slice 2). A parent or department that belongs to another
+            // organization answers `department_not_found` exactly like one that does not exist,
+            // so an id from another tenant cannot be probed.
+            IdentityError::InvalidDepartment(message) => {
+                Self::bad_request("invalid_request", message)
+            }
+            IdentityError::DepartmentNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "department_not_found",
+                "no such department",
+            ),
+            IdentityError::DepartmentKeyTaken => Self::new(
+                StatusCode::CONFLICT,
+                "department_key_taken",
+                "a department with this key already exists in the organization",
+            ),
+            IdentityError::DepartmentCycle => Self::new(
+                StatusCode::CONFLICT,
+                "department_cycle",
+                "a department cannot be moved inside itself",
+            ),
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
