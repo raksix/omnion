@@ -360,9 +360,17 @@ export function fetchPattern(patternId: string): Promise<ContentPattern> {
  * second implementation of "copy this pattern" which will disagree with the server's the first
  * time either one learns a rule the other does not have.
  */
-export function fetchPatternBlocks(patternId: string): Promise<PatternBlocksResponse> {
+export function fetchPatternBlocks(
+  patternId: string,
+  organizationId?: string,
+): Promise<PatternBlocksResponse> {
+  // A path-addressed read has no body to name a tenant in, so it rides the query string. Without
+  // it the route answers `400 organization_required` to the platform account that owns the
+  // pattern — the fifth call site to forget this, and the reason the editor's "insert pattern"
+  // could not read a pattern the same screen had just saved.
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
   return request<PatternBlocksResponse>(
-    `/api/v1/patterns/${encodeURIComponent(patternId)}/blocks`,
+    `/api/v1/patterns/${encodeURIComponent(patternId)}/blocks${query}`,
   );
 }
 

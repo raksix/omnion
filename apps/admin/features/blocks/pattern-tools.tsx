@@ -75,7 +75,7 @@ const load = useCallback(() => {
     setBusyId(pattern.id);
     setError(null);
     try {
-      const answer = await fetchPatternBlocks(pattern.id);
+      const answer = await fetchPatternBlocks(pattern.id, organizationId);
       onInsert(answer.blocks as ContentBlock[]);
       setBusyId(null);
     } catch (cause: unknown) {
