@@ -14,6 +14,7 @@
 //!   turns a request into a [`rule::Decision`].
 //! * [`headers`] — a decision rendered into `Cache-Control`, `CDN-Cache-Control`
 //!   and surrogate keys.
+//! * [`etag`] — the `ETag` and `Vary` that tell a cache *which* stored copy to hand back.
 //! * [`provider`] — the adapter seam the purge worker dispatches through, and the
 //!   catalogue of adapters that actually ship.
 //!
@@ -24,6 +25,7 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod etag;
 pub mod headers;
 pub mod matcher;
 pub mod provider;
@@ -31,6 +33,7 @@ pub mod rule;
 pub mod store;
 
 pub use error::CdnError;
+pub use etag::{etag_for_file, etag_for_page, if_none_match_hits, vary_for};
 pub use headers::{headers_for, surrogate_keys};
 pub use matcher::{CacheKey, PathPattern, PatternError, RequestShape};
 pub use provider::{AdapterInfo, Provider, Purge, PurgeOutcome, catalogue, is_shipped};
