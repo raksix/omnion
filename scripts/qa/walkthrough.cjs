@@ -4886,7 +4886,10 @@ async function runAutomationsOperationsDepth(page, report) {
     await page.waitForSelector("[data-automation-notice]", { timeout: 15000 }).catch(() => {});
   }
   await page.locator("[data-automation-tab='runs']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
-  // The row is the evidence; poll for it instead of guessing how long the queue takes.
+  // The row is the evidence; poll for it instead of guessing how long the queue takes. The
+  // re-read is a tab click *and* a reload token: a panel that reads on mount alone reports
+  // "this rule has not run yet" a second after a run started, which is a broken control
+  // dressed as a fresh rule. Re-clicking the tab also proves the tab itself still works.
   for (let wait = 0; wait < 12 && (await page.locator("[data-automation-run-row]").count()) === 0; wait += 1) {
     await page.waitForTimeout(1000);
     await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
