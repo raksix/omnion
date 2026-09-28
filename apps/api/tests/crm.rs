@@ -20,6 +20,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
+use omnion_automation::matcher;
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
@@ -4051,5 +4052,435 @@ async fn archiving_a_crm_record_removes_it_from_the_palette() {
         !hit_providers(&after.body).iter().any(|key| key == "companies"),
         "an archived company must leave the index: {}",
         after.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The automation trigger (slice 4, part six)
+//
+// The criterion is one sentence — "an automation rule triggered by `crm.deal.stage_changed`
+// runs once" — and it is the only part of this slice that had to leave the CRM's own code to be
+// answered at all. The CRM emits the event; the **matcher** (crates/automation/src/matcher.rs)
+// decides what fires and starts the run. Proving it from here therefore means driving the real
+// matcher over a real bus, in this suite's own database, so the event the rule reads is the one
+// the board's stage endpoint emitted — not a hand-written row that would prove nothing.
+// ---------------------------------------------------------------------------------------------
+
+/// A rule that mails the deal's owner when a deal reaches a **negotiation** stage.
+///
+/// `crm.deal.stage_changed` carries no deal title (a payload is read by every subscriber, and a
+/// title is a customer's own words), so the subject is built from the fields the event really
+/// does carry: the stage kind it entered, the money and the currency. The `{{event.*}}` bindings
+/// are what make this walk worth running — they prove the run's steps carry *this* move's values
+/// rather than the rule author's template.
+fn stage_changed_rule(organization_id: Uuid, into_kind: &str) -> Value {
+    json!({
+        "organization_id": organization_id,
+        "name": format!("Tell the owner when a deal enters {into_kind}"),
+        "description": "Slice 4: proves the CRM's event starts a run exactly once.",
+        "event": "crm.deal.stage_changed",
+        "conditions": [
+            { "field": "to_stage_kind", "operator": "equals", "value": into_kind }
+        ],
+        "actions": [
+            {
+                "name": "tell the owner",
+                "kind": "task",
+                "action": "send_email",
+                "params": {
+                    "to": "owner@example.com",
+                    "subject": "A deal entered {{event.to_stage_kind}}",
+                    "body": "Deal {{event.deal_id}} is now {{event.to_stage_kind}} at \
+                             {{event.amount}} {{event.currency}}."
+                },
+                "max_attempts": 1
+            }
+        ]
+    })
+}
+
+/// How many runs the workflow behind a rule has started, read from the engine's own tables.
+async fn runs_of_workflow(db: &Db, workflow_id: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from workflow_executions where workflow_id = $1")
+        .bind(workflow_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("the executions must read")
+}
+
+/// Give an account the two powers the automation surface is guarded by.
+///
+/// Writing a rule is `workflows.manage` and reading the surface is `workflows.read`; the CRM
+/// manager holds neither, and it is exactly that fact the walk needs — the rule is written the
+/// way a person with the panel's own key would write it, not by reaching past the guard.
+async fn grant_workflow_powers(fixture: &Fixture, email: &str) {
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    let user_id = account_id(&fixture.db, email).await;
+    grant(
+        &fixture.db,
+        fixture.org,
+        user_id,
+        owner_id,
+        &["workflows.read", "workflows.manage"],
+    )
+    .await;
+}
+
+/// Drain the bus and hand back what it read, asserting that **nothing ran**.
+///
+/// Creating a deal is itself an event on the bus, so a walk that writes a rule and then counts
+/// events from the bus counts a fact it did not cause. Every walk here flushes the setup with
+/// this, so the counts that follow are the ones the move under test produced.
+async fn flush_without_runs(db: &Db) -> matcher::MatchReport {
+    let report = matcher::drain(db.pool(), 100)
+        .await
+        .expect("the matcher must run");
+    assert!(report.runs.is_empty(), "setup must not start a run: {report:?}");
+    report
+}
+
+/// A rule on `crm.deal.stage_changed` fires **once** per real stage move — not on the move that
+/// does not move, not twice for one move, and not for a move its condition excludes.
+#[tokio::test]
+async fn a_rule_on_a_deal_stage_change_runs_exactly_once() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    // The token is taken **after** the grant: the session's powers are read from the role at
+    // login, so a token minted before the grant would answer 403 on the very rule this walk
+    // writes. Granting first and signing in second is the order every workflow key needs.
+    grant_workflow_powers(&fixture, &fixture.manager).await;
+    let manager = fixture.token(&fixture.manager).await;
+
+    // The matcher watches forward: a rule created today must not fire for the history already on
+    // the bus, so the cursor is seeded to the end of the bus before anything happens.
+    matcher::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let stages = pipeline["stages"].as_array().expect("stages").clone();
+    let first_open = stages[0].clone();
+    // The seeded pipeline is New/Qualified/Negotiation/Won/Lost in every install, but the rule
+    // must not be written against a stage *name* — only a stage's kind is stable, so the walk
+    // finds the negotiation column by kind and fails loudly if an install ever drops it.
+    let negotiation = stages
+        .iter()
+        .find(|stage| stage["name"] == json!("Negotiation"))
+        .expect("the seeded pipeline has a Negotiation column")
+        .clone();
+    assert_eq!(negotiation["kind"], json!("open"), "{negotiation}");
+
+    // The rule is written through the surface, so the definition checks that guard the store
+    // (`validate_event` against the bus's own name rule) are part of what is being proved.
+    let created = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/automations",
+            Some(&manager),
+            Some(stage_changed_rule(fixture.org, "open")),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(created.body["event"], json!("crm.deal.stage_changed"));
+    assert_eq!(created.body["trigger_count"], 0);
+    let rule_id = created.body["id"].as_str().expect("an id").to_owned();
+
+    let created_deal = create_deal_via_api(
+        state,
+        &manager,
+        json!({ "title": format!("Trigger {}", Uuid::new_v4().simple()), "amount": "4200.00" }),
+    )
+    .await;
+    assert_eq!(created_deal.status, StatusCode::CREATED, "body: {}", created_deal.body);
+    let deal_id = created_deal.body["id"].as_str().expect("an id").to_owned();
+
+    // Creating a deal is itself an event. The bus is flushed here so that every count below is
+    // the move under test and nothing else — a walk that leaves its own setup on the bus cannot
+    // tell "the rule fired once" from "the rule fired once and something else was there too".
+    flush_without_runs(&fixture.db).await;
+
+    // ---- a move that does not move wakes nobody -----------------------------------------
+    // The board's keyboard path posts on every arrow press, so a no-op move must leave the bus
+    // alone. This is asserted first, because a rule that fired here would be indistinguishable
+    // from a rule that simply fires too eagerly.
+    let no_op = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": first_open["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(no_op.status, StatusCode::OK, "body: {}", no_op.body);
+
+    let idle = matcher::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the matcher must run");
+    assert!(idle.is_idle(), "a move to the same stage must not fire the rule: {idle:?}");
+    assert_eq!(
+        runs_of_workflow(&fixture.db, Uuid::parse_str(&rule_id).expect("a uuid")).await,
+        0,
+        "no run may exist yet"
+    );
+
+    // ---- the move that moves --------------------------------------------------------------
+    let moved = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": negotiation["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK, "body: {}", moved.body);
+
+    let report = matcher::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the matcher must run");
+    assert_eq!(report.evaluated, 1, "exactly one event was on the bus: {report:?}");
+    assert_eq!(report.matched, 1, "the rule matched: {report:?}");
+    assert_eq!(report.skipped, 0, "{report:?}");
+    assert_eq!(report.runs.len(), 1, "one move, one run: {report:?}");
+    let execution_id = report.runs[0];
+
+    // The run's steps carry **this** move's values: the placeholders were resolved against the
+    // event that fired the rule, so a retry would repeat the first attempt rather than reading a
+    // bus that has moved on.
+    let steps = omnion_workflows::store::list_steps(fixture.db.pool(), execution_id)
+        .await
+        .expect("the steps must be readable");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].action.as_deref(), Some("send_email"));
+    assert_eq!(steps[0].status, "pending", "{:?}", steps[0].error);
+    assert_eq!(
+        steps[0].params["body"],
+        format!("Deal {deal_id} is now open at 4200.00 USD.")
+    );
+    assert_eq!(steps[0].params["subject"], "A deal entered open");
+
+    // ---- exactly once, proved by the second tick having nothing to do ----------------------
+    // The cursor advanced inside the same transaction as the run, so a second drain over the
+    // same bus is idle. This is the "once" in "runs once": not a count, but the absence of a
+    // second chance.
+    let second = matcher::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the second tick must run");
+    assert!(second.is_idle(), "one move must not start a second run: {second:?}");
+    assert_eq!(
+        matcher::event_cursor(fixture.db.pool()).await.expect("the cursor must read"),
+        report.cursor
+    );
+    assert_eq!(
+        runs_of_workflow(&fixture.db, Uuid::parse_str(&rule_id).expect("a uuid")).await,
+        1,
+        "the rule has started exactly one run"
+    );
+
+    // ---- the rule remembers, and the match is audited on both sides ------------------------
+    let after = call(
+        state,
+        request(Method::GET, &format!("/api/v1/automations/{rule_id}"), Some(&manager), None),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK, "body: {}", after.body);
+    assert_eq!(after.body["trigger_count"], 1, "{}", after.body);
+    assert!(after.body["last_triggered_at"].is_string(), "{}", after.body);
+
+    let matched = audit_rows(&fixture.db, "automation.rule.matched").await;
+    assert!(
+        matched
+            .iter()
+            .any(|row| row["target_id"] == json!(execution_id.to_string())),
+        "the match must be audited against the run: {matched:?}"
+    );
+
+    // ---- a second, *different* deal fires its own run --------------------------------------
+    // Exactly-once is per event, not per rule: two deals are two facts, and a rule that
+    // collapsed them into one run would silently drop a customer.
+    let other_deal = create_deal_via_api(
+        state,
+        &manager,
+        json!({ "title": format!("Second {}", Uuid::new_v4().simple()), "amount": "900.00" }),
+    )
+    .await;
+    let other_id = other_deal.body["id"].as_str().expect("an id").to_owned();
+    // The second deal's creation is an event too, and it would be counted as part of the move.
+    flush_without_runs(&fixture.db).await;
+    let other_moved = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{other_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": negotiation["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(other_moved.status, StatusCode::OK, "body: {}", other_moved.body);
+
+    let third = matcher::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the third tick must run");
+    assert_eq!(third.evaluated, 1, "{third:?}");
+    assert_eq!(third.matched, 1, "{third:?}");
+    assert_eq!(
+        runs_of_workflow(&fixture.db, Uuid::parse_str(&rule_id).expect("a uuid")).await,
+        2,
+        "two moves, two runs"
+    );
+}
+
+/// A second rule on the same event, narrowed by a condition, does not fire on the move the
+/// condition excludes — the shape every "tell me only about the big ones" rule takes.
+#[tokio::test]
+async fn a_rule_whose_condition_does_not_hold_starts_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    grant_workflow_powers(&fixture, &fixture.manager).await;
+    let manager = fixture.token(&fixture.manager).await;
+
+    matcher::seed_cursor(fixture.db.pool())
+        .await
+        .expect("the cursor must seed");
+
+    let pipeline = default_pipeline_with_stages(&fixture.db, fixture.org).await;
+    let stages = pipeline["stages"].as_array().expect("stages").clone();
+    let first_open = stages[0].clone();
+    let second_open = stages
+        .iter()
+        .find(|stage| stage["kind"] == json!("open") && stage["id"] != first_open["id"])
+        .expect("a second open stage")
+        .clone();
+
+    // The rule fires for a won deal — an outcome, not a move. Both stages below are `open`, so
+    // the condition can never hold for the move this walk performs.
+    let won_only = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/automations",
+            Some(&manager),
+            Some(json!({
+                "organization_id": fixture.org,
+                "name": "Only ever for a won deal",
+                "event": "crm.deal.stage_changed",
+                "conditions": [
+                    { "field": "to_stage_kind", "operator": "equals", "value": "won" }
+                ],
+                "actions": [{
+                    "name": "celebrate",
+                    "kind": "task",
+                    "action": "send_email",
+                    "params": {
+                        "to": "owner@example.com",
+                        "subject": "Won",
+                        "body": "Deal {{event.deal_id}} was won."
+                    },
+                    "max_attempts": 1
+                }]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(won_only.status, StatusCode::CREATED, "body: {}", won_only.body);
+    let won_rule = won_only.body["id"].as_str().expect("an id").to_owned();
+
+    let created = create_deal_via_api(
+        state,
+        &manager,
+        json!({ "title": format!("Conditional {}", Uuid::new_v4().simple()), "amount": "10.00" }),
+    )
+    .await;
+    let deal_id = created.body["id"].as_str().expect("an id").to_owned();
+
+    // The deal's own creation is on the bus; the counts below are about the move.
+    flush_without_runs(&fixture.db).await;
+
+    let moved = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/deals/{deal_id}/stage"),
+            Some(&manager),
+            Some(json!({ "stage_id": second_open["id"] })),
+        ),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK, "body: {}", moved.body);
+
+    let report = matcher::drain(fixture.db.pool(), 100)
+        .await
+        .expect("the matcher must run");
+    assert_eq!(report.evaluated, 1, "the move is on the bus: {report:?}");
+    assert_eq!(report.matched, 0, "a condition that does not hold starts nothing: {report:?}");
+    assert_eq!(report.skipped, 1, "the rule was evaluated and declined: {report:?}");
+    assert!(report.runs.is_empty());
+    assert_eq!(
+        runs_of_workflow(&fixture.db, Uuid::parse_str(&won_rule).expect("a uuid")).await,
+        0
+    );
+}
+
+/// The rule's key is a workflow key, not a CRM one: a caller who may move deals all day and
+/// still cannot define the rule that watches them.
+#[tokio::test]
+async fn defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    // The manager is handed every CRM power by the fixture and *no* workflow key.
+    let manager = fixture.token(&fixture.manager).await;
+    let body = stage_changed_rule(fixture.org, "open");
+
+    let refused = call(
+        state,
+        request(Method::POST, "/api/v1/automations", Some(&manager), Some(body.clone())),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "a CRM manager must not be able to define a rule: {}",
+        refused.body
+    );
+
+    grant_workflow_powers(&fixture, &fixture.manager).await;
+    let manager = fixture.token(&fixture.manager).await;
+
+    // Unauthenticated is still unauthenticated.
+    let anonymous = call(
+        state,
+        request(Method::POST, "/api/v1/automations", None, Some(body.clone())),
+    )
+    .await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "{}", anonymous.body);
+
+    // A rule for **another** organization is refused by the scope check rather than created.
+    let foreign = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/automations",
+            Some(&manager),
+            Some(stage_changed_rule(fixture.other_org, "open")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign.status,
+        StatusCode::FORBIDDEN,
+        "a tenant must not write a rule into another tenant: {}",
+        foreign.body
     );
 }

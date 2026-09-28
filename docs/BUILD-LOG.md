@@ -2390,3 +2390,56 @@ result** — which returned 1.3 GB. Two details worth keeping:
 **Next.** The `form.submitted` consumer (REQ-064) and the workflow-trigger proof (wave 3's engine).
 Then REQ-051's last three acceptance boxes — the empty/loading/error sweep, the 390×844 mobile pass
 and the keyboard sheet — and only then the status line may read `done`.
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part six: the workflow-trigger proof
+
+**What.** The acceptance criterion is one sentence — "an automation rule triggered by
+`crm.deal.stage_changed` runs once" — and it is the only part of this slice that could not be
+answered from inside the CRM. The CRM emits the event; the **matcher** decides what fires. So the
+proof drives the real `crates/automation/src/matcher.rs` over the real bus in this suite's own
+database, and the event the rule reads is the one the board's stage endpoint emitted. Three walks,
+in `apps/api/tests/crm.rs`.
+
+**What they assert, and why each one is a separate claim.**
+- A move to the stage a deal is **already in** starts nothing. The board's keyboard path posts on
+  every arrow press, so this is the assertion that keeps a rule from being a nuisance.
+- One move starts **one** run, and the run's step carries *this* move's values: the subject reads
+  "A deal entered open" and the body the deal's id, amount and currency. A retry therefore repeats
+  the first attempt rather than re-reading a bus that has moved on.
+- The second drain is **idle**. That is what "once" means — the absence of a second chance, not a
+  count — and the cursor is read back to prove it.
+- The match is audited (`automation.rule.matched`) against the execution.
+- A **second deal** starts a second run: exactly-once is per *event*, and a rule that collapsed two
+  customers into one run would silently drop one.
+- A rule whose condition does not hold is `skipped`, not `matched`.
+- The key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define
+  the rule watching them, and a rule for another organization is refused.
+
+**Three defects this found, and the fourth that was not mine.**
+- A token minted **before** the grant answered 403 on the very rule the walk writes: a session's
+  powers are read at login, so grant-then-sign-in is the order every workflow key needs.
+- The first draft read a token *twice* — once before the grant and once after — and the compiler's
+  unused-variable warning was the only thing that noticed the first line was dead.
+- The bus was **not empty** after the setup: creating a deal is itself an event. Two walks counted
+  their own fixture and read "a rule fired twice" or "two events on the bus" where the product was
+  right. Fixed with `flush_without_runs`, which asserts the drain started *nothing* — a setup flush
+  that silently ran a rule would hide exactly what these walks are for.
+- The fourth failure was **not a defect**: the suite's database was gone mid-run. `/mnt/apopic`
+  reached 100% earlier in the tick, the Postgres container restarted, and a database created before
+  that did not survive it. `RestartCount=0` with a fresh `pg_postmaster_start_time` is the tell, and
+  the lesson is the one the disk keeps teaching: on this mount a full disk takes the **database**
+  down, not just the build.
+
+**Disk, again.** The build died at `libomnion_identity-….rlib: No space left on device`. This time
+the reclaim was `apps/admin/.next/dev` and `apps/web/.next/dev` — 1.2 GB of turbopack dev cache,
+re-derivable, and inside **this** worktree only. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1` did the
+rest at roughly a third of the wall-clock.
+
+**Proof.** `cargo test -p omnion-api --test crm` → **42 passed; 0 failed** against a database
+created for this run (`omnion_test_w4_t7c`), `--test-threads=1`. `cargo test -p omnion-module-crm
+--lib` → **146/146**. `pnpm typecheck` → **2/2**.
+
+**Next.** The `form.submitted` consumer (REQ-064 — a submitted form becomes a contact and a deal),
+which is the last part of this slice. Then REQ-051's final three acceptance boxes: the
+empty/loading/error sweep across all six screens, the 390×844 mobile pass and the keyboard sheet.
+Only then may the status line read `done`, and that close tick runs the w4 QA browser pass.
