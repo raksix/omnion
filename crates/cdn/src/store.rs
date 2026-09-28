@@ -302,6 +302,14 @@ pub async fn reorder_rules(
 /// A site that has never been configured inherits the platform row, which is what makes
 /// the settings screen work on a fresh installation instead of showing an empty form for
 /// a provider that is in fact running.
+///
+/// The precedence is the *whole* query, and getting it wrong is silent in the way that
+/// matters most: `where site_id is not distinct from $1` matches the site's own row and
+/// nothing else, so a site without one finds nothing at all and reports "no CDN is
+/// configured" while the installation has a provider running. The two candidates are
+/// therefore selected together and the site's own row is preferred, which is one
+/// statement and one round trip rather than a read-then-fallback that races a concurrent
+/// write.
 pub async fn resolve_settings(
     pool: &PgPool,
     site_id: Option<Uuid>,
@@ -311,8 +319,9 @@ pub async fn resolve_settings(
                 (credential_ciphertext is not null) as has_credential, auto_purge, batch_size, \
                 max_attempts, updated_by, created_at, updated_at \
          from cdn_settings \
-         where site_id is not distinct from $1 \
-         order by site_id nulls last limit 1",
+         where site_id is not distinct from $1 or site_id is null \
+         order by site_id is null asc, site_id nulls last \
+         limit 1",
     ))
     .bind(site_id)
     .fetch_optional(pool)
