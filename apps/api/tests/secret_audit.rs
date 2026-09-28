@@ -129,6 +129,13 @@ fn patch(uri: &str, token: &str, body: Value) -> Request<Body> {
     request(Method::PATCH, uri, Some(token), Some(body))
 }
 
+/// A `POST` with NO session cookie and NO deployment key — the shape of a stranger reaching for a
+/// leased secret. The redemption path is deliberately reachable without a session, so this is a
+/// real request shape rather than a contrived one.
+fn post_anonymous(uri: &str, body: Value) -> Request<Body> {
+    request(Method::POST, uri, None, Some(body))
+}
+
 /// Object store of the test state.
 fn test_storage() -> omnion_storage::Storage {
     omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
@@ -643,4 +650,107 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
     )
     .await;
     assert_eq!(capped.status, StatusCode::OK, "{}", capped.raw);
+}
+
+/// The redemption refusal must leave a row an operator can find.
+///
+/// `POST /secret-leases/{id}/redeem` answered 401 with a request id and wrote nothing, while
+/// every other refusal in that handler wrote a denial row. The operator holding that id had no
+/// trail to land on — the one situation the request id exists to prevent, and the one the REQ's
+/// "writes a denial row" line names. This proves the row is there AND that the screen's own
+/// request-id filter returns it, because a row the filter cannot reach is as useless as no row.
+#[tokio::test]
+async fn a_redemption_without_a_deployment_key_writes_a_joinable_denial() {
+    // SAFETY: the same guard the suite above uses.
+    // SAFETY: `set_var` is `unsafe` in edition 2024 and this is the process-wide database URL the
+    // whole binary reads once at startup; the tests in this file run one at a time.
+    unsafe {
+        std::env::set_var(
+            "OMNION_DATABASE_URL",
+            std::env::var("OMNION_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://omnion:omnion@127.0.0.1:5433/omnion_w6_dev".into()),
+        );
+    }
+    let Some((state, db)) = live_state().await else {
+        eprintln!("skipping: no test database");
+        return;
+    };
+
+    // An owner to read the trail back with. The denial itself needs no session at all — that is
+    // the point of it — but the audit screen does.
+    let slug = format!("audit-denial-{}", Uuid::new_v4().simple());
+    let organization_id: Uuid =
+        sqlx::query_scalar("insert into organizations (name, slug) values ($1, $2) returning id")
+            .bind("Audit Denial Organization")
+            .bind(&slug)
+            .fetch_one(db.pool())
+            .await
+            .expect("the organization must be created");
+    let (user_id, email) = create_account(&db, Some(organization_id)).await;
+    // The roles have to exist before a user can hold one. On a database where another suite (or
+    // the wizard) already seeded them this is a no-op; on a freshly created one it is the
+    // difference between a test and a `RoleNotFound`, and which of those two you get depends on
+    // which test ran first.
+    seed::ensure(db.pool())
+        .await
+        .expect("the default roles must exist");
+    seed::bind_owner(db.pool(), user_id)
+        .await
+        .expect("the owner binding must be created");
+    let token = login(&state, &email).await;
+
+    let lease_id = Uuid::new_v4();
+    let denied = call(
+        &state,
+        post_anonymous(
+            &format!("/api/v1/secret-leases/{lease_id}/redeem"),
+            json!({ "token": "a-token-that-was-never-issued" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::UNAUTHORIZED,
+        "a redemption without a deployment key must be refused: {}",
+        denied.raw
+    );
+    let request_id = denied.body["error"]["details"]["request_id"]
+        .as_str()
+        .expect("the refusal must hand the caller a request id to quote")
+        .to_owned();
+    assert_eq!(
+        denied.body["error"]["code"], "deployment_key_required",
+        "the refusal must name its own cause: {}",
+        denied.raw
+    );
+
+    // The row must exist, and — the part that was broken — carry that id in the COLUMN.
+    let trail = call(
+        &state,
+        get(
+            &format!("/api/v1/secrets/audit?request_id={request_id}"),
+            &token,
+        ),
+    )
+    .await;
+    let rows = trail.body["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    let row = rows
+        .iter()
+        .find(|row| row["action"] == "secret.access.denied")
+        .unwrap_or_else(|| {
+            panic!(
+                "the refusal must be auditable and joinable by its own request id: {}",
+                trail.raw
+            )
+        });
+    assert_eq!(
+        row["request_id"], request_id,
+        "the id belongs in the column the screen filters on, not only in the metadata blob"
+    );
+    assert!(
+        row["ip_address"].is_string(),
+        "a denial that cannot say where it came from is half a trail: {row}"
+    );
 }
