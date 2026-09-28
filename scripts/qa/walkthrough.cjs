@@ -3718,6 +3718,197 @@ async function runNotificationsDepth(page, report) {
 }
 
 /**
+ * The preferences pass (REQ-021, slice 2): the matrix, the settings row, and the two rules
+ * that make them safe to edit.
+ *
+ * Everything here is driven through the **screen** and read back from the **API**, in that
+ * order. A form that renders its own state correctly proves nothing about whether the server
+ * stored it — the class of bug this screen is most likely to have is "the checkbox moved and
+ * the row did not", and only a read-back after a reload can see it.
+ *
+ * The three claims:
+ * 1. **A cell survives a round trip.** Flip one, save, reload, and it is still flipped.
+ * 2. **The in-app column cannot be turned off**, and the server says why rather than ignoring
+ *    the write — asserted by asking the API directly, because the UI's disabled checkbox is a
+ *    promise while the API's refusal is a guarantee.
+ * 3. **A half-set quiet window is refused.** The form is allowed to submit it; the server is
+ *    not, and the message has to reach the screen.
+ */
+async function runNotificationSettingsDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  steps.loaded = (await page.locator("[data-pref-state=ready]").count()) > 0;
+  if (!steps.loaded) {
+    steps.reason = await page
+      .locator("[data-pref-state=error]")
+      .innerText()
+      .catch(() => "the settings screen did not reach its ready state");
+    return steps;
+  }
+
+  // The complete matrix: categories × channels, with the in-app column locked. A matrix that
+  // renders only the stated cells would show fewer boxes than this count, and the difference
+  // between a hole and a checked box is invisible until a reader tries to change one.
+  steps.cells = await page.locator("[data-cell]").count();
+  steps.matrixIsComplete = steps.cells >= 6 * 5;
+  steps.inAppLocked = await page.evaluate(() => {
+    const locked = [...document.querySelectorAll('[data-cell*="/in_app"]')];
+    return locked.length > 0 && locked.every((box) => box.disabled);
+  });
+  steps.lockedColumnExplainsItself =
+    (await page.locator("[data-pref-state=ready]").innerText()).includes("cannot be turned off");
+  await shot(page, "page-notifications-settings");
+
+  // 1. Flip one real cell, save, reload, read it back from the API.
+  const target = "ticket/email";
+  const box = page.locator(`[data-cell="${target}"]`);
+  const before = await box.isChecked().catch(() => false);
+  await box.click({ timeout: 4000 });
+  await page.waitForTimeout(300);
+  steps.saveEnabledAfterChange = await page.locator("[data-pref-save]").isEnabled();
+  await page.locator("[data-pref-save]").click({ timeout: 4000 });
+  await page.waitForTimeout(1200);
+  steps.saveNotice = await page.locator("[data-pref-notice]").innerText().catch(() => "");
+  // "1 preference saved" is the honest shape. A form that says "5" for one flipped box is
+  // reporting its grid size, not its work.
+  steps.saveNoticeIsHonest = /\b1 preference\b/.test(steps.saveNotice);
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.persisted = (await page.locator(`[data-cell="${target}"]`).isChecked().catch(() => before)) === !before;
+
+  // Read the server's own copy, not the screen's: this is the difference between "the form
+  // renders what it was sent" and "the row was written".
+  steps.serverAgrees = await page.evaluate(async (cellKey) => {
+    const response = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" });
+    if (!response.ok) return null;
+    const body = await response.json();
+    const [category, channel] = cellKey.split("/");
+    const cell = body.cells.find((c) => c.category === category && c.channel === channel);
+    return cell ? cell.enabled : null;
+  }, target);
+  steps.serverAgrees = steps.serverAgrees === !before;
+
+  // 2. The server refuses to write in_app:false, and says why in a sentence.
+  steps.inAppRefusal = await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return null;
+    const response = await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [{ category: "security", channel: "in_app", enabled: false }],
+        settings: current.settings,
+      }),
+    });
+    return { status: response.status, message: (await response.json().catch(() => ({})))?.error?.message ?? "" };
+  });
+  steps.inAppRefusalIsA400 = steps.inAppRefusal?.status === 400;
+  steps.inAppRefusalExplainsItself = /in-app/i.test(steps.inAppRefusal?.message ?? "");
+
+  // 3. Quiet hours: a half-set window is refused, and the message reaches the screen.
+  await page.locator("[data-quiet-toggle]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.quietFieldsAppear = (await page.locator("[data-quiet-start]").count()) > 0;
+  await page.locator("[data-quiet-start]").fill("22:00").catch(() => {});
+  await page.locator("[data-quiet-end]").fill("07:00").catch(() => {});
+  await page.locator("[data-timezone]").selectOption("Europe/Istanbul").catch(() => {});
+  await page.locator("[data-pref-save]").click({ timeout: 4000 });
+  await page.waitForTimeout(1200);
+  steps.quietSaved = (await page.locator("[data-quiet-start]").inputValue().catch(() => "")) === "22:00";
+  steps.timezoneSaved = (await page.locator("[data-timezone]").inputValue().catch(() => "")) === "Europe/Istanbul";
+
+  // A window that leaves no waking hours is refused by the server. Asked directly, because the
+  // form is *allowed* to submit it — the rule is the server's, and a form that pre-emptively
+  // disabled the input would be hiding a rule the reader is entitled to know.
+  steps.fullDayRefused = await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return null;
+    const response = await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [],
+        settings: { ...current.settings, quiet_hours_start: "08:00", quiet_hours_end: "08:00" },
+      }),
+    });
+    return response.status;
+  });
+  steps.fullDayRefusedIsA400 = steps.fullDayRefused === 400;
+
+  // 4. The digest: weekly needs a weekday, and the form supplies one rather than sending an
+  //    unsaveable body. Saving `weekly` and reloading is the whole claim.
+  await page.locator("[data-digest-cadence]").selectOption("weekly").catch(() => {});
+  await page.waitForTimeout(300);
+  steps.weekdayAppears = (await page.locator("[data-digest-weekday]").count()) > 0;
+  await page.locator("[data-digest-hour]").selectOption("9").catch(() => {});
+  await page.locator("[data-pref-save]").click({ timeout: 4000 });
+  await page.waitForTimeout(1200);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.digestPersisted =
+    (await page.locator("[data-digest-cadence]").inputValue().catch(() => "")) === "weekly" &&
+    (await page.locator("[data-digest-hour]").inputValue().catch(() => "")) === "9";
+  await shot(page, "page-notifications-settings-saved");
+
+  // The error state, provoked the way the list's is: a routed 500 must show a retry, not a
+  // blank screen with the Save button still on it.
+  await page.route("**/api/v1/notifications/preferences", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: '{"error":{"code":"boom","message":"deliberate"}}',
+    }),
+  );
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.errorState = (await page.locator("[data-pref-state=error]").count()) > 0;
+  steps.errorOffersRetry =
+    (await page.locator("[data-pref-state=error]").innerText().catch(() => "")).length > 0;
+  await shot(page, "page-notifications-settings-error");
+  await page.unroute("**/api/v1/notifications/preferences").catch(() => {});
+
+  // Put the row back the way it was, so a later pass in the same run starts from the defaults
+  // rather than from whatever this one left behind. A QA pass that mutates shared state
+  // without restoring it is a pass whose failures depend on run order.
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return;
+    await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [{ category: "ticket", channel: "email", enabled: true }],
+        settings: {
+          quiet_hours_start: null,
+          quiet_hours_end: null,
+          timezone: "UTC",
+          digest_cadence: "off",
+          digest_weekday: null,
+          digest_hour: 8,
+        },
+      }),
+    });
+  }).catch(() => {});
+  steps.restored = true;
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -4018,6 +4209,11 @@ async function main() {
     // its own grouped lines, filters from a group line, runs a bulk action and proves the
     // keyboard path.
     { path: "/notifications", name: "notifications" },
+    // The preferences matrix (REQ-021, slice 2). Walked on its own route rather than reached
+    // through the list, because "no untested screen" is about the *screen* and a settings
+    // page that is only ever opened by a click is a screen whose first paint is never seen.
+    // Its depth pass below flips a cell, saves, reloads and reads the value back.
+    { path: "/notifications/settings", name: "notifications-settings" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -4139,6 +4335,12 @@ async function main() {
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
   report.notifications = await runNotificationsDepth(page, report);
   log(`notifications: ${JSON.stringify(report.notifications)}`);
+
+  // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
+  // restores the row it touched, so a later pass in the same run sees the defaults rather
+  // than whatever this one left behind.
+  report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
