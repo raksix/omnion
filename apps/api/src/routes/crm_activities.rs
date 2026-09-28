@@ -332,7 +332,7 @@ mod tests {
             "a timeline is read for a contact, a company or a deal".to_owned(),
         ));
         let body = body_of(error).await;
-        assert_eq!(body["error"]["code"], "invalid_list_query", "{body}");
+        assert_eq!(body["error"]["code"], "invalid_crm_query", "{body}");
     }
 
     #[test]

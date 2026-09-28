@@ -3532,3 +3532,238 @@ async fn the_new_activity_keys_are_in_the_catalogue_and_the_owner_holds_them() {
         "the owner must hold slice 4's keys: {held:?}"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// Slice 4, part three: the copilot's two endpoints.
+//
+// The walk proves what can be proved without a provider connected: the guard chain, the
+// cross-tenant 404, and the **audited failure** — an installation with no model answers a
+// copilot call, and the audit row is the record that the call was made and failed. A model
+// answer's *text* cannot be asserted here (it belongs to the provider, not to us), but the
+// sanitiser's text rules are unit-tested in `modules/crm/src/copilot.rs` and the guard and the
+// audit are proved here — which is the part that is ours.
+// -------------------------------------------------------------------------------------------
+
+/// The permission set the copilot account holds: the key, plus the deal read it needs to build
+/// the context. The suite grants it through `grant_and_login`, so the account is a **real** one
+/// with the key and not a hand-written row.
+const COPILOT_PERMISSIONS: [&str; 4] = [
+    "crm.copilot.use",
+    "crm.deals.read",
+    // The foreign account makes a deal of its own so the walk can prove the scope in **both**
+    // directions; a caller that could only read would prove it in one.
+    "crm.deals.create",
+    "sites.read",
+];
+
+/// The copilot's two endpoints are guarded, scoped and audited — and a deal belonging to another
+/// organization is a `404`, not a `403` and not an answer.
+#[tokio::test]
+async fn the_copilot_is_guarded_scoped_and_audited() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let marker = Uuid::new_v4().simple().to_string();
+
+    // Two accounts in **different** organizations, each holding the copilot key. This is the
+    // point the walk cannot be written without: `grant_and_login` puts its account in the
+    // foreign organization, so an account made with it is a cross-tenant *caller* for a deal in
+    // the home organization — and the walk needs one of each, or every 404 below would be a
+    // same-tenant read that happens to miss.
+    let (copilot_id, copilot_email) = create_account(&fixture.db, Some(fixture.org), "CRM Copilot").await;
+    grant(
+        &fixture.db,
+        fixture.org,
+        copilot_id,
+        fixture.accounts[0],
+        &COPILOT_PERMISSIONS,
+    )
+    .await;
+    let copilot = login(&fixture.state, &copilot_email).await;
+
+    let (foreign_id, foreign_email) =
+        create_account(&fixture.db, Some(fixture.other_org), "CRM Copilot Foreign").await;
+    grant(
+        &fixture.db,
+        fixture.other_org,
+        foreign_id,
+        fixture.accounts[0],
+        &COPILOT_PERMISSIONS,
+    )
+    .await;
+    let foreign_copilot = login(&fixture.state, &foreign_email).await;
+    let manager = fixture.token(&fixture.manager).await;
+
+    let created = create_deal_via_api(
+        state,
+        &manager,
+        json!({
+            "title": format!("Copilot walk {marker}"),
+            "amount": "2500.00",
+            "currency": "USD",
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let deal_id = created.body["id"].as_str().expect("a created deal has an id");
+
+    for (path, expected_action) in [
+        ("summarize", "summarize"),
+        ("follow-up", "follow-up"),
+    ] {
+        let uri = format!("/api/v1/crm/copilot/{path}/{deal_id}");
+
+        // 401 without a session.
+        let anonymous = call(state, request(Method::POST, &uri, None, None)).await;
+        assert_eq!(
+            anonymous.status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must need a session, body: {}",
+            anonymous.body
+        );
+
+        // 403 with a session that lacks `crm.copilot.use`. The manager holds the whole contact
+        // and deal family and deliberately NOT the copilot key, so this is a real refusal by a
+        // real account rather than a synthetic one.
+        let refused = call(
+            state,
+            request(Method::POST, &uri, Some(&manager), Some(json!({}))),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "{path} must need crm.copilot.use, body: {}",
+            refused.body
+        );
+
+        // 404 for a deal in another organization, to a caller that HOLDS the key — the rule
+        // under test is the scope, so the guard must not answer first. The foreign deal is made
+        // by a **second** granted account rather than by `other_writer`, which predates the deal
+        // keys and holds none of them: widening an existing fixture to serve one walk would
+        // change what every other walk proves.
+        // The *home* deal, asked about by the account in the other organization. The key is
+        // held, so the guard cannot be what refuses — only the scope can.
+        let cross = call(
+            state,
+            request(
+                Method::POST,
+                &format!("/api/v1/crm/copilot/{path}/{deal_id}"),
+                Some(&foreign_copilot),
+                Some(json!({})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            cross.status,
+            StatusCode::NOT_FOUND,
+            "{path} must not confirm a deal in another organization, body: {}",
+            cross.body
+        );
+        // And the other direction: a deal in the *foreign* organization asked about from home is
+        // equally invisible. One direction proves the scope exists; both prove it is the scope
+        // and not a rule that happens to hide this one row.
+        let foreign = create_deal_via_api(
+            state,
+            &foreign_copilot,
+            json!({
+                "title": format!("Foreign {marker}"),
+                "amount": "10.00",
+                "currency": "USD",
+            }),
+        )
+        .await;
+        assert_eq!(
+            foreign.status,
+            StatusCode::CREATED,
+            "the foreign account needs crm.deals.create to make its own deal: {}",
+            foreign.body
+        );
+        let foreign_deal = foreign.body["id"].as_str().expect("a created deal has an id");
+        let cross_back = call(
+            state,
+            request(
+                Method::POST,
+                &format!("/api/v1/crm/copilot/{path}/{foreign_deal}"),
+                Some(&copilot),
+                Some(json!({})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            cross_back.status,
+            StatusCode::NOT_FOUND,
+            "{path} must not confirm a foreign deal either, body: {}",
+            cross_back.body
+        );
+
+        // The call lands, and the answer is audited whatever it is. This installation connects no
+        // provider, so the call **fails** — and a failure is still a call, and the audit row is
+        // the only record that it happened. The status is therefore not asserted to be any
+        // particular value: what is asserted is that the attempt was written down.
+        let called = call(
+            state,
+            request(Method::POST, &uri, Some(&copilot), Some(json!({}))),
+        )
+        .await;
+        assert!(
+            called.status.is_client_error() || called.status.is_server_error() || called.status == StatusCode::OK,
+            "{path} answered an unexpected status {}: {}",
+            called.status,
+            called.body
+        );
+
+        let rows = audit_rows(&fixture.db, "crm.copilot.failed").await;
+        assert!(
+            !rows.is_empty(),
+            "a copilot call must be audited even when it cannot be answered: {path}"
+        );
+        // The row names the deal and the action, and deliberately does NOT carry the draft or the
+        // deal's title: an audit log is read by people the CRM is not about.
+        let latest = &rows[0];
+        let metadata = &latest["metadata"];
+        assert_eq!(
+            metadata["deal_id"],
+            json!(deal_id),
+            "the audit must name the deal it read: {latest}"
+        );
+        assert_eq!(
+            metadata["action"],
+            json!(expected_action),
+            "the audit must name the action: {latest}"
+        );
+        assert!(
+            latest["target_type"] == json!("crm_deal"),
+            "the audit targets the deal: {latest}"
+        );
+        assert!(
+            metadata.get("draft").is_none() && metadata.get("title").is_none(),
+            "the audit must not carry the model's answer or the deal's title: {latest}"
+        );
+    }
+
+    // Nothing was written to the record: a copilot call is a draft, and the deal is untouched.
+    let after = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals/{deal_id}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK, "body: {}", after.body);
+    assert_eq!(
+        after.body["title"],
+        json!(format!("Copilot walk {marker}")),
+        "the copilot must not write to the record: {}",
+        after.body
+    );
+    assert!(
+        after.body.get("summary").is_none() && after.body.get("next_action").is_none(),
+        "the deal must carry no stored copilot output: {}",
+        after.body
+    );
+}

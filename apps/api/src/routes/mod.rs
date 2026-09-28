@@ -88,6 +88,7 @@ pub mod commands;
 pub mod content;
 pub mod crm;
 pub mod crm_activities;
+pub mod crm_copilot;
 pub mod crm_deals;
 pub mod crm_views;
 pub mod health;
@@ -812,9 +813,25 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "crm.activities.create"));
 
+    // The copilot. `crm.copilot.use` is a key of its own and not a sub-permission of the read or
+    // the update, for the reason the catalogue gives: a model that can read the whole CRM is a
+    // data-exfiltration surface even when it only ever returns text. The route answers a draft
+    // and writes nothing to the record, so there is deliberately no `POST` that applies one.
+    let crm_copilot = Router::new()
+        .route(
+            "/crm/copilot/summarize/{deal_id}",
+            post(crm_copilot::summarize),
+        )
+        .route(
+            "/crm/copilot/follow-up/{deal_id}",
+            post(crm_copilot::follow_up),
+        )
+        .route_layer(guards::require(&state, "crm.copilot.use"));
+
     let crm = crm_read
         .merge(crm_activities_read)
         .merge(crm_activities_create)
+        .merge(crm_copilot)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)
