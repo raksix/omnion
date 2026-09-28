@@ -726,8 +726,8 @@ pub async fn approve_invitation(
         .with_details(json!({ "invite_policy": "owner_approval" })));
     }
 
-    let released = memberships::approve_invitation(state.db().pool(), invitation_id, current.user.id)
-        .await?;
+    let released =
+        memberships::approve_invitation(state.db().pool(), invitation_id, current.user.id).await?;
 
     let Some((released, raw_token)) = released else {
         let invitations = memberships::list_invitations(state.db().pool(), organization.id).await?;
@@ -1493,7 +1493,8 @@ async fn invite_policy_decision(
         .with_details(json!({ "invite_policy": policy })));
     }
 
-    let queues = policy == "owner_approval" && !caller_is_organization_owner(state, current, organization_id).await?;
+    let queues = policy == "owner_approval"
+        && !caller_is_organization_owner(state, current, organization_id).await?;
 
     Ok(InviteDecision { queues, policy })
 }
@@ -1547,7 +1548,8 @@ async fn caller_is_organization_owner(
         }
     }
 
-    let memberships = memberships::list_account_memberships(state.db().pool(), current.user.id).await?;
+    let memberships =
+        memberships::list_account_memberships(state.db().pool(), current.user.id).await?;
     Ok(memberships.is_empty())
 }
 

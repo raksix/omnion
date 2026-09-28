@@ -306,12 +306,11 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
     // `Promise<OnboardingStatus>` and never looks for an id. Asserting `body["organization"]`
     // here was asking for a field the contract does not have, and it failed on the first
     // implementation it was ever run against.
-    let organization_id: Uuid = sqlx::query_scalar(
-        "select id from organizations order by created_at asc limit 1",
-    )
-    .fetch_one(harness.db.pool())
-    .await
-    .expect("the first run created exactly one organization");
+    let organization_id: Uuid =
+        sqlx::query_scalar("select id from organizations order by created_at asc limit 1")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the first run created exactly one organization");
     let members = harness
         .call(get(
             &format!("/api/v1/organizations/{organization_id}/members"),

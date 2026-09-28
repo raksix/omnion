@@ -80,20 +80,23 @@ pub async fn sweep_once(state: &AppState) -> Result<i64, omnion_audit::AuditErro
     let mut removed_total = 0_i64;
 
     for window in due_windows(state, now).await? {
-        let removed =
-            match omnion_audit::purge_before(state.db().pool(), window.organization_id, window.cutoff)
-                .await
-            {
-                Ok(removed) => removed,
-                Err(error) => {
-                    tracing::warn!(
-                        organization_id = %window.organization_id,
-                        error = %error,
-                        "the retention sweep could not purge one organization"
-                    );
-                    continue;
-                }
-            };
+        let removed = match omnion_audit::purge_before(
+            state.db().pool(),
+            window.organization_id,
+            window.cutoff,
+        )
+        .await
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                tracing::warn!(
+                    organization_id = %window.organization_id,
+                    error = %error,
+                    "the retention sweep could not purge one organization"
+                );
+                continue;
+            }
+        };
 
         if removed == 0 {
             // The oldest-row probe and the delete disagree only under a concurrent write, and
@@ -131,7 +134,10 @@ struct Window {
 /// per-tenant window authoritative. Ordering by the oldest expired row means a tick that hits
 /// its batch cap works on the tenants that have the most history waiting, and the rest follow
 /// on the next tick rather than being starved forever.
-async fn due_windows(state: &AppState, now: OffsetDateTime) -> Result<Vec<Window>, omnion_audit::AuditError> {
+async fn due_windows(
+    state: &AppState,
+    now: OffsetDateTime,
+) -> Result<Vec<Window>, omnion_audit::AuditError> {
     let batch = state.config().retention.sweep_batch as i64;
 
     // A tenant with no settings row still gets the default window, and the schema default is
@@ -243,7 +249,10 @@ mod tests {
         // Retention that only runs when somebody remembers is not retention. A default of
         // `false` would make the whole feature a lie on a stock installation.
         let defaults = RetentionConfig::default();
-        assert!(defaults.sweep_enabled, "the sweep must be on without configuration");
+        assert!(
+            defaults.sweep_enabled,
+            "the sweep must be on without configuration"
+        );
     }
 
     #[test]

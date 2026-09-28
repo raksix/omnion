@@ -68,12 +68,13 @@ impl PathPattern {
         &self.0
     }
 
-    /// Wrap an already-validated pattern.
+    /// Wrap an already-validated pattern, for test fixtures.
     ///
-    /// Only for callers that hold a pattern straight from the database (written
-    /// by `CacheRule::checked`) or from a test fixture. The type is public and
-    /// serialisable, so a value can arrive from outside without passing through
-    /// `parse`; anything an *author* types goes through `parse`.
+    /// Production code reaches a `PathPattern` either by `parse` (anything an author
+    /// types) or by serde (a row read from the database, via the transparent derive).
+    /// This constructor exists so a test can build a rule whose pattern is *meant* to be
+    /// invalid and still hand it to `CacheRule::checked`.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_raw(raw: impl Into<String>) -> Self {
         Self(raw.into())

@@ -23,7 +23,9 @@ use uuid::Uuid;
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
-use crate::scope::{ensure_same_organization, is_status_change, platform_only, resolve_organization};
+use crate::scope::{
+    ensure_same_organization, is_status_change, platform_only, resolve_organization,
+};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -459,7 +461,8 @@ pub async fn create_site(
 ) -> Result<(StatusCode, Json<SiteBody>), ApiError> {
     let organization_id = resolve_organization(&current, body.organization_id)?;
 
-    let Some(organization) = organizations::find_organization(state.db().pool(), organization_id).await?
+    let Some(organization) =
+        organizations::find_organization(state.db().pool(), organization_id).await?
     else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,

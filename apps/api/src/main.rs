@@ -131,7 +131,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if state.config().retention.sweep_enabled {
         let _sweeper = retention_runner::spawn(state.clone());
     } else {
-        tracing::info!("the audit retention sweep is disabled (OMNION_AUDIT_RETENTION_SWEEP=false)");
+        tracing::info!(
+            "the audit retention sweep is disabled (OMNION_AUDIT_RETENTION_SWEEP=false)"
+        );
     }
 
     let app = routes::router(state);

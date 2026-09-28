@@ -73,6 +73,7 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
+pub mod cdn;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -85,9 +86,9 @@ pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
+pub mod media_duplicates;
 pub mod media_files;
 pub mod media_grants;
-pub mod media_duplicates;
 pub mod media_scan;
 mod media_settings;
 pub mod media_shares;
@@ -407,9 +408,8 @@ pub fn router(state: AppState) -> Router {
     // the Members tab already has; releasing is `organizations.manage` *plus* the owner check
     // inside the handler, because "who may release" is a per-tenant fact the permission catalogue
     // cannot express — a manager manages the organization and still cannot approve here.
-    let organization_invitation_queue =
-        get(tenancy_members::list_queued_invitations)
-            .layer(guards::require(&state, "organizations.read"));
+    let organization_invitation_queue = get(tenancy_members::list_queued_invitations)
+        .layer(guards::require(&state, "organizations.read"));
 
     let organization_invitation_approval = post(tenancy_members::approve_invitation)
         .layer(guards::require(&state, "organizations.manage"));
@@ -678,8 +678,8 @@ pub fn router(state: AppState) -> Router {
     // permission as repointing where every file in it lives.
     let media_settings_route: MethodRouter<AppState, Infallible> =
         get(media_settings::read).layer(guards::require(&state, "media.read"));
-    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
-        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -719,18 +719,18 @@ pub fn router(state: AppState) -> Router {
     // (organise a library) nor `media.delete` (remove a file) is that power.
     let media_scan_route: MethodRouter<AppState, Infallible> =
         get(media_scan::read).layer(guards::require(&state, "media.read"));
-    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
-        .layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
         get(media_scan::list_held).layer(guards::require(&state, "media.read"));
     let media_quarantine_release: MethodRouter<AppState, Infallible> =
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -740,12 +740,12 @@ pub fn router(state: AppState) -> Router {
     // able to decide who else may read what they uploaded.
     let media_folder_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
-    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
-    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     // Two independent routers rather than one value mounted twice: `MethodRouter` is moved
     // into each `.route()` call, so sharing it would move out of the first and fail the second
     // at runtime rather than at compile time.
@@ -867,6 +867,21 @@ pub fn router(state: AppState) -> Router {
             delete(automation::delete_automation)
                 .layer(guards::require(&state, "workflows.manage")),
         );
+
+    // The CDN / edge surface (docs/requests/REQ-011, slice 1): reading rules and settings is
+    // `cdn.read`, writing a rule is `cdn.manage`, and invalidating cached content is the
+    // separate `cdn.purge` — a blunt act an operator may grant without letting the same
+    // account rewrite the policy that decides what may be cached. The purge tables
+    // themselves are slice 2; only the rules and settings ship here.
+    let cdn_rules = get(cdn::list_rules)
+        .layer(guards::require(&state, "cdn.read"))
+        .merge(post(cdn::create_rule).layer(guards::require(&state, "cdn.manage")))
+        .merge(post(cdn::reorder_rules).layer(guards::require(&state, "cdn.manage")));
+    let cdn_rule = get(cdn::get_rule)
+        .layer(guards::require(&state, "cdn.read"))
+        .merge(put(cdn::update_rule).layer(guards::require(&state, "cdn.manage")))
+        .merge(delete(cdn::delete_rule).layer(guards::require(&state, "cdn.manage")));
+    let cdn_rule_toggle = post(cdn::toggle_rule).layer(guards::require(&state, "cdn.manage"));
 
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
@@ -1232,7 +1247,10 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        .route("/media/folders/{id}/grants/{grant_id}", media_folder_grant_delete)
+        .route(
+            "/media/folders/{id}/grants/{grant_id}",
+            media_folder_grant_delete,
+        )
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
         .route("/media/{id}/grants/{grant_id}", media_file_grant_delete)
@@ -1273,6 +1291,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
+        .route("/cdn/rules", cdn_rules)
+        .route("/cdn/rules/{id}", cdn_rule)
+        .route("/cdn/rules/{id}/toggle", cdn_rule_toggle)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
@@ -1294,6 +1315,9 @@ pub fn router(state: AppState) -> Router {
         // navigation is built from which module owns the matched route, so a screen cannot be
         // added to a module without the switch governing it, and the core (tenancy, identity,
         // content, search) is never a module and can never be switched off.
-        .nest("/api/v1", v1.layer(crate::module_guard::RequireModules::new(state.clone())))
+        .nest(
+            "/api/v1",
+            v1.layer(crate::module_guard::RequireModules::new(state.clone())),
+        )
         .with_state(state)
 }

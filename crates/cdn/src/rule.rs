@@ -7,8 +7,8 @@ use crate::matcher::{CacheKey, PathPattern, RequestShape};
 /// One year, the cap both TTLs are validated against.
 pub const MAX_TTL_SECONDS: i32 = 31_536_000;
 
-/// The name a rule is given, with its bounds.
-const NAME_MIN: usize = 1;
+/// The bounds on a rule name; the minimum is 1, which `char_length` already enforces
+/// in the table, so only the maximum needs a constant here.
 const NAME_MAX: usize = 64;
 
 /// A cache rule as the panel stores it.

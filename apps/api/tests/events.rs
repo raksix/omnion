@@ -1332,8 +1332,7 @@ async fn a_members_join_reaches_only_the_tenant_it_belongs_to() {
     assert_eq!(body_a["payload"]["user_id"], json!(joiner_a.to_string()));
     assert_eq!(body_b["payload"]["user_id"], json!(joiner_b.to_string()));
     assert_ne!(
-        body_a["payload"]["user_id"],
-        body_b["payload"]["user_id"],
+        body_a["payload"]["user_id"], body_b["payload"]["user_id"],
         "two tenants' joins are two facts"
     );
 
@@ -1450,7 +1449,10 @@ async fn a_members_join_reaches_only_the_tenant_it_belongs_to() {
         ))
         .await;
     assert_eq!(opened.status, StatusCode::OK, "{:?}", opened.body);
-    assert_eq!(opened.body["settings"]["invite_policy"], json!("self_serve"));
+    assert_eq!(
+        opened.body["settings"]["invite_policy"],
+        json!("self_serve")
+    );
 
     let invited = harness
         .call(post(
@@ -1502,8 +1504,7 @@ async fn a_members_join_reaches_only_the_tenant_it_belongs_to() {
         .expect("tenant A received the acceptance delivery");
     assert_eq!(via_invitation["organization_id"], json!(org_a.to_string()));
     assert_eq!(
-        via_invitation["payload"]["user_id"],
-        accepted.body["user_id"],
+        via_invitation["payload"]["user_id"], accepted.body["user_id"],
         "the acceptance is delivered about the account it created"
     );
     assert_eq!(

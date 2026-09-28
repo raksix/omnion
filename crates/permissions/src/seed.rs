@@ -105,6 +105,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "domains.manage",
             "webhooks.read",
             "events.read",
+            "cdn.read",
             "search.read",
             "search.manage",
             "analytics.read",

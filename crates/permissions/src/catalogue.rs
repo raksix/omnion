@@ -396,6 +396,26 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "events",
         description: "Read the platform's event feed",
     },
+    // CDN / edge (docs/requests/REQ-011). Reading rules and the provider state is one
+    // power; changing a rule is another, because a rule decides what a shared cache is
+    // allowed to keep. `cdn.purge` is separate from `cdn.manage` on purpose: invalidating
+    // a zone is a blunt operational act that an operator may want to allow without
+    // letting the same account rewrite the policy.
+    PermissionDef {
+        key: "cdn.read",
+        category: "cdn",
+        description: "Read CDN settings, cache rules and purge history",
+    },
+    PermissionDef {
+        key: "cdn.manage",
+        category: "cdn",
+        description: "Create, change, reorder and remove cache rules and provider settings",
+    },
+    PermissionDef {
+        key: "cdn.purge",
+        category: "cdn",
+        description: "Invalidate cached URLs, tags or a whole zone",
+    },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each
     // provider's own read permission; `search.manage` is index maintenance, not searching.

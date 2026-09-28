@@ -503,11 +503,7 @@ async fn set_invite_policy(db: &Db, organization_id: Uuid, policy: &str) {
 ///
 /// Several walks assert *how* a create ended — `201` with a link, `202` queued, `403` closed —
 /// and a helper that panicked on the wrong status would hide which one it was.
-async fn invite(
-    fixture: &Fixture,
-    token: &str,
-    email: &str,
-) -> TestResponse {
+async fn invite(fixture: &Fixture, token: &str, email: &str) -> TestResponse {
     call(
         &fixture.state,
         request(
@@ -1772,7 +1768,12 @@ async fn self_serve_hands_over_a_working_link_to_anyone_who_may_manage() {
 
     let created = invite(&fixture, &admin, &address).await;
 
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let token = created.body["token"]
         .as_str()
         .expect("a self-serve invitation must carry its link")
@@ -1796,7 +1797,11 @@ async fn self_serve_hands_over_a_working_link_to_anyone_who_may_manage() {
     )
     .await;
     assert_eq!(preview.status, StatusCode::OK, "body: {}", preview.body);
-    assert_eq!(preview.body["usable"], true, "the link must be usable: {}", preview.body);
+    assert_eq!(
+        preview.body["usable"], true,
+        "the link must be usable: {}",
+        preview.body
+    );
 
     fixture.cleanup().await;
 }
@@ -1843,7 +1848,9 @@ async fn owner_approval_queues_the_link_until_an_owner_releases_it() {
     assert_eq!(queue.status, StatusCode::OK, "body: {}", queue.body);
     let queued_rows = queue.body["invitations"].as_array().expect("an array");
     assert!(
-        queued_rows.iter().any(|row| row["id"] == invitation_id.as_str()),
+        queued_rows
+            .iter()
+            .any(|row| row["id"] == invitation_id.as_str()),
         "the queue must list what is waiting: {}",
         queue.body
     );
@@ -2022,7 +2029,12 @@ async fn a_queued_link_never_works_and_says_so() {
         ),
     )
     .await;
-    assert_eq!(accepted.status, StatusCode::CONFLICT, "body: {}", accepted.body);
+    assert_eq!(
+        accepted.status,
+        StatusCode::CONFLICT,
+        "body: {}",
+        accepted.body
+    );
     assert_eq!(
         code_of(&accepted.body),
         "invitation_awaiting_approval",
@@ -2031,11 +2043,12 @@ async fn a_queued_link_never_works_and_says_so() {
     );
 
     // It is still queued afterwards: a refused acceptance must not have released it.
-    let status: String = sqlx::query_scalar("select status from organization_invitations where id = $1")
-        .bind(created.invitation.id)
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("the row must still be there");
+    let status: String =
+        sqlx::query_scalar("select status from organization_invitations where id = $1")
+            .bind(created.invitation.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the row must still be there");
     assert_eq!(status, "awaiting_approval");
 
     // A token that was never issued still answers indistinguishably, so the queue is not a probe
@@ -2052,8 +2065,7 @@ async fn a_queued_link_never_works_and_says_so() {
     )
     .await;
     assert_eq!(
-        bogus.status,
-        preview.status,
+        bogus.status, preview.status,
         "a queued and an unknown token must answer alike: {} vs {}",
         bogus.status, preview.status
     );
@@ -2107,7 +2119,12 @@ async fn an_owner_inviting_into_their_own_tenant_is_not_stuck_behind_the_queue()
         "an owner must not have to queue an invitation behind themselves: {}",
         created.body
     );
-    assert!(!created.body["token"].as_str().unwrap_or_default().is_empty());
+    assert!(
+        !created.body["token"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
 
     fixture.cleanup().await;
 }
@@ -2161,7 +2178,12 @@ async fn one_tenants_queue_is_another_tenants_invisible_row() {
         ),
     )
     .await;
-    assert_eq!(release.status, StatusCode::NOT_FOUND, "body: {}", release.body);
+    assert_eq!(
+        release.status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        release.body
+    );
     assert_eq!(code_of(&release.body), "organization_not_found");
 
     fixture.cleanup().await;
@@ -2222,7 +2244,9 @@ async fn a_suspended_organization_keeps_reads_and_refuses_writes_by_name() {
     )
     .await;
     assert_eq!(site.status, StatusCode::CREATED, "body: {}", site.body);
-    let site_id = site.body["id"].as_str().expect("a created site carries an id");
+    let site_id = site.body["id"]
+        .as_str()
+        .expect("a created site carries an id");
 
     // While it is active, the same writes work. A walk that only ever exercises the frozen state
     // cannot tell "the guard refused" from "this endpoint was always broken".
@@ -2361,24 +2385,22 @@ async fn a_suspended_organization_keeps_reads_and_refuses_writes_by_name() {
     // ---- and it really refused: nothing was written --------------------------------------------------------
     // A refusal that leaves the row behind is a refusal that failed. The site's name and the
     // settings' locale are the two writes above, read back from the database.
-    let stored_name: String =
-        sqlx::query_scalar("select name from sites where id = $1")
-            .bind(Uuid::parse_str(site_id).expect("a site id parses"))
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the site must still be there");
+    let stored_name: String = sqlx::query_scalar("select name from sites where id = $1")
+        .bind(Uuid::parse_str(site_id).expect("a site id parses"))
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the site must still be there");
     assert_eq!(
         stored_name, "Before the freeze",
         "the refused site rename must not have been written"
     );
 
-    let stored_locale: String = sqlx::query_scalar(
-        "select locale from organization_settings where organization_id = $1",
-    )
-    .bind(fixture.org_a)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the settings row must still be there");
+    let stored_locale: String =
+        sqlx::query_scalar("select locale from organization_settings where organization_id = $1")
+            .bind(fixture.org_a)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the settings row must still be there");
     assert_eq!(
         stored_locale, "en-GB",
         "the refused settings write must not have been written"
@@ -2407,7 +2429,10 @@ async fn reactivating_restores_writes_and_archives_freeze_them_too() {
     let settings_uri = format!("/api/v1/organizations/{}/settings", fixture.org_a);
 
     // ---- suspend, refuse, reactivate, write ----------------------------------------------------------------
-    assert_eq!(set_status(&fixture, &admin, "suspended").await.status, StatusCode::OK);
+    assert_eq!(
+        set_status(&fixture, &admin, "suspended").await.status,
+        StatusCode::OK
+    );
 
     let refused = call(
         &fixture.state,
@@ -2419,7 +2444,12 @@ async fn reactivating_restores_writes_and_archives_freeze_them_too() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "body: {}",
+        refused.body
+    );
 
     // The escape hatch. If this is the step that fails, the feature has shipped a tenant that
     // can be suspended and never brought back — a guard in front of the only control that undoes
@@ -2451,7 +2481,10 @@ async fn reactivating_restores_writes_and_archives_freeze_them_too() {
     );
 
     // ---- archive: the same freeze, a quieter one ------------------------------------------------------------
-    assert_eq!(set_status(&fixture, &admin, "archived").await.status, StatusCode::OK);
+    assert_eq!(
+        set_status(&fixture, &admin, "archived").await.status,
+        StatusCode::OK
+    );
 
     let archived_write = call(
         &fixture.state,
@@ -2513,7 +2546,10 @@ async fn a_status_move_is_audited_and_announced_as_its_own_event() {
     };
     let admin = fixture.admin_token().await;
 
-    assert_eq!(set_status(&fixture, &admin, "suspended").await.status, StatusCode::OK);
+    assert_eq!(
+        set_status(&fixture, &admin, "suspended").await.status,
+        StatusCode::OK
+    );
 
     // The audit row is the *lifecycle* action, not a generic `organization.updated`: a trail that
     // records "someone edited the organization" cannot answer "who suspended this tenant and
@@ -2526,7 +2562,9 @@ async fn a_status_move_is_audited_and_announced_as_its_own_event() {
     .await
     .expect("the trail must read");
     assert!(
-        trail.iter().any(|action| action == "organization.suspended"),
+        trail
+            .iter()
+            .any(|action| action == "organization.suspended"),
         "the suspension must be audited as itself: {trail:?}"
     );
     assert!(
@@ -2536,14 +2574,13 @@ async fn a_status_move_is_audited_and_announced_as_its_own_event() {
 
     // The event bus carries it too, so a subscriber can freeze downstream work on the tenant
     // without polling the organization row.
-    let emitted: Vec<String> = sqlx::query_scalar(
-        "select name from events where organization_id = $1 and name = $2",
-    )
-    .bind(fixture.org_a)
-    .bind("organization.suspended")
-    .fetch_all(fixture.db.pool())
-    .await
-    .expect("the events must read");
+    let emitted: Vec<String> =
+        sqlx::query_scalar("select name from events where organization_id = $1 and name = $2")
+            .bind(fixture.org_a)
+            .bind("organization.suspended")
+            .fetch_all(fixture.db.pool())
+            .await
+            .expect("the events must read");
     assert_eq!(
         emitted.len(),
         1,
@@ -2552,7 +2589,10 @@ async fn a_status_move_is_audited_and_announced_as_its_own_event() {
 
     // Reactivating is its own action rather than a second `suspended`, so a consumer can count
     // the freezes a tenant went through.
-    assert_eq!(set_status(&fixture, &admin, "active").await.status, StatusCode::OK);
+    assert_eq!(
+        set_status(&fixture, &admin, "active").await.status,
+        StatusCode::OK
+    );
     let reactivated: i64 = sqlx::query_scalar(
         "select count(*) from audit_log where organization_id = $1 and action = $2",
     )
@@ -2666,12 +2706,16 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
     assert_eq!(feed.status, StatusCode::OK, "body: {}", feed.body);
     let entries = feed.body["entries"].as_array().expect("an array");
     assert!(
-        entries.iter().any(|row| row["action"] == "organization.settings.updated"),
+        entries
+            .iter()
+            .any(|row| row["action"] == "organization.settings.updated"),
         "the settings change must be in this tenant's trail: {}",
         feed.body
     );
     assert!(
-        entries.iter().any(|row| row["action"] == "organization.member.invited"),
+        entries
+            .iter()
+            .any(|row| row["action"] == "organization.member.invited"),
         "and so must the invitation: {}",
         feed.body
     );
@@ -2679,10 +2723,15 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
     // Every row carries a readable actor — the whole point of a feed. A system row says so rather
     // than rendering a blank cell.
     for row in entries {
-        assert!(row["actor_type"].is_string(), "every row names its actor type: {row}");
+        assert!(
+            row["actor_type"].is_string(),
+            "every row names its actor type: {row}"
+        );
         if row["actor_type"] == "user" {
             assert!(
-                row["actor_name"].as_str().is_some_and(|name| !name.is_empty()),
+                row["actor_name"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty()),
                 "a human row names the human: {row}"
             );
         }
@@ -2691,7 +2740,9 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
     // The action filter is exact, chosen from the list the same response returns.
     let actions = feed.body["actions"].as_array().expect("an array");
     assert!(
-        actions.iter().any(|value| value == "organization.settings.updated"),
+        actions
+            .iter()
+            .any(|value| value == "organization.settings.updated"),
         "the filter offers what this tenant has done: {actions:?}"
     );
     let filtered = call(
@@ -2718,32 +2769,56 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
         filtered.body
     );
     assert!(
-        filtered.body["total"].as_i64().unwrap_or_default() < feed.body["total"].as_i64().unwrap_or_default(),
+        filtered.body["total"].as_i64().unwrap_or_default()
+            < feed.body["total"].as_i64().unwrap_or_default(),
         "a narrowed feed counts fewer rows than the whole one: {} vs {}",
-        filtered.body["total"], feed.body["total"]
+        filtered.body["total"],
+        feed.body["total"]
     );
 
     // A typo is refused rather than answered as "this tenant has no history" — the one reading an
     // audit screen must never give by accident.
     let nonsense = call(
         &fixture.state,
-        request(Method::GET, &format!("{uri}?actor=not-an-id"), Some(&auditor), None),
+        request(
+            Method::GET,
+            &format!("{uri}?actor=not-an-id"),
+            Some(&auditor),
+            None,
+        ),
     )
     .await;
-    assert_eq!(nonsense.status, StatusCode::BAD_REQUEST, "body: {}", nonsense.body);
+    assert_eq!(
+        nonsense.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        nonsense.body
+    );
     assert_eq!(code_of(&nonsense.body), "invalid_actor_filter");
 
     // The CSV repeats the rows on screen, not a different query's idea of them.
     let csv = call(
         &fixture.state,
-        request(Method::GET, &format!("{uri}?format=csv"), Some(&auditor), None),
+        request(
+            Method::GET,
+            &format!("{uri}?format=csv"),
+            Some(&auditor),
+            None,
+        ),
     )
     .await;
     assert_eq!(csv.status, StatusCode::OK);
     let text = String::from_utf8_lossy(&csv.raw);
     let header = text.lines().next().expect("a header row");
-    assert!(header.starts_with("id,action,actor,"), "the header names the columns: {header}");
-    let rows = text.lines().skip(1).filter(|line| !line.trim().is_empty()).count();
+    assert!(
+        header.starts_with("id,action,actor,"),
+        "the header names the columns: {header}"
+    );
+    let rows = text
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .count();
     assert_eq!(
         rows,
         entries.len(),
@@ -2782,7 +2857,12 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
         request(Method::GET, &uri, Some(&other_admin), None),
     )
     .await;
-    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "body: {}", foreign.body);
+    assert_eq!(
+        foreign.status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        foreign.body
+    );
     assert_eq!(code_of(&foreign.body), "organization_not_found");
 
     fixture.cleanup().await;
@@ -3044,7 +3124,12 @@ async fn switching_a_module_off_hides_its_api_and_switching_it_back_restores_it(
 
     let theirs = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/me/organizations", Some(&other_admin), None),
+        request(
+            Method::GET,
+            "/api/v1/me/organizations",
+            Some(&other_admin),
+            None,
+        ),
     )
     .await;
     assert_eq!(
@@ -3140,7 +3225,13 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
 
     // A: two rows outside its 30-day window, one inside it.
     plant_audit_row(&fixture.db, fixture.org_a, "test.old", now - (day * 60)).await;
-    plant_audit_row(&fixture.db, fixture.org_a, "test.ancient", now - (day * 400)).await;
+    plant_audit_row(
+        &fixture.db,
+        fixture.org_a,
+        "test.ancient",
+        now - (day * 400),
+    )
+    .await;
     plant_audit_row(&fixture.db, fixture.org_a, "test.recent", now - (day * 2)).await;
 
     // B: one row outside A's window but well inside its own, and one outside both.
@@ -3150,7 +3241,10 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
     let removed = omnion_api::retention_runner::sweep_once(&fixture.state)
         .await
         .expect("the sweep must run");
-    assert_eq!(removed, 3, "two rows from A and one from B, and not one more");
+    assert_eq!(
+        removed, 3,
+        "two rows from A and one from B, and not one more"
+    );
 
     assert_eq!(
         audit_count(&fixture.db, fixture.org_a).await,
@@ -3163,12 +3257,13 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
         "B keeps its 100-day-old row, which is inside its own 365-day window"
     );
 
-    let b_actions: Vec<String> =
-        sqlx::query_scalar("select action from audit_log where organization_id = $1 order by action")
-            .bind(fixture.org_b())
-            .fetch_all(fixture.db.pool())
-            .await
-            .expect("B's trail must read");
+    let b_actions: Vec<String> = sqlx::query_scalar(
+        "select action from audit_log where organization_id = $1 order by action",
+    )
+    .bind(fixture.org_b())
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("B's trail must read");
     assert!(
         b_actions.contains(&"test.b100".to_owned()),
         "the 100-day-old row is inside B's window and must survive: {b_actions:?}"
@@ -3190,10 +3285,17 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
     .fetch_all(fixture.db.pool())
     .await
     .expect("the receipts must read");
-    assert_eq!(filed.len(), 1, "one receipt per sweep that removed something");
+    assert_eq!(
+        filed.len(),
+        1,
+        "one receipt per sweep that removed something"
+    );
     assert_eq!(filed[0].0, "system", "nobody performed a sweep");
     assert_eq!(filed[0].1, "organization.retention.swept");
-    assert_eq!(filed[0].2, 2, "the receipt repeats the count the sweep removed");
+    assert_eq!(
+        filed[0].2, 2,
+        "the receipt repeats the count the sweep removed"
+    );
     assert_eq!(filed[0].3, 30, "the receipt names the window it applied");
 
     // The bus carries it, so a subscriber can archive elsewhere in step with the platform.
@@ -3205,7 +3307,10 @@ async fn the_retention_sweep_applies_each_tenants_own_window() {
     .fetch_all(fixture.db.pool())
     .await
     .expect("the events must read");
-    assert_eq!(emitted, vec![("organization.retention.swept".to_owned(), 2)]);
+    assert_eq!(
+        emitted,
+        vec![("organization.retention.swept".to_owned(), 2)]
+    );
 
     // A second sweep over the same data removes nothing and files nothing: a trail full of its
     // own nightly housekeeping is a trail nobody reads.
@@ -3261,7 +3366,10 @@ async fn a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still
     let removed = omnion_api::retention_runner::sweep_once(&fixture.state)
         .await
         .expect("the sweep must run");
-    assert_eq!(removed, 1, "only the settings-less tenant's expired row goes");
+    assert_eq!(
+        removed, 1,
+        "only the settings-less tenant's expired row goes"
+    );
     assert_eq!(
         audit_count(&fixture.db, fixture.org_a).await,
         1,
@@ -3296,7 +3404,6 @@ async fn set_retention(db: &Db, organization_id: Uuid, days: i32) {
     .expect("the retention window must be storable");
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // The member drawer (REQ-005, slice 4)
 // ---------------------------------------------------------------------------------------------
@@ -3310,11 +3417,7 @@ async fn set_retention(db: &Db, organization_id: Uuid, days: i32) {
 /// outside — from the guard the walk means to exercise. A walk built on that fixture would
 /// "prove" the drawer refuses a cross-tenant grant while proving only that the caller was
 /// short of a permission.
-const DRAWER_PERMISSIONS: [&str; 3] = [
-    "iam.bindings.read",
-    "iam.bindings.manage",
-    "audit.read",
-];
+const DRAWER_PERMISSIONS: [&str; 3] = ["iam.bindings.read", "iam.bindings.manage", "audit.read"];
 
 /// Grant the drawer powers to an account and return the role it created.
 ///
@@ -3380,10 +3483,7 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
     let subject = fixture.accounts[1];
     let role_id = grant_drawer_permissions(&fixture.db, fixture.org_a, fixture.accounts[0]).await;
 
-    let uri = format!(
-        "/api/v1/organizations/{}/members/{subject}",
-        fixture.org_a
-    );
+    let uri = format!("/api/v1/organizations/{}/members/{subject}", fixture.org_a);
 
     let opened = call(
         &fixture.state,
@@ -3412,7 +3512,12 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
         ),
     )
     .await;
-    assert_eq!(granted.status, StatusCode::CREATED, "grant: {}", granted.body);
+    assert_eq!(
+        granted.status,
+        StatusCode::CREATED,
+        "grant: {}",
+        granted.body
+    );
     assert_eq!(granted.body["role_id"], role_id.to_string());
     // The default scope is the organization's, and it is named rather than assumed — a grant
     // that silently resolved to `global` would be a tenant administrator handing out a platform
@@ -3428,7 +3533,9 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
     )
     .await;
     assert_eq!(after.status, StatusCode::OK);
-    let bindings = after.body["bindings"].as_array().expect("an array of bindings");
+    let bindings = after.body["bindings"]
+        .as_array()
+        .expect("an array of bindings");
     assert_eq!(bindings.len(), 1, "{:?}", after.body["bindings"]);
     assert_eq!(bindings[0]["id"], binding_id);
     assert_eq!(bindings[0]["role_id"], role_id.to_string());
@@ -3439,7 +3546,9 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
     // would be the wrong half of a privacy decision made by accident. Asserting the subject's
     // trail is empty therefore pins the boundary down rather than leaving it to whichever side
     // of the line the implementation happened to land on.
-    let subject_trail = after.body["recent_audit"].as_array().expect("an audit array");
+    let subject_trail = after.body["recent_audit"]
+        .as_array()
+        .expect("an audit array");
     assert!(
         !subject_trail
             .iter()
@@ -3469,7 +3578,10 @@ async fn the_member_drawer_answers_with_everything_it_renders() {
         "the grant must be on the grantor's own trail: {grantor_trail:?}"
     );
     // And a human name, not a blank — the Audit tab resolves it and so must this.
-    assert_eq!(role_changed.expect("the grant row")["actor_name"], "Tenant Test");
+    assert_eq!(
+        role_changed.expect("the grant row")["actor_name"],
+        "Tenant Test"
+    );
 
     // The other tenant's administrator may not open this member at all — a `404`, because a
     // `403` would confirm that the user id exists somewhere.
@@ -3502,10 +3614,7 @@ async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
     let subject = fixture.accounts[1];
     let role_id = grant_drawer_permissions(&fixture.db, fixture.org_a, fixture.accounts[0]).await;
 
-    let uri = format!(
-        "/api/v1/organizations/{}/members/{subject}",
-        fixture.org_a
-    );
+    let uri = format!("/api/v1/organizations/{}/members/{subject}", fixture.org_a);
 
     // A grant with a window an hour out.
     let first_hour = OffsetDateTime::now_utc() + time::Duration::hours(1);
@@ -3522,9 +3631,17 @@ async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
         ),
     )
     .await;
-    assert_eq!(granted.status, StatusCode::CREATED, "grant: {}", granted.body);
+    assert_eq!(
+        granted.status,
+        StatusCode::CREATED,
+        "grant: {}",
+        granted.body
+    );
     let binding_id = id_of(&granted.body);
-    let original_expiry = granted.body["expires_at"].as_str().expect("an expiry").to_owned();
+    let original_expiry = granted.body["expires_at"]
+        .as_str()
+        .expect("an expiry")
+        .to_owned();
 
     // Extending backwards is refused: "extend" that lands in the past is a grant that reads as
     // renewed and does nothing.
@@ -3573,11 +3690,7 @@ async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
         ),
     )
     .await;
-    assert_eq!(
-        extended.status, StatusCode::OK,
-        "extend: {}",
-        extended.body
-    );
+    assert_eq!(extended.status, StatusCode::OK, "extend: {}", extended.body);
     assert_eq!(extended.body["id"], binding_id, "the same row answered");
     assert_ne!(extended.body["expires_at"], original_expiry);
     assert_eq!(extended.body["active"], true);
@@ -3588,8 +3701,14 @@ async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
         request(Method::GET, &uri, Some(&admin), None),
     )
     .await;
-    let bindings = after.body["bindings"].as_array().expect("an array of bindings");
-    assert_eq!(bindings.len(), 1, "an extension must not add a row: {bindings:?}");
+    let bindings = after.body["bindings"]
+        .as_array()
+        .expect("an array of bindings");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "an extension must not add a row: {bindings:?}"
+    );
     assert_eq!(bindings[0]["id"], binding_id);
 
     // Revoking it is the last step, and a *revoked* binding cannot be extended afterwards: the
@@ -3623,7 +3742,12 @@ async fn a_temporary_grant_is_extended_in_place_and_never_into_a_second_row() {
     // A revoked grant is refused *by name* rather than answered as a 404. The row exists, the
     // caller can see it in the drawer, and "there is no such grant" would send them looking for
     // a typo instead of reading the sentence that explains the rule.
-    assert_eq!(reopen.status, StatusCode::BAD_REQUEST, "reopen: {}", reopen.body);
+    assert_eq!(
+        reopen.status,
+        StatusCode::BAD_REQUEST,
+        "reopen: {}",
+        reopen.body
+    );
     assert_eq!(code_of(&reopen.body), "binding_revoked");
 
     fixture.cleanup().await;
@@ -3666,11 +3790,9 @@ async fn a_grant_stays_inside_the_tenant_that_makes_it() {
     assert_eq!(code_of(&refused.body), "member_not_found");
 
     // A role from the *other* tenant, granted to a real member of this one.
-    let other_role = grant_drawer_permissions(&fixture.db, fixture.org_b(), fixture.accounts[2]).await;
-    let member_uri = format!(
-        "/api/v1/organizations/{}/members/{subject}",
-        fixture.org_a
-    );
+    let other_role =
+        grant_drawer_permissions(&fixture.db, fixture.org_b(), fixture.accounts[2]).await;
+    let member_uri = format!("/api/v1/organizations/{}/members/{subject}", fixture.org_a);
     let cross_role = call(
         &fixture.state,
         request(
@@ -3726,7 +3848,12 @@ async fn a_grant_stays_inside_the_tenant_that_makes_it() {
         ),
     )
     .await;
-    assert_eq!(granted.status, StatusCode::CREATED, "grant: {}", granted.body);
+    assert_eq!(
+        granted.status,
+        StatusCode::CREATED,
+        "grant: {}",
+        granted.body
+    );
     let binding_id = id_of(&granted.body);
 
     let other = fixture.other_admin_token().await;
@@ -3744,14 +3871,14 @@ async fn a_grant_stays_inside_the_tenant_that_makes_it() {
     )
     .await;
     assert_eq!(
-        foreign.status, StatusCode::NOT_FOUND,
+        foreign.status,
+        StatusCode::NOT_FOUND,
         "another tenant may not revoke: {}",
         foreign.body
     );
 
     fixture.cleanup().await;
 }
-
 
 /// A platform account has no tenant of its own, so a write that does not name one has no
 /// subject. The criterion for this walk is the *whole* sentence: "a platform account can list

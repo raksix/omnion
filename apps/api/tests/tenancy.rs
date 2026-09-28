@@ -593,10 +593,12 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
         refused_while_frozen.body
     );
     assert_eq!(
-        refused_while_frozen.body["error"]["code"], "organization_not_writable"
+        refused_while_frozen.body["error"]["code"],
+        "organization_not_writable"
     );
     assert_eq!(
-        refused_while_frozen.body["error"]["details"]["status"], "suspended"
+        refused_while_frozen.body["error"]["details"]["status"],
+        "suspended"
     );
 
     // Thawing is a status change, so it is the one write the freeze cannot block — otherwise a

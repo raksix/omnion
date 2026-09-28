@@ -295,8 +295,14 @@ mod tests {
     fn the_status_change_is_never_itself_refused() {
         // `is_status_change` is the escape hatch: without it a suspended tenant can never be
         // reactivated, because the guard would sit in front of the only control that undoes it.
-        assert!(is_status_change(Some("active")), "reactivating is a status change");
-        assert!(is_status_change(Some("suspended")), "suspending is a status change");
+        assert!(
+            is_status_change(Some("active")),
+            "reactivating is a status change"
+        );
+        assert!(
+            is_status_change(Some("suspended")),
+            "suspending is a status change"
+        );
         assert!(
             !is_status_change(None),
             "a change that carries no status is a plain write and must be refused"

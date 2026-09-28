@@ -30,9 +30,9 @@ use omnion_events::{NewEvent, bus};
 use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_media::{
-    MAX_UPLOAD_BYTES, Media, MediaError, NewMedia, normalize_content_type, object_key,
+    MAX_UPLOAD_BYTES, Media, MediaError, MediaFile, NewMedia, normalize_content_type, object_key,
     sanitize_filename, serve_plan,
-    MediaFile,};
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -284,10 +284,7 @@ pub async fn upload_media(
 /// `hold` to `serve` has to take effect on the next request: a cached policy would keep
 /// refusing a file for as long as the entry lived, and the operator has just said the
 /// opposite on the settings screen.
-pub(crate) async fn ensure_servable(
-    state: &AppState,
-    media: &MediaFile,
-) -> Result<(), ApiError> {
+pub(crate) async fn ensure_servable(state: &AppState, media: &MediaFile) -> Result<(), ApiError> {
     // A `clean` file needs no policy read at all: the state already answers the question, and
     // the panel serves far more of those than anything else, so a row read per request on the
     // hottest path in the library is a cost with no benefit.
@@ -530,7 +527,10 @@ async fn serve_file(
     headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
     headers.insert(
         header::CONTENT_DISPOSITION,
-        header_value(&format!("{}; filename=\"{}\"", plan.disposition, media.filename))?,
+        header_value(&format!(
+            "{}; filename=\"{}\"",
+            plan.disposition, media.filename
+        ))?,
     );
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);

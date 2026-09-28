@@ -211,16 +211,16 @@ pub async fn grant_member_role(
     member_detail(&state, organization.id, user_id).await?;
 
     let expires_at = match body.expires_at.as_deref() {
-        Some(raw) => Some(OffsetDateTime::parse(
-            raw,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| {
-            ApiError::bad_request(
-                "invalid_expiry",
-                format!("{raw:?} is not an RFC 3339 timestamp"),
-            )
-        })?),
+        Some(raw) => Some(
+            OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).map_err(
+                |_| {
+                    ApiError::bad_request(
+                        "invalid_expiry",
+                        format!("{raw:?} is not an RFC 3339 timestamp"),
+                    )
+                },
+            )?,
+        ),
         None => None,
     };
 
@@ -236,9 +236,7 @@ pub async fn grant_member_role(
     // not carry the role — a grant nobody can exercise and nobody can revoke cleanly.
     let role = role_store::find_role(state.db().pool(), body.role_id)
         .await?
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::NOT_FOUND, "role_not_found", "no such role")
-        })?;
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "role_not_found", "no such role"))?;
     if role.organization_id != Some(organization.id) {
         return Err(ApiError::forbidden(
             "cross_organization",
@@ -399,13 +397,16 @@ pub async fn extend_member_role(
 ) -> Result<Json<MemberBindingBody>, ApiError> {
     let organization = organization_in_scope_for_write(&state, &current, organization_id).await?;
 
-    let expires_at = OffsetDateTime::parse(&body.expires_at, &time::format_description::well_known::Rfc3339)
-        .map_err(|_| {
-            ApiError::bad_request(
-                "invalid_expiry",
-                format!("{:?} is not an RFC 3339 timestamp", body.expires_at),
-            )
-        })?;
+    let expires_at = OffsetDateTime::parse(
+        &body.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| {
+        ApiError::bad_request(
+            "invalid_expiry",
+            format!("{:?} is not an RFC 3339 timestamp", body.expires_at),
+        )
+    })?;
 
     // Only a window that ends in the future is an extension. Accepting a past date would let a
     // caller "extend" a grant into a state that is already expired, which reads as success and
@@ -515,20 +516,17 @@ async fn member_detail(
         binding_bodies.push(binding_body(pool, row).await?);
     }
 
-    let departments = omnion_identity::departments::list_departments_of_user(
-        pool,
-        organization_id,
-        user_id,
-    )
-    .await?
-    .into_iter()
-    .map(|row| MemberDepartmentBody {
-        id: row.id,
-        key: row.key,
-        name: row.name,
-        status: row.status,
-    })
-    .collect();
+    let departments =
+        omnion_identity::departments::list_departments_of_user(pool, organization_id, user_id)
+            .await?
+            .into_iter()
+            .map(|row| MemberDepartmentBody {
+                id: row.id,
+                key: row.key,
+                name: row.name,
+                status: row.status,
+            })
+            .collect();
 
     // The member's own trail *in this tenant*. Filtering by the actor is the honest reading of
     // "this member's recent audit": a grant an administrator made *to* them is filed against
@@ -642,7 +640,9 @@ async fn binding_body(
     Ok(MemberBindingBody {
         id: binding.id,
         role_id: binding.role_id,
-        role_key: role.as_ref().map_or_else(String::new, |row| row.key.clone()),
+        role_key: role
+            .as_ref()
+            .map_or_else(String::new, |row| row.key.clone()),
         role_name: role
             .as_ref()
             .map_or_else(|| "Unknown role".to_owned(), |row| row.name.clone()),
@@ -693,10 +693,7 @@ fn scope_for_member(
         "organization" => Ok(Scope::Organization { organization_id }),
         "site" => {
             let site_id = site_id.ok_or_else(|| {
-                ApiError::bad_request(
-                    "site_required",
-                    "a site scope needs the site it applies to",
-                )
+                ApiError::bad_request("site_required", "a site scope needs the site it applies to")
             })?;
             Ok(Scope::Site {
                 organization_id: Some(organization_id),

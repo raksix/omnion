@@ -23,11 +23,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod error;
 pub mod headers;
 pub mod matcher;
 pub mod provider;
 pub mod rule;
+pub mod store;
 
+pub use error::CdnError;
 pub use headers::{headers_for, surrogate_keys};
 pub use matcher::{CacheKey, PathPattern, PatternError, RequestShape};
 pub use provider::{AdapterInfo, Provider, Purge, PurgeOutcome, catalogue, is_shipped};

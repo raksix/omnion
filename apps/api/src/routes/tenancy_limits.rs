@@ -848,7 +848,8 @@ async fn actor_names(
 
 /// The Audit tab's CSV: the same rows, with the columns a reader would filter in a spreadsheet.
 fn audit_csv(slug: String, entries: &[OrganizationAuditEntry]) -> Response {
-    let mut csv = String::from("id,action,actor,actor_type,target_type,target_id,ip_address,created_at\n");
+    let mut csv =
+        String::from("id,action,actor,actor_type,target_type,target_id,ip_address,created_at\n");
     for entry in entries {
         csv.push_str(&format!(
             "{},{},{},{},{},{},{},{}\n",
