@@ -53,6 +53,28 @@ const ADMIN_PERMISSIONS: [&str; 7] = [
     "domains.manage",
 ];
 
+/// The powers the module-switch walk needs *on top* of [`ADMIN_PERMISSIONS`].
+///
+/// A separate list, and a separate grant, on purpose. The module guard refuses with
+/// `organization.module.disabled` only *after* the permission guard has said yes — so an
+/// administrator without `media.read` would answer `403 permission_denied` on the media route
+/// and the walk would "prove" the module switch works while proving the permission instead. The
+/// two refusals are indistinguishable from the outside, which is the whole reason this list
+/// exists.
+const MODULE_PERMISSIONS: [&str; 4] = [
+    "media.read",
+    "analytics.read",
+    "webhooks.read",
+    "ai.providers.read",
+];
+
+/// The module-switch walk's *core* surfaces, which must keep answering while a module is off.
+///
+/// `content.pages.read` is here for the same reason [`MODULE_PERMISSIONS`] exists: the core
+/// assertion is "the core is unaffected", and a `403 permission_denied` from a fixture that
+/// never held the permission looks exactly like a module refusal until the code is read.
+const CORE_PERMISSIONS: [&str; 1] = ["content.pages.read"];
+
 /// What the Audit tab needs on top of that, and what a tenancy administrator deliberately does
 /// not get for free: a trail names every privileged act in the tenant, so `audit.read` is its own
 /// permission rather than a consequence of `organizations.read`.
@@ -2649,6 +2671,301 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
     .await;
     assert_eq!(foreign.status, StatusCode::NOT_FOUND, "body: {}", foreign.body);
     assert_eq!(code_of(&foreign.body), "organization_not_found");
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The module switch, applied (REQ-005, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// Switching a module off takes its screens away and its API with them, and switching it back
+/// restores both.
+///
+/// Slice 3 stored the decision and this is the half that *applies* it. The walk is careful about
+/// three ways it can pass for the wrong reason, and each of them is guarded here rather than left
+/// to review:
+///
+/// 1. **A 403 from the permission guard looks exactly like a 403 from the module guard.** The
+///    fixture grants [`MODULE_PERMISSIONS`] to the administrator first, so the module refusal is
+///    the one that can be reached — and the assertion is on the *code*, not the status.
+/// 2. **A core route must not move.** `/organizations` and `/pages` are never modules, so a
+///    tenant that switched three of five modules off has still lost nothing it cannot get back.
+/// 3. **A module the platform did not ship must not be switchable into place** — which the
+///    Modules endpoint already refuses, so the guard never has an unknown key to look up.
+#[tokio::test]
+async fn switching_a_module_off_hides_its_api_and_switching_it_back_restores_it() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // The module routes carry their own permissions; without them the walk would prove the
+    // permission guard instead of the module guard, which reads the same from the outside.
+    // Organization B's administrator gets them too, for the isolation assertions below: a 403
+    // there would be indistinguishable from B having inherited A's switch.
+    let admin_id = fixture.accounts[0];
+    let other_admin_id = fixture.accounts[2];
+    grant_permissions(&fixture.db, fixture.org_a, admin_id, &MODULE_PERMISSIONS).await;
+    grant_permissions(&fixture.db, fixture.org_a, admin_id, &CORE_PERMISSIONS).await;
+    grant_permissions(
+        &fixture.db,
+        fixture.organizations[1],
+        other_admin_id,
+        &MODULE_PERMISSIONS,
+    )
+    .await;
+    let admin = fixture.admin_token().await;
+    let modules_uri = format!("/api/v1/organizations/{}/modules", fixture.org_a);
+
+    // The media library is site-scoped, so the walk creates a site rather than calling the
+    // collection with a blank `site_id`. That is not a convenience: an empty id answers `400`
+    // from `site_in_scope`, and a `400` in the "before" position would make the whole comparison
+    // meaningless — the walk would be comparing a parameter error to a module refusal and
+    // reading the difference as "the switch worked".
+    let site = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/sites",
+            Some(&admin),
+            Some(json!({ "key": "module-switch", "name": "Module switch" })),
+        ),
+    )
+    .await;
+    assert_eq!(site.status, StatusCode::CREATED, "body: {}", site.body);
+    let site_id = site.body["id"]
+        .as_str()
+        .expect("a created site carries an id")
+        .to_owned();
+    let media_uri = format!("/api/v1/media?site_id={site_id}");
+
+    // Before: media works. This is the control — a walk that never showed the route working
+    // cannot show that switching the module off *changed* anything.
+    let before = call(
+        &fixture.state,
+        request(Method::GET, &media_uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "media answers for an organization that never switched it off: {}",
+        before.body
+    );
+
+    // Switch media off.
+    let switched = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &modules_uri,
+            Some(&admin),
+            Some(json!({ "modules": [{ "module_key": "media", "enabled": false }] })),
+        ),
+    )
+    .await;
+    assert_eq!(switched.status, StatusCode::OK, "body: {}", switched.body);
+
+    // The API now refuses it, and the refusal names the module rather than a permission.
+    let after = call(
+        &fixture.state,
+        request(Method::GET, &media_uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(
+        after.status,
+        StatusCode::FORBIDDEN,
+        "a module switched off refuses its own routes: {}",
+        after.body
+    );
+    assert_eq!(
+        code_of(&after.body),
+        "organization.module.disabled",
+        "and the refusal names the switch, not the role"
+    );
+    assert_eq!(after.body["error"]["details"]["module"], "media");
+    assert_eq!(
+        after.body["error"]["details"]["module_name"], "Media library",
+        "a module key alone reads as a path segment to somebody who has never seen the tab"
+    );
+
+    // A *sub*-route is refused the same way — the guard keys on the module, not on one endpoint.
+    // The mount a screen actually uses is `/media/files`, and a guard that only covered the
+    // collection route would leave the file manager reachable with the switch off.
+    let sub = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/media/files", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(sub.status, StatusCode::FORBIDDEN, "body: {}", sub.body);
+    assert_eq!(code_of(&sub.body), "organization.module.disabled");
+
+    // Another module is untouched: one tenant's switch is not a global one.
+    let other_module = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/analytics/overview?site_id={site_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        other_module.status,
+        StatusCode::OK,
+        "switching one module off leaves the others alone: {}",
+        other_module.body
+    );
+
+    // The core is never a module. Tenancy and content stay reachable with media off, because an
+    // organization that could lose its own member list to a module switch could not be
+    // administered back — the same rule as the frozen tenant's reactivation.
+    for core in [
+        format!("/api/v1/organizations/{}", fixture.org_a),
+        format!("/api/v1/organizations/{}/members", fixture.org_a),
+        format!("/api/v1/pages?site_id={site_id}"),
+    ] {
+        let response = call(
+            &fixture.state,
+            request(Method::GET, &core, Some(&admin), None),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{core} is the core and stays reachable with a module switched off: {}",
+            response.body
+        );
+    }
+
+    // Another tenant is unaffected — the decision is per organization, not per installation.
+    // Their own site, so the read is not a `404` from tenancy: the point of the assertion is
+    // that the *module* decision did not travel, and reusing organization A's site would prove
+    // only that sites are isolated.
+    let other_admin = fixture.other_admin_token().await;
+    let their_site = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/sites",
+            Some(&other_admin),
+            Some(json!({ "key": "other-tenant", "name": "Other tenant" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        their_site.status,
+        StatusCode::CREATED,
+        "body: {}",
+        their_site.body
+    );
+    let their_site_id = their_site.body["id"]
+        .as_str()
+        .expect("a created site carries an id");
+
+    let foreign = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media?site_id={their_site_id}"),
+            Some(&other_admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign.status,
+        StatusCode::OK,
+        "one tenant's switch must not reach another: {}",
+        foreign.body
+    );
+
+    // And the isolation is real in the other direction too: organization A's site is not this
+    // tenant's to read, so the 403 above was a *module* refusal and not a tenancy one. The code
+    // is asserted as well as the status: `media.read` and a cross-tenant site produce two 403s
+    // that differ only in the body, and reading the status alone would let the tenancy guard
+    // pass for the module guard — the same substitution as a missing fixture permission, one
+    // layer further out.
+    let cross = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media?site_id={site_id}"),
+            Some(&other_admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cross.status,
+        StatusCode::FORBIDDEN,
+        "another tenant cannot read this site's media: {}",
+        cross.body
+    );
+    assert_eq!(
+        code_of(&cross.body),
+        "cross_organization",
+        "and the reason is the tenancy boundary, not the module switch — otherwise the two \
+         assertions above prove the same refusal twice and the module guard was never reached"
+    );
+
+    // The sidebar is told, so the panel can hide the entry: the same response the switcher reads
+    // carries the keys.
+    let mine = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me/organizations", Some(&admin), None),
+    )
+    .await;
+    let disabled: Vec<&str> = mine.body["disabled_modules"]
+        .as_array()
+        .expect("disabled_modules is an array")
+        .iter()
+        .map(|key| key.as_str().expect("a module key"))
+        .collect();
+    assert_eq!(
+        disabled,
+        vec!["media"],
+        "the shell needs exactly the switched-off key to hide the entry: {}",
+        mine.body
+    );
+
+    let theirs = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/me/organizations", Some(&other_admin), None),
+    )
+    .await;
+    assert_eq!(
+        theirs.body["disabled_modules"].as_array().map(Vec::len),
+        Some(0),
+        "a tenant that switched nothing off is told nothing: {}",
+        theirs.body
+    );
+
+    // Switching it back on restores the route. A guard that only ever refused would satisfy
+    // every assertion above, so the round trip is the whole proof.
+    let restored = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &modules_uri,
+            Some(&admin),
+            Some(json!({ "modules": [{ "module_key": "media", "enabled": true }] })),
+        ),
+    )
+    .await;
+    assert_eq!(restored.status, StatusCode::OK, "body: {}", restored.body);
+
+    let again = call(
+        &fixture.state,
+        request(Method::GET, &media_uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(
+        again.status,
+        StatusCode::OK,
+        "switching it back on restores the module: {}",
+        again.body
+    );
 
     fixture.cleanup().await;
 }
