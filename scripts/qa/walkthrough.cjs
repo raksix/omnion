@@ -4812,14 +4812,28 @@ async function runBlockEditorDepth(page, report) {
   await page.waitForTimeout(300);
 
   // A heading first, then a text, then a columns container: the container is what proves
-  // nesting, and the heading is what the heading-order rule is about. The heading's text is
-  // required, so the pass fills it the moment the block lands — that is the flow the REQ asks
-  // for, and a heading left empty would block the publish for a reason the pass created.
+  // nesting, and the heading is what the heading-order rule is about. Each block is filled
+  // the moment it lands, BEFORE the next insert moves the selection away — that is the flow
+  // the REQ asks for, and a heading left empty blocks the publish for a reason the pass
+  // created. Filling afterwards would not do: the inspector renders the props of whatever is
+  // selected, and the selection is on the last block inserted, so `#block-prop-text` is not
+  // even on the screen (a Columns block has no `text` prop) and the fill quietly does nothing.
+  const fillPropText = async (value_) => {
+    const field = page.locator("#block-prop-text").first();
+    if ((await field.count()) === 0) {
+      return false;
+    }
+    await field.fill(value_).catch(() => {});
+    await page.waitForTimeout(700);
+    return true;
+  };
   await page.locator("[data-block-insert-option=heading]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(500);
+  steps.headingFieldPresent = await fillPropText("QA heading from the walkthrough");
   await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
   await page.locator("[data-block-insert-option=text]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(500);
+  await fillPropText("A paragraph written by the QA walkthrough.");
   await page.locator("[data-block-insert-toggle]").first().click({ timeout: 6000 }).catch(() => {});
   await page.locator("[data-block-insert-option=columns]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(700);
@@ -4829,23 +4843,13 @@ async function runBlockEditorDepth(page, report) {
   await shot(page, "page-block-editor-canvas");
 
   // ---- Inspector ----------------------------------------------------------------------------
-  // The heading's text prop: `heading`'s first prop is the text, and the panel generated it
-  // from the schema, so it is the field the schema names.
-  // The heading was selected as it landed, so its text field is the one the schema names.
-  //
-  // `#block-prop-text` is NOT a name — every text-bearing block renders that id, so it is
-  // whichever block happens to be selected. Filling it without re-selecting the heading types
-  // into somebody else's paragraph and leaves the heading as "Untitled heading", which is
-  // `block_prop_required` and blocks the publish. That is what this pass did for two runs: the
-  // fill "succeeded", the heading stayed empty, and the publish that follows was refused by an
-  // error the pass itself had created. So the step asserts the heading's own text afterwards.
-  const headingField = page.locator("#block-prop-text").first();
-  await headingField.fill("QA heading from the walkthrough").catch(() => {});
-  await page.waitForTimeout(900);
-  // Re-select the heading from the canvas and read its own body: the field is a claim about
-  // what was typed, the canvas is the claim about where it landed.
+  // The heading's text is filled as the block lands (above). This step is the READ side: it
+  // selects the heading on the canvas and reads its own body, which is a claim about where the
+  // text landed rather than about whether a field accepted it. A `.fill()` on a controlled
+  // textarea reports success even when the selection had already moved on, so the fill alone
+  // proves nothing about the block.
   await page.locator('[data-block-canvas-block=heading]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(600);
   steps.headingGotItsOwnText =
     /QA heading from the walkthrough/.test(
       (await page.locator('[data-block-canvas-block=heading]').first().innerText().catch(() => "")) || "",
