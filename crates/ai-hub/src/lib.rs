@@ -24,6 +24,7 @@ pub mod health_store;
 pub mod model;
 pub mod protocol;
 pub mod router;
+pub mod routing;
 pub mod store;
 
 pub use catalog::{
@@ -55,6 +56,11 @@ pub use model::{
 };
 pub use protocol::{ProtocolAdapter, ProtocolInfo, StreamPiece, adapter_for, protocol_infos};
 pub use router::{ResolvedModel, model_id, resolve, resolve_for};
+pub use routing::{
+    Candidate, Decision, DecisionSource, FeatureOverride, RULES, ResolveRequest, ResolvedCandidate,
+    RoutingMaps, Scope, WalkEntry, WalkStep, check_feature, check_requirement, check_task, decide,
+    requirement_rows, scope_label, task_rows, unknown_feature, unknown_requirement, unknown_task,
+};
 pub use store::{
     apply_discovery, create_provider, delete_provider, discovery_diff, failover_chain,
     find_default_model, find_model, find_model_by_key, find_provider, find_provider_by_name,
