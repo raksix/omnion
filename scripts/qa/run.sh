@@ -64,6 +64,14 @@ if [ -n "$QA_SLOT_PID" ]; then
 fi
 
 step "resetting the QA database"
+# Stop this stack's API *before* the reset, not after. A process that is already running (or
+# crash-looping, as it does when the binary and the migration set disagree) reconnects to the
+# moment the database comes back and applies whatever migration set *it* was compiled with. The
+# rebuilt binary then boots into a database carrying its predecessor's checksums and dies with
+# `migration 27 was previously applied but has been modified` — a failure that reads like a
+# corrupt database and is really a race between the reset and the restart. Only this stack's own
+# process is touched; the sibling stacks keep their servers.
+pm2 stop "$API_NAME" >/dev/null 2>&1 || true
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"

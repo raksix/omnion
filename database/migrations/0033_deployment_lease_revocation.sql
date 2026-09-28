@@ -1,4 +1,4 @@
--- Omnion · 0027 · Deployment-driven lease revocation
+-- Omnion · 0033 · Deployment-driven lease revocation
 -- (REQ-125, slice 3 · docs/requests/REQ-125-secrets-management-depth.md).
 --
 -- Additive by design (docs/05-VERSIONING.md): one table, no existing table is touched, nothing
@@ -19,11 +19,12 @@
 -- writer that has never heard of this request, and a restart resumes from the cursor rather
 -- than re-revoking the same leases.
 --
--- Numbering note: the version slot is global across the parallel waves, and wave 7 had already
--- opened 0026 for the AI model capabilities. sqlx keys a migration on version *and* checksum, so
--- two files claiming 0026 would make every database that applied one refuse the other. 0027 was
--- chosen from `ls` of the sibling worktrees at write time, not from a counter that pretends the
--- branch is alone.
+-- Numbering note: the version slot is global across the parallel waves, so the file's number is
+-- chosen by listing the sibling worktrees at write time, never by a counter that pretends the
+-- branch is alone. This file was written as 0027, and `origin/main` then shipped its own
+-- `0027_media_transforms.sql` for REQ-010. sqlx keys a migration on version *and* checksum, so
+-- two files claiming one slot make every database that applied one refuse the other — the branch
+-- was unbootable until this was renumbered. 0033 is the first slot free in every worktree.
 --
 -- How far one consumer has read the event stream.
 --
@@ -44,7 +45,7 @@ create table event_consumer_cursors (
 
 comment on table event_consumer_cursors is
     'Per-consumer read position in the events stream, so two consumers of the same events do not '
-    'move each other''s position. Added by 0027 for the deployment-driven lease revocation of '
+    'move each other''s position. Added by 0033 for the deployment-driven lease revocation of '
     'REQ-125; the mechanism is generic so the next consumer does not need its own migration.';
 
 -- The seeds are data, not schema, and they are the whole content of this migration's data half:
