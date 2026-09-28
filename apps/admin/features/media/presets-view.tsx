@@ -15,7 +15,7 @@
  * - **what a delete does** — it takes every derivative built from that preset with it, so it
  *   asks for a confirmation that names them.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { Check, Copy, Loader2, Pencil, Plus, Trash2, X } from "lucide-react";
 
@@ -25,6 +25,7 @@ import {
   ApiError,
   createMediaPreset,
   deleteMediaPreset,
+  fetchMediaFiles,
   fetchMediaPresets,
   mediaRawUrl,
   updateMediaPreset,
@@ -85,6 +86,10 @@ function toDraft(preset: MediaPreset): Draft {
 export function MediaSettingsView() {
   const { selectedSite, status: sitesStatus } = useSites();
   const [presets, setPresets] = useState<MediaPreset[] | null>(null);
+  // The newest image of the site, used as the live preview's subject. A preset screen that
+  // describes a size in words is a screen nobody can check; one that renders the pixels is a
+  // screen that answers "is this what I want" without leaving the page.
+  const [sampleId, setSampleId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fieldError, setFieldError] = useState<{ field: string; message: string } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -118,6 +123,21 @@ export function MediaSettingsView() {
           cause instanceof ApiError ? cause.message : "The presets could not be loaded.",
         );
       });
+
+    // The preview subject is a separate concern from the preset list, and it must not fail the
+    // screen: a library with no images yet is a perfectly good state to open this page in.
+    fetchMediaFiles(siteId, { kind: "image", limit: 1 })
+      .then((page) => {
+        if (!cancelled) {
+          setSampleId(page.files[0]?.id ?? null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSampleId(null);
+        }
+      });
+
     return () => {
       cancelled = true;
     };
@@ -328,6 +348,7 @@ export function MediaSettingsView() {
         <PresetList
           presets={presets ?? []}
           busy={busy}
+          sampleId={sampleId}
           onEdit={startEdit}
           onDelete={remove}
         />
@@ -352,11 +373,13 @@ export function MediaSettingsView() {
 function PresetList({
   presets,
   busy,
+  sampleId,
   onEdit,
   onDelete,
 }: {
   presets: MediaPreset[];
   busy: boolean;
+  sampleId: string | null;
   onEdit: (preset: MediaPreset) => void;
   onDelete: (preset: MediaPreset) => void;
 }) {
@@ -377,7 +400,7 @@ function PresetList({
             <p className="font-mono text-[13px] font-medium">{preset.name}</p>
             <p className="text-[12px] text-muted">{preset.summary}</p>
           </div>
-          <PresetExample preset={preset} />
+          <PresetExample preset={preset} sampleId={sampleId} />
           <div className="flex items-center gap-1">
             <button
               type="button"
@@ -405,19 +428,51 @@ function PresetList({
 }
 
 /** The URL a page uses, with a copy button that says whether it worked. */
-function PresetExample({ preset }: { preset: MediaPreset }) {
+function PresetExample({ preset, sampleId }: { preset: MediaPreset; sampleId: string | null }) {
   const [copied, setCopied] = useState(false);
-  const example = useMemo(() => `${mediaRawUrl("<file-id>")}${preset.example_query}`, [preset]);
+  // The *copyable* text is always the generic form — a URL with one site's file id in it is not
+  // what a template author pastes into a theme. The `data-preset-query` attribute carries the
+  // part that is genuinely the contract, so a walkthrough can build a real URL from it.
+  const example = `${mediaRawUrl("<file-id>")}${preset.example_query}`;
 
   return (
     <div className="flex items-center gap-1.5">
-      <code className="max-w-[280px] truncate rounded bg-canvas px-2 py-1 font-mono text-[11.5px] text-muted">
+      {/*
+        The preview is a real request for the real URL, so what the operator sees is what a page
+        will get — including the failure case, which the `onError` turns into a note rather than
+        a broken-image glyph. A preview that only worked for the sizes that happen to be cached
+        would be worse than none.
+      */}
+      {sampleId ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={mediaRawUrl(sampleId, preset.name)}
+          alt={`The ${preset.name} preset applied to the newest image of this site`}
+          width={56}
+          height={56}
+          data-testid={`media-preset-preview-${preset.name}`}
+          onError={(event) => {
+            event.currentTarget.style.display = "none";
+          }}
+          className="size-14 shrink-0 rounded border border-line object-cover"
+        />
+      ) : null}
+      <code
+        data-preset-query={preset.example_query}
+        title={example}
+        className="max-w-[280px] truncate rounded bg-canvas px-2 py-1 font-mono text-[11.5px] text-muted"
+      >
         {example}
       </code>
       <button
         type="button"
+        disabled={sampleId === null}
         onClick={() => {
-          void navigator.clipboard?.writeText(example).then(() => {
+          if (!sampleId) {
+            return;
+          }
+          const url = `${mediaRawUrl(sampleId)}${preset.example_query}`;
+          void navigator.clipboard?.writeText(url).then(() => {
             setCopied(true);
             window.setTimeout(() => setCopied(false), 2000);
           });
