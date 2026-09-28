@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod activities;
 pub mod contacts;
 pub mod csv;
 pub mod dates;

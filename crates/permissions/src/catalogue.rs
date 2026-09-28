@@ -491,6 +491,29 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Create and reshape pipelines and their stages",
     },
+    // Slice 4's keys. An activity is a note a person wrote about a person, so reading the feed
+    // and reading one record's timeline are the *same* exposure and share a key — a separate
+    // "timeline" key would let someone read a contact's history through the deal screen while
+    // being refused on the contact. Writing one is its own decision because the activity feed is
+    // the only place a CRM record's history can be *added* to.
+    PermissionDef {
+        key: "crm.activities.read",
+        category: "crm",
+        description: "Read the CRM activity feed and a record's merged timeline",
+    },
+    PermissionDef {
+        key: "crm.activities.create",
+        category: "crm",
+        description: "Log CRM activities (calls, meetings, notes and tasks)",
+    },
+    // The copilot reads a record and proposes a sentence; it never writes one. The key exists
+    // because a model that can read the whole CRM is a data-exfiltration surface even when it
+    // only ever returns text, and the audit of the call is the record of what it saw.
+    PermissionDef {
+        key: "crm.copilot.use",
+        category: "crm",
+        description: "Ask the CRM copilot to summarize a deal or draft a follow-up",
+    },
 ];
 
 /// Look a permission up by key.
