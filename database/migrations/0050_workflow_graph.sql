@@ -102,7 +102,13 @@ set graph = jsonb_build_object(
                         'id', 'trigger',
                         'type', case w.trigger_kind
                                     when 'schedule' then 'trigger.schedule'
-                                    else 'trigger.event'
+                                    -- A `manual` workflow has no event, so writing it as
+                                    -- `trigger.event` would produce a node whose required
+                                    -- `event` field is null — a backfilled rule that opens
+                                    -- already invalid, and the finding would blame the author
+                                    -- for a migration's choice of default.
+                                    when 'event' then 'trigger.event'
+                                    else 'trigger.manual'
                                 end,
                         'label', 'Trigger',
                         'params', jsonb_build_object(
@@ -116,15 +122,29 @@ set graph = jsonb_build_object(
              select ord,
                     jsonb_build_object(
                         'id', 'n' || (ord - 1),
-                        'type', case s.kind
+                        -- `s` is the step *object*, so its kind is a JSON key and not a
+                        -- column: `s.step->>'kind'`. Writing `s.kind` fails at boot with
+                        -- "column s.kind does not exist", twelve seconds into a deploy and
+                        -- in a line that reads like a build problem rather than a migration
+                        -- problem.
+                        'type', case s.step->>'kind'
                                     when 'wait' then 'wait'
                                     when 'branch' then 'condition'
                                     when 'stop' then 'end'
                                     when 'approval' then 'approval'
                                     else 'action'
                                 end,
-                        'label', s.name,
-                        'params', s.params,
+                        'label', s.step->>'name',
+                        -- A task step's action is a *column of the step object* next to its
+                        -- params, not a key inside them. Copying `params` alone therefore
+                        -- produces an `action` node whose required `action` field is empty —
+                        -- a backfilled rule that opens already invalid, with a finding that
+                        -- reads as though the author had forgotten to choose an action.
+                        'params', case s.step->>'kind'
+                                       when 'task' then coalesce(s.step->'params', '{}'::jsonb)
+                                              || jsonb_build_object('action', s.step->>'action')
+                                       else coalesce(s.step->'params', '{}'::jsonb)
+                                   end,
                         'position', jsonb_build_object('x', 40 + (ord - 1) * 260, 'y', 120)
                     )
              from jsonb_array_elements(w.steps) with ordinality as s(step, ord)
@@ -136,19 +156,38 @@ set graph = jsonb_build_object(
                         'id', 'e0',
                         'source', 'trigger',
                         'source_port', 'out',
-                        'target', 'n1'
+                        -- `n0`, not `n1`: the step at ordinality 1 becomes node `n0`, since
+                        -- the ids are `n<ordinal-1>`. The off-by-one is invisible in the edge
+                        -- list — it still has the right *number* of edges — and its only
+                        -- symptom is that every backfilled rule fails validation on a
+                        -- dangling edge, which reads as though the author's rule were broken.
+                        'target', 'n0'
                     ) as e
              where jsonb_array_length(w.steps) > 0
              union all
+             -- The port an edge leaves by is decided by the type of the node it leaves,
+             -- and the port a node exports is decided by its own type: `wait` exports
+             -- `out`, a `condition` exports `true`/`false`, a task exports `success`/
+             -- `error`, and an `end` exports nothing at all. A `source_port` of `out` on
+             -- every edge therefore makes two thirds of the backfilled rules invalid on a
+             -- second count the edge list cannot show — and a rule that fails validation
+             -- because of the backfill reads as though its author had broken it.
              select ord + 1,
                     jsonb_build_object(
                         'id', 'e' || ord,
-                        'source', 'n' || ord,
-                        'source_port', 'out',
-                        'target', 'n' || (ord + 1)
+                        'source', 'n' || (ord - 1),
+                        'source_port', case s.step->>'kind'
+                                           when 'branch' then 'true'
+                                           when 'wait' then 'out'
+                                           else 'success'
+                                       end,
+                        'target', 'n' || ord
                     )
              from jsonb_array_elements(w.steps) with ordinality as s(step, ord)
              where ord < jsonb_array_length(w.steps)
+               -- An `end` node exports no port, so the edge that would leave it is dropped
+               -- rather than written with a port that does not exist.
+               and s.step->>'kind' is distinct from 'stop'
          ) as x)
     ),
     -- A rule with no steps still needs a valid graph: a trigger and an end, connected.
@@ -173,7 +212,8 @@ set graph = jsonb_build_object(
                 'id', 'trigger',
                 'type', case w.trigger_kind
                             when 'schedule' then 'trigger.schedule'
-                            else 'trigger.event'
+                            when 'event' then 'trigger.event'
+                            else 'trigger.manual'
                         end,
                 'label', 'Trigger',
                 'params', jsonb_build_object('kind', w.trigger_kind, 'cron', w.schedule, 'event', w.trigger_event),
