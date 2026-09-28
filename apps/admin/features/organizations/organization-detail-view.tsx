@@ -603,59 +603,99 @@ function MembersTab({ organization }: { organization: Organization }) {
             hint="An invitation is a single-use link with an expiry — nothing is waiting for an answer."
           />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-[13px]">
-              <thead>
-                <tr className="bg-canvas/60 text-[11px] font-medium tracking-wide text-muted uppercase">
-                  <th scope="col" className="px-4 py-2.5">Address</th>
-                  <th scope="col" className="px-4 py-2.5">Status</th>
-                  <th scope="col" className="px-4 py-2.5">Expires</th>
-                  <th scope="col" className="px-4 py-2.5"><span className="sr-only">Actions</span></th>
-                </tr>
-              </thead>
-              <tbody>
-                {invitations.map((invitation) => (
-                  <tr
+          <>
+            <div className="hidden overflow-x-auto md:block">
+              <table className="w-full border-collapse text-left text-[13px]">
+                <thead>
+                  <tr className="bg-canvas/60 text-[11px] font-medium tracking-wide text-muted uppercase">
+                    <th scope="col" className="px-4 py-2.5">Address</th>
+                    <th scope="col" className="px-4 py-2.5">Status</th>
+                    <th scope="col" className="px-4 py-2.5">Expires</th>
+                    <th scope="col" className="px-4 py-2.5"><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {invitations.map((invitation) => (
+                    <tr
+                    key={invitation.id}
+                    data-invitation-row={invitation.email}
+                    className="border-t border-line transition hover:bg-canvas/60"
+                  >
+                      <td className="px-4 py-3.5">
+                        <span className="flex min-w-0 flex-col">
+                          <span className="truncate font-medium">{invitation.email}</span>
+                          {invitation.message ? (
+                            <span className="truncate text-[12px] text-muted">
+                              “{invitation.message}”
+                            </span>
+                          ) : null}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3.5"><StatusBadge status={invitation.status} /></td>
+                      <td className="px-4 py-3.5 text-muted">
+                        {formatTimestamp(invitation.expires_at)}
+                      </td>
+                      <td className="px-4 py-3.5 text-right">
+                        {invitation.status === "pending" ? (
+                          <button
+                            type="button"
+                            data-qa-guard="write"
+                            data-invitation-revoke={invitation.email}
+                            onClick={() => void revoke(invitation)}
+                            disabled={busyId === invitation.id}
+                            className="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
+                          >
+                            <Trash2 className="size-3" aria-hidden />
+                            Revoke
+                          </button>
+                        ) : (
+                          <span className="text-[12px] text-muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <ul className="flex flex-col gap-2 px-3 py-3 md:hidden">
+              {invitations.map((invitation) => (
+                <li
                   key={invitation.id}
                   data-invitation-row={invitation.email}
-                  className="border-t border-line transition hover:bg-canvas/60"
+                  className="rounded-lg border border-line px-3 py-2.5"
                 >
-                    <td className="px-4 py-3.5">
-                      <span className="flex min-w-0 flex-col">
-                        <span className="truncate font-medium">{invitation.email}</span>
-                        {invitation.message ? (
-                          <span className="truncate text-[12px] text-muted">
-                            “{invitation.message}”
-                          </span>
-                        ) : null}
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="flex min-w-0 flex-col">
+                      <span className="truncate text-[13px] font-medium">{invitation.email}</span>
+                      <span className="truncate text-[12px] text-muted">
+                        expires {formatTimestamp(invitation.expires_at)}
                       </span>
-                    </td>
-                    <td className="px-4 py-3.5"><StatusBadge status={invitation.status} /></td>
-                    <td className="px-4 py-3.5 text-muted">
-                      {formatTimestamp(invitation.expires_at)}
-                    </td>
-                    <td className="px-4 py-3.5 text-right">
-                      {invitation.status === "pending" ? (
-                        <button
-                          type="button"
-                          data-qa-guard="write"
-                          data-invitation-revoke={invitation.email}
-                          onClick={() => void revoke(invitation)}
-                          disabled={busyId === invitation.id}
-                          className="flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
-                        >
-                          <Trash2 className="size-3" aria-hidden />
-                          Revoke
-                        </button>
-                      ) : (
-                        <span className="text-[12px] text-muted">—</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                    </span>
+                    <StatusBadge status={invitation.status} />
+                  </div>
+                  {invitation.message ? (
+                    <p className="mt-1.5 line-clamp-2 text-[12px] text-muted">
+                      “{invitation.message}”
+                    </p>
+                  ) : null}
+                  {invitation.status === "pending" ? (
+                    <button
+                      type="button"
+                      data-qa-guard="write"
+                      data-invitation-revoke={invitation.email}
+                      onClick={() => void revoke(invitation)}
+                      disabled={busyId === invitation.id}
+                      className="mt-2 flex items-center gap-1 rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-canvas disabled:opacity-60"
+                    >
+                      <Trash2 className="size-3" aria-hidden />
+                      Revoke
+                    </button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </div>
 

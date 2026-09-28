@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Building2, Check, ChevronDown, Search } from "lucide-react";
+import { Building2, Check, ChevronDown, Search, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 
 import {
@@ -169,28 +169,52 @@ export function OrganizationSwitcher() {
       </button>
 
       {open ? (
-        <div
-          role="dialog"
-          aria-label="Switch organization"
-          className="absolute right-0 z-50 mt-1.5 w-72 overflow-hidden rounded-xl border border-line bg-surface shadow-xl"
-        >
-          {organizations.length > 6 ? (
-            <div className="flex items-center gap-1.5 border-b border-line px-3 py-2">
-              <Search className="size-3.5 text-muted" aria-hidden />
-              <span className="sr-only">Search organizations</span>
-              <input
-                value={query}
-                onChange={(event) => {
-                  setQuery(event.target.value);
-                  setActive(0);
-                }}
-                placeholder="Search organizations"
-                className="w-full bg-transparent text-[12.5px] outline-none"
-              />
-            </div>
-          ) : null}
+        <>
+          {/* A phone has no room for a floating panel beside the header, and a dropdown that
+              hangs off the right edge of a 390px screen puts the longest organization name in
+              the one place a reader cannot scroll to. Under `sm` the switcher is therefore a
+              bottom sheet that covers the screen, with 44px rows and a close control; from `sm`
+              up it is the panel that drops out of the button. Same state, same keyboard, two
+              shapes — the layout is the only thing that changes. */}
+          <button
+            type="button"
+            aria-label="Close the organization switcher"
+            onClick={() => setOpen(false)}
+            className="fixed inset-0 z-40 bg-ink/40 sm:hidden"
+          />
+          <div
+            role="dialog"
+            aria-label="Switch organization"
+            data-org-switcher="sheet"
+            className="fixed inset-x-0 bottom-0 z-50 flex max-h-[85vh] flex-col overflow-hidden rounded-t-2xl border-t border-line bg-surface shadow-2xl sm:absolute sm:inset-x-auto sm:bottom-auto sm:right-0 sm:mt-1.5 sm:max-h-none sm:w-72 sm:rounded-xl sm:border sm:shadow-xl"
+          >
+          <div className="flex items-center gap-1.5 border-b border-line px-3 py-2">
+            <Search className="size-3.5 text-muted" aria-hidden />
+            <span className="sr-only">Search organizations</span>
+            <input
+              value={query}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setActive(0);
+              }}
+              placeholder="Search organizations"
+              className="w-full bg-transparent text-[12.5px] outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              aria-label="Close"
+              className="shrink-0 rounded-md p-1.5 text-muted transition hover:bg-quiet-soft hover:text-ink sm:hidden"
+            >
+              <X className="size-4" aria-hidden />
+            </button>
+          </div>
 
-          <ul role="listbox" aria-label="Your organizations" className="max-h-72 overflow-y-auto py-1">
+          <ul
+            role="listbox"
+            aria-label="Your organizations"
+            className="min-h-0 flex-1 overflow-y-auto py-1 sm:max-h-72"
+          >
             {visible.map((organization, index) => {
               const selected = organization.organization_id === currentId;
               return (
@@ -202,7 +226,9 @@ export function OrganizationSwitcher() {
                     onMouseEnter={() => setActive(index)}
                     onClick={() => void choose(organization)}
                     disabled={busyId === organization.organization_id}
-                    className={`flex w-full items-center gap-2 px-3 py-2 text-left transition ${
+                    // 44px on touch, 32px on a pointer: the row is the whole target and a
+                    // two-line row is taller than both, so the floor is the *minimum* here.
+                    className={`flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition sm:min-h-0 ${
                       index === active ? "bg-quiet-soft" : ""
                     }`}
                   >
@@ -252,7 +278,8 @@ export function OrganizationSwitcher() {
               {error}
             </p>
           ) : null}
-        </div>
+          </div>
+        </>
       ) : null}
     </div>
   );

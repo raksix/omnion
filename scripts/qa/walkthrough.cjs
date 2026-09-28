@@ -4392,6 +4392,70 @@ async function main() {
     report.mobile.push({ ...route, diagnostics: diag });
   }
 
+  // The tenant screens (REQ-005, slice 4's mobile pass). They are walked here for the same
+  // reason the palette is: the layouts that only exist under `md` — the members table as cards,
+  // the department tree as cards, the trail as cards, the switcher as a sheet — are the *only*
+  // rendering a phone gets, and a pass that never opened them at 390px would report nothing
+  // about the layout the spec's own acceptance line names. The detail route carries an id, so it
+  // cannot sit in the route list above; the depth pass below supplies the real one.
+  const mobileOrganizationId = (report.organizations && report.organizations.organizationId) || null;
+  const mobileTenantRoutes = [
+    { path: "/organizations", name: "organizations" },
+    ...(mobileOrganizationId
+      ? [
+          { path: `/organizations/${mobileOrganizationId}?tab=members`, name: "organization-members" },
+          { path: `/organizations/${mobileOrganizationId}?tab=departments`, name: "organization-departments" },
+          { path: `/organizations/${mobileOrganizationId}?tab=billing`, name: "organization-billing" },
+          { path: `/organizations/${mobileOrganizationId}?tab=audit`, name: "organization-audit" },
+        ]
+      : []),
+  ];
+  for (const route of mobileTenantRoutes) {
+    await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await mpage.waitForTimeout(1200);
+    const diag = await diagnostics(mpage);
+    await shot(mpage, `mobile-${route.name}`);
+    report.mobile.push({ ...route, diagnostics: diag });
+  }
+
+  // The switcher on a phone is a bottom sheet, not a dropdown: this reads its geometry, because
+  // "it opens" is not the claim — the claim is that it covers the screen, that its rows are
+  // reachable with a thumb, and that the longest organization name fits inside it.
+  await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await mpage.waitForTimeout(1500);
+  const switcherButton = mpage.locator('button[aria-label="Current organization"]').first();
+  if ((await switcherButton.count()) > 0) {
+    await switcherButton.click({ timeout: 8000 }).catch(() => {});
+    await mpage.waitForTimeout(700);
+    const sheet = await mpage
+      .evaluate(() => {
+        const dialog = document.querySelector("[data-org-switcher]");
+        if (!dialog) return null;
+        const rect = dialog.getBoundingClientRect();
+        const rows = [...dialog.querySelectorAll('[role="option"]')].map((row) =>
+          Math.round(row.getBoundingClientRect().height),
+        );
+        const overflowX = document.documentElement.scrollWidth > innerWidth + 2;
+        return {
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          bottom: Math.round(rect.bottom),
+          viewport: { w: innerWidth, h: innerHeight },
+          rowHeights: rows.slice(0, 6),
+          minRow: rows.length ? Math.min(...rows) : 0,
+          closeButtons: dialog.querySelectorAll('button[aria-label="Close"]').length,
+          overlay: document.querySelector('button[aria-label="Close the organization switcher"]') !== null,
+          pageOverflow: overflowX,
+        };
+      })
+      .catch(() => null);
+    report.mobileSwitcher = sheet;
+    // Overlay shots are viewport-only: a full-page capture of a fixed sheet also photographs the
+    // page below the fold, which reads as an overlay that failed to cover the screen.
+    await shot(mpage, "mobile-organization-switcher", { full: false });
+    log(`mobile switcher: ${JSON.stringify(sheet)}`);
+  }
+
   // The palette on a phone: a full-screen sheet with 44px rows and a reachable close control.
   // Overlay shots are viewport-only: a full-page screenshot of a fixed sheet shows the page
   // below the fold as well, which reads as an overlay that fails to cover the screen.
@@ -4496,6 +4560,25 @@ async function main() {
   for (const m of report.mobile) {
     if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
     if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+  }
+  // The switcher sheet's own claims, read above: a sheet that opens but does not cover the
+  // screen, rows a thumb cannot reach, or a page that scrolls sideways underneath it are the
+  // three ways "it opens on a phone" can be true and still be wrong. A `null` reading means the
+  // account has no membership to switch between, which is a correct absence, not a failure.
+  if (report.mobileSwitcher) {
+    const sheet = report.mobileSwitcher;
+    if (sheet.minRow > 0 && sheet.minRow < 40) {
+      pushFindings("high", "tiny-target", `mobile organization switcher: rows are ${sheet.minRow}px tall (44 is the floor for a touch target)`);
+    }
+    if (sheet.bottom < sheet.viewport.h - 2) {
+      pushFindings("high", "sheet-not-anchored", `mobile organization switcher: the sheet ends ${sheet.viewport.h - sheet.bottom}px above the bottom of the screen`);
+    }
+    if (!sheet.overlay) {
+      pushFindings("medium", "sheet-no-overlay", "mobile organization switcher: the sheet opens without a backdrop, so the page behind it stays visible and tappable");
+    }
+    if (sheet.pageOverflow) {
+      pushFindings("high", "overflow-mobile", "mobile organization switcher: the page scrolls horizontally with the sheet open");
+    }
   }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {

@@ -245,48 +245,83 @@ export function AuditTab({ organization }: { organization: Organization }) {
             }
           />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-[13px]">
-              <thead>
-                <tr className="bg-canvas/60 text-[11px] font-medium tracking-wide text-muted uppercase">
-                  <th scope="col" className="px-4 py-2.5">Action</th>
-                  <th scope="col" className="px-4 py-2.5">Actor</th>
-                  <th scope="col" className="px-4 py-2.5">Target</th>
-                  <th scope="col" className="px-4 py-2.5">From</th>
-                  <th scope="col" className="px-4 py-2.5">When</th>
-                </tr>
-              </thead>
-              <tbody>
-                {entries.map((entry) => (
-                  <tr
-                    key={entry.id}
-                    data-audit-row={entry.action}
-                    className="border-t border-line transition hover:bg-canvas/60"
-                  >
-                    <td className="px-4 py-3">
-                      <span className="font-mono text-[12px]">{entry.action}</span>
-                    </td>
-                    <td className="px-4 py-3">
-                      {entry.actor_type === "system" ? (
-                        <span className="text-muted">Platform (system)</span>
-                      ) : (
-                        <span className="truncate">{entry.actor_name ?? "Unknown account"}</span>
-                      )}
-                    </td>
-                    <td className="max-w-48 truncate px-4 py-3 text-muted">
-                      {entry.target_type
-                        ? `${entry.target_type}${entry.target_id ? ` ${entry.target_id.slice(0, 8)}` : ""}`
-                        : "—"}
-                    </td>
-                    <td className="px-4 py-3 font-mono text-[12px] text-muted">
-                      {entry.ip_address ?? "—"}
-                    </td>
-                    <td className="px-4 py-3 text-muted">{formatTimestamp(entry.created_at)}</td>
+          <>
+            {/* A five-column trail (action, actor, target, address, time) is a table on a desktop
+                and a card on a phone. Both render from the same `entries`, and each carries the
+                same `data-audit-row`, so the QA pass's row assertions mean the same thing at
+                either width. */}
+            <div className="hidden overflow-x-auto md:block">
+              <table className="w-full border-collapse text-left text-[13px]">
+                <thead>
+                  <tr className="bg-canvas/60 text-[11px] font-medium tracking-wide text-muted uppercase">
+                    <th scope="col" className="px-4 py-2.5">Action</th>
+                    <th scope="col" className="px-4 py-2.5">Actor</th>
+                    <th scope="col" className="px-4 py-2.5">Target</th>
+                    <th scope="col" className="px-4 py-2.5">From</th>
+                    <th scope="col" className="px-4 py-2.5">When</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {entries.map((entry) => (
+                    <tr
+                      key={entry.id}
+                      data-audit-row={entry.action}
+                      className="border-t border-line transition hover:bg-canvas/60"
+                    >
+                      <td className="px-4 py-3">
+                        <span className="font-mono text-[12px]">{entry.action}</span>
+                      </td>
+                      <td className="px-4 py-3">
+                        {entry.actor_type === "system" ? (
+                          <span className="text-muted">Platform (system)</span>
+                        ) : (
+                          <span className="truncate">{entry.actor_name ?? "Unknown account"}</span>
+                        )}
+                      </td>
+                      <td className="max-w-48 truncate px-4 py-3 text-muted">
+                        {entry.target_type
+                          ? `${entry.target_type}${entry.target_id ? ` ${entry.target_id.slice(0, 8)}` : ""}`
+                          : "—"}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-[12px] text-muted">
+                        {entry.ip_address ?? "—"}
+                      </td>
+                      <td className="px-4 py-3 text-muted">{formatTimestamp(entry.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <ul className="flex flex-col gap-2 px-3 py-3 md:hidden">
+              {entries.map((entry) => (
+                <li
+                  key={entry.id}
+                  data-audit-row={entry.action}
+                  className="rounded-lg border border-line px-3 py-2.5"
+                >
+                  <p className="font-mono text-[12px] break-words">{entry.action}</p>
+                  <p className="mt-1 text-[12.5px]">
+                    {entry.actor_type === "system" ? (
+                      <span className="text-muted">Platform (system)</span>
+                    ) : (
+                      entry.actor_name ?? "Unknown account"
+                    )}
+                  </p>
+                  <p className="mt-0.5 flex flex-wrap gap-x-3 text-[11.5px] text-muted">
+                    {entry.target_type ? (
+                      <span>
+                        {entry.target_type}
+                        {entry.target_id ? ` ${entry.target_id.slice(0, 8)}` : ""}
+                      </span>
+                    ) : null}
+                    {entry.ip_address ? <span className="font-mono">{entry.ip_address}</span> : null}
+                    <span>{formatTimestamp(entry.created_at)}</span>
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </div>
     </div>

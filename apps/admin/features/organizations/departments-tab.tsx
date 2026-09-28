@@ -798,7 +798,12 @@ export function DepartmentsTab({ organization }: { organization: Organization })
       ) : null}
 
       {status === "ready" && visible.length > 0 ? (
-        <div className="overflow-x-auto">
+        <>
+        {/* A seven-column tree table cannot be read on a 390px screen: below `md` the same rows
+            become cards, keeping the indentation as leading padding on the name so the structure
+            is still visible. Both renderings are in the DOM at their own widths only, so the QA
+            pass can drive either without a duplicate row counting as two departments. */}
+        <div className="hidden overflow-x-auto md:block">
           <table className="w-full border-collapse text-left text-[13px]">
             <thead>
               <tr className="border-b border-line text-[11.5px] uppercase tracking-wide text-muted">
@@ -922,6 +927,102 @@ export function DepartmentsTab({ organization }: { organization: Organization })
             </tbody>
           </table>
         </div>
+
+        {/* The same rows as cards, below `md`. The three facts a phone can carry — who, how many
+            people, whether it still grants — sit on the card; the parent's key and the updated
+            timestamp are the two columns a 390px screen cannot hold without truncating every
+            name, and neither changes what a reader decides from a phone. */}
+        <ul className="flex flex-col gap-2 md:hidden">
+          {visible.map((row) => (
+            <li
+              key={row.id}
+              data-department-row={row.key}
+              className="rounded-xl border border-line bg-surface px-3 py-2.5"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => setOpen(row)}
+                  data-department-open={row.key}
+                  className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                  style={{ paddingLeft: `${row.depth * 14}px` }}
+                >
+                  {row.depth > 0 ? (
+                    <ChevronRight className="size-3 shrink-0 text-muted" aria-hidden />
+                  ) : (
+                    <FolderTree className="size-3.5 shrink-0 text-muted" aria-hidden />
+                  )}
+                  <span className="flex min-w-0 flex-col">
+                    <span className="truncate text-[13px] font-medium">{row.name}</span>
+                    <span className="truncate text-[11.5px] text-muted">
+                      {row.key}
+                      {row.parent_key ? ` · under ${row.parent_key}` : ""}
+                    </span>
+                  </span>
+                </button>
+                <StatusBadge status={row.status} />
+              </div>
+
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                <span className="flex items-center gap-3 text-[12px] text-muted">
+                  <span className="inline-flex items-center gap-1">
+                    <Users className="size-3.5" aria-hidden />
+                    {row.member_count} member{row.member_count === 1 ? "" : "s"}
+                  </span>
+                  <span>
+                    {row.role_count} role{row.role_count === 1 ? "" : "s"}
+                  </span>
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setDialog(row)}
+                    aria-label={`Edit ${row.name}`}
+                    className="rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-canvas"
+                  >
+                    Edit
+                  </button>
+                  {row.status === "active" ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void run(
+                          row.id,
+                          () =>
+                            archiveOrganizationDepartment(organization.id, row.id),
+                          `${row.name} is archived. It keeps its structure but no longer grants its roles.`,
+                        )
+                      }
+                      disabled={busyId === row.id}
+                      data-department-archive={row.key}
+                      aria-label={`Archive ${row.name}`}
+                      className="rounded-lg border border-line p-2 text-muted transition hover:bg-canvas hover:text-ink disabled:opacity-50"
+                    >
+                      <Archive className="size-3.5" aria-hidden />
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void run(
+                        row.id,
+                        () => deleteOrganizationDepartment(organization.id, row.id),
+                        `${row.name} is deleted.`,
+                      )
+                    }
+                    disabled={busyId === row.id}
+                    data-department-delete={row.key}
+                    aria-label={`Delete ${row.name}`}
+                    className="rounded-lg border border-line p-2 text-muted transition hover:bg-canvas hover:text-accent-strong disabled:opacity-50"
+                  >
+                    <Trash2 className="size-3.5" aria-hidden />
+                  </button>
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+        </>
       ) : null}
 
       {dialog ? (

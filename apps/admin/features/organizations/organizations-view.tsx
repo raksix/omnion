@@ -339,87 +339,144 @@ export function OrganizationsView() {
             }
           />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-left text-[13px]">
-              <thead>
-                <tr className="bg-canvas/60 text-[11px] font-medium tracking-wide text-muted uppercase">
-                  <th scope="col" className="px-4 py-2.5">
-                    Organization
-                  </th>
-                  <th scope="col" className="px-4 py-2.5">
-                    Slug
-                  </th>
-                  <th scope="col" className="px-4 py-2.5">
-                    Status
-                  </th>
-                  <th scope="col" className="px-4 py-2.5">
-                    Members
-                  </th>
-                  <th scope="col" className="px-4 py-2.5">
-                    Created
-                  </th>
-                  <th scope="col" className="px-4 py-2.5">
-                    <span className="sr-only">Actions</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((organization) => (
-                  <tr key={organization.id} className="border-t border-line transition hover:bg-canvas/60">
-                    <td className="px-4 py-3.5">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <Building2 className="size-3.5 shrink-0 text-muted" aria-hidden />
-                        <Link
-                          href={`/organizations/${organization.id}`}
-                          className="truncate font-medium hover:underline"
-                        >
-                          {organization.name}
-                        </Link>
-                      </span>
-                    </td>
-                    <td className="px-4 py-3.5 text-muted">{organization.slug}</td>
-                    <td className="px-4 py-3.5">
-                      <StatusBadge status={organization.status} />
-                    </td>
-                    <td className="px-4 py-3.5">
-                      <Link
-                        href={`/organizations/${organization.id}?tab=members`}
-                        className="text-accent-strong hover:underline"
-                      >
-                        Manage
-                      </Link>
-                    </td>
-                    <td className="px-4 py-3.5 text-muted">
-                      {formatTimestamp(organization.created_at)}
-                    </td>
-                    <td className="px-4 py-3.5 text-right">
-                      {organization.status === "active" ? (
-                        <button
-                          type="button"
-                          data-qa-guard="write"
-                          onClick={() => void setStatusOf(organization, "suspended")}
-                          disabled={busyId === organization.id}
-                          className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
-                        >
-                          Suspend
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          data-qa-guard="write"
-                          onClick={() => void setStatusOf(organization, "active")}
-                          disabled={busyId === organization.id}
-                          className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
-                        >
-                          Reactivate
-                        </button>
-                      )}
-                    </td>
+          <>
+            {/* Six columns (organization, slug, status, members, created, actions) do not fit a
+                phone, so below `md` each organization is a card: the name links to the same
+                detail screen, the status badge and the suspend/reactivate control are both
+                present, and the slug becomes a supporting line rather than a column. */}
+            <div className="hidden overflow-x-auto md:block">
+              <table className="w-full border-collapse text-left text-[13px]">
+                <thead>
+                  <tr className="bg-canvas/60 text-[11px] font-medium tracking-wide text-muted uppercase">
+                    <th scope="col" className="px-4 py-2.5">
+                      Organization
+                    </th>
+                    <th scope="col" className="px-4 py-2.5">
+                      Slug
+                    </th>
+                    <th scope="col" className="px-4 py-2.5">
+                      Status
+                    </th>
+                    <th scope="col" className="px-4 py-2.5">
+                      Members
+                    </th>
+                    <th scope="col" className="px-4 py-2.5">
+                      Created
+                    </th>
+                    <th scope="col" className="px-4 py-2.5">
+                      <span className="sr-only">Actions</span>
+                    </th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {filtered.map((organization) => (
+                    <tr key={organization.id} className="border-t border-line transition hover:bg-canvas/60">
+                      <td className="px-4 py-3.5">
+                        <span className="flex min-w-0 items-center gap-2">
+                          <Building2 className="size-3.5 shrink-0 text-muted" aria-hidden />
+                          <Link
+                            href={`/organizations/${organization.id}`}
+                            className="truncate font-medium hover:underline"
+                          >
+                            {organization.name}
+                          </Link>
+                        </span>
+                      </td>
+                      <td className="px-4 py-3.5 text-muted">{organization.slug}</td>
+                      <td className="px-4 py-3.5">
+                        <StatusBadge status={organization.status} />
+                      </td>
+                      <td className="px-4 py-3.5">
+                        <Link
+                          href={`/organizations/${organization.id}?tab=members`}
+                          className="text-accent-strong hover:underline"
+                        >
+                          Manage
+                        </Link>
+                      </td>
+                      <td className="px-4 py-3.5 text-muted">
+                        {formatTimestamp(organization.created_at)}
+                      </td>
+                      <td className="px-4 py-3.5 text-right">
+                        {organization.status === "active" ? (
+                          <button
+                            type="button"
+                            data-qa-guard="write"
+                            data-organization-suspend={organization.slug}
+                            onClick={() => void setStatusOf(organization, "suspended")}
+                            disabled={busyId === organization.id}
+                            className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
+                          >
+                            Suspend
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            data-qa-guard="write"
+                            data-organization-suspend={organization.slug}
+                            onClick={() => void setStatusOf(organization, "active")}
+                            disabled={busyId === organization.id}
+                            className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas disabled:opacity-60"
+                          >
+                            Reactivate
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <ul className="flex flex-col gap-2 px-3 py-3 md:hidden">
+              {filtered.map((organization) => (
+                <li
+                  key={organization.id}
+                  data-organization-row={organization.slug}
+                  className="rounded-xl border border-line px-3 py-2.5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-2">
+                      <Building2 className="size-3.5 shrink-0 text-muted" aria-hidden />
+                      <Link
+                        href={`/organizations/${organization.id}`}
+                        className="truncate text-[13px] font-medium hover:underline"
+                      >
+                        {organization.name}
+                      </Link>
+                    </span>
+                    <StatusBadge status={organization.status} />
+                  </div>
+                  <p className="mt-1 truncate text-[12px] text-muted">
+                    {organization.slug} · created {formatTimestamp(organization.created_at)}
+                  </p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <Link
+                      href={`/organizations/${organization.id}?tab=members`}
+                      className="rounded-lg border border-line px-2.5 py-1.5 text-[12px] text-accent-strong"
+                    >
+                      Manage members
+                    </Link>
+                    <button
+                      type="button"
+                      data-qa-guard="write"
+                      data-organization-suspend={organization.slug}
+                      onClick={() =>
+                        void setStatusOf(
+                          organization,
+                          organization.status === "active" ? "suspended" : "active",
+                        )
+                      }
+                      disabled={busyId === organization.id}
+                      className="rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-canvas disabled:opacity-60"
+                    >
+                      {organization.status === "active" ? "Suspend" : "Reactivate"}
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </div>
     </div>

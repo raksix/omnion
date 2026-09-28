@@ -403,7 +403,11 @@ export function MemberDrawer({
         role="dialog"
         aria-label={`Member ${detail?.display_name || memberName}`}
         data-member-drawer="1"
-        className="relative flex h-full w-full max-w-lg flex-col gap-4 overflow-y-auto border-l border-line bg-surface p-4 shadow-xl sm:p-5"
+        // On a phone the drawer takes the whole screen: a 512px panel pushed to the right edge
+        // of a 390px viewport leaves the reader a sliver to peek past and every control on the
+        // far side out of reach. Below `sm` it is a full-height sheet; from `sm` up it is the
+        // side panel, which is the only place it fits.
+        className="relative flex h-full w-full flex-col gap-4 overflow-y-auto bg-surface p-4 shadow-xl sm:max-w-lg sm:border-l sm:border-line sm:p-5"
       >
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-col gap-1">
