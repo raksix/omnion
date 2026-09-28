@@ -2386,3 +2386,47 @@
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+## 2026-09-28 · wave 7 · tick 7 · REQ-097 held open, and the box fought the closing pass
+
+- **What.** No new feature shipped this tick. The merge came first (main was 4 commits ahead), and
+  then two environment failures each cost a full QA attempt. REQ-097 stays `in-progress` rather than
+  closed on a pass that never finished.
+
+- **The migration collided again, and that is the lesson.** `c75a51b` moved the AI pair to
+  0029/0030 an hour earlier; main has since landed `0029_media_storage_settings`. The numbers are now
+  0031/0032. Re-reading the directory when the migration is *written* is not the whole rule —
+  `origin/main` moves underneath a branch that is working for hours, so the directory has to be read
+  again at commit time. Seven writers, one number space, no lock.
+
+- **The append-only merge, done properly.** `BUILD-LOG.md` is a pure append, so the merge is a
+  UNION and `git merge-file` resolving the call-site hunk can quietly drop one side. Both sides' insert
+  opcodes were spliced onto the common base and checked with a **multiset** comparison, not
+  `base + ours + theirs == merged`: a duplicated block satisfies that arithmetic perfectly while
+  corrupting the ledger. `docs/BUILD-LOG.md` verified — every line of `ef192bc` and of `origin/main`
+  survives.
+
+- **One trap worth naming.** `git checkout stash@{0} -- <file>` during a conflicted merge *stages the
+  file and finalises the merge commit*, so the later `git stash pop` overwrote the resolved file with
+  the pre-merge version — main's slice-3 entry deleted, silently, in a file nobody diffs. The
+  recovery is `git checkout HEAD -- <file>`, then re-verify both parents. Do not pop the stash.
+
+- **The box, twice.** Both Chrome copies were **0 bytes** (`/opt/google/chrome/chrome` and Playwright's
+  `chromium-1234`), which fails a walk as `spawn …/chrome EACCES` rather than an exec error.
+  `playwright install` no-ops when the browser *looks* installed — the directory has to go first.
+  Then a sibling's disk reclaim deleted `qa-artifacts/<ts>/` mid-run (`ENOENT … clicks.jsonl`) and
+  the `target → /dev/shm/w7-target` symlink with it, so cargo failed with `failed to create
+  directory … Not a directory (os error 20)`. The second run got further — `iam-roles`,
+  `analytics-settings` — and then lost its browser context under `load 16` with 319 MB free, at
+  `runAiProviderDepth`, the first AI depth pass.
+
+- **Proof.** `pnpm typecheck` green (admin executed, web cached). `cargo test -p omnion-ai-hub
+  --test-threads=1` → **86 passed, 0 failed**. `node scripts/qa/probe-refusal-gate.cjs` → **9/9 PASS**,
+  which is the gate that keeps an unregistered 500 a high finding. QA: **no completed pass this tick**;
+  the last one on record is `20260928-074302` (23 findings, 18 high, of which 12 were caused by the
+  states sweep itself — the reason `ef192bc` widened the refusal gate).
+
+- **Next.** Re-run the closing pass for REQ-097 and, if the box is still starved, add a targeted
+  `--only=ai` mode so the AI depth passes can be proven without walking 32 IAM and analytics screens
+  first — the pass spends 40 of its 45 minutes on screens this request did not touch. Then REQ-098
+  slice 1 (the catalog).
