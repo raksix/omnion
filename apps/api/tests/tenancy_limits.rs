@@ -1057,7 +1057,7 @@ async fn a_ceiling_really_bounds_accepting_an_invitation() {
     let invitations_uri = format!("/api/v1/organizations/{}/invitations", fixture.org_a);
 
     // The walk states its own invite policy instead of inheriting the column default. Migration
-    // 0038 declares `invite_policy … default 'owner_approval'`, so a walk that says nothing about
+    // 0040 declares `invite_policy … default 'owner_approval'`, so a walk that says nothing about
     // the policy gets a *queued* invitation (202, no token) and then blames the seat ceiling for
     // a refusal it never reached — which is exactly the 202-vs-201 this walk used to fail on. The
     // ceiling under test is the seats, so the policy is pinned to the one mode that hands over a

@@ -1,4 +1,4 @@
--- Omnion · 0031 · the invitation approval queue (REQ-005, slice 3)
+-- Omnion · 0041 · the invitation approval queue (REQ-005, slice 3)
 --
 -- `organization_settings.invite_policy` has been stored, validated and offered in the Settings
 -- tab since migration 0030 — but the three *behaviours* it names were never enforced, so the
