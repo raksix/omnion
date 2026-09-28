@@ -334,8 +334,8 @@ async fn drive_until_terminal(
             actions,
             &omnion_workflows::guard::NoRunGuard,
         )
-            .await
-            .expect("the engine tick must run");
+        .await
+        .expect("the engine tick must run");
 
         let execution = store::find_execution(harness.db.pool(), execution_id)
             .await
@@ -362,8 +362,8 @@ async fn drive(harness: &Harness, actions: &AutomationActions, ticks: usize) {
             actions,
             &omnion_workflows::guard::NoRunGuard,
         )
-            .await
-            .expect("the engine tick must run");
+        .await
+        .expect("the engine tick must run");
         tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
 }
