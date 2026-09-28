@@ -79,6 +79,7 @@ pub mod health;
 pub mod iam;
 pub mod iam_approvals;
 pub mod iam_policy;
+pub mod iam_attribute_mappings;
 pub mod iam_providers;
 pub mod iam_provisioning;
 pub mod iam_security;
@@ -294,6 +295,21 @@ pub fn router(state: AppState) -> Router {
 
     let iam_provider_events = get(iam_providers::list_provider_events)
         .layer(guards::require(&state, "iam.providers.read"));
+
+    // The attribute map (REQ-065, slice 2). Reading it and rehearsing it is `read` — a preview
+    // writes nothing — while replacing it is `manage`, because the map decides which claim becomes
+    // somebody's email address.
+    let iam_provider_attribute_mappings =
+        get(iam_attribute_mappings::get_attribute_mappings)
+            .layer(guards::require(&state, "iam.providers.read"))
+            .merge(
+                put(iam_attribute_mappings::replace_attribute_mappings)
+                    .layer(guards::require(&state, "iam.providers.manage")),
+            );
+    let iam_provider_attribute_preview = post(
+        iam_attribute_mappings::preview_attribute_mappings,
+    )
+    .layer(guards::require(&state, "iam.providers.read"));
 
     // The public sign-in surface: no guard, because there is no session yet — the same reason
     // `auth/login` and `auth/mfa/verify` carry none. `sso/{slug}/saml` is the panel page a SAML
@@ -982,6 +998,14 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers/{id}/enable", iam_provider_enable)
         .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
+        .route(
+            "/iam/providers/{id}/attribute-mappings",
+            iam_provider_attribute_mappings,
+        )
+        .route(
+            "/iam/providers/{id}/attribute-mappings/preview",
+            iam_provider_attribute_preview,
+        )
         .route("/scim/v2/ServiceProviderConfig", scim_config)
         .route("/scim/v2/Schemas", scim_schemas)
         .route("/scim/v2/Users", scim_users)

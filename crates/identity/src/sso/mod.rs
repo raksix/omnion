@@ -19,15 +19,23 @@
 //! language (what a usable directory configuration is, and every way it can be wrong, each
 //! attached to the field that owns it) and a connection test that is a **ladder of steps** rather
 //! than a boolean. REQ-065.
+//!
+//! [`attributes`] is shared by all five kinds: whatever hands us the claims, somebody has to say
+//! which of them is the email. [`mappings`] stores that answer.
 
+pub mod attributes;
 pub mod challenges;
 pub mod claims;
 pub mod directory;
+pub mod mappings;
 pub mod oidc;
 pub mod providers;
 pub mod provisioning;
 pub mod saml;
 
+pub use attributes::{
+    AttributeMap, AttributeMapping, MapProblem, Projection, TargetField, Transform,
+};
 pub use challenges::{CHALLENGE_TTL_MINUTES, IssuedChallenge, SsoChallenge, hash_state};
 pub use claims::{Identity, RoleMapping, identity_from_claims, resolve_roles};
 pub use directory::{

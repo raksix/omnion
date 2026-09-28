@@ -3752,6 +3752,95 @@ export function fetchIamProviderEvents(
   return request(`/api/v1/iam/providers/${id}/events${query ? `?${query}` : ""}`);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The attribute map (REQ-065, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of a provider's attribute map. */
+export type IamAttributeMapping = {
+  source_attr: string;
+  target_field: string;
+  transform: string;
+  /** Whether the transform needs an argument — the server says so, the client does not guess. */
+  needs_argument: boolean;
+  transform_arg: string | null;
+  required: boolean;
+  position: number;
+};
+
+/** One transform, with the hint the picker shows. */
+export type IamTransform = { name: string; needs_argument: boolean; hint: string };
+
+/**
+ * The map, plus the catalogue the editor renders itself from.
+ *
+ * The pickers are built from `target_fields` and `transforms` rather than from constants here, so
+ * adding a field to the server does not leave this screen offering an option that is then
+ * refused — the failure an operator reads as "the panel is broken".
+ */
+export type IamAttributeMap = {
+  provider_id: string;
+  mappings: IamAttributeMapping[];
+  target_fields: string[];
+  transforms: IamTransform[];
+  problems: IamTestProblem[];
+};
+
+/**
+ * The result of running the map against a pasted sample.
+ *
+ * `ok: false` with a non-empty `missing` is the important case: it is what a real sign-in would
+ * do, which is why this endpoint runs the sign-in function rather than a display-only one.
+ */
+export type IamAttributePreview = {
+  provider_id: string;
+  ok: boolean;
+  values: { field: string; value: string }[];
+  missing: string[];
+  unused: string[];
+  rows: {
+    source_attr: string;
+    target_field: string;
+    transform: string;
+    transform_arg: string | null;
+    raw: string | null;
+    value: string | null;
+    required: boolean;
+  }[];
+  problems: IamTestProblem[];
+};
+
+/** The provider's map, with the field and transform catalogues. */
+export function fetchIamAttributeMap(id: string): Promise<IamAttributeMap> {
+  return request(`/api/v1/iam/providers/${id}/attribute-mappings`);
+}
+
+/**
+ * Replace the whole map. A PUT and not a row-at-a-time POST because a partially applied map is
+ * the failure that matters: an email row that never landed refuses real sign-ins for a reason
+ * nobody can see from the panel.
+ */
+export function saveIamAttributeMap(
+  id: string,
+  mappings: IamAttributeMapping[],
+): Promise<IamAttributeMap> {
+  return request(`/api/v1/iam/providers/${id}/attribute-mappings`, {
+    method: "PUT",
+    body: JSON.stringify({ mappings }),
+  });
+}
+
+/** Run the map against a pasted sample. Writes nothing and creates no account. */
+export function previewIamAttributeMap(
+  id: string,
+  sample: unknown,
+): Promise<IamAttributePreview> {
+  return request(`/api/v1/iam/providers/${id}/attribute-mappings/preview`, {
+    method: "POST",
+    body: JSON.stringify({ sample }),
+  });
+}
+
 /** The providers a person may sign in with — the public list the sign-in screen renders. */
 export function fetchSsoProviders(): Promise<{
   organization_id: string;

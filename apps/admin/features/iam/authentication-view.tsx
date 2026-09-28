@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 
 import { useSession } from "@/lib/session";
+import { AttributeMapEditor } from "@/features/iam/attribute-map-editor";
 import {
   ApiError,
   createIamProvider,
@@ -1119,6 +1120,16 @@ export function AuthenticationView() {
                   </span>
                 </span>
               </label>
+            ) : null}
+
+            {/* The attribute map belongs to a *saved* provider: the map is rows keyed by
+                provider id, so there is nothing to attach it to while the provider is still a
+                draft. It lives in the same drawer as the connection settings because it is the
+                next step of the same job, not a separate screen. */}
+            {draft.id ? (
+              <div className="border-t border-line pt-3">
+                <AttributeMapEditor providerId={draft.id} />
+              </div>
             ) : null}
 
             <div className="mt-auto flex items-center justify-end gap-2 border-t border-line pt-3">
