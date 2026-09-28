@@ -337,6 +337,139 @@ export type MediaVersionList = {
   versions: MediaVersion[];
 };
 
+/**
+ * One share link, as the panel reads it (REQ-010, slice 3).
+ *
+ * There is no `token` field here, and that is not an oversight: the API cannot return one after
+ * creation, because the row stores only its hash. A type that carried a token would be a lie
+ * that shows up as an empty column in the table.
+ */
+export type MediaShare = {
+  id: string;
+  media_id: string;
+  /** When the link stops working; `null` means "until revoked". */
+  expires_at: string | null;
+  /** Whether the link needs a password. The password itself is never returned. */
+  has_password: boolean;
+  /** Downloads that produced bytes. */
+  download_count: number;
+  created_at: string;
+  /** When it was revoked; `null` while it is live. */
+  revoked_at: string | null;
+  revoked_reason: string;
+  /** `live`, `expired` or `revoked`, resolved by the API against the clock. */
+  state: "live" | "expired" | "revoked";
+};
+
+/**
+ * A freshly created share, with the token shown once.
+ *
+ * `token` and `url` exist on this type and on no other — which is how the screen knows to put
+ * the one-time copy panel on screen and to never try to show a link it cannot re-derive.
+ */
+export type CreatedMediaShare = {
+  share: MediaShare;
+  url: string;
+  token: string;
+  notice: string;
+};
+
+/**
+ * One row of the duplicate report (`GET /api/v1/media/duplicates`).
+ *
+ * `full_checksum` is what the merge posts; `checksum` is the short form for the eye and is
+ * **not** a usable value. The two being different types' worth of fields rather than one
+ * truncated one is what stops a client from sending the short one and being told, correctly,
+ * that it is not a checksum.
+ */
+export type MediaDuplicateGroup = {
+  site_id: string;
+  /** Site name; present only where the caller asked for names. */
+  site_name?: string;
+  /** First sixteen characters, with an ellipsis. For reading, never for posting. */
+  checksum: string;
+  /** The full checksum — the value `Merge group` sends. */
+  full_checksum: string;
+  /** How many live files share it. */
+  file_count: number;
+  total_bytes: number;
+  /** The group minus one keeper: what a purge of the copies returns, not the group's size. */
+  reclaimable_bytes: number;
+  first_seen: string;
+  last_seen: string;
+  /** Present only when the report was asked to expand. */
+  files?: MediaDuplicateFile[];
+};
+
+/** One file inside a duplicate group. */
+export type MediaDuplicateFile = {
+  id: string;
+  filename: string;
+  folder_id: string | null;
+  size_bytes: number;
+  content_type: string;
+  uploaded_at: string;
+  /** How many *records* use it — a page naming it in two fields is one usage. */
+  reference_count: number;
+  raw_path: string;
+};
+
+/** The per-site report. Every group here has a keeper to pick and a merge button. */
+export type MediaDuplicateReport = {
+  site_ids: string[];
+  cross_site: false;
+  reclaimable_bytes: number;
+  group_count: number;
+  groups: MediaDuplicateGroup[];
+};
+
+/** One site's holding of an installation-wide duplicate. */
+export type MediaCrossSiteCopy = {
+  site_id: string;
+  site_name: string;
+  file_count: number;
+  site_bytes: number;
+};
+
+/**
+ * A checksum the whole installation holds more than once.
+ *
+ * No `reclaimable_bytes`, and that absence is the feature: nothing on this report can return
+ * the space, because a merge repoints rows inside one site and cannot decide which tenant keeps
+ * the file. The screen says where the copies are and sends the operator to the site that can act.
+ */
+export type MediaCrossSiteGroup = {
+  checksum: string;
+  full_checksum: string;
+  file_count: number;
+  site_count: number;
+  total_bytes: number;
+  first_seen: string;
+  last_seen: string;
+  sites: MediaCrossSiteCopy[];
+};
+
+/** The installation-wide report, for a platform account. */
+export type MediaCrossSiteReport = {
+  site_ids: string[];
+  cross_site: true;
+  group_count: number;
+  total_bytes: number;
+  groups: MediaCrossSiteGroup[];
+  notice: string;
+};
+
+/** What a merge did. `notice` says the bytes are *pending*, because they are. */
+export type MediaMergeResult = {
+  kept: string;
+  trashed: string[];
+  references_moved: number;
+  references_collapsed: number;
+  bytes_pending_purge: number;
+  shares_revoked: number;
+  notice: string;
+};
+
 /** What a replace or a restore did. */
 export type MediaReplaceResult = {
   file: MediaFile;
