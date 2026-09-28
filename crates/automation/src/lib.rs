@@ -38,6 +38,11 @@
 //!   call), `publish_page` and `run_workflow` (REQ-003 slice 2);
 //! * [`outbound`] — the three actions that leave the process, and the two bounds that keep
 //!   them bounded: the outbound host allow-list and the HMAC signature every call carries;
+//! * [`limits`] — the two bounds that make a rule safe to leave *armed*: the rolling-hour
+//!   rate window and the concurrency policy, both decided in the same transaction that
+//!   starts the run (REQ-003 slice 4);
+//! * [`loopguard`] — the endless-loop guard: the same step kind twice in a row with
+//!   identical resolved parameters stops the run and explains itself in the trace;
 //! * [`mail`] — the small SMTP client behind the email action.
 //!
 //! The crate never writes `workflows`/`workflow_steps` rows by hand: it goes through
@@ -53,6 +58,8 @@ pub mod condition;
 pub mod error;
 pub mod groups;
 pub mod hooks;
+pub mod limits;
+pub mod loopguard;
 pub mod mail;
 pub mod matcher;
 pub mod model;

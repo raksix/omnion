@@ -33,6 +33,7 @@ use omnion_workflows::{TriggerKind, Workflow, WorkflowExecution, engine};
 
 use crate::binding::resolve_params;
 use crate::error::Result;
+use crate::limits::{self, Admit, Policy};
 use crate::model::AutomationRule;
 
 /// Most events one drain evaluates.
@@ -54,8 +55,28 @@ pub struct MatchReport {
     pub skipped: usize,
     /// Runs that were started.
     pub runs: Vec<Uuid>,
+    /// Triggers a bound refused: (rule id, event id, bound name, reason).
+    ///
+    /// Reported rather than counted, because a refusal is an ordinary fact about a busy
+    /// rule and not an error: returning `Err` here would roll the cursor transaction back
+    /// and re-evaluate every event in the batch, which is how a rate limit turns into a
+    /// stuck bus. The row is audited after the commit, like every other fact.
+    pub refused: Vec<Refused>,
     /// `true` when this drain found nothing to do.
     pub idle: bool,
+}
+
+/// One trigger a bound refused to start a run for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The rule whose bound refused.
+    pub workflow_id: Uuid,
+    /// The event that would have started it.
+    pub event_id: i64,
+    /// Which bound refused: `rate_limit_per_hour` or `concurrency`.
+    pub bound: &'static str,
+    /// The message the rule's `last_error` carries and the audit row records.
+    pub reason: String,
 }
 
 impl MatchReport {
@@ -149,6 +170,13 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
     let mut captured: Vec<(Uuid, i64, String, Value)> = Vec::new();
     // (workflow id, event id, reason) of every rule that could not be run.
     let mut failures: Vec<(Uuid, i64, String)> = Vec::new();
+    // (rule, event, bound, reason) of every trigger a bound refused.
+    let mut refused: Vec<Refused> = Vec::new();
+    // The rolling hour, read once per drain rather than per rule: a drain evaluates a
+    // batch of events and a rule that appears twice in the batch would otherwise be
+    // counted twice for the same window — which is correct, because the guard is per
+    // *trigger*, but the read is the same read, so it is done once.
+    let now = time::OffsetDateTime::now_utc();
 
     for event in &events {
         report.evaluated += 1;
@@ -213,6 +241,32 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
                 }
             };
 
+            // The two bounds, decided in the same transaction that creates the run and
+            // under the window row's own lock. A guard that read the counter and then
+            // wrote the run would be three statements, and two API instances
+            // interleaving them would both see an empty window — which is exactly the
+            // failure the request's risk note names.
+            let policy = Policy::from_columns(workflow.rate_limit_per_hour, &workflow.concurrency);
+            let verdict =
+                limits::admit(&mut transaction, workflow.id, &policy, now).await?;
+            if !verdict.is_allowed() {
+                report.skipped += 1;
+                if let Some(reason) = verdict.reason(&policy) {
+                    let bound = match verdict {
+                        Admit::RateLimited { .. } => "rate_limit_per_hour",
+                        Admit::Skipped { .. } => "concurrency",
+                        Admit::Allowed { .. } => unreachable!("admitted runs are not refusals"),
+                    };
+                    refused.push(Refused {
+                        workflow_id: workflow.id,
+                        event_id: event.id,
+                        bound,
+                        reason,
+                    });
+                }
+                continue;
+            }
+
             let (execution, _rows) = store::create_execution_in(
                 &mut transaction,
                 &workflow,
@@ -237,6 +291,7 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
         .execute(&mut *transaction)
         .await?;
     report.cursor = last;
+    report.refused = refused.clone();
 
     transaction.commit().await?;
 
@@ -269,6 +324,18 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
             Err(err) => {
                 tracing::warn!(workflow_id = %workflow_id, error = %err, "the listener could not be filled in");
             }
+        }
+    }
+
+    for entry in &refused {
+        tracing::info!(
+            workflow_id = %entry.workflow_id,
+            event_id = entry.event_id,
+            bound = entry.bound,
+            "a bound refused to start a run"
+        );
+        if let Err(err) = record_refusal(pool, entry).await {
+            tracing::warn!(workflow_id = %entry.workflow_id, error = %err, "the refusal audit row could not be written");
         }
     }
 
@@ -332,6 +399,32 @@ async fn record_skip(pool: &PgPool, workflow_id: Uuid, event_id: i64, reason: &s
     Ok(())
 }
 
+/// Audit one trigger a bound refused.
+///
+/// `automation.rule.limit_reached` — the event the request asks for. It is written after
+/// the commit, for the reason every other audit row here is: the run that did not happen
+/// is the fact, and this is the record of it. A missing row is a gap in the trail, never a
+/// trigger that slipped through.
+async fn record_refusal(pool: &PgPool, entry: &Refused) -> Result<()> {
+    let organization: Option<Uuid> =
+        sqlx::query_scalar("select organization_id from workflows where id = $1")
+            .bind(entry.workflow_id)
+            .fetch_optional(pool)
+            .await?;
+
+    let audit = omnion_audit::NewAuditEntry::system("automation.rule.limit_reached")
+        .organization(organization)
+        .target("workflow", entry.workflow_id.to_string())
+        .metadata(json!({
+            "event_id": entry.event_id,
+            "bound": entry.bound,
+            "reason": entry.reason,
+        }));
+
+    omnion_audit::record(pool, audit).await?;
+    Ok(())
+}
+
 /// The definition columns the automations surface may rewrite, built from a rule.
 #[must_use]
 pub fn update_from_rule(rule: &AutomationRule) -> Option<WorkflowUpdate> {
@@ -351,6 +444,10 @@ pub fn update_from_rule(rule: &AutomationRule) -> Option<WorkflowUpdate> {
         // deliberately handed to, which is the kind of change nobody notices until a run
         // stops with a permission error.
         run_as_user_id: rule.run_as_user_id,
+        // Carried through for the same reason as `run_as_user_id`: arming, pausing or
+        // renaming a rule is not a decision to move its bounds back to the defaults.
+        rate_limit_per_hour: Some(rule.rate_limit_per_hour),
+        concurrency: Some(rule.concurrency.as_str().to_owned()),
         next_run_at: None,
         steps: definition.steps_json().ok()?,
     })
@@ -384,6 +481,9 @@ mod tests {
             hook_triggered: false,
             hook_configured: false,
             on_error: OnError::Stop,
+            rate_limit_per_hour: crate::limits::DEFAULT_RATE_LIMIT,
+            concurrency: crate::limits::Concurrency::Queue,
+            last_error: None,
             trigger_count: 0,
             last_triggered_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,

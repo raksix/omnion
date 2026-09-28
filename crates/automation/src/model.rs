@@ -61,6 +61,20 @@ pub struct AutomationRule {
     /// author loses a permission must stop on its next run, not keep the snapshot it had when
     /// it was saved.
     pub run_as_user_id: Option<Uuid>,
+    /// Runs this rule may start in a rolling hour (REQ-003 slice 4).
+    ///
+    /// Clamped on read, never trusted: the database refuses an out-of-range value on the
+    /// way in, so a value that arrives out of range was written by hand — and a run that
+    /// has already been authorised should not fail on a bad integer.
+    pub rate_limit_per_hour: i32,
+    /// What a second trigger does while a run of this rule is going (REQ-003 slice 4).
+    pub concurrency: crate::limits::Concurrency,
+    /// The last message a bound produced when it refused a run of this rule.
+    ///
+    /// `None` is the ordinary state. It is cleared the moment a run is admitted again, so
+    /// it answers "the last thing that went wrong" rather than "something once went wrong",
+    /// and the rule list can show it without a join against the run history.
+    pub last_error: Option<String>,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
     /// When it last fired.
@@ -120,6 +134,17 @@ impl AutomationRule {
             hook_configured,
             on_error: OnError::parse(&workflow.on_error).unwrap_or(OnError::Stop),
             run_as_user_id: workflow.run_as_user_id,
+            // The two bounds, read the same defensive way [`crate::limits::Policy`]
+            // reads them: clamped and defaulted rather than trusted, because a guard that
+            // trusts a hand-edited column is a guard that can be switched off by editing
+            // a row.
+            rate_limit_per_hour: crate::limits::Policy::from_columns(
+                workflow.rate_limit_per_hour,
+                &workflow.concurrency,
+            )
+            .rate_limit_per_hour,
+            concurrency: crate::limits::Concurrency::parse_or_default(&workflow.concurrency),
+            last_error: workflow.last_error.clone(),
             trigger_count: workflow.trigger_count,
             last_triggered_at: workflow.last_triggered_at,
             created_at: workflow.created_at,
@@ -185,6 +210,14 @@ pub struct NewRule {
     pub on_error: OnError,
     /// Whose authority the rule runs with. `None` follows the author.
     pub run_as_user_id: Option<Uuid>,
+    /// Runs this rule may start in a rolling hour; `None` takes the default.
+    ///
+    /// `Option` on the way *in* and `i32` on the way *out* is deliberate: a create that
+    /// names no limit gets the default without the caller having to know it, and a rule
+    /// that is read back always has a number the guard can compare against.
+    pub rate_limit_per_hour: Option<i32>,
+    /// What a concurrent trigger does; `None` takes the default (`queue`).
+    pub concurrency: Option<crate::limits::Concurrency>,
 }
 
 impl NewRule {
