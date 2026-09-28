@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — slices 1, 2 and 3 shipped; slice 3's integration walks pass 29/29 and the QA browser pass is its last gate. **Slice 4 is under way: activities and the merged timeline are built** (`modules/crm/src/activities.rs`, `apps/api/src/routes/crm_activities.rs`, `apps/admin/features/crm/activities-view.tsx`, 132 module unit tests green); the copilot, the global-search registration and the `form.submitted` consumer are what is left of this slice · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
+> **Status:** in-progress — slices 1, 2 and 3 shipped and green. Slices 1-3: 29 integration walks + 132 module unit tests. **Slice 4 part one (activities, feed, log form, merged timeline) and part two (the copilot module) are in**, and the six slice-4 walks now **run and pass: 35/35** against a fresh database in `d132936` — they had never executed before this tick. The copilot's two endpoints (`/crm/copilot/summarize`, `/follow-up`), the global-search registration and the `form.submitted` consumer are what is left of this slice · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -163,8 +163,39 @@ What the visual check should see: a board with four stage columns, per-column co
 
 1. **Data + API core.** Migration, companies/contacts CRUD with filters and paging, permission keys registered, audit + events wired, integration tests. Done when `cargo test -p omnion-module-crm` is green and a signed-in curl round-trip creates a contact that produces an audit row and a `crm.contact.created` event. **Shipped** as `database/migrations/0021_crm.sql` (the spec's `0011` was taken by IAM before this work started; a migration number is global, so the next free one was taken and the file is still additive), `modules/crm` (`omnion-module-crm`) and `apps/api/src/routes/crm.rs`.
 2. **Contact & company screens.** List, filters, saved views, column chooser, inline edit, create/edit form with validation, archive/merge, CSV import (dry run + commit) and export. Done when the walkthrough clicks both screens end to end and the QA pass reports zero high findings. **Shipped** in `apps/admin/features/crm/`, `apps/admin/lib/crm.ts`, `modules/crm/src/{csv,views}.rs` and `apps/api/src/routes/crm_views.rs`.
-3. **Deals + pipeline board.** Stages editor, board with drag + keyboard move, per-stage totals and weighted forecast, won/lost flows, list mode. Done when QA drags a card, reloads, and the stage plus `crm.deal.stage_changed` persist. **Shipped** in `9909af9` as `modules/crm/src/deals.rs`, `apps/api/src/routes/crm_deals.rs`, the five `crm.deals.*` / `crm.pipelines.manage` keys, `apps/admin/features/crm/deals-view.tsx` and the walkthrough's deals depth pass. The unit and typecheck gates are green; the **integration walks have not run** — see the note below.
-4. **Activities, timeline, copilot, search & automations.** Activity capture, merged timeline, copilot read-only actions, global-search registration, workflow triggers and the `form.submitted` consumer. Done when a logged activity appears in the record timeline and in search, and an automation rule triggered by `crm.deal.stage_changed` runs once. **Half shipped** (2026-09-28): activity capture, the feed with its filters, the log form and the merged timeline are in, with `crm.activities.read` / `.create` / `crm.copilot.use` registered. The copilot endpoints, the search registration and the `form.submitted` consumer are not, so this slice is still open.
+3. **Deals + pipeline board.** Stages editor, board with drag + keyboard move, per-stage totals and weighted forecast, won/lost flows, list mode. Done when QA drags a card, reloads, and the stage plus `crm.deal.stage_changed` persist. **Shipped** in `9909af9` as `modules/crm/src/deals.rs`, `apps/api/src/routes/crm_deals.rs`, the five `crm.deals.*` / `crm.pipelines.manage` keys, `apps/admin/features/crm/deals-view.tsx` and the walkthrough's deals depth pass. Shipped and green: 29/29 of its walks ran in `b49aa3d` and again in `d132936` (35/35 with slice 4).
+4. **Activities, timeline, copilot, search & automations.** Activity capture, merged timeline, copilot read-only actions, global-search registration, workflow triggers and the `form.submitted` consumer. Done when a logged activity appears in the record timeline and in search, and an automation rule triggered by `crm.deal.stage_changed` runs once. **Half shipped** (2026-09-28): activity capture, the feed with its filters, the log form and the merged timeline are in, with `crm.activities.read` / `.create` / `crm.copilot.use` registered, and `modules/crm/src/copilot.rs` holds the copilot's context, its two instructions and the sanitiser that treats a model's answer as untrusted text. The copilot **endpoints**, the search registration and the `form.submitted` consumer are not, so this slice is still open.
+
+### The walks that were written but never run (2026-09-28, `d132936`)
+
+Slice 4 part one shipped with six integration walks that had never executed. They were never
+executed because the suite is pointed at the shared development database by default, and that
+database's `_sqlx_migrations` ledger carries versions 19 and 21 from a run against files no branch
+carries — so the fixture panicked before any test body and the "29 passed" that was being reported
+was 29 of the *slice-1-3* walks running against a database that happened to work. The six slice-4
+walks were silently not in that number.
+
+Pointed at a throwaway database, they ran and found **four product defects**, each of which made a
+documented feature unusable rather than slightly wrong:
+
+1. **The activity feed 500'd for every caller at the `team` visibility level.** The clause was
+   built as `any(` followed by a `separated(", ")` of individual binds, which is `any($1, $2)`; the
+   array operator needs one array parameter. `open_tasks` repeated the clause by hand, and
+   `set_activity_done` used `$3` for both the `done_at` timestamp and the id list, so closing any
+   task was a 500 too. All three now share `push_activity_visibility`.
+2. **Every timestamp in an activity response was `time`'s tuple** (`[2026, 263, …]`), because
+   `Activity` and `TimelineEntry` carried no serde attribute on those fields.
+3. **Logging a task with a due date was a 422 for every caller**, because `ActivityChanges`' three
+   timestamps were bare `Option<OffsetDateTime>` and `time`'s serde support is opt-in per field —
+   a bare one accepts no JSON string at all. `dates::instant` is the round trip that fixes it.
+4. The three walks themselves passed an e-mail where a session token belonged, a deal's id where a
+   route takes an activity's, `rp.permission` where the column is `permission_key`, and read
+   `actor_user_id` from a helper that names the key `actor`.
+
+**For the next writer.** A suite's green number is only about the tests in it. If a feature's walks
+are added and the run is a re-run of a database the fixture has always used, check *which* tests the
+count is made of before believing the feature is proved — and run the suite against a database
+created for the purpose at least once per feature.
 
 ### Risks / notes
 

@@ -2123,3 +2123,57 @@ global-search registration and the `form.submitted` consumer.
 and `CARGO_BUILD_JOBS=1` are the settings that got the rest of the tick through. The seven writers'
 `target/` directories are still the pressure — they total over 27 GB on a 60 GB mount — and a
 shared `CARGO_TARGET_DIR` would remove it permanently.
+
+---
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4: the gate that had never run, and the copilot's module
+
+**What.** Ran the database gate that two ticks had deferred, against a throwaway database
+(`omnion_w4_gate`) rather than the shared development one, and built the copilot's module — the
+piece of slice 4 that is pure rule and needs no provider to prove.
+
+The suite **ran for the first time**: 29 of 35 walks passed and the six slice-4 walks failed. They
+had never executed — the default database's migration ledger carries versions 19 and 21 from a run
+against files no branch carries, so the fixture panicked before any test body and the "29 passed"
+being reported was 29 of the *slice-1-3* walks. The six new ones were silently not in that number.
+
+They found **four product defects** and three mistakes inside the walks themselves:
+
+* The activity feed's visibility clause emitted `any($1, $2)` instead of `any($1)` — a
+  `separated(", ")` of individual binds where the array operator needs one array parameter. A 500
+  for every caller at the `team` level. `open_tasks` repeated it by hand; `set_activity_done` used
+  `$3` for both the `done_at` timestamp *and* the id list, so closing any task was a 500 too. One
+  shared `push_activity_visibility` now serves all three.
+* `Activity` and `TimelineEntry` serialised their timestamps with no serde attribute, so every
+  activity response carried `time`'s tuple (`[2026, 263, …]`).
+* `ActivityChanges`' three timestamps were bare `Option<OffsetDateTime>`, and `time`'s serde support
+  is opt-in per field — a bare one accepts **no** JSON string, so logging a task with a due date
+  was a 422 for every caller. `dates::instant` is the new round trip: RFC 3339 as written, a
+  zone-less `datetime-local` value as UTC, an explicit offset on the way back out.
+* In the walks: an e-mail passed where a session token belonged (a 401 that reads as a broken
+  endpoint), a deal's id passed to a route that takes an activity's, `rp.permission` where the
+  column is `permission_key`, and `actor_user_id` read from a helper that names the key `actor`.
+
+`modules/crm/src/copilot.rs` is new: the deal + company + history read through the **caller's own
+`Scope`** (so a copilot call is exactly as restricted as the card it sits on), the two instructions
+as constants, and a sanitiser that treats the model's answer as untrusted text — unwraps a stray
+code fence, strips tag runs and control characters, caps a runaway answer, and refuses an answer
+that is only markup with a new `CrmError::EmptyAnswer` (mapped to a `502` with the code
+`crm_copilot_empty_answer`). The module writes nothing to any CRM row, by construction.
+
+**Proof.** `cargo test -p omnion-module-crm` → **146 passed** (139 before; 7 new for the timestamp
+round trip, plus the copilot's 7 in the previous commit). `cargo test -p omnion-api --test crm`
+against `omnion_w4_gate` → **35 passed, 0 failed** (29 of them the slice-1-3 walks, re-proved; 6 the
+slice-4 walks, running for the first time). `pnpm typecheck` → 2/2 packages, 0 errors.
+
+**Next.** The copilot's two endpoints (`POST /api/v1/crm/copilot/summarize` and `/follow-up`,
+`crm.copilot.use`, each audited) — the module is in and the route is not — then the global-search
+registration (REQ-002) and the `form.submitted` consumer. The **w4 QA browser pass still has not run
+this tick** (`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`);
+it is the last gate for closing REQ-051, and `/mnt/apopic` was back at 97% with other writers
+compiling when the tick ended.
+
+**Environment note.** `/mnt/apopic` is shared by seven writers and the mount sat at 97-98% for most
+of this tick (1.5-3.0 GB free). `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2` and deleting this
+worktree's own `target/debug/incremental` (46 MB) kept it workable; the seven `target/` directories
+still total over 27 GB on a 60 GB mount, and a shared `CARGO_TARGET_DIR` remains the permanent fix.
