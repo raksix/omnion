@@ -2996,3 +2996,38 @@ metric families give it a contract to import against.
   eight are dead today, which is the same "provable but unreachable" finding in a different
   table. Then the `observability.read`-cannot-write `403` line, and the REQ's close gate
   (`cargo test --workspace`, `pnpm build`, the private-stack walkthrough).
+
+### REQ-126 · slice 4c · the Events block — seven of eight events were documented and dead
+
+- **What.** `crates/telemetry/src/events.rs` (new) owns the eight names the request's **Events**
+  block documents, in one `DOCUMENTED` table, and builds each payload from a struct that has no
+  field a log line or a secret could travel through. `PassReport` now carries the alert
+  transitions instead of only counting them, so `alert_loop` emits `alert.fired` /
+  `.resolved`; the flush loop emits `exporter.degraded` / `.recovered` when the chip moves;
+  the settings and silence handlers emit `sampling.changed`, `log_level.changed` and
+  `silence.created`. `retention::PRUNED_EVENT` became an alias of the shared constant, so the
+  eight names have one home instead of two that can disagree.
+- **Why this tick.** The Events block was the last block this REQ documents that the code did
+  not do, and it had the same shape as slice 3's un-called `Collector::push` and slice 4's
+  un-called `store::prune`: **a documented thing with no caller.** Three times on one request is
+  a procedure, not an incident, so the fix is a pair of tests that hold the table from both
+  sides rather than a re-read of the document.
+- **Proof.** `omnion-telemetry` **160/160**; `apps/api/tests/observability_events.rs` **6/6**
+  against `omnion_w6_dev`; the six sibling walks unchanged — `observability_alerts` 8/8,
+  `observability_retention` 7/7, `exporter_flush` 5/5, `observability_metrics` 11/11,
+  `observability_traces` 8/8, `observability_logs` 3/3; `pnpm typecheck` 2/2.
+- **Two defects the first version of the work had, both found by its own tests.** (1) The
+  "does every constant have a caller" test grepped the event NAME, which no caller writes — they
+  write the constant's identifier, which is the whole point of having constants. It failed for
+  the right reason on the day it was written and would have **passed against a fully dead name**
+  had the constants been inlined: a test of this kind that cannot find a caller is worse than no
+  test. It now greps the identifier, and across `apps/api/src` too, because three of the eight
+  are emitted from a route handler. (2) The alert payload's key-set allowlist was written from
+  memory and omitted `rule` — the very first field the request names — so the assertion was
+  checking a contract I had not written down rather than the one I had implemented.
+- **A type that could not lie.** `PassReport` lost its `Eq` derive. It now carries a measured
+  `f64` in each transition, and `Eq` on a float is a claim about precision the type cannot make
+  (NaN is not equal to itself). The derive was the thing that had to go, not the measurement.
+- **Next.** The bundle import check and the shipped rule's fire-through-a-real-outage walk (both
+  need a Prometheus in the QA stack), then the `observability.read`-cannot-write line, then the
+  close gate: `cargo test --workspace`, `pnpm build`, and the private-stack walkthrough.
