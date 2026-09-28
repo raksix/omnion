@@ -3844,6 +3844,21 @@ async function runBlockEditorDepth(page, report) {
   const steps = {};
   const note = (action) => record({ page: "page-editor-depth", action });
 
+  // One reader for the status bar, and it never throws.
+  //
+  // A bare `locator().getAttribute(...)` has NO timeout of its own: Playwright's default is
+  // 30 seconds, then it throws a TimeoutError that is not caught anywhere, and the run dies
+  // with a `summary.json` holding nothing but `{"fatal": …}`. That is not a failed assertion —
+  // it is the loss of the entire pass, forty minutes in, including every screen that came
+  // before. A value that may be absent is read through this, so an absent one is `null` and
+  // the step records "the bar was not there" instead of ending the run.
+  const blockStatus = async (name) =>
+    page
+      .locator("[data-block-status]")
+      .first()
+      .getAttribute(name, { timeout: 5000 })
+      .catch(() => null);
+
   // ---- A page to edit -----------------------------------------------------------------------
   await page.goto(`${URL_ADMIN}/pages`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForSelector("[data-page-new]", { timeout: 20000 }).catch(() => {});
@@ -3945,9 +3960,9 @@ async function runBlockEditorDepth(page, report) {
   steps.statusLine = (await page.locator("[data-block-status]").innerText().catch(() => ""))
     .replace(/\s+/g, " ")
     .trim();
-  steps.blockCount = await page.locator("[data-block-status]").getAttribute("data-block-count");
-  steps.errors = await page.locator("[data-block-status]").getAttribute("data-block-errors");
-  steps.warnings = await page.locator("[data-block-status]").getAttribute("data-block-warnings");
+  steps.blockCount = await blockStatus("data-block-count");
+  steps.errors = await blockStatus("data-block-errors");
+  steps.warnings = await blockStatus("data-block-warnings");
   note("read the validation summary");
 
   // An image with no alternative text is the blocking case the REQ names; the publish button
@@ -3989,7 +4004,7 @@ async function runBlockEditorDepth(page, report) {
   await altField.fill("A screenshot of the QA walkthrough").catch(() => {});
   await page.waitForTimeout(1000);
   steps.clearedAfterFix =
-    (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0";
+    (await blockStatus("data-block-errors")) === "0";
   steps.publishEnabledAfterFix = !(await page.locator("[data-block-publish]").isDisabled());
   note("fixed the blocking issue in the field");
 
@@ -4086,7 +4101,7 @@ async function runBlockEditorDepth(page, report) {
   steps.columnCountGrew = Number(steps.columnCountAfterAdd) === Number(steps.columnCount) + 1;
   steps.columnsStillValid = (await page.locator("[data-block-columns] [data-block-column]").count())
     === Number(steps.columnCountAfterAdd);
-  steps.noColumnErrors = (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0";
+  steps.noColumnErrors = (await blockStatus("data-block-errors")) === "0";
   await shot(page, "page-block-editor-columns-three");
   note("built a nested columns layout");
 
@@ -4415,15 +4430,49 @@ async function runBlockEditorDepth(page, report) {
     // the author hid from phones is ABSENT, not invisible.
     await page.locator("[data-block-preview-viewport=mobile]").first().click({ timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(2000);
-    steps.previewPhoneActive =
-      (await page.locator("[data-block-preview-frame]").getAttribute("data-block-preview-viewport-active")) === "mobile";
-    steps.previewPhoneBlocks = await page.locator("[data-block-preview-frame] [data-block-canvas-block]").count();
+    // Every read on this frame is `.catch()`-guarded AND timeout-bounded. A bare
+    // `getAttribute` waits the full 30s and then throws a TimeoutError that aborts the whole
+    // pass — after the report would have been written — and the run is lost with no summary at
+    // all. The frame is a *secondary* screen reached by a link, so its absence is a fact to
+    // record, never a reason to end the run.
+    const frameAttr = async (name) =>
+      page
+        .locator("[data-block-preview-frame]")
+        .first()
+        .getAttribute(name, { timeout: 5000 })
+        .catch(() => null);
+    // The two counts are printed by the STATUS element, not the frame — the frame carries only
+    // which viewport is active. Reading them off the frame (the obvious simplification) returns
+    // null and turns a passing assertion into a silent one, so the selector is per-element.
+    const statusAttr = async (name) =>
+      page
+        .locator("[data-block-preview-status]")
+        .first()
+        .getAttribute(name, { timeout: 5000 })
+        .catch(() => null);
+    // The live-pass guard is the same shape: the frame's save must NOT move the published
+    // revision, and reading that number is the assertion. Unguarded, a missing banner hangs
+    // 30s and then throws — the exact failure that cost this pass its entire summary.
+    const previewStatus = statusAttr;
+    const previewBanner = async (name) =>
+      page
+        .locator("[data-block-preview-banner]")
+        .first()
+        .getAttribute(name, { timeout: 5000 })
+        .catch(() => null);
+    steps.previewPhoneActive = (await frameAttr("data-block-preview-viewport-active")) === "mobile";
+    steps.previewPhoneBlocks = await page
+      .locator("[data-block-preview-frame] [data-block-canvas-block]")
+      .count()
+      .catch(() => 0);
     steps.previewPhoneNarrower = await page
       .locator("[data-block-preview-frame]")
-      .evaluate((node) => node.getBoundingClientRect().width);
+      .first()
+      .evaluate((node) => node.getBoundingClientRect().width, { timeout: 5000 })
+      .catch(() => null);
     steps.previewCounts = {
-      block: await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-block-count"),
-      visible: await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-visible-count"),
+      block: await statusAttr("data-block-preview-block-count"),
+      visible: await statusAttr("data-block-preview-visible-count"),
     };
     await shot(page, "page-block-preview-phone");
     await page.locator("[data-block-preview-viewport=desktop]").first().click({ timeout: 8000 }).catch(() => {});
@@ -4445,7 +4494,7 @@ async function runBlockEditorDepth(page, report) {
       await page.waitForTimeout(700);
     }
     steps.previewDirtyAfterTyping =
-      (await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-dirty")) === "true";
+      (await previewStatus("data-block-preview-dirty")) === "true";
     steps.previewSaveEnabled = !(await page.locator("[data-block-preview-save]").isDisabled());
     await shot(page, "page-block-preview-editing");
 
@@ -4467,9 +4516,9 @@ async function runBlockEditorDepth(page, report) {
       .catch(() => null);
     steps.previewRevisionAdvanced = Number(afterSaveNo) > beforeSaveNo;
     steps.previewLiveUnchanged =
-      (await page.locator("[data-block-preview-banner]").getAttribute("data-block-preview-live")) === liveNo;
+      (await previewBanner("data-block-preview-live")) === liveNo;
     steps.previewCleanAfterSave =
-      (await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-dirty")) === "false";
+      (await previewStatus("data-block-preview-dirty")) === "false";
     await shot(page, "page-block-preview-saved");
     note("typed in the frame and saved a draft revision");
   }
