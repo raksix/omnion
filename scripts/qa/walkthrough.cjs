@@ -945,7 +945,17 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "image");
   await page.waitForTimeout(1200);
   const imageRows = await page.locator("tbody tr").count();
-  const footer = await page.locator("text=/Showing \\d+ of \\d+/").first().textContent();
+  // Every other read on this screen is best-effort, and this one was not: an unguarded
+  // `textContent()` waits the full 30s for a footer that a build under load renders late
+  // or not at all, and the timeout escapes as a **fatal** that kills the whole pass — an
+  // hour of other writers' screens thrown away by a counting that was a nicety, not a
+  // criterion. A pass that dies takes every screen after it unvisited, so a read here is
+  // a number when the footer is there and a note when it is not.
+  const footer = await page
+    .locator("text=/Showing \\d+ of \\d+/")
+    .first()
+    .textContent({ timeout: 4000 })
+    .catch(() => null);
   note({ step: "filter-kind", imageRows, footer });
   await shot(page, "media-filtered");
   await page.selectOption("#media-kind", "");
