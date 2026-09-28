@@ -118,9 +118,9 @@ meant for external consumers; the graph events exist so audit and the notificati
 ### Acceptance criteria
 
 - [x] The builder route, palette, canvas, inspector and problems panel render at `/workflows/[id]/builder` and appear in the QA walkthrough inventory. — slice 1: `WorkflowBuilder` at `/workflows/[id]/builder`; `runWorkflowBuilderDepth` opens a real rule's builder and records `panes` (all four true), `paletteNodes` and `canvasNodes`.
-- [ ] A node can be added from the palette by drag, by click and from the keyboard; it lands at the viewport centre and is selected immediately. — slice 2: click-add and the viewport-centre landing were already true; **the keyboard route is still open** (the palette's items are not yet focusable buttons bound to Enter).
-- [ ] Nodes move by mouse and by arrow keys, multi-select works (marquee, `Shift+click`, `⌘A`) and a group move keeps edges attached. — slice 2 has the marquee (overlap test, `Shift`-additive) and the arrow-key nudge of a whole selection, each as one undoable step. **Not ticked:** `⌘A` and `Shift+click` on a card are not wired, and a criterion is met or it is not.
-- [ ] A connection can be drawn between compatible ports; an incompatible target refuses with a visible reason; `Del` on a selected edge removes it.
+- [ ] A node can be added from the palette by drag, by click and from the keyboard; it lands at the viewport centre and is selected immediately. — click-add and the viewport-centre landing are proven in the browser; the keyboard route is now built (`⌘P` → arrows → `Enter`, roving focus by `[data-palette-node]`) but unproven until a pass watches it. **Not ticked: palette *drag*-and-drop is still not implemented** — this criterion asks for three routes and two of them exist.
+- [ ] Nodes move by mouse and by arrow keys, multi-select works (marquee, `Shift+click`, `⌘A`) and a group move keeps edges attached. — slice 2 has the marquee, the arrow-key nudge of a whole selection, `Shift+click` (additive, toggling) and `⌘A`, each as one undoable step. The walkthrough now measures the two new ones by counting outlined cards; unproven until a pass reports them.
+- [ ] A connection can be drawn between compatible ports; an incompatible target refuses with a visible reason; `Del` on a selected edge removes it. — `Del` on a selected edge is now built and undoable (`removeEdge` routes through `commit`, which it did not before this tick), and the pass checks the deletion *and* its undo against the server's `edge_count`. **Not ticked: the incompatible-target refusal with a visible reason is still open.**
 - [ ] Validation finds each error class (cycle, two triggers, orphan, missing input, duplicate edge) naming the node involved, and a clean graph reports "No problems".
 - [ ] Undo/redo restores add, move, connect, delete and parameter edits at least 50 steps deep, and `⌘S` during a pending autosave does not write twice.
 - [ ] Two tabs on one workflow: the second save answers `409` and the UI offers Reload while keeping the local copy visible instead of overwriting silently.
@@ -165,14 +165,19 @@ the problems panel not covering the last row of the graph.
    check rather than by the browser pass, and Table-mode parity (`/workflows/[id]`'s own tab)
    lands with slice 2 — the existing linear editor is reachable from the builder's toolbar.
 
-   **In flight 2026-09-28** (`c88273a`, `3739414`). `builder-history.ts` is a snapshot history
-   with a coalescing window, so a drag, a re-type and a three-node delete are each one press;
-   wired to the toolbar (Undo/Redo/Duplicate/Copy/Paste/Auto layout/Minimap), to
+   **In flight 2026-09-28** (`c88273a`, `3739414`, `bc48938`). `builder-history.ts` is a snapshot
+   history with a coalescing window, so a drag, a re-type and a three-node delete are each one
+   press; wired to the toolbar (Undo/Redo/Duplicate/Copy/Paste/Auto layout/Minimap), to
    Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y / Ctrl+C / Ctrl+V / Ctrl+D / Escape, and to a marquee that
-   moves a whole selection. 12 unit tests on the history; `pnpm typecheck` clean. **Still open
-   in this slice:** the browser pass (queued behind a sibling's live slot), `⌘A` and
-   `Shift+click`, palette keyboard-add, edge selection and `Del`, and the expression
-   autocomplete the inspector does not have yet.
+   moves a whole selection. `bc48938` closed the four gaps that were named as open: `⌘A`,
+   `Shift+click`, edge selection with `Del` (now routed through `commit`, so an edge delete is
+   undoable like every other change) and the palette keyboard route. 12 unit tests on the
+   history; `pnpm typecheck` clean; `cargo check -p omnion-api --all-targets` clean.
+   **Still open in this slice:** the browser pass, which is what the four new gestures need —
+   a pass must watch `⌘A` highlight, `Shift+click` reach two cards, the palette add by keyboard
+   and the edge delete fall in the server's `edge_count`. Then palette *drag*-and-drop, the
+   incompatible-target refusal with a visible reason, and the expression autocomplete the
+   inspector does not have yet.
 2. **Interaction depth** — palette drag/click/keyboard, marquee and multi-move, snap and alignment, undo/redo, copy/paste, duplicate, delete, minimap, fit, auto-layout, inspector forms with expression autocomplete, problems panel with jump links.
    *Done when:* the keyboard-only acceptance pass works and undo/redo survives a reload of a saved graph.
 3. **Run integration** — node status on the canvas, node↔step mapping, run-from-here, retry-this-node, trace deep links, batched progress event, audit entry.
