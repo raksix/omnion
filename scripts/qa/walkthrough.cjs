@@ -868,24 +868,6 @@ async function interact(page, pageName, report) {
     // ended the window before the 400 ever reached `netFailures`. Measured against the real
     // panel, the refusal lands at ~230 ms; the wait is generous because the box is shared and a
     // slow dev server answering a small POST is normal, not a defect.
-    if (submitsAForm) {
-      await page.waitForTimeout(2500);
-      endRefusalWindow("/api/v1/");
-      // Record what the window actually covered. A registration that opens and closes over
-      // nothing is a registration that will not excuse anything, and the report then files the
-      // pass's own refusal as a defect with no way to tell the two apart. One line in the
-      // artifact is the difference between "the pass provoked a 400 it did not claim" and "the
-      // pass's window was already closed before the response arrived".
-      record({
-        page: pageName,
-        i,
-        action: "submit-window",
-        outcome: netFailures.length > netAtOpen ? "covered" : "empty",
-        covered: netFailures.length - netAtOpen,
-        statuses: netFailures.slice(netAtOpen).map((n) => n.status || "net"),
-      });
-    }
-
     const after = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     let outcome = "ok";
     if (clickError) {
@@ -918,6 +900,24 @@ async function interact(page, pageName, report) {
       ms: Date.now() - started,
     };
     record(entry);
+
+    // The window closes **after** the click has been judged, not before. The refusal reaches
+    // `netFailures` asynchronously — the browser dispatches the POST and the click promise
+    // resolves independently of the response — so closing the window the moment the click settled
+    // raced the response and left the window covering nothing. `submit-window` exists to make
+    // that visible instead of letting it show up later as an unexplained high finding.
+    if (submitsAForm) {
+      await page.waitForTimeout(2000);
+      endRefusalWindow("/api/v1/");
+      record({
+        page: pageName,
+        i,
+        action: "submit-window",
+        outcome: netFailures.length > netAtOpen ? "covered" : "empty",
+        covered: netFailures.length - netAtOpen,
+        statuses: netFailures.slice(netAtOpen).map((n) => n.status || "net"),
+      });
+    }
 
     // Anything that deserves eyes: navigation, dialogs, errors, popups.
     if (["navigated", "dialog", "console-error", "request-failed", "popup", "click-error"].includes(outcome)) {
