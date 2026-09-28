@@ -431,6 +431,31 @@ const DEFAULT_SECRETS_POLL_MS: u64 = 2_000;
 /// Default versions per re-wrap batch — a write window a redemption can queue behind.
 const DEFAULT_SECRETS_REWRAP_BATCH: usize = 25;
 
+/// The telemetry exporter loop (docs/requests/REQ-126).
+///
+/// The loop is the half of the exporter pipeline that MOVES data: it drains each configured
+/// exporter's bounded buffer on that row's `batch_ms` and sends it. It is a flag rather than a
+/// constant because an operator who wants telemetry to stop leaving the instance should be able
+/// to say so in the deployment rather than deleting every exporter row — the rows are the
+/// configuration, and the switch is the temporary decision.
+///
+/// Note what the flag does NOT control: the fan-out. Turning the loop off stops sending; the
+/// request path still fills the buffers, and their drop counter still rises, which is exactly
+/// what an operator wants to see before turning it back on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    /// Whether this process drains exporter buffers (`OMNION_EXPORTER_FLUSH`).
+    pub exporter_flush_enabled: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            exporter_flush_enabled: true,
+        }
+    }
+}
+
 /// Analytics collection and rollup knobs (docs/requests/REQ-007).
 ///
 /// The rollup worker of `apps/api` reads these: it rebuilds the recent hourly and daily buckets
@@ -560,6 +585,8 @@ pub struct Config {
     pub secrets: SecretsConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
+    /// The telemetry exporter flush loop (REQ-126).
+    pub telemetry: TelemetryConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -726,6 +753,10 @@ impl Config {
             rewrap_batch: read_count(&read, "OMNION_SECRETS_REWRAP", DEFAULT_SECRETS_REWRAP_BATCH)?,
         };
 
+        let telemetry = TelemetryConfig {
+            exporter_flush_enabled: read_flag(&read, "OMNION_EXPORTER_FLUSH", true)?,
+        };
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -758,6 +789,7 @@ impl Config {
             automation,
             search,
             analytics,
+            telemetry,
             mail,
             log,
         };
@@ -797,6 +829,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             secrets: SecretsConfig::default(),
             analytics: AnalyticsConfig::default(),
+            telemetry: TelemetryConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
@@ -1091,6 +1124,26 @@ mod tests {
         let error = config_from(&[("OMNION_EVENTS_RUNNER", "maybe")])
             .expect_err("an unknown boolean is refused");
         assert_eq!(error.key, "OMNION_EVENTS_RUNNER");
+    }
+
+    #[test]
+    fn the_exporter_flush_loop_runs_by_default_and_can_be_switched_off() {
+        // The loop is ON by default: an exporter row an operator configured should start working
+        // without a second environment change, and "telemetry is configured but nothing arrives"
+        // is the failure the request names. The switch exists for the opposite decision — stop
+        // sending, keep the rows — and it must parse strictly, like every other boolean here, so a
+        // typo in a compose file is an error at boot rather than a loop that silently keeps going.
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.telemetry.exporter_flush_enabled);
+
+        let off = config_from(&[("OMNION_EXPORTER_FLUSH", "false")]).expect("the switch loads");
+        assert!(!off.telemetry.exporter_flush_enabled);
+
+        // "yes" is deliberately NOT the fixture: the platform's boolean reader accepts it, so a
+        // test that used it would assert the opposite of what it claims to check.
+        let error = config_from(&[("OMNION_EXPORTER_FLUSH", "maybe")])
+            .expect_err("an unknown boolean is refused");
+        assert_eq!(error.key, "OMNION_EXPORTER_FLUSH");
     }
 
     #[test]

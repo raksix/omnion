@@ -328,6 +328,19 @@ pub const FAMILIES: &[FamilySpec] = &[
         max_series: 20,
         bounded_labels: true,
     },
+    // The flush counter, added with the loop that records it. A drop counter with no flush
+    // counter cannot answer the question an operator actually has when a buffer is full: is the
+    // exporter broken, or is the drain broken? Dropped-but-never-flushed means the second.
+    FamilySpec {
+        name: "omnion_exporter_batches_flushed_total",
+        kind: MetricKind::Counter,
+        unit: "1",
+        description: "Telemetry batches a flush loop handed to a backend and the backend accepted.",
+        labels: &["kind"],
+        source: "core",
+        max_series: 8,
+        bounded_labels: true,
+    },
     FamilySpec {
         name: "omnion_registry_budget_exceeded",
         kind: MetricKind::Counter,

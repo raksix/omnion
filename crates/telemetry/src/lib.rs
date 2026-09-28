@@ -18,6 +18,10 @@
 //!   process can record rather than what someone remembered to write down.
 //! * [`store`] — the bounded store. The explorer reads it and nothing else; a request path never
 //!   blocks on it.
+//! * [`exporter_flush`] — the part of the exporter pipeline that actually MOVES telemetry: the
+//!   fan-out that feeds the buffers and the loop that drains them. It lives beside
+//!   [`exporter`] rather than in the API binary because the drain is worth testing without a
+//!   database and the fan-out is worth testing without a request.
 //!
 //! ## Why a separate crate and not a module in `omnion-core`
 //!
@@ -30,6 +34,7 @@
 pub mod context;
 pub mod error;
 pub mod exporter;
+pub mod exporter_flush;
 pub mod metric_catalog;
 pub mod metrics;
 pub mod redact;
@@ -44,6 +49,7 @@ pub use error::TelemetryError;
 pub use exporter::{
     Batch, Collector as ExporterCollector, ExporterHealth, ExporterKind, FlushOutcome,
 };
+pub use exporter_flush::{batch_body, fan_out};
 pub use metric_catalog::FamilyDeclaration;
 pub use metrics::{FamilySpec, MetricKind, Registry, global as metrics_registry};
 pub use redact::{REDACTED, redact_fields, redact_text};

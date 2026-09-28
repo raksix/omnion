@@ -256,6 +256,16 @@ pub async fn request_context(
     // that does not depend on the store being writable.
     if let Err(error) = omnion_telemetry::store::write(&state_for_line.db().pool(), &entry).await {
         eprintln!("omnion-api: the request line could not be stored: {error}");
+    } else {
+        // The exporter fan-out (REQ-126 slice 3's remaining half). It runs ONLY when the row was
+        // written: a payload the local store rejected would otherwise still be shipped to a
+        // backend, which means the exporter's copy and the explorer's copy disagree about which
+        // lines exist. The fan-out is a ring push per configured exporter and cannot fail a
+        // request — that is the whole contract of the buffer.
+        let _ = omnion_telemetry::exporter_flush::fan_out(
+            omnion_telemetry::exporter::global(),
+            serde_json::to_value(&entry).unwrap_or(serde_json::Value::Null),
+        );
     }
 
     // The trace is written LAST, after the log line, so a trace that is searchable always has its

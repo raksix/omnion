@@ -143,6 +143,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the secret re-wrap runner is disabled (OMNION_SECRETS_RUNNER=false)");
     }
 
+    // The exporter flush loop (REQ-126, slice 3). It drains each configured exporter's bounded
+    // buffer on that row's `batch_ms` and folds the drop counter and the health chip back into
+    // the row. Spawned, never awaited: a backend that is unreachable must not be able to keep
+    // the API from serving traffic, and every failure inside a sweep is logged and the next
+    // sweep runs anyway.
+    if state.config().telemetry.exporter_flush_enabled {
+        let _flush = omnion_telemetry::exporter_flush::run(db.pool().clone());
+    } else {
+        tracing::info!("the exporter flush loop is disabled (OMNION_EXPORTER_FLUSH=false)");
+    }
+
     let app = routes::router(state);
     axum::serve(
         listener,
