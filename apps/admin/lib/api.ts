@@ -4799,3 +4799,199 @@ export function releaseMediaQuarantine(
     { method: "POST", body: JSON.stringify({ reason }) },
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The visual workflow builder (REQ-004)
+// ---------------------------------------------------------------------------------------------
+
+/** One output port of a node type. */
+export interface GraphPort {
+  /** What an edge's `source_port` refers to. */
+  key: string;
+  /** What leaving through this port means. */
+  label: string;
+  /** `true` when leaving here ends the run. */
+  terminal: boolean;
+}
+
+/** One field of a node's parameter form. */
+export interface GraphParamField {
+  /** Key in the node's `params`. */
+  key: string;
+  /** Label above the input. */
+  label: string;
+  /** `text`, `textarea`, `number`, `select` or `boolean`. */
+  kind: string;
+  /** `true` when the node is refused without it. */
+  required: boolean;
+  /** The legal values of a `select`. */
+  options: string[];
+  /** Help text under the input. */
+  help: string;
+}
+
+/** One node type the palette offers. */
+export interface GraphNodeType {
+  /** Registry key, stored on a node as `type`. */
+  key: string;
+  /** What the palette calls it. */
+  label: string;
+  /** Which rail group it sits in. */
+  category: string;
+  /** One line under the card. */
+  summary: string;
+  /** Output ports, in draw order. */
+  outputs: GraphPort[];
+  /** The parameter fields the inspector draws. */
+  params: GraphParamField[];
+  /** `true` when the engine never runs it. */
+  inert: boolean;
+  /** The parameters a freshly dropped card starts with. */
+  defaults: Record<string, unknown>;
+}
+
+/** The palette's whole registry. */
+export interface GraphNodeTypes {
+  /** Every node type, in rail order. */
+  node_types: GraphNodeType[];
+  /** The rail's groups, in draw order. */
+  categories: string[];
+}
+
+/** One node of a graph. */
+export interface GraphNode {
+  /** Stable id within the graph. */
+  id: string;
+  /** The registry key. */
+  type: string;
+  /** What the canvas draws on the card. */
+  label: string;
+  /** The node's parameters. */
+  params: Record<string, unknown>;
+  /** Where it sits. */
+  position: { x: number; y: number };
+}
+
+/** One connection between two nodes. */
+export interface GraphEdge {
+  /** Stable id within the graph. */
+  id: string;
+  /** Node the edge leaves. */
+  source: string;
+  /** Output port it leaves from. */
+  source_port: string;
+  /** Node it arrives at. */
+  target: string;
+}
+
+/** One thing validation has to say about a graph. */
+export interface GraphFinding {
+  /** `error` or `warning`. */
+  severity: "error" | "warning";
+  /** Stable machine-readable code. */
+  code: string;
+  /** Human-readable explanation, naming the node. */
+  message: string;
+  /** The node the finding is about, when there is one. */
+  node_id: string | null;
+  /** The other end of a two-node finding. */
+  related_node_id: string | null;
+}
+
+/** What a validation answers. */
+export interface GraphValidation {
+  /** `true` when nothing is an error. */
+  valid: boolean;
+  /** Every finding. */
+  findings: GraphFinding[];
+  /** How many are errors. */
+  error_count: number;
+  /** How many are warnings. */
+  warning_count: number;
+}
+
+/** A definition as the builder reads it. */
+export interface WorkflowGraph {
+  /** The rule's id. */
+  id: string;
+  /** The nodes and the connections between them. */
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+  /** Positions, viewport and collapsed groups. */
+  ui_state: Record<string, unknown>;
+  /** The version a save must quote. */
+  graph_version: number;
+  /** When the definition was last validated. */
+  validated_at: string | null;
+  /** The first validation error, when there was one. */
+  validation_error: string | null;
+  /** The step list the projection derived. */
+  steps: unknown[];
+  /** How many nodes the canvas draws. */
+  node_count: number;
+  /** How many connections the canvas draws. */
+  edge_count: number;
+  /** What the author would see if they pressed Run now. */
+  projection: { valid: boolean; step_count: number; reason: string | null };
+}
+
+/** The node-type registry the palette draws. */
+export function fetchGraphNodeTypes(): Promise<GraphNodeTypes> {
+  return request<GraphNodeTypes>("/api/v1/workflows/node-types");
+}
+
+/** One rule's graph, layout, version and projection. */
+export function fetchWorkflowGraph(workflowId: string): Promise<WorkflowGraph> {
+  return request<WorkflowGraph>(`/api/v1/workflows/${workflowId}/graph`);
+}
+
+/**
+ * Replace a rule's graph.
+ *
+ * `graphVersion` is the version the editor loaded. A mismatch is a `409`, and the caller
+ * keeps its local copy on screen rather than reloading over the author's work.
+ */
+export function saveWorkflowGraph(
+  workflowId: string,
+  input: {
+    graph: WorkflowGraph["graph"];
+    ui_state?: Record<string, unknown> | null;
+    graph_version: number;
+  },
+): Promise<WorkflowGraph> {
+  return request<WorkflowGraph>(`/api/v1/workflows/${workflowId}/graph`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Save only the layout.
+ *
+ * Positions are not semantics: this bumps neither the version nor the step list, so panning
+ * the canvas all afternoon never invalidates a colleague's edit.
+ */
+export function saveWorkflowUiState(
+  workflowId: string,
+  uiState: Record<string, unknown>,
+): Promise<null> {
+  return request<null>(`/api/v1/workflows/${workflowId}/graph/ui-state`, {
+    method: "PUT",
+    body: JSON.stringify({ ui_state: uiState }),
+  });
+}
+
+/**
+ * Validate a graph, stored or not.
+ *
+ * A body validates what the editor is holding without storing it; no body validates the
+ * stored graph, which is what the toolbar's Validate button sends.
+ */
+export function validateWorkflowGraph(
+  workflowId: string,
+  graph?: WorkflowGraph["graph"],
+): Promise<GraphValidation> {
+  return request<GraphValidation>(`/api/v1/workflows/${workflowId}/validate`, {
+    method: "POST",
+    body: JSON.stringify(graph ? { graph, graph_version: 0 } : {}),
+  });
+}
