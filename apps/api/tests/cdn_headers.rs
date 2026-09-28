@@ -43,8 +43,10 @@ const PASSWORD: &str = "correct horse battery";
 /// The keys the administrator of this suite holds: the CDN surface under test, plus the
 /// content keys the fixture needs in order to publish the page the public surface serves.
 /// Without the second group there is nothing published to ask for, and the suite would
-/// measure an empty site rather than a cache.
-const ADMIN_PERMISSIONS: [&str; 8] = [
+/// measure an empty site rather than a cache. `media.upload` is here for the same reason
+/// one layer down: the media walks need a file that really is in storage, because a row
+/// whose bytes are missing exercises the storage error path rather than the cache path.
+const ADMIN_PERMISSIONS: [&str; 9] = [
     "cdn.read",
     "cdn.manage",
     "cdn.purge",
@@ -53,6 +55,7 @@ const ADMIN_PERMISSIONS: [&str; 8] = [
     "content.pages.update",
     "content.pages.publish",
     "content.pages.delete",
+    "media.upload",
 ];
 
 /// One response, in the pieces the header assertions need.
@@ -130,6 +133,60 @@ fn public_get(uri: &str, extra: &[(&str, &str)]) -> Request<Body> {
     }
     builder.body(Body::empty()).expect("request must build")
 }
+
+/// The boundary the media walks' upload bodies are written with.
+///
+/// Spelled once rather than interpolated at each call site: two different constants in two
+/// different builders produce a body the parser accepts and then finds no part in, which
+/// reads as "the route ignored my file" rather than as a test bug.
+const BOUNDARY: &str = "omnion-cdn-headers-boundary";
+
+/// Build a `multipart/form-data` body carrying one `file` part.
+///
+/// Written out in full rather than assembled from `public_get`: the closing boundary is
+/// part of the body, and a part appended after it is not a part at all — a silent no-op
+/// that shows up as a `400 media.empty_file` in a test about caching.
+fn multipart_body(filename: &str, content_type: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 256);
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// A `POST /api/v1/media?site_id=…` carrying one file.
+fn upload_request(
+    uri: &str,
+    token: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::COOKIE, format!("omnion_session={token}"))
+        .body(Body::from(multipart_body(filename, content_type, bytes)))
+        .expect("request must build")
+}
+
+/// A one-pixel PNG: small enough to store twice, real enough that the probe reads it.
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
 
 fn test_storage() -> omnion_storage::Storage {
     omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
@@ -304,6 +361,61 @@ impl Fixture {
             ),
         )
         .await
+    }
+
+    /// Upload one file through the real route and return its id.
+    ///
+    /// The bytes go through the real storage driver rather than being inserted as a row,
+    /// because a `media` row whose object is not in storage is a `500` from the storage
+    /// layer — and a test that asserts on a 500 is not a test of the cache. The upload
+    /// leaves the row in `scan_status = 'pending'`; `mark_clean` is called separately so
+    /// the walk can say why it needs the row marked.
+    async fn upload(&self, filename: &str, bytes: &[u8]) -> Uuid {
+        let response = call(
+            &self.state,
+            upload_request(
+                &format!("/api/v1/media?site_id={}", self.site),
+                &self.token,
+                filename,
+                "image/png",
+                bytes,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "the file must upload: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: Value = serde_json::from_slice(&response.body).expect("the media body is JSON");
+        body["id"]
+            .as_str()
+            .expect("the media body carries an id")
+            .parse()
+            .expect("an id is a uuid")
+    }
+
+    /// The public read of one file, with optional extra headers.
+    ///
+    /// A media file has no address of its own, so unlike the page there is no `?site=`
+    /// hint: the id names the row and the row names the site. That is also why a cache
+    /// rule for media has to be written against the API path.
+    async fn public_file(&self, media: Uuid, extra: &[(&str, &str)]) -> Response {
+        call(
+            &self.state,
+            public_get(&format!("/api/v1/public/media/{media}"), extra),
+        )
+        .await
+    }
+
+    /// Mark a file scanned, so the public surface will serve it.
+    async fn mark_clean(&self, media: Uuid) {
+        sqlx::query("update media set scan_status = 'clean' where id = $1")
+            .bind(media)
+            .execute(self.db.pool())
+            .await
+            .expect("the file must be markable");
     }
 
     async fn cleanup(self) {
@@ -803,5 +915,184 @@ async fn a_rule_whose_pattern_a_hand_edit_broke_does_not_take_the_page_down() {
         "one unreadable rule must not fail the page"
     );
     assert_eq!(response.header("cache-control"), Some("private, no-store"));
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Media
+//
+// The page walks above prove a validator on one route. A media file is a *different* route
+// with a different validator: it is derived from the checksum rather than the revision
+// number, it is addressed by an id rather than a slug, and it is matched against
+// `/api/v1/public/media/{id}` — a path nobody types, which is precisely why a rule for it
+// is easy to write wrong and worth proving rather than assuming.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_media_file_answers_a_conditional_read_with_304_and_the_same_validator() {
+    // The acceptance item the page walks left open. Two reads of one file must agree on the
+    // validator, and the second one — sent the first one's `ETag` — must be answered `304`
+    // with no body. A media handler that always sends `200` is not slower, it is a promise
+    // the CDN cannot keep: every visitor re-downloads a megabyte a day.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let media = fixture.upload("pixel.png", PNG).await;
+    fixture.mark_clean(media).await;
+
+    let first = fixture.public_file(media, &[]).await;
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "the file must be served: {}",
+        String::from_utf8_lossy(&first.body)
+    );
+    let etag = first
+        .header("etag")
+        .expect("a media response carries a validator")
+        .to_owned();
+
+    let second = fixture.public_file(media, &[("if-none-match", &etag)]).await;
+    assert_eq!(
+        second.status,
+        StatusCode::NOT_MODIFIED,
+        "a client holding this file's validator must get 304"
+    );
+    assert!(
+        second.body.is_empty(),
+        "a 304 carries no body, got {} bytes",
+        second.body.len()
+    );
+    assert_eq!(
+        second.header("etag"),
+        Some(etag.as_str()),
+        "the 304 must name the same validator the 200 did"
+    );
+    let declared: Option<usize> = second.header("content-length").and_then(|v| v.parse().ok());
+    assert_eq!(
+        declared.unwrap_or(0),
+        second.body.len(),
+        "the advertised length must describe the body that was actually sent"
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_cache_rule_written_for_the_media_path_changes_what_a_visitor_keeps() {
+    // The page route carries the slug, so a rule for it is something a person can type. A
+    // media file has no address at all, and the rule engine is given the API path. Getting
+    // that wrong fails *silently*: the rule is listed, enabled, and matched against nothing,
+    // and the only evidence is a browser that still refetches.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let media = fixture.upload("pixel.png", PNG).await;
+    fixture.mark_clean(media).await;
+
+    let before = fixture.public_file(media, &[]).await;
+    assert_eq!(
+        before.header("cache-control"),
+        Some("private, no-store"),
+        "a site with no rule keeps its files private"
+    );
+    assert_eq!(
+        before.header("cdn-cache-control"),
+        None,
+        "a private response offers the shared cache nothing at all"
+    );
+
+    fixture
+        .rule(json!({
+            "site_id": fixture.site,
+            "name": "public files",
+            "path_pattern": "/api/v1/public/media/**",
+            "edge_ttl_seconds": 3600,
+            "browser_ttl_seconds": 120,
+        }))
+        .await;
+
+    let after = fixture.public_file(media, &[]).await;
+    // The two TTLs land in two *different* headers, and reading the wrong one is the easy
+    // mistake here: `Cache-Control: max-age` is what a visitor's browser obeys, while the
+    // edge's own lifetime is `CDN-Cache-Control`. A rule that sets an hour at the edge and
+    // a minute in the browser is the ordinary configuration, so this asserts both — and
+    // their being different is the point, not an accident.
+    assert_eq!(
+        after.header("cache-control"),
+        Some("public, max-age=120"),
+        "the browser TTL is what Cache-Control carries"
+    );
+    assert_eq!(
+        after.header("cdn-cache-control"),
+        Some("public, max-age=3600"),
+        "the edge TTL is a separate header, not a longer Cache-Control"
+    );
+    assert_eq!(
+        after.body,
+        before.body,
+        "the rule changes the headers, never the bytes"
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_file_the_scanner_has_not_cleared_is_refused_before_any_cache_header() {
+    // The order of the two checks is the whole point. A file that may not be served must not
+    // first be given an `ETag` and a public TTL and *then* be refused: a refusal carrying a
+    // validator is a refusal an intermediary is entitled to remember, and a scan that
+    // finishes an hour later leaves the cached 403 sitting in front of it.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let media = fixture.upload("pixel.png", PNG).await;
+
+    // The upload leaves the row `pending` and no site has scanning switched on, so this is
+    // the ordinary state of a freshly uploaded file: served, but privately.
+    let response = fixture.public_file(media, &[]).await;
+    assert_eq!(response.status, StatusCode::OK, "scanning is off by default");
+    assert_eq!(response.header("cache-control"), Some("private, no-store"));
+
+    // Now a site that *has* asked for scanning, and a file nobody has looked at.
+    sqlx::query(
+        "insert into media_scan_settings (site_id, enabled) values ($1, true) \
+         on conflict (site_id) do update set enabled = true",
+    )
+    .bind(fixture.site)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the site's scanning switch must save");
+
+    // The rule exists *before* the refusal so the test is about the order of the two checks
+    // and not about there happening to be no rule: without it, "no cache header" would be
+    // true for a reason that has nothing to do with scanning.
+    fixture
+        .rule(json!({
+            "site_id": fixture.site,
+            "name": "public files",
+            "path_pattern": "/api/v1/public/media/**",
+        }))
+        .await;
+
+    let refused = fixture.public_file(media, &[]).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "an unscanned file on a scanning site is refused"
+    );
+    assert_eq!(
+        refused.header("etag"),
+        None,
+        "a refusal must not hand a validator to the cache"
+    );
+    assert_eq!(
+        refused.header("cache-control"),
+        None,
+        "a refusal must not be stored either: a cached 403 outlives the scan that caused it"
+    );
+    assert_eq!(
+        refused.header("cdn-cache-control"),
+        None,
+        "nor may the shared cache be offered the file at all"
+    );
     fixture.cleanup().await;
 }
