@@ -13,3 +13,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
+# The HTTP adapters (`generic_http`, `cloudflare_style`) make real calls: blocking so the
+# synchronous `Provider` trait stays synchronous, with the queue worker awaiting on
+# `spawn_blocking`.
+reqwest = { workspace = true, features = ["blocking", "json"] }

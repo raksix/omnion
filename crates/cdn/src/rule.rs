@@ -256,7 +256,9 @@ mod tests {
     use super::*;
 
     fn shape(path: &str, method: &str) -> RequestShape {
-        RequestShape::bare(path).with_method(method).with_host("site.test")
+        RequestShape::bare(path)
+            .with_method(method)
+            .with_host("site.test")
     }
 
     fn rule(name: &str, pattern: &str, edge: i32) -> CacheRule {
