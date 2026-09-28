@@ -9,6 +9,7 @@
 //! * [`error`] — what the API layer needs to tell apart: a refused field, a record that is not
 //!   there, a name that is taken, and a conflict with the immutability rules.
 //! * [`model`] — the shared vocabulary: statuses, units and the settings row.
+//! * [`dates`] — how a day and a timestamp cross the wire, in the two shapes a browser sends.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature the platform can carry behind the
 //! `sales.*` permission family, not infrastructure the core depends on. It talks to PostgreSQL
@@ -17,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod dates;
 pub mod error;
 pub mod model;
 pub mod money;

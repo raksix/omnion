@@ -116,6 +116,7 @@ pub mod notifications;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod sales;
 pub mod scim;
 pub mod search;
 pub mod sso;
@@ -1056,6 +1057,64 @@ pub fn router(state: AppState) -> Router {
         .merge(crm_deals_archive)
         .merge(crm_pipelines_manage);
 
+    // The sales surface (docs/requests/REQ-052, slice 1): the sellable catalog and the price
+    // lists. Four keys rather than two, and the split is the point: **a price list is a separate
+    // decision from a product**, because a price list is shared with everyone who quotes from it
+    // and a product is one item in a catalog. A role that may add a widget must not thereby be
+    // able to rewrite what the whole sales desk charges for everything.
+    //
+    // The price-resolution route sits on the *read* key deliberately: asking "what would this
+    // product cost at 100 units on this list" discloses nothing the catalog does not already
+    // show, and putting it behind a write key would mean the quote builder cannot prefill a
+    // price for a seller who is not allowed to change it — which is most of them.
+    let sales_products_read = Router::new()
+        .route("/sales/products", get(sales::list_products))
+        .route("/sales/products/vocabulary", get(sales::catalog_vocabulary))
+        .route("/sales/products/{id}", get(sales::get_product))
+        .route("/sales/products/{id}/price", get(sales::resolve_product_price))
+        .route_layer(guards::require(&state, "sales.products.read"));
+
+    let sales_products_manage = Router::new()
+        .route("/sales/products", post(sales::create_product))
+        .route("/sales/products/{id}", patch(sales::update_product))
+        .route("/sales/products/{id}", delete(sales::archive_product))
+        .route_layer(guards::require(&state, "sales.products.manage"));
+
+    let sales_pricelists_read = Router::new()
+        .route("/sales/pricelists", get(sales::list_price_lists))
+        .route("/sales/pricelists/{id}", get(sales::get_price_list))
+        .route_layer(guards::require(&state, "sales.pricelists.read"));
+
+    let sales_pricelists_manage = Router::new()
+        .route("/sales/pricelists", post(sales::create_price_list))
+        .route("/sales/pricelists/{id}", patch(sales::update_price_list))
+        .route("/sales/pricelists/{id}", delete(sales::archive_price_list))
+        .route(
+            "/sales/pricelists/{id}/items",
+            put(sales::replace_price_list_items),
+        )
+        .route_layer(guards::require(&state, "sales.pricelists.manage"));
+
+    // The settings row is read on the quote builder (every new quote's currency and validity come
+    // from it) and written on the settings screen. One path, two keys, split by method — the same
+    // treatment the CRM lead settings get, for the same reason: a screen that cannot read the
+    // defaults cannot build a quote, and a seller who can build quotes need not be able to change
+    // the approval threshold they are measured against.
+    let sales_settings_read = Router::new()
+        .route("/sales/settings", get(sales::get_settings))
+        .route_layer(guards::require(&state, "sales.quotes.create"));
+
+    let sales_settings_write = Router::new()
+        .route("/sales/settings", put(sales::update_settings))
+        .route_layer(guards::require(&state, "sales.quotes.send"));
+
+    let sales = sales_products_read
+        .merge(sales_products_manage)
+        .merge(sales_pricelists_read)
+        .merge(sales_pricelists_manage)
+        .merge(sales_settings_read)
+        .merge(sales_settings_write);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -1118,6 +1177,7 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_privacy)
         .merge(analytics_collect)
         .merge(crm)
+        .merge(sales)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),

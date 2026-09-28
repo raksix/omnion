@@ -68,10 +68,13 @@ pub struct ProductView {
     #[serde(flatten)]
     pub product: Product,
     /// When it was archived, if it was.
+    #[serde(with = "crate::dates::instant::option")]
     pub archived_at: Option<OffsetDateTime>,
     /// When the row was created.
+    #[serde(with = "crate::dates::instant")]
     pub created_at: OffsetDateTime,
     /// When the row last changed.
+    #[serde(with = "crate::dates::instant")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -89,14 +92,18 @@ pub struct PriceListView {
     /// Whether the list is offered to the builder.
     pub active: bool,
     /// First day the list may be used on.
+    #[serde(with = "crate::dates::option")]
     pub valid_from: Option<time::Date>,
     /// Last day the list may be used on.
+    #[serde(with = "crate::dates::option")]
     pub valid_until: Option<time::Date>,
     /// How many price rows it carries, joined — the editor shows it before the rows load.
     pub item_count: i64,
     /// When it was archived, if it was.
+    #[serde(with = "crate::dates::instant::option")]
     pub archived_at: Option<OffsetDateTime>,
     /// When the row was created.
+    #[serde(with = "crate::dates::instant")]
     pub created_at: OffsetDateTime,
 }
 
@@ -532,26 +539,22 @@ pub async fn list_products(
     let limit = query.page_size();
     let direction = if desc { "desc" } else { "asc" };
 
-    let mut count = QueryBuilder::<Postgres>::new("select count(*) from sales_products p where p.organization_id = ");
-    let mut filter = QueryBuilder::<Postgres>::new(" where p.organization_id = ");
-    filter.push_bind(organization_id);
-    count.push_bind(organization_id);
-    push_product_filters(&mut filter, query, term.as_deref());
+    // **The count and the page are two statements that share one *filter function*, not one
+    // built fragment.** This is not a style preference: `QueryBuilder::sql()` renders the
+    // placeholder text and returns nothing about the bindings, so a fragment copied from one
+    // builder into another with `push(fragment.sql())` produces a statement whose text says
+    // `$1 … $4` with **zero** parameters — a `500` of "bind message supplies 0 parameters, but
+    // the prepared statement requires 4" on every filtered list. Sharing the function means the
+    // clauses cannot drift apart, which is the real reason to do it this way: a count that
+    // matched a different set than the page it counts is how a list claims forty rows and shows
+    // none.
+    let total_estimate = count_products(pool, organization_id, query, term.as_deref()).await?;
 
-    let total_estimate: i64 = count
-        .push(filter.sql())
-        .build_query_scalar()
-        .fetch_one(pool)
-        .await?;
-
-    let mut builder: QueryBuilder<Postgres> =
-        QueryBuilder::new("select ");
+    let mut builder: QueryBuilder<Postgres> = QueryBuilder::new("select ");
     builder
         .push(PRODUCT_COLUMNS)
-        .push(" from sales_products p")
-        .push(filter.sql().trim_start_matches(" where"))
-        .push(" and p.organization_id = ")
-        .push_bind(organization_id);
+        .push(" from sales_products p");
+    push_product_filters(&mut builder, organization_id, query, term.as_deref());
 
     if let Some(cursor_id) = query.cursor_id() {
         builder
@@ -587,10 +590,37 @@ pub async fn list_products(
     Ok(Page::new(items, next_cursor, total_estimate))
 }
 
-/// The clauses both the count and the page share, so a filter can never match in one and miss in
+/// How many products a filter matches — the same clauses as the page, written by the same
+/// function.
+async fn count_products(
+    pool: &PgPool,
+    organization_id: Uuid,
+    query: &CatalogQuery,
+    term: Option<&str>,
+) -> Result<i64> {
+    let mut count: QueryBuilder<Postgres> =
+        QueryBuilder::new("select count(*) from sales_products p");
+    push_product_filters(&mut count, organization_id, query, term);
+
+    count.build_query_scalar().fetch_one(pool).await.map_err(Into::into)
+}
+
+/// The clauses the product count and page share, so a filter can never match in one and miss in
 /// the other — the two would then disagree about how many rows there are, which is the kind of
 /// bug a list hides by being empty.
-fn push_product_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &CatalogQuery, term: Option<&str>) {
+///
+/// Takes the organization and the already-validated search term rather than reading them off the
+/// query, so the count does not have to re-validate and reject in a different order than the page.
+fn push_product_filters(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    organization_id: Uuid,
+    query: &CatalogQuery,
+    term: Option<&str>,
+) {
+    builder
+        .push(" where p.organization_id = ")
+        .push_bind(organization_id);
+
     if let Some(term) = term {
         let pattern = format!("%{}%", term.to_lowercase());
         builder
@@ -602,15 +632,18 @@ fn push_product_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &Catalo
             .push_bind(pattern)
             .push(")");
     }
-    if let Some(category) = query.category.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+    if let Some(category) = query
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
         builder
             .push(" and lower(p.category) = ")
             .push_bind(category.to_lowercase());
     }
     if let Some(active) = query.active {
-        builder
-            .push(" and p.active = ")
-            .push_bind(active);
+        builder.push(" and p.active = ").push_bind(active);
     }
     if !query.shows_archived() {
         builder.push(" and p.archived_at is null");
@@ -844,6 +877,10 @@ pub async fn list_categories(pool: &PgPool, organization_id: Uuid) -> Result<Vec
 
 /// The values a price-list create carries.
 #[derive(Debug, Clone, Default, Deserialize)]
+// Container-level `default` is what keeps an **omitted** window legal: naming a `with` path
+// replaces a field's whole deserializer, which silently discards a field-level
+// `#[serde(default)]`, and a form that leaves "valid from" blank must not be a 422.
+#[serde(default)]
 pub struct NewPriceList {
     /// The name a seller picks from.
     pub name: String,
@@ -854,15 +891,17 @@ pub struct NewPriceList {
     #[serde(default)]
     pub active: Option<bool>,
     /// First day the list may be used on.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_from: Option<time::Date>,
     /// Last day the list may be used on.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_until: Option<time::Date>,
 }
 
 /// A patch of a price list.
 #[derive(Debug, Clone, Default, Deserialize)]
+// Same reason as `NewPriceList`: a patch that does not mention the window leaves it alone.
+#[serde(default)]
 pub struct PriceListPatch {
     /// The name a seller picks from.
     #[serde(default)]
@@ -874,10 +913,10 @@ pub struct PriceListPatch {
     #[serde(default)]
     pub active: Option<bool>,
     /// First day the list may be used on.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_from: Option<time::Date>,
     /// Last day the list may be used on.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_until: Option<time::Date>,
 }
 
@@ -978,26 +1017,14 @@ pub async fn list_price_lists(
     let limit = query.page_size();
     let direction = if desc { "desc" } else { "asc" };
 
-    let mut count =
-        QueryBuilder::<Postgres>::new("select count(*) from sales_price_lists l where l.organization_id = ");
-    let mut filter = QueryBuilder::<Postgres>::new(" where l.organization_id = ");
-    filter.push_bind(organization_id);
-    count.push_bind(organization_id);
-    push_price_list_filters(&mut filter, query, term.as_deref());
-
-    let total_estimate: i64 = count
-        .push(filter.sql())
-        .build_query_scalar()
-        .fetch_one(pool)
-        .await?;
+    // The same one-function shape as the product list, for the same reason.
+    let total_estimate = count_price_lists(pool, organization_id, query, term.as_deref()).await?;
 
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new("select ");
     builder
         .push(PRICE_LIST_COLUMNS)
-        .push(" from sales_price_lists l")
-        .push(filter.sql().trim_start_matches(" where"))
-        .push(" and l.organization_id = ")
-        .push_bind(organization_id);
+        .push(" from sales_price_lists l");
+    push_price_list_filters(&mut builder, organization_id, query, term.as_deref());
 
     if let Some(cursor_id) = query.cursor_id() {
         builder
@@ -1030,17 +1057,34 @@ pub async fn list_price_lists(
     Ok(Page::new(items, next_cursor, total_estimate))
 }
 
+/// How many price lists a filter matches.
+async fn count_price_lists(
+    pool: &PgPool,
+    organization_id: Uuid,
+    query: &CatalogQuery,
+    term: Option<&str>,
+) -> Result<i64> {
+    let mut count: QueryBuilder<Postgres> =
+        QueryBuilder::new("select count(*) from sales_price_lists l");
+    push_price_list_filters(&mut count, organization_id, query, term);
+
+    count.build_query_scalar().fetch_one(pool).await.map_err(Into::into)
+}
+
 /// The clauses the price-list count and page share.
 fn push_price_list_filters(
     builder: &mut QueryBuilder<'_, Postgres>,
+    organization_id: Uuid,
     query: &CatalogQuery,
     term: Option<&str>,
 ) {
+    builder
+        .push(" where l.organization_id = ")
+        .push_bind(organization_id);
+
     if let Some(term) = term {
         let pattern = format!("%{}%", term.to_lowercase());
-        builder
-            .push(" and lower(l.name) like ")
-            .push_bind(pattern);
+        builder.push(" and lower(l.name) like ").push_bind(pattern);
     }
     if let Some(active) = query.active {
         builder.push(" and l.active = ").push_bind(active);
