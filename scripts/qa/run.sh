@@ -87,15 +87,44 @@ stop_stack
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database omnion_qa)"
+step "API on :$API_PORT (database $QA_DB_NAME)"
+# Where cargo actually put the binary. `cargo build` honours an ambient CARGO_TARGET_DIR, so a
+# caller that exports one (the loop's own build advice on this disk-full box) makes the build land
+# somewhere other than ./target. Hardcoding ./target/debug both hides that and inverts the freshness
+# guard below — the *other* directory holds a stale binary, so the build is skipped and the pass
+# then dies on `Script not found`, which reads as a queue problem and is not one.
+#
+# cargo metadata reports the target ROOT, and the binary sits in the profile subdirectory under it
+# (debug/, release/, ...), so the root alone is not the path: append the profile that actually holds
+# it rather than assuming `debug`, and remember the location so the freshness check and the build
+# agree with each other.
+API_TARGET_DIR="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | tail -n 1)"
+[ -n "$API_TARGET_DIR" ] || API_TARGET_DIR="$ROOT/target"
+API_BIN=""
+for profile in debug release; do
+  if [ -x "$API_TARGET_DIR/$profile/omnion-api" ]; then
+    API_BIN="$API_TARGET_DIR/$profile/omnion-api"
+    break
+  fi
+done
+# Nothing built yet: default to the profile cargo will use for this (dev) build.
+[ -n "$API_BIN" ] || API_BIN="$API_TARGET_DIR/debug/omnion-api"
+step "API binary: $API_BIN"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-if [ ! -x target/debug/omnion-api ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+if [ ! -x "$API_BIN" ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
   cargo build -p omnion-api
+fi
+if [ ! -x "$API_BIN" ]; then
+  # Say it plainly instead of letting pm2 report a missing script: this is the difference between
+  # "the build is slow" and "the pass never ran", and a log that stops here looks like the former.
+  echo "[qa] FAILED: no omnion-api binary at $API_BIN after the build — the pass did not run." >&2
+  exit 1
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
@@ -104,7 +133,7 @@ else
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
-    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+    pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
