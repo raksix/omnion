@@ -88,6 +88,22 @@ if [ ! -x "$API_BIN" ] \
   step "building the API (first pass, or a migration changed since the last build)"
   cargo build -p omnion-api
 fi
+# A pm2 entry that exists but points at a binary which is no longer there is *worse* than no
+# entry: `pm2 restart` succeeds, nothing listens, and the pass dies at `wait_http` blaming the
+# product. This is the second half of the same bug as the hardcoded path above — once a pass has
+# started the API from `$CARGO_TARGET_DIR`, the registered script path is the tmpfs copy, and a
+# later pass that builds somewhere else inherits an entry that can only fail. Compare the
+# registered path to the one this pass just built and re-register when they differ.
+# pm2 draws its table with a box character followed by a NON-BREAKING space (U+00A0), so a sed
+# pattern that matches an ordinary space extracts nothing at all. Strip the non-breaking spaces
+# and the box characters first, then cut the field.
+RUNNING_BIN="$(pm2 describe "$API_NAME" 2>/dev/null \
+  | tr -d '\302\240\342\224\202' \
+  | sed -n 's/^.*script path *//p' | head -1 | sed 's/[[:space:]]*$//')"
+if [ -n "$RUNNING_BIN" ] && [ "$RUNNING_BIN" != "$API_BIN" ]; then
+  step "the pm2 entry runs $RUNNING_BIN, not $API_BIN — re-registering"
+  pm2 delete "$API_NAME" >/dev/null 2>&1 || true
+fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
