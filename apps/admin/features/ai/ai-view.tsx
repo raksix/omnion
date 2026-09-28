@@ -1213,7 +1213,7 @@ export function AiView() {
       </section>
 
       {/* Models */}
-      <section className="rounded-xl border border-line bg-surface">
+      <section id="ai-provider-models" className="scroll-mt-4 rounded-xl border border-line bg-surface">
         <header className="border-b border-line px-4 py-3">
           <h2 className="text-[13.5px] font-semibold">Models</h2>
           <p className="text-[12px] text-muted">

@@ -33,6 +33,8 @@ import {
   type AiModelPrice,
   type AiModelQuery,
   type AiProvider,
+  applyAiProviderDiscovery,
+  discoverAiProviderModels,
   fetchAiModels,
   updateAiModel,
 } from "@/lib/api";
@@ -235,6 +237,10 @@ export function ModelCatalog({
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [token, setToken] = useState(0);
+  // Which provider the empty state's "Discover models" will ask. Separate from `providerId`,
+  // which filters the *table*: a discovery target is a destination, not a narrowing, and sharing
+  // the two would mean picking a provider to ask silently turned into a filter on the listing.
+  const [discoverProviderId, setDiscoverProviderId] = useState("");
 
   const query: AiModelQuery = useMemo(
     () => ({
@@ -286,6 +292,53 @@ export function ModelCatalog({
   }, [query, token]);
 
   const reload = useCallback(() => setToken((current) => current + 1), []);
+
+  /**
+   * Pull the models a provider says it serves, then add them to the registry.
+   *
+   * The empty state has to offer a way out, and "nothing is registered" has exactly two honest
+   * answers: type the keys, or ask the provider. This is the second one, and it is a *chain* —
+   * discover, then apply — because the diff is a review step, not a formality: an endpoint that
+   * suddenly reports two hundred models must not rewrite the registry because someone was curious
+   * whether it was up. Both steps report what happened, and a discovery that finds nothing new
+   * says so rather than reporting a silent success.
+   */
+  const discoverIntoRegistry = async (provider: AiProvider) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const report = await discoverAiProviderModels(provider.id);
+      const added = report.lines.filter((line) => line.action === "added").length;
+      const changed = report.lines.filter((line) => line.action === "changed").length;
+
+      if (added === 0 && changed === 0) {
+        setNotice(
+          `${provider.name} already serves every model the catalog holds — nothing to add.`,
+        );
+        return;
+      }
+
+      const applied = await applyAiProviderDiscovery(provider.id);
+      const appliedAdded = applied.lines.filter((line) => line.action === "added").length;
+      const appliedChanged = applied.lines.filter((line) => line.action === "changed").length;
+      setNotice(
+        `${provider.name}: ${appliedAdded} model${appliedAdded === 1 ? "" : "s"} added` +
+          (appliedChanged > 0 ? `, ${appliedChanged} updated` : "") +
+          ".",
+      );
+      onReload();
+      reload();
+    } catch (cause: unknown) {
+      setError(
+        cause instanceof ApiError
+          ? cause.message
+          : `${provider.name} could not be asked which models it serves.`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const toggleCapability = (capability: AiCapability) =>
     setCapabilities((current) =>
@@ -503,6 +556,50 @@ export function ModelCatalog({
           <EmptyState
             title="No model is registered"
             hint="Add models to a provider — or pull them from the provider itself with Discover."
+            action={
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="sr-only" htmlFor="catalog-discover-provider">
+                  Which provider should be asked which models it serves?
+                </label>
+                <select
+                  id="catalog-discover-provider"
+                  value={discoverProviderId}
+                  onChange={(event) => setDiscoverProviderId(event.target.value)}
+                  data-catalog-discover-provider
+                  className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px]"
+                >
+                  <option value="">Choose a provider…</option>
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  disabled={busy || discoverProviderId === ""}
+                  onClick={() => {
+                    const provider = providers.find((entry) => entry.id === discoverProviderId);
+                    if (provider) {
+                      void discoverIntoRegistry(provider);
+                    }
+                  }}
+                  data-catalog-discover
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas disabled:opacity-50"
+                >
+                  {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Search className="size-3.5" />}
+                  Discover models
+                </button>
+                <a
+                  href="#ai-provider-models"
+                  data-catalog-add
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] text-white transition hover:opacity-90"
+                >
+                  <Star className="size-3.5" />
+                  Add a model
+                </a>
+              </div>
+            }
           />
         ) : (
           <EmptyState
