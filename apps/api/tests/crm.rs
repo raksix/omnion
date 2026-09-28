@@ -5124,7 +5124,7 @@ async fn a_stage_from_another_pipelines_organization_is_refused() {
     )
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
-    assert_eq!(refused.body["code"], json!("invalid_lead_settings.stage_id"));
+    assert_eq!(refused.body["error"]["code"], json!("invalid_lead_settings.stage_id"));
 
     // And the refusal left the stored row alone.
     let after = call(
@@ -5252,13 +5252,260 @@ async fn the_lead_keys_are_catalogued_and_belong_to_the_owner() {
     // the family, and the suite grants it explicitly where it needs it.
     let held: i64 = sqlx::query_scalar(
         "select count(*) from role_permissions rp \
-         join roles r on r.id = rp.role_id \
-         join users u on u.id = any(rp.grant_scope_ids) \
-         where u.email = $1 and rp.permission_key = 'crm.leads.read'",
+         join role_bindings rb on rb.role_id = rp.role_id \
+         join users u on u.id = rb.subject_id \
+         where u.email = $1 and rb.revoked_at is null and rb.user_id is not null \
+           and rp.permission_key = 'crm.leads.read'",
     )
     .bind(&fixture.manager)
     .fetch_one(fixture.db.pool())
     .await
     .expect("the bindings must read");
     assert_eq!(held, 0, "a CRM manager is not handed the ingress by default");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The platform account and the missing tenant (2026-09-28)
+// ---------------------------------------------------------------------------------------------
+
+/// A platform account with no primary organization reads the tenant it is the only member of.
+///
+/// The account this describes is not a corner case: it is the **first-run `owner`** of every
+/// installation. `users.organization_id` is `null` for it by design, because it is the account
+/// that *creates* the tenants. Every CRM screen it opened therefore answered `400
+/// organization_required` until the module grew a fallback — the whole module was unreachable
+/// for its own owner, which is the sign of a rule written for one caller and generalised later.
+///
+/// The fallback is deliberately narrow, and the other two arms are proven below rather than
+/// assumed: one tenant is taken, **two is a refusal** rather than a coin toss, and an account
+/// bound to none is told so. A screen that silently opened the wrong tenant's records would be a
+/// data leak wearing the costume of a convenience.
+#[tokio::test]
+async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // The owner is bound to exactly one organization for the length of this walk — the arm
+    // under test. The binding is the *platform* `owner` role scoped to the tenant, which is what
+    // an administrator grants when they want the platform owner to look inside a customer.
+    let role = role_store::create_role(
+        fixture.db.pool(),
+        NewRole {
+            organization_id: fixture.org,
+            key: format!("crm-platform-{}-{}", "own", Uuid::new_v4().simple()),
+            name: "CRM Platform Reader".to_owned(),
+            description: "The platform owner looking into one tenant".to_owned(),
+            priority: 300,
+            inherits_role_id: None,
+        },
+    )
+    .await
+    .expect("the tenant-scoped role must be created");
+    role_store::set_role_permissions(
+        fixture.db.pool(),
+        role.id,
+        &MANAGER_PERMISSIONS
+            .iter()
+            .map(|key| RolePermissionInput {
+                key: (*key).to_owned(),
+                effect: Effect::Allow,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("the tenant role's permissions must be written");
+
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    omnion_permissions::bindings::grant(
+        fixture.db.pool(),
+        NewBinding {
+            role_id: role.id,
+            user_id: owner_id,
+            scope: PermScope::Organization {
+                organization_id: fixture.org,
+            },
+            granted_by: Some(owner_id),
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the tenant binding must be created");
+
+    // A contact to read, so the answer is a list and not merely a status.
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts",
+            Some(&fixture.manager),
+            Some(json!({ "first_name": "Tenant", "last_name": "Probe" })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "the fixture's contact must be created");
+
+    // The route with **no** organization named: the shape the panel sends.
+    for uri in [
+        "/api/v1/crm/contacts",
+        "/api/v1/crm/companies",
+        "/api/v1/crm/deals?view=list",
+        "/api/v1/crm/activities",
+        "/api/v1/crm/leads",
+    ] {
+        let response = call(
+            &fixture.state,
+            request(Method::GET, uri, Some(&fixture.owner), None),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{uri} must resolve the caller's one organization instead of refusing: {}",
+            response.body
+        );
+    }
+
+    // And the list actually holds the tenant's record — a `200` with somebody else's empty list
+    // would pass the check above and mean nothing.
+    let listed = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/crm/contacts", Some(&fixture.owner), None),
+    )
+    .await;
+    let items = listed.body["items"].as_array().expect("the list envelope must be an object");
+    assert!(
+        items.iter().any(|row| row["first_name"] == "Tenant"),
+        "the resolved tenant's own contact must be in the answer"
+    );
+
+    // Naming a different tenant is still a cross-organization refusal: the fallback decides what
+    // an *unnamed* request means, and it grants no new reach.
+    let elsewhere = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/contacts?organization_id={}", fixture.other_org),
+            Some(&fixture.owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        elsewhere.status,
+        StatusCode::FORBIDDEN,
+        "the fallback must not become a way to read a tenant that was not named"
+    );
+}
+
+/// Two organizations is a **refusal**, not a guess.
+///
+/// The tempting alternative is "take the first", and the reason it is wrong is that it is
+/// indistinguishable from correct to the person looking at the screen: rows appear, nothing is
+/// greyed out, and the only evidence is the tenant chip several rows away. A `400` that names
+/// the count is a question the caller can answer, and the picker in the panel is built to ask it.
+#[tokio::test]
+async fn a_platform_account_bound_to_two_organizations_is_told_to_choose() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+
+    for organization in [fixture.org, fixture.other_org] {
+        let role = role_store::create_role(
+            fixture.db.pool(),
+            NewRole {
+                organization_id: organization,
+                key: format!("crm-two-{}-{}", organization, Uuid::new_v4().simple()),
+                name: "CRM Two Tenants".to_owned(),
+                description: "A role in each of two organizations".to_owned(),
+                priority: 300,
+                inherits_role_id: None,
+            },
+        )
+        .await
+        .expect("the role must be created");
+        omnion_permissions::bindings::grant(
+            fixture.db.pool(),
+            NewBinding {
+                role_id: role.id,
+                user_id: owner_id,
+                scope: PermScope::Organization { organization_id: organization },
+                granted_by: Some(owner_id),
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("the binding must be created");
+    }
+
+    let response = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/crm/contacts", Some(&fixture.owner), None),
+    )
+    .await;
+
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "an account in two organizations must be asked, not answered for: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["error"]["code"], "organization_ambiguous",
+        "the refusal must be its own code — a client that cannot tell this apart from an empty          organization has nothing to draw a picker from"
+    );
+
+    // Naming one of them is enough, and it is the only thing that is.
+    let chosen = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/contacts?organization_id={}", fixture.org),
+            Some(&fixture.owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        chosen.status,
+        StatusCode::OK,
+        "naming a tenant must resolve the ambiguity the unnamed request was refused for"
+    );
+}
+
+/// An account bound to **no** organization is told it, and is not handed a stranger's rows.
+///
+/// The account is the platform owner before anybody has given it a role in any tenant, which is
+/// the state of a brand-new installation. There is no right answer to give it, so the API says
+/// so with the code the panel already knows how to draw a "nothing to show" state from.
+#[tokio::test]
+async fn a_platform_account_in_no_organization_is_told_it_has_none() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // A fresh platform owner: no primary organization and no tenant binding at all.
+    let (account, email) = create_account(&fixture.db, None, "CRM Unbound Owner").await;
+    seed::bind_owner(fixture.db.pool(), account)
+        .await
+        .expect("the platform owner binding must be created");
+    let _ = &fixture.owner;
+
+    let response = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/crm/contacts", Some(&email), None),
+    )
+    .await;
+
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "an unbound platform account has no tenant to read: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["error"]["code"], "organization_required",
+        "the code must be the one the panel's empty state reads"
+    );
 }

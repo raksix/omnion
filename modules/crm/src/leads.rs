@@ -423,9 +423,9 @@ pub async fn load_settings(pool: &PgPool, organization_id: Uuid) -> Result<LeadS
     }
 
     let row: Row = sqlx::query_as(
-        "insert into crm_lead_settings (organization_id) values ($1) \\
-         on conflict (organization_id) do update \\
-             set organization_id = crm_lead_settings.organization_id \\
+        "insert into crm_lead_settings (organization_id) values ($1) \
+         on conflict (organization_id) do update \
+             set organization_id = crm_lead_settings.organization_id \
          returning create_contact, create_deal, stage_id, repeat_stage_id, source_label",
     )
     .bind(organization_id)
@@ -457,7 +457,7 @@ pub async fn read_settings_row(
     }
 
     let row: Option<Row> = sqlx::query_as(
-        "select create_contact, create_deal, stage_id, repeat_stage_id, source_label \\
+        "select create_contact, create_deal, stage_id, repeat_stage_id, source_label \
          from crm_lead_settings where organization_id = $1",
     )
     .bind(organization_id)
