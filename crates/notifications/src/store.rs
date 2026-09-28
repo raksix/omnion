@@ -355,6 +355,25 @@ pub async fn within_emit_budget(pool: &PgPool, emitted_by: Uuid) -> Result<bool>
         < crate::vocabulary::EMIT_BUDGET_PER_MINUTE)
 }
 
+/// The subset of `user_ids` that names a real account.
+///
+/// The `notifications_user_id_fkey` is the honest authority on who may be addressed, but it
+/// answers by refusing the *whole insert*, so a caller that sends four good ids and one
+/// stale one loses all four and is handed a 500 carrying a Postgres constraint name. This
+/// turns the same fact into a list the caller can answer, before anything is written.
+pub async fn existing_users(pool: &PgPool, user_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known: Vec<Uuid> = sqlx::query_scalar(
+        "select id from users where id = any($1::uuid[])",
+    )
+    .bind(user_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(known)
+}
+
 /// Check a payload's category and channel names before the store ever sees them.
 ///
 /// The SQL has check constraints and would refuse a bad value — but with a constraint name

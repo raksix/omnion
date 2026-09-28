@@ -601,6 +601,32 @@ pub async fn emit(
         ));
     }
 
+    // Recipients are checked *before* the loop, not by the foreign key inside it. The key
+    // answers a bad address by refusing the whole batch, so one stale id in a list of five
+    // costs the caller the four good rows and returns a 500 that quotes the constraint name
+    // to whoever is holding the response. The list is the same fact said in a sentence, and
+    // the caller is told *which* id is wrong so it can drop that one and send the rest.
+    let known = omnion_notifications::store::existing_users(state.db().pool(), &body.user_ids)
+        .await
+        .map_err(map_store)?;
+    if known.len() != body.user_ids.len() {
+        let unknown: Vec<String> = body
+            .user_ids
+            .iter()
+            .filter(|id| !known.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+        return Err(ApiError::bad_request(
+            "unknown_recipient",
+            format!(
+                "{} of {} recipients are not accounts: {}",
+                unknown.len(),
+                body.user_ids.len(),
+                unknown.join(", ")
+            ),
+        ));
+    }
+
     let mut created = 0u64;
     let mut deduped = 0u64;
     for user_id in &body.user_ids {

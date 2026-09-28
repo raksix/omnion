@@ -172,6 +172,33 @@ else
   fail "the emit answered: $msg"
 fi
 
+# 7. A recipient that is not an account. The foreign key is the honest authority on who may
+#    be addressed, but it answers by refusing the *whole batch* and by naming itself in the
+#    message. So a caller who sends four good ids and one stale one loses the four, gets a
+#    500, and reads a Postgres constraint name. The claim here is two-sided: the batch that
+#    does not exist is refused in a *sentence*, and the batch that does exist is not touched
+#    by the refusal next door.
+ghost_status=$(curl -s -o /tmp/notif-ghost.json -w '%{http_code}' -X POST "$URL/api/v1/notifications/emit" \
+  -b "$COOKIE_A" -H 'content-type: application/json' \
+  -d "{\"category\":\"approval\",\"title\":\"QA ghost\",\"user_ids\":[\"00000000-0000-4000-8000-000000000000\"],\"dedupe_key\":\"qa-ghost-$RANDOM\"}")
+ghost=$(cat /tmp/notif-ghost.json)
+mixed_before=$(curl -s "$URL/api/v1/notifications/summary" -b "$COOKIE_A" | sed -n 's/.*"unread":\([0-9]*\).*/\1/p')
+mixed=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/api/v1/notifications/emit" -b "$COOKIE_A" \
+  -H 'content-type: application/json' \
+  -d "{\"category\":\"approval\",\"title\":\"QA mixed\",\"user_ids\":[\"$OWNER_ID\",\"00000000-0000-4000-8000-000000000001\"],\"dedupe_key\":\"qa-mixed-$RANDOM\"}")
+mixed_after=$(curl -s "$URL/api/v1/notifications/summary" -b "$COOKIE_A" | sed -n 's/.*"unread":\([0-9]*\).*/\1/p')
+if [ "$ghost_status" = "400" ] && echo "$ghost" | grep -q '"code":"unknown_recipient"' \
+   && ! echo "$ghost" | grep -qi 'fkey\|constraint'; then
+  pass "a recipient that is not an account is a 400 in a sentence, not a constraint name"
+else
+  fail "a ghost recipient answered ($ghost_status): $ghost"
+fi
+if [ "$mixed" = "400" ] && [ "$mixed_before" = "$mixed_after" ]; then
+  pass "a batch with one bad id writes none of the good ones"
+else
+  fail "a mixed batch answered $mixed and moved the unread count $mixed_before -> $mixed_after"
+fi
+
 # 3. Dedupe. Two emits with the same key are one row, and the second says so.
 key="qa-$RANDOM"
 first=$(curl -s -X POST "$URL/api/v1/notifications/emit" -b "$COOKIE_A" \
