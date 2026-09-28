@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 1 done, slice 2 started: raw_html sanitisation) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
+> **Status:** in-progress (slice 2 at 3/4: containers + validation + revision diff) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -125,7 +125,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [ ] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
 - [ ] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
 - [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
-- [ ] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
+- [x] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
 - [ ] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
 - [ ] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
 - [ ] `content.blocks.updated` and `content.page.published` are delivered to a subscribed endpoint with redelivery working.
@@ -166,14 +166,41 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    `/pages/<id>/edit` are both in the walkthrough inventory with a depth pass on each.
 2. **Containers, validation, revision diff.** Nested `columns`, breadcrumb selection, accessibility and viewport rules (`hide_on` server-side), heading-order linting, `raw_html` sanitisation, block-level diff on the revisions screen, inline-editing frame at `/pages/<id>/preview`. *Done when:* acceptance 4, 6–8, 13–15 pass.
 
-   - **Done in this slice so far (1/4):** `raw_html` sanitisation (acceptance 8) and nested
-     columns with the breadcrumb (acceptance 4). `crates/content/src/sanitize.rs` is the
+   - **Done in this slice so far (3/4):** `raw_html` sanitisation (acceptance 8), nested columns
+     with the breadcrumb (acceptance 4), heading-order linting and server-side `hide_on`
+     (acceptance 7 and 15, proven in the previous tick's tests), and the block-level revision
+     compare (acceptance 13). `crates/content/src/sanitize.rs` is the
      sanitiser — an allow-list scanner that removes rather than escapes, reports what it
      removed, and is applied by `blocks::sanitize_tree` on the way into storage, so a stored
      payload is already safe. The `embed` host allow-list ships with it (empty by default, so no
      `iframe` renders until an operator allow-lists a host). 22 sanitiser tests + 4 tree tests.
 
-     **Acceptance 4 shipped as a `column` block type.** The REQ's sentence is "2–4 child
+     **Acceptance 13 shipped as a block-level compare.** The criterion says "not a raw JSON
+   diff", and that is a claim about *what a row is*, not about whether a compare exists. So the
+   compare is keyed on the block id, not on position: ids are client-generated and never
+   rewritten, which means a reorder is two `moved` rows instead of every block on the page
+   being reported as removed and re-added. A positional diff cannot express a move at all —
+   after a reorder every position differs, so it reports the page as rewritten, which is the
+   same failure mode as showing two JSON payloads side by side.
+
+   A row names its block by a **headline** — the first text-typed prop in registry order, so
+   every text block leads with its text and every image with its alt — and a `changed` row
+   lists each differing prop with the inspector's own label for it. The one row an author has
+   to notice is a removal, so `has_removals` is carried on the compare and the screen says how
+   many blocks travelled with a deleted container, rather than listing its children again.
+
+   Two decisions worth recording. The compare **defaults its base** to the previous revision,
+   so opening a history answers "what changed in this one" instead of demanding a base
+   pick — and a revision with nothing before it says so rather than reporting every block as
+   an addition. And the response carries the **body text compare** alongside the block rows: a
+   page that still renders from its body has no blocks, and reporting "nothing changed" for a
+   page whose paragraphs were rewritten would be a lie.
+
+   The panel renders the server's answer and computes no diff of its own
+   (`features/blocks/revision-history-view.tsx`). Two implementations of "what changed" is how
+   a panel and a server start disagreeing about the same page.
+
+   **Acceptance 4 shipped as a `column` block type.** The REQ's sentence is "2–4 child
      columns, *each accepting child blocks*", and a child column has to be a node for that to
      hold: a `columns` block whose children are content blocks cannot express "these two, side
      by side" — it can only express a list that happens to be indented. So the registry gained a

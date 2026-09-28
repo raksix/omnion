@@ -1450,7 +1450,13 @@ fn validate_meta(block: &Block, index: usize, issues: &mut Vec<BlockIssue>) {
                 format!(
                     "{key:?} is not a block setting; this platform reads {}",
                     [
-                        "hide_on", "align", "anchor", "id", "class", "aria_label", "style"
+                        "hide_on",
+                        "align",
+                        "anchor",
+                        "id",
+                        "class",
+                        "aria_label",
+                        "style"
                     ]
                     .join(", ")
                 ),
@@ -2158,14 +2164,8 @@ mod tests {
     /// A `columns` block whose prop count matches the wrappers it holds.
     fn columns(extra: Vec<Value>) -> Value {
         let count = 2 + extra.len();
-        let mut children = vec![column(vec![block(
-            "text",
-            json!({ "text": "left" }),
-        )])];
-        children.push(column(vec![block(
-            "text",
-            json!({ "text": "right" }),
-        )]));
+        let mut children = vec![column(vec![block("text", json!({ "text": "left" }))])];
+        children.push(column(vec![block("text", json!({ "text": "right" }))]));
         for child in extra {
             children.push(column(vec![child]));
         }
@@ -2191,30 +2191,33 @@ mod tests {
     #[test]
     fn a_columns_block_with_one_column_is_refused() {
         let mut value = block("columns", json!({ "columns": 1 }));
-        value["children"] = json!([column(vec![block(
-            "text",
-            json!({ "text": "lonely" }),
-        )])]);
+        value["children"] = json!([column(vec![block("text", json!({ "text": "lonely" }),)])]);
         let report = validate(&json!([value]));
         assert!(!report.can_publish);
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.code == "block_column_count"));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "block_column_count")
+        );
     }
 
     #[test]
     fn a_columns_block_with_five_columns_is_refused() {
         let mut value = block("columns", json!({ "columns": 5 }));
-        value["children"] = json!((0..5)
-            .map(|_| column(vec![block("text", json!({ "text": "x" }))]))
-            .collect::<Vec<_>>());
+        value["children"] = json!(
+            (0..5)
+                .map(|_| column(vec![block("text", json!({ "text": "x" }))]))
+                .collect::<Vec<_>>()
+        );
         let report = validate(&json!([value]));
         assert!(!report.can_publish);
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.code == "block_column_count"));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "block_column_count")
+        );
     }
 
     /// The rule that needs the parent threaded through: a Column is only meaningful inside a
@@ -2245,10 +2248,12 @@ mod tests {
         ]);
         let report = validate(&json!([value]));
         assert!(report.can_publish);
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.code == "block_column_empty"));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "block_column_empty")
+        );
     }
 
     /// Slice 1 let a `columns` block hold blocks directly. A draft saved then still loads and
@@ -2322,7 +2327,10 @@ mod tests {
     #[test]
     fn a_lone_heading_at_any_level_is_silent() {
         for level in ["h1", "h2", "h3", "h4", "h5", "h6"] {
-            let report = validate(&json!([block("heading", json!({ "text": "Only", "level": level }))]));
+            let report = validate(&json!([block(
+                "heading",
+                json!({ "text": "Only", "level": level })
+            )]));
             assert!(
                 report.issues.is_empty(),
                 "a single {level} warned: {:?}",
@@ -2338,14 +2346,20 @@ mod tests {
             json!({ "text": "x" }),
             json!({ "hide_on": "tablet" }),
         )]));
-        assert!(!report.can_publish, "an unknown viewport must not be storable");
+        assert!(
+            !report.can_publish,
+            "an unknown viewport must not be storable"
+        );
         let issue = report
             .issues
             .iter()
             .find(|issue| issue.code == "block_meta_invalid")
             .expect("the setting is named");
         assert_eq!(issue.severity, "error");
-        assert!(issue.message.contains("mobile"), "the list is in the message");
+        assert!(
+            issue.message.contains("mobile"),
+            "the list is in the message"
+        );
     }
 
     /// The three real values are accepted, and `none` is stored as *no* setting.
@@ -2357,7 +2371,11 @@ mod tests {
                 json!({ "text": "x" }),
                 json!({ "hide_on": value }),
             )]));
-            assert!(report.issues.is_empty(), "{value} warned: {:?}", report.issues);
+            assert!(
+                report.issues.is_empty(),
+                "{value} warned: {:?}",
+                report.issues
+            );
         }
 
         let mut blocks = parse_blocks(&json!([block_with_meta(
@@ -2385,7 +2403,10 @@ mod tests {
             json!({ "text": "x" }),
             json!({ "hover": "lift" }),
         )]));
-        assert!(report.can_publish, "an unknown setting does not break the page");
+        assert!(
+            report.can_publish,
+            "an unknown setting does not break the page"
+        );
         let issue = report
             .issues
             .iter()
@@ -2401,14 +2422,24 @@ mod tests {
     fn a_block_hidden_on_mobile_is_absent_from_the_mobile_render() {
         let blocks = parse_blocks(&json!([
             block_with_meta("text", json!({ "text": "everywhere" }), json!({})),
-            block_with_meta("text", json!({ "text": "wide only" }), json!({ "hide_on": "mobile" })),
-            block_with_meta("text", json!({ "text": "phone only" }), json!({ "hide_on": "desktop" })),
+            block_with_meta(
+                "text",
+                json!({ "text": "wide only" }),
+                json!({ "hide_on": "mobile" })
+            ),
+            block_with_meta(
+                "text",
+                json!({ "text": "phone only" }),
+                json!({ "hide_on": "desktop" })
+            ),
         ]))
         .expect("parseable");
 
         let desktop = filter_for_viewport(&blocks, ReadOn::Desktop);
         let texts = |list: &[Block]| -> Vec<String> {
-            list.iter().map(|b| b.props["text"].as_str().unwrap_or("").to_owned()).collect()
+            list.iter()
+                .map(|b| b.props["text"].as_str().unwrap_or("").to_owned())
+                .collect()
         };
         assert_eq!(
             texts(&desktop),
@@ -2445,7 +2476,11 @@ mod tests {
         let blocks = parse_blocks(&json!([value])).expect("parseable");
 
         let mobile = filter_for_viewport(&blocks, ReadOn::Mobile);
-        assert_eq!(mobile[0].children.len(), 2, "the whole column went, not just the block");
+        assert_eq!(
+            mobile[0].children.len(),
+            2,
+            "the whole column went, not just the block"
+        );
         // The renderer lays the grid out from the `columns` prop. A three-column grid with two
         // cells renders a gap on a phone, so the prop has to follow the structure.
         assert_eq!(
@@ -2457,7 +2492,11 @@ mod tests {
 
     #[test]
     fn a_meta_that_says_nothing_is_not_stored() {
-        for meta in [json!({}), json!({ "hide_on": "" }), json!({ "hide_on": "none" })] {
+        for meta in [
+            json!({}),
+            json!({ "hide_on": "" }),
+            json!({ "hide_on": "none" }),
+        ] {
             assert!(
                 !meta_is_meaningful(&meta),
                 "{meta} should not be stored as a setting"

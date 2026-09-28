@@ -550,6 +550,144 @@ pub async fn get_revision(
     Ok(Json(RevisionBody::from(&revision)))
 }
 
+/// `GET /api/v1/pages/{id}/revisions/{revision_id}/diff?against={revision_id}`.
+///
+/// The block-level compare behind the revisions screen (REQ-063 acceptance 13): "shows
+/// added/removed/changed blocks with prop-level detail, not a raw JSON diff".
+///
+/// `against` is optional and defaults to the previous revision, so opening a revision with no
+/// query string answers the question an author actually has — "what changed in this one" —
+/// rather than refusing for a missing parameter.
+///
+/// The response carries BOTH revisions' `body` text as a plain string compare alongside the
+/// block rows. A page that still renders from its body has no blocks at all, and a compare that
+/// reported "nothing changed" for a page whose paragraphs were rewritten would be a lie; the
+/// block rows answer the same question for a block-built page and this answers it for the rest.
+pub async fn diff_revision(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path((page_id, revision_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<DiffQuery>,
+) -> Result<Json<RevisionDiffBody>, ApiError> {
+    let page = page_in_scope(&state, &current, page_id).await?;
+    let revision = revision_of(&state, page.id, revision_id).await?;
+
+    // The base is the nearest older revision unless the caller named one. Comparing a revision
+    // with itself is refused rather than answered as "no changes": it means the query was built
+    // wrong, and returning an empty diff would hide that.
+    let base = match query.against {
+        Some(other) => revision_of(&state, page.id, other).await?,
+        None => pages::list_revisions(state.db().pool(), page.id)
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.revision_no < revision.revision_no)
+            .max_by_key(|candidate| candidate.revision_no)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "no_earlier_revision",
+                    format!(
+                        "revision {} is the first one on this page, so there is nothing to compare it with",
+                        revision.revision_no
+                    ),
+                )
+            })?,
+    };
+
+    if base.id == revision.id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "diff_same_revision",
+            "a revision cannot be compared with itself",
+        ));
+    }
+
+    // A payload either side cannot parse is compared as "no blocks" rather than refused: the
+    // page still renders (the renderer's own fallback takes over) and an author asking what
+    // changed should get the body compare even if one side's block tree is corrupt.
+    let blocks_of = |value: &Value| {
+        omnion_content::parse_blocks(value).unwrap_or_else(|_| Vec::new())
+    };
+    let diff = omnion_content::diff_blocks(
+        &blocks_of(&base.blocks),
+        &blocks_of(&revision.blocks),
+    );
+
+    Ok(Json(RevisionDiffBody {
+        page_id: page.id,
+        base: DiffRevisionRef::from(&base),
+        compared: DiffRevisionRef::from(&revision),
+        blocks: serde_json::to_value(&diff).unwrap_or(Value::Null),
+        body: BodyDiff {
+            changed: base.body != revision.body,
+            before: base.body.clone(),
+            after: revision.body.clone(),
+        },
+    }))
+}
+
+/// `?against=` — which revision to compare against.
+#[derive(Debug, Default, Deserialize)]
+pub struct DiffQuery {
+    /// Revision to compare against; the nearest earlier one when omitted.
+    #[serde(default)]
+    pub against: Option<Uuid>,
+}
+
+/// One side of a compare, as a pointer rather than a full revision.
+#[derive(Debug, Serialize)]
+pub struct DiffRevisionRef {
+    /// Revision id.
+    pub id: Uuid,
+    /// Monotonic revision number.
+    pub revision_no: i32,
+    /// `draft`, `published` or `archived`.
+    pub state: String,
+    /// Revision title, for the compare header.
+    pub title: String,
+    /// Creation timestamp, RFC 3339.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+impl From<&PageRevision> for DiffRevisionRef {
+    fn from(revision: &PageRevision) -> Self {
+        Self {
+            id: revision.id,
+            revision_no: revision.revision_no,
+            state: revision.state.clone(),
+            title: revision.title.clone(),
+            created_at: revision.created_at,
+        }
+    }
+}
+
+/// How a revision's plain body text compared.
+#[derive(Debug, Serialize)]
+pub struct BodyDiff {
+    /// `false` when the two bodies are byte-identical.
+    pub changed: bool,
+    /// Body before.
+    pub before: String,
+    /// Body after.
+    pub after: String,
+}
+
+/// The compare two revisions, as the revisions screen reads it.
+#[derive(Debug, Serialize)]
+pub struct RevisionDiffBody {
+    /// Page the compare belongs to.
+    pub page_id: Uuid,
+    /// The revision the change is measured from.
+    pub base: DiffRevisionRef,
+    /// The revision being read.
+    pub compared: DiffRevisionRef,
+    /// The block compare: `entries`, `added`, `removed`, `changed`, `moved`, `has_removals`.
+    pub blocks: Value,
+    /// The body compare, for a page that still renders from plain text.
+    pub body: BodyDiff,
+}
+
 /// One comment on a revision, as the panel reads it.
 #[derive(Debug, Serialize)]
 pub struct RevisionCommentBody {

@@ -2000,3 +2000,59 @@
 
 - **Next.** Slice 2 (3/4): heading-order linting, `hide_on` server-side, the block-level revision
   diff and the inline-editing frame. Then slice 3 (patterns and templates).
+
+## 2026-09-28 — REQ-063 slice 2 (3/4): the block-level revision compare
+
+- **What.** Acceptance 13: "The revision diff shows added/removed/changed blocks with
+  prop-level detail, not a raw JSON diff." `crates/content/src/blockdiff.rs` is the compare;
+  `GET /api/v1/pages/{id}/revisions/{revision_id}/diff` is the route; the panel gains
+  `/pages/<id>/revisions` with a history list and the compare beside it.
+
+  The compare is keyed on the **block id**, not on position. Ids are client-generated and never
+  rewritten, so a reorder is two `moved` rows; a positional compare reports the whole page as
+  removed-and-re-added, which is the same failure as showing two JSON payloads side by side.
+  A row carries a headline (the first text-typed prop in registry order) and, when it changed,
+  one line per differing prop under the inspector's own label for it.
+
+  Two decisions that are about the *question*, not the algorithm. The base **defaults** to the
+  previous revision, so opening a history answers "what changed in this one" instead of making
+  the author pick a base before the screen says anything; and a revision with nothing before it
+  answers `no_earlier_revision` rather than reporting every block as an addition. The response
+  also carries a **body text compare** next to the block rows — a page that renders from its
+  body has no blocks, and "nothing changed" for a page whose paragraphs were rewritten is a lie.
+
+  The panel renders the server's answer and computes no diff of its own. Two implementations of
+  "what changed" is how a panel and a server start disagreeing about one page.
+
+- **Proof.**
+  - `cargo test -p omnion-content --quiet` → **93 passed, 0 failed** (73 before this tick, 20
+    new: identical trees compare empty, an addition is named by its text, a changed prop carries
+    the inspector label, a prop that only exists afterwards is an addition and not a change from
+    blank, a visibility change reads as `meta.hide_on`, a reorder is two moves and no
+    additions, a deleted container counts its subtree, a lifted child is a *move* and not a
+    second deletion, a nested move reports both paths, a long value is elided).
+  - `pnpm typecheck` → **2/2 successful**, 0 errors (`@omnion/admin`, `@omnion/web`).
+  - `node --check scripts/qa/walkthrough.cjs` → clean; the new step opens the revisions screen
+    for the page the pass itself built, reads the diff rows, and asserts a changed row names a
+    prop in words rather than carrying a `"props"` key.
+  - `cargo test -p omnion-api --test content_blocks` → **not claimed this tick**. Four new
+    integration tests are written (block-by-block compare, a body-only page, a reorder read as
+    moves, and the permission guard) but the run was still linking when the tick ended: the box
+    is at load 322 with five `rustc` processes and 28G of 32G used, and this is a shared volume
+    with three writers. The build runs against `CARGO_TARGET_DIR=/dev/shm/omnion-target-w2`; it
+    needs to be finished next tick before this slice is closed.
+
+- **Three tests failed first, and the code was right.** Two were my own assertions indexing
+  diff rows by position — rows come out in the *new* document order, so "block 0 moved to 1" was
+  asserted against the wrong row. The third is the interesting one: a child lifted out of a
+  deleted container was being asserted as an *addition*, and the correct reading is a **move** —
+  its id is in both revisions, so claiming it was added tells the author they gained a paragraph
+  they already had. Looking a row up by id is what the id is for.
+
+- **Two component APIs were guessed and typecheck caught both.** `EmptyState` takes `hint`, not
+  `description`; `LoadingTable` takes `columns` and renders a *table*, which is the wrong
+  semantic for a list of revision buttons — so the loading state is a local skeleton list.
+
+- **Next.** Finish the API integration run, then slice 2 (4/4): the inline-editing frame at
+  `/pages/<id>/preview`. Then a QA browser pass — the walkthrough step for the nested columns
+  and the one for this compare have both been written and neither has yet been run in a browser.

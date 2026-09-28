@@ -19,6 +19,8 @@ import type {
   Organization,
   OwnerSetupResult,
   Page,
+  Revision,
+  RevisionDiff,
   Site,
   User,
 } from "./types";
@@ -321,6 +323,33 @@ export function validateBlocks(blocks: unknown[]): Promise<BlockValidationResult
     method: "POST",
     body: JSON.stringify({ blocks }),
   });
+}
+
+/**
+ * Compare two revisions block by block (REQ-063).
+ *
+ * `against` is optional: the API defaults to the revision before the one being read, which is
+ * the question an author opening a revision actually has. It is passed only when the revisions
+ * screen's picker names a different base.
+ */
+export function fetchRevisionDiff(
+  pageId: string,
+  revisionId: string,
+  against?: string,
+): Promise<RevisionDiff> {
+  const query = against
+    ? `?against=${encodeURIComponent(against)}`
+    : "";
+  return request<RevisionDiff>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/revisions/${encodeURIComponent(revisionId)}/diff${query}`,
+  );
+}
+
+/** The revision history of a page, newest first. */
+export function fetchRevisions(pageId: string): Promise<Revision[]> {
+  return request<{ revisions: Revision[] }>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/revisions`,
+  ).then((body) => body.revisions);
 }
 
 /** Publish the page's working draft — the revision visitors then see. */

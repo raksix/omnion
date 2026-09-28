@@ -412,6 +412,12 @@ pub fn router(state: AppState) -> Router {
     let page_revision =
         get(content::get_revision).layer(guards::require(&state, "content.pages.read"));
 
+    // REQ-063: the block-level compare two revisions, on the same read key as reading either
+    // of them — looking at a history is `content.pages.read`, and needing a second permission to
+    // ask what changed inside it would only teach authors to restore instead of compare.
+    let page_revision_diff = get(content::diff_revision)
+        .layer(guards::require(&state, "content.pages.read"));
+
     let page_revision_comments =
         get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read"));
 
@@ -824,6 +830,10 @@ pub fn router(state: AppState) -> Router {
         .route("/pages/{id}/restore", page_restore)
         .route("/pages/{id}/revisions", page_revisions)
         .route("/pages/{id}/revisions/{revision_id}", page_revision)
+        .route(
+            "/pages/{id}/revisions/{revision_id}/diff",
+            page_revision_diff,
+        )
         .route(
             "/pages/{id}/revisions/{revision_id}/translations",
             page_translations,

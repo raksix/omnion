@@ -70,6 +70,70 @@ export type {
   ContentBlock,
 } from "@omnion/types";
 
+/** One prop-level difference inside a `changed` block row (REQ-063). */
+export type PropChange = {
+  /** Prop name (`text`, `alt`) or `meta.<setting>` for a per-block setting. */
+  path: string;
+  /** The inspector's own name for the prop, when the registry declares one. */
+  label: string | null;
+  /** Value before the change, elided past 160 characters. */
+  before: string;
+  /** Value after the change. */
+  after: string;
+  /** The prop is only in the new revision. */
+  added: boolean;
+  /** The prop is only in the old revision. */
+  removed: boolean;
+};
+
+/** One row of a revision compare (`GET /api/v1/pages/{id}/revisions/{rev}/diff`). */
+export type BlockDiffEntry = {
+  /** The same value in both revisions when the block survived — this is what makes a move
+   * readable instead of a rewrite. */
+  block_id: string;
+  block_type: string;
+  change: "added" | "removed" | "changed" | "moved" | "unchanged";
+  /** Headline naming the block in a word or two, so a row is not a JSON object. */
+  label: string;
+  /** Where the block sat before, as `0.children.1`. */
+  from_path: string;
+  /** Where it sits now; empty for a removal. */
+  to_path: string;
+  /** Prop-level detail, for a `changed` block. */
+  props: PropChange[];
+  /** How many blocks travelled with this one when it was removed. */
+  removed_count?: number;
+};
+
+/** The whole block compare. */
+export type BlockDiff = {
+  entries: BlockDiffEntry[];
+  added: number;
+  removed: number;
+  changed: number;
+  moved: number;
+  /** `true` when at least one block was deleted — the only row that needs an author to look. */
+  has_removals: boolean;
+};
+
+/** One side of a compare, as a pointer rather than a whole revision. */
+export type DiffRevisionRef = {
+  id: string;
+  revision_no: number;
+  state: string;
+  title: string;
+  created_at: string;
+};
+
+/** Two revisions, compared. `body` covers a page that still renders from plain text. */
+export type RevisionDiff = {
+  page_id: string;
+  base: DiffRevisionRef;
+  compared: DiffRevisionRef;
+  blocks: BlockDiff;
+  body: { changed: boolean; before: string; after: string };
+};
+
 /** One page with its working draft and the revision visitors see (`GET /api/v1/pages`). */
 export type Page = {
   id: string;

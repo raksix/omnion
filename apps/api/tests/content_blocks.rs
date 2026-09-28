@@ -1483,3 +1483,322 @@ async fn a_heading_that_skips_back_to_an_h1_is_reported_by_the_dry_run() {
 
     fixture.cleanup().await;
 }
+
+
+/// REQ-063, slice 2: the revision compare. "The revision diff shows added/removed/changed
+/// blocks with prop-level detail, not a raw JSON diff."
+///
+/// The test drives the compare the way an author meets it — save a page, change it, open the
+/// second revision — so the assertions are about what the response says, not about the shape of
+/// a struct the handler happens to return.
+#[tokio::test]
+async fn two_revisions_compare_block_by_block() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = login(&fixture.state, &fixture.editor_email).await;
+    let page_id = fixture.page(&editor, "diffed").await;
+
+    // Revision 2: a heading, an image and a paragraph. The ids are held so the second save can
+    // reuse them — that is what makes the compare report "changed" instead of "removed and
+    // added", and it is what the editor does on every keystroke-batched save.
+    let heading = block("heading", json!({ "text": "Welcome", "level": "h1" }));
+    let image = block("image", json!({ "url": "/hero.png", "alt": "A cat" }));
+    let paragraph = block("text", json!({ "text": "The first wording." }));
+    let first = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [heading.clone(), image.clone(), paragraph.clone()] })),
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let first_revision = first.body["draft"]["id"]
+        .as_str()
+        .expect("a revision id")
+        .to_owned();
+
+    // Revision 3: the image's alt text is rewritten, the paragraph is deleted, a button is
+    // added. Three of the four change kinds, from one save.
+    let mut edited_image = image.clone();
+    edited_image["props"]["alt"] = json!("A cat asleep on a keyboard");
+    let cta = block("cta", json!({ "text": "Start now", "url": "/signup" }));
+    let second = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [heading, edited_image, cta] })),
+        ),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+    let second_revision = second.body["draft"]["id"]
+        .as_str()
+        .expect("a revision id")
+        .to_owned();
+
+    let diff = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions/{second_revision}/diff"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(diff.status, StatusCode::OK, "{}", diff.body);
+
+    // With no `?against=`, the base is the revision before the one being read. An author opening
+    // a revision has not chosen a base; the screen asking them to would be a screen that says
+    // "pick something to compare" the first time anyone opens it.
+    assert_eq!(diff.body["base"]["id"], json!(first_revision));
+    assert_eq!(diff.body["compared"]["id"], json!(second_revision));
+
+    let blocks = &diff.body["blocks"];
+    assert_eq!(blocks["changed"], json!(1), "the image: {}", diff.body);
+    assert_eq!(blocks["removed"], json!(1), "the paragraph: {}", diff.body);
+    assert_eq!(blocks["added"], json!(1), "the call to action: {}", diff.body);
+    assert!(blocks["has_removals"].as_bool().expect("a bool"));
+
+    // The changed row names the prop and shows both values. This is the whole criterion: a row
+    // saying "image changed" is a summary, a row saying "Alternative text: A cat → A cat asleep
+    // on a keyboard" is the diff.
+    let changed = blocks["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["change"] == json!("changed"))
+        .expect("a changed row");
+    assert_eq!(changed["block_id"], json!(image["id"]));
+    assert_eq!(changed["block_type"], json!("image"));
+    assert_eq!(changed["label"], json!("A cat asleep on a keyboard"));
+    let prop = &changed["props"][0];
+    assert_eq!(prop["path"], json!("alt"));
+    assert_eq!(prop["label"], json!("Alternative text"));
+    assert_eq!(prop["before"], json!("A cat"));
+    assert_eq!(prop["after"], json!("A cat asleep on a keyboard"));
+
+    // The removed row carries the paragraph's text, so a reader can tell *which* paragraph
+    // went without opening the old revision.
+    let removed = blocks["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["change"] == json!("removed"))
+        .expect("a removed row");
+    assert_eq!(removed["label"], json!("The first wording."));
+    assert_eq!(removed["to_path"], json!(""));
+
+    // The body never changed, and the compare says so rather than inventing a body diff.
+    assert_eq!(diff.body["body"]["changed"], json!(false));
+
+    // Naming the base explicitly is the same compare, which is what the revisions screen's
+    // "compare with…" picker does.
+    let explicit = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/pages/{page_id}/revisions/{second_revision}/diff?against={first_revision}"
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(explicit.status, StatusCode::OK, "{}", explicit.body);
+    assert_eq!(explicit.body["blocks"], diff.body["blocks"]);
+
+    // A revision cannot be compared with itself: the query was built wrong, and an empty diff
+    // would look like a page nobody ever edited.
+    let with_itself = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/pages/{page_id}/revisions/{second_revision}/diff?against={second_revision}"
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(with_itself.status, StatusCode::BAD_REQUEST, "{}", with_itself.body);
+    assert_eq!(with_itself.body["code"], json!("diff_same_revision"));
+
+    // The first revision on a page has nothing before it. Saying so beats comparing it with
+    // the empty tree and reporting that every block was added.
+    let first_diff = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions/{first_revision}/diff"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(first_diff.status, StatusCode::BAD_REQUEST, "{}", first_diff.body);
+    assert_eq!(first_diff.body["code"], json!("no_earlier_revision"));
+
+    fixture.cleanup().await;
+}
+
+/// A page that renders from its body has no blocks, and the compare must still answer the
+/// question — otherwise "no blocks changed" would be reported for a page whose paragraphs were
+/// rewritten wholesale.
+#[tokio::test]
+async fn a_body_only_page_compares_its_text() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = login(&fixture.state, &fixture.editor_email).await;
+    let page_id = fixture.page(&editor, "body-diffed").await;
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "body": "A completely rewritten paragraph." })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+    let revision = saved.body["draft"]["id"].as_str().expect("a revision id");
+
+    let diff = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions/{revision}/diff"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(diff.status, StatusCode::OK, "{}", diff.body);
+    assert_eq!(diff.body["body"]["changed"], json!(true));
+    assert_eq!(
+        diff.body["body"]["after"],
+        json!("A completely rewritten paragraph.")
+    );
+    assert_eq!(
+        diff.body["blocks"]["entries"],
+        json!([]),
+        "a page with no blocks has no block rows, and that is not the same as no change"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A reorder must read as a move. This is the property id-keyed comparison buys and a
+/// positional diff cannot have: after a reorder every position differs, so a positional compare
+/// reports the whole page as rewritten.
+#[tokio::test]
+async fn a_reorder_reads_as_a_move_not_as_a_rewrite() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = login(&fixture.state, &fixture.editor_email).await;
+    let page_id = fixture.page(&editor, "moved").await;
+
+    let first_block = block("text", json!({ "text": "First." }));
+    let second_block = block("text", json!({ "text": "Second." }));
+    let first = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [first_block.clone(), second_block.clone()] })),
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let base_revision = first.body["draft"]["id"].as_str().expect("a revision id");
+
+    let moved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [second_block, first_block] })),
+        ),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK, "{}", moved.body);
+    let revision = moved.body["draft"]["id"].as_str().expect("a revision id");
+
+    let diff = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions/{revision}/diff"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(diff.status, StatusCode::OK, "{}", diff.body);
+    let blocks = &diff.body["blocks"];
+    assert_eq!(blocks["moved"], json!(2), "{}", diff.body);
+    assert_eq!(blocks["added"], json!(0), "a move is not an addition");
+    assert_eq!(blocks["removed"], json!(0), "a move is not a removal");
+    assert_eq!(blocks["changed"], json!(0), "a move is not an edit");
+
+    let _ = base_revision;
+    fixture.cleanup().await;
+}
+
+/// Comparing a revision is reading the history, so it carries the same key — and a member with
+/// only `content.blocks.read` cannot use a page's history through the compare route.
+#[tokio::test]
+async fn comparing_revisions_needs_the_pages_read_key() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = login(&fixture.state, &fixture.editor_email).await;
+    let page_id = fixture.page(&editor, "guarded-diff").await;
+    let member = login(&fixture.state, &fixture.member_email).await;
+
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions/{page_id}/diff"),
+            Some(&member),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+
+    let allowed = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions/{page_id}/diff"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    // The editor passes the guard; the revision id is a page id, so the request fails later —
+    // which is exactly the point being asserted (the guard, not the lookup).
+    assert_ne!(allowed.status, StatusCode::FORBIDDEN, "{}", allowed.body);
+
+    fixture.cleanup().await;
+}

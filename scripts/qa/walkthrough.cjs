@@ -4175,6 +4175,59 @@ async function runBlockEditorDepth(page, report) {
   await shot(page, "web-block-page-rendered");
   note("checked the public render");
 
+  // ---- The revision compare (REQ-063 slice 2) -----------------------------------------------
+  // The compare is the reason the revisions screen exists, and the only way to see it working
+  // is to build a history worth comparing: the pass above has just written several revisions of
+  // the QA page, so opening its history now exercises the real case rather than a fixture.
+  //
+  // The page id is the editor's own path (`/pages/<uuid>/edit`), so the revisions screen is one
+  // hop from where the pass already is — and deriving the URL from the editor is what keeps the
+  // step pointed at *this* page rather than whichever one sorts first.
+  const pageId = (steps.path || "").match(/\/pages\/([^/]+)\/edit/)?.[1] || null;
+  steps.revisionsPageId = pageId;
+  if (pageId) {
+    await page
+      .goto(`${URL_ADMIN}/pages/${pageId}/revisions`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForSelector("[data-revision-diff]", { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+
+    steps.revisionRows = await page.locator("[data-revision-row]").count();
+    steps.diffEntries = await page.locator("[data-diff-entry]").count();
+    steps.diffCounts = await page
+      .locator("[data-diff-count]")
+      .evaluateAll((nodes) =>
+        nodes.map((node) => `${node.getAttribute("data-diff-count")}:${node.innerText.trim()}`),
+      )
+      .catch(() => []);
+    await shot(page, "page-revisions-diff");
+
+    // "Not a raw JSON diff" is a claim about the shape of a row, so the assertion is that a
+    // changed row names a *prop* in words and shows both values — not that an entry exists.
+    const changedRow = page.locator("[data-diff-entry][data-change=changed]").first();
+    steps.changedRowText = (await changedRow.innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    steps.changedRowNamesProp =
+      /Alternative text|Text|Heading|Url|Link/i.test(steps.changedRowText) &&
+      !steps.changedRowText.includes('"props"');
+
+    // Picking a different base must re-run the compare rather than be a dead control.
+    const against = page.locator("[data-revision-against]").first();
+    const options = await against.locator("option").count().catch(() => 0);
+    steps.againstOptions = options;
+    if (options > 1) {
+      const firstEntry = steps.diffEntries;
+      await against.selectOption({ index: 1 }).catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.baseSwitched = (await page.locator("[data-revision-row][aria-current=true]").count()) > 0;
+      steps.diffRecomputed = (await page.locator("[data-diff-entry]").count()) !== firstEntry ||
+        (await page.locator("[data-diff-count]").count()) > 0;
+      await shot(page, "page-revisions-diff-other-base");
+    }
+    note("compared two revisions of the QA page");
+  }
+
   report.blockEditor = steps;
   return steps;
 }
