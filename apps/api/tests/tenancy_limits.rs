@@ -1056,6 +1056,14 @@ async fn a_ceiling_really_bounds_accepting_an_invitation() {
     let limits_uri = format!("/api/v1/organizations/{}/limits", fixture.org_a);
     let invitations_uri = format!("/api/v1/organizations/{}/invitations", fixture.org_a);
 
+    // The walk states its own invite policy instead of inheriting the column default. Migration
+    // 0038 declares `invite_policy … default 'owner_approval'`, so a walk that says nothing about
+    // the policy gets a *queued* invitation (202, no token) and then blames the seat ceiling for
+    // a refusal it never reached — which is exactly the 202-vs-201 this walk used to fail on. The
+    // ceiling under test is the seats, so the policy is pinned to the one mode that hands over a
+    // working link.
+    set_invite_policy(&fixture.db, fixture.org_a, "self_serve").await;
+
     // The fixture's organization already holds two active members, so a ceiling of two is
     // exactly full.
     call(
@@ -2031,7 +2039,8 @@ async fn a_queued_link_never_works_and_says_so() {
     assert_eq!(status, "awaiting_approval");
 
     // A token that was never issued still answers indistinguishably, so the queue is not a probe
-    // for which organizations exist.
+    // for which organizations exist. `usable` and `reason` are the two fields both answers agree
+    // on — and the status must be the same too, because a `404` is itself the answer.
     let bogus = call(
         &fixture.state,
         request(
@@ -2043,6 +2052,12 @@ async fn a_queued_link_never_works_and_says_so() {
     )
     .await;
     assert_eq!(
+        bogus.status,
+        preview.status,
+        "a queued and an unknown token must answer alike: {} vs {}",
+        bogus.status, preview.status
+    );
+    assert_eq!(
         bogus.body["usable"], false,
         "an unknown token is unusable: {}",
         bogus.body
@@ -2051,6 +2066,16 @@ async fn a_queued_link_never_works_and_says_so() {
         bogus.body["reason"], preview.body["reason"],
         "a queued and an unknown token must be indistinguishable: {} vs {}",
         preview.body, bogus.body
+    );
+    assert_eq!(
+        bogus.body["reason"], "unusable",
+        "the reason must not say *which* way it is unusable: {}",
+        bogus.body
+    );
+    assert!(
+        bogus.body["organization_name"].is_null(),
+        "an unknown token names no organization: {}",
+        bogus.body
     );
 
     let _ = admin;
@@ -2581,7 +2606,51 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
     fixture.track_account(auditor_id).await;
     let auditor = login(&fixture.state, &auditor_email).await;
 
-    set_invite_policy(&fixture.db, fixture.org_a, "self_serve").await;
+    set_invite_policy(&fixture.db, fixture.org_a, "owner_approval").await;
+
+    // The settings change goes through the ROUTE, not the store. `set_invite_policy` writes the
+    // column directly, which bypasses `update_settings`'s `omnion_audit::record` call — so the
+    // walk could look for an `organization.settings.updated` row that the product never had a
+    // chance to write, and the audit screen would be blamed for a write it never received. This
+    // is the Settings tab's own route, driven with the administrator's token, so it proves the
+    // criterion the tab actually claims: "every privileged write records in the same request".
+    let settings_uri = format!("/api/v1/organizations/{}/settings", fixture.org_a);
+
+    // The route is a `PUT` of the whole row, so the walk sends the whole row. It reads the
+    // current settings first and changes one field: sending a partial body is a `422` (and would
+    // be the wrong shape anyway — the tab posts every field).
+    let before = call(
+        &fixture.state,
+        request(Method::GET, &settings_uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(before.status, StatusCode::OK, "body: {}", before.body);
+    let mut row = json!({});
+    for field in [
+        "locale",
+        "timezone",
+        "invite_policy",
+        "audit_retention_days",
+    ] {
+        row[field] = before.body["settings"][field].clone();
+    }
+    row["default_invite_role_id"] = before.body["settings"]["default_invite_role_id"].clone();
+    row["logo_media_id"] = before.body["settings"]["logo_media_id"].clone();
+    row["accent_color"] = before.body["settings"]["accent_color"].clone();
+    row["invite_policy"] = json!("self_serve");
+
+    let saved = call(
+        &fixture.state,
+        request(Method::PUT, &settings_uri, Some(&admin), Some(row)),
+    )
+    .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "the settings write the trail must contain has to work: {}",
+        saved.body
+    );
+
     invite(
         &fixture,
         &admin,
@@ -2687,6 +2756,26 @@ async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
     );
 
     // Another tenant's trail is a 404, never a 403.
+    //
+    // The other administrator is given `audit.read` **inside their own tenant** first. Without
+    // it the route's permission guard answers `403` before the handler ever resolves the tenant,
+    // which proves nothing about isolation — it only says "you may not read any trail", and a
+    // caller in that position learns nothing about tenant A. The property under test is the
+    // stronger one: a subject who *does* hold the permission, and holds it in real life, still
+    // gets a `404` rather than an empty feed for somebody else's tenant — so an audit id cannot
+    // be walked across tenants even by an auditor.
+    grant_permissions(
+        &fixture.db,
+        fixture.organizations[1],
+        sqlx::query_scalar("select id from users where email = $1")
+            .bind(&fixture.other_admin_email)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the other administrator must be readable"),
+        &["organizations.read", AUDIT_PERMISSIONS[0]],
+    )
+    .await;
+
     let other_admin = fixture.other_admin_token().await;
     let foreign = call(
         &fixture.state,
