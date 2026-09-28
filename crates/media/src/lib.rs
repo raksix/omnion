@@ -23,6 +23,7 @@ pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod retention;
 pub mod scanning;
 pub mod shares;
 pub mod storage_settings;
@@ -74,6 +75,16 @@ pub use preset_store::{
     list_presets, require_preset, require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
+pub use retention::{
+    DanglingReference, MAX_POLICY_NAME_LENGTH, MAX_WINDOW_DAYS, MIN_WINDOW_DAYS,
+    NewRetentionPolicy, PolicyChanges, PurgeOutcome, PurgeRefusal, RetentionPolicy, RetentionRun,
+    RunTotals, SWEEP_BATCH as RETENTION_SWEEP_BATCH, VersionSweep, Window, all_keys_of,
+    begin_run as begin_retention_run, create_policy, dangling_references, delete_policy,
+    enabled_policies, find_policy, finish_run as finish_retention_run, governing_window, last_run,
+    list_policies, list_runs as list_retention_runs, past_restore_window, policy_scope_paths,
+    purge_candidates, purge_eligible, repair_references, set_hold, site_policy, sites_with_media,
+    sweep_versions, update_policy, validate_new as validate_retention,
+};
 pub use shares::{
     CreatedShare, MAX_EXPIRY_DAYS, MIN_EXPIRY_MINUTES, NewShare, Share, ShareRefusal, TOKEN_BYTES,
     count_download, create_share, find_by_token, find_share, hash_token, is_password_protected,
