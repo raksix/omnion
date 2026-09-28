@@ -71,6 +71,26 @@ pub const MAX_SILENCE_DAYS: i64 = 7;
 /// rule about a trend, and a trend belongs in a report.
 pub const MAX_FOR_SECONDS: i32 = 86_400;
 
+/// The window an alert rule reads, in minutes.
+///
+/// Five minutes, and it is the same window `infra/observability/alerts.yml` wraps its `rate()`
+/// and `increase()` in. That sameness is the point: the file and the panel are two evaluations
+/// of one rule, so an operator who runs the PromQL version must not see a different incident
+/// from the one the panel shows.
+///
+/// It is deliberately longer than [`crate::alert_loop::EVAL_INTERVAL_MS`]. A window shorter than
+/// the cadence would read a window that is usually empty, and a counter whose minute bucket has
+/// not been written yet reads as zero — so a rule could flap on the evaluator's own schedule.
+pub const ALERT_WINDOW_MINUTES: usize = 5;
+
+/// The window the preview reads, in minutes — the open minute only.
+///
+/// Zero is not "the same as five": it is the difference between a preview that answers "what
+/// does the rule see at this instant" and one that answers "what did it see in the last five
+/// minutes", and a screen labelled *Preview* that silently reported the second is a screen that
+/// tells an operator an outage is over while it is still happening.
+pub const PREVIEW_WINDOW_MINUTES: usize = 0;
+
 /// One rule's row, as the evaluator needs it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Rule {
@@ -210,14 +230,31 @@ pub struct Expression {
 }
 
 impl Expression {
-    /// Evaluate against the live registry.
+    /// Evaluate against the live registry, over [`ALERT_WINDOW_MINUTES`].
     ///
     /// A family with no samples evaluates to `false`, not to a zero the comparison might pass:
     /// "no errors recorded" and "the recorder is not running" produce the same zero, and an
     /// alert that fires on the second of those is an alert that pages about its own monitoring.
     /// So the answer is `Option<f64>`, and `None` means "no data", which never fires.
+    ///
+    /// The value is the family's **windowed** reading, not its running total — see
+    /// [`metrics::Registry::windowed_max`]. It used to be the total, and the whole state machine
+    /// was built on that: a `firing` event that could not be resolved, because the number the
+    /// rule compared could never come back down. The panel's own screenshot of a rule stuck on
+    /// `firing` forever was the only symptom, because every test asserted the counter moved.
     #[must_use]
     pub fn evaluate(&self) -> Evaluation {
+        self.evaluate_over(ALERT_WINDOW_MINUTES)
+    }
+
+    /// [`Self::evaluate`] over an explicit window, in minutes.
+    ///
+    /// The window is a parameter so the PREVIEW can answer a different question from the
+    /// evaluator without forking the arithmetic: the preview is "is this rule breaching right
+    /// now", which is the open minute, and the evaluator is "has this been true for the rule's
+    /// own dwell", which is the window. Both read the same ring and the same per-kind rules.
+    #[must_use]
+    pub fn evaluate_over(&self, window_minutes: usize) -> Evaluation {
         let Some(spec) = metrics::family(self.family) else {
             // Unreachable through `parse` (it checks the catalogue), but a family removed from a
             // build while a rule survives the migration must not read as "healthy".
@@ -228,36 +265,41 @@ impl Expression {
             };
         };
 
-        let snapshots = metrics::global().series_of(spec.name, 1);
+        // A selector narrows the family, so the windowed reading has to be taken per matching
+        // series rather than for the family as a whole: `omnion_http_requests_total{status="5xx"}`
+        // must not read the total of every status class, and the difference between the two is
+        // the difference between an alert and no alert.
+        let registry = metrics::global();
+        let series = registry.series_in_window(spec.name, window_minutes);
         let mut matched: Option<f64> = None;
-        let mut series = 0usize;
+        let mut count = 0usize;
 
-        for snapshot in &snapshots {
-            if !self.matches(spec, &snapshot.labels) {
+        for reading in &series {
+            if !self.matches(spec, &reading.labels) {
                 continue;
             }
-            series += 1;
-            // A rule with no matchers aggregates: the worst value across the family, which for
-            // an error rate is the series that is actually failing rather than the average of one
-            // broken route among forty healthy ones. A NaN never wins the comparison, so a series
-            // the registry could not compute cannot make a rule fire either.
-            let value = snapshot.total;
-            if !value.is_finite() {
+            count += 1;
+            if !reading.value.is_finite() {
                 continue;
             }
             matched = Some(match matched {
-                None => value,
+                None => reading.value,
+                // A rule with no matchers aggregates: the worst value across the family, which
+                // for an error rate is the series that is actually failing rather than the
+                // average of one broken route among forty healthy ones. A `<` rule inverts —
+                // "the worst" is then the lowest, and averaging those would page on every
+                // healthy series when one was starved.
                 Some(previous) => match self.operator {
-                    Operator::Less | Operator::LessOrEqual => previous.min(value),
-                    _ => previous.max(value),
+                    Operator::Less | Operator::LessOrEqual => previous.min(reading.value),
+                    _ => previous.max(reading.value),
                 },
             });
         }
 
         Evaluation {
             value: matched,
-            matched: series > 0,
-            series,
+            matched: count > 0,
+            series: count,
         }
     }
 
@@ -939,7 +981,12 @@ pub struct Preview {
 /// Evaluate an expression for the preview.
 pub fn preview(expr: &str) -> Result<Preview, String> {
     let expression = parse(expr)?;
-    let evaluation = expression.evaluate();
+    // The OPEN MINUTE, not the evaluator's window. The two questions are different: "is this
+    // rule breaching right now" is a point reading, and "has this been true for the rule's dwell"
+    // is a window reading. Previewing the window would answer the second question on a panel
+    // that asked the first — reporting a rule as quiet for the four minutes after it stopped,
+    // which is exactly when somebody is watching the preview to decide whether to page.
+    let evaluation = expression.evaluate_over(PREVIEW_WINDOW_MINUTES);
     Ok(Preview {
         rendered: expression.render(),
         value: evaluation.value,
@@ -1216,6 +1263,330 @@ mod tests {
             metrics::family(TRANSITIONS_FAMILY).is_some(),
             "{TRANSITIONS_FAMILY} is recorded on every transition but not declared, so the \
              transition count is invisible on the scrape"
+        );
+    }
+
+    // The tests below use their own registry rather than the process-wide one. `metrics::global()`
+    // is a `OnceLock` singleton, so a test that recorded into it would be visible to every other
+    // test in the binary — and a test asserting "this rule does NOT fire" is exactly the test
+    // another test's leftover sample silently turns green.
+
+    /// Record a drop in this minute.
+    fn drop_once(registry: &metrics::Registry) {
+        registry.counter_add("omnion_exporter_dropped_total", &["probe"], 3.0);
+    }
+
+    #[test]
+    fn a_counter_rule_fires_on_the_drop_and_resolves_when_the_drops_stop() {
+        // This is the test whose absence let a permanent alert ship. `drops > 0` against a
+        // counter's RUNNING TOTAL is a rule that fires once and can never resolve: the total only
+        // goes up, so the incident never closes and the rule sits on `firing` for the life of the
+        // process. Every other test in this module asserted the counter MOVED, which is the one
+        // direction that keeps working while the bug is present.
+        let registry = metrics::Registry::new();
+
+        drop_once(&registry);
+        assert_eq!(
+            registry.windowed_max("omnion_exporter_dropped_total", 0),
+            Some(3.0),
+            "the drop did not register in the window it happened in"
+        );
+
+        // A quiet minute passes. The drop happened; it is simply no longer IN THE WINDOW, which is
+        // the whole difference between an incident that ends and an alert that is forever on.
+        registry.advance_minutes(1);
+        drop_once_quietly(&registry);
+
+        assert_eq!(
+            registry.windowed_max("omnion_exporter_dropped_total", 0),
+            Some(0.0),
+            "a minute with no drops must read zero, so the rule can resolve"
+        );
+        // And the counter itself has not been reset: this is a window, not a reset, and an
+        // operator reading `/metrics` must still see the loss they suffered.
+        assert_eq!(
+            registry.value_of("omnion_exporter_dropped_total", &["probe"]),
+            Some(3.0),
+            "the running total was reset by a window rolling over — /metrics now lies about a \
+             loss that already happened"
+        );
+    }
+
+    /// Record a minute that had no drops, which closes the previous one at its value.
+    fn drop_once_quietly(registry: &metrics::Registry) {
+        // A zero delta into the SAME counter. The ring closes a minute when something is recorded
+        // in a later one, and a counter cannot be written with a negative delta (`record` ignores
+        // those by design), so a zero is the honest way to say "this minute passed and nothing
+        // happened" — as opposed to touching an unrelated family, which is what the first draft
+        // of this helper did and which left the counter's minute open.
+        registry.counter_add("omnion_exporter_dropped_total", &["probe"], 0.0);
+    }
+
+    #[test]
+    fn a_counter_reading_is_the_growth_inside_the_window_not_the_total_behind_it() {
+        let registry = metrics::Registry::new();
+        drop_once(&registry);
+        // Growth in the current window is the 3 drops that just happened.
+        let window = registry
+            .windowed_max("omnion_exporter_dropped_total", 0)
+            .expect("a window");
+        let total = registry
+            .value_of("omnion_exporter_dropped_total", &["probe"])
+            .expect("a recorded series");
+        assert_eq!(total, 3.0, "the running total is every drop since boot");
+        assert_eq!(
+            window, total,
+            "with no time having passed, the window and the total are the same number — which is \
+             why this test needs the second minute below to tell them apart"
+        );
+
+        // Now a later window with no drops: the total is unchanged and the window is not.
+        registry.advance_minutes(6);
+        drop_once_quietly(&registry);
+        assert_eq!(
+            registry.value_of("omnion_exporter_dropped_total", &["probe"]),
+            Some(3.0),
+            "the total must not fall when time passes"
+        );
+        assert_eq!(
+            registry.windowed_max("omnion_exporter_dropped_total", 1),
+            Some(0.0),
+            "the last minute had no drops, so a rule reading the window goes quiet — the \
+             acceptance line 'resolves when the dependency returns'"
+        );
+    }
+
+    #[test]
+    fn a_gauge_rule_reads_the_level_not_a_sum() {
+        // A queue that drains is healthy. A sum would keep an alert up after the backlog is gone,
+        // which is the same defect as the counter's from the other direction.
+        //
+        // TWO minutes, and that is the load-bearing part: a single minute has one point, and a
+        // sum of one point IS its level, so the first draft of this test passed against a window
+        // that summed gauges. It only bites once the ring holds a high minute and a low one.
+        let registry = metrics::Registry::new();
+        let labels = ["email", "ready"];
+        registry.gauge_set("omnion_queue_depth", &labels, 500.0);
+        assert_eq!(
+            registry.windowed_max("omnion_queue_depth", 0),
+            Some(500.0),
+            "a gauge is its own level"
+        );
+
+        registry.advance_minutes(1);
+        registry.gauge_set("omnion_queue_depth", &labels, 10.0);
+        assert_eq!(
+            registry.windowed_max("omnion_queue_depth", 0),
+            Some(10.0),
+            "a gauge reads the LEVEL it is at now, not the high-water mark it passed through"
+        );
+        // A sum over the same window would read 510, which is a queue depth no queue ever had.
+        assert_eq!(
+            registry.windowed_max("omnion_queue_depth", 2),
+            Some(10.0),
+            "a wider window must not add a gauge's minutes together — the backlog did not grow to \
+             510 items, it drained to 10"
+        );
+    }
+
+    #[test]
+    fn a_histogram_rule_reads_a_mean_not_a_running_sum() {
+        // `duration > 1.5` on a sum breaches on the first slow request and never clears, no
+        // matter how much fast traffic follows. A mean is what "slow" means.
+        let registry = metrics::Registry::new();
+        let labels = ["POST", "/api/v1/login"];
+        registry.observe("omnion_http_request_duration_seconds", &labels, 0.1);
+        registry.observe("omnion_http_request_duration_seconds", &labels, 0.2);
+        let mean = registry
+            .windowed_max("omnion_http_request_duration_seconds", 0)
+            .expect("a window");
+        assert!(
+            mean < 1.5,
+            "two fast requests must not read as a slow request (mean {mean})"
+        );
+
+        // Two minutes, so a mean and a running sum are different numbers. The sum of the whole
+        // history is 0.3 — below the line — so this alone would not catch it; what catches it is
+        // that the MEAN stays 0.15 while any accumulating total keeps growing with every request.
+        registry.advance_minutes(1);
+        for _ in 0..20 {
+            registry.observe("omnion_http_request_duration_seconds", &labels, 0.1);
+        }
+        let across_two_minutes = registry
+            .windowed_max("omnion_http_request_duration_seconds", 5)
+            .expect("a window");
+        // Through `series_of`, not `value_of`: a histogram accumulates in `sum`, and
+        // `value_of` reads `series.value`, which no histogram write ever touches and which is
+        // therefore always 0. That is a real edge in the accessor, not a fixture mistake — the
+        // first draft of this assertion used it and "proved" the sum was 0.
+        let total = registry
+            .series_of("omnion_http_request_duration_seconds", 5)
+            .into_iter()
+            .find(|snapshot| snapshot.labels == labels)
+            .map(|snapshot| snapshot.total)
+            .expect("a recorded series");
+        assert!(
+            total > 2.0,
+            "the running sum of 22 observations should exceed the slow line; the fixture is \
+             wrong, not the code"
+        );
+        assert!(
+            across_two_minutes < 1.5,
+            "22 fast requests read as a slow route (mean {across_two_minutes}) — the rule is \
+             comparing an accumulating total"
+        );
+    }
+
+    #[test]
+    fn the_windowed_reading_ignores_a_series_with_no_points_in_the_window() {
+        // "No data in the window" and "zero in the window" are different answers, and only the
+        // first may be treated as an absence. A window that is three minutes old has rolled out
+        // of every window here, and reporting it as a zero is what pages an operator for a
+        // webhook that stopped delivering an hour ago.
+        let registry = metrics::Registry::new();
+        let stale = ["stale"];
+        registry.counter_add("omnion_webhook_deliveries_total", &stale, 9.0);
+
+        // Still inside the open minute.
+        assert_eq!(
+            registry
+                .series_in_window("omnion_webhook_deliveries_total", 0)
+                .len(),
+            1,
+            "a series recorded in this minute is missing from the window"
+        );
+
+        // Four minutes later this series has no bucket inside a one-minute window at all, so it
+        // must be ABSENT rather than a zero — and `windowed_max` must then find nothing, which is
+        // what `matched = false` (and therefore "does not fire") is derived from.
+        registry.advance_minutes(4);
+        registry.counter_add("omnion_webhook_deliveries_total", &["live"], 1.0);
+        let readings = registry.series_in_window("omnion_webhook_deliveries_total", 1);
+        assert!(
+            readings.iter().all(|reading| reading.labels != stale),
+            "a series whose minute rolled out of the window was still reported: {readings:?}"
+        );
+        assert_eq!(
+            registry.windowed_max("omnion_webhook_deliveries_total", 1),
+            Some(1.0),
+            "the window must read the series that is actually inside it"
+        );
+    }
+
+    #[test]
+    fn the_ring_plots_one_bucket_per_minute_and_no_more() {
+        // The duplication the window arithmetic was masking. Three minutes of drops plotted as
+        // FIVE buckets, so a three-minute window summed five minutes of traffic and the chart
+        // drew a staircase. A window that sums its buckets cannot see it — a correct sum of a
+        // wrong ring is still wrong — so the assertion has to be on the ring's own length.
+        let registry = metrics::Registry::new();
+        let labels = ["probe"];
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 2.0);
+        registry.advance_minutes(1);
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 5.0);
+        registry.advance_minutes(1);
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 1.0);
+
+        let points: Vec<f64> = registry
+            .series_of("omnion_exporter_dropped_total", 10)
+            .into_iter()
+            .next()
+            .expect("the series")
+            .points
+            .into_iter()
+            .map(|point| point.value)
+            .collect();
+        assert_eq!(
+            points,
+            vec![2.0, 5.0, 1.0],
+            "three minutes must plot three buckets carrying their own deltas — a repeated \
+             bucket is a window that counts the same traffic twice"
+        );
+    }
+
+    #[test]
+    fn a_minute_nobody_recorded_in_plots_as_silence_rather_than_a_line() {
+        // The other half of the close loop: a gap is a flat minute, not a straight line between
+        // two samples. Without it a chart interpolates over an outage and reads as traffic that
+        // never happened.
+        let registry = metrics::Registry::new();
+        let labels = ["probe"];
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 4.0);
+        // Four minutes of silence.
+        registry.advance_minutes(5);
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 1.0);
+
+        let points: Vec<f64> = registry
+            .series_of("omnion_exporter_dropped_total", 10)
+            .into_iter()
+            .next()
+            .expect("the series")
+            .points
+            .into_iter()
+            .map(|point| point.value)
+            .collect();
+        assert_eq!(
+            points,
+            vec![4.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "the quiet minutes must be four flat zeros, not a line from 4 to 1"
+        );
+    }
+
+    #[test]
+    fn a_window_that_spans_several_minutes_sums_only_those_minutes() {
+        // The width is the other half of the fix. With the window collapsed to the open minute,
+        // a five-minute rule would answer a five-minute question with the last sixty seconds —
+        // and every other test here would still pass, because each of them only ever looks at
+        // one or two minutes.
+        let registry = metrics::Registry::new();
+        let labels = ["probe"];
+
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 2.0);
+        registry.advance_minutes(1);
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 5.0);
+        registry.advance_minutes(1);
+        registry.counter_add("omnion_exporter_dropped_total", &labels, 1.0);
+
+        // The open minute alone saw 1.
+        assert_eq!(
+            registry.windowed_max("omnion_exporter_dropped_total", 0),
+            Some(1.0),
+            "the open minute is not the whole window"
+        );
+        // A two-minute window saw 5 + 1.
+        assert_eq!(
+            registry.windowed_max("omnion_exporter_dropped_total", 2),
+            Some(6.0),
+            "a two-minute window must add the two minutes inside it"
+        );
+        // A ten-minute window saw everything since the registry was built.
+        assert_eq!(
+            registry.windowed_max("omnion_exporter_dropped_total", 10),
+            Some(8.0),
+            "a wide window must add every minute inside it, not just the last"
+        );
+    }
+
+    #[test]
+    fn a_label_selector_reads_only_the_series_it_names() {
+        // The regression this whole change risks introducing: computing the window per family and
+        // then filtering would make `{status="5xx"}` read every status class.
+        let registry = metrics::Registry::new();
+        let ok = ["/login", "POST", "2xx"];
+        let bad = ["/login", "POST", "5xx"];
+        registry.counter_add("omnion_http_requests_total", &ok, 100.0);
+        registry.counter_add("omnion_http_requests_total", &bad, 1.0);
+
+        let matching: Vec<f64> = registry
+            .series_in_window("omnion_http_requests_total", 0)
+            .into_iter()
+            .filter(|reading| reading.labels[2] == "5xx")
+            .map(|reading| reading.value)
+            .collect();
+        assert_eq!(
+            matching,
+            vec![1.0],
+            "the selector did not narrow the family before the window was taken"
         );
     }
 

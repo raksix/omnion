@@ -501,6 +501,18 @@ struct Inner {
 pub struct Registry {
     spec: Vec<FamilySpec>,
     inner: Mutex<Inner>,
+    /// An offset applied to the wall clock when the history ring buckets, in minutes.
+    ///
+    /// This exists because the ring buckets by the CURRENT minute, and without a seam there is
+    /// no way to write a test — or a walk — that says "this dropped, then a minute passed, then
+    /// it stopped dropping". Both halves of an alert are about a window opening and closing, so
+    /// a suite that cannot advance the clock can only ever prove the opening — which is exactly
+    /// the half that was already green when a rule could never resolve.
+    ///
+    /// It is an OFFSET, not a replacement for the clock, and it lives on the instance rather than
+    /// behind a global: a test that shifted the process-wide registry's clock would redraw every
+    /// real metric's history, and the next test in the binary would inherit it.
+    clock: std::sync::atomic::AtomicI64,
 }
 
 impl Default for Registry {
@@ -521,7 +533,28 @@ impl Registry {
                 global_budget: total.max(1),
                 ..Inner::default()
             }),
+            clock: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// Move this registry's clock forward by `minutes`, for tests.
+    ///
+    /// Only ever called from a test's own registry; [`global`] is never given one, because a
+    /// shifted clock in the process-wide registry would redraw every real metric's history.
+    pub fn advance_minutes(&self, minutes: i64) {
+        self.clock
+            .fetch_add(minutes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The minute this registry buckets into.
+    fn minute(&self) -> i64 {
+        // A plain OFFSET from the wall clock, never a replacement for it. The first draft used
+        // `i64::MIN` as a "no override" sentinel and added the wall clock to it, which overflowed
+        // to a large negative minute: the ring then saw every later write as belonging to a past
+        // bucket, so nothing rolled and a "quiet minute" read as the previous minute's drops. A
+        // seam that lies about the clock is worse than no seam, and it failed as a confusing
+        // assertion rather than as an arithmetic error.
+        current_minute() + self.clock.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The declared families, in catalogue order.
@@ -610,7 +643,7 @@ impl Registry {
 
         let mut guard = self.lock();
         let labels = self.normalise(&mut guard, &spec, labels);
-        let minute = current_minute();
+        let minute = self.minute();
         let cap = self.cap_for(&guard, &spec);
         let name = spec.name.to_owned();
 
@@ -643,7 +676,7 @@ impl Registry {
             if let Some(series) = existing {
                 Self::apply(series, minute, &apply);
             } else {
-                let mut series = Self::blank(&overflow, &spec);
+                let mut series = Self::blank(&overflow, &spec, minute);
                 Self::apply(&mut series, minute, &apply);
                 guard
                     .series
@@ -654,12 +687,12 @@ impl Registry {
             return;
         }
 
-        let mut series = Self::blank(&labels, &spec);
+        let mut series = Self::blank(&labels, &spec, minute);
         Self::apply(&mut series, minute, &apply);
         guard.series.entry(name).or_default().push(series);
     }
 
-    fn blank(labels: &[String], spec: &FamilySpec) -> Series {
+    fn blank(labels: &[String], spec: &FamilySpec, minute: i64) -> Series {
         Series {
             labels: labels.to_vec(),
             kind: spec.kind,
@@ -668,7 +701,7 @@ impl Registry {
             count: 0,
             buckets: vec![0; spec.buckets().len()],
             history: VecDeque::new(),
-            open_minute: current_minute(),
+            open_minute: minute,
             minute_start_value: 0.0,
             minute_start_sum: 0.0,
             minute_start_count: 0,
@@ -681,16 +714,35 @@ impl Registry {
     /// so a process that records nothing for five minutes gets five flat minutes rather than a
     /// straight line between two points — a chart that interpolates over silence reads as traffic
     /// that never happened.
+    ///
+    /// The close happens BEFORE the value is applied, and the order is the whole correctness of
+    /// the ring. The first version applied first and closed afterwards, which attributed every
+    /// sample to the minute *before* the one it was recorded in: the minute a write landed in
+    /// plotted its own delta minus the new one, so it read 0, and the previous minute carried
+    /// both. For a chart that is an hour of traffic shifted left, and for an alert it is worse —
+    /// a `for: 0` rule reads the open minute, which was always 0, so the rule that exists to page
+    /// the moment telemetry starts being lost could not fire until the next minute, and a
+    /// five-minute window was really a four-minute one shifted by one.
     fn apply(series: &mut Series, minute: i64, apply: &impl Fn(&mut Series)) {
-        apply(series);
+        let first = series.open_minute;
         while series.open_minute < minute {
-            let value = plot(series);
-            series.history.push_back((series.open_minute, value));
             series.open_minute += 1;
             series.minute_start_value = series.value;
             series.minute_start_sum = series.sum;
             series.minute_start_count = series.count;
+            // The minute that was open has ALREADY been written by the previous call — that is
+            // what the tail of this function does. Pushing it again on the way past is what made
+            // three minutes of drops plot as five buckets (`2, 2, 5, 5, 1`), so every counter's
+            // window was double-counting and a chart drew a staircase. Only a minute that was
+            // genuinely SKIPPED needs a point, and it plots as silence rather than as a straight
+            // line between two samples.
+            if series.open_minute > first + 1 {
+                series
+                    .history
+                    .push_back((series.open_minute - 1, plot(series)));
+            }
         }
+        apply(series);
         let point = plot(series);
         match series.history.back_mut() {
             Some((at, value)) if *at == minute => *value = point,
@@ -787,7 +839,7 @@ impl Registry {
     #[must_use]
     pub fn series_of(&self, name: &str, window_minutes: usize) -> Vec<SeriesSnapshot> {
         let guard = self.lock();
-        let cutoff = current_minute() - window_minutes.min(MAX_POINTS).max(1) as i64;
+        let cutoff = self.minute() - window_minutes.min(MAX_POINTS).max(1) as i64;
         guard
             .series
             .get(name)
@@ -813,6 +865,104 @@ impl Registry {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Every series of a family with its **windowed** reading, in registration order.
+    ///
+    /// This is the per-series form, and it is what an alert rule needs: a rule selects by label
+    /// (`{status="5xx"}`), so the window has to be computed for the series the selector matches
+    /// rather than for the family as a whole. [`Self::windowed_max`] is the family-level
+    /// shortcut for a caller that does not filter, and is built on this one so the two can never
+    /// disagree about what a window means.
+    #[must_use]
+    pub fn series_in_window(&self, name: &str, window_minutes: usize) -> Vec<WindowedSeries> {
+        let Some(kind) = family(name).map(|spec| spec.kind) else {
+            return Vec::new();
+        };
+        let guard = self.lock();
+        let cutoff = self.cutoff(window_minutes);
+
+        guard
+            .series
+            .get(name)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|series| {
+                        let points: Vec<f64> = series
+                            .history
+                            .iter()
+                            .filter(|(at, _)| *at >= cutoff)
+                            .map(|(_, value)| *value)
+                            .collect();
+                        if points.is_empty() {
+                            return None;
+                        }
+                        // Per kind, and the same arithmetic in both callers: a counter's points
+                        // are already per-minute deltas, a gauge's last point is its level, and a
+                        // histogram's points are per-minute means.
+                        let value = match kind {
+                            MetricKind::Counter => points.iter().sum(),
+                            MetricKind::Gauge => *points.last().expect("the slice is not empty"),
+                            MetricKind::Histogram => {
+                                points.iter().sum::<f64>() / points.len() as f64
+                            }
+                        };
+                        Some(WindowedSeries {
+                            labels: series.labels.clone(),
+                            value,
+                            observations: points.len(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The worst **windowed** value across a family's matching series, or `None` when none
+    /// matched.
+    ///
+    /// This is what an alert rule compares, and it is deliberately not [`Self::value_of`]'s
+    /// running total. The two differ for every family that is not a gauge, and the difference is
+    /// not academic: a counter's total only ever goes up, so a rule reading it (`drops > 0`)
+    /// breaches the moment it first breaches and **can never resolve** — the incident closes in
+    /// the panel's history and stays open in the rule's. That shipped in [`crate::alerts`] until
+    /// this function existed, with every unit test green, because each test asserted the
+    /// *counter moved* rather than that the rule could go quiet again.
+    ///
+    /// A window is what PromQL's `rate()` / `increase()` compute, so this is also what makes the
+    /// bundled `alerts.yml` and the panel's `BUNDLED_RULES` the same rule rather than two
+    /// rules that look alike: the file says `increase(omnion_exporter_dropped_total[5m]) > 0`
+    /// and the panel now says the same thing.
+    ///
+    /// Per kind, over the last `window_minutes`:
+    ///
+    /// * **counter** — the sum of the minute deltas (what actually happened in the window).
+    /// * **gauge** — the latest point, since a level is a level.
+    /// * **histogram** — the mean of the observations recorded in the window, so a rule
+    ///   written as `... > 1.5` reads as a mean latency rather than as a running sum that any
+    ///   traffic at all carries above the line.
+    ///
+    /// `window_minutes` of 0 means "the open minute only", which is the honest reading of a
+    /// process that has been up one minute: no window has elapsed yet.
+    #[must_use]
+    pub fn windowed_max(&self, name: &str, window_minutes: usize) -> Option<f64> {
+        self.series_in_window(name, window_minutes)
+            .into_iter()
+            .map(|reading| reading.value)
+            .filter(|value| value.is_finite())
+            .reduce(f64::max)
+    }
+
+    /// The oldest minute a window of `window_minutes` reaches, INCLUSIVE.
+    ///
+    /// A window of N is the N most recent buckets, so the cut is `minute - N + 1` and not
+    /// `minute - N`: subtracting N includes the bucket just OUTSIDE the window, which made a
+    /// two-minute rule sum three minutes. The `max(1)` is what makes a window of zero mean "the
+    /// open minute" rather than "a minute in the future", which would be empty and read as no
+    /// data at all.
+    fn cutoff(&self, window_minutes: usize) -> i64 {
+        let window = window_minutes.min(MAX_POINTS).max(1) as i64;
+        self.minute() - window + 1
     }
 
     /// The value of one exact series, or `None` when it was never recorded.
@@ -909,6 +1059,19 @@ pub struct SeriesSnapshot {
     pub observations: u64,
     /// The minute buckets inside the requested window, oldest first.
     pub points: Vec<Point>,
+}
+
+/// One series' reading over a window, as an alert rule sees it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct WindowedSeries {
+    /// The series' label values, positionally matching the family's label names.
+    pub labels: Vec<String>,
+    /// The windowed value: the counter's increase, the gauge's level, the histogram's mean.
+    pub value: f64,
+    /// How many minute buckets the window covered, so "no data" and "a quiet window" stay
+    /// distinguishable — a rule that fired on one old bucket and one that fired on a full window
+    /// of drops are not the same incident, and the timeline is where that difference is read.
+    pub observations: usize,
 }
 
 /// One point on a chart.
