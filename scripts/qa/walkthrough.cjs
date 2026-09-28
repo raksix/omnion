@@ -390,6 +390,24 @@ async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(900);
+
+  // A fresh installation does not answer "/" with the wizard: the request gate sends an anonymous
+  // visitor to /login, and *that* screen asks the API whether setup is needed and replaces itself
+  // with /setup. The redirect is client-side, so the URL is not the answer yet — reading it after a
+  // fixed 900ms makes the pass decide "an installation already exists" about an empty database, and
+  // then fail to sign into the account it never created. Wait for one of the two to be true
+  // instead of assuming after a sleep.
+  await page
+    .waitForFunction(
+      () => location.pathname.includes("/setup") || location.pathname.includes("/login"),
+      null,
+      { timeout: 15000 },
+    )
+    .catch(() => {});
+  await page
+    .waitForFunction(() => !location.pathname.includes("/setup"), null, { timeout: 8000 })
+    .catch(() => {});
+
   const url = page.url();
   if (!url.includes("/setup")) {
     log(`wizard: not in setup (${url}) — installation already exists`);
