@@ -107,3 +107,45 @@ alter table webhook_deliveries
 comment on column webhook_deliveries.trace_context is
     'The producing request''s W3C trace id/span id and request id, written at enqueue so the consumer '
     'span can link back (REQ-126 slice 3). Null when the delivery was queued outside a traced request.';
+
+-- The exporter rows (REQ-126, slice 3).
+--
+-- The `auth_secret_id` is a REFERENCE, never a credential: the request is explicit that each
+-- exporter is "configured as an exporter row with a secret reference (REQ-037) rather than an
+-- inline credential", and a column that could hold a token is a column that will eventually hold
+-- one. The `on delete set null` is the right direction — deleting the secret de-authenticates the
+-- exporter rather than deleting the exporter, so the operator sees a broken exporter and fixes it
+-- instead of finding that a secret rotation silently removed their telemetry.
+create table if not exists obs_exporters (
+    id              uuid        primary key default gen_random_uuid(),
+    name            text        not null,
+    kind            text        not null,
+    endpoint        text        not null,
+    protocol        text,
+    auth_secret_id  uuid        references secrets (id) on delete set null,
+    batch_ms        integer     not null default 5000,
+    timeout_ms      integer     not null default 10000,
+    enabled         boolean     not null default true,
+    health          text        not null default 'unknown',
+    last_flush_at   timestamptz,
+    last_error      text,
+    -- The persisted drop counter. The in-process counter is authoritative for the current process,
+    -- but a restart must not reset the number an operator is looking at, so the flush loop folds
+    -- it in here. Keeping both is the honest option: "0 since restart" and "17,482 this month"
+    -- answer different questions and neither alone answers both.
+    dropped_total   bigint      not null default 0,
+    created_by      uuid,
+    created_at      timestamptz not null default now(),
+    constraint obs_exporters_kind_check
+        check (kind in ('otlp', 'prometheus_remote_write', 'syslog', 'webhook')),
+    constraint obs_exporters_health_check
+        check (health in ('unknown', 'ok', 'degraded', 'down')),
+    constraint obs_exporters_batch_check check (batch_ms between 100 and 3600000),
+    constraint obs_exporters_timeout_check check (timeout_ms between 100 and 600000),
+    constraint obs_exporters_name_key unique (name)
+);
+
+comment on table obs_exporters is
+    'A telemetry sink. auth_secret_id references the secret store; no credential is ever stored here.';
+
+--   drop table if exists obs_exporters;
