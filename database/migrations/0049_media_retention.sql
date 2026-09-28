@@ -178,10 +178,22 @@ insert into media_retention_policies (site_id, name)
 select id, 'Standard retention' from sites
 on conflict (site_id, name) do nothing;
 
+-- A site created after the migration gets a row. The seed above covers the sites that existed
+-- when this migration ran; a new one would have no policy, and the failure mode is a pleasant
+-- `GET` that answers with platform defaults while every save writes nothing.
+--
+-- The **name** is in the insert, and the first version omitted it: `name` is `not null` with
+-- no default, so the trigger fired on every `sites` insert and failed with
+-- `null value in column "name" of relation "media_retention_policies"` — which does not read
+-- as a retention problem at all. It reads as *the site could not be created*, and it fires
+-- from a trigger two migrations away, so the only place the error names the cause is the
+-- function body. A unit test on `validate_new` could never have seen it; the walk that creates
+-- a site did, immediately, five times out of five.
 create or replace function media_retention_policy_default() returns trigger
 language plpgsql as $$
 begin
-    insert into media_retention_policies (site_id) values (new.id) on conflict do nothing;
+    insert into media_retention_policies (site_id, name) values (new.id, 'Standard retention')
+    on conflict do nothing;
     return new;
 end $$;
 

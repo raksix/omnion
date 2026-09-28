@@ -26,6 +26,7 @@ import {
   Plus,
   RotateCcw,
   ShieldCheck,
+  ShieldOff,
   Tag as TagIcon,
   X,
 } from "lucide-react";
@@ -46,6 +47,7 @@ import {
   mediaRawUrl,
   mediaVersionRawUrl,
   restoreMediaVersion,
+  setMediaHold,
   updateMediaFile,
 } from "@/lib/api";
 import { formatBytes, formatTimestamp } from "@/lib/format";
@@ -570,6 +572,111 @@ function MetadataTab({
           {saving ? "Saving…" : "Save metadata"}
         </button>
       </div>
+
+      <LegalHold file={file} />
+    </div>
+  );
+}
+
+/**
+ * The legal hold, on the metadata tab rather than a fifth tab of its own.
+ *
+ * A hold is a fact about the *file*, so it belongs with the file's other facts rather than in
+ * a place an operator has to go looking. Three things on it are deliberate:
+ *
+ * - **the reason is required, and the input is always visible.** A hold with no reason is a
+ *   file nobody will ever be allowed to delete and nobody can explain; a release with no
+ *   reason is a file somebody bypassed the rules for. The platform refuses both.
+ * - **the consequence is stated before the button, not after.** "Retention will not remove
+ *   this file" is what somebody needs to know at the moment they decide, and discovering it
+ *   afterwards — when the file is still there — is the only way to be sure of it.
+ * - **a second identical press is a no-op and says so**, rather than writing a second audit
+ *   row: a log with three identical entries reads as three people and answers nothing about
+ *   who decided what.
+ */
+function LegalHold({ file }: { file: MediaFile }) {
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const held = file.legal_hold === true;
+
+  const apply = useCallback(
+    async (next: boolean) => {
+      setBusy(true);
+      setProblem(null);
+      setNote(null);
+      try {
+        const answer = await setMediaHold(file.id, next, reason.trim());
+        if (!answer.changed) {
+          setNote(`This file is already ${next ? "under a legal hold" : "not held"}. Nothing was recorded.`);
+        } else {
+          setReason("");
+          setNote(
+            next
+              ? "The file is under a legal hold. No retention run will remove it until the hold is cleared."
+              : "The hold is cleared. The next eligible run may remove this file if it is past its window.",
+          );
+        }
+      } catch (cause) {
+        setProblem(cause instanceof ApiError ? cause.message : "The hold was not changed.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [file.id, reason],
+  );
+
+  return (
+    <div
+      className="mt-3 space-y-2 border-t border-line pt-3"
+      data-testid="media-legal-hold"
+      data-held={held ? "true" : "false"}
+    >
+      <h3 className="text-[12.5px] font-medium">Legal hold</h3>
+      <p className="text-[12px] text-muted">
+        {held
+          ? "This file is held: retention will not remove it, at any depth, under any policy. It survives a purge, an emptied trash and a shortened window until somebody clears this."
+          : "A legal hold stops every retention rule from touching this file — versions, trash and purge. It is the switch to use for a file under litigation, an audit or a dispute, and clearing it is a decision somebody will be asked to justify."}
+      </p>
+
+      <label className="block text-[12px]">
+        <span className="text-ink">Reason</span>
+        <input
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder={held ? "Why the hold is being cleared" : "Litigation hold, case 2026-114"}
+          data-testid="media-hold-reason"
+          className="mt-0.5 w-full rounded-md border border-line bg-canvas px-2 py-1.5 text-[12px]"
+        />
+      </label>
+
+      {problem ? (
+        <p role="alert" className="text-[11.5px] text-danger">
+          {problem}
+        </p>
+      ) : null}
+      {note ? (
+        <p role="status" className="text-[11.5px] text-muted">
+          {note}
+        </p>
+      ) : null}
+
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void apply(!held)}
+        data-testid="media-hold-toggle"
+        className={[
+          "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[12px] transition-opacity disabled:opacity-50",
+          held
+            ? "border-warn/50 text-warn hover:bg-warn/5"
+            : "border-line hover:bg-canvas",
+        ].join(" ")}
+      >
+        {held ? <ShieldOff className="h-3.5 w-3.5" aria-hidden /> : <ShieldCheck className="h-3.5 w-3.5" aria-hidden />}
+        {held ? "Clear the hold" : "Put this file under a legal hold"}
+      </button>
     </div>
   );
 }

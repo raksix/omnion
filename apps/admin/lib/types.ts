@@ -188,6 +188,114 @@ export type MediaScanSettingsInput = Partial<
   Omit<MediaScanSettings, "secret_available" | "behaviour" | "pending_count" | "configured">
 >;
 
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-010, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** One retention policy. */
+export type MediaRetentionPolicy = {
+  id: string;
+  site_id: string;
+  name: string;
+  /** The folder it governs; `null` means the whole site. */
+  folder_id: string | null;
+  /** The folder's path, so the screen names a folder rather than printing a uuid. */
+  folder_path: string;
+  keep_versions_days: number;
+  trash_days: number;
+  purge_after_days: number;
+  legal_hold: boolean;
+  enabled: boolean;
+  /** What the policy does to a file, in one sentence. */
+  behaviour: string;
+  /** What the policy is scoped to, in words. */
+  scope: string;
+};
+
+/** The policy list of a site, with the numbers the screen cannot compute on its own. */
+export type MediaRetentionList = {
+  site_id: string;
+  policies: MediaRetentionPolicy[];
+  /** Trashed files whose restore window has closed. */
+  past_restore: number;
+  /** The bytes those files occupy. */
+  past_restore_bytes: number;
+  last_run: MediaRetentionRun | null;
+  /** One sentence about the site-wide rule. */
+  summary: string;
+};
+
+/** A policy as the editor sends it. Every field is optional so a save sends only what changed. */
+export type MediaRetentionPolicyInput = {
+  name?: string;
+  /**
+   * `undefined` leaves the scope alone; `null` widens the policy to the whole site.
+   *
+   * The distinction is load-bearing: the API reads the scope from the **key's presence**, so a
+   * form that sends `folder_id: undefined` (which `JSON.stringify` drops) edits the other two
+   * windows and leaves the scope exactly as it was.
+   */
+  folder_id?: string | null;
+  keep_versions_days?: number;
+  trash_days?: number;
+  purge_after_days?: number;
+  legal_hold?: boolean;
+  enabled?: boolean;
+};
+
+/** One row of the retention run log. */
+export type MediaRetentionRun = {
+  id: string;
+  kind: string;
+  versions_removed: number;
+  versions_bytes: number;
+  purged: number;
+  purged_bytes: number;
+  /** Files the sweep would not purge because something still points at them. */
+  refused: number;
+  /** Files the legal hold removed from the eligible set. */
+  held_back: number;
+  /** What stopped the run; empty when nothing did. */
+  error: string;
+  started_at: string;
+  finished_at: string | null;
+  /** One sentence — a number without a word is not an answer an operator can act on. */
+  summary: string;
+  bytes_reclaimed: number;
+};
+
+/** The run log of a site, newest first. */
+export type MediaRetentionRunList = {
+  site_id: string;
+  runs: MediaRetentionRun[];
+};
+
+/** One "this file is still referenced" line, naming the record that holds it. */
+export type MediaPurgeRefusal = {
+  media_id: string;
+  filename: string;
+  resource_kind: string;
+  resource_id: string;
+  field: string;
+  describe: string;
+};
+
+/** The answer to "run retention now". */
+export type MediaRetentionRunResult = {
+  run_id: string;
+  run: MediaRetentionRun;
+  remaining_files: number;
+  remaining_bytes: number;
+  refused: MediaPurgeRefusal[];
+};
+
+/** The answer to "repair the stale references". */
+export type MediaRetentionRepair = {
+  site_id: string;
+  references_removed: number;
+  summary: string;
+};
+
 /** One held file (`GET /api/v1/media/quarantine`). */
 export type MediaQuarantineEntry = {
   id: string;
@@ -314,6 +422,15 @@ export type MediaFile = Media & {
   display_height: number | null;
   scan_status: string;
   version_count: number;
+  /**
+   * Whether a legal hold is on the file (REQ-010, slice 4).
+   *
+   * `false` rather than `absent` for a server that predates the column: the detail screen's
+   * hold switch reads this to decide which button to draw, and `undefined` would have to be
+   * treated as "not held" anyway — so the type says so rather than leaving it to a truthiness
+   * check that happens to work.
+   */
+  legal_hold: boolean;
   uploaded_by: string | null;
   updated_at: string | null;
 };

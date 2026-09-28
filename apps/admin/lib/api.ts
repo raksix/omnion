@@ -32,6 +32,12 @@ import type {
   MediaSweepResult,
   MediaStorageSettingsInput,
   MediaReplaceResult,
+  MediaRetentionList,
+  MediaRetentionPolicy,
+  MediaRetentionPolicyInput,
+  MediaRetentionRepair,
+  MediaRetentionRunList,
+  MediaRetentionRunResult,
   MediaTrash,
   MediaVersionList,
   OnboardingStatus,
@@ -3826,6 +3832,84 @@ export function runMediaScan(siteId: string): Promise<MediaSweepResult> {
 /** The run log of a site, newest first. */
 export function fetchMediaScanRuns(siteId: string): Promise<MediaScanRunList> {
   return request<MediaScanRunList>(`/api/v1/media/scan/runs?${mediaQuery(siteId)}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-010, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** A site's retention policies and the numbers around them. */
+export function fetchMediaRetention(siteId: string): Promise<MediaRetentionList> {
+  return request<MediaRetentionList>(`/api/v1/media/retention?${mediaQuery(siteId)}`);
+}
+
+/** Create a retention policy. */
+export function createMediaRetentionPolicy(
+  siteId: string,
+  input: MediaRetentionPolicyInput,
+): Promise<MediaRetentionPolicy> {
+  return request<MediaRetentionPolicy>(`/api/v1/media/retention?${mediaQuery(siteId)}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Change a retention policy.
+ *
+ * The body is sent **verbatim**, including a `folder_id: null`. The API reads the scope from
+ * the key's presence rather than from a deserialised value — serde's `Option` maps a `null`
+ * to `None` whatever the inner type is, so `Option<Option<Uuid>>` cannot tell "leave the
+ * scope alone" from "widen it to the whole site". Dropping a null here would make the second
+ * edit an operator most often wants unreachable.
+ */
+export function saveMediaRetentionPolicy(
+  siteId: string,
+  policyId: string,
+  input: MediaRetentionPolicyInput,
+): Promise<MediaRetentionPolicy> {
+  return request<MediaRetentionPolicy>(
+    `/api/v1/media/retention/${policyId}?${mediaQuery(siteId)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** Delete a retention policy. */
+export function deleteMediaRetentionPolicy(siteId: string, policyId: string): Promise<void> {
+  return request<void>(`/api/v1/media/retention/${policyId}?${mediaQuery(siteId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Sweep a site now and return what the pass actually did. */
+export function runMediaRetention(siteId: string): Promise<MediaRetentionRunResult> {
+  return request<MediaRetentionRunResult>(`/api/v1/media/retention/run?${mediaQuery(siteId)}`, {
+    method: "POST",
+  });
+}
+
+/** The retention run log of a site, newest first. */
+export function fetchMediaRetentionRuns(siteId: string): Promise<MediaRetentionRunList> {
+  return request<MediaRetentionRunList>(`/api/v1/media/retention/runs?${mediaQuery(siteId)}`);
+}
+
+/** Drop the reference rows whose referent is gone. */
+export function repairMediaReferences(siteId: string): Promise<MediaRetentionRepair> {
+  return request<MediaRetentionRepair>(`/api/v1/media/retention/repair?${mediaQuery(siteId)}`, {
+    method: "POST",
+  });
+}
+
+/** Put a file under a legal hold, or take it off one. The reason is required either way. */
+export function setMediaHold(
+  fileId: string,
+  hold: boolean,
+  reason: string,
+): Promise<{ media_id: string; legal_hold: boolean; changed: boolean }> {
+  return request<{ media_id: string; legal_hold: boolean; changed: boolean }>(
+    `/api/v1/media/files/${fileId}/hold`,
+    { method: "PUT", body: JSON.stringify({ hold, reason }) },
+  );
 }
 
 /** The open quarantines of a site, with their totals. */

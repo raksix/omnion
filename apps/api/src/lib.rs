@@ -19,6 +19,7 @@ pub mod lead_runner;
 pub mod request_id;
 pub mod routes;
 pub mod scope;
+pub mod retention_runner;
 pub mod search_runner;
 pub mod state;
 pub mod workflow_runner;
