@@ -10,11 +10,17 @@
 //!   it is the reason [`resolve_price`] exists as a function: a builder that prefilled nothing
 //!   would make a person look the price up by hand for every product not on the list.
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Result, SalesError};
 use crate::money::Money;
 
 /// A product as the module holds it, without the row's bookkeeping columns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` because the product is returned inside the store's view: a screen that had to
+/// ask a second question about the money would be a screen that could draw the two halves of a
+/// product differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Product {
     /// The row's id.
     pub id: uuid::Uuid,

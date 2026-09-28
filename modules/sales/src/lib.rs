@@ -20,7 +20,12 @@ pub mod catalog;
 pub mod error;
 pub mod model;
 pub mod money;
+pub mod store;
 
 pub use error::{Result, SalesError};
 pub use model::{QuoteStatus, Settings, Unit};
 pub use money::{LineTotals, QuoteTotals};
+pub use store::{
+    CatalogQuery, CatalogVocabulary, NewPriceList, NewPriceRow, NewProduct, Page, PriceListDetail,
+    PriceListPatch, PriceListView, PriceRowView, ProductPatch, ProductView, SettingsPatch,
+};

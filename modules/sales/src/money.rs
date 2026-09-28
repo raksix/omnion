@@ -141,17 +141,27 @@ impl Money {
     /// Half-up on the magnitude: `2.345` at two places is `2.35` and `-2.345` is `-2.35`. This is
     /// what the spec asks for and what an accountant expects; a banker's rounding (ties to even)
     /// would make `2.345 → 2.34`, which is a different rule and not this one.
+    ///
+    /// **A value with fewer decimals than the target is padded, not relabelled.** `19.9` is
+    /// parsed at scale 1 as `199` minor units, and rounding it to the document's two places has to
+    /// make it `1990` — the same nineteen pounds and ninety pence. The earlier version returned
+    /// the `199` and only changed the scale field, which is not a rounding decision at all: it
+    /// reinterprets the same integer as a different number, so the price a person typed without a
+    /// trailing zero came back **a tenth of itself**, and the catalog happily stored `1.99` for a
+    /// product entered as `19.9`. The direction that matters is the one nobody tested, because
+    /// every test that existed wrote two decimals in the first place.
     #[must_use]
     pub fn round_to(self, scale: u32) -> Self {
-        if self.scale <= scale {
-            return Self {
-                minor: self.minor,
+        match scale.cmp(&self.scale) {
+            std::cmp::Ordering::Equal => self,
+            std::cmp::Ordering::Less => Self {
+                minor: round_half_away(self.minor, self.scale, scale),
                 scale,
-            };
-        }
-        Self {
-            minor: round_half_away(self.minor, self.scale, scale),
-            scale,
+            },
+            std::cmp::Ordering::Greater => Self {
+                minor: rescale(self.minor, self.scale, scale),
+                scale,
+            },
         }
     }
 
@@ -656,6 +666,57 @@ mod tests {
     #[test]
     fn rounding_a_value_that_is_already_at_the_scale_changes_nothing() {
         assert_eq!(money("12.34").round_to_cents().to_text(), "12.34");
+    }
+
+    #[test]
+    fn rounding_up_in_precision_pads_the_minor_units_and_keeps_the_amount() {
+        // The direction that had no test and hid the worst bug in the module. `19.9` is `199` at
+        // scale 1; rounding it to the document's two places has to be `1990`, i.e. still 19.90.
+        // The version that only relabelled the scale returned `199` and rendered **1.99** — a
+        // price a person typed without a trailing zero became a tenth of itself, silently, and
+        // the catalog stored the wrong number as though it had been the right one.
+        for (written, expected) in [
+            ("19.9", "19.90"),
+            ("0.5", "0.50"),
+            ("7", "7.00"),
+            ("1234", "1234.00"),
+            ("-19.9", "-19.90"),
+            ("0", "0.00"),
+        ] {
+            assert_eq!(
+                money(written).round_to_cents().to_text(),
+                expected,
+                "{written} must be worth {expected} after rounding to the cent"
+            );
+        }
+    }
+
+    #[test]
+    fn padding_is_exact_because_the_minor_count_never_changes_its_meaning() {
+        // The invariant, stated as a property: rounding to a *finer* scale multiplies the minor
+        // count by the same power of ten, so no digits are invented and none are dropped.
+        let value = money("19.9");
+        let padded = value.round_to_cents();
+        assert_eq!(padded.minor(), value.minor() * 10);
+        assert_eq!(padded.scale(), crate::money::DEFAULT_SCALE);
+    }
+
+    #[test]
+    fn a_value_at_the_scale_rounds_to_itself_byte_for_byte() {
+        // `Equal` is its own arm rather than falling into the padding branch, and the test that
+        // says so: rounding must not multiply by ten on the way to the scale it is already at.
+        let value = money("12.34");
+        assert_eq!(value.round_to_cents().minor(), value.minor());
+    }
+
+    #[test]
+    fn a_price_typed_without_a_trailing_zero_survives_the_whole_line() {
+        // The bug end to end, because a fix in `round_to` that the line arithmetic ignored would
+        // still print a wrong total.
+        let t = line("2", "19.9", 0, 20).totals();
+        assert_eq!(t.gross.to_text(), "39.80", "19.90 × 2 is not 3.98");
+        assert_eq!(t.tax.to_text(), "7.96");
+        assert_eq!(t.net.to_text(), "47.76");
     }
 
     // ---- the line -----------------------------------------------------------------------------
