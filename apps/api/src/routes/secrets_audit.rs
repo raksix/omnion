@@ -49,7 +49,7 @@ use super::secrets::map_error;
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct AuditQuery {
     /// Only these actions.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub action: Vec<String>,
     /// Only rows about this secret.
     pub secret_id: Option<Uuid>,
@@ -63,6 +63,31 @@ pub struct AuditQuery {
     pub since: Option<String>,
     /// How many rows; the panel asks for 200 and the store caps it.
     pub limit: Option<i64>,
+}
+
+/// Accept `?action=one` as well as `?action=one&action=two`.
+///
+/// A `Vec` in a query struct only deserializes the repeated form, so the single-value case — what
+/// a link, a bookmark or a hand-typed URL produces, and what every caller outside the panel's own
+/// multi-select sends — came back as `400 invalid type: string … expected a sequence`. A filter that
+/// only its own client can satisfy is not a filter.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(
+        match <OneOrMany as serde::Deserialize>::deserialize(deserializer)? {
+            OneOrMany::One(value) => vec![value],
+            OneOrMany::Many(values) => values,
+        },
+    )
 }
 
 /// One audit row, in the panel's shape.
@@ -334,10 +359,12 @@ pub async fn acknowledge_anomaly(
     .await
     .map_err(map_error)?;
 
+    let request_id: Uuid = Uuid::new_v4();
     audit_entry(
         &state,
         NewAuditEntry::by_user(session.user.id, "secret.audit.acknowledged")
             .organization(organization_id)
+            .request_id(request_id)
             .target("anomaly", id.to_string())
             .metadata(json!({ "anomaly_id": id, "changed": changed }))
             .ip_address(address.as_text()),
@@ -520,5 +547,36 @@ mod tests {
                 "{owned} is written by a handler and must be visible on the audit screen"
             );
         }
+    }
+
+    /// The filter the panel's multi-select builds, and the single-value form every other caller
+    /// sends. Both are one filter, so both must parse.
+    ///
+    /// Driven through `serde_json` because `serde_urlencoded` is not a dependency here, and because
+    /// the value that failed in production was exactly this shape arriving from a query string.
+    #[test]
+    fn the_action_filter_accepts_one_value_or_several() {
+        let one: AuditQuery = serde_json::from_value(serde_json::json!({
+            "action": "secret.revealed",
+            "limit": 200,
+        }))
+        .expect("a single value");
+        assert_eq!(one.action, vec!["secret.revealed".to_owned()]);
+
+        let many: AuditQuery = serde_json::from_value(serde_json::json!({
+            "action": ["secret.revealed", "secret.lease.revoked"],
+        }))
+        .expect("a repeated value");
+        assert_eq!(
+            many.action,
+            vec![
+                "secret.revealed".to_owned(),
+                "secret.lease.revoked".to_owned()
+            ]
+        );
+
+        let none: AuditQuery =
+            serde_json::from_value(serde_json::json!({ "limit": 10 })).expect("an absent filter");
+        assert!(none.action.is_empty(), "an absent filter narrows nothing");
     }
 }
