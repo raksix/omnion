@@ -178,6 +178,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   // driven by `selected`, and an edge selected for deletion must not replace the node the
   // user was editing with an inspector panel that has nothing to say about a line.
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
+  // A connection being drawn: the source node and the port the user picked. Kept as state
+  // rather than a ref because the canvas has to paint the in-flight line, and because the
+  // reason a drop was refused has to survive the click that produced it long enough to be
+  // read.
+  const [linkDraft, setLinkDraft] = useState<{ nodeId: string; port: string } | null>(null);
+  const [linkNotice, setLinkNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(
+    null,
+  );
 
   const nodeTypes = useMemo(() => {
     const map = new Map<string, GraphNodeType>();
@@ -616,29 +624,69 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const connect = useCallback(
     (source: string, sourcePort: string, target: string) => {
-      const legal = nodeTypes.get(source)?.outputs.some((port) => port.key === sourcePort);
-      if (!legal) {
-        return;
+      const sourceType = nodeTypes.get(source);
+      const sourceLabel = sourceType?.label ?? source;
+      // A refusal the user cannot read is indistinguishable from a broken builder, and the
+      // acceptance criteria ask for the reason to be *visible*: every branch below names
+      // what is wrong in the author's own terms (which node, which port, which alternatives
+      // are legal) rather than dropping the gesture on the floor.
+      const refuse = (text: string) => {
+        setLinkNotice({ tone: "error", text });
+        setLinkDraft(null);
+      };
+
+      const port = sourceType?.outputs.find((candidate) => candidate.key === sourcePort);
+      if (!sourceType || !port) {
+        const legal = (sourceType?.outputs ?? []).map((candidate) => candidate.key);
+        refuse(
+          legal.length > 0
+            ? `${sourceLabel} has no “${sourcePort}” port. It exports ${legal.join(", ")}.`
+            : `${sourceLabel} has no output ports, so nothing can leave it.`,
+        );
+        return false;
       }
+
+      // A self-connection is a cycle of length one. The server's validator would catch it, but
+      // the user is watching the canvas, not the problems panel, and a line drawn from a node
+      // back into itself looks like it worked.
+      if (source === target) {
+        refuse(`${sourceLabel} cannot connect to itself.`);
+        return false;
+      }
+
       const already = edges.some(
         (edge) =>
           edge.source === source && edge.source_port === sourcePort && edge.target === target,
       );
       if (already) {
-        return;
+        // Not an error: the port is simply taken. Saying so keeps the second attempt from
+        // looking like the button is broken.
+        setLinkNotice({
+          tone: "error",
+          text: `${sourceLabel} · ${port.label} already leads to that node.`,
+        });
+        setLinkDraft(null);
+        return false;
       }
-      setEdges((current) => [
-        ...current,
-        {
-          id: uniqueEdgeId(current),
-          source,
-          source_port: sourcePort,
-          target,
-        },
-      ]);
-      queueSave();
+
+      const edge: GraphEdge = {
+        id: uniqueEdgeId(edges),
+        source,
+        source_port: sourcePort,
+        target,
+      };
+      // Routed through `commit` like every other change, so a connection is one undoable
+      // step. The criteria ask undo to "restore add, move, connect, delete …"; an edge added
+      // behind the history's back is the one case that could not be undone.
+      commit("edge-add", currentSnapshot(), graphRef.current.nodes, [...graphRef.current.edges, edge]);
+      setLinkNotice({
+        tone: "ok",
+        text: `${sourceLabel} · ${port.label} → ${nodeTypes.get(target)?.label ?? target}`,
+      });
+      setLinkDraft(null);
+      return true;
     },
-    [edges, nodeTypes, queueSave],
+    [commit, currentSnapshot, edges, nodeTypes],
   );
 
   const removeEdge = useCallback(
@@ -1029,6 +1077,15 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
       if (event.key === "Escape") {
+        // Escape cancels a connection in progress before it clears anything else: a half-drawn
+        // line is the one piece of state the user is actively holding, and clearing the node
+        // selection instead leaves them still mid-gesture with no idea why.
+        if (linkDraft) {
+          event.preventDefault();
+          setLinkDraft(null);
+          setLinkNotice({ tone: "error", text: "Connection cancelled." });
+          return;
+        }
         // Escape clears the selection, which is also the only way out of a marquee that the
         // user started by accident and cannot see the end of. An edge is cleared with it:
         // Escape is the gesture that says "I did not mean that", and it has to reach the
@@ -1524,6 +1581,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                   }}
                   onClick={(event) => {
                     event.stopPropagation();
+                    // A connection in progress swallows the click: the node the user just
+                    // aimed at is the target, not a new selection.
+                    if (linkDraft) {
+                      connect(linkDraft.nodeId, linkDraft.port, node.id);
+                      return;
+                    }
                     // Shift+click extends the multi-selection, which is what every canvas
                     // does and what the marquee's additive mode already implies. Without it
                     // a user who marquee-selects a group and then adds one more node has to
@@ -1564,9 +1627,27 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                         aria-label={`Connect from ${port.label}`}
                         className="h-2.5 w-2.5 rounded-full border border-muted bg-surface hover:bg-accent"
                         data-port-out={`${node.id}:${port.key}`}
+                        data-port-key={port.key}
+                        // The port the connection is currently leaving from is drawn as an
+                        // accent dot, so "which of these four dots did I press?" has a
+                        // visible answer while the gesture is in flight.
+                        style={
+                          linkDraft?.nodeId === node.id && linkDraft.port === port.key
+                            ? { background: "var(--color-accent)", borderColor: "var(--color-accent)" }
+                            : undefined
+                        }
                         onClick={(event) => {
                           event.stopPropagation();
                           setSelected(node.id);
+                          // Pressing a port starts a connection; pressing it again (or
+                          // pressing Escape) cancels it. Without the toggle, a mis-click has
+                          // no way out except finishing the link somewhere sensible.
+                          setLinkDraft((current) =>
+                            current?.nodeId === node.id && current.port === port.key
+                              ? null
+                              : { nodeId: node.id, port: port.key },
+                          );
+                          setLinkNotice(null);
                         }}
                       />
                     ))}
@@ -1582,6 +1663,35 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               data-builder-empty
             >
               This rule has no nodes. Add one from the palette.
+            </p>
+          ) : null}
+
+          {/* The outcome of a connection attempt. Positioned inside the canvas (rather than in
+              a toast) because the reason a drop was refused is only meaningful next to the
+              nodes it names, and because the acceptance criteria ask for the refusal to be
+              *visible* — a refused connection that says nothing is a dead gesture. */}
+          {linkDraft ? (
+            <p
+              className="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 rounded-md border border-accent bg-surface px-2.5 py-1 text-[12px] shadow-sm"
+              data-link-draft
+            >
+              Connecting from{" "}
+              <strong>{nodeTypes.get(linkDraft.nodeId)?.label ?? linkDraft.nodeId}</strong> ·{" "}
+              {linkDraft.port} — click a target node, or press Escape.
+            </p>
+          ) : null}
+          {linkNotice ? (
+            <p
+              role="status"
+              className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-md border px-2.5 py-1 text-[12px] shadow-sm"
+              style={{
+                borderColor: linkNotice.tone === "error" ? "var(--color-accent)" : "var(--color-line)",
+                color: linkNotice.tone === "error" ? "var(--color-ink)" : "var(--color-muted)",
+                background: "var(--color-surface)",
+              }}
+              data-link-notice={linkNotice.tone}
+            >
+              {linkNotice.text}
             </p>
           ) : null}
         </div>
