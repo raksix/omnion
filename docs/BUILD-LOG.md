@@ -2550,3 +2550,53 @@
 - **Next.** Read the scoped pass's report. If it is clean, REQ-097 closes and REQ-098 slice 1 (the
   model catalog) starts. If it found something, that something is a defect in the panels this
   request shipped, and it is fixed here rather than explained away.
+
+## 2026-09-28 · wave 7 · tick 8b · the pass finally reaches its own screens, and finds a real bug
+
+- **What.** `acb73eb` (scoped pass), `0a2868c` / `967b134` / `1778fdc` / `32302ef` (four defects the
+  pass found in *itself* and one in the panel), `64f6783` (the fixture probe). REQ-097 is still
+  `in-progress`: eleven of its depth assertions now run green, and one high finding remains that
+  is not yet explained.
+
+- **The scope did what it was built for.** `--only=ai` reaches the AI depth passes in about two
+  minutes instead of the fortieth. `analytics seed: {"skipped":"out of scope"}` and then straight
+  to `page: ai`. Three passes ran back to back on the shared box; the last one completed.
+
+- **A real product bug, found because the pass could finally run.** Applying a discovery diff
+  re-read the *diff* and stopped there — the model **list** was never re-fetched. So the panel
+  announced "applied 2 added" over an empty registry table, and everything downstream read empty:
+  the capability editor reported `editor: 0` and the flag toggle said "no vision flag in the
+  catalog". Neither was broken; the rows they hang off were not in the list. `applyDiscovery` now
+  refetches the models, and the same pass reads `editor: 1` with all ten flags listed and a toggle
+  that flips (`qa-large: vision enabled.`). This is the bug a closing pass exists to find, and it
+  survived three ticks of unit tests because it is a *state after a write*, not a state.
+
+- **Four defects were in the pass, not the product**, and each read exactly like a broken screen:
+  a placeholder-filled form's 400 filed as a high finding; a result assigned at the end of the
+  function and then overwritten by the caller's `report.x = await runX()`, which returns nothing;
+  the local endpoint closed in a `finally` *before* discovery, so `list-models` hit a dead port;
+  and Discover living inside the provider's Models drawer, so the button did not exist in the DOM.
+  A depth pass that reports "the screen is broken" is often reporting that it broke the screen.
+
+- **Still open, honestly.** One high finding remains: a `400 POST /api/v1/ai/providers` that the
+  pass provoked and did not claim. Reproduced outside the pass (a bare Playwright script submits
+  the form and the refusal lands at 52 ms), and the endpoint answers `201` for the same payload by
+  curl — so the 400 is a *field* refusal, and the registration window is in the right place with
+  the right vocabulary. The pass records `submit-window: {"outcome":"empty","covered":0}` next to
+  it, which says the window closed over nothing: the response is recorded against a **different**
+  `netFailures` position than the window opened at. That is the next thing to look at, and it is
+  written down rather than guessed at. **REQ-097 does not close on this pass.**
+
+- **Proof.** `cargo test -p omnion-ai-hub -- --test-threads=1` → **86 passed, 0 failed**.
+  `pnpm typecheck` → **2/2**. `probe-refusal-gate.cjs` **12/12**, `probe-pass-scope.cjs` **7/7**,
+  `probe-depth-fixture.cjs` **4/4** (verified to exit 1 at 2/4 on the reconstructed old ordering).
+  QA `20260928-145112`: 1 page, 26 clicks, 53 screenshots, **2 high** (the unexplained 400 on the
+  request + its console line), 0 medium, 0 low. Depth steps all green: empty state, three
+  protocols, field refusal, connected, five-step test (`resolve:9 ms | tls:not applicable | auth:0 ms
+  | models:0 ms | stream:2 ms`), a dead endpoint naming `resolve`, health dots, discovery
+  (2 to add → applied → "Already up to date"), the capability editor, the flag toggle, and the
+  three panels. States sweep: three failures provoked, each with a real retry that recovered, 0
+  skeletons on screen.
+
+- **Next.** The window/net-position mismatch above. Then REQ-097 closes, and REQ-098 slice 1 (the
+  model catalog) starts.
