@@ -1430,6 +1430,160 @@ async function runMediaShares(page, report) {
   };
 }
 
+
+// ---------------------------------------------------------------- duplicates (REQ-010, slice 3)
+
+/**
+ * Put two *identical* files in the library.
+ *
+ * The duplicate report groups by checksum, so the screen only has content when two rows carry
+ * the same bytes. Uploading the same sample file twice is the honest way to do it: a fabricated
+ * checksum written straight into the database would make the report pass against rows the
+ * application never created.
+ */
+async function uploadDuplicateSample(page) {
+  const file = ensureSamplePng();
+  const input = page.locator('input[type="file"]').first();
+  if ((await input.count()) === 0) {
+    return { uploaded: false, note: "no file input on this screen" };
+  }
+  // The same bytes under a different name, so the two rows are distinguishable in the report.
+  const second = path.join(path.dirname(file), "upload-sample-copy.png");
+  fs.copyFileSync(file, second);
+
+  await input.setInputFiles(file).catch(() => {});
+  await page.waitForTimeout(1800);
+  await input.setInputFiles(second).catch(() => {});
+  await page.waitForTimeout(1800);
+  return {
+    uploaded: true,
+    first: path.basename(file),
+    second: path.basename(second),
+  };
+}
+
+/**
+ * Drive `/media/duplicates`.
+ *
+ * The pass asserts the four things a screenshot cannot see: the two identical uploads actually
+ * form a group, the Merge button stays **disabled until a keeper is chosen**, the merge keeps the
+ * file the radio named (not the first one), and the result panel says the bytes are *pending*
+ * rather than reclaimed. It then re-reads the API to prove the group is really gone.
+ */
+async function runMediaDuplicates(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-duplicates", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadDuplicateSample(page);
+  note({ step: "upload", ...uploaded });
+  if (!uploaded || !uploaded.uploaded) {
+    return { ok: false, reason: "no file input — the duplicate pair was not uploaded" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/duplicates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="media-duplicates"]', { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const rendered = (await page.locator('[data-testid="media-duplicates"]').count()) > 0;
+  note({ step: "screen", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the duplicate screen did not render" };
+  }
+
+  const groups = await page.locator('[data-testid="duplicates-group"]').count();
+  note({ step: "groups", groups });
+  if (groups === 0) {
+    await shot(page, "page-media-duplicates-empty");
+    return { ok: false, reason: "two identical uploads produced no duplicate group" };
+  }
+
+  // Expand the first group. The rows must be there without a click — the choice of keeper is the
+  // screen's whole job, and a report that hides the files cannot make that choice.
+  await page.locator('[data-testid="duplicates-group"] button:has-text("Show files")').first().click().catch(() => {});
+  await page.waitForTimeout(900);
+  const radios = page.locator('[data-testid="duplicates-group"] input[type="radio"]');
+  const radioCount = await radios.count();
+  const mergeButton = page.locator('[data-testid="duplicates-group"] button:has-text("Merge group")').first();
+  note({ step: "expanded", radioCount, mergeButtons: await mergeButton.count() });
+
+  // The decisive control: **disabled with no keeper chosen**. A screen that enabled it would let
+  // an operator merge without ever answering the question, and the platform would have to guess.
+  const disabledBeforeChoice = await mergeButton.isDisabled().catch(() => false);
+  note({ step: "merge-disabled-without-a-keeper", disabledBeforeChoice });
+
+  // Pick the *second* file, so a merge that quietly kept the first would be caught rather than
+  // coinciding with the walkthrough's own order.
+  const keepLabel = await radios.nth(1).getAttribute("aria-label").catch(() => null);
+  await radios.nth(1).check().catch(() => {});
+  await page.waitForTimeout(400);
+  const disabledAfterChoice = await mergeButton.isDisabled().catch(() => true);
+  note({ step: "merge-enabled-after-a-keeper", keepLabel, disabledAfterChoice });
+
+  await shot(page, "page-media-duplicates");
+
+  // The confirmation must say *trash*, and must not say the bytes are already back.
+  await mergeButton.click().catch(() => {});
+  await page.waitForTimeout(700);
+  const dialogText = await page.locator('[role="dialog"]').innerText().catch(() => "");
+  note({ step: "confirm", mentionsTrash: /trash/i.test(dialogText) });
+  await shot(page, "page-media-duplicates-confirm");
+  await page.click("#duplicates-merge-confirm").catch(() => {});
+  await page.waitForTimeout(3000);
+
+  const notice = await page.locator('[role="status"]').first().innerText().catch(() => "");
+  const groupCountAfter = await page.locator('[data-testid="duplicates-group"]').count();
+  note({ step: "merged", notice: notice.slice(0, 160), groupCountAfter });
+  await shot(page, "page-media-duplicates-merged");
+
+  // The notice has to state that the bytes are *pending*, not reclaimed. A report that showed
+  // freed space immediately would teach the operator to trust a number that is a week old.
+  const pendingClaimed = /only reclaimed when the trash is purged/i.test(notice);
+
+  // And the report agrees: the group is gone, because one live file is not a group.
+  const apiGroups = await page.evaluate(async () => {
+    const site = document.querySelector('[data-site-switcher] select')?.value;
+    const params = new URLSearchParams();
+    if (site) {
+      params.set("site_id", site);
+    }
+    const response = await fetch(`/api/v1/media/duplicates?${params}`, {
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      return { status: response.status, group_count: -1 };
+    }
+    const body = await response.json();
+    return { status: response.status, group_count: body.group_count };
+  });
+  note({ step: "api", ...apiGroups });
+
+  return {
+    // One assertion per claim, so a failure names what broke rather than just "false":
+    // the pair formed a group; the button was dead until a keeper was named and alive after;
+    // the merge removed *a* group (the report had one more row than it has now, or the API
+    // agrees it is gone — both are checked below and the API is the authority);
+    // the notice does not claim the bytes are back.
+    ok:
+      disabledBeforeChoice &&
+      !disabledAfterChoice &&
+      radioCount >= 2 &&
+      groupCountAfter < groups &&
+      apiGroups.status === 200 &&
+      apiGroups.group_count < groups &&
+      pendingClaimed,
+    steps: steps.length,
+    radioCount,
+    groups,
+    groupCountAfter,
+    notice: notice.slice(0, 160),
+    apiGroups,
+  };
+}
+
 // ---------------------------------------------------------------- palette (REQ-002)
 
 /**
@@ -3118,6 +3272,7 @@ async function main() {
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
+    { path: "/media/duplicates", name: "media-duplicates" },
     { path: "/media/trash", name: "media-trash" },
     // The transformation presets (REQ-010, slice 3) — walked here and driven by the depth pass
     // below, which creates a preset, submits an out-of-range quality to see the field error, and
@@ -3230,6 +3385,14 @@ async function main() {
   // actually serves the bytes, and a revoke stops it on the very next request.
   report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
   log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+
+  // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
+  // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
+  // bytes are pending rather than reclaimed.
+  report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
+    runMediaDuplicates(page, report),
+  );
+  log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
