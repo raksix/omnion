@@ -1302,6 +1302,134 @@ async function runMediaFileDetail(page, report) {
   return { ok: rendered && kind !== null, steps: steps.length, kind, fileId };
 }
 
+/**
+ * Drive the share tab the way an operator does (REQ-010, slice 3).
+ *
+ * The claim a screenshot cannot settle is the one the whole feature rests on: the link is shown
+ * **once**, so the screen must show it after creation and must *not* offer to show it again. A
+ * walk that only looked for "a share button exists" would pass on a screen whose `Copy` silently
+ * copies nothing — which is the failure mode this tab is designed to rule out.
+ */
+async function runMediaShares(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-shares", ...step });
+  };
+
+  // The pass needs a real file with a real id, so it resolves one the way the detail pass does
+  // — from the library listing — rather than depending on a field another pass happens to set.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadMediaSample(page);
+  await page.waitForTimeout(1500);
+  note({ step: "upload", ...uploaded });
+  if (!uploaded || !uploaded.ok) {
+    return { ok: false, reason: "no file to share — the upload step did not succeed" };
+  }
+  const fileId = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  note({ step: "file-id", fileId });
+  if (!fileId) {
+    return { ok: false, reason: "the library rendered no file to share" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The tab is a tab, not a second URL.
+  await page.click("#media-tab-shares").catch(() => {});
+  await page.waitForSelector('[data-testid="share-create"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="share-create"]').count()) > 0;
+  note({ step: "tab", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the share tab did not render" };
+  }
+
+  // A fresh file has no links, and the empty state has to say what a link *is* rather than
+  // showing an empty table.
+  const emptyState = await page.locator("text=No share links yet").count();
+  note({ step: "empty", emptyState });
+
+  // An out-of-range expiry is refused by the form, naming the field, before it is sent — the
+  // same sentence the API would produce, and the walk proves the screen has one at all.
+  await page.fill("#share-expires", "0");
+  await page.click('[data-testid="share-create"]');
+  await page.waitForTimeout(600);
+  const fieldError = await page.locator('[data-testid="share-field-error"]').innerText().catch(() => "");
+  note({ step: "expiry-refused", fieldError });
+  const expiryNamed = /at least 1/i.test(fieldError);
+
+  // Now a real link, with no choices made: the common case is a body-less POST.
+  await page.fill("#share-expires", "");
+  await page.click('[data-testid="share-create"]');
+  await page.waitForTimeout(2500);
+  const shownOnce = (await page.locator('[data-testid="media-share-created"]').count()) > 0;
+  const url = await page.inputValue('input[aria-label="The new share link"]').catch(() => "");
+  const tokenLength = url.split("/").pop()?.length ?? 0;
+  note({ step: "created", shownOnce, tokenLength });
+  await shot(page, "page-media-file-detail-share");
+
+  // The decisive check: with the one-time panel open, the table behind it offers *revoke* and
+  // no copy control. A `Copy` beside an existing row would copy nothing, because the platform
+  // stores only a hash of the token.
+  const revokeButtons = await page.locator("[data-testid^='media-share-revoke-']").count();
+  const copyButtonsInTable = await page
+    .locator('[data-testid="media-share-created"] ~ * button:has-text("Copy")')
+    .count();
+  note({ step: "no-copy-on-existing", revokeButtons, copyButtonsInTable });
+  const copyIsOnlyInPanel = await page.locator('[data-testid="media-share-created"] button:has-text("Copy")').count();
+
+  // The link must actually work: fetch the public URL from the test process context and check
+  // it serves the bytes. A link the panel shows but nobody can open is the worst outcome.
+  const publicStatus = await page.evaluate(async (link) => {
+    if (!link) {
+      return 0;
+    }
+    const response = await fetch(link, { credentials: "omit" });
+    await response.arrayBuffer();
+    return response.status;
+  }, url);
+  note({ step: "public-link", publicStatus });
+
+  // And revoking it is immediate, checked through the public route rather than the panel.
+  await page.click('[data-testid="media-share-created"] button:has-text("Done")').catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-testid^='media-share-revoke-']").first().click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const afterRevoke = await page.evaluate(async (link) => {
+    if (!link) {
+      return 0;
+    }
+    const response = await fetch(link, { credentials: "omit" });
+    await response.arrayBuffer();
+    return response.status;
+  }, url);
+  const stateText = await page.locator("[data-testid^='media-share-state-']").first().innerText().catch(() => "");
+  note({ step: "revoked", afterRevoke, stateText });
+  await shot(page, "page-media-file-detail-share-revoked");
+
+  return {
+    ok:
+      rendered &&
+      emptyState > 0 &&
+      expiryNamed &&
+      shownOnce &&
+      tokenLength === 64 &&
+      revokeButtons > 0 &&
+      copyButtonsInTable === 0 &&
+      copyIsOnlyInPanel === 1 &&
+      publicStatus === 200 &&
+      afterRevoke === 410,
+    steps: steps.length,
+    publicStatus,
+    afterRevoke,
+    tokenLength,
+  };
+}
+
 // ---------------------------------------------------------------- palette (REQ-002)
 
 /**
@@ -3097,6 +3225,11 @@ async function main() {
   // says what it proved, and a save that leaves the untouched fields alone.
   report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
   log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
+
+  // The share tab (REQ-010, slice 3): the link is shown once and never again, the public URL
+  // actually serves the bytes, and a revoke stops it on the very next request.
+  report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
+  log(`media shares: ${JSON.stringify(report.mediaShares)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
