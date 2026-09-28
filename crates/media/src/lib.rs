@@ -28,6 +28,7 @@ pub mod scanning;
 pub mod shares;
 pub mod storage_settings;
 pub mod transform;
+pub mod usage;
 pub mod validation;
 pub mod versions;
 
@@ -99,6 +100,9 @@ pub use transform::{
     Derivative, Fit, ImageFormat, MAX_PRESET_DIMENSION, MAX_PRESET_NAME_LENGTH, NewPreset, Preset,
     Recipe, derivative_prefix, validate_dimensions, validate_new, validate_preset_name,
     validate_quality,
+};
+pub use usage::{
+    MAX_USAGE_ROWS, RESOLVABLE_KINDS, UsageCounts, UsageEntry, count_usage, list_usage,
 };
 pub use validation::{
     INLINE_CONTENT_TYPES, ServePlan, normalize_content_type, object_key, sanitize_filename,
