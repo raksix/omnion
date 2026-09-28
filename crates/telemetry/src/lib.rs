@@ -37,6 +37,7 @@ pub mod schema;
 pub mod store;
 pub mod trace_store;
 pub mod tracing_span;
+pub mod tracing_spine;
 
 pub use context::{LogContext, mint_span_id, mint_trace_id, trace_id_from_header};
 pub use error::TelemetryError;

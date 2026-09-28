@@ -164,8 +164,12 @@ pub enum FlushOutcome {
 }
 
 /// One exporter's bounded buffer and its health.
+///
+/// Public because [`Collector::register`] hands one back: a caller that registered an exporter
+/// needs to be able to assert on its own buffer without going through the global, and a private
+/// type in a public signature is a compile error at the call site, not a warning here.
 #[derive(Debug)]
-struct Buffer {
+pub struct Buffer {
     name: String,
     kind: ExporterKind,
     capacity: usize,
