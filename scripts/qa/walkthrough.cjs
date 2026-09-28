@@ -2675,6 +2675,11 @@ async function main() {
     // and expanded, and the editor it documents is driven by the depth pass below, which first
     // creates a page to edit (the editor's address carries the page's id, not its slug).
     { path: "/blocks", name: "blocks" },
+    // The pattern library and the template gallery (REQ-063, slice 3) — no untested screen: the
+    // routes are walked here and the depth pass below creates a pattern, inserts it into the
+    // editor's page, and builds a page from a template.
+    { path: "/patterns", name: "patterns" },
+    { path: "/page-templates", name: "page-templates" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -2746,6 +2751,13 @@ async function main() {
   // delete, save, publish, and the public page the published block tree actually renders.
   report.blockEditor = await runBlockEditorDepth(page, report);
   log(`block editor: ${JSON.stringify(report.blockEditor)}`);
+
+  // The pattern library's and the template gallery's pass (REQ-063, slice 3): a pattern is
+  // created from the editor's blocks, inserted back into the page, and a page is built from a
+  // platform template. Runs *after* the block editor's pass, which is what leaves blocks on a
+  // page for the selection to be cut from.
+  report.patterns = await runPatternDepth(page, report);
+  log(`patterns: ${JSON.stringify(report.patterns)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
@@ -4344,6 +4356,145 @@ async function runBlockEditorDepth(page, report) {
   await runRevisionCompare();
 
   report.blockEditor = steps;
+  return steps;
+}
+
+/**
+ * The pattern library and the template gallery (REQ-063, slice 3).
+ *
+ * Two acceptance criteria, and each is a claim about a *result* rather than about a screen:
+ *
+ *  - 10: "a pattern inserted into a page reproduces the block tree exactly; creating a pattern
+ *    from a selection works and the new pattern appears in the library." So the pass saves a
+ *    pattern from the editor's own blocks, reads the library, inserts it back into the same
+ *    page, and reads the canvas — the count has to grow by what the card said it would.
+ *  - 11: "`New page from template` creates a draft page whose blocks match the template, with
+ *    the sample content intact." So the pass builds a page from the landing template and opens
+ *    the page it claims to have made.
+ *
+ * It runs after the block editor's pass because that pass is what leaves blocks on a page to
+ * cut a pattern from — "create a pattern from a selection" has nothing to select without them.
+ */
+async function runPatternDepth(page, report) {
+  const steps = {};
+  const note = (action) => record({ page: "pattern-depth", action });
+
+  // ---- Create a pattern from the editor's own blocks -----------------------------------------
+  // The editor is where the selection lives, and the pattern tools are a panel *inside* it, so
+  // the pass goes back to the page the block editor pass left its blocks on rather than
+  // building a second fixture.
+  const editorHref = report.blockEditor && report.blockEditor.path;
+  if (!editorHref) {
+    steps.blocked = "the block editor pass left no page to cut a pattern from";
+    return steps;
+  }
+  await page.goto(`${URL_ADMIN}${editorHref}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-block-editor]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const blocksBefore = await page.locator("[data-block-canvas-block]").count();
+
+  await page.locator("[data-pattern-tools-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-pattern-tools]", { timeout: 8000 }).catch(() => {});
+  steps.toolsOpened = (await page.locator("[data-pattern-tools]").count()) > 0;
+  await shot(page, "pattern-editor-panel");
+
+  // "New pattern from selection": the form saves the *selected* subtree, and the pass says which
+  // one it is about to save — so the assertion below is about a specific number of blocks.
+  await page.locator("[data-block-outline-row]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("#save-pattern-name").fill("QA hero").catch(() => {});
+  await page.locator("#save-pattern-category").fill("qa").catch(() => {});
+  await page.locator("#save-pattern-description").fill("A group the QA pass cut out of a page").catch(() => {});
+  await shot(page, "pattern-editor-save-form");
+  await page.locator('[data-action="save-selection-as-pattern"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.savedFromSelection = (await page.locator("[data-pattern-option=qa-hero]").count()) > 0;
+  note("saved the selected block as a pattern");
+
+  // ---- The library ----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/patterns`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-pattern-card]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.cards = await page.locator("[data-pattern-card]").count();
+  steps.found = (await page.locator("[data-pattern-card=qa-hero]").count()) > 0;
+  await shot(page, "pattern-library");
+
+  // The card carries the tree's outline, read from the registry — "12 blocks" is a number, an
+  // outline is what an author recognises. Asserted on text, because a card with neither is a
+  // card that tells an author nothing before the click.
+  const outline = await page
+    .locator("[data-pattern-outline=qa-hero]")
+    .first()
+    .textContent()
+    .catch(() => "");
+  steps.outline = (outline || "").trim().length > 0;
+  steps.outlineText = (outline || "").trim().slice(0, 80);
+
+  // Search narrows the library — a library that only lists is a list.
+  await page.locator("#pattern-search").fill("hero").catch(() => {});
+  await page.waitForTimeout(500);
+  steps.searchNarrows =
+    (await page.locator("[data-pattern-card=qa-hero]").count()) > 0 &&
+    (await page.locator("[data-pattern-card]").count()) <= steps.cards;
+  await page.locator("#pattern-search").fill("").catch(() => {});
+  await page.waitForTimeout(300);
+
+  // ---- Insert it back into the page (acceptance 10) -------------------------------------------
+  await page.goto(`${URL_ADMIN}${editorHref}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-block-editor]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const beforeInsert = await page.locator("[data-block-canvas-block]").count();
+  await page.locator("[data-pattern-tools-toggle]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-pattern-tools]", { timeout: 8000 }).catch(() => {});
+  await page.locator('[data-action="insert-pattern-qa-hero"]').click({ timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const afterInsert = await page.locator("[data-block-canvas-block]").count();
+  // The selected block was a heading, so a one-block pattern adds exactly one block. Reading
+  // the count rather than asserting "it went up" is what makes this the "reproduces the tree
+  // exactly" claim: a pattern that arrived with three blocks would fail here.
+  steps.inserted = afterInsert === beforeInsert + 1;
+  steps.beforeInsert = beforeInsert;
+  steps.afterInsert = afterInsert;
+  await shot(page, "pattern-inserted-into-page");
+
+  // And the inserted blocks carry the server's ids: saving and reloading the draft must not
+  // change the count, which is what "a copy with fresh ids" buys over a shared reference.
+  await page.locator("[data-block-save]").first().click({ timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(2400);
+  steps.savedAfterInsert = (await page.locator("[data-block-canvas-block]").count()) === afterInsert;
+  note("inserted a pattern into the page and saved the draft");
+
+  // ---- The gallery (acceptance 11) ------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/page-templates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-template-card]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.templates = await page.locator("[data-template-card]").count();
+  // The five the REQ names, seeded from code.
+  for (const key of ["landing", "about", "pricing", "blog-post", "contact"]) {
+    steps[`template-${key}`] = (await page.locator(`[data-template-card=${key}]`).count()) > 0;
+  }
+  await shot(page, "page-template-gallery");
+
+  // "Use template" asks for a slug and a title, then creates a *draft* and lands in the editor.
+  await page.locator('[data-action="use-template-landing"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-template-form]", { timeout: 8000 }).catch(() => {});
+  steps.formOpened = (await page.locator("[data-template-form]").count()) > 0;
+  await shot(page, "page-template-form");
+
+  await page.locator("#template-title").fill("QA from landing").catch(() => {});
+  await page.locator("#template-slug").fill("qa-from-landing").catch(() => {});
+  await page.locator("#template-site").selectOption({ index: 1 }).catch(() => {});
+  await page.locator('[data-action="create-from-template"]').click({ timeout: 12000 }).catch(() => {});
+  await page.waitForSelector("[data-block-editor]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.landedInEditor = (await page.locator("[data-block-editor]").count()) > 0;
+  steps.templateBlocksOnPage = await page.locator("[data-block-canvas-block]").count();
+  // The sample content is intact: the landing template's own headline is on the canvas. An empty
+  // canvas here would mean the page was created but the blocks did not travel with it.
+  const canvasText = await page.locator("[data-block-canvas]").innerText().catch(() => "");
+  steps.sampleContentIntact = /headline|Start with the free plan/i.test(canvasText || "");
+  await shot(page, "page-created-from-template");
+
   return steps;
 }
 

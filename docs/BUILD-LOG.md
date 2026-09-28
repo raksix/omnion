@@ -2202,3 +2202,37 @@ different ways, both of which had been silently green in the plan.
   siblings took 0019/0020/0021/0022 and the ledger is append-only, so the number is chosen, not
   assumed. And `git fetch` shows `origin/main` is 8 commits ahead: merge it at the START of the
   next tick, before editing, never mid-slice.
+
+## Wave 2 · REQ-063 slice 3 — patterns and page templates
+
+- **What.** The two reusable libraries of the page builder. A *pattern* is a block group an
+  author cuts out of a page and drops into the next; a *page template* is a whole page's worth of
+  blocks with sample content. Migration `0026_content_patterns.sql`, the store in
+  `crates/content/src/patterns.rs`, the five system templates in
+  `crates/content/src/templates.rs`, the surface in `apps/api/src/routes/patterns.rs`, and the
+  `/patterns` + `/page-templates` screens with the editor's pattern panel.
+
+- **The decision everything follows from.** A pattern and a template store *the same thing a
+  revision stores*: a block tree as JSON, with no second representation. So "insert" is a copy
+  with fresh block ids, not a conversion between two shapes — a conversion is where content
+  quietly loses a prop. `instance_blocks` is the whole of it: parse, mint a new id per block,
+  hand it back.
+
+- **What is proved, and how.** 9 integration tests against a real database
+  (`apps/api/tests/content_patterns.rs`) covering the insert-is-exact claim (ids stripped, the
+  rest compared; no stored id appears in the source; two insertions share nothing), the key-as-
+  identity upsert, the five named templates and the page built from one, the permission split in
+  both directions, the system-template refusal, sanitisation on save, and organization scoping.
+  107 content unit tests, 216 API + content lib tests, `pnpm typecheck` 2/2.
+
+- **Three defects the tests found, all one shape.** (1) The store validated a pattern but did
+  not normalise it while `pages::update_page` did, so a page built from a template stored a
+  filled-in tree and the template did not — and the diff reported every block changed for a page
+  nobody edited. (2) `BlockIssue::is_fatal` is "can the store hold this", not "is this an error";
+  used as a save predicate it refused half-built patterns, and an author must be able to cut a
+  pattern out of a page that is itself half-built. (3) A tree walker that descended only into
+  `children` found no ids in a flat page, so the "no shared ids" assertion compared nothing and
+  read as a pass.
+
+- **Next.** The browser pass over `/patterns`, `/page-templates` and the editor's pattern panel
+  is what closes this slice, and the undo/redo stack and the remaining slice-2 boxes follow.

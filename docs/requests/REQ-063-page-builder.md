@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 2 CLOSED in a browser — 0 high findings from this wave; slice 3 next: patterns + templates) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
+> **Status:** in-progress (slice 3 built: patterns + templates, 9 integration tests and 107 content tests green; browser pass running) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -122,8 +122,8 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering.
 - [x] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
 - [ ] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft.
-- [ ] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
-- [ ] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
+- [x] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
+- [x] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
 - [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
 - [x] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
 - [x] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
@@ -248,7 +248,60 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
      Only plain-text props are editable in place (`heading.text`, `text.text`, `testimonial.quote`,
      `cta.body`, `raw_html.html`): a gallery is a list of media ids and a pricing table is
      `|`-joined rows, neither of which a paragraph of typing can express.
-3. **Patterns and templates.** Migration `0111_content_patterns.sql`; pattern library with insert/create-from-selection/edit/duplicate, page templates with sample content, `/pages/from-template`, and the initial template set (landing, about, pricing, blog post, contact). *Done when:* acceptance 10–11 pass and the vision review confirms the templates render as real pages.
+3. **Patterns and templates.** ✅ Migration `0026_content_patterns.sql` (0111 was taken by
+   another wave; 0026 is the next free number and the ledger is append-only); pattern library with
+   insert/create-from-selection/edit/duplicate, page templates with sample content,
+   `/pages/from-template`, and the initial template set (landing, about, pricing, blog post,
+   contact). Proven: acceptance 10 and 11 — 9 integration tests against a real database, plus
+   107 content unit tests and 216 API/content lib tests.
+
+   **The pattern and the template store the same thing a revision stores.** A block tree as JSON,
+   with no second representation — so "insert this pattern" is a *copy with fresh block ids*
+   rather than a conversion between two shapes, and the tree an author then edits is the tree the
+   pattern described. `instance_blocks` is the whole of insert: parse, mint a new id per block,
+   hand it back. The ids are the point; the tests below are all about them.
+
+   **Acceptance 10 shipped as an id argument, not a count.** "Reproduces the block tree exactly"
+   is a claim about *what* reproduces, and the one thing that must differ is the id — one pattern
+   inserted into three pages must not leave three blocks sharing an id, or the inspector's
+   selection and the revision diff both become ambiguous about which block an author meant. So
+   the tests strip ids and compare the rest (type, props, order, nesting), and separately assert
+   that no stored id appears in the source and that two insertions share nothing.
+
+   **The permission split is the design, not a detail.** Reading either library is
+   `content.blocks.read` — what an author may build is not a privilege — while writing is
+   `content.patterns.manage` / `content.templates.manage`, kept apart from `content.pages.update`
+   because a pattern outlives the page it was cut from and is reused across every site of the
+   organization. Building from a template is the other direction: `content.pages.create` and no
+   curation power at all, so an author who may not rewrite the gallery can still start a page
+   from it. Three tests prove each direction is refused for the account that should not have it.
+
+   **The system templates are code, not migration rows.** Sample content belongs where it is
+   reviewable and testable in the same commit as the renderer that draws it, and a template an
+   operator hand-edited is a page nobody can reproduce. They are seeded per organization on the
+   first gallery read, keyed on `(organization_id, key)`, so a release that improves a template
+   updates every organization's copy of that one and leaves custom templates alone. A request
+   cannot claim `is_system` — the handler hard-codes `false` — because that flag is what makes a
+   row undeletable, and a body that could set it would be a way to lock the gallery.
+
+   A page created from a template is a real page: the template is read inside the same call, its
+   blocks land as the *next* draft revision (a revision's content is never rewritten), and its
+   words also become the `body`, so a page built from a template is findable by search and
+   readable by the SEO fields instead of being a structured page with nothing to read.
+
+   Three defects the tests found, all one shape — two implementations of a rule that had already
+   drifted, which is the failure mode this REQ keeps meeting:
+
+   - The store sanitised and validated a pattern but did not **normalise** it, while
+     `pages::update_page` did. So a page built from a template stored a tree with every registry
+     default filled in and the template did not, and the revision diff then reported *every block
+     changed* for a page nobody had edited. One normaliser, one stored shape.
+   - `BlockIssue::is_fatal` is not "is this an error"; it is "can the store hold this at all". A
+     `column` outside a `columns` block is a `Severity::Error` that blocks the *publish*. Using it
+     as a save predicate refused half-built patterns — and an author must be able to cut a
+     pattern out of a page that is itself half-built.
+   - A tree walker that descended only into `children` found no ids in a flat page, so the "two
+     insertions never collide" assertion was comparing nothing and reading as a pass.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
 
 ### Risks / notes

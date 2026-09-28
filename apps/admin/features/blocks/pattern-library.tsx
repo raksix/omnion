@@ -288,7 +288,10 @@ export function PatternLibrary() {
                   {pattern.block_count} block
                   {pattern.block_count === 1 ? "" : "s"} · {pattern.category}
                 </p>
-                <p className="line-clamp-2 font-mono text-[11px] text-muted/90">
+                <p
+                  data-pattern-outline={pattern.key}
+                  className="line-clamp-2 font-mono text-[11px] text-muted/90"
+                >
                   {describeTree(pattern.blocks as ContentBlock[], registry ?? NO_REGISTRY, 5)}
                 </p>
 
