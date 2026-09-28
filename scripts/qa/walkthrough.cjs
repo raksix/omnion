@@ -38,6 +38,28 @@ function arg(name, fallback) {
 const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
 const URL_WEB = arg("web", "http://127.0.0.1:3200");
 const OUT = path.resolve(arg("out", `qa-artifacts/${Date.now()}`));
+/**
+ * `--only=<group>` runs one section on its own, for the sections that sit at the *end* of the
+ * pass. Seven writers share this box, so a concurrent pass can exhaust memory and take the tab
+ * out from under a seventy-minute walk; when that happened the CRM depth passes — which start
+ * around minute sixty-five — never ran and the run reported nothing about them, which reads as
+ * "green" and is not. A scoped pass is minutes long, starts at the section itself, and reports
+ * the same keys, so a claim about a section can be proved without re-walking the pages above it.
+ *
+ * The group is matched against the section's name, so `--only=crm` runs the CRM routes and the
+ * six CRM depth passes in their existing order (the copilot needs the deal the deals pass put
+ * on the board, and the state sweep restores the network before it returns, so the order is
+ * load-bearing and is not a list to sort).
+ */
+// Both spellings are accepted, because `--only=crm` is the one the wizard check below already
+// uses and `--only crm` is the one every other flag in this file takes. `arg()` only matches the
+// separated form, so the joined one is read here — a scoped pass that silently ran the whole
+// panel would be worse than no scoped pass at all, since it would look like a proof.
+const ONLY = (
+  (process.argv.includes("--only") ? arg("only", "") : "") ||
+  (process.argv.find((a) => a.startsWith("--only=")) || "").replace(/^--only=/, "")
+).trim().toLowerCase();
+const onlyGroup = (group) => ONLY !== "" && ONLY === group;
 const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
@@ -3467,7 +3489,11 @@ async function main() {
   report.analytics = await seedAnalytics(report);
   log(`analytics seed: ${JSON.stringify(report.analytics)}`);
 
-  const routes = [
+  // A scoped pass (`--only=crm`) walks the section's own routes and nothing else. The full list
+  // is kept whole below so a normal pass still visits every screen; filtering rather than
+  // branching means a new route is picked up by a scoped pass the day it is added, with no
+  // second list to forget.
+  const ALL_ROUTES = [
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
     { path: "/media", name: "media" },
@@ -3547,6 +3573,10 @@ async function main() {
     // is the rule the whole route list exists to enforce.
     { path: "/crm/leads", name: "crm-leads" },
   ];
+  // `crm-leads-mobile` is the one route whose name is not a prefix of its path group, so the
+  // group is decided by the path rather than by the name: a scoped pass takes a route whose path
+  // starts with `/crm`, which is the section a person would call the CRM, and skips the rest.
+  const routes = ONLY === "" ? ALL_ROUTES : ALL_ROUTES.filter((r) => ONLY === "crm" && r.path.startsWith("/crm"));
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
   // memory) used to end the entire run, so every route after the crash and every depth pass
@@ -3574,6 +3604,10 @@ async function main() {
     }
   }
 
+  // A scoped pass runs its own section's depth passes and skips the rest (the file manager below
+  // and the IAM/analytics/media passes that follow): they are minutes of work that prove nothing
+  // about the section being asked about, and this box is shared with six other writers.
+  if (!onlyGroup("crm")) {
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
   // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
@@ -3655,6 +3689,8 @@ async function main() {
   await runIamSecurityDepth(page, report);
   log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
+  } // end the non-CRM depth passes skipped by a scoped pass
+
   // The CRM pass (REQ-051, slice 2): a company, a contact on it, an inline edit that survives a
   // reload, a saved view, a column chooser, a filter that is a URL, an import dry run with one
   // refused row and a CSV export read back from the API.
@@ -3686,6 +3722,7 @@ async function main() {
   // hand, and a stub left installed would make the sign-out step below look like a broken panel.
   await runCrmStateSweep(page, report);
 
+  if (!onlyGroup("crm")) {
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -3821,6 +3858,8 @@ async function main() {
   } catch (err) {
     report.web = { error: String(err).slice(0, 300) };
   }
+
+  } // end the sign-out, mobile and renderer passes skipped by a scoped pass
 
   await browser.close();
 
