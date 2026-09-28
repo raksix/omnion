@@ -1,7 +1,7 @@
 /** Placeholder rows shown while a table's data is on its way. */
 export function LoadingTable({ columns, rows = 4 }: { columns: number; rows?: number }) {
   return (
-    <div className="overflow-x-auto" aria-busy="true">
+    <div className="overflow-x-auto" aria-busy="true" data-loading-table>
       <table className="w-full border-collapse text-left text-[13px]">
         <tbody>
           {Array.from({ length: rows }, (_, rowIndex) => (

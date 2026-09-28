@@ -109,6 +109,17 @@ const consoleLog = [];
  */
 const expectedRefusals = [];
 
+/**
+ * Failed assertions raised by a depth pass, waiting for the roll-up to own them.
+ *
+ * The roll-up builds its own `findings` array after every pass has run, so a pass that wants a
+ * failed claim to reach the report cannot push into it directly. It queues here instead, and the
+ * roll-up drains the queue before it writes. Anything left unclaimed in this array at the end of
+ * a run is itself reported — a silently swallowed assertion is a gate that can be switched off
+ * without anyone noticing.
+ */
+const aiStateFindings = [];
+
 /** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
 function expectRefusal(match, reason) {
   expectedRefusals.push({
@@ -1252,6 +1263,171 @@ async function discoverTwice(page, fake) {
     fakeEndpoint: fake.baseUrl,
   };
 }
+
+/**
+ * Every screen has three states, and only one of them is the happy path.
+ *
+ * A panel that renders a skeleton when the request *failed* is the defect this pass exists to
+ * find: `null` used to mean both "loading" and "could not be loaded", so an outage looked like a
+ * slow network and the skeleton shimmered for ever. Each state is provoked for real — the
+ * request is answered with a 500 or the connection is dropped, never a mock of the component —
+ * and the pass asserts the screen says which one it is and offers a way out.
+ *
+ * The failing call is scoped with a route handler and then removed, so the retry is a real second
+ * request rather than a re-render of cached state.
+ */
+async function runAiStatesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-providers", action: "ai-states", ...step });
+  };
+  // A note in a jsonl file is evidence for a human reading the log, not a gate. Every assertion
+  // here is a claim about the panel, so a false one has to reach the report as a finding — the
+  // whole point of the sweep is that a screen which cannot say what went wrong is a defect, and a
+  // defect that only prints is a defect nobody fixes.
+  //
+  // The roll-up owns the real `findings` array and runs after this pass, so the assertions queue
+  // here and are drained into it. Pushing straight at the roll-up's array would be a ReferenceError
+  // — a gate that throws is worse than no gate, because the run dies before the report is written.
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    aiStateFindings.push(detail);
+    return false;
+  };
+
+  const readStates = () =>
+    page.evaluate(() => ({
+      providersError: document.querySelectorAll("[data-providers-error]").length,
+      providersRetry: document.querySelectorAll("[data-providers-retry]").length,
+      modelsError: document.querySelectorAll("[data-models-error]").length,
+      modelsRetry: document.querySelectorAll("[data-models-retry]").length,
+      // The skeleton is the *loading* state. If it is on screen while an error is also claimed,
+      // the screen is telling the operator two different things at once.
+      skeletons: document.querySelectorAll("[data-loading-table]").length,
+      emptyTitle: (document.body.textContent || "").includes("No provider is connected yet"),
+    }));
+
+  // --- one list fails, the other keeps working ---------------------------------------------
+  // A provider-list outage that also blanked the model registry would prove the two are not
+  // really independent, which is the whole point of the `allSettled` above.
+  //
+  // Every failure below is *registered* first. The roll-up turns an unclaimed 500 or a dropped
+  // connection into a high finding, and that is the right default — but these are the assertions
+  // this pass exists to make, so they are excused deliberately rather than by loosening the gate.
+  const failProviders = async (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { message: "the provider registry is unreachable" } }),
+    });
+  const failModels = async (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { message: "the model registry is unreachable" } }),
+    });
+
+  const unroute = async (pattern) => {
+    try {
+      await page.unroute(pattern);
+    } catch {
+      /* never registered — nothing to undo */
+    }
+  };
+
+  // ---- the provider list fails -----------------------------------------------------------
+  expectRefusal("/ai/providers", "ai-states: the provider list is answered with a 500 on purpose");
+  await page.route("**/api/v1/ai/providers**", failProviders);
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const providersDown = await readStates();
+  // An error with no button is a dead end: the operator is told what broke and given nothing.
+  expect(
+    providersDown.providersError === 1 && providersDown.providersRetry === 1,
+    `ai-states: the provider list answered 500 but the screen showed no retryable error ` +
+      `(error blocks ${providersDown.providersError}, retry buttons ${providersDown.providersRetry})`,
+  );
+  // "No provider is connected yet" is a *different* claim — it tells an operator with a working
+  // installation that they have no provider, and invites them to add a duplicate.
+  expect(
+    providersDown.emptyTitle === false,
+    'ai-states: the provider outage claimed the installation is empty ("No provider is connected yet")',
+  );
+  // The models list is untouched, so it must still be readable rather than erroring too.
+  expect(
+    providersDown.modelsError === 0,
+    "ai-states: one failing provider list also blanked the model registry — they are not independent",
+  );
+  note({ step: "providers-outage", ...providersDown });
+  await shot(page, "ai-providers-outage");
+
+  // ---- the retry really re-requests ------------------------------------------------------
+  await unroute("**/api/v1/ai/providers**");
+  await page.locator("[data-providers-retry]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const afterRetry = await readStates();
+  expect(
+    afterRetry.providersError === 0,
+    "ai-states: the retry button left the error on screen after the endpoint recovered",
+  );
+  expect(
+    afterRetry.skeletons === 0,
+    "ai-states: the retry left the loading skeleton up — the request never resolved",
+  );
+  note({
+    step: "retry-recovers",
+    clearedError: afterRetry.providersError === 0,
+    showsRowsOrEmpty: afterRetry.skeletons === 0,
+  });
+  await shot(page, "ai-providers-recovered");
+
+  // ---- the model registry fails -----------------------------------------------------------
+  expectRefusal("/ai/models", "ai-states: the model registry is answered with a 500 on purpose");
+  await page.route("**/api/v1/ai/models**", failModels);
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const modelsDown = await readStates();
+  expect(
+    modelsDown.modelsError === 1 && modelsDown.modelsRetry === 1,
+    `ai-states: the model registry answered 500 but the screen showed no retryable error ` +
+      `(error blocks ${modelsDown.modelsError}, retry buttons ${modelsDown.modelsRetry})`,
+  );
+  // The provider list is the screen's real content; losing it too would mean one failure took
+  // the whole hub down.
+  expect(
+    modelsDown.providersError === 0,
+    "ai-states: one failing model registry also blanked the provider list — they are not independent",
+  );
+  note({ step: "models-outage", ...modelsDown });
+  await shot(page, "ai-models-outage");
+  await unroute("**/api/v1/ai/models**");
+
+  // ---- the transport itself fails ---------------------------------------------------------
+  // A dropped connection is a different failure from a 500 and the honest message is not the
+  // same: the server never answered, so the panel must not claim it did.
+  expectRefusal("/ai/providers", "ai-states: the provider request is dropped on purpose");
+  await page.route("**/api/v1/ai/providers**", (route) => route.abort("connectionrefused"));
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const offline = await readStates();
+  // A skeleton here is the original bug, unfixed: a transport failure read as "still loading".
+  expect(
+    offline.skeletons === 0,
+    "ai-states: a dropped connection left the loading skeleton on screen — a failure reads as pending",
+  );
+  expect(
+    offline.providersError === 1 && offline.providersRetry === 1,
+    `ai-states: the provider request was dropped but the screen showed no retryable error ` +
+      `(error blocks ${offline.providersError}, retry buttons ${offline.providersRetry})`,
+  );
+  note({ step: "connection-refused", ...offline });
+  await shot(page, "ai-providers-offline");
+  await unroute("**/api/v1/ai/providers**");
+
+  return { providersDown, afterRetry, modelsDown, offline };
+}
+
 
 /**
  * Run one depth pass without letting it end the run.
@@ -3353,6 +3529,11 @@ async function main() {
   // The AI provider runtime pass (REQ-097, slice 1): the form's own refusal, a real local
   // endpoint, the five-step connection test, and a dead endpoint that names its failing step.
   report.aiProviders = await runAiProviderDepth(page, report);
+  // The three states of every list — the one criterion that is a *claim* until the network
+  // says otherwise. Each failure is provoked for real (a 500 and a dropped connection), the
+  // retry is a real second request, and a skeleton on screen while an error is claimed is
+  // itself the finding.
+  report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
   log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
@@ -3560,6 +3741,12 @@ async function main() {
   const clicks = clickLines.filter((e) => e.action === "click");
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
+
+  // The assertions a depth pass could not keep. Drained before anything is written, so a claim
+  // the panel failed lands in the report with the same weight as a broken image.
+  for (const detail of aiStateFindings.splice(0)) {
+    pushFindings("high", "ai-state", detail);
+  }
 
   for (const p of report.pages) {
     const d = p.diagnostics;

@@ -388,6 +388,14 @@ export function AiView() {
   const searchParams = useSearchParams();
   const [providers, setProviders] = useState<AiProvider[] | null>(null);
   const [models, setModels] = useState<AiModel[] | null>(null);
+  // A *failed* load is not a pending one. `null` means "still loading" and renders the skeleton;
+  // parking a rejection there left the screen shimmering for ever with a banner nobody could act
+  // on. The failure of each list is held separately so a provider-list outage does not also
+  // blank the model registry beside it — the two settle independently above.
+  const [listError, setListError] = useState<{ providers: string | null; models: string | null }>({
+    providers: null,
+    models: null,
+  });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -455,6 +463,7 @@ export function AiView() {
   useEffect(() => {
     let cancelled = false;
     setError(null);
+    setListError({ providers: null, models: null });
 
     // The three calls settle independently on purpose: a provider list that fails must not take
     // the model registry and the form's protocol vocabulary down with it.
@@ -465,20 +474,24 @@ export function AiView() {
         }
 
         const [providersResult, modelsResult, protocolsResult] = results;
-        setProviders(providersResult.status === "fulfilled" ? providersResult.value : null);
-        setModels(modelsResult.status === "fulfilled" ? modelsResult.value : null);
+        const reasonFor = (result: PromiseSettledResult<unknown>, fallback: string) =>
+          result.status === "rejected"
+            ? result.reason instanceof ApiError
+              ? result.reason.message
+              : fallback
+            : null;
+
+        const providersFailed = reasonFor(providersResult, "The providers could not be read.");
+        const modelsFailed = reasonFor(modelsResult, "The model registry could not be read.");
+
+        // A rejection lands on the *error* slot, never back on the loading one. `null` here would
+        // be read as "still loading" and the skeleton would never resolve.
+        setProviders(providersFailed ? [] : (providersResult as PromiseFulfilledResult<AiProvider[]>).value);
+        setModels(modelsFailed ? [] : (modelsResult as PromiseFulfilledResult<AiModel[]>).value);
+        setListError({ providers: providersFailed, models: modelsFailed });
         if (protocolsResult.status === "fulfilled") {
           setProtocols(protocolsResult.value.protocols);
           setBounds(protocolsResult.value.bounds);
-        }
-
-        const failure = results.find((result) => result.status === "rejected");
-        if (failure && failure.status === "rejected") {
-          setError(
-            failure.reason instanceof ApiError
-              ? failure.reason.message
-              : "The AI Hub could not be loaded.",
-          );
         }
       });
 
@@ -948,10 +961,36 @@ export function AiView() {
 
         {providers === null ? (
           <LoadingTable columns={4} rows={2} />
+        ) : listError.providers ? (
+          // An outage is not an empty installation. "No provider is connected yet" would send an
+          // operator to connect one that is already there, so the failure keeps its own wording and
+          // the button is a retry rather than an invitation to add.
+          <div className="flex flex-col items-center gap-2 px-6 py-10 text-center" data-providers-error>
+            <p className="text-[13.5px] font-medium">The providers could not be loaded</p>
+            <p className="max-w-sm text-[12.5px] text-muted">{listError.providers}</p>
+            <button
+              type="button"
+              onClick={reload}
+              className="mt-2 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+              data-providers-retry
+            >
+              Try again
+            </button>
+          </div>
         ) : providers.length === 0 ? (
           <EmptyState
             title="No provider is connected yet"
             hint="Connect an OpenAI-compatible endpoint, give it the models it serves, and the platform can talk to it."
+            action={
+              <button
+                type="button"
+                onClick={() => setShowForm(true)}
+                className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong"
+                data-empty-connect
+              >
+                Connect a provider
+              </button>
+            }
           />
         ) : (
           <ul className="divide-y divide-[var(--color-line)]">
@@ -1176,10 +1215,33 @@ export function AiView() {
 
         {models === null ? (
           <LoadingTable columns={4} rows={2} />
+        ) : listError.models ? (
+          <div className="flex flex-col items-center gap-2 px-6 py-10 text-center" data-models-error>
+            <p className="text-[13.5px] font-medium">The model registry could not be loaded</p>
+            <p className="max-w-sm text-[12.5px] text-muted">{listError.models}</p>
+            <button
+              type="button"
+              onClick={reload}
+              className="mt-2 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+              data-models-retry
+            >
+              Try again
+            </button>
+          </div>
         ) : models.length === 0 ? (
           <EmptyState
             title="No model is registered"
             hint="Add models to a provider — or pull them from the provider itself with Discover."
+            action={
+              <button
+                type="button"
+                onClick={() => setShowForm(true)}
+                className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong"
+                data-empty-model
+              >
+                Add a model
+              </button>
+            }
           />
         ) : (
           <ul className="divide-y divide-[var(--color-line)]">
