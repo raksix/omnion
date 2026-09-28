@@ -3495,6 +3495,185 @@ export type DepartmentFilters = {
   q?: string;
 };
 
+// ---------------------------------------------------------------------------------------------
+// Organization settings, modules, limits and usage (REQ-005, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of the Settings tab. */
+export type OrganizationSettings = {
+  locale: string;
+  timezone: string;
+  invite_policy: string;
+  default_invite_role_id: string | null;
+  logo_media_id: string | null;
+  accent_color: string | null;
+  audit_retention_days: number;
+  updated_at: string;
+};
+
+/** The Settings payload, with the choices the form offers. */
+export type OrganizationSettingsPayload = {
+  organization_id: string;
+  settings: OrganizationSettings;
+  available_locales: string[];
+  invite_policies: { key: string; description: string }[];
+};
+
+/** One row of the Modules tab. */
+export type OrganizationModule = {
+  key: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  /** Whether the organization made an explicit decision about this module. */
+  explicit: boolean;
+};
+
+/** The Modules payload. */
+export type OrganizationModulesPayload = {
+  organization_id: string;
+  modules: OrganizationModule[];
+};
+
+/** The plan and its ceilings; a `null` limit is unlimited. */
+export type OrganizationLimits = {
+  plan: string;
+  seat_limit: number | null;
+  site_limit: number | null;
+  storage_bytes_limit: number | null;
+  ai_monthly_limit_micros: number | null;
+  updated_at: string;
+};
+
+/** The Limits payload, with the plans the selector offers. */
+export type OrganizationLimitsPayload = {
+  organization_id: string;
+  limits: OrganizationLimits;
+  available_plans: { key: string; description: string }[];
+};
+
+/** What the organization holds, next to the ceilings it is measured against. */
+export type OrganizationUsage = {
+  organization_id: string;
+  seats_used: number;
+  sites_used: number;
+  storage_used_bytes: number;
+  ai_micros_this_month: number;
+  limits: OrganizationLimits;
+  /** Per-metric label naming which limit the bar reads. */
+  sources: {
+    seats: string;
+    sites: string;
+    storage_bytes: string;
+    ai_monthly_micros: string;
+  };
+};
+
+/** The organization settings and the choices the form may offer. */
+export function fetchOrganizationSettings(
+  organizationId: string,
+): Promise<OrganizationSettingsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/settings`,
+  );
+}
+
+/** Save the whole settings row. */
+export function updateOrganizationSettings(
+  organizationId: string,
+  input: {
+    locale: string;
+    timezone: string;
+    invite_policy: string;
+    default_invite_role_id?: string | null;
+    logo_media_id?: string | null;
+    accent_color?: string | null;
+    audit_retention_days: number;
+  },
+): Promise<OrganizationSettingsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/settings`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** The installed modules with this organization's decision about each. */
+export function fetchOrganizationModules(
+  organizationId: string,
+): Promise<OrganizationModulesPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/modules`,
+  );
+}
+
+/**
+ * Switch a set of modules.
+ *
+ * The whole batch is sent at once on purpose: the API validates every key before writing any
+ * of them, so a batch naming one module this installation does not ship leaves the others
+ * untouched — which a row of independent `PUT`s could not promise.
+ */
+export function updateOrganizationModules(
+  organizationId: string,
+  modules: { module_key: string; enabled: boolean }[],
+): Promise<OrganizationModulesPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/modules`,
+    { method: "PUT", body: JSON.stringify({ modules }) },
+  );
+}
+
+/** The plan and its ceilings. */
+export function fetchOrganizationLimits(
+  organizationId: string,
+): Promise<OrganizationLimitsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/limits`,
+  );
+}
+
+/** Save the plan and every ceiling. */
+export function updateOrganizationLimits(
+  organizationId: string,
+  input: {
+    plan: string;
+    seat_limit: number | null;
+    site_limit: number | null;
+    storage_bytes_limit: number | null;
+    ai_monthly_limit_micros: number | null;
+  },
+): Promise<OrganizationLimitsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/limits`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** What the organization holds, next to its ceilings. */
+export function fetchOrganizationUsage(organizationId: string): Promise<OrganizationUsage> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/usage`,
+  );
+}
+
+/**
+ * The same numbers as a spreadsheet, from the same call the screen renders.
+ *
+ * The file is fetched rather than built here: a CSV assembled in the browser from an older
+ * payload would be a second reading of the data, and the Billing tab's whole claim is that the
+ * two agree.
+ */
+export async function downloadOrganizationUsage(organizationId: string): Promise<Blob> {
+  const response = await fetch(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/usage?format=csv`,
+    { credentials: "include" },
+  );
+  if (!response.ok) {
+    throw new ApiError(response.status, "usage_export_failed", "The usage file could not be downloaded.");
+  }
+  return response.blob();
+}
+
 /** The department tree, parents before children. */
 export async function fetchOrganizationDepartments(
   organizationId: string,

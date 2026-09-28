@@ -1981,6 +1981,128 @@ async function runOrganizationDepartments(page, report, organizationId) {
   return out;
 }
 
+/**
+ * The Modules, Settings and Billing tabs of one organization (REQ-005, slice 3).
+ *
+ * The pass walks what the request asks a reader to be able to *do*, not merely that the tabs
+ * render: switch a module off and on and read the state back, change the locale and the accent
+ * and reload to prove both persisted, and look at the usage bars the Billing tab labels with
+ * their ceiling. A tab that only loads is a screenshot, not a walk.
+ */
+async function runOrganizationTenantTabs(page, report, organizationId) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "organization-tenant-tabs", action: "organizations", ...step });
+  };
+
+  if (!organizationId) {
+    note({ step: "skip", reason: "no organization was created by an earlier pass" });
+    report.organizationTenantTabs = { steps, organizationId: null };
+    return report.organizationTenantTabs;
+  }
+
+  // ---- Modules -------------------------------------------------------------------------------
+  const modulesUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=modules`;
+  await page.goto(modulesUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-organization-module]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  const moduleRows = await page.locator("[data-organization-module]").count();
+  note({ step: "modules-list", rows: moduleRows });
+  await shot(page, "page-organization-modules");
+
+  if (moduleRows > 0) {
+    const firstKey = await page
+      .locator("[data-organization-module]")
+      .first()
+      .getAttribute("data-organization-module");
+    const switchAt = (moduleKey) =>
+      page.locator(`[data-organization-module="${moduleKey}"] button[role="switch"]`);
+
+    const wasOn = (await switchAt(firstKey).getAttribute("aria-checked")) === "true";
+    await switchAt(firstKey).click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const nowOn = (await switchAt(firstKey).getAttribute("aria-checked")) === "true";
+    note({ step: "module-toggle", module: firstKey, wasOn, nowOn, changed: wasOn !== nowOn });
+    await shot(page, "page-organization-module-toggled");
+
+    // A reload is what proves it persisted rather than being echoed back.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-organization-module]", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const afterReload = (await switchAt(firstKey).getAttribute("aria-checked")) === "true";
+    note({ step: "module-persisted", module: firstKey, persisted: afterReload === nowOn });
+
+    // Put it back, so the pass leaves the organization as it found it.
+    await switchAt(firstKey).click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+    const restored = (await switchAt(firstKey).getAttribute("aria-checked")) === "true";
+    note({ step: "module-restored", module: firstKey, restored: restored === wasOn });
+  }
+
+  // ---- Settings ------------------------------------------------------------------------------
+  const settingsUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=settings`;
+  await page.goto(settingsUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("select", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  await page.locator("select").first().selectOption("tr").catch(() => {});
+  await page.locator('input[placeholder="Europe/Istanbul"]').first().fill("Europe/Istanbul").catch(() => {});
+  await page.locator('input[placeholder="Platform default"]').first().fill("#2f6f4f").catch(() => {});
+  await shot(page, "page-organization-settings");
+  await page.locator('button:has-text("Save settings")').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  // Reload and read the stored values back: a form that only looks right is not saved.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("select", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const storedLocale = await page.locator("select").first().inputValue().catch(() => "");
+  const storedAccent = await page
+    .locator('input[placeholder="Platform default"]')
+    .first()
+    .inputValue()
+    .catch(() => "");
+  const storedZone = await page
+    .locator('input[placeholder="Europe/Istanbul"]')
+    .first()
+    .inputValue()
+    .catch(() => "");
+  note({ step: "settings-saved", locale: storedLocale, accent: storedAccent, timezone: storedZone });
+  await shot(page, "page-organization-settings-saved");
+
+  // Put the locale back so the next pass reads the screen in the language it started in.
+  await page.locator("select").first().selectOption("en").catch(() => {});
+  await page.locator('button:has-text("Save settings")').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+
+  // ---- Billing -------------------------------------------------------------------------------
+  const billingUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=billing`;
+  await page.goto(billingUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[role="progressbar"]', { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const bars = await page.locator('[role="progressbar"]').count();
+  const barLabels = await page.locator('[role="progressbar"]').evaluateAll((nodes) =>
+    nodes.map((node) => ({
+      label: node.getAttribute("aria-label"),
+      now: node.getAttribute("aria-valuenow"),
+    })),
+  );
+  // A bar that names neither a metric nor a number is decoration; the REQ asks for a number and
+  // a ceiling on every one.
+  const labelled = barLabels.every((bar) => bar.label && bar.now !== null);
+  note({ step: "billing-bars", bars, labelled, barLabels });
+  await shot(page, "page-organization-billing");
+
+  const out = { steps, organizationId };
+  report.organizationTenantTabs = out;
+  log(`organization tenant tabs: ${JSON.stringify(steps)}`);
+  return out;
+}
+
 async function runIamRolesDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -3020,6 +3142,13 @@ async function main() {
   // clean up again. It needs the organization the pass above just opened.
   await runOrganizationDepartments(page, report, organizationDepth.organizationId);
   log(`organization departments: ${JSON.stringify(report.organizationDepartments)}`);
+
+  // The Modules, Settings and Billing tabs (REQ-005, slice 3): switch a module off and on and
+  // read it back after a reload, change the locale and accent and prove both persisted, and
+  // check that every usage bar names its metric and its number. Same organization, so it runs
+  // straight after the departments pass rather than opening a second one.
+  await runOrganizationTenantTabs(page, report, organizationDepth.organizationId);
+  log(`organization tenant tabs: ${JSON.stringify(report.organizationTenantTabs)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.

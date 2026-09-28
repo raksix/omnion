@@ -14,6 +14,7 @@ import { Check, MailPlus, RefreshCw, Search, Send, Trash2, UserMinus, X } from "
 import { useSearchParams } from "next/navigation";
 
 import { DepartmentsTab } from "@/features/organizations/departments-tab";
+import { BillingTab, ModulesTab, SettingsTab } from "@/features/organizations/settings-tabs";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -651,12 +652,18 @@ function MembersTab({ organization }: { organization: Organization }) {
 }
 
 /**
- * The tabs this slice ships. Roles, modules, API keys, billing, settings and audit arrive with
- * slice 3; the Overview summary with it as well.
+ * The tabs this organization screen carries.
+ *
+ * Roles, API keys and audit still arrive with their own requests — the panel never shows a tab
+ * it cannot fill, and a tab that renders an empty state for a feature that does not exist yet
+ * is a dead control wearing an empty state.
  */
 const TABS = [
   { key: "members", label: "Members" },
   { key: "departments", label: "Departments" },
+  { key: "modules", label: "Modules" },
+  { key: "settings", label: "Settings" },
+  { key: "billing", label: "Billing" },
 ] as const;
 
 /** `/organizations/[id]`. */
@@ -745,6 +752,9 @@ export function OrganizationDetailView({ organizationId }: { organizationId: str
 
       {tab === "members" ? <MembersTab organization={organization} /> : null}
       {tab === "departments" ? <DepartmentsTab organization={organization} /> : null}
+      {tab === "modules" ? <ModulesTab organization={organization} /> : null}
+      {tab === "settings" ? <SettingsTab organization={organization} /> : null}
+      {tab === "billing" ? <BillingTab organization={organization} /> : null}
     </div>
   );
 }
