@@ -258,13 +258,24 @@ pub async fn search(
 /// from here. A retention job that deleted an audit row would be a compliance bug, so the absence
 /// is the interesting property and the test asserts the audit row survives.
 pub async fn prune(pool: &PgPool, retention_days: i64) -> Result<i64, TelemetryError> {
+    // `make_interval`'s `days` parameter is `integer`, NOT `bigint`. Binding an `i64` sends a
+    // bigint, and PostgreSQL has no implicit bigint→integer cast for named parameters, so the
+    // whole statement fails with `function make_interval(days => bigint) does not exist` — on
+    // EVERY call, for EVERY window.
+    //
+    // This shipped broken and nothing caught it for a tick, because the retention sweep treats
+    // a failed prune as a warning and carries on: `trace_rows: 0` looks exactly like "nothing was
+    // old enough to prune". The integration walk is what found it, by asserting the row was
+    // GONE from PostgreSQL rather than trusting the report. The cast is in SQL because that is
+    // where the type lives.
     let result = sqlx::query(
-        "delete from obs_trace_index where started_at < now() - make_interval(days => $1)",
+        "delete from obs_trace_index \
+         where started_at < now() - make_interval(days => $1::int)",
     )
-    .bind(retention_days)
+    .bind(i32::try_from(retention_days.clamp(1, MAX_TRACE_RETENTION_DAYS)).unwrap_or(1))
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() as i64)
+    Ok(i64::try_from(result.rows_affected()).unwrap_or(i64::MAX))
 }
 
 /// How many traces the index holds.

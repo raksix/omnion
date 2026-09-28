@@ -893,9 +893,9 @@ pub async fn prune_events(pool: &PgPool, retention_days: i64) -> Result<i64, Tel
     let removed = sqlx::query(
         "delete from obs_alert_events \
          where state = 'resolved' \
-           and ended_at < now() - make_interval(days => $1)",
+           and ended_at < now() - make_interval(days => $1::int)",
     )
-    .bind(retention_days.clamp(1, 30))
+    .bind(i32::try_from(retention_days.clamp(1, 30)).unwrap_or(1))
     .execute(pool)
     .await?;
     // `rows_affected` is `u64`; every other count in this crate is `i64`, because a JSON number

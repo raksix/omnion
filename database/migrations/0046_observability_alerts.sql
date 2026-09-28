@@ -1,4 +1,4 @@
--- Omnion · 0044 · Alerts, silences, sampling and the settings row (REQ-126, slice 4)
+-- Omnion · 0046 · Alerts, silences, sampling and the settings row (REQ-126, slice 4)
 -- (docs/requests/REQ-126-observability-stack.md).
 --
 -- Additive by design (docs/05-VERSIONING.md): three new tables and three columns added to the
@@ -9,11 +9,21 @@
 -- ## Numbering note
 --
 -- The slot is global across the parallel waves. 0040 is this wave's own tracing migration, 0041
--- is held by wave 5 and 0042 by the media work on main, 0043 by wave 7 — so the alerts are 0044.
--- The name came from an `ls` of every sibling worktree and `origin/main`, re-run after the merge,
+-- is held by wave 5, 0042 by the media work on main, 0043 by wave 7's prices and 0045 by its
+-- task routes — so the alerts are 0046.
+--
+-- The name came from an `ls` of every sibling worktree AND `origin/main`, re-run after the merge,
 -- because two branches can each be internally consistent and still collide in their union, and
 -- sqlx keys migrations on version AND checksum, so a collision makes the API refuse to boot at
 -- all.
+--
+-- **The `ls` has to include a sibling's WORKING TREE, not only its commits.** This file was
+-- first written as 0044, at a moment when every *committed* migration was clear of that slot —
+-- and `0044_media_scanning.sql` was sitting untracked in the main writer's working tree. A
+-- check that only reads `origin/main` reports the slot free, and the collision then lands the
+-- moment they merge, in a union neither branch was internally inconsistent about. The check that
+-- catches it is `git status --short database/migrations/` in every sibling, not
+-- `git ls-tree origin/main`.
 --
 -- ## Why the sampling ratio lives in a column and not in a config file
 --
