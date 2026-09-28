@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
+import { BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -23,6 +23,12 @@ const NAV = [
   { href: "/notifications", label: "Notifications", icon: Bell },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
+  // The CRM's two entry points. The duplicate queue is a sibling rather than a filter of the
+  // inbox: it answers "which verdicts can I still reverse", and burying it in a dropdown is how
+  // a wrong dedupe verdict becomes permanent.
+  { href: "/crm/leads", label: "Lead inbox", icon: UserCog },
+  { href: "/crm/leads/duplicates", label: "Duplicate leads", icon: Copy },
+  { href: "/crm/settings/intake", label: "Intake sources", icon: KeyRound },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
@@ -41,7 +47,9 @@ const NAV = [
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
-const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam"]);
+/// `/crm/leads/duplicates` is here for the same reason — without it the inbox entry would
+/// light up on the queue, and two highlighted items at once reads as a broken sidebar.
+const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam", "/crm/leads/duplicates"]);
 
 /** `true` when a navigation entry belongs to the screen that is open. */
 function isActive(href: string, pathname: string): boolean {
