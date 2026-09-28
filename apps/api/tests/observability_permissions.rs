@@ -228,6 +228,28 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
+/// A request authenticated as the account that owns the walk's fixtures.
+///
+/// A walk that creates its fixtures through the account under test is a walk whose setup
+/// depends on the thing it is proving: the read-only walk needed `observability.manage` to
+/// create an exporter, got a bare `403` instead, and the failure read as "the fixture was
+/// refused" rather than "the fixture was never created". The cookie is therefore passed
+/// explicitly — a task-local that only lives for the scope that sets it is worse than a
+/// parameter, because the scope ends and the reader has to know it.
+fn admin_request(method: Method, uri: &str, body: Option<Value>, cookie: &str) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, cookie);
+    match body {
+        None | Some(Value::Null) => builder.body(Body::empty()),
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string())),
+    }
+    .expect("the admin request builds")
+}
+
 fn request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     match body {
@@ -387,9 +409,19 @@ async fn account_with(state: &AppState, permissions: &[&str]) -> (Uuid, Uuid, St
     )
 }
 
-/// A signed `Cookie` header for a session.
+/// The value for a session `Cookie` header.
+///
+/// The bare `name=value` pair, NOT `Cookie: name=value`. This helper used to return the
+/// `Cookie: ` prefix as well, and both call sites passed it to `.header(header::COOKIE, …)`,
+/// so the request went out as `Cookie: Cookie: omnion_session=…`. Every authenticated call
+/// answered `401 unauthenticated` — and because the whole suite was skipping (see
+/// `state_or_fail`), that never showed up: the first run of these walks was a *vacuous* pass,
+/// and the second exposed a second, independent defect underneath it.
+///
+/// This is why a skip guard and a first real run are two different pieces of evidence. The
+/// guard is what makes the run fail loudly; only a genuine run finds what was hidden.
 fn cookie_header(cookie: &str) -> String {
-    format!("Cookie: {cookie}")
+    cookie.to_owned()
 }
 
 /// The number of audit rows an actor wrote for one action, read out of PostgreSQL.
@@ -406,16 +438,24 @@ async fn audit_rows(state: &AppState, actor: Uuid, action: &str) -> i64 {
 
 #[tokio::test]
 async fn observability_read_is_refused_on_every_write_and_the_refusal_names_the_permission() {
+    // TWO accounts, deliberately. The fixtures below (a real exporter, a real rule, a real
+    // silence) are created with `observability.manage`, because `routes/mod.rs` guards the whole
+    // write surface with `guards::require(&state, "observability.manage")` — a narrower
+    // `observability.exporters.manage` does NOT create an exporter, and asking the account under
+    // test to create its own fixture is the mistake this two-account split removes. The account
+    // that is then refused holds `observability.read` and nothing else.
     let state = state_or_fail().await;
+    let (_admin, _admin_org, admin_cookie) =
+        account_with(&state, &["observability.manage", "observability.read"]).await;
     let (_actor, _organization, cookie) =
-        account_with(&state, &["observability.read", "observability.exporters.manage"]).await;
+        account_with(&state, &["observability.read"]).await;
 
     // A real exporter and a real rule, so the paths under test address rows that exist rather
     // than ids that 404. A refusal on a missing row would still be a `403` from the guard — the
     // guard runs first — so the walk would pass while proving nothing about the body.
     let created_exporter = call(
         &state,
-        request(
+        admin_request(
             Method::POST,
             "/api/v1/observability/exporters",
             Some(json!({
@@ -426,16 +466,17 @@ async fn observability_read_is_refused_on_every_write_and_the_refusal_names_the_
                 "timeout_ms": 1000,
                 "enabled": true,
             })),
+            &admin_cookie,
         ),
     )
     .await;
     let exporter_id = created_exporter.body["id"]
         .as_str()
-        .expect("the fixture exporter was created")
+        .unwrap_or_else(|| panic!("the fixture exporter was created: {}", created_exporter.body))
         .to_owned();
     let created_rule = call(
         &state,
-        request(
+        admin_request(
             Method::POST,
             "/api/v1/observability/alert-rules",
             Some(json!({
@@ -446,26 +487,28 @@ async fn observability_read_is_refused_on_every_write_and_the_refusal_names_the_
                 "summary": "a rule the readonly walk addresses",
                 "runbook_url": null,
             })),
+            &admin_cookie,
         ),
     )
     .await;
     let rule_id = created_rule.body["id"]
         .as_str()
-        .expect("the fixture rule was created")
+        .unwrap_or_else(|| panic!("the fixture rule was created: {}", created_rule.body))
         .to_owned();
 
     let created_silence = call(
         &state,
-        request(
+        admin_request(
             Method::POST,
             "/api/v1/observability/silences",
             Some(json!({ "rule_id": rule_id, "reason": "the readonly walk", "ends_at": rfc3339_in(1) })),
+            &admin_cookie,
         ),
     )
     .await;
     let silence_id = created_silence.body["id"]
         .as_str()
-        .expect("the fixture silence was created")
+        .unwrap_or_else(|| panic!("the fixture silence was created: {}", created_silence.body))
         .to_owned();
 
     let mut refused = 0;
@@ -485,7 +528,7 @@ async fn observability_read_is_refused_on_every_write_and_the_refusal_names_the_
             .to_owned();
         let body = match mutation.action {
             "observability.alert_rule.updated" => {
-                Some(json!({ "id": rule_id, "enabled": false }))
+                Some(json!({ "enabled": false }))
             }
             "observability.silence.lifted" => None,
             _ => Some(mutation.body.clone()),
@@ -556,6 +599,11 @@ async fn every_mutation_writes_its_own_audit_row() {
 
     let mut created_exporter = String::new();
     let mut created_rule = String::new();
+    // A SECOND rule, for the silence. The table deletes the alert rule before it creates the
+    // silence, so a silence aimed at that rule addresses a row that no longer exists and the
+    // walk dies with `404 no alert rule with the id …` — which reads as a broken foreign key
+    // and is really a walk that shared one fixture between two rows with different lifetimes.
+    let mut silence_rule = String::new();
     let mut created_silence = String::new();
 
     for mutation in mutations() {
@@ -610,40 +658,59 @@ async fn every_mutation_writes_its_own_audit_row() {
                     .await;
                     created_rule = response.body["id"]
                         .as_str()
-                        .expect("the rule was created")
+                        .unwrap_or_else(|| panic!("the audit walk's rule was not created: {}", response.body))
                         .to_owned();
                 }
                 created_rule.clone()
             }
-            "observability.silence.lifted" => {
-                if created_silence.is_empty() {
+            // The rule the silence will belong to, for BOTH silence rows. The lifted row
+            // addresses the SILENCE, not the rule, so it captures the created silence's id below
+            // instead — sharing one branch for the two would send `DELETE /silences/{rule id}`
+            // and produce a `404 no silence with the id …`.
+            "observability.silence.created" | "observability.silence.lifted" => {
+                if silence_rule.is_empty() {
                     let response = call(
                         &state,
                         authed(
                             Method::POST,
-                            "/api/v1/observability/silences",
+                            "/api/v1/observability/alert-rules",
                             Some(json!({
-                                "rule_id": created_rule,
-                                "reason": "the audit walk",
-                                "ends_at": rfc3339_in(1),
+                                "name": format!("audit-silence-rule-{}", Uuid::new_v4().simple()),
+                                "expr": "omnion_queue_depth > 1000",
+                                "severity": "warning",
+                                "for_seconds": 0,
+                                "summary": "the rule the audit walk's silence belongs to",
+                                "runbook_url": null,
                             })),
                             &cookie,
                         ),
                     )
                     .await;
-                    created_silence = response.body["id"]
+                    silence_rule = response.body["id"]
                         .as_str()
-                        .expect("the silence was created")
+                        .unwrap_or_else(|| {
+                            panic!("the silence's rule was not created: {}", response.body)
+                        })
                         .to_owned();
                 }
-                created_silence.clone()
+                if mutation.action == "observability.silence.lifted" {
+                    // The lifted row addresses the silence created by the row above it.
+                    created_silence.clone()
+                } else {
+                    silence_rule.clone()
+                }
             }
             _ => String::new(),
         };
 
         let uri = mutation.path.replace("{id}", &id);
         let body = match mutation.action {
-            "observability.alert_rule.updated" => Some(json!({ "id": created_rule, "enabled": false })),
+            // The patch body carries only the field that changes — the id is in the PATH.
+            // `AlertRulePatch` is `deny_unknown_fields` (as every other write in this surface
+            // is), so an `id` echoed in the body is a `422`. This walk used to send one and
+            // the route was right to refuse it: a body that repeats the path's own id can
+            // disagree with it, and nothing downstream would notice.
+            "observability.alert_rule.updated" => Some(json!({ "enabled": false })),
             "observability.exporter.updated" => {
                 let response = call(
                     &state,
@@ -677,11 +744,17 @@ async fn every_mutation_writes_its_own_audit_row() {
             _ => Some(mutation.body.clone()),
         };
 
-        let before = if mutation.action.is_empty() {
-            0
-        } else {
-            audit_rows(&state, actor, mutation.action).await
-        };
+        // The baseline is the actor's TOTAL row count, counted the same way for every
+        // mutation. The preview has no action name of its own, and a baseline of `0` for it
+        // compares an absolute count against zero — after the eight mutations that precede it in
+        // the table, which is why it reported `left: 8, right: 0` and read as "the preview wrote
+        // a row" when the eight rows were the other mutations' own. A count is only comparable
+        // to a count.
+        let before: i64 = sqlx::query_scalar("select count(*) from audit_log where actor_user_id = $1")
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .expect("the baseline count runs");
         let response = call(
             &state,
             authed(mutation.method.clone(), &uri, body, &cookie),
@@ -696,30 +769,54 @@ async fn every_mutation_writes_its_own_audit_row() {
             response.body
         );
 
+        if mutation.action == "observability.silence.created" {
+            created_silence = response.body["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the silence was not created: {}", response.body))
+                .to_owned();
+        }
+
         if mutation.action.is_empty() {
             // The preview writes nothing, and that is the contract: a GET-shaped evaluation must
-            // not leave a row an operator later has to explain. Asserted rather than assumed.
-            let rules_after: i64 =
+            // not leave a row an operator later has to explain. Asserted rather than assumed —
+            // against the same total-count baseline the other mutations are measured from.
+            let after: i64 =
                 sqlx::query_scalar("select count(*) from audit_log where actor_user_id = $1")
                     .bind(actor)
                     .fetch_one(pool)
                     .await
                     .expect("the count runs");
             assert_eq!(
-                rules_after, before,
+                after, before,
                 "the alert preview wrote an audit row; it evaluates and returns"
             );
             continue;
         }
 
-        let after = audit_rows(&state, actor, mutation.action).await;
+        // Counted the same way as the baseline: the actor's total. The per-action count is
+        // asserted separately below, because "exactly one row for THIS action" and "exactly one
+        // row added in total" are different claims and only the first one survives a route that
+        // writes one right row and one wrong one.
+        let after: i64 =
+            sqlx::query_scalar("select count(*) from audit_log where actor_user_id = $1")
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .expect("the count runs");
         assert_eq!(
             after,
             before + 1,
-            "{} {} answered {} but did not write exactly one `{}` row for its actor",
+            "{} {} answered {} but did not write exactly one audit row for its actor",
             mutation.method,
             uri,
-            response.status,
+            response.status
+        );
+        let per_action = audit_rows(&state, actor, mutation.action).await;
+        assert_eq!(
+            per_action, 1,
+            "{} {} wrote a row whose action is not `{}`",
+            mutation.method,
+            uri,
             mutation.action
         );
     }
