@@ -2609,3 +2609,32 @@ Only then may the status line read `done`, and that close tick runs the w4 QA br
   empty/loading/error sweep across every screen, the 390×844 mobile pass and the keyboard sheet.
   The inbox screen already answers `/` for the search and is in the route list, so the sweep is
   about the six screens that predate it. The close tick runs the w4 QA pass.
+
+## 2026-09-28 · REQ-051 · tick 10 — the platform account, and twelve failures that were five
+
+- **What shipped.** **The tenant fallback** (`b899f7f`) — the QA owner's five CRM screens
+  answered `400 organization_required` because a platform account has no primary organization
+  by design. The module now resolves the tenant itself and falls back to the single
+  organization a platform account is bound to, refusing when there are two (`organization_
+  ambiguous`) or none. `apps/admin/app/crm/layout.tsx` wraps the six screens in one
+  `CrmTenantProvider` so two screens cannot disagree about which tenant they are showing.
+- **And four real defects, found by running a suite whose walks had never executed.**
+  `29b202f` a doubled trailing backslash in a Rust SQL string (`\\`) is an escaped backslash,
+  not a line continuation, so a literal `\` reached Postgres: nine of the twelve failures were
+  one character, and it made every lead-settings read a 500. `c739ccf` `crm_form_leads.
+  organization_id` was `not null` while the migration's own header says a submission may belong
+  to nobody — so the orphan path, the branch that exists to *keep* such a submission, raised a
+  not-null violation and the drain reported `failures: 1` while every counter read zero.
+  `fe2d49b` `NAME_KEYS` held `"name"` beside `"first_name"`, so a form whose field is `name`
+  gave `Ada Lovelace Lovelace`: each half a valid name, which is why no validator caught it.
+- **Proof.** `cargo test -p omnion-module-crm --lib` → **172/172**. `cargo test -p omnion-api
+  --test crm` → **55/55** against a database created for the run, `--test-threads=1` (52 before,
+  12 of them failing, 3 new). `pnpm turbo run typecheck --force` → **2/2**. The other seven
+  failures were walks passing `fixture.owner` — an e-mail — where `request` takes a bearer
+  token, answering 401 before the route under test was reached.
+- **The environment.** `rustc` was **0 bytes, mode 000** (`Permission denied` on `rustc -vV`),
+  the known box-wide 0-byte corruption; `rustup toolchain install stable --profile minimal
+  --force` restored it, and `/mnt/apopic` was at 95% throughout.
+- **Next.** REQ-051's **last three acceptance boxes**: the empty/loading/error sweep across the
+  six screens, the 390×844 mobile pass and the keyboard sheet. The close tick runs the w4 QA
+  pass and requires 0 high findings before the status becomes `done`.
