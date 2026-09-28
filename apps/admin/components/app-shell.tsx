@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
+import { BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, ListOrdered, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -32,6 +32,7 @@ const NAV: readonly NavItem[] = [
   { href: "/media", label: "Media", icon: Images, module: "media" },
   { href: "/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
   { href: "/notifications", label: "Notifications", icon: Bell },
+  { href: "/cdn/rules", label: "CDN rules", icon: ListOrdered },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
   { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },

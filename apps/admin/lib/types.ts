@@ -931,3 +931,122 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
+
+// ---------------------------------------------------------------------------------------------
+// CDN / edge (REQ-011)
+// ---------------------------------------------------------------------------------------------
+
+/** Which request parts form a rule's cache key. */
+export type CdnCacheKey = {
+  host: boolean;
+  path: boolean;
+  /** Query parameters the key keeps; everything else is dropped from it. */
+  query_include: string[];
+  /** Vary on the language cookie, so one language's page is never served to another. */
+  language_cookie: boolean;
+};
+
+/** What forces a rule to hand the request to the origin. */
+export type CdnBypass = {
+  cookie_names: string[];
+  query_params: string[];
+  header_names: string[];
+};
+
+/** One cache rule, in the shape `/api/v1/cdn/rules` returns it. */
+export type CdnCacheRule = {
+  id: string;
+  site_id: string;
+  name: string;
+  /** Lower wins. The panel table is ordered by this. */
+  priority: number;
+  path_pattern: string;
+  methods: string[];
+  edge_ttl_seconds: number;
+  browser_ttl_seconds: number;
+  swr_seconds: number;
+  cache_key: CdnCacheKey;
+  bypass: CdnBypass;
+  enabled: boolean;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** What the rule form sends. Every field is optional and folded onto the stored row. */
+export type CdnCacheRuleInput = {
+  site_id: string;
+  name: string;
+  path_pattern: string;
+  priority?: number;
+  methods?: string[];
+  edge_ttl_seconds?: number;
+  browser_ttl_seconds?: number;
+  swr_seconds?: number;
+  cache_key?: Partial<CdnCacheKey>;
+  bypass?: Partial<CdnBypass>;
+  enabled?: boolean;
+};
+
+/**
+ * A stored rule that no longer compiles.
+ *
+ * Surfaced rather than hidden: a rule that silently stopped matching is the failure an
+ * operator finds days later from a page that is still serving the old revision.
+ */
+export type CdnUnreadableRule = {
+  id: string;
+  reason: string;
+};
+
+export type CdnRulesResponse = {
+  rules: CdnCacheRule[];
+  unreadable: CdnUnreadableRule[];
+};
+
+/**
+ * The CDN settings row for one site.
+ *
+ * There is no credential field, and that is the design rather than an omission: the API
+ * never returns the stored value, so the panel can only say whether one is *present* and
+ * offer to replace it.
+ */
+export type CdnSettings = {
+  site_id: string | null;
+  provider: string;
+  endpoint_url: string | null;
+  zone_ref: string | null;
+  /** Whether a credential is stored. The value itself is write-only. */
+  has_credential: boolean;
+  /** Trigger event name -> enabled. */
+  auto_purge: Record<string, boolean>;
+  batch_size: number;
+  max_attempts: number;
+  updated_at: string;
+};
+
+/** What the settings form sends. `credential` is write-only and omitted when unchanged. */
+export type CdnSettingsInput = {
+  site_id: string | null;
+  provider: string;
+  endpoint_url?: string | null;
+  zone_ref?: string | null;
+  credential?: string | null;
+  auto_purge?: Record<string, boolean>;
+  batch_size?: number;
+  max_attempts?: number;
+};
+
+/** One shipped provider adapter, as the catalogue describes it. */
+export type CdnAdapterInfo = {
+  key: string;
+  name: string;
+  /** One line saying what the adapter actually does, in the adapter's own terms. */
+  description: string;
+  /** Fields the adapter needs before it can work; empty for `origin`. */
+  config_fields: { name: string; label: string; required: boolean; write_only: boolean }[];
+  /** Whether the adapter can invalidate by surrogate key rather than by URL. */
+  supports_tags: boolean;
+  /** Whether the adapter can invalidate its whole zone in one call. */
+  supports_zone_purge: boolean;
+};

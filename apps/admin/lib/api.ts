@@ -5,6 +5,12 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  CdnAdapterInfo,
+  CdnCacheRule,
+  CdnCacheRuleInput,
+  CdnRulesResponse,
+  CdnSettings,
+  CdnSettingsInput,
   CreatedMediaShare,
   NewMediaGrant,
   Media,
@@ -4878,4 +4884,92 @@ export function emitNotification(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// CDN / edge (REQ-011)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A site's cache rules, in precedence order.
+ *
+ * `unreadable` is part of the response rather than an error: one rule whose pattern no
+ * longer compiles must not take the whole list away, and it must not be dropped either —
+ * a rule that silently stopped matching is what an operator discovers days later.
+ */
+export async function fetchCdnRules(siteId: string): Promise<CdnRulesResponse> {
+  return request(`/api/v1/cdn/rules?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/** Create a cache rule. */
+export async function createCdnRule(input: CdnCacheRuleInput): Promise<CdnCacheRule> {
+  return request("/api/v1/cdn/rules", { method: "POST", body: JSON.stringify(input) });
+}
+
+/** Change one rule. The site is named in the body, not in the path. */
+export async function updateCdnRule(
+  ruleId: string,
+  input: CdnCacheRuleInput,
+): Promise<CdnCacheRule> {
+  return request(`/api/v1/cdn/rules/${encodeURIComponent(ruleId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Delete a rule. */
+export async function deleteCdnRule(ruleId: string, siteId: string): Promise<void> {
+  await request(
+    `/api/v1/cdn/rules/${encodeURIComponent(ruleId)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Turn a rule on or off without touching the rest of it. */
+export async function setCdnRuleEnabled(
+  ruleId: string,
+  siteId: string,
+  enabled: boolean,
+): Promise<CdnCacheRule> {
+  return request(`/api/v1/cdn/rules/${encodeURIComponent(ruleId)}/toggle`, {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId, enabled }),
+  });
+}
+
+/**
+ * Persist a new precedence order.
+ *
+ * The order is sent as the complete list rather than as a delta: a reorder that renumbers
+ * one row is the operation that can leave two rules claiming the same priority, and the
+ * matcher would then pick between them by row order — which is not what the drag showed.
+ */
+export async function reorderCdnRules(siteId: string, order: string[]): Promise<CdnRulesResponse> {
+  return request("/api/v1/cdn/rules/reorder", {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId, order }),
+  });
+}
+
+/** The settings row for a site, or the installation default when `siteId` is null. */
+export async function fetchCdnSettings(siteId: string | null): Promise<CdnSettings> {
+  const query = siteId === null ? "" : `?site_id=${encodeURIComponent(siteId)}`;
+  return request(`/api/v1/cdn/settings${query}`);
+}
+
+/**
+ * Save the settings row.
+ *
+ * `credential` is only sent when the operator typed one: sending the empty string would
+ * clear a stored credential, because "the field is empty" and "the operator cleared it" are
+ * the same request. The panel therefore omits the field entirely when it is untouched.
+ */
+export async function saveCdnSettings(input: CdnSettingsInput): Promise<CdnSettings> {
+  return request("/api/v1/cdn/settings", { method: "PUT", body: JSON.stringify(input) });
+}
+
+/** The shipped provider adapters, with the fields each one needs. */
+export async function fetchCdnAdapters(): Promise<CdnAdapterInfo[]> {
+  const body = await request<{ adapters: CdnAdapterInfo[] }>("/api/v1/cdn/adapters");
+  return body.adapters;
 }
