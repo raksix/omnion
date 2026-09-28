@@ -2042,6 +2042,28 @@
   `tenancy` (5), `tenancy_members` (7) and `tenancy_departments` (7) all green against the same
   per-writer database. `tsc --noEmit` in `apps/admin` → clean. A new QA pass
   (`runOrganizationInvitePolicy`) walks all three policies, the queue panel and the Audit tab.
+- **Live proof, 24 steps, 0 failures** (`scripts/qa/probe-tenant-invite-policy.cjs`), because the
+  full pass could not run: `closed` → `403 invitations_closed` with the policy in `details`;
+  `self_serve` → `201` whose link previews `usable: true`; a **manager**'s invite → `202` with
+  `tokenLength: 0`; the manager's own release → `403 not_an_organization_owner`; the owner's
+  release → `200` minting a link that previews usable; a second release → `409
+  invitation_not_queued`. On screen: the queue panel shows the row with *Release* and *Revoke* and
+  the sentence explaining the policy; the Audit tab lists 22 rows, its action filter is built from
+  14 distinct actions this tenant has actually performed, narrowing to one action moves the count
+  from `22 of 22` to `1 of 1`, 0 px horizontal overflow at 390×844, and 0 console errors.
+- **The probe had to create a *manager*, and that is the point.** The QA owner holds `owner` at
+  **global** scope, so the policy must *not* queue it — driving the queue with that account
+  answers `201` with a link, correctly, and proves nothing. The only account the queue exists for
+  is somebody with `organizations.manage` who is not an owner. Its password hash is copied from
+  the owner rather than re-implemented, because a second argon2 in a probe is a second
+  implementation of the thing being verified.
+- **A defect only the reviewer's eye found, which no assertion would have.** The status badge
+  rendered `awaiting_approval` as **`Awaiting_approval`** — a raw enum token. `statusLabel` had
+  only ever capitalised the first letter, which is correct for every value the panel had seen
+  (`active`, `pending`, `archived`) and wrong for the first one with an underscore. The *value*
+  was right, so the DOM was right, so every automated check passed: `53fc50d` splits on `_` and
+  `-` and gives the queued state the attention tone. The general rule: a formatter that has
+  never been shown a value it does not recognise is a formatter that has never been tested.
 - **A defect the QA stack's own start-up found, not my code.** The walkthrough read `/` after a
   fixed 900ms to decide whether setup was needed. But a fresh installation does not answer `/`
   with the wizard: the request gate sends an anonymous visitor to `/login`, and *that* screen asks
