@@ -202,11 +202,7 @@ impl DeploymentKeyView {
         Self {
             state: row.state(now).to_owned(),
             expires_in_seconds: (row.expires_at - now).whole_seconds().max(0),
-            scopes: row
-                .scope_list()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            scopes: row.scope_list().into_iter().map(str::to_owned).collect(),
             allowed_ips: row
                 .allowed_ips
                 .split(',')
@@ -336,12 +332,8 @@ pub async fn read_leases(
         .map_err(map_error)?;
     let views: Vec<LeaseView> = rows.into_iter().map(LeaseView::from_row).collect();
 
-    let count_of = |state_name: &str| {
-        views
-            .iter()
-            .filter(|view| view.state == state_name)
-            .count() as i32
-    };
+    let count_of =
+        |state_name: &str| views.iter().filter(|view| view.state == state_name).count() as i32;
     let mut environments: Vec<String> = views
         .iter()
         .map(|view| view.environment.clone())
@@ -389,12 +381,15 @@ pub async fn issue_lease(
     .await
     .map_err(map_error)?;
 
+    let request_id: Uuid = Uuid::new_v4();
     audit(
         &state,
         NewAuditEntry::by_user(session.user.id, "secret.lease.issued")
             .target("secret", id.to_string())
+            .request_id(request_id)
+            .lease_id(issued.lease.id)
             .metadata(json!({
-                "lease_id": issued.lease.id,
+                "name": owner.name,
                 "name": owner.name,
                 "consumer": issued.lease.consumer,
                 "environment": issued.lease.environment,
@@ -444,13 +439,11 @@ pub async fn revoke_lease(
         .ok_or_else(|| not_found("lease"))?;
     let organization_id = resolve_organization(&session, None)?;
     in_organization(
-        &sqlx::query_scalar::<_, Option<Uuid>>(
-            "select organization_id from secrets where id = $1",
-        )
-        .bind(existing.secret_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| ApiError::from_core(error.into()))?,
+        &sqlx::query_scalar::<_, Option<Uuid>>("select organization_id from secrets where id = $1")
+            .bind(existing.secret_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| ApiError::from_core(error.into()))?,
         Some(organization_id),
     )?;
 
@@ -462,9 +455,11 @@ pub async fn revoke_lease(
     .await
     .map_err(map_error)?;
 
+    let request_id: Uuid = Uuid::new_v4();
     audit(
         &state,
         NewAuditEntry::by_user(session.user.id, "secret.lease.revoked")
+            .request_id(request_id)
             .target("lease", id.to_string())
             .metadata(json!({
                 "secret_id": existing.secret_id,
@@ -510,19 +505,19 @@ pub async fn redeem_lease(
 
     // 1. Who is this? A deployment key, and only a deployment key.
     let key = match presented_key(&headers) {
-        Some(value) => match leases::authenticate_deployment_key(pool, &value, address_text.as_deref())
-            .await
-        {
-            Ok(key) => key,
-            Err(error) => {
-                return Err(ApiError::new(
-                    StatusCode::UNAUTHORIZED,
-                    error.code(),
-                    error.to_string(),
-                )
-                .with_details(json!({ "request_id": request_id })));
+        Some(value) => {
+            match leases::authenticate_deployment_key(pool, &value, address_text.as_deref()).await {
+                Ok(key) => key,
+                Err(error) => {
+                    return Err(ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        error.code(),
+                        error.to_string(),
+                    )
+                    .with_details(json!({ "request_id": request_id })));
+                }
             }
-        },
+        }
         None => {
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
@@ -549,12 +544,10 @@ pub async fn redeem_lease(
             "lease_not_found",
         )
         .await;
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "lease_not_found",
-            "no such lease",
-        )
-        .with_details(json!({ "request_id": request_id })));
+        return Err(
+            ApiError::new(StatusCode::NOT_FOUND, "lease_not_found", "no such lease")
+                .with_details(json!({ "request_id": request_id })),
+        );
     };
     let secret_name = leases::secret_name_for(pool, lease.secret_id)
         .await
@@ -574,8 +567,13 @@ pub async fn redeem_lease(
             &state,
             NewAuditEntry::system("secret.access.denied")
                 .target("lease", lease.id.to_string())
+                // The request id goes in the COLUMN, not only in the metadata object: the audit
+                // screen filters on `audit_log.request_id`, so an id that only ever lived inside a
+                // JSON blob would be readable but unjoinable -- which is the whole point of it.
+                .request_id(request_id)
+                .lease_id(lease.id)
+                .machine(Some(key.id), None, Some(lease.id))
                 .metadata(json!({
-                    "request_id": request_id,
                     "reason": error.code(),
                     "deployment_key_id": key.id,
                     "environment": lease.environment,
@@ -584,8 +582,10 @@ pub async fn redeem_lease(
                 .ip_address(address_text.clone()),
         )
         .await;
-        return Err(ApiError::new(StatusCode::FORBIDDEN, error.code(), error.to_string())
-            .with_details(json!({ "request_id": request_id })));
+        return Err(
+            ApiError::new(StatusCode::FORBIDDEN, error.code(), error.to_string())
+                .with_details(json!({ "request_id": request_id })),
+        );
     }
 
     // 3. Redeem. Every refusal from here is a `410`-shaped answer plus a denial row.
@@ -605,13 +605,12 @@ pub async fn redeem_lease(
                 &state,
                 NewAuditEntry::system("secret.lease.redeemed")
                     .target("secret", lease.secret_id.to_string())
+                    .request_id(request_id)
+                    .machine(Some(key.id), None, Some(lease.id))
                     .metadata(json!({
-                        "request_id": request_id,
-                        "lease_id": lease.id,
                         "name": redemption.name,
                         "version": redemption.version,
                         "hint": redemption.hint,
-                        "deployment_key_id": key.id,
                         "consumer": lease.consumer,
                     }))
                     .ip_address(address_text.clone()),
@@ -619,15 +618,14 @@ pub async fn redeem_lease(
             .await;
             emit(
                 &state,
-                NewEvent::new("secrets.lease_redeemed")
-                    .payload(json!({
-                        "lease_id": lease.id,
-                        "secret_id": lease.secret_id,
-                        "name": redemption.name,
-                        "version": redemption.version,
-                        "deployment_key_id": key.id,
-                        "consumer": lease.consumer,
-                    })),
+                NewEvent::new("secrets.lease_redeemed").payload(json!({
+                    "lease_id": lease.id,
+                    "secret_id": lease.secret_id,
+                    "name": redemption.name,
+                    "version": redemption.version,
+                    "deployment_key_id": key.id,
+                    "consumer": lease.consumer,
+                })),
             )
             .await;
 
@@ -664,8 +662,10 @@ pub async fn redeem_lease(
                     .ip_address(address_text.clone()),
             )
             .await;
-            Err(ApiError::new(StatusCode::GONE, error.code(), error.to_string())
-                .with_details(json!({ "request_id": request_id })))
+            Err(
+                ApiError::new(StatusCode::GONE, error.code(), error.to_string())
+                    .with_details(json!({ "request_id": request_id })),
+            )
         }
     }
 }
@@ -686,12 +686,8 @@ pub async fn read_deployment_keys(
         .await
         .map_err(map_error)?;
     let views: Vec<DeploymentKeyView> = rows.into_iter().map(DeploymentKeyView::from_row).collect();
-    let count_of = |state_name: &str| {
-        views
-            .iter()
-            .filter(|view| view.state == state_name)
-            .count() as i32
-    };
+    let count_of =
+        |state_name: &str| views.iter().filter(|view| view.state == state_name).count() as i32;
 
     Ok(Json(DeploymentKeysResponse {
         total: views.len() as i32,
@@ -861,15 +857,13 @@ pub async fn read_deployment_key_uses(
     Ok(Json(
         rows.into_iter()
             .map(
-                |(action, lease_id, identity, address, result, created_at)| {
-                    DeploymentKeyUseView {
-                        action,
-                        lease_id,
-                        identity,
-                        address,
-                        result,
-                        created_at,
-                    }
+                |(action, lease_id, identity, address, result, created_at)| DeploymentKeyUseView {
+                    action,
+                    lease_id,
+                    identity,
+                    address,
+                    result,
+                    created_at,
                 },
             )
             .collect(),
@@ -983,7 +977,10 @@ mod tests {
 
     #[test]
     fn a_bearer_token_is_also_accepted() {
-        let headers = headers_with(axum::http::header::AUTHORIZATION.as_str(), "Bearer omnion_dk_abc");
+        let headers = headers_with(
+            axum::http::header::AUTHORIZATION.as_str(),
+            "Bearer omnion_dk_abc",
+        );
         assert_eq!(presented_key(&headers).as_deref(), Some("omnion_dk_abc"));
     }
 

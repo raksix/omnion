@@ -51,8 +51,16 @@ pub struct AuditEntry {
     pub target_id: Option<String>,
     /// Structured detail; never carries secrets.
     pub metadata: serde_json::Value,
-    /// Peer address of the actor, when known.
+    /// Peer address of the actor.
     pub ip_address: Option<String>,
+    /// The request id handed to the caller, echoed back so a refusal is joinable (REQ-125).
+    pub request_id: Option<Uuid>,
+    /// The credential lease the operation touched, when it was one.
+    pub lease_id: Option<Uuid>,
+    /// The machine identity that spent the operation, when a deployment key was the actor.
+    pub deployment_key_id: Option<Uuid>,
+    /// The pipeline identity the machine presented, as text.
+    pub pipeline: Option<String>,
     /// When the action was recorded.
     pub created_at: OffsetDateTime,
 }
@@ -79,6 +87,18 @@ pub struct NewAuditEntry {
     pub metadata: serde_json::Value,
     /// Peer address of the actor.
     pub ip_address: Option<String>,
+    /// The request id handed to the caller, so a refusal joins to the row explaining it.
+    ///
+    /// Null on every row written before REQ-125 slice 4 — the honest value for "this action was
+    /// not part of a request that was ever refused", and the reason the column is nullable with
+    /// no default rather than a backfilled uuid.
+    pub request_id: Option<Uuid>,
+    /// The credential lease the operation touched, when it was one.
+    pub lease_id: Option<Uuid>,
+    /// The machine identity that spent the operation, when a deployment key was the actor.
+    pub deployment_key_id: Option<Uuid>,
+    /// The pipeline identity the machine presented, as text.
+    pub pipeline: Option<String>,
 }
 
 impl NewAuditEntry {
@@ -94,6 +114,10 @@ impl NewAuditEntry {
             target_id: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             ip_address: None,
+            request_id: None,
+            lease_id: None,
+            deployment_key_id: None,
+            pipeline: None,
         }
     }
 
@@ -109,6 +133,10 @@ impl NewAuditEntry {
             target_id: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             ip_address: None,
+            request_id: None,
+            lease_id: None,
+            deployment_key_id: None,
+            pipeline: None,
         }
     }
 
@@ -140,11 +168,66 @@ impl NewAuditEntry {
         self.ip_address = ip_address;
         self
     }
+
+    /// Attach the request id the caller was handed in its error banner (REQ-125, slice 4).
+    ///
+    /// This is the field that makes a *refusal* joinable: the caller holds a request id and the
+    /// row explaining it is found by filtering on exactly that value. Without it the id in the
+    /// error banner is decoration — a human-readable string that no query can match.
+    ///
+    /// It is a setter rather than a constructor argument because a null here is the honest value
+    /// for the overwhelming majority of rows in the platform: the vast majority of actions are not
+    /// part of a lease, a deployment key or a secret operation, and making every caller think
+    /// about it would be four arguments of `None` on every call site in the codebase.
+    #[must_use]
+    pub fn request_id(mut self, request_id: impl Into<Option<Uuid>>) -> Self {
+        self.request_id = request_id.into();
+        self
+    }
+
+    /// Attach the credential lease this operation touched.
+    #[must_use]
+    pub fn lease_id(mut self, lease_id: impl Into<Option<Uuid>>) -> Self {
+        self.lease_id = lease_id.into();
+        self
+    }
+
+    /// Attach the machine identity that spent the operation, when a deployment key was the actor.
+    #[must_use]
+    pub fn deployment_key_id(mut self, deployment_key_id: impl Into<Option<Uuid>>) -> Self {
+        self.deployment_key_id = deployment_key_id.into();
+        self
+    }
+
+    /// Attach the pipeline identity the machine presented.
+    ///
+    /// Text, not a relation: a leaked deployment key has to be traced to a *pipeline name* the
+    /// operator recognises, and a name is not a row in any table.
+    #[must_use]
+    pub fn pipeline(mut self, pipeline: impl Into<Option<String>>) -> Self {
+        self.pipeline = pipeline.into();
+        self
+    }
+
+    /// The lease, machine identity and pipeline in one call, which is how a redemption writes.
+    #[must_use]
+    pub fn machine(
+        mut self,
+        deployment_key_id: Option<Uuid>,
+        pipeline: Option<String>,
+        lease_id: Option<Uuid>,
+    ) -> Self {
+        self.deployment_key_id = deployment_key_id;
+        self.pipeline = pipeline;
+        self.lease_id = lease_id;
+        self
+    }
 }
 
 /// Columns read back from `audit_log`, with `inet` rendered as text.
 const AUDIT_COLUMNS: &str = "id, organization_id, actor_user_id, actor_type, action, \
-     target_type, target_id, metadata, ip_address::text as ip_address, created_at";
+     target_type, target_id, metadata, ip_address::text as ip_address, created_at, request_id, \
+     lease_id, deployment_key_id, pipeline";
 
 /// Append an entry to the audit trail.
 ///
@@ -153,8 +236,9 @@ const AUDIT_COLUMNS: &str = "id, organization_id, actor_user_id, actor_type, act
 pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
     let sql = format!(
         "insert into audit_log (organization_id, actor_user_id, actor_type, action, target_type, \
-         target_id, metadata, ip_address) \
-         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet)) returning {AUDIT_COLUMNS}"
+         target_id, metadata, ip_address, request_id, lease_id, deployment_key_id, pipeline) \
+         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9, $10, $11, $12) \
+         returning {AUDIT_COLUMNS}"
     );
 
     let stored: AuditEntry = sqlx::query_as(&sql)
@@ -166,6 +250,10 @@ pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
         .bind(entry.target_id.as_deref())
         .bind(entry.metadata)
         .bind(entry.ip_address.as_deref())
+        .bind(entry.request_id)
+        .bind(entry.lease_id)
+        .bind(entry.deployment_key_id)
+        .bind(entry.pipeline.as_deref())
         .fetch_one(pool)
         .await?;
 

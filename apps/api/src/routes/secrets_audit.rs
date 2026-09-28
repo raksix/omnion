@@ -27,7 +27,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
-use omnion_secrets::audit::{self, AnomalyRow, AuditFilter, AuditRow, actions, tracked_actions};
+use omnion_secrets::audit::{self, AnomalyRow, AuditFilter, AuditRow, tracked_actions};
 use serde::Serialize;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -462,6 +462,7 @@ pub fn action_names() -> [&'static str; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omnion_secrets::audit::actions;
 
     #[test]
     fn a_wired_offset_is_read_and_a_broken_one_falls_back_to_utc() {
