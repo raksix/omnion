@@ -1550,6 +1550,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-module-sales"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-notifications"
 version = "0.1.0"
 dependencies = [
