@@ -70,6 +70,10 @@ create table if not exists obs_trace_index (
     spans_truncated boolean     not null default false,
     status          text        not null default 'ok',
     sampled         boolean     not null default true,
+    -- WHY a trace was sampled. A bare boolean forces the search to invent a reason, and the
+    -- reason is what an operator is actually asking: "why do I have this trace but not the one
+    -- next to it" is answered by `error` vs `ratio`, and by nothing a boolean can say.
+    sampling        text        not null default 'sampled',
     -- The link to the operator's tracing backend for the full trace. Omnion knows the convention
     -- (Tempo/Jaeger/Grafana) but not the instance, so the value is a template the settings row
     -- fills — a link that 404s is worse than an honest "no backend configured".

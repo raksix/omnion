@@ -69,17 +69,30 @@ pub async fn upsert(pool: &PgPool, record: &TraceRecord) -> Result<(), Telemetry
         TelemetryError::Telemetry(format!("the trace spans did not serialise: {error}"))
     })?;
 
+    // `sampling` is written as a literal rather than bound: it is one of five closed values from
+    // `SamplingDecision::as_str`, and a closed set in a query is cheaper to read than a parameter
+    // whose every caller has to remember to derive.
     sqlx::query(
         "insert into obs_trace_index ( \
              trace_id, root_name, service, route, request_id, started_at, duration_ms, \
-             span_count, spans_kept, spans_truncated, status, sampled, backend_trace_url, spans) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             span_count, spans_kept, spans_truncated, status, sampled, sampling, \
+             backend_trace_url, spans) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
          on conflict (trace_id) do update set \
              duration_ms = greatest(obs_trace_index.duration_ms, excluded.duration_ms), \
              span_count = excluded.span_count, \
              spans_kept = excluded.spans_kept, \
              spans_truncated = excluded.spans_truncated, \
              status = excluded.status, \
+             -- The request id and the route ARE updated, and this is not cosmetic. A consumer
+             -- process appends its spans to a trace the producer opened, and a producer that
+             -- replays under a new request would otherwise leave the FIRST request id on the row
+             -- forever: a request-id search would then miss a trace that is genuinely that
+             -- request's, which is the one lookup the screen exists for.
+             request_id = coalesce(excluded.request_id, obs_trace_index.request_id), \
+             sampling = excluded.sampling, \
+             route = coalesce(excluded.route, obs_trace_index.route), \
+             root_name = excluded.root_name, \
              backend_trace_url = coalesce(excluded.backend_trace_url, obs_trace_index.backend_trace_url), \
              spans = excluded.spans",
     )
@@ -95,6 +108,7 @@ pub async fn upsert(pool: &PgPool, record: &TraceRecord) -> Result<(), Telemetry
     .bind(record.spans_truncated)
     .bind(&record.status)
     .bind(record.sampled)
+    .bind(&record.sampling)
     .bind(record.backend_trace_url.as_deref())
     .bind(&spans)
     .execute(pool)
@@ -107,7 +121,8 @@ pub async fn upsert(pool: &PgPool, record: &TraceRecord) -> Result<(), Telemetry
 pub async fn load(pool: &PgPool, trace_id: &str) -> Result<Option<TraceRecord>, TelemetryError> {
     let row = sqlx::query(
         "select trace_id, root_name, service, route, request_id, started_at, duration_ms, \
-                span_count, spans_kept, spans_truncated, status, sampled, backend_trace_url, spans \
+                span_count, spans_kept, spans_truncated, status, sampled, sampling, \
+                backend_trace_url, spans \
          from obs_trace_index where trace_id = $1",
     )
     .bind(trace_id)
@@ -127,20 +142,14 @@ pub async fn load(pool: &PgPool, trace_id: &str) -> Result<Option<TraceRecord>, 
         route: row.get("route"),
         request_id: row.get("request_id"),
         started_at: row.get("started_at"),
-        duration_ms: row.get("duration_ms"),
-        span_count: row.get("span_count"),
-        spans_kept: row.get("spans_kept"),
+        // Same INT4 → i64 widening as the search projection, for the same reason.
+        duration_ms: i64::from(row.get::<i32, _>("duration_ms")),
+        span_count: i64::from(row.get::<i32, _>("span_count")),
+        spans_kept: i64::from(row.get::<i32, _>("spans_kept")),
         spans_truncated: row.get("spans_truncated"),
         status: row.get("status"),
         sampled: row.get("sampled"),
-        // The sampling reason is not a column: it is a property of the decision, and re-deriving
-        // it from `sampled` would claim a reason the index never recorded. The screen says
-        // "sampled" or "not sampled", and the *live* trace's reason is in the detail route.
-        sampling: if row.get::<bool, _>("sampled") {
-            "sampled".to_owned()
-        } else {
-            "not_sampled".to_owned()
-        },
+        sampling: row.get("sampling"),
         backend_trace_url: row.get("backend_trace_url"),
         spans,
     }))
@@ -183,7 +192,7 @@ pub async fn search(
 
     let sql = format!(
         "select trace_id, root_name, service, route, request_id, started_at, duration_ms, \
-                span_count, status, sampled \
+                span_count, status, sampled, sampling \
          from obs_trace_index{where_clause} \
          order by started_at desc \
          limit ${limit_param}"
@@ -227,11 +236,14 @@ pub async fn search(
                 started_at: started_at
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| started_at.to_string()),
-                duration_ms: row.get("duration_ms"),
-                span_count: row.get("span_count"),
+                // `duration_ms` and `span_count` are `integer` (INT4) in the migration and `i64`
+                // here. The cast is in the SQL, not in Rust: `i64::from(i32)` is exact, and a
+                // decode that silently widened would report a wrong duration rather than fail.
+                duration_ms: i64::from(row.get::<i32, _>("duration_ms")),
+                span_count: i64::from(row.get::<i32, _>("span_count")),
                 status: row.get("status"),
                 sampled,
-                sampling: if sampled { "sampled" } else { "not_sampled" }.to_owned(),
+                sampling: row.get("sampling"),
             }
         })
         .collect();
