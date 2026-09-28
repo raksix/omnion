@@ -1331,6 +1331,37 @@ async function runAiProviderDepth(page, report) {
     const panels = await exerciseHealthPanels(page);
     note({ step: "panels", ...panels });
     await shot(page, "ai-health-panels");
+
+    // Slice 2 (REQ-098) in the same pass: the routing section is opened, a primary is saved and
+    // the dry run is pressed, so the screen is proved by use rather than by its presence.
+    const routing = await exerciseRouting(page);
+    note({ step: "routing", ...routing });
+    if (!routing.present) {
+      aiStateFindings.push(
+        "the routing section did not render on /ai, so no route was configured or previewed",
+      );
+    } else {
+      if (routing.tasks.length !== 7) {
+        aiStateFindings.push(
+          `the routing screen rendered ${routing.tasks.length} task rows instead of all seven`,
+        );
+      }
+      if (routing.afterSave.error) {
+        aiStateFindings.push(
+          `saving a routing chain was refused on the panel: ${routing.afterSave.error}`,
+        );
+      }
+      if (routing.afterSave.candidates === 0) {
+        aiStateFindings.push(
+          "a saved routing chain rendered no candidate, so the save did not take effect",
+        );
+      }
+      if (!routing.walk.present || routing.walk.entries.length === 0) {
+        aiStateFindings.push(
+          "the dry run rendered no walk, which is the one thing the routing screen exists for",
+        );
+      }
+    }
   } catch (cause) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     // The second half failing is a finding, not a shrug: the screen is half-tested and the report
@@ -1441,6 +1472,94 @@ async function readCapabilityEditor(page) {
     flagCount: flags.length,
     notes: notes.map((text) => text.replace(/\s+/g, " ").trim()).slice(0, 4).join(" / "),
   };
+}
+
+/**
+ * Open the routing section and read what it rendered (REQ-098 slice 2).
+ *
+ * Three claims are checked here that no API test can make, because they are claims about the
+ * *screen*: that all seven task rows exist on a fresh install, that the unresolvable banner is
+ * amber rather than red, and that the dry run renders a walk after a click. The walk is the
+ * whole point of the screen — a routing table that shows chains but cannot explain itself is
+ * the failure this slice exists to prevent.
+ */
+async function exerciseRouting(page) {
+  await page.locator("[data-routing-screen]").first().scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const initial = await page.evaluate(() => {
+    const root = document.querySelector("[data-routing-screen]");
+    if (!root) return { present: false };
+    const banner = root.querySelector("[data-routing-warning]");
+    return {
+      present: true,
+      tasks: [...root.querySelectorAll("[data-routing-task]")].map((node) => ({
+        task: node.getAttribute("data-routing-task") ?? "",
+        inherited: node.getAttribute("data-routing-inherited") === "true",
+        candidates: node.querySelectorAll("[data-routing-candidate]").length,
+        selects: node.querySelectorAll("select").length,
+        save: node.querySelectorAll("button").length,
+      })),
+      warning: banner?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      // The banner's own class is read rather than judged from a screenshot: "warning, not
+      // error" is a claim about colour, and colour is exactly what a screenshot review is worst
+      // at asserting.
+      warningTone: banner ? getComputedStyle(banner).borderColor : "",
+      error: root.querySelectorAll("[data-routing-error]").length,
+      preview: root.querySelectorAll("[data-routing-preview]").length,
+      overrides: root.querySelectorAll("[data-routing-override]").length,
+      rule: root.textContent?.match(/Resolution order: ([a-z_ →]+)/)?.[1] ?? "",
+    };
+  });
+  await shot(page, "ai-routing-tasks");
+
+  // Set a primary for `cheap`, then ask the dry run what that request would do.
+  const saved = await page
+    .locator('[data-routing-task="cheap"] select')
+    .first()
+    .selectOption({ index: 1 })
+    .catch(() => null);
+  await page.waitForTimeout(400);
+  await page
+    .locator('[data-routing-task="cheap"] button:has-text("Save chain")')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+
+  const afterSave = await page.evaluate(() => {
+    const root = document.querySelector("[data-routing-screen]");
+    const row = root?.querySelector('[data-routing-task="cheap"]');
+    return {
+      candidates: row?.querySelectorAll("[data-routing-candidate]").length ?? 0,
+      notice: root?.querySelector("[data-routing-notice]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      error: root?.querySelector("[data-routing-error]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    };
+  });
+  await shot(page, "ai-routing-saved");
+
+  await page
+    .locator("[data-routing-preview] button:has-text('Resolve')")
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+
+  const walk = await page.evaluate(() => {
+    const root = document.querySelector("[data-routing-preview]");
+    if (!root) return { present: false };
+    return {
+      present: true,
+      answer: root.querySelector("[data-routing-walk]")?.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "",
+      entries: [...root.querySelectorAll("[data-routing-walk-outcome]")].map(
+        (node) => node.getAttribute("data-routing-walk-outcome") ?? "",
+      ),
+      previewError: root.querySelectorAll("[data-routing-preview-error]").length,
+    };
+  });
+  await shot(page, "ai-routing-walk");
+
+  return { ...initial, saved: saved !== null, afterSave, walk };
 }
 
 /** Switch one editable capability off and back on, and read the notice each time. */
