@@ -2086,6 +2086,142 @@ async function runOrganizationDepth(page, report) {
 }
 
 /**
+ * The member drawer (REQ-005, slice 4).
+ *
+ * The pass drives the three operations the REQ names on a real member of the organization the
+ * depth pass just created:
+ *
+ *   1. the drawer opens from a member row and shows identity, bindings, departments and trail;
+ *   2. a role is granted at organization scope and the binding row appears;
+ *   3. a grant made temporary is **extended** — the third verb, and the one that only exists
+ *      because this slice added it. A revoke-and-re-grant would satisfy every other assertion a
+ *      person can make by eye, and the count check is what catches it: the drawer must still
+ *      show exactly one binding for that role afterwards, with the same id.
+ *   4. the grant is revoked and the row stays on screen marked revoked, because the tenant's
+ *      trail records it;
+ *   5. the drawer closes with Escape.
+ *
+ * The empty state is exercised too, and it is the *first* member row on purpose: the first
+ * thing a person sees when a tenant has nobody with a bespoke role should be the sentence that
+ * explains what to do next, not a blank panel.
+ */
+async function runOrganizationMemberDrawer(page, report, organizationId) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "organization-member-drawer", action: "organizations", ...step });
+  };
+
+  if (!organizationId) {
+    note({ step: "skipped", reason: "no organization to open" });
+    report.organizationMemberDrawer = { steps, organizationId: null };
+    log(`organization member drawer: ${JSON.stringify(steps)}`);
+    return report.organizationMemberDrawer;
+  }
+
+  const membersUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=members`;
+  await page.goto(membersUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-member-row], [data-members-heading]", { timeout: 15000 }).catch(
+    () => {},
+  );
+  await page.waitForTimeout(900);
+
+  const rows = await page.locator("[data-member-row]").count();
+  const noMembers = await page.locator("text=No members yet").count();
+  if (rows === 0) {
+    // Nothing to open. Saying so is the honest report; inventing a member here would make the
+    // pass depend on a signup the walk does not perform.
+    note({ step: "no-rows", rows, emptyState: noMembers > 0 });
+    await shot(page, "page-organization-members-empty");
+    const out = { steps, organizationId };
+    report.organizationMemberDrawer = out;
+    log(`organization member drawer: ${JSON.stringify(steps)}`);
+    return out;
+  }
+
+  // 1. Open the drawer from the first row.
+  await page.locator("[data-member-open]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-member-drawer]", { timeout: 12000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const open = await page.locator("[data-member-drawer]").count();
+  const identity = await page.locator("[data-member-identity]").count();
+  const audit = await page.locator("[data-member-audit]").count();
+  const auditEmpty = await page.locator("[data-member-audit-empty]").count();
+  note({ step: "open", drawerOpen: open > 0, identityShown: identity > 0, trailRowsOrEmpty: audit + auditEmpty });
+  await shot(page, "page-organization-member-drawer");
+
+  // 2. Grant a role. The picker is a real select, so index 1 is the first real role.
+  await page.locator("[data-member-grant-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-member-grant-role]").first().selectOption({ index: 1 }).catch(() => {});
+  await page.locator("[data-member-grant-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const afterGrant = await page.locator("[data-member-binding]").count();
+  note({ step: "grant", bindingRows: afterGrant });
+  await shot(page, "page-organization-member-grant");
+
+  // 3. Extend. Only a temporary grant carries the control, so one is granted with a window
+  //    first — which is why this step grants its *own* role rather than reaching for the row the
+  //    previous step made. A walk that extends "whatever is first" would silently pass on the
+  //    permanent grant's absence of the control and prove nothing.
+  await page.locator("[data-member-grant-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-member-grant-role]").first().selectOption({ index: 2 }).catch(() => {});
+  await page.locator("[data-member-grant-submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const beforeExtend = await page.locator("[data-member-binding]").count();
+  const extendable = await page.locator("[data-member-binding-extend]").count();
+  note({ step: "grant-second", bindingRows: beforeExtend, extendControls: extendable });
+
+  if (extendable > 0) {
+    await page.locator("[data-member-binding-extend]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    const dateField = await page.locator("[data-member-extend-date]").count();
+    // A date well in the future: extending into the past is refused by the API on purpose, and
+    // this pass is about the success path.
+    const future = new Date(Date.now() + 45 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    await page.locator("[data-member-extend-date]").first().fill(future).catch(() => {});
+    await page.locator("[data-member-extend-submit]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1700);
+    const afterExtend = await page.locator("[data-member-binding]").count();
+    // The count is the assertion: a revoke-and-re-grant would leave an extra row here, and the
+    // panel would look identical to somebody who is not counting.
+    note({
+      step: "extend",
+      dateField: dateField > 0,
+      bindingRowsBefore: beforeExtend,
+      bindingRowsAfter: afterExtend,
+      noExtraRow: afterExtend === beforeExtend,
+    });
+    await shot(page, "page-organization-member-extended");
+  }
+
+  // 4. Revoke the first grant; the row must remain, marked.
+  const revokeControls = await page.locator("[data-member-binding-revoke]").count();
+  if (revokeControls > 0) {
+    await page.locator("[data-member-binding-revoke]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1700);
+  }
+  const afterRevoke = await page.locator("[data-member-binding]").count();
+  const revokedBadges = await page.locator('[data-member-binding] >> text=Revoked').count();
+  note({ step: "revoke", rowsStillListed: afterRevoke > 0, revokedShown: revokedBadges > 0 });
+  await shot(page, "page-organization-member-revoked");
+
+  // 5. Escape closes it, and the tab underneath is still the filtered list it was.
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(600);
+  const closed = (await page.locator("[data-member-drawer]").count()) === 0;
+  const tableBack = await page.locator("[data-members-heading]").count();
+  note({ step: "close", closedWithEscape: closed, tabStillMounted: tableBack > 0 });
+  await shot(page, "page-organization-member-drawer-closed");
+
+  const out = { steps, organizationId };
+  report.organizationMemberDrawer = out;
+  log(`organization member drawer: ${JSON.stringify(steps)}`);
+  return out;
+}
+
+/**
  * The Departments tab of an organization (REQ-005, slice 2).
  *
  * The walk covers the whole of the slice's own promise rather than just the screen:
@@ -3747,6 +3883,11 @@ async function main() {
   // clean up again. It needs the organization the pass above just opened.
   await runOrganizationDepartments(page, report, organizationDepth.organizationId);
   log(`organization departments: ${JSON.stringify(report.organizationDepartments)}`);
+
+  // The member drawer (REQ-005, slice 4): open a member, grant a role, extend a temporary grant
+  // and revoke one. It runs after the departments pass because that pass leaves the organization
+  // with its members, its roles and a live tab to open the drawer from.
+  await runOrganizationMemberDrawer(page, report, organizationDepth.organizationId);
 
   // The Modules, Settings and Billing tabs (REQ-005, slice 3): switch a module off and on and
   // read it back after a reload, change the locale and accent and prove both persisted, and

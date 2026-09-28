@@ -15,6 +15,7 @@ import { useSearchParams } from "next/navigation";
 
 import { AuditTab } from "@/features/organizations/audit-tab";
 import { DepartmentsTab } from "@/features/organizations/departments-tab";
+import { MemberDrawer } from "@/features/organizations/member-drawer";
 import { BillingTab, ModulesTab, SettingsTab } from "@/features/organizations/settings-tabs";
 
 import { EmptyState } from "@/components/empty-state";
@@ -239,6 +240,10 @@ function MembersTab({ organization }: { organization: Organization }) {
   const [statusFilter, setStatusFilter] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [inviting, setInviting] = useState(false);
+  // The drawer opens over the tab, so the table underneath stays mounted and keeps its search
+  // and filter — a person who grants a role and closes the drawer should land back on the same
+  // filtered list, not on a freshly reset one.
+  const [openMember, setOpenMember] = useState<OrganizationMember | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -449,9 +454,15 @@ function MembersTab({ organization }: { organization: Organization }) {
                       <td className="px-4 py-3.5">
                         <span className="flex min-w-0 flex-col">
                           <span className="flex items-center gap-2">
-                            <span className="truncate font-medium">
+                            <button
+                              type="button"
+                              data-member-open={member.email}
+                              onClick={() => setOpenMember(member)}
+                              title={`Manage ${member.display_name || member.email}`}
+                              className="truncate text-left font-medium underline-offset-2 hover:underline"
+                            >
                               {member.display_name || member.email}
-                            </span>
+                            </button>
                             {member.is_primary ? (
                               <span
                                 title="This account's home organization"
@@ -524,9 +535,15 @@ function MembersTab({ organization }: { organization: Organization }) {
                 <li key={member.id} className="rounded-lg border border-line px-3 py-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <span className="flex min-w-0 flex-col">
-                      <span className="truncate text-[13px] font-medium">
+                      <button
+                        type="button"
+                        data-member-open={member.email}
+                        onClick={() => setOpenMember(member)}
+                        title={`Manage ${member.display_name || member.email}`}
+                        className="truncate text-left text-[13px] font-medium underline-offset-2 hover:underline"
+                      >
                         {member.display_name || member.email}
-                      </span>
+                      </button>
                       <span className="truncate text-[12px] text-muted">{member.email}</span>
                     </span>
                     <StatusBadge status={member.status} />
@@ -641,6 +658,16 @@ function MembersTab({ organization }: { organization: Organization }) {
           </div>
         )}
       </div>
+
+      {openMember ? (
+        <MemberDrawer
+          organization={organization}
+          memberId={openMember.user_id}
+          memberName={openMember.display_name || openMember.email}
+          onClose={() => setOpenMember(null)}
+          onChanged={() => void load()}
+        />
+      ) : null}
 
       {inviting ? (
         <InviteDialog

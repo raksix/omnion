@@ -3559,6 +3559,132 @@ export async function removeOrganizationMember(
   );
 }
 
+// ---------------------------------------------------------------------------------------------
+// The member drawer (REQ-005, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** One role binding as the drawer shows it, with the role's key and name resolved. */
+export type MemberBinding = {
+  id: string;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  subject_type: string;
+  subject_id: string;
+  scope_type: string;
+  organization_id: string | null;
+  site_id: string | null;
+  department: string | null;
+  module: string | null;
+  resource_id: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  /** Whether it still applies right now. */
+  active: boolean;
+  /** Whether a temporary window has run out. */
+  expired: boolean;
+  created_at: string;
+};
+
+/** One row of the drawer's trail. */
+export type MemberAuditRow = {
+  action: string;
+  actor_user_id: string | null;
+  /** The account's name, or `system` for a row nobody performed. */
+  actor_name: string;
+  target_type: string | null;
+  target_id: string | null;
+  created_at: string;
+};
+
+/**
+ * Everything the member drawer renders, in one response.
+ *
+ * One request rather than four: a person looking at a colleague must never see a half-filled
+ * panel, and an empty binding list that arrived while the identity succeeded is
+ * indistinguishable from "this person holds nothing".
+ */
+export type OrganizationMemberDetail = {
+  organization_id: string;
+  membership_id: string;
+  user_id: string;
+  display_name: string;
+  email: string;
+  user_status: string;
+  status: string;
+  is_primary: boolean;
+  joined_at: string | null;
+  last_active_at: string | null;
+  bindings: MemberBinding[];
+  departments: MemberDepartment[];
+  recent_audit: MemberAuditRow[];
+};
+
+/** `GET /api/v1/organizations/{id}/members/{user_id}` — the member drawer. */
+export async function fetchOrganizationMember(
+  organizationId: string,
+  userId: string,
+): Promise<OrganizationMemberDetail> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+  );
+}
+
+/**
+ * Grant a role to a member of this organization.
+ *
+ * The scope defaults to `organization` and the server refuses `global`: inside a tenant,
+ * "this person may do this here" is the shape that cannot escape, and a tenant administrator
+ * asking for a platform grant is asking for something the platform owns.
+ */
+export async function grantMemberRole(
+  organizationId: string,
+  userId: string,
+  input: {
+    role_id: string;
+    scope_type?: "organization" | "site" | "department";
+    site_id?: string;
+    department?: string;
+    expires_at?: string;
+  },
+): Promise<MemberBinding> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Move a temporary grant's expiry.
+ *
+ * The server patches the same row and refuses a date in the past, so "extend" cannot leave two
+ * live bindings for one role — which the effective-permissions screen would render as the same
+ * role twice with two different windows, neither of them the truth.
+ */
+export async function extendMemberRole(
+  organizationId: string,
+  userId: string,
+  bindingId: string,
+  expiresAt: string,
+): Promise<MemberBinding> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings/${encodeURIComponent(bindingId)}`,
+    { method: "PATCH", body: JSON.stringify({ expires_at: expiresAt }) },
+  );
+}
+
+/** Revoke a grant. The row stays in the trail; `revoked_at` is what changes. */
+export async function revokeMemberRole(
+  organizationId: string,
+  userId: string,
+  bindingId: string,
+): Promise<MemberBinding> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings/${encodeURIComponent(bindingId)}`,
+    { method: "DELETE" },
+  );
+}
+
 /** The invitations of one organization. */
 export async function fetchOrganizationInvitations(
   organizationId: string,
