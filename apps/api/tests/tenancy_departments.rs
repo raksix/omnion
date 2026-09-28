@@ -164,7 +164,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let org_a = create_organization_row(&db, "a", "Department Test A").await;
         let org_b = create_organization_row(&db, "b", "Department Test B").await;
@@ -447,7 +449,12 @@ async fn a_department_role_reaches_its_members_and_only_its_members() {
         ),
     )
     .await;
-    assert_eq!(added.status, StatusCode::CREATED, "adding a member: {}", added.body);
+    assert_eq!(
+        added.status,
+        StatusCode::CREATED,
+        "adding a member: {}",
+        added.body
+    );
 
     // Bind the probe role to the department as a whole.
     let bound = call(
@@ -463,7 +470,12 @@ async fn a_department_role_reaches_its_members_and_only_its_members() {
         ),
     )
     .await;
-    assert_eq!(bound.status, StatusCode::CREATED, "binding a role: {}", bound.body);
+    assert_eq!(
+        bound.status,
+        StatusCode::CREATED,
+        "binding a role: {}",
+        bound.body
+    );
 
     // The member, resolving inside the department, holds the role.
     let member = fixture.member_token().await;
@@ -527,7 +539,12 @@ async fn a_department_role_reaches_its_members_and_only_its_members() {
         ),
     )
     .await;
-    assert_eq!(removed.status, StatusCode::NO_CONTENT, "removing: {}", removed.body);
+    assert_eq!(
+        removed.status,
+        StatusCode::NO_CONTENT,
+        "removing: {}",
+        removed.body
+    );
 
     let after = call(
         &fixture.state,
@@ -568,10 +585,7 @@ async fn a_department_can_never_become_its_own_ancestor() {
         &fixture.state,
         request(
             Method::PATCH,
-            &format!(
-                "/api/v1/organizations/{}/departments/{}",
-                fixture.org_a, it
-            ),
+            &format!("/api/v1/organizations/{}/departments/{}", fixture.org_a, it),
             Some(&admin),
             Some(json!({ "parent_id": it })),
         ),
@@ -590,10 +604,7 @@ async fn a_department_can_never_become_its_own_ancestor() {
         &fixture.state,
         request(
             Method::PATCH,
-            &format!(
-                "/api/v1/organizations/{}/departments/{}",
-                fixture.org_a, it
-            ),
+            &format!("/api/v1/organizations/{}/departments/{}", fixture.org_a, it),
             Some(&admin),
             Some(json!({ "parent_id": squad })),
         ),
@@ -621,7 +632,12 @@ async fn a_department_can_never_become_its_own_ancestor() {
         ),
     )
     .await;
-    assert_eq!(legal.status, StatusCode::OK, "promoting to a root: {}", legal.body);
+    assert_eq!(
+        legal.status,
+        StatusCode::OK,
+        "promoting to a root: {}",
+        legal.body
+    );
     assert!(legal.body["parent_id"].is_null());
 
     fixture.cleanup().await;
@@ -701,7 +717,12 @@ async fn a_binding_on_a_parent_reaches_its_children_until_it_is_archived() {
         ),
     )
     .await;
-    assert_eq!(archived.status, StatusCode::OK, "archiving: {}", archived.body);
+    assert_eq!(
+        archived.status,
+        StatusCode::OK,
+        "archiving: {}",
+        archived.body
+    );
     assert_eq!(archived.body["status"], "archived");
 
     let after_archive = call(
@@ -818,7 +839,12 @@ async fn another_organizations_department_is_a_404_and_deletes_refuse_while_occu
         ),
     )
     .await;
-    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "deleting: {}", deleted.body);
+    assert_eq!(
+        deleted.status,
+        StatusCode::NO_CONTENT,
+        "deleting: {}",
+        deleted.body
+    );
 
     // A parent with a child is refused too.
     let parent = create_department(&fixture, &admin, "parent", "Parent", None).await;
@@ -868,7 +894,12 @@ async fn the_tree_reads_in_order_and_a_taken_key_is_refused() {
         ),
     )
     .await;
-    assert_eq!(tree.status, StatusCode::OK, "reading the tree: {}", tree.body);
+    assert_eq!(
+        tree.status,
+        StatusCode::OK,
+        "reading the tree: {}",
+        tree.body
+    );
 
     let rows = tree.body["departments"]
         .as_array()
@@ -1053,7 +1084,12 @@ async fn a_role_bound_to_one_site_never_answers_for_another() {
         ),
     )
     .await;
-    assert_eq!(inside.status, StatusCode::OK, "inside the site: {}", inside.body);
+    assert_eq!(
+        inside.status,
+        StatusCode::OK,
+        "inside the site: {}",
+        inside.body
+    );
     assert!(
         granted_keys(&inside.body).contains(&PROBE_PERMISSION.to_owned()),
         "a role bound to this site must apply inside it, got {:?}",
@@ -1117,4 +1153,3 @@ async fn a_role_bound_to_one_site_never_answers_for_another() {
 
     fixture.cleanup().await;
 }
-

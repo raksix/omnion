@@ -316,7 +316,10 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
         "reading the members must work: {:?}",
         members.body
     );
-    let listed = members.body["members"].as_array().cloned().unwrap_or_default();
+    let listed = members.body["members"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
         listed.len(),
         1,

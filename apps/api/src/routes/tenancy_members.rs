@@ -11,9 +11,9 @@
 //! id exists.
 
 use axum::Json;
-use axum::response::IntoResponse;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use omnion_identity::IdentityError;
@@ -524,11 +524,14 @@ pub async fn create_invitation(
         // The unique index caught a second live invitation for the same address: answer with
         // the row that already exists, so the panel can show it instead of duplicating it.
         Err(IdentityError::InvitationAlreadyPending(_)) => {
-            let pending =
-                memberships::find_pending_invitation(state.db().pool(), organization.id, &body.email)
-                    .await
-                    .ok()
-                    .flatten();
+            let pending = memberships::find_pending_invitation(
+                state.db().pool(),
+                organization.id,
+                &body.email,
+            )
+            .await
+            .ok()
+            .flatten();
             let mut refusal = ApiError::new(
                 StatusCode::CONFLICT,
                 "invitation_already_pending",
@@ -690,6 +693,13 @@ pub async fn accept_invitation(
         .await?
         .ok_or_else(invitation_not_found)?;
 
+    // The seat ceiling (REQ-005, slice 3) is checked here, *before* the acceptance — and before
+    // a sign-up account is created. The REQ is explicit that enforcement belongs to acceptance
+    // rather than to inviting ("an invitation is a request, the plan is charged for people who
+    // have joined"), and checking early means a refusal does not leave a brand new account
+    // behind that holds no membership and cannot get in.
+    super::tenancy_limits::guard_seat_limit(&state, invitation.organization_id).await?;
+
     // A signed-in caller accepts as itself; a signed-out one signs up as the address the
     // invitation was sent to. `Option<CurrentSession>` is not an extractor (an unauthenticated
     // request is a rejection, not a value), so the session is resolved here instead — and a
@@ -820,9 +830,10 @@ pub async fn accept_invitation(
         payload.0,
     )
     .await?;
-    response
-        .headers_mut()
-        .insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
     Ok(response)
 }
 
@@ -890,14 +901,13 @@ pub async fn switch_organization(
     address: ClientAddress,
     Json(body): Json<SwitchOrganizationRequest>,
 ) -> Result<Json<SwitchOrganizationResponse>, ApiError> {
-    let organization = omnion_identity::organizations::find_organization(
-        state.db().pool(),
-        body.organization_id,
-    )
-    .await?
-    .ok_or_else(invitation_not_found)?;
+    let organization =
+        omnion_identity::organizations::find_organization(state.db().pool(), body.organization_id)
+            .await?
+            .ok_or_else(invitation_not_found)?;
 
-    let memberships_of_user = memberships::list_account_memberships(state.db().pool(), current.user.id).await?;
+    let memberships_of_user =
+        memberships::list_account_memberships(state.db().pool(), current.user.id).await?;
     let known = memberships_of_user
         .iter()
         .any(|row| row.organization_id == organization.id);
@@ -962,12 +972,16 @@ pub(crate) async fn organization_in_scope(
     current: &CurrentSession,
     organization_id: Uuid,
 ) -> Result<Organization, ApiError> {
-    let organization = omnion_identity::organizations::find_organization(state.db().pool(), organization_id)
-        .await?
-        .ok_or_else(organization_not_found)?;
+    let organization =
+        omnion_identity::organizations::find_organization(state.db().pool(), organization_id)
+            .await?
+            .ok_or_else(organization_not_found)?;
 
     let rows = memberships::list_account_memberships(state.db().pool(), current.user.id).await?;
-    if rows.iter().any(|row| row.organization_id == organization.id) {
+    if rows
+        .iter()
+        .any(|row| row.organization_id == organization.id)
+    {
         return Ok(organization);
     }
 
@@ -1026,12 +1040,7 @@ async fn find_membership(
     organization_id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<Membership>, ApiError> {
-    Ok(memberships::find_member(
-        state.db().pool(),
-        organization_id,
-        user_id,
-    )
-    .await?)
+    Ok(memberships::find_member(state.db().pool(), organization_id, user_id).await?)
 }
 
 /// Account columns the Members tab reads, in one query.
@@ -1103,14 +1112,11 @@ async fn member_roles(
 
     let mut by_user: HashMap<Uuid, Vec<RoleChipBody>> = HashMap::new();
     for (user_id, role_id, key, name) in rows {
-        by_user
-            .entry(user_id)
-            .or_default()
-            .push(RoleChipBody {
-                id: role_id,
-                key,
-                name,
-            });
+        by_user.entry(user_id).or_default().push(RoleChipBody {
+            id: role_id,
+            key,
+            name,
+        });
     }
     Ok(by_user)
 }
@@ -1161,7 +1167,9 @@ async fn invitation_bodies(
             role_id: invitation.role_id,
             role_name: invitation.role_id.and_then(|id| roles.get(&id).cloned()),
             invited_by: invitation.invited_by,
-            invited_by_name: invitation.invited_by.and_then(|id| inviters.get(&id).cloned()),
+            invited_by_name: invitation
+                .invited_by
+                .and_then(|id| inviters.get(&id).cloned()),
             status: invitation.status,
             message: invitation.message,
             expires_at: invitation.expires_at,
@@ -1229,7 +1237,9 @@ pub fn mask_email(email: &str) -> String {
 /// otherwise, so an in-process test (which carries no connection info) is not thrown into
 /// one shared bucket.
 fn preview_key(address: Option<IpAddr>) -> String {
-    address.map(|ip| ip.to_string()).unwrap_or_else(|| "anon".to_owned())
+    address
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "anon".to_owned())
 }
 
 /// Fixed-window counter for the invitation preview, in memory.
@@ -1315,7 +1325,10 @@ mod tests {
         let now = Instant::now();
 
         for hit in 0..PREVIEW_RATE_BUDGET {
-            assert!(limiter.allows("1.2.3.4", PREVIEW_RATE_BUDGET, now), "hit {hit}");
+            assert!(
+                limiter.allows("1.2.3.4", PREVIEW_RATE_BUDGET, now),
+                "hit {hit}"
+            );
         }
         assert!(
             !limiter.allows("1.2.3.4", PREVIEW_RATE_BUDGET, now),
@@ -1334,7 +1347,10 @@ mod tests {
     #[test]
     fn requests_without_a_connection_info_share_one_anonymous_bucket() {
         assert_eq!(preview_key(None), "anon");
-        assert_eq!(preview_key(Some("127.0.0.1".parse().expect("ip"))), "127.0.0.1");
+        assert_eq!(
+            preview_key(Some("127.0.0.1".parse().expect("ip"))),
+            "127.0.0.1"
+        );
     }
 
     #[test]

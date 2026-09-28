@@ -428,6 +428,11 @@ pub async fn create_site(
         ));
     }
 
+    // The site ceiling (REQ-005, slice 3). A plan that says "5 sites" and quietly accepts a
+    // sixth is a plan that decorates the UI without bounding anything, so the check happens
+    // here, before the insert, and refuses with the ceiling named.
+    super::tenancy_limits::guard_site_limit(&state, organization_id).await?;
+
     let site = sites::create_site(
         state.db().pool(),
         NewSite {

@@ -237,7 +237,8 @@ pub async fn list_departments(
     Query(query): Query<DepartmentsQuery>,
 ) -> Result<Json<DepartmentsResponse>, ApiError> {
     let organization = organization_in_scope(&state, &current, organization_id).await?;
-    let summaries = departments::list_department_summaries(state.db().pool(), organization.id).await?;
+    let summaries =
+        departments::list_department_summaries(state.db().pool(), organization.id).await?;
 
     // `parent_key_of` looks a department's *parent id* up in this map, so the entry has to be
     // the parent's own key. Building it from each row's `parent_id` would store the child's key
@@ -375,8 +376,8 @@ pub async fn update_department(
     let pool = state.db().pool();
     let changes = body.changes();
 
-    let updated = departments::update_department(pool, organization.id, department_id, &changes)
-        .await?;
+    let updated =
+        departments::update_department(pool, organization.id, department_id, &changes).await?;
 
     bus::emit(
         state.db().pool(),
@@ -473,8 +474,8 @@ pub async fn delete_department(
     Path((organization_id, department_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let organization = organization_in_scope(&state, &current, organization_id).await?;
-    let removed = departments::delete_department(state.db().pool(), organization.id, department_id)
-        .await?;
+    let removed =
+        departments::delete_department(state.db().pool(), organization.id, department_id).await?;
     Ok(if removed {
         StatusCode::NO_CONTENT
     } else {
@@ -493,13 +494,9 @@ pub async fn add_department_member(
     let organization = organization_in_scope(&state, &current, organization_id).await?;
     let pool = state.db().pool();
 
-    let added = departments::add_department_member(
-        pool,
-        organization.id,
-        department_id,
-        body.user_id,
-    )
-    .await?;
+    let added =
+        departments::add_department_member(pool, organization.id, department_id, body.user_id)
+            .await?;
 
     record(
         &state,
@@ -569,8 +566,8 @@ pub async fn list_member_departments(
 ) -> Result<Json<Vec<MemberDepartmentBody>>, ApiError> {
     let organization = organization_in_scope(&state, &current, organization_id).await?;
 
-    let rows = departments::list_departments_of_user(state.db().pool(), organization.id, user_id)
-        .await?;
+    let rows =
+        departments::list_departments_of_user(state.db().pool(), organization.id, user_id).await?;
 
     Ok(Json(
         rows.into_iter()
@@ -833,7 +830,17 @@ async fn role_bodies(
     organization_id: Uuid,
     department_key: &str,
 ) -> Result<Vec<DepartmentRoleBody>, ApiError> {
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Option<Uuid>, Option<OffsetDateTime>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            String,
+            String,
+            Option<Uuid>,
+            Option<OffsetDateTime>,
+        ),
+    >(
         "select b.id, r.id, r.key, r.name, b.granted_by, b.expires_at \
            from role_bindings b \
            join roles r on r.id = b.role_id \

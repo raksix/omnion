@@ -38,11 +38,7 @@ const PASSWORD: &str = "correct horse battery";
 /// Permission keys the administrator of this suite holds. `sites.read` is part of it because
 /// the switcher's whole point is that the panel's data follows the switch, and a site list
 /// nobody may read would prove nothing.
-const ADMIN_PERMISSIONS: [&str; 3] = [
-    "organizations.read",
-    "organizations.manage",
-    "sites.read",
-];
+const ADMIN_PERMISSIONS: [&str; 3] = ["organizations.read", "organizations.manage", "sites.read"];
 
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
@@ -470,7 +466,11 @@ async fn an_invited_address_signs_up_joins_and_lands_on_the_organization() {
         .fetch_one(fixture.db.pool())
         .await
         .expect("the home column must be readable");
-    assert_eq!(home, Some(fixture.org_a), "the account adopted the organization");
+    assert_eq!(
+        home,
+        Some(fixture.org_a),
+        "the account adopted the organization"
+    );
 
     let status: String = sqlx::query_scalar(
         "select status from organization_members where organization_id = $1 and user_id = $2",
@@ -668,7 +668,12 @@ async fn inviting_a_member_or_a_pending_address_is_refused_by_name() {
         ),
     )
     .await;
-    assert_eq!(existing.status, StatusCode::CONFLICT, "member: {}", existing.body);
+    assert_eq!(
+        existing.status,
+        StatusCode::CONFLICT,
+        "member: {}",
+        existing.body
+    );
     assert_eq!(code_of(&existing.body), "already_member");
     assert!(
         existing.body["error"]["message"]
@@ -690,7 +695,12 @@ async fn inviting_a_member_or_a_pending_address_is_refused_by_name() {
         ),
     )
     .await;
-    assert_eq!(first.status, StatusCode::CREATED, "first invite: {}", first.body);
+    assert_eq!(
+        first.status,
+        StatusCode::CREATED,
+        "first invite: {}",
+        first.body
+    );
     let second = call(
         &fixture.state,
         request(
@@ -701,7 +711,12 @@ async fn inviting_a_member_or_a_pending_address_is_refused_by_name() {
         ),
     )
     .await;
-    assert_eq!(second.status, StatusCode::CONFLICT, "second invite: {}", second.body);
+    assert_eq!(
+        second.status,
+        StatusCode::CONFLICT,
+        "second invite: {}",
+        second.body
+    );
     assert_eq!(code_of(&second.body), "invitation_already_pending");
     assert_eq!(
         second.body["error"]["details"]["invitation_id"],
@@ -740,7 +755,12 @@ async fn inviting_a_member_or_a_pending_address_is_refused_by_name() {
         ),
     )
     .await;
-    assert_eq!(invalid.status, StatusCode::BAD_REQUEST, "invalid: {}", invalid.body);
+    assert_eq!(
+        invalid.status,
+        StatusCode::BAD_REQUEST,
+        "invalid: {}",
+        invalid.body
+    );
 
     fixture.cleanup().await;
 }
@@ -759,7 +779,12 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
         request(Method::GET, "/api/v1/sites", Some(&outsider), None),
     )
     .await;
-    assert_eq!(before_sites.status, StatusCode::OK, "sites: {}", before_sites.body);
+    assert_eq!(
+        before_sites.status,
+        StatusCode::OK,
+        "sites: {}",
+        before_sites.body
+    );
     assert_eq!(
         site_keys(&before_sites.body),
         vec!["b-main".to_owned()],
@@ -769,15 +794,28 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
     // Before: the account works in organization B, which is the only membership it has.
     let before = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/me/organizations", Some(&outsider), None),
+        request(
+            Method::GET,
+            "/api/v1/me/organizations",
+            Some(&outsider),
+            None,
+        ),
     )
     .await;
     assert_eq!(before.status, StatusCode::OK, "before: {}", before.body);
-    assert_eq!(before.body["current_organization_id"], json!(fixture.org_b.to_string()));
-    assert_eq!(before.body["organizations"].as_array().expect("an array").len(), 1);
     assert_eq!(
-        before.body["organizations"][0]["roles"][0]["name"],
-        "Organization Administrator",
+        before.body["current_organization_id"],
+        json!(fixture.org_b.to_string())
+    );
+    assert_eq!(
+        before.body["organizations"]
+            .as_array()
+            .expect("an array")
+            .len(),
+        1
+    );
+    assert_eq!(
+        before.body["organizations"][0]["roles"][0]["name"], "Organization Administrator",
         "the switcher shows the roles held there"
     );
 
@@ -792,7 +830,12 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::FORBIDDEN, "refused: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "refused: {}",
+        refused.body
+    );
     assert_eq!(code_of(&refused.body), "not_a_member");
 
     // An invitation makes the account a member; accepting it does not move the home, because
@@ -833,7 +876,12 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
     // Now the switcher lists both, and the session still works in B.
     let both = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/me/organizations", Some(&outsider), None),
+        request(
+            Method::GET,
+            "/api/v1/me/organizations",
+            Some(&outsider),
+            None,
+        ),
     )
     .await;
     assert_eq!(both.status, StatusCode::OK, "both: {}", both.body);
@@ -842,7 +890,13 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
         json!(fixture.org_b.to_string()),
         "the home does not move on its own"
     );
-    assert_eq!(both.body["organizations"].as_array().expect("an array").len(), 2);
+    assert_eq!(
+        both.body["organizations"]
+            .as_array()
+            .expect("an array")
+            .len(),
+        2
+    );
 
     // Switching moves it.
     let switched = call(
@@ -856,7 +910,10 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
     )
     .await;
     assert_eq!(switched.status, StatusCode::OK, "switch: {}", switched.body);
-    assert_eq!(switched.body["organization_id"], json!(fixture.org_a.to_string()));
+    assert_eq!(
+        switched.body["organization_id"],
+        json!(fixture.org_a.to_string())
+    );
 
     let me = call(
         &fixture.state,
@@ -886,10 +943,18 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
 
     let after = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/me/organizations", Some(&outsider), None),
+        request(
+            Method::GET,
+            "/api/v1/me/organizations",
+            Some(&outsider),
+            None,
+        ),
     )
     .await;
-    assert_eq!(after.body["current_organization_id"], json!(fixture.org_a.to_string()));
+    assert_eq!(
+        after.body["current_organization_id"],
+        json!(fixture.org_a.to_string())
+    );
     assert_eq!(
         after.body["organizations"]
             .as_array()
@@ -909,7 +974,12 @@ async fn the_switcher_moves_the_session_and_follows_the_membership() {
         request(Method::GET, "/api/v1/sites", Some(&outsider), None),
     )
     .await;
-    assert_eq!(after_sites.status, StatusCode::OK, "sites: {}", after_sites.body);
+    assert_eq!(
+        after_sites.status,
+        StatusCode::OK,
+        "sites: {}",
+        after_sites.body
+    );
     assert_eq!(
         site_keys(&after_sites.body),
         vec!["a-main".to_owned()],
@@ -1030,7 +1100,10 @@ async fn the_backfill_gives_every_home_organization_one_primary_membership() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the primary count must be readable");
-    assert_eq!(double_primary, 0, "an account has at most one primary membership");
+    assert_eq!(
+        double_primary, 0,
+        "an account has at most one primary membership"
+    );
 
     // And a membership never points at a user without a home organization.
     let mismatched: i64 = sqlx::query_scalar(
@@ -1093,7 +1166,12 @@ async fn a_suspended_member_and_a_last_primary_are_refused_with_their_reason() {
         ),
     )
     .await;
-    assert_eq!(suspended.status, StatusCode::OK, "suspend: {}", suspended.body);
+    assert_eq!(
+        suspended.status,
+        StatusCode::OK,
+        "suspend: {}",
+        suspended.body
+    );
     assert_eq!(suspended.body["status"], json!("suspended"));
     assert_eq!(suspended.body["email"], json!(member_email));
 
@@ -1126,7 +1204,12 @@ async fn a_suspended_member_and_a_last_primary_are_refused_with_their_reason() {
         ),
     )
     .await;
-    assert_eq!(bogus.status, StatusCode::BAD_REQUEST, "bogus: {}", bogus.body);
+    assert_eq!(
+        bogus.status,
+        StatusCode::BAD_REQUEST,
+        "bogus: {}",
+        bogus.body
+    );
 
     // The primary member cannot be removed: the organization would be left with no home.
     let refused = call(
@@ -1142,7 +1225,12 @@ async fn a_suspended_member_and_a_last_primary_are_refused_with_their_reason() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT, "refused: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "refused: {}",
+        refused.body
+    );
     assert_eq!(code_of(&refused.body), "last_owner");
 
     // A non-primary member is removed, and the removal is visible in the list.
@@ -1194,7 +1282,10 @@ async fn a_suspended_member_and_a_last_primary_are_refused_with_their_reason() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the audit count must be readable");
-    assert!(audited >= 3, "the membership changes are audited: {audited}");
+    assert!(
+        audited >= 3,
+        "the membership changes are audited: {audited}"
+    );
 
     fixture.cleanup().await;
 }

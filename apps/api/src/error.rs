@@ -266,7 +266,8 @@ impl From<IdentityError> for ApiError {
             // account that simply does not exist — except a token that is not valid, which
             // answers the same way for unknown, revoked and used, so the public link cannot be
             // used to discover an organization.
-            IdentityError::InvalidMembership(message) | IdentityError::InvalidInvitation(message) => {
+            IdentityError::InvalidMembership(message)
+            | IdentityError::InvalidInvitation(message) => {
                 Self::bad_request("invalid_request", message)
             }
             IdentityError::MemberAlreadyPresent => Self::new(
@@ -316,6 +317,24 @@ impl From<IdentityError> for ApiError {
                 StatusCode::CONFLICT,
                 "department_cycle",
                 "a department cannot be moved inside itself",
+            ),
+            // Settings, modules and limits (REQ-005, slice 3). A refused field names what the
+            // reader has to fix, and a module the installation does not ship is a 404: the
+            // row would describe a feature this build cannot serve, so the tab must not offer
+            // a switch for it.
+            IdentityError::InvalidSettings(message) => {
+                Self::bad_request("invalid_organization_settings", message)
+            }
+            IdentityError::InvalidLimits(message) => {
+                Self::bad_request("invalid_organization_limits", message)
+            }
+            IdentityError::InvalidModule(message) => {
+                Self::bad_request("invalid_module_key", message)
+            }
+            IdentityError::ModuleNotInstalled(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "module_not_installed",
+                format!("this installation does not ship the module {key:?}"),
             ),
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can

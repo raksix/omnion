@@ -94,6 +94,7 @@ pub mod search;
 pub mod sso;
 pub mod tenancy;
 pub mod tenancy_departments;
+pub mod tenancy_limits;
 pub mod tenancy_members;
 pub mod webauthn;
 pub mod webhooks;
@@ -424,6 +425,35 @@ pub fn router(state: AppState) -> Router {
     let member_departments = get(tenancy_departments::list_member_departments)
         .layer(guards::require(&state, "organizations.read"));
 
+    // Settings, modules, limits and usage (REQ-005, slice 3). Reads ride
+    // `organizations.read`, writes `organizations.manage`. The usage route is a `GET` that
+    // answers either a JSON payload or a CSV download, so it is one handler behind a query
+    // flag rather than two routes — the numbers on screen and the numbers in the file then
+    // come from the same call and cannot drift apart.
+    let organization_settings = get(tenancy_limits::get_settings)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            put(tenancy_limits::update_settings)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization_modules = get(tenancy_limits::get_modules)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            put(tenancy_limits::update_modules)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization_limits = get(tenancy_limits::get_limits)
+        .layer(guards::require(&state, "organizations.read"))
+        .merge(
+            put(tenancy_limits::update_limits)
+                .layer(guards::require(&state, "organizations.manage")),
+        );
+
+    let organization_usage =
+        get(tenancy_limits::get_usage).layer(guards::require(&state, "organizations.read"));
+
     // The switcher's two routes are session-scoped by design (the request's own table says
     // "session only"): they only ever return the caller's own memberships and switch to one
     // they already hold. A permission guard here would be a dead end - the caller's role
@@ -438,7 +468,10 @@ pub fn router(state: AppState) -> Router {
     // so they get their own small body cap (a preview sends nothing, an acceptance carries a
     // name and a password) instead of the router-wide limit.
     let invitation_preview = Router::new()
-        .route("/invitations/{token}", get(tenancy_members::preview_invitation))
+        .route(
+            "/invitations/{token}",
+            get(tenancy_members::preview_invitation),
+        )
         .route(
             "/invitations/{token}/accept",
             post(tenancy_members::accept_invitation),
@@ -900,18 +933,9 @@ pub fn router(state: AppState) -> Router {
         .route("/organizations", organizations)
         .route("/organizations/{id}", organization)
         .route("/organizations/{id}/members", organization_members)
-        .route(
-            "/organizations/{id}/members/{user_id}",
-            organization_member,
-        )
-        .route(
-            "/organizations/{id}/invitations",
-            organization_invitations,
-        )
-        .route(
-            "/organizations/{id}/departments",
-            organization_departments,
-        )
+        .route("/organizations/{id}/members/{user_id}", organization_member)
+        .route("/organizations/{id}/invitations", organization_invitations)
+        .route("/organizations/{id}/departments", organization_departments)
         .route(
             "/organizations/{id}/departments/{department_id}",
             organization_department,
@@ -939,6 +963,10 @@ pub fn router(state: AppState) -> Router {
             "/organizations/{id}/members/{user_id}/departments",
             member_departments,
         )
+        .route("/organizations/{id}/settings", organization_settings)
+        .route("/organizations/{id}/modules", organization_modules)
+        .route("/organizations/{id}/limits", organization_limits)
+        .route("/organizations/{id}/usage", organization_usage)
         .route(
             "/organizations/{id}/invitations/{invitation_id}",
             organization_invitation,

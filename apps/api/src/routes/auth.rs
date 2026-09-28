@@ -16,9 +16,9 @@ use omnion_identity::security;
 use omnion_identity::sessions::{self, NewSession};
 use omnion_identity::signin::{self, SignInOutcome};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
 use crate::client_ip::ClientAddress;
 use crate::cookies;
@@ -195,17 +195,24 @@ pub(crate) async fn start_session(
     ip_address: Option<String>,
     auth_methods: Vec<String>,
 ) -> Result<Response, ApiError> {
-    start_session_with_body(state, user, user_agent, ip_address, auth_methods, LoginResponse {
-        user: UserBody::from(user),
-        device: DeviceBody {
-            id: Uuid::nil(),
-            label: String::new(),
-            platform: String::new(),
-            browser: String::new(),
-            trusted: false,
+    start_session_with_body(
+        state,
+        user,
+        user_agent,
+        ip_address,
+        auth_methods,
+        LoginResponse {
+            user: UserBody::from(user),
+            device: DeviceBody {
+                id: Uuid::nil(),
+                label: String::new(),
+                platform: String::new(),
+                browser: String::new(),
+                trusted: false,
+            },
+            expires_in: sessions::SESSION_TTL_SECONDS,
         },
-        expires_in: sessions::SESSION_TTL_SECONDS,
-    })
+    )
     .await
 }
 
