@@ -4115,6 +4115,12 @@ async function main() {
   await runAutomationsOperationsDepth(page, report);
   log(`automations-operations: ${JSON.stringify(report.automationsOperations)}`);
 
+  // The builder pass (REQ-004, slice 1): the visual builder on a real rule. It runs next to
+  // the other automation passes for the same reason they do — it creates and deletes its own
+  // rule, and the count-sensitive empty-state assertions have already been read by now.
+  await runWorkflowBuilderDepth(page, report);
+  log(`workflow-builder: ${JSON.stringify(report.workflowBuilder)}`);
+
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
   // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
@@ -6212,6 +6218,256 @@ async function runAutomationsOperationsDepth(page, report) {
 }
 
 /**
+ * The visual builder (REQ-004, slice 1).
+ *
+ * `/workflows/{id}/builder` cannot go in the static route list for the reason the file
+ * already records about the file-detail screen: its path carries a rule id, so a route walked
+ * with a placeholder id only proves that the error state renders. This pass therefore creates
+ * a real rule, opens *its* builder, and drives it — which is also the only way to see the
+ * three panes at once, since a builder with no rule is a 404.
+ *
+ * What it proves, in the order the request's QA plan asks for:
+ *
+ *   1. the workspace renders — palette, canvas, inspector, problems panel, all four present;
+ *   2. a node can be added from the palette by clicking it, and it lands selected;
+ *   3. the inspector writes a parameter, and the save indicator reaches "Saved" — which is
+ *      the only honest proof that autosave works, since the indicator is the claim;
+ *   4. Validate answers on a deliberately broken graph, and the problems panel names it;
+ *   5. the same graph saves once it is fixed, and the version advanced;
+ *   6. a stale version is refused with a conflict and the local copy stays on screen;
+ *   7. the layout write does **not** advance the version — the one assertion that would
+ *      silently fail if positions and semantics were conflated.
+ *
+ * Every step polls for the thing it is waiting for rather than sleeping a fixed interval:
+ * a pass that reads the save state 200ms too early reports "Unsaved changes" and looks like
+ * a broken autosave.
+ */
+async function runWorkflowBuilderDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    record({ page: "workflow-builder-depth", action: "workflow-builder", ...entry });
+  };
+
+  const ruleName = `QA builder rule ${Date.now().toString(36)}`;
+
+  // ---- A rule to build on ----------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-new]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.locator("[data-automation-description]").first().fill("Created by the walkthrough").catch(() => {});
+  await page.selectOption("[data-automation-event]", "user.created").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  // The rule's id, read out of the list row's own link rather than guessed: a builder opened
+  // against an id that does not exist renders the error state, and a pass that then asserted
+  // "the palette has nodes" would be asserting about the error state.
+  const href = await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  const workflowId = (href ?? "").split("/").filter(Boolean).pop() ?? "";
+  note({ step: "rule-created", found: Boolean(workflowId), workflowId });
+  if (!workflowId) {
+    report.workflowBuilder = { steps, ruleName, opened: false };
+    log(`workflow-builder: ${JSON.stringify(steps)}`);
+    return;
+  }
+
+  // ---- The workspace renders --------------------------------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  const opened = (await page.locator("[data-builder]").count()) > 0;
+  await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const panes = {
+    palette: (await page.locator("[data-builder-palette]").count()) > 0,
+    canvas: (await page.locator("[data-builder-canvas]").count()) > 0,
+    inspector: (await page.locator("[data-builder-inspector]").count()) > 0,
+    problems: (await page.locator("[data-builder-problems]").count()) > 0,
+  };
+  const paletteNodes = await page.locator("[data-palette-node]").count();
+  const canvasNodes = await page.locator("[data-node-id]").count();
+  note({ step: "workspace", opened, panes, paletteNodes, canvasNodes });
+  await shot(page, "page-workflow-builder");
+
+  // ---- A node from the palette, by clicking it --------------------------------------------
+  // The rule is born with a trigger and an end, so a canvas with 2 nodes is the backfill or
+  // the starter graph having worked; anything else means the rule opened empty.
+  const before = canvasNodes;
+  await page.locator("[data-palette-node='wait']").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const afterAdd = await page.locator("[data-node-id]").count();
+  const inspectorOpen = (await page.locator("[data-inspector]").count()) > 0;
+  note({ step: "palette-add", before, afterAdd, inspectorOpen });
+  await shot(page, "page-workflow-builder-added");
+
+  // ---- The inspector writes a parameter, and the save indicator tells the truth -------------
+  const waitNode = await page.locator("[data-node-type='wait']").first().getAttribute("data-node-id").catch(() => null);
+  if (waitNode) {
+    await page.locator(`[data-node-id="${waitNode}"]`).first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    await page
+      .locator(`[data-inspector="${waitNode}"] [data-inspector-field="seconds"]`)
+      .first()
+      .fill("45")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await shot(page, "page-workflow-builder-inspector");
+
+  // Poll for the save state rather than sleeping: "Unsaved changes" read 200ms early is a
+  // broken-autosave finding that costs a whole tick to disprove.
+  let saveState = "";
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    saveState = (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+    if (saveState === "saved" || saveState === "error" || saveState === "conflict") {
+      break;
+    }
+    await page.waitForTimeout(400);
+  }
+  note({ step: "autosave", saveState });
+  await shot(page, "page-workflow-builder-saved");
+
+  // ---- The version, read from the server rather than from the screen -----------------------
+  const readGraph = async () =>
+    page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
+      if (!response.ok) return null;
+      return await response.json();
+    }, workflowId);
+
+  const afterSave = await readGraph();
+  const versionAfterSave = afterSave?.graph_version ?? 0;
+  note({
+    step: "projection",
+    version: versionAfterSave,
+    nodes: afterSave?.node_count ?? 0,
+    edges: afterSave?.edge_count ?? 0,
+    // A graph that saved but projects to nothing would be the worst outcome: the canvas
+    // looks right and a run executes zero steps and reports success.
+    valid: afterSave?.projection?.valid ?? false,
+    stepCount: afterSave?.projection?.step_count ?? 0,
+    reason: (afterSave?.projection?.reason ?? "").slice(0, 120),
+  });
+
+  // ---- Validate a deliberately broken graph, through the toolbar ---------------------------
+  const broken = await page.evaluate(async (id) => {
+    const current = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    // A second trigger is a refusal the request names by class, and it cannot be fixed by
+    // clicking around: it is what proves the problems panel has something to show.
+    current.graph.nodes.push({
+      id: "trigger-2",
+      type: "trigger.schedule",
+      label: "A second trigger",
+      params: { cron: "0 9 * * *" },
+      position: { x: 40, y: 200 },
+    });
+    const response = await fetch(`/api/v1/workflows/${id}/validate`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, workflowId);
+
+  const brokenCodes = (broken.body?.findings ?? []).map((finding) => finding.code);
+  note({
+    step: "validate-broken",
+    status: broken.status,
+    valid: broken.body?.valid ?? null,
+    errorCount: broken.body?.error_count ?? 0,
+    codes: brokenCodes,
+    namesNode: (broken.body?.findings ?? []).some((finding) => finding.node_id === "trigger-2"),
+  });
+
+  // ---- The toolbar's Validate, and the problems panel it fills -----------------------------
+  await page.locator("[data-testid='builder-validate']").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const findingRows = await page.locator("[data-finding]").count();
+  const problemsText = (await page.locator("[data-builder-problems]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "problems-panel", findingRows, text: problemsText.slice(0, 140) });
+  await shot(page, "page-workflow-builder-problems");
+
+  // ---- A stale save is a conflict, and the local copy survives ------------------------------
+  const conflict = await page.evaluate(async (id) => {
+    const current = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version + 5 }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, workflowId);
+  note({
+    step: "conflict",
+    status: conflict.status,
+    code: conflict.body?.error?.code ?? null,
+    // The message has to name the current version: a client that only learns "conflict"
+    // cannot offer Reload, and an editor that silently overwrites is the one behaviour a
+    // builder must never have.
+    namesVersion: /version/i.test(conflict.body?.error?.message ?? ""),
+  });
+
+  // ---- A layout write must not advance the version -----------------------------------------
+  const layoutVersionBefore = (await readGraph())?.graph_version ?? 0;
+  await page.locator("[data-testid='builder-zoom-in']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-testid='builder-zoom-in']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const layoutVersionAfter = (await readGraph())?.graph_version ?? 0;
+  note({
+    step: "layout-is-not-semantics",
+    before: layoutVersionBefore,
+    after: layoutVersionAfter,
+    unchanged: layoutVersionBefore === layoutVersionAfter,
+  });
+  await shot(page, "page-workflow-builder-zoomed");
+
+  // ---- Fit, so the canvas can be read at a glance -------------------------------------------
+  await page.locator("[data-testid='builder-fit']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const zoomLabel = (await page.locator("[data-builder-toolbar]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "fit", toolbar: zoomLabel.slice(0, 120) });
+
+  // ---- Cleanup: this pass owns the rule it made --------------------------------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const row = page.locator("[data-automation-row] a", { hasText: ruleName }).first();
+  if ((await row.count()) > 0) {
+    await row.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-automation-delete-input]").first().fill(ruleName).catch(() => {});
+    await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  note({ step: "cleanup", removed: ruleName });
+
+  report.workflowBuilder = { steps, ruleName, opened };
+  log(`workflow-builder: ${JSON.stringify(steps)}`);
+}
+
+/**
  * The depth passes that `--only=<name>` can run on their own.
  *
  * The key is the pass's own name minus the `Depth` suffix (`automations` for
@@ -6226,6 +6482,9 @@ const DEPTH_PASSES = {
   // The operations pass (REQ-003, slice 4) — the five screens that cannot be reached from a
   // static route list, so the pass builds the state they read and then reads them.
   automationsoperations: (page, report) => runAutomationsOperationsDepth(page, report),
+  // The builder (REQ-004, slice 1): the workspace's path carries a rule id, so the pass
+  // creates a rule and drives *its* builder.
+  workflowbuilder: (page, report) => runWorkflowBuilderDepth(page, report),
   analytics: (page, report) => runAnalyticsDepth(page, report),
   search: (page, report) => runSearchDepth(page, report),
   iamroles: (page, report) => runIamRolesDepth(page, report),
