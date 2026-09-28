@@ -2060,3 +2060,66 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+## 2026-09-28 — main merged, and slice 4's first half: activities and the merged record timeline
+
+**What.** Two things in one tick, because the first was a prerequisite for measuring the second.
+
+**The merge.** `origin/main` had moved 17 commits (IAM SSO, the file manager, the authentication
+screen). Three files conflicted and all three are shared, so each was resolved as a union rather
+than a choice: `app-shell.tsx` (both sides added a nav entry and its icon), `BUILD-LOG.md`
+(append-only) and `scripts/qa/walkthrough.cjs`, where two independent depth passes sit at the same
+insertion point — `runCrmDealsDepth` and `runIamAuthenticationDepth` — and the mobile route list
+became the union of both sides' entries. The walkthrough resolution was rebuilt from the three
+merge stages with `difflib` rather than by hand: a first attempt joined the blocks and lost the
+file's tail, which `node --check` caught as `Unexpected end of input`.
+
+**Slice 4, half one.** The activity feed, the log form, and one ordered timeline that merges a
+record's calls, meetings, notes and tasks with its deals' stage changes and archive markers.
+
+The rules that needed writing down, because the schema could not express them:
+
+* **An activity hangs off exactly one record.** `crm_activities_attached` only requires *one* of
+  the three foreign keys, so `company_id` **and** `contact_id` together satisfies the database
+  while making the timeline ambiguous about which record owns the row. The module is the stricter
+  of the two, and the API test proves the refusal.
+* **A task needs a due date or a done mark.** The open-task index is
+  `(organization_id, due_at) where done_at is null`, so a dateless open task appears on no list.
+* **The attachment is checked inside the statement that writes the row.** A separate existence
+  check is a race: an activity logged against a deal archived a millisecond later hangs off
+  nothing, and the API answers `404` rather than writing an orphan.
+
+The timeline is built rather than stored, and its stage changes come from the **deal rows**, not
+from the event log — so a record imported before the event bus existed still has a correct
+history, and a replayed event cannot duplicate an entry. The synthetic entry id carries its arm
+(`stage:<id>` / `archived:<id>`) because a deal's stage change and its archive marker are two
+entries of one timeline, and two identical React keys means one of them silently overwrites the
+other.
+
+**A defect the tests caught in the first draft.** `relative_label` had the sign inverted:
+`then - at` is **negative** for the past, so the first version read `"in 5m"` for something that
+happened five minutes ago. Two unit tests caught it. The same function is mirrored in
+`apps/admin/lib/crm.ts` — a label is a presentation decision, and two spellings of one idea is how
+a timeline ends up disagreeing with its own feed — so both now carry the same bucket bounds and a
+comment naming the sign. A third test failure was the *test's* fault, not the code's: 14 days is
+`1_209_600s`, below the week bucket's `2_592_000s` floor, so `"14d"` is correct and the
+expectation was wrong. The bucket bounds are consts now, because a range *pattern* cannot hold the
+arithmetic they are written with.
+
+**Proof.** `cargo test -p omnion-module-crm` → **132 passed** (106 before this tick; 26 new).
+`apps/admin` `tsc --noEmit` → 0 errors. `node --check scripts/qa/walkthrough.cjs` → clean. The
+route-level `crm_activities.rs` handlers carry their own unit tests, and the integration walks are
+written but **have not run** — they need a database, and `/mnt/apopic` was at 97% with four other
+writers compiling when the tick ended. The QA browser pass is likewise not run.
+
+**Next.** Run `cargo test -p omnion-api --test crm` against a **fresh** database (see the
+`VersionMissing` note in REQ-051 — the shared dev database carries applied migrations no branch
+has, and a throwaway one is the only way the walks execute), then the w4 QA pass:
+`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`. That
+is also the last gate for slice 3. Then the rest of slice 4: the copilot's two endpoints, the
+global-search registration and the `form.submitted` consumer.
+
+**Environment note.** `/mnt/apopic` went to **98%** (1.5 GB free) mid-tick and a
+`cargo build -p omnion-api` died with `No space left on device` writing a `.rmeta`. `CARGO_INCREMENTAL=0`
+and `CARGO_BUILD_JOBS=1` are the settings that got the rest of the tick through. The seven writers'
+`target/` directories are still the pressure — they total over 27 GB on a 60 GB mount — and a
+shared `CARGO_TARGET_DIR` would remove it permanently.
