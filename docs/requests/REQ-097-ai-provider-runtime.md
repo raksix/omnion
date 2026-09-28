@@ -1,6 +1,6 @@
 # REQ-097 — AI Provider Runtime & Local Models
 
-> **Status:** in-progress · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** done (5a2f10c) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > Slice 1 · 2 shipped, slice 3 in its last stretch: the storage, the HTTP surface, the
 > three panels, the background probe runner, the failover substitution, the default-provider
 > removal guard, the **local-runtime walk** (Ollama / vLLM / llama.cpp, each passing Test,
@@ -175,7 +175,18 @@ Providers are installation-level, so these events carry `organization_id = null`
   and the guards **out of `walkthrough.cjs`** — a typo in a scope would otherwise report a clean
   sheet of zeros for a pass that walked nothing, and a depth pass nobody tagged falls out of every
   scope with nobody noticing.*
-- [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
+- [x] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
+  *Closed on the scoped pass `20260928-150720`: **0 findings — high 0 · medium 0 · low 0** over
+  1 page, 26 clicks, 8 field fills and 53 screenshots, with all **12** provoked failures claimed
+  by a registration and none filed as a defect. `cargo test -p omnion-ai-hub` **86 passed**,
+  `pnpm typecheck` **2/2**, and the three QA probes 12/12, 7/7 and 6/6. The eleven depth
+  assertions all read as claims rather than nulls: the empty state offers its action, three
+  protocols, the field refusal, a connected local provider, the five-step test
+  (`resolve:1 ms | tls:not applicable | auth:0 ms | models:0 ms | stream:4 ms`), a dead endpoint
+  naming `resolve`, the health dots, discovery (2 to add → applied → already up to date), the
+  capability editor with all ten flags, the flag toggle, and the three panels. The states sweep
+  provoked three failures and each recovered through a real retry with no skeleton on screen, and
+  the mobile pass held 44px rows in a full-height sheet.*
 
 ### QA plan
 

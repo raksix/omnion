@@ -2600,3 +2600,38 @@
 
 - **Next.** The window/net-position mismatch above. Then REQ-097 closes, and REQ-098 slice 1 (the
   model catalog) starts.
+
+## 2026-09-28 · wave 7 · tick 8c · REQ-097 closed, on a pass that found one real bug
+
+- **What.** `32302ef` (the product bug), `cdb7ca7` + the follow-up registration (the pass's own
+  submissions), and the closing pass `20260928-150720`: **0 findings, high 0 · medium 0 · low 0**.
+  REQ-097 is `done`.
+
+- **The bug a closing pass exists to find.** Applying a discovery diff re-read the diff and
+  stopped; the model **list** was never re-fetched. The panel said "applied 2 added" over an empty
+  table, and everything reading that list reported empty — the capability editor `editor: 0`, the
+  flag toggle "no vision flag in the catalog". Three ticks of unit tests never saw it, because it
+  is a *state after a write*, not a state. The pass found it only by applying a diff and then
+  looking for the row the notice had just promised.
+
+- **The last high finding was the pass's own, and it had been hiding in plain sight.** The
+  `400 POST /api/v1/ai/providers` opening every report came from the depth pass's **own**
+  "QA Refused" step — a provider submitted with the base URL `not-a-url`, refused by the API
+  exactly as it should be. It read as a product defect because the step asserts the *field* error
+  and so looks wholly client-side, while the request that produced the report entry sat three lines
+  below that assertion. Three of my own fixes went into the generic interactor's submit window
+  (correct, and its `submit-window: {"covered":0}` diagnostic is what made this findable) and the
+  finding was still there. Lesson below.
+
+- **Proof.** QA `20260928-150720`: **high 0 · medium 0 · low 0**, 1 page, 26 clicks, 8 fills, 53
+  screenshots, **12 of 12** provoked failures claimed, none filed. Eleven depth assertions all
+  green, including `resolve:1 ms | tls:not applicable | auth:0 ms | models:0 ms | stream:4 ms` on
+  the five-step test, discovery `2 to add → applied → already up to date`, the capability editor
+  with all ten flags, and a toggle that flips and reports `qa-large: vision enabled.` The states
+  sweep provoked three failures, each recovered through a real retry, 0 skeletons. Mobile: 44px
+  rows in a full-height sheet. `cargo test -p omnion-ai-hub -p omnion-api` green, `pnpm typecheck`
+  **2/2**, `pnpm build` **2/2**, probes 12/12 · 7/7 · 6/6.
+
+- **Next.** REQ-098 slice 1 — the model catalog. The registry screen exists and is walked, but the
+  catalog's own rules (which model is default, what a task resolves to, the routing decision) are
+  REQ-098 and are not started.
