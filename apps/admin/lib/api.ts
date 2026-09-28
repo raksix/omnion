@@ -3626,7 +3626,10 @@ export type IamProviderTest = {
   detail: string;
   endpoints?: Record<string, unknown> | null;
   secret_present: boolean;
-  /** Present for a directory only; the protocol kinds report one result rather than a walk. */
+  /**
+   * The step ladder, for every kind. A directory walks six checks and a protocol provider walks
+   * four; the two sets differ, the shape does not, so the panel renders one list.
+   */
   steps?: IamTestStep[] | null;
   problems?: IamTestProblem[] | null;
 };

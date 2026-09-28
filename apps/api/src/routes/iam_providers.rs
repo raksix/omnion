@@ -23,11 +23,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
-use omnion_identity::sso::oidc::{self, Discovery, HttpClient};
+use omnion_identity::sso::oidc::{self, Discovery, HttpClient, Jwk};
 use omnion_identity::sso::providers::{
     self, AuthProvider, NewProvider, ProviderChanges, ProviderKind, default_scopes,
 };
-use omnion_identity::sso::{directory, provisioning};
+use omnion_identity::sso::{directory, protocol_steps, provisioning};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -272,14 +272,52 @@ pub struct ProviderTestBody {
     pub endpoints: Option<Value>,
     /// Whether the client secret is readable in this installation.
     pub secret_present: bool,
-    /// The step ladder, for a directory. Absent for the protocol kinds, which report one
-    /// result rather than a walk — the field is skipped rather than sent empty so the panel
-    /// cannot render six grey rows for an OIDC provider.
+    /// The step ladder, for every kind. A directory walks six checks, a protocol provider walks
+    /// four — the two ladders have different steps, which is the point, but the same *shape*, so
+    /// the panel renders one list and an operator reads one kind of answer whatever they
+    /// configured. Skipped rather than sent empty, so a result without a ladder cannot render as
+    /// grey rows.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub steps: Option<Vec<directory::StepReport>>,
+    pub steps: Option<Vec<StepRow>>,
     /// Configuration problems, each attached to the field that owns it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problems: Option<Vec<directory::ConfigProblem>>,
+}
+
+/// One row of a step ladder, whichever kind produced it.
+///
+/// Two ladders with two Rust types is the right shape in the crate — a directory's step is a
+/// DNS resolution and a protocol's is a signature check, and pretending otherwise is how a
+/// `TestStep::Dns` ends up meaning "the JWKS was unreadable". But the panel needs one list, so
+/// the row is flattened to the three fields it actually renders.
+#[derive(Debug, Serialize)]
+pub struct StepRow {
+    /// The step's machine name, which the panel's label table keys on.
+    pub step: String,
+    /// `ok`, `failed` or `pending`.
+    pub status: &'static str,
+    /// The sentence beside the step.
+    pub detail: String,
+}
+
+impl From<&directory::StepReport> for StepRow {
+    fn from(step: &directory::StepReport) -> Self {
+        Self {
+            step: step.step.as_str().to_owned(),
+            status: step.status,
+            detail: step.detail.clone(),
+        }
+    }
+}
+
+impl From<&protocol_steps::StepReport> for StepRow {
+    fn from(step: &protocol_steps::StepReport) -> Self {
+        Self {
+            step: step.step.as_str().to_owned(),
+            status: step.status,
+            detail: step.detail.clone(),
+        }
+    }
 }
 
 /// The answer of the enable action.
@@ -616,11 +654,10 @@ pub async fn test_provider(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ProviderTestBody>, ApiError> {
     let provider = load(&state, &current, id).await?;
-
-    // A directory is a different kind of question, so it gets a different shape of answer: the
-    // configuration ladder plus, once the network half lands, a step walk. The protocol kinds
-    // still get one result — a boolean for them is not a loss, because they fail in exactly one
-    // place (the provider did not answer, or answered with something unreadable).
+    // A directory asks a different question — can this host be bound to? — so it keeps its own
+    // six-step ladder and its own sentence. The protocol kinds now walk theirs: the argument that
+    // they "fail in exactly one place" was wrong, and a single result for three different repairs
+    // is a panel that names none of them.
     if provider.kind.is_directory() {
         let config = directory::DirectoryConfig::from_value(&provider.config)
             .map_err(|error| ApiError::bad_request("invalid_request", error.to_string()))?;
@@ -630,16 +667,13 @@ pub async fn test_provider(
         // rather than by the provider's `secret_ref` — the two are different credentials and
         // conflating them is how a directory ends up authenticating with a client secret.
         let bind_present = std::env::var(config.bind_secret_ref.trim()).is_ok();
-        let (detail, endpoints) = (
-            directory_detail(&outcome, bind_present),
-            Some(json!({
-                "host": config.hostname(),
-                "port": config.port(),
-                "encrypted": config.is_secure(),
-                "login_attribute": config.login_attribute(),
-                "bind_within_base": config.bind_within_base(),
-            })),
-        );
+        let endpoints = Some(json!({
+            "host": config.hostname(),
+            "port": config.port(),
+            "encrypted": config.is_secure(),
+            "login_attribute": config.login_attribute(),
+            "bind_within_base": config.bind_within_base(),
+        }));
 
         // Recorded on the row either way: a failed test is a result, and the enable gate reads
         // it. Not recording failures is how a provider ends up enabled with a red "Last test".
@@ -667,10 +701,10 @@ pub async fn test_provider(
             slug: provider.slug.clone(),
             kind: provider.kind.as_str(),
             status: outcome.status,
-            detail,
+            detail: directory_detail(&outcome, bind_present),
             endpoints,
             secret_present: bind_present,
-            steps: Some(outcome.steps),
+            steps: Some(outcome.steps.iter().map(StepRow::from).collect()),
             problems: if outcome.problems.is_empty() {
                 None
             } else {
@@ -684,24 +718,29 @@ pub async fn test_provider(
         .map(|value| value.is_some())
         .unwrap_or(false);
 
-    let (status, detail, endpoints) = match provider.kind {
+    let outcome = match provider.kind {
         ProviderKind::Oidc | ProviderKind::Oauth2 => {
             test_oidc(&client, &provider, secret_present).await
         }
-        ProviderKind::Saml => test_saml(&provider, secret_present),
+        ProviderKind::Saml => test_saml(&provider),
         // A directory is handled above, so this arm is unreachable — but `match` on an enum
         // without it would be a compile error the day a sixth kind lands, which is the right
         // moment to be interrupted and not one second later.
-        _ => ("failed", "this kind has no connection test yet".to_owned(), None),
+        _ => protocol_steps::TestOutcome::unconfigured(&provider.kind.as_str(), &["kind"]),
     };
+
+    // The failing step rides on the event for every kind. A webhook subscriber deciding whether
+    // to page somebody needs to know *which check* refused — "the provider is broken" at 3am is
+    // not actionable and a step name is.
+    let failing_step = outcome.failing_step().map(|step| step.as_str());
 
     // The protocol kinds record their outcome too, so the registry's column and the gate mean
     // the same thing for every kind rather than only for directories.
-    providers::record_test(state.db().pool(), provider.id, status == "ok").await?;
+    providers::record_test(state.db().pool(), provider.id, outcome.passed()).await?;
 
     emit(
         &state,
-        NewEvent::new(if status == "ok" {
+        NewEvent::new(if outcome.passed() {
             "iam.provider_test_passed"
         } else {
             "iam.provider_test_failed"
@@ -711,6 +750,7 @@ pub async fn test_provider(
         .payload(json!({
             "provider_id": provider.id,
             "kind": provider.kind.as_str(),
+            "step": failing_step,
         })),
     )
     .await;
@@ -719,14 +759,16 @@ pub async fn test_provider(
         provider_id: provider.id,
         slug: provider.slug.clone(),
         kind: provider.kind.as_str(),
-        status,
-        detail,
-        endpoints,
+        status: outcome.status,
+        detail: outcome.headline(),
+        endpoints: outcome.endpoints,
         secret_present,
-        steps: None,
+        steps: Some(outcome.steps.iter().map(StepRow::from).collect()),
         problems: None,
     }))
 }
+
+
 
 /// One sentence for the top of a directory test result.
 ///
@@ -947,15 +989,20 @@ async fn sign_in_summary(
 }
 
 /// The `code` flows: discovery first, then the key set the discovery document points at.
+///
+/// This is the *fetch* half only. Deciding what the fetch means — including the issuer check that
+/// makes a discovery document belonging to somebody else a refusal rather than a result — lives in
+/// [`protocol_steps`], so the sign-in path and this button cannot disagree about whether a provider
+/// is the one it was configured to be.
 async fn test_oidc(
     client: &HttpClient,
     provider: &AuthProvider,
     secret_present: bool,
-) -> (&'static str, String, Option<Value>) {
+) -> protocol_steps::TestOutcome {
     // A SAML provider stores its endpoints explicitly; an OIDC one may either name an issuer to
     // discover, or name the endpoints outright for a provider that publishes no discovery
     // document. Both are supported, and which one is in use is visible in the row.
-    let issuer = provider
+    let configured_issuer = provider
         .config
         .get("issuer")
         .and_then(Value::as_str)
@@ -963,33 +1010,37 @@ async fn test_oidc(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
 
-    let discovery = match issuer.as_deref() {
+    let (document, keys) = match configured_issuer.as_deref() {
         Some(issuer) => {
             let url = format!(
                 "{}/.well-known/openid-configuration",
                 issuer.trim_end_matches('/')
             );
             match client.get_json(&url).await {
-                Ok(document) => match Discovery::from_value(&document) {
-                    Ok(discovery) => discovery,
-                    Err(error) => {
-                        return (
-                            "failed",
-                            format!("the discovery document is incomplete: {error}"),
-                            None,
-                        );
+                Ok(value) => match Discovery::from_value(&value) {
+                    // The keys are read *before* the document is moved into the tuple: a tuple
+                    // evaluates its elements left to right, so writing `(Ok(discovery),
+                    // fetch_keys(&discovery))` borrows a value that is already gone.
+                    Ok(discovery) => {
+                        let keys = fetch_keys(client, &discovery).await;
+                        (Ok(discovery), keys)
                     }
+                    // An incomplete document is a discovery failure, not a transport one: the
+                    // server answered, and what it answered cannot be used. The ladder says so.
+                    Err(error) => (
+                        Err(invalid(format!(
+                            "the discovery document is incomplete: {error}"
+                        ))),
+                        Ok(Vec::new()),
+                    ),
                 },
-                Err(error) => {
-                    return (
-                        "failed",
-                        format!("the discovery document could not be read: {error}"),
-                        None,
-                    );
-                }
+                Err(error) => (Err(error), Ok(Vec::new())),
             }
         }
         None => {
+            // Endpoints entered by hand: there is no document to fetch and therefore no issuer to
+            // compare against. The keys still have to be readable, so the JWKS the row names is
+            // fetched and the issuer step is told rather than failed.
             let text = |field: &str| {
                 provider
                     .config
@@ -1005,69 +1056,56 @@ async fn test_oidc(
                 text("token_endpoint"),
                 text("jwks_uri"),
             ) else {
-                return (
-                    "failed",
-                    "the provider names no issuer, so nothing can be discovered — set `issuer` \
-                     in the configuration to discover the rest"
-                        .to_owned(),
-                    None,
+                return protocol_steps::TestOutcome::unconfigured(
+                    "oidc",
+                    &["issuer", "authorization_endpoint", "token_endpoint", "jwks_uri"],
                 );
             };
-            Discovery {
+            let discovery = Discovery {
                 issuer,
                 authorization_endpoint,
                 token_endpoint,
                 jwks_uri,
                 userinfo_endpoint: text("userinfo_endpoint"),
-            }
+            };
+            let keys = fetch_keys(client, &discovery).await;
+            (Ok(discovery), keys)
         }
     };
 
-    let jwks = match client.get_json(&discovery.jwks_uri).await {
-        Ok(document) => document,
-        Err(error) => {
-            return (
-                "failed",
-                format!(
-                    "the discovery document is fine, but its signing keys are not readable: {error}"
-                ),
-                Some(endpoints_json(&discovery)),
-            );
-        }
-    };
-    let keys = oidc::parse_jwks(&jwks);
-    if keys.is_empty() {
-        return (
-            "failed",
-            "the provider publishes no RSA signing key this platform can verify".to_owned(),
-            Some(endpoints_json(&discovery)),
-        );
+    protocol_steps::test_oidc(protocol_steps::OidcProbe {
+        configured_issuer: configured_issuer.as_deref(),
+        document,
+        keys,
+        secret_present,
+    })
+}
+
+/// The signing keys the discovery document points at.
+///
+/// Returns the *reason* on failure rather than an empty vector: a provider that publishes no key
+/// this platform trusts and a provider whose key set cannot be read are different failures with
+/// different repairs, and the ladder is what keeps them apart.
+async fn fetch_keys(client: &HttpClient, discovery: &Discovery) -> Result<Vec<Jwk>, String> {
+    match client.get_json(&discovery.jwks_uri).await {
+        Ok(document) => Ok(oidc::parse_jwks(&document)),
+        Err(error) => Err(error.to_string()),
     }
+}
 
-    let note = if secret_present {
-        String::new()
-    } else {
-        " (the client secret is not defined in this installation, so a sign-in will be refused \
-         until it is)"
-            .to_owned()
-    };
-    (
-        "ok",
-        format!(
-            "discovery answered and {} usable signing key(s) were published{note}",
-            keys.len()
-        ),
-        Some(endpoints_json(&discovery)),
-    )
+/// A configuration problem, as the provider layer names it.
+fn invalid(message: impl Into<String>) -> omnion_identity::IdentityError {
+    omnion_identity::IdentityError::InvalidProvider(message.into())
 }
 
 /// SAML has no discovery: every endpoint is entered, so the test is a *parse* of what is
 /// configured — which is exactly the failure an operator hits first (a certificate copied with
 /// its BEGIN line missing, or a base64 blob that lost its wrapping).
-fn test_saml(
-    provider: &AuthProvider,
-    secret_present: bool,
-) -> (&'static str, String, Option<Value>) {
+///
+/// A missing field is refused by name rather than fed to the ladder as an empty string, because
+/// "you did not fill this in" and "the certificate is broken" are different messages and the
+/// wizard underlines a different input for each.
+fn test_saml(provider: &AuthProvider) -> protocol_steps::TestOutcome {
     let text = |field: &str| {
         provider
             .config
@@ -1077,83 +1115,25 @@ fn test_saml(
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
-    let (Some(issuer), Some(audience), Some(certificate)) =
-        (text("issuer"), text("audience"), text("certificate_pem"))
-    else {
-        return (
-            "failed",
-            "a SAML provider needs `issuer`, `audience` and `certificate_pem` in its \
-             configuration"
-                .to_owned(),
-            None,
-        );
-    };
-
-    let email_attribute = text("email_attribute").unwrap_or_else(|| "email".to_owned());
-    let group_attribute = text("group_attribute");
-    let display_name_attribute = text("display_name_attribute");
-
-    // A configuration is proved by asking the *real* parser whether the certificate is usable,
-    // not by a second implementation of the parse that could drift from it. The earlier version
-    // fed a probe response to `verify_response` and inferred the answer from the error text —
-    // and because the probe carried a self-closing `<saml:Assertion/>` (which the reader never
-    // parses at all), the button reported every certificate as broken and could never succeed.
-    if let Err(error) = omnion_identity::sso::saml::certificate_is_readable(&certificate) {
-        return (
-            "failed",
-            format!("the configured certificate could not be read: {error}"),
-            None,
-        );
+    let required = ["issuer", "audience", "certificate_pem"];
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|field| text(field).is_none())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return protocol_steps::TestOutcome::unconfigured("saml", &missing);
     }
 
-    // The attribute names are configuration too, and a typo in one is invisible until a real
-    // assertion arrives carrying no address the reader recognises. So the probe runs the whole
-    // reader over a document that has *every* attribute the configuration names — which is the
-    // last check that needs no signature, and it proves the wiring end to end.
-    let probe = omnion_identity::sso::saml::probe_document(
-        &issuer,
-        &audience,
-        &email_attribute,
-        group_attribute.as_deref(),
-        display_name_attribute.as_deref(),
-    );
     let config = omnion_identity::sso::saml::SamlConfig {
-        issuer: issuer.clone(),
-        audience: audience.clone(),
-        certificate_pem: certificate,
-        email_attribute,
-        group_attribute,
-        display_name_attribute,
+        issuer: text("issuer").unwrap_or_default(),
+        audience: text("audience").unwrap_or_default(),
+        certificate_pem: text("certificate_pem").unwrap_or_default(),
+        email_attribute: text("email_attribute").unwrap_or_else(|| "email".to_owned()),
+        group_attribute: text("group_attribute"),
+        display_name_attribute: text("display_name_attribute"),
     };
-    if let Err(error) = omnion_identity::sso::saml::probe_claims(&probe, &config) {
-        return (
-            "failed",
-            format!("the assertion reader cannot read this configuration: {error}"),
-            None,
-        );
-    }
-
-    let note = if secret_present {
-        String::new()
-    } else {
-        " (SAML usually needs no client secret — the certificate is the credential)".to_owned()
-    };
-    (
-        "ok",
-        format!("the assertion reader accepts this configuration{note}"),
-        Some(json!({ "issuer": issuer, "audience": audience })),
-    )
-}
-
-/// The endpoints the panel shows next to a successful test.
-fn endpoints_json(discovery: &Discovery) -> Value {
-    json!({
-        "issuer": discovery.issuer,
-        "authorization_endpoint": discovery.authorization_endpoint,
-        "token_endpoint": discovery.token_endpoint,
-        "jwks_uri": discovery.jwks_uri,
-        "userinfo_endpoint": discovery.userinfo_endpoint,
-    })
+    protocol_steps::test_saml(&config)
 }
 
 #[cfg(test)]

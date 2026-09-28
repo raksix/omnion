@@ -87,7 +87,15 @@ const DIRECTORY_FIELDS = [
   { key: "group_filter", label: "Group filter", optional: true },
 ] as const;
 
-/** The step names in the order the ladder renders them. */
+/**
+ * Step names, in the vocabulary both ladders share.
+ *
+ * A directory walks six checks and a protocol provider walks four, and the two sets do not
+ * overlap except in `issuer` — a directory's `bind` is a service-account credential and a
+ * protocol's `certificate` is a pasted public key. The table holds every name either ladder can
+ * produce, and the renderer falls back to the raw name for anything added later, so a new step
+ * shows up with a readable name instead of silently rendering nothing.
+ */
 const STEP_LABELS: Record<string, string> = {
   dns: "DNS",
   tcp: "TCP",
@@ -95,6 +103,11 @@ const STEP_LABELS: Record<string, string> = {
   bind: "Bind",
   search: "Search",
   attributes: "Attributes",
+  discovery: "Discovery",
+  certificate: "Certificate",
+  issuer: "Issuer",
+  key_set: "Signing keys",
+  claims: "Claims",
 };
 
 /** What a SAML provider needs instead of a discovery document. */
