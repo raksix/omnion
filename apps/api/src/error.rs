@@ -638,6 +638,70 @@ impl From<MediaError> for ApiError {
                 "file_trashed",
                 "the file is in the trash; restore it before changing it",
             ),
+            // A preset name is part of a public URL, so a missing one is a `404` *naming the
+            // name*: "card is not a preset" and "card produced no bytes" are different answers,
+            // and someone debugging a broken page needs to know which one they got.
+            MediaError::PresetNotFound { name } => Self::new(
+                StatusCode::NOT_FOUND,
+                "preset_not_found",
+                format!("no transformation preset named `{name}` on this site"),
+            ),
+            MediaError::PresetNameTaken { name } => Self::new(
+                StatusCode::CONFLICT,
+                "preset_name_taken",
+                format!("a preset named `{name}` already exists on this site"),
+            ),
+            // A file that cannot be transformed is a `422`: the request was well-formed, the
+            // thing it named is simply not transformable. Reporting it as a bad request would
+            // tell an editor their form was malformed when the form is fine and the PNG is not.
+            MediaError::NotAnImage { content_type } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_transformable",
+                format!("`{content_type}` is not a raster image, so it cannot be transformed"),
+            ),
+            MediaError::Undecodable { reason } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_transformable",
+                format!("the file could not be decoded as an image: {reason}"),
+            ),
+            // An enlargement is refused rather than honoured, and the reason says so: the
+            // operator's fix is to serve the original, not to pick a smaller number.
+            MediaError::TransformFailed { reason } if reason.contains("enlarge") => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "transform_would_enlarge",
+                reason,
+            ),
+            MediaError::TransformFailed { reason } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "transform_failed",
+                format!("the image could not be transformed: {reason}"),
+            ),
+            // Every preset field error names the field that caused it, so the settings form can
+            // put the message under the right input instead of in a banner nobody reads.
+            MediaError::InvalidPreset(message) => {
+                let field = if message.contains("quality") {
+                    Some("quality")
+                } else if message.contains("width") || message.contains("height") {
+                    Some("width")
+                } else if message.contains("name") {
+                    Some("name")
+                } else {
+                    None
+                };
+                match field {
+                    Some(field) => Self::bad_request("invalid_preset", message)
+                        .with_details(serde_json::json!({ "field": field })),
+                    None => Self::bad_request("invalid_preset", message),
+                }
+            }
+            // Every storage field error names the field that caused it, and carries it as a
+            // detail — the settings form puts the message under that input, and a *save* and a
+            // *connection test* of the same bad value produce the same field, so a person is
+            // never told to fix a field on one path that the other path accepted.
+            MediaError::InvalidStorageSetting { field, message } => {
+                Self::bad_request("invalid_storage_setting", message)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }
