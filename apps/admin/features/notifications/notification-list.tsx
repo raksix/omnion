@@ -21,6 +21,7 @@
  *    than no shortcut.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Archive,
@@ -29,6 +30,7 @@ import {
   Inbox,
   RefreshCw,
   Search,
+  Settings2,
   Square,
   SquareCheckBig,
   Trash2,
@@ -346,6 +348,18 @@ export function NotificationList() {
             Reset filters
           </button>
         ) : null}
+
+        {/* The link to the settings screen lives here rather than behind the bell, because
+            the reader who has just worked out that they want fewer notifications is standing
+            on this page, not looking at the header. */}
+        <Link
+          href="/notifications/settings"
+          data-notification-settings-link
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12.5px] text-muted transition hover:text-ink"
+        >
+          <Settings2 className="size-3.5" aria-hidden />
+          Settings
+        </Link>
       </section>
 
       {notice ? (

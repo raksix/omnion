@@ -931,3 +931,93 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
+
+// ---------------------------------------------------------------------------------------------
+// Slice 2: the reader's own channel configuration
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One cell of the matrix: "does category *C* reach me over *channel*?".
+ *
+ * The form never invents a cell — the server sends all thirty and the form renders what it is
+ * given, so a channel added in a later slice appears here with no change to this file.
+ */
+export type NotificationPreferenceCell = {
+  category: string;
+  channel: string;
+  enabled: boolean;
+};
+
+/** Quiet hours, the timezone and the digest cadence. */
+export type NotificationSettingsRow = {
+  /** `HH:MM` in the reader's own timezone, or `null` for no window. */
+  quiet_hours_start: string | null;
+  quiet_hours_end: string | null;
+  /** IANA zone name; an unknown one is read as UTC by the server. */
+  timezone: string;
+  /** `off`, `daily` or `weekly`. */
+  digest_cadence: string;
+  /** Which weekday a weekly digest goes out on, 0 = Monday. */
+  digest_weekday: number | null;
+  /** Which hour a digest goes out in. */
+  digest_hour: number;
+};
+
+/**
+ * The whole preferences answer.
+ *
+ * `locked_channel` comes from the server rather than being hard-coded here: the rule that
+ * in-app cannot be switched off is a server rule, and a form that hard-codes the name while
+ * the server owns the rule is one rename away from a checkbox that lies.
+ */
+export type NotificationPreferences = {
+  cells: NotificationPreferenceCell[];
+  settings: NotificationSettingsRow;
+  locked_channel: string;
+};
+
+/** What a save changed, and the authoritative state to render from. */
+export type NotificationPreferencesSaved = {
+  /** How many cells actually changed value — zero is a legitimate answer. */
+  changed: number;
+  cells: NotificationPreferenceCell[];
+  settings: NotificationSettingsRow;
+  locked_channel: string;
+};
+
+export const DIGEST_CADENCES = ["off", "daily", "weekly"] as const;
+
+/** 0 = Monday, which is the numbering the server's `extract(dow) - 1` uses. */
+export const DIGEST_WEEKDAYS = [
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+  "Sunday",
+] as const;
+
+/**
+ * The zones the form offers.
+ *
+ * A choice list, not the IANA database: the server reads anything else as UTC, and a select
+ * with 400 entries is a select nobody scrolls.
+ */
+export const NOTIFICATION_TIMEZONES = [
+  "UTC",
+  "Europe/Istanbul",
+  "Europe/Berlin",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Madrid",
+  "Europe/Rome",
+  "Europe/Amsterdam",
+  "America/New_York",
+  "America/Los_Angeles",
+  "America/Sao_Paulo",
+  "Asia/Dubai",
+  "Asia/Kolkata",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+] as const;

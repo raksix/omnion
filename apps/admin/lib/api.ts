@@ -49,7 +49,10 @@ import type {
   NotificationBulkResult,
   NotificationFilters,
   NotificationPage,
+  NotificationPreferences,
+  NotificationPreferencesSaved,
   NotificationRow,
+  NotificationSettingsRow,
   NotificationSummary,
   Site,
   User,
@@ -4033,6 +4036,38 @@ export function emitNotification(input: {
 }): Promise<{ created: number; deduped: number }> {
   return request<{ created: number; deduped: number }>("/api/v1/notifications/emit", {
     method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The caller's own channel configuration (REQ-021, slice 2).
+ *
+ * The answer is always a **complete** matrix, so the form renders what the server sent rather
+ * than building a grid from the category and channel lists it happens to have. Two copies of
+ * the closed vocabulary in two languages is how a channel ends up in one list and not the
+ * other — and the failure is a form with a hole in it, not an error.
+ */
+export function fetchNotificationPreferences(): Promise<NotificationPreferences> {
+  return request<NotificationPreferences>("/api/v1/notifications/preferences");
+}
+
+/**
+ * Save the stated cells and the settings row.
+ *
+ * `settings` is required by the API, so this signature makes it required here too: a client
+ * that could omit it would discover at runtime that omitting it is a `400`, and the fix would
+ * be to stop sending cells.
+ *
+ * The answer carries the whole matrix back rather than a count, and the form renders from that
+ * — the count is for the toast, the matrix is for the screen.
+ */
+export function saveNotificationPreferences(input: {
+  cells: { category: string; channel: string; enabled: boolean }[];
+  settings: NotificationSettingsRow;
+}): Promise<NotificationPreferencesSaved> {
+  return request<NotificationPreferencesSaved>("/api/v1/notifications/preferences", {
+    method: "PUT",
     body: JSON.stringify(input),
   });
 }
