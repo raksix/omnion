@@ -39,6 +39,7 @@ import {
   fetchAutomationRunHistory,
   fetchAutomationTemplates,
   fetchAutomationVersions,
+  fetchOrganizations,
   restoreAutomationVersion,
   resumeAutomationFrom,
   type AutomationAuditEntry,
@@ -616,7 +617,14 @@ export function RunTrace({
 }
 
 /** The run history of one rule, newest first; a row opens its trace. */
-export function RunsPanel({ automationId }: { automationId: string }) {
+export function RunsPanel({
+  automationId,
+  reloadToken = 0,
+}: {
+  automationId: string;
+  /** Bumped by whoever started a run, so the list is not read once and abandoned. */
+  reloadToken?: number;
+}) {
   const [runs, setRuns] = useState<AutomationRunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
@@ -642,7 +650,7 @@ export function RunsPanel({ automationId }: { automationId: string }) {
     return () => {
       live = false;
     };
-  }, [automationId, reload]);
+  }, [automationId, reload, reloadToken]);
 
   if (error) {
     return (
@@ -716,7 +724,33 @@ export function AutomationTemplatesView() {
   // the screen that reads the session is the screen that must send it. A prop would push the
   // question one level up to a caller that has no better answer.
   const { user } = useSession();
-  const organizationId = user?.organization_id ?? null;
+  // A platform account belongs to no organization, and a rule is created *into* one: the
+  // create endpoint refuses a body with no tenant, so the gallery's one real control would
+  // fail on exactly the installation where a starter is most wanted. The rule list solved
+  // the same problem by reading the organizations and defaulting to the first, so the
+  // gallery does the same instead of handing the button a null it cannot use. An account
+  // that belongs to an organization never pays for this.
+  const [platformOrganization, setPlatformOrganization] = useState<string | null>(null);
+  useEffect(() => {
+    if (!user || user.organization_id !== null) {
+      return;
+    }
+    let live = true;
+    fetchOrganizations()
+      .then((list) => {
+        if (live) {
+          setPlatformOrganization(list[0]?.id ?? null);
+        }
+      })
+      .catch(() => {
+        /* the card below says why nothing can be installed */
+      });
+    return () => {
+      live = false;
+    };
+  }, [user]);
+  const organizationId = user?.organization_id ?? platformOrganization;
+  const needsOrg = Boolean(user) && user?.organization_id === null && organizationId === null;
   const [templates, setTemplates] = useState<AutomationTemplate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [using, setUsing] = useState<string | null>(null);
@@ -783,6 +817,24 @@ export function AutomationTemplatesView() {
         title="No templates"
         hint="The starter rules are part of the platform, so this list is never empty unless the API is unreachable."
       />
+    );
+  }
+  // A platform account with no tenant has nowhere to install a starter into. Saying so in
+  // one sentence beats six cards whose buttons each fail the same way.
+  if (needsOrg) {
+    return (
+      <div data-automation-templates className="flex flex-col gap-5 p-6">
+        <header className="flex flex-wrap items-baseline gap-3">
+          <h1 className="text-[15px] font-medium">Templates</h1>
+          <Link href="/automations" className="text-[12.5px] text-muted hover:text-ink">
+            Back to automations
+          </Link>
+        </header>
+        <p role="status" className="text-[12.5px] text-muted">
+          A rule belongs to a tenant. Create or open an organization on the sites screen, then
+          install a starter from here.
+        </p>
+      </div>
     );
   }
 
@@ -854,13 +906,19 @@ export function AutomationTemplatesView() {
                     data-automation-template-use={template.key}
                     className="rounded-md border border-line px-2.5 py-1 text-[12px] hover:bg-quiet-soft disabled:opacity-50"
                     onClick={() => install(template.key)}
-                    disabled={using === template.key || template.installable === false}
+                    disabled={
+                      using === template.key ||
+                      template.installable === false ||
+                      organizationId === null
+                    }
                   >
                     {using === template.key
                       ? "Installing…"
                       : template.installable === false
                         ? "Not available on this installation"
-                        : "Use this template"}
+                        : organizationId === null
+                          ? "Choose a tenant to install"
+                          : "Use this template"}
                   </button>
                 </div>
               </li>

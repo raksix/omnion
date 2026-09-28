@@ -325,6 +325,10 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
   const [listeners, setListeners] = useState<AutomationTestEvent[]>([]);
   const [hookUrl, setHookUrl] = useState<string | null>(null);
   const [lastRun, setLastRun] = useState<string | null>(null);
+  // A run started from this screen has to appear in the open run history without the
+  // author going round the loop: the panel is a child that reads on mount, so a control
+  // that starts a run and leaves the list unchanged is a control that looks broken.
+  const [runsReloadToken, setRunsReloadToken] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
 
   // Which of the three operations tabs is open (REQ-003 slice 4). The default is `runs`,
@@ -667,6 +671,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           `A run started with ${started.steps} step${started.steps === 1 ? "" : "s"}. Its actions really run — the dry run above is the simulation.`,
         );
         setLastRun(started.execution_id);
+        setRunsReloadToken((token) => token + 1);
       } catch (cause) {
         setSaveError(
           cause instanceof ApiError ? cause.message : "The rule could not be run.",
@@ -1178,6 +1183,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           onTest={runTest}
           onListen={armListener}
           onRunNow={runNow}
+          runsReloadToken={runsReloadToken}
           onRotateHook={rotateHook}
           onArmDelete={setConfirmDelete}
           runAsChoices={runAsAccounts}
@@ -1235,6 +1241,8 @@ type EditorProps = {
   onTest: (automationId: string) => void;
   onListen: (automationId: string) => void;
   onRunNow: (automationId: string) => void;
+  /** Bumped when a run starts, so the open run history re-reads (REQ-003 slice 4). */
+  runsReloadToken: number;
   onRotateHook: (automationId: string) => void;
   onArmDelete: (name: string) => void;
   /** The accounts of this tenant, for the run-as picker. */
@@ -1273,6 +1281,7 @@ function AutomationEditor({
   onTest,
   onListen,
   onRunNow,
+  runsReloadToken,
   onRotateHook,
   onArmDelete,
   runAsChoices,
@@ -2172,7 +2181,9 @@ function AutomationEditor({
               </button>
             ))}
           </div>
-          {operationsTab === "runs" ? <RunsPanel automationId={draft.id} /> : null}
+          {operationsTab === "runs" ? (
+            <RunsPanel automationId={draft.id} reloadToken={runsReloadToken} />
+          ) : null}
           {operationsTab === "versions" ? (
             <VersionsPanel automationId={draft.id} onRestored={onReloadRule} />
           ) : null}

@@ -1,4 +1,4 @@
--- Omnion · 0029 · automation operations: rate window, concurrency policy, last error
+-- Omnion · 0031 · automation operations: rate window, concurrency policy, last error
 --
 -- Slice 4 of the automation depth pass (docs/requests/REQ-003). Slices 1–3 gave the
 -- layer its trigger library, its action library and its approvals; this migration gives

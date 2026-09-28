@@ -1,7 +1,7 @@
--- Omnion · 0030 · automation versions and the audit read surface
+-- Omnion · 0032 · automation versions and the audit read surface
 --
 -- Slice 4 of the automation depth pass (docs/requests/REQ-003) finished the engine in
--- migration 0029 (rate window, concurrency, last error) and the endless-loop guard in code.
+-- migration 0031 (rate window, concurrency, last error) and the endless-loop guard in code.
 -- What is left of the request's *operations surfaces* needs two tables this migration adds:
 --
 -- This migration adds ONE table and one column:

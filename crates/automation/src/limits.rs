@@ -49,7 +49,7 @@ use crate::error::Result;
 ///
 /// The bounds are a pair: `0` would mean "never run", which is what the `enabled` flag is
 /// for, and a number in the hundreds of thousands is not a rate limit but a throughput
-/// promise. The check lives in the database too (migration `0029`), so a row written by
+/// promise. The check lives in the database too (migration `0031`), so a row written by
 /// hand is bounded the same way a row written by the panel is.
 pub const MIN_RATE_LIMIT: i32 = 1;
 
