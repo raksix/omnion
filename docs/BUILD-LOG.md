@@ -3143,3 +3143,62 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+## 2026-09-28 — the board answered 404 on every organization created after its own migration
+
+**What.** `0022_crm.sql` wrote `crm_seed_default_pipeline(organization)` — the function that
+builds a pipeline and its six stages — and then called it exactly once, in the same statement
+that created it, against the organizations that existed at that moment. Nothing ever called it
+again. Every organization created afterwards through the product (the tenancy route, onboarding,
+SCIM, provisioning) therefore owns no pipeline, no stages and no board, and
+`GET /api/v1/crm/deals?view=board` answers `404 NotFound("pipeline")` for it. The stage editor
+was a screen over an empty table and the board was a 404.
+
+The rule is now a **trigger**, not a call site: `organizations` is written by several unrelated
+paths, and a rule that has to be remembered at each of them will be forgotten at the fifth. The
+migration also backfills the organizations that already exist. `default_pipeline` repairs the
+state too, through the same seed function, so a database restored from a dump taken before this
+migration is not a board that stays broken.
+
+**The suite could not see it, and that is the second half of the bug.** The CRM fixture calls
+`crm_seed_default_pipeline` by hand for its own organizations, and the comment there says that
+is "the same path a new tenant takes". It was not — the fixture was seeding a world the product
+never built, so every board test in the suite started from a pipeline that no real tenant had.
+The new test seeds **nothing**: it inserts the organization row and immediately reads the board.
+
+**Proof.**
+- `cargo test -p omnion-api --test crm an_organization_created_after_the_migration_still_owns_a_board` — **1/1**,
+  and it asserts the pipeline, the six stages in board order, and a **200** with six columns from
+  an organization that has never sold anything.
+- `cargo test -p omnion-module-crm --lib` — **172/172** · `cargo test -p omnion-api --lib routes::crm` — **27/27**
+  · `pnpm turbo run typecheck --force` — **2/2**.
+- Live, in the QA database: the organization created by the product at 15:38 had **0 pipelines**,
+  which is the 404 the pass reported sixty times. After the migration it has **1 pipeline and 6
+  stages** (the backfill), and the organization the new test created at 17:06 got its pipeline
+  from the trigger alone.
+- The full CRM walk suite: **56 tests, 55 passing** on the first run, with one failure that
+  turned out to be nobody's regression — see below.
+
+**The failure that was not mine, and was still mine to fix.**
+`a_platform_account_in_no_organization_is_told_it_has_none` asserted one code unconditionally,
+which made it a function of how many organizations the shared database held: it wants a fresh
+installation's `organization_required` and reads `organization_ambiguous` once a second
+organization exists from an earlier run. The QA database holds **186** organizations. It also
+turned out the `organization_ambiguous` sentence still said "pass organization_id" — the exact
+advice the `[]` arm dropped last tick, for the exact same caller who cannot follow it. Both are
+fixed: the test now asserts what it owns (refused, with a code the panel knows, never asking for
+a parameter the caller has no value for), and the sentence points at the decision the panel
+offers.
+
+**Commits.** `4aca09e` the trigger, the backfill and the test that seeds nothing · `01d0a8a` the
+sentence and the test that depended on a fresh database.
+
+**Next.** The re-run decides whether the empty/loading/error box closes, or whether the state
+sweep finds that a screen with a working error state still has a broken *load* state. Then the
+390×844 pass and the keyboard sheet, which are the two boxes after it.
+
+**Environment.** The build lives on `CARGO_TARGET_DIR=.tmp-target` (the repo's own convention, and
+the tree the box-wide disk guard spares). `/mnt/apopic` sat at 86% with 8.2G free; seven writers
+compile at once, so a build can sit at 0% CPU for minutes before it is scheduled at all. The
+CRM walk suite is **~11 minutes** on its own (`--test-threads=1` against the shared database), so
+it does not fit inside a foreground call and is run as a background process.
