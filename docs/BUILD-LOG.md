@@ -2778,3 +2778,53 @@ hours, the digest job, the e-mail and webhook adapters and the delivery rows in 
 - **Next.** The consumer once REQ-064's event exists on the branch, then the four slice-1 screens
   (`/crm/leads`, `/crm/leads/{id}`, `/crm/leads/duplicates`, `/crm/settings/intake`) and the
   walkthrough routes, which is where acceptance 15 and 16 close.
+
+## Wave 4b · REQ-117 slice 1, the four screens (omnion-w8)
+
+**What.** `/crm/leads`, `/crm/leads/{id}`, `/crm/leads/duplicates` and `/crm/settings/intake`
+— the panel for the inbox the previous tick's HTTP layer feeds. 3,097 lines across seven client
+and feature files plus four route files, and the client split into `lib/crm-intake-api.ts`
+(three consumers, not a thousand-line `api.ts`) with the panel's own derivations — the SLA
+state, the countdown, the relative instant, the status words — in `lib/crm-intake.ts`.
+
+The three rules the screens are built around:
+
+- **The counters and the rows come from one read.** The store already builds both from the
+  same `push_lead_filters`; the panel keeps them in one response, so "3 open" above a table of
+  five cannot happen. The screen says which filter the counters follow.
+- **A lead edit cannot rewrite its own evidence, by construction.** The left column of the
+  detail is read-only because the patch body has no `received_at`, no `payload` and no
+  `spam_score` — not because buttons were hidden, which would have been a promise the API does
+  not keep. The raw-payload toggle states the rule in one line.
+- **A route that does not exist is drawn as missing.** `crm.leads.convert` is slice 3, so the
+  conversion stepper marks the opportunity and quotation steps unavailable *and names the
+  permission* that will do it, rather than drawing a button that would answer a 404.
+
+The status filter is eight toggles writing a repeated `?status=` rather than a comma-joined
+select, matching the API's own rule (a comma inside a value then becomes impossible), and a
+filtered inbox is shareable because the URL is the state.
+
+**Proof.**
+
+- `apps/admin` `tsc --noEmit` → clean, first run.
+- `cargo test -p omnion-module-crm-intake --quiet` → **65 passed**.
+- `cargo test -p omnion-api --lib --quiet` → **166 passed**.
+- `node --check scripts/qa/walkthrough.cjs` → clean.
+- `runCrmIntakeDepth` measures what a screenshot cannot: the key is revealed once and not on a
+  re-read (`rereadHasKey === false`); a `Test mapping` leaves the lead count unchanged
+  (`previewWroteNothing`); the endpoint answers 202/401, files a honeypot submission as spam
+  and an uncontactable one as rejected, and returns the *same* reference for an idempotent
+  retry; a lead edit leaves the payload, the received instant and the spam score byte-identical
+  (`editKeptEvidence`); `Mark responded` pressed twice leaves the timeline unchanged
+  (`respondIsIdempotent`); a required target with no source disables the save and names the
+  field. The three list routes are in the walkthrough's route list; the lead detail is opened
+  from a *real* id, because a route walked with a placeholder id only proves the 404 state
+  renders. The write controls carry `data-qa-guard` so the generic click pass defers rotation
+  and deletion to this pass rather than firing them with a sample value.
+
+**Next.** Slice 2 — assignment rules with the atomic round-robin cursor, the simulator, SLA
+policies with business hours, the breach worker, notifications and the two settings screens —
+behind `/crm/settings/assignment` and `/crm/settings/sla`, which the sidebar already names.
+
+**Commits.** `2efbe45` the client and the panel's vocabulary · `1d9cf05` the four screens ·
+`0e9063c` the navigation · `17b302d` the exported request helper · `7a3d09b` the depth pass.
