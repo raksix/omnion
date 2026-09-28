@@ -28,6 +28,7 @@ use omnion_identity::tenancy_limits;
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::{roles as role_store, seed};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -326,6 +327,15 @@ impl Fixture {
 
     async fn other_admin_token(&self) -> String {
         login(&self.state, &self.other_admin_email).await
+    }
+
+    /// The *second* organization — the cross-tenant reader's tenant.
+    ///
+    /// A method rather than a second field: the fixture already keeps both ids in
+    /// `organizations`, and a duplicate field is a second source of truth that can drift from
+    /// the list the cleanup deletes by.
+    fn org_b(&self) -> Uuid {
+        self.organizations[1]
     }
 
     /// Remember an account a walk created *after* the fixture was built, so cleanup reaches it.
@@ -2969,3 +2979,217 @@ async fn switching_a_module_off_hides_its_api_and_switching_it_back_restores_it(
 
     fixture.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The per-organization retention sweep (slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// Write one audit row for `organization_id`, dated `created_at`.
+///
+/// Straight into `audit_log` rather than through a route: the sweep's job is to remove rows the
+/// platform wrote over time, and a row planted in the past is the only way to prove a *window*
+/// without waiting ten years for it to close.
+async fn plant_audit_row(db: &Db, organization_id: Uuid, action: &str, created_at: OffsetDateTime) {
+    sqlx::query(
+        "insert into audit_log (organization_id, actor_type, action, target_type, target_id, \
+         metadata, created_at) \
+         values ($1, 'system', $2, 'organization', $1, '{}'::jsonb, $3)",
+    )
+    .bind(organization_id)
+    .bind(action)
+    .bind(created_at)
+    .execute(db.pool())
+    .await
+    .expect("the audit row must be planted");
+}
+
+/// How many *non-housekeeping* rows one organization still holds.
+///
+/// The sweep's own receipt is excluded on purpose. It is written by this walk's own
+/// assertion subjects, so counting it would make "did the sweep keep what it should" answer
+/// `2` for a tenant that correctly kept exactly one row — a failure that reads as a leak when
+/// it is really a receipt.
+async fn audit_count(db: &Db, organization_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from audit_log where organization_id = $1 \
+         and action <> 'organization.retention.swept'",
+    )
+    .bind(organization_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the trail must read")
+}
+
+#[tokio::test]
+async fn the_retention_sweep_applies_each_tenants_own_window() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc();
+    let day = time::Duration::days(1);
+
+    // Two tenants with two *different* windows, and both windows already closed. A sweep that
+    // used one platform-wide default would delete the 100-day-old row of the tenant that asked
+    // for a 365-day window — and the only assertion that catches it is the one on the other
+    // tenant, which is exactly the assertion people skip.
+    set_retention(&fixture.db, fixture.org_a, 30).await;
+    set_retention(&fixture.db, fixture.org_b(), 365).await;
+
+    // A: two rows outside its 30-day window, one inside it.
+    plant_audit_row(&fixture.db, fixture.org_a, "test.old", now - (day * 60)).await;
+    plant_audit_row(&fixture.db, fixture.org_a, "test.ancient", now - (day * 400)).await;
+    plant_audit_row(&fixture.db, fixture.org_a, "test.recent", now - (day * 2)).await;
+
+    // B: one row outside A's window but well inside its own, and one outside both.
+    plant_audit_row(&fixture.db, fixture.org_b(), "test.b100", now - (day * 100)).await;
+    plant_audit_row(&fixture.db, fixture.org_b(), "test.b400", now - (day * 400)).await;
+
+    let removed = omnion_api::retention_runner::sweep_once(&fixture.state)
+        .await
+        .expect("the sweep must run");
+    assert_eq!(removed, 3, "two rows from A and one from B, and not one more");
+
+    assert_eq!(
+        audit_count(&fixture.db, fixture.org_a).await,
+        1,
+        "A keeps only the row inside its 30-day window"
+    );
+    assert_eq!(
+        audit_count(&fixture.db, fixture.org_b()).await,
+        1,
+        "B keeps its 100-day-old row, which is inside its own 365-day window"
+    );
+
+    let b_actions: Vec<String> =
+        sqlx::query_scalar("select action from audit_log where organization_id = $1 order by action")
+            .bind(fixture.org_b())
+            .fetch_all(fixture.db.pool())
+            .await
+            .expect("B's trail must read");
+    assert!(
+        b_actions.contains(&"test.b100".to_owned()),
+        "the 100-day-old row is inside B's window and must survive: {b_actions:?}"
+    );
+    assert!(
+        !b_actions.contains(&"test.b400".to_owned()),
+        "the 400-day-old row is outside B's window and must not: {b_actions:?}"
+    );
+
+    // The receipt: a system row naming the tenant, the window it applied and the count. Read
+    // from the database the way an operator's next audit would find it — the route is
+    // `audit.read`-guarded and this walk is about the sweep, not about the tab.
+    let filed: Vec<(String, String, i64, i32)> = sqlx::query_as(
+        "select actor_type, action, (metadata->>'rows_removed')::bigint, \
+                (metadata->>'retention_days')::int \
+         from audit_log where organization_id = $1 and action = 'organization.retention.swept'",
+    )
+    .bind(fixture.org_a)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the receipts must read");
+    assert_eq!(filed.len(), 1, "one receipt per sweep that removed something");
+    assert_eq!(filed[0].0, "system", "nobody performed a sweep");
+    assert_eq!(filed[0].1, "organization.retention.swept");
+    assert_eq!(filed[0].2, 2, "the receipt repeats the count the sweep removed");
+    assert_eq!(filed[0].3, 30, "the receipt names the window it applied");
+
+    // The bus carries it, so a subscriber can archive elsewhere in step with the platform.
+    let emitted: Vec<(String, i64)> = sqlx::query_as(
+        "select name, (payload->>'rows_removed')::bigint from events \
+         where organization_id = $1 and name = 'organization.retention.swept'",
+    )
+    .bind(fixture.org_a)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the events must read");
+    assert_eq!(emitted, vec![("organization.retention.swept".to_owned(), 2)]);
+
+    // A second sweep over the same data removes nothing and files nothing: a trail full of its
+    // own nightly housekeeping is a trail nobody reads.
+    let again = omnion_api::retention_runner::sweep_once(&fixture.state)
+        .await
+        .expect("the sweep must run again");
+    assert_eq!(again, 0, "a second sweep over the same rows is a no-op");
+    let receipts: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where organization_id = $1 \
+         and action = 'organization.retention.swept'",
+    )
+    .bind(fixture.org_a)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the receipt count must run");
+    assert_eq!(receipts, 1, "a sweep that removed nothing files nothing");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc();
+
+    // A tenant whose rows are all *inside* its window, and a second one with no settings row at
+    // all. The first must be untouched; the second must be held to the default window rather
+    // than being invisible to the sweep — a tenant created after the settings backfill has no
+    // row, and "skip it" would keep its history forever, the opposite of what the tab promises.
+    set_retention(&fixture.db, fixture.org_a, 365).await;
+    plant_audit_row(
+        &fixture.db,
+        fixture.org_a,
+        "test.fresh",
+        now - time::Duration::days(1),
+    )
+    .await;
+    plant_audit_row(
+        &fixture.db,
+        fixture.org_b(),
+        "test.b.ancient",
+        now - time::Duration::days(400),
+    )
+    .await;
+    sqlx::query("delete from organization_settings where organization_id = $1")
+        .bind(fixture.org_b())
+        .execute(fixture.db.pool())
+        .await
+        .expect("the settings row must be removable for this walk");
+
+    let removed = omnion_api::retention_runner::sweep_once(&fixture.state)
+        .await
+        .expect("the sweep must run");
+    assert_eq!(removed, 1, "only the settings-less tenant's expired row goes");
+    assert_eq!(
+        audit_count(&fixture.db, fixture.org_a).await,
+        1,
+        "a row inside the window is not the sweep's business"
+    );
+    assert_eq!(
+        audit_count(&fixture.db, fixture.org_b()).await,
+        0,
+        "a tenant with no settings row is held to the 365-day default, not skipped"
+    );
+
+    // The backfill restores the row, so this walk does not leave the tenant without settings.
+    tenancy_limits::load_settings(fixture.db.pool(), fixture.org_b())
+        .await
+        .expect("the settings row must be backfillable");
+
+    fixture.cleanup().await;
+}
+
+/// Store one organization's own retention window.
+async fn set_retention(db: &Db, organization_id: Uuid, days: i32) {
+    sqlx::query(
+        "insert into organization_settings (organization_id, audit_retention_days) \
+         values ($1, $2) \
+         on conflict (organization_id) do update \
+         set audit_retention_days = excluded.audit_retention_days",
+    )
+    .bind(organization_id)
+    .bind(days)
+    .execute(db.pool())
+    .await
+    .expect("the retention window must be storable");
+}
+

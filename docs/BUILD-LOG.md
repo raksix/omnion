@@ -2308,3 +2308,52 @@
 - **Next.** Slice 4: events and hardening — the per-organization audit retention sweep, the module
   toggle events, and the mobile pass. The lifecycle events a status move emits are already in
   place here, which is one item of that slice already done.
+
+## 2026-09-28 — REQ-005 slice 4, second unit · the retention sweep, so the stored number means something
+
+- **What.** `organization_settings.audit_retention_days` had been stored, validated (30–3650) and
+  rendered on the Settings tab since slice 3, and nothing read it: there was no sweep that purged
+  anything, so the field was a number an operator could change and never see anything happen. This
+  tick makes the platform enforce it. `omnion_audit::purge_before` is the only place an audit row
+  leaves the trail, and the tenant is scoped **in the statement** (`where organization_id = $1`)
+  rather than by a filter the caller passed — a retention sweep that deleted another tenant's row
+  would be the worst bug this platform could ship, and the only place that cannot go wrong is the
+  `where`. `apps/api/src/retention_runner.rs` reads each tenant's own stored window, computes that
+  tenant's cutoff, removes what fell out of it, then files a **system** `organization.retention.swept`
+  audit row and announces the same event with `rows_removed` and `cutoff`.
+- **A sweep that removed nothing files nothing.** The receipt is about a deletion that happened. A
+  nightly `rows_removed: 0` row on a two-hundred-tenant platform is two hundred rows a day in the
+  trail, and a trail full of its own housekeeping is a trail nobody reads — so a tenant with nothing
+  expired is skipped entirely, and the walk asserts the second sweep returns 0 and files 0.
+- **A tenant with no settings row is swept, not spared.** The `left join` on `organization_settings`
+  matters: a tenant created after the backfill has no row, and reading that as "no window" would keep
+  its history forever — the exact opposite of what the tab promises. It falls back to the schema's 365.
+- **The cadence is a day, not a minute.** The shortest window a tenant can ask for is 30 days, so a
+  minute-cadence sweep would re-read every tenant 1440 times a day to delete rows that are at least a
+  month old. The first tick fires at boot, so a process restarted more often than daily still sweeps.
+  `OMNION_AUDIT_RETENTION_SWEEP{,_SECONDS,_BATCH}` are the knobs; the sweep is **on by default**,
+  because retention that only runs when somebody remembers is not retention.
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **22 passed, 3 failed**, and the three
+  are the pre-existing baseline BUILD-LOG already records (`a_ceiling_really_bounds_accepting_an_invitation`,
+  `a_queued_link_never_works_and_says_so`, `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows` —
+  cross-test interference between parallel walks sharing one database, reproduced at HEAD). The two new
+  walks pass on their own: `the_retention_sweep_applies_each_tenants_own_window` (two tenants, two
+  windows, rows at 2/60/100/400 days; 3 removed, the 365-day tenant **keeps** its 100-day row, the
+  receipt repeats `rows_removed: 2` / `retention_days: 30` as `system`, the bus event matches, and the
+  second sweep is a no-op that files nothing) and
+  `a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept`.
+  `cargo test -p omnion-audit -p omnion-core --lib` → **36 unit tests, 0 failures** (2 + 34, including
+  the two new `RetentionConfig` tests). `cargo test -p omnion-api --lib` → **133 passed, 0 failures**.
+  `pnpm typecheck` in `apps/admin` → clean.
+- **The panel says what the number now does.** The Settings tab's helper line grew from "Between 30 and
+  3650 days." to say the platform enforces it, that each sweep files a row here, and that the trail
+  therefore explains its own gaps. A setting that is enforced but described as if it were not is the same
+  dead feature one layer down, and the field also got the `data-organization-settings-retention` hook the
+  walkthrough needs.
+- **Environment.** `/mnt/apopic` opened the tick at 99% with 882M free, so the build target moved to
+  `/dev/shm/w5-target` (32G tmpfs, already holding w6's and w7's targets) and this writer's 2.4G
+  `target/` was reclaimed after a `cp -a` warm start. `/mnt/apopic` went 99% → 95% without touching a
+  single file that belongs to another writer.
+- **Next.** The last item of slice 4 is the `organization.member.joined` webhook-isolation walk — an
+  org-scoped webhook endpoint subscribed to that event must receive **only** its own tenant's
+  deliveries, which is the slice's done-when — then the mobile pass, then the REQ can close.

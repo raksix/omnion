@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+    analytics_runner, automation_runner, event_runner, retention_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -122,6 +123,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
+    }
+
+    // The audit retention sweep applies each tenant's own stored window, unattended
+    // (REQ-005, slice 4): the number an operator typed into the Settings tab is enforced by
+    // the platform, so the trail holds what that tenant said it should hold — and no more.
+    if state.config().retention.sweep_enabled {
+        let _sweeper = retention_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the audit retention sweep is disabled (OMNION_AUDIT_RETENTION_SWEEP=false)");
     }
 
     let app = routes::router(state);

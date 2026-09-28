@@ -440,9 +440,17 @@ export function SettingsTab({ organization }: { organization: Organization }) {
             max={3650}
             value={retention}
             onChange={(event) => setRetention(Number(event.target.value))}
+            data-organization-settings-retention
             className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px]"
           />
-          <span className="text-[11.5px] text-muted">Between 30 and 3650 days.</span>
+          <span className="text-[11.5px] text-muted">
+            Between 30 and 3650 days. The platform enforces this: rows older than the window are
+            removed on a scheduled sweep, and each sweep files a{" "}
+            <code className="rounded bg-surface-2 px-1 font-mono text-[11px]">
+              organization.retention.swept
+            </code>{" "}
+            row here, so the trail always explains its own gaps.
+          </span>
         </label>
       </div>
 

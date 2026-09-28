@@ -250,6 +250,68 @@ pub async fn filtered(pool: &PgPool, filter: &AuditFilter, limit: i64) -> Result
     Ok((rows, total))
 }
 
+/// What one retention sweep removed for one organization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionSweep {
+    /// Organization the sweep ran for.
+    pub organization_id: Uuid,
+    /// The window that was applied, in days.
+    pub retention_days: i32,
+    /// Rows older than this instant were removed.
+    pub cutoff: OffsetDateTime,
+    /// Rows removed.
+    pub rows_removed: i64,
+}
+
+/// The oldest audit row one organization still holds.
+///
+/// The sweep asks this rather than counting: what it needs to know is whether there is
+/// anything at all to do, and a tenant that never sweeps is the common case. `None` when the
+/// organization has no rows older than `cutoff` — which is also the answer for an
+/// organization that has no rows.
+pub async fn oldest_older_than(
+    pool: &PgPool,
+    organization_id: Uuid,
+    cutoff: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>> {
+    let oldest: Option<OffsetDateTime> = sqlx::query_scalar(
+        "select min(created_at) from audit_log \
+         where organization_id = $1 and created_at < $2",
+    )
+    .bind(organization_id)
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(oldest)
+}
+
+/// Remove one organization's audit rows older than `cutoff`.
+///
+/// Scoped by `organization_id` in the statement itself, not by a filter the caller passed:
+/// a retention sweep that deleted a row belonging to a *different* tenant would be the worst
+/// bug this platform could ship, and the only place that cannot go wrong is the `where`.
+///
+/// The cutoff is a parameter rather than computed here so the caller (and its test) name the
+/// same instant the run used. Idempotent by construction — the statement removes what is there,
+/// so a retried sweep removes nothing and still reports honestly.
+pub async fn purge_before(
+    pool: &PgPool,
+    organization_id: Uuid,
+    cutoff: OffsetDateTime,
+) -> Result<i64> {
+    let removed = sqlx::query(
+        "delete from audit_log where organization_id = $1 and created_at < $2",
+    )
+    .bind(organization_id)
+    .bind(cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected() as i64;
+
+    Ok(removed)
+}
+
 /// The distinct action names in one organization's history, for a feed's filter.
 ///
 /// Read from the tenant's own rows rather than from a fixed list: the filter then offers what

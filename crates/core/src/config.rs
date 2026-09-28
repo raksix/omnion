@@ -82,6 +82,23 @@ pub const DEFAULT_ANALYTICS_POLL_MS: u64 = 15_000;
 /// Default beacon budget of one site and caller per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
 pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
 
+/// Default cadence of the per-organization audit retention sweep, in seconds
+/// (`OMNION_AUDIT_RETENTION_SWEEP_SECONDS`).
+///
+/// A day, not a minute: the shortest window a tenant can ask for is 30 days
+/// (`omnion_identity::tenancy_limits::MIN_AUDIT_RETENTION_DAYS`), so a sweep that runs every
+/// minute would do the same work ninety-nine times out of a hundred. The first tick runs at
+/// boot, so a nightly sweep still happens on a process that is restarted more often than
+/// once a day.
+pub const DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS: u64 = 86_400;
+
+/// How many organizations one sweep tick looks at (`OMNION_AUDIT_RETENTION_SWEEP_BATCH`).
+///
+/// The tick reads the tenants that actually have something to purge, and a batch keeps a
+/// large installation's nightly run from holding one statement open for every tenant it has
+/// ever had. Whatever falls outside the batch is picked up on the next tick.
+pub const DEFAULT_AUDIT_RETENTION_SWEEP_BATCH: usize = 200;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -425,6 +442,37 @@ impl Default for AnalyticsConfig {
     }
 }
 
+/// Audit retention sweep knobs (docs/requests/REQ-005, slice 4).
+///
+/// The sweep of `apps/api/src/retention_runner.rs` reads these: every tick it walks the
+/// tenants whose stored `organization_settings.audit_retention_days` window has expired rows
+/// and removes them, then files a system audit row and announces
+/// `organization.retention.swept` with the count and the cutoff.
+///
+/// The sweep is on by default because retention that only runs when somebody remembers is not
+/// retention: a setting that is stored, validated and rendered but never read is exactly the
+/// kind of "coming soon" the platform does not ship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Whether this process sweeps expired audit rows (`OMNION_AUDIT_RETENTION_SWEEP`).
+    pub sweep_enabled: bool,
+    /// Delay between two sweep ticks, in seconds
+    /// (`OMNION_AUDIT_RETENTION_SWEEP_SECONDS`).
+    pub sweep_seconds: u64,
+    /// Tenants one tick looks at (`OMNION_AUDIT_RETENTION_SWEEP_BATCH`).
+    pub sweep_batch: usize,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            sweep_enabled: true,
+            sweep_seconds: DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS,
+            sweep_batch: DEFAULT_AUDIT_RETENTION_SWEEP_BATCH,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -526,6 +574,8 @@ pub struct Config {
     pub search: SearchConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
+    /// Audit retention sweep knobs (REQ-005, slice 4).
+    pub retention: RetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -690,6 +740,20 @@ impl Config {
             )?,
         };
 
+        let retention = RetentionConfig {
+            sweep_enabled: read_flag(&read, "OMNION_AUDIT_RETENTION_SWEEP", true)?,
+            sweep_seconds: read_positive(
+                &read,
+                "OMNION_AUDIT_RETENTION_SWEEP_SECONDS",
+                DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS,
+            )?,
+            sweep_batch: read_count(
+                &read,
+                "OMNION_AUDIT_RETENTION_SWEEP_BATCH",
+                DEFAULT_AUDIT_RETENTION_SWEEP_BATCH,
+            )?,
+        };
+
         let mail = MailConfig {
             enabled: read_flag(&read, "OMNION_MAIL_ENABLED", true)?,
             host: read("OMNION_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.to_owned()),
@@ -711,6 +775,7 @@ impl Config {
             automation,
             search,
             analytics,
+            retention,
             mail,
             log,
         };
@@ -749,6 +814,7 @@ impl Default for Config {
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
             analytics: AnalyticsConfig::default(),
+            retention: RetentionConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
