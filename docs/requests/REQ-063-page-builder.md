@@ -128,7 +128,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [x] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
 - [x] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
 - [x] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
-- [ ] `content.blocks.updated` and `content.page.published` are delivered to a subscribed endpoint with redelivery working.
+- [x] The two block-system events are delivered to a subscribed endpoint with redelivery working. **Proven by `the_block_events_reach_a_subscribed_endpoint_and_redeliver` (3/3 in `apps/api/tests/events.rs`): both events reach a real loopback receiver, the signature verifies over the exact bytes, the payload carries `block_count` and not the tree, and a refusal is re-attempted (`retried`, not `failed`) after the backoff. The name is `page.published`, not the `content.page.published` this criterion spells — see the slice 4 note.**
 - [ ] The editor is usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone), and the walkthrough reports zero high findings.
 
 #### Proven in slice 1
@@ -331,6 +331,37 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    `SELECT max(version) FROM _sqlx_migrations` is the other half of the check and it is what
    decides whether a renumber is legal at all: it proved nothing had applied my `0026` anywhere,
    so no checksum had to be rewritten and no `repair` migration was owed to anyone.
+
+   **Acceptance 16 ships against `page.published`, and that is a decision, not a shortcut.** The
+   criterion spells the publication `content.page.published`; the platform has always emitted
+   `page.published`, and the difference is not cosmetic — it is the whole string an integration
+   subscribes to. REQ-016's end-to-end proof, REQ-019's build hook, the webhooks screen and six
+   other REQ documents all name `page.published`, and every endpoint connected against it would
+   have gone silent if the publication were renamed to satisfy one request document. Renaming a
+   shipped event name to match a spec is the failure mode where the spec is right and the users
+   are wrong: nothing in the test suite would have caught it, because the tests subscribe to
+   whatever the code emits.
+
+   So the names are two separate things and both are kept: `content.blocks.updated` is new, and it
+   is named after the `content.` band the pattern and template events already use, so the block
+   system's own events are one namespace an operator can subscribe to as a group; the publication
+   keeps the name that has already shipped. What this criterion actually asks — *are these events
+   delivered, and does redelivery work* — is a question about delivery, and the walk answers it
+   against the names the platform actually emits.
+
+   **The walk found a bug that was not on anybody's list.** `update_page` gated
+   `content.blocks.updated` on a draft existing, and a title rename leaves a draft — so every
+   rename announced a block change carrying `block_count: 0`. The event would have told every
+   subscriber to rebuild media, re-run a diff and invalidate a CDN cache for a page whose blocks
+   never moved, and the audit entry right below it recorded `blocks_changed: false`, so the two
+   halves of the same request disagreed in the same log line. The gate is now
+   `changes.blocks.is_some()`.
+
+   Worth noting how it surfaced: it was not a new test that found it. The existing fan-out walk
+   asserts the event feed holds exactly four events after its retry ladder, and the rename in the
+   middle of that ladder was producing a fifth — so the assertion that had been passing on
+   intention was passing on a count that included a phantom. Writing the acceptance walk made the
+   discrepancy visible, and fixing the source fixed a test nobody had opened.
 
 ### Risks / notes
 
