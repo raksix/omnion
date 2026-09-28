@@ -19,6 +19,8 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod credential_store;
+pub mod credentials;
 pub mod cron;
 pub mod definition;
 pub mod engine;
@@ -41,4 +43,15 @@ pub use registry::{
     NodeCategory, NodeDefinition, OAuthConfig, ParamHint, ParamSpec, Port, PortKind, Sandbox,
     credential_type_keys, credential_types, find_credential_type, find_node, lint, node_keys,
     nodes,
+};
+// The credential entity of REQ-087 slice 2. Re-exported because the API layer names these
+// types in its bodies, and a caller reaching two modules for one entity is how the two halves
+// of a feature end up disagreeing about what a credential is.
+pub use credential_store::{
+    CredentialUpdate, DeleteOutcome, NewNodePackage, NodePackage, PACKAGE_COLUMNS,
+};
+pub use credentials::{
+    Credential, CredentialUsage, CredentialUsageReport, Health, ListQuery as CredentialListQuery,
+    NewCredential, SCOPES as CREDENTIAL_SCOPES, SHARINGS as CREDENTIAL_SHARINGS, SecretPayload,
+    Settings, TestOutcome,
 };
