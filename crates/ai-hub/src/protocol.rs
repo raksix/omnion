@@ -189,6 +189,14 @@ impl ProtocolAdapter for OpenAiCompatible {
             "messages": request.messages,
             "stream": stream,
         });
+        if stream {
+            // A streamed answer carries no token counts unless the caller asks for them: OpenAI,
+            // vLLM and llama.cpp all read `stream_options.include_usage` and report nothing when
+            // it is absent, so without this the Usage tab can only ever say "unknown" for every
+            // local endpoint — a stream that ends without a usage frame is honest, but one that
+            // was never asked is a platform omission, not a provider's.
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
         }
@@ -857,6 +865,33 @@ mod tests {
         assert_eq!(body["temperature"], 0.3);
         assert_eq!(body["max_tokens"], 64);
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn a_stream_asks_for_its_usage_and_a_plain_call_carries_no_stream_options() {
+        // OpenAI, vLLM, llama.cpp and Ollama's compat layer all report token counts in a stream
+        // **only** when the request asks for them. The field is the ask.
+        let streamed = adapter_for("openai_compatible")
+            .build_chat(&request(vec![ChatMessage::user("hi")]), true);
+        assert_eq!(streamed["stream_options"]["include_usage"], true);
+
+        // A non-streaming answer always carries its usage, so the field would be noise there —
+        // and a local runtime that validates its body strictly is the reason to omit it.
+        let whole = adapter_for("openai_compatible")
+            .build_chat(&request(vec![ChatMessage::user("hi")]), false);
+        assert!(
+            whole.get("stream_options").is_none(),
+            "a non-streaming body carries nothing that only a stream needs"
+        );
+
+        // The other two protocols spell it their own way and must stay untouched by this.
+        for protocol in ["anthropic_messages", "google_gemini"] {
+            let body = adapter_for(protocol).build_chat(&request(vec![ChatMessage::user("hi")]), true);
+            assert!(
+                body.get("stream_options").is_none(),
+                "{protocol}: this field is an OpenAI-compatible one"
+            );
+        }
     }
 
     #[test]
