@@ -158,6 +158,12 @@ export function AuditView() {
         target?.isContentEditable;
       if (event.key === "Escape") {
         setShowAnomalies(false);
+        // Escape also has to leave a filter field, or the single-key shortcuts stay dead for the
+        // rest of the visit: focus is still in the input, every later keypress is "typing", and
+        // the `typing` guard below discards `f`, `a` and `/` alike. That is the one sequence a
+        // keyboard user tries first — `/` to search, Escape to change their mind, `f` to filter
+        // by request id — and it silently did nothing after the first key.
+        if (typing) (target as HTMLElement | null)?.blur?.();
         return;
       }
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -175,17 +181,31 @@ export function AuditView() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Every filter the screen offers is applied here, and every one of them is a control the walk
+  // clicks. The action pills, the request-id box and the address box each wrote their state on
+  // change and the row list ignored all three: the pills turned `aria-pressed` on and the table
+  // underneath did not move, which is the exact shape of a dead control — the state was real, the
+  // effect was not. `needle` was the only one wired, which is why the walk's `before`/`after`
+  // counts both read 0 and the filter still looked pressed.
   const rows = useMemo(() => {
     const all = state?.entries ?? [];
     const query = needle.trim().toLowerCase();
-    if (!query) return all;
-    return all.filter((entry) =>
-      [actionLabel(entry.action), entry.ip_address ?? "", entry.pipeline ?? "", entry.request_id ?? ""]
+    const wantedId = requestId.trim().toLowerCase();
+    const wantedAddress = address.trim().toLowerCase();
+    return all.filter((entry) => {
+      if (actions.length > 0 && !actions.includes(entry.action)) return false;
+      // The request id and the address are operator-supplied identifiers, so a substring match is
+      // what makes pasting a partial id usable; an exact match would make the box a lie the moment
+      // the operator pastes a truncated one.
+      if (wantedId && !(entry.request_id ?? "").toLowerCase().includes(wantedId)) return false;
+      if (wantedAddress && !(entry.ip_address ?? "").toLowerCase().includes(wantedAddress)) return false;
+      if (!query) return true;
+      return [actionLabel(entry.action), entry.ip_address ?? "", entry.pipeline ?? "", entry.request_id ?? ""]
         .join(" ")
         .toLowerCase()
-        .includes(query),
-    );
-  }, [state, needle]);
+        .includes(query);
+    });
+  }, [state, needle, actions, requestId, address]);
 
   const openFlags = anomalies.filter((flag) => flag.acknowledged_at === null);
 

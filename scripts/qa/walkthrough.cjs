@@ -3257,15 +3257,27 @@ async function main() {
   console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length}`);
 }
 
-main().catch(async (err) => {
-  console.error("[walk] unexpected failure:", err);
-  try {
-    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
-  } catch {
-    /* ignore */
-  }
-  process.exit(1);
-});
+// The walk is a whole-box pass: it visits every screen, and on a machine where six writers are
+// compiling and three are driving their own Chromium at the same time it can die part-way through
+// with `Target page, context or browser has been closed` — long before the depth passes run. A
+// pass that aborts proves nothing about the screen it never reached.
+//
+// So the depth passes are exported, and `secrets-audit-depth.cjs` can drive one of them on its
+// own against a single stack. Requiring this file must not start the whole walk, hence the guard:
+// the CLI is `node walkthrough.cjs`, a require is a library call.
+module.exports = { runSecretsAuditDepth, ensureSignedIn, runWizard, CREDS, URL_ADMIN };
+
+if (require.main === module) {
+  main().catch(async (err) => {
+    console.error("[walk] unexpected failure:", err);
+    try {
+      fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
+    } catch {
+      /* ignore */
+    }
+    process.exit(1);
+  });
+}
 
 /**
  * The security-policy, session, device and second-factor pass (REQ-006, slice 3).

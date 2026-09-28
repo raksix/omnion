@@ -529,6 +529,26 @@ pub async fn redeem_lease(
             }
         }
         None => {
+            // The refusal every other branch of this handler writes a row for. A caller with no
+            // deployment key is exactly the case an operator needs to see: something reached for a
+            // secret from a machine that was never provisioned for it. Without this row the answer
+            // is a 401 carrying a request id and nothing to look that id up against — the one case
+            // the request id exists to prevent.
+            audit(
+                &state,
+                NewAuditEntry::system("secret.access.denied")
+                    .target("lease", id.to_string())
+                    // In the COLUMN, like every other denial here, so the screen's request-id
+                    // filter can actually find this row.
+                    .request_id(request_id)
+                    .metadata(json!({
+                        "reason": "deployment_key_required",
+                        "lease_id": id,
+                        "header": DEPLOYMENT_KEY_HEADER,
+                    }))
+                    .ip_address(address_text.clone()),
+            )
+            .await;
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "deployment_key_required",
