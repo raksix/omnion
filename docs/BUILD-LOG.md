@@ -2166,3 +2166,68 @@
 - **Next.** The local-endpoint walk (an Ollama-, vLLM- and llama.cpp-shaped base URL each
   passing Test, Discover and a streamed chat), the mid-stream vendor-error frame, and the
   every-screen-states sweep.
+
+## 2026-09-28 · wave 7 · tick 5 · REQ-097 slice 3 — three local runtimes, a mid-stream failure, and a Usage tab that was throwing its own numbers away
+
+- **What.** The two remaining proofs of slice 3 and the defect the first of them exposed.
+
+  1. **The local-endpoint walk.** Ollama, vLLM and llama.cpp, each on its own mock prefix, each
+     reproducing the quirk that runtime really has — the walk cannot pass against one smoothed
+     shape. Each one connects with **no key**, passes the five-step connection test, gets a
+     discovery diff whose apply adds exactly what it named, streams an answer addressed as
+     `provider/model`, and lands in the Usage tab.
+  2. **The mid-stream vendor-error frame.** A provider that answers `200`, streams two words and
+     then puts its own `{"error":…}` frame inside the stream. One `error` frame, no `done`, the
+     deltas that already arrived kept, one failed usage row, and no `ai.chat.completed`.
+
+- **Proof.**
+  - `cargo test -p omnion-ai-hub` → **86 passed** (one new: a stream asks for its usage, a plain
+    call carries no stream-only field, and the other two protocols stay untouched).
+  - `cargo test -p omnion-api --test ai_hub` against `omnion_test_w7`, `--test-threads=1` →
+    **14 passed** (201 s), including the two new walks.
+  - `pnpm typecheck` → green.
+
+- **A local runtime is not a cloud provider with the key left off.** The three differences the
+  walk pins, all of which a naive call gets wrong:
+
+  | runtime | the fact | what breaks without it |
+  |---------|----------|------------------------|
+  | Ollama | models carry a **tag** (`llama3.2:latest`); a bare name 404s with "try pulling it first" | the connection test asks the *first* reported model, so a stripped key fails the test of a healthy endpoint |
+  | vLLM | a stream reports tokens **only** under `stream_options.include_usage` | every local provider reads "unknown" in the Usage tab, forever |
+  | llama.cpp | the id is the **gguf file path** (`models/….gguf`) — a key with a slash | the router's `provider/model` address and the model's own key collide; a slash-blind resolver reads `models` as a provider name and answers "no such model" |
+
+- **The adapter now asks for the usage it wants** (`stream_options.include_usage` on the
+  OpenAI-compatible stream body, and **only** there). A stream that ends without a usage frame is
+  honest; one that was never asked is a platform omission, and the two look identical in the
+  panel. A non-streaming body carries no such field — llama.cpp's strict body validation is
+  exactly why.
+
+- **The defect: the Usage tab threw the numbers away.** `record_usage` bound
+  `prompt_tokens: None, completion_tokens: None` on **every** row, so the counts the provider
+  reported on the `done` frame never reached the table. Every call in the platform's own history
+  read "unknown" while the audit metadata beside it held the real totals — two places disagreeing
+  about the same fact, which is the one thing the panel must never do. The walk caught it because
+  it read the Usage tab *after* making the call rather than trusting the `done` frame it had
+  already asserted. The counts now ride on the row that **served** the call (`is_ok` gate) and
+  nowhere else: a failed attempt produced no answer and therefore spent no tokens, and a stream
+  that reported none stays `None` so `missing_usage` counts it as unknown rather than free. The
+  `u64` → `int` narrowing **saturates** — a wrapped count is a negative bill.
+
+- **A model key with a slash is the router's own edge, and it was already handled.** The
+  `provider/` prefix only counts when a provider of that name is really connected, so
+  `Local llama.cpp/models/llama-3.1-8b-instruct.Q4_K_M.gguf` resolves on the *first* slash and the
+  rest is the key. The walk asserts it rather than trusting slice 1's unit test.
+
+- **The mid-stream walk pins the request** to the flaky provider while a healthy second provider
+  serving the same key stands by. Without that, "it was not rerouted" is an accident of there
+  being nowhere to go — the same trap the failover walk stepped in last tick.
+
+- **Disk.** `/mnt/apopic` hit 100% again mid-tick and killed a `rustc` compile of `num-bigint-dig`
+  with a bare "could not compile" and no reason. Reclaimed only this worktree's `target/`, then
+  moved the build to `CARGO_TARGET_DIR=/dev/shm/w7-target`: the shared mount carries seven
+  writers' `target/` dirs and the box has 32 GB of tmpfs sitting **unused**, so a 60 GB disk full
+  of build artifacts and an empty 24 GB RAM disk is the box answering a question nobody asked. A
+  shared `CARGO_TARGET_DIR` remains the owner's call, not a writer's.
+
+- **Next.** The every-screen-states sweep for REQ-097 (empty / loading / error on each screen with
+  a real call to action), then the closing QA pass and the `done` commit.
