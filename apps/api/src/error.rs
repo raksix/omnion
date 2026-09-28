@@ -304,6 +304,15 @@ impl From<IdentityError> for ApiError {
                 "invitation_expired",
                 "this invitation has expired — ask for a new one",
             ),
+            // A queued link is not an error and not a `404` either: the invitee did nothing
+            // wrong and the panel can say something useful — "an owner has to release this".
+            // Without this arm it fell through to `internal_error`, which tells the invitee the
+            // platform is broken and sends them to the manager who cannot fix it.
+            IdentityError::InvitationAwaitingApproval => Self::new(
+                StatusCode::CONFLICT,
+                "invitation_awaiting_approval",
+                "this invitation is waiting for an owner to release it",
+            ),
             IdentityError::InvitationAlreadyPending(_) => Self::new(
                 StatusCode::CONFLICT,
                 "invitation_already_pending",

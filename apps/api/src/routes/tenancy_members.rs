@@ -45,6 +45,13 @@ const PREVIEW_RATE_BUDGET: u64 = 20;
 /// How many distinct caller buckets the preview limiter remembers before it prunes.
 const PREVIEW_RATE_BUCKETS: usize = 4_096;
 
+/// The single `reason` an unusable preview ever carries.
+///
+/// One coarse value for queued, revoked, expired and never-issued tokens alike. Anything more
+/// specific — `"queued"`, `"expired"` — would turn the preview back into the probe it exists to
+/// stop being, because "why" is exactly the question a token-walker wants answered.
+const PREVIEW_UNUSABLE_REASON: &str = "unusable";
+
 // ---------------------------------------------------------------------------------------------
 // Response shapes
 // ---------------------------------------------------------------------------------------------
@@ -195,23 +202,56 @@ pub struct SwitchOrganizationResponse {
 }
 
 /// Public preview of an invitation (`GET /api/v1/invitations/{token}`).
+///
+/// Deliberately uninformative, and the shape is load-bearing: a token that cannot be used
+/// answers `200` with the same body and `usable: false`, *not* a `404`. A `404` would itself be
+/// the answer to "is this token real?" — so anybody holding a leaked or guessed token could
+/// walk it and learn which organizations exist and which invitations are live. `reason` is
+/// therefore one coarse, non-revealing value (`"unusable"`), identical for a queued, revoked,
+/// expired and never-issued token, and `null` for a usable one.
+///
+/// The organization details are `null` for a token that was never issued, because there is no
+/// organization to describe. Inventing a name there would be fake data on a public endpoint.
 #[derive(Debug, Serialize)]
 pub struct InvitationPreviewResponse {
-    /// The organization inviting.
-    pub organization_name: String,
-    /// The organization slug.
-    pub organization_slug: String,
+    /// The organization inviting; `null` when the token was never issued.
+    pub organization_name: Option<String>,
+    /// The organization slug; `null` when the token was never issued.
+    pub organization_slug: Option<String>,
     /// Who sent the invitation.
     pub invited_by_name: Option<String>,
     /// The role the invitee receives.
     pub role_name: Option<String>,
     /// The address the invitation was sent to (masked: `a***@example.com`).
-    pub email_masked: String,
-    /// When the token stops working, RFC 3339.
-    #[serde(with = "time::serde::rfc3339")]
-    pub expires_at: OffsetDateTime,
+    pub email_masked: Option<String>,
+    /// When the token stops working, RFC 3339; `null` when the token was never issued.
+    pub expires_at: Option<OffsetDateTime>,
     /// Whether the token can still be presented.
     pub usable: bool,
+    /// Why it cannot, in one word that says nothing: `null` when it can.
+    pub reason: Option<&'static str>,
+}
+
+impl InvitationPreviewResponse {
+    /// The answer for a token nobody issued — and, deliberately, also the answer's *shape*.
+    ///
+    /// Every field that would describe an organization is `null` because there is no
+    /// organization to describe; the two that are always true (`usable: false` and the one
+    /// coarse `reason`) are what make it indistinguishable from a real-but-dead token. A
+    /// platform that has never issued this token must not be able to tell itself apart from
+    /// one that has, on a public endpoint.
+    fn unusable() -> Self {
+        Self {
+            organization_name: None,
+            organization_slug: None,
+            invited_by_name: None,
+            role_name: None,
+            email_masked: None,
+            expires_at: None,
+            usable: false,
+            reason: Some(PREVIEW_UNUSABLE_REASON),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -265,7 +305,12 @@ pub struct CreateInvitationRequest {
 }
 
 /// `POST /api/v1/invitations/{token}/accept` — the sign-up path.
-#[derive(Debug, Deserialize)]
+///
+/// `Default` is load-bearing, not boilerplate: a signed-in member accepting an invitation has
+/// no account details to send, and the handler takes the body as `Option<Json<…>>` so a
+/// bodyless POST answers instead of dying in the extractor with `415`. An empty body and a
+/// `{}` body must mean the same thing here.
+#[derive(Debug, Default, Deserialize)]
 pub struct AcceptInvitationRequest {
     /// When the caller is not signed in: the account to create.
     #[serde(default)]
@@ -783,9 +828,13 @@ pub async fn revoke_invitation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Public preview of an invitation link. Rate-limited and deliberately uninformative: a token
-/// that is not usable answers with the same shape and `usable: false`, so the page cannot be
-/// used to discover whether an organization exists.
+/// Public preview of an invitation link. Rate-limited and deliberately uninformative.
+///
+/// A token that was never issued answers `200` with the same shape and `usable: false` — **not**
+/// a `404`. The `404` would itself answer "is this token real?", which is the one thing this
+/// endpoint exists to prevent: a leaked or guessed token would let somebody map which
+/// organizations exist. So an unknown token and a queued one are the same answer apart from the
+/// details they *can* honestly show.
 pub async fn preview_invitation(
     State(state): State<AppState>,
     address: ClientAddress,
@@ -799,9 +848,10 @@ pub async fn preview_invitation(
         ));
     }
 
-    let invitation = memberships::find_invitation_by_token(state.db().pool(), &token)
-        .await?
-        .ok_or_else(invitation_not_found)?;
+    let Some(invitation) = memberships::find_invitation_by_token(state.db().pool(), &token).await?
+    else {
+        return Ok(Json(InvitationPreviewResponse::unusable()));
+    };
 
     let organization = omnion_identity::organizations::find_organization(
         state.db().pool(),
@@ -819,14 +869,18 @@ pub async fn preview_invitation(
         None => None,
     };
 
+    let now = OffsetDateTime::now_utc();
+    let usable = invitation.is_usable(now);
+
     Ok(Json(InvitationPreviewResponse {
-        organization_name: organization.name,
-        organization_slug: organization.slug,
+        organization_name: Some(organization.name),
+        organization_slug: Some(organization.slug),
         invited_by_name,
         role_name,
-        email_masked: mask_email(&invitation.email),
-        expires_at: invitation.expires_at,
-        usable: invitation.is_usable(OffsetDateTime::now_utc()),
+        email_masked: Some(mask_email(&invitation.email)),
+        expires_at: Some(invitation.expires_at),
+        usable,
+        reason: (!usable).then_some(PREVIEW_UNUSABLE_REASON),
     }))
 }
 
@@ -837,11 +891,12 @@ pub async fn accept_invitation(
     headers: axum::http::HeaderMap,
     address: ClientAddress,
     Path(token): Path<String>,
-    Json(body): Json<AcceptInvitationRequest>,
+    body: Option<Json<AcceptInvitationRequest>>,
 ) -> Result<axum::response::Response, ApiError> {
     let invitation = memberships::find_invitation_by_token(state.db().pool(), &token)
         .await?
         .ok_or_else(invitation_not_found)?;
+    let body = body.map(|Json(body)| body).unwrap_or_default();
 
     // The seat ceiling (REQ-005, slice 3) is checked here, *before* the acceptance — and before
     // a sign-up account is created. The REQ is explicit that enforcement belongs to acceptance
