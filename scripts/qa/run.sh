@@ -124,8 +124,20 @@ step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
+# Build whenever the binary is missing OR older than the sources it is built from. A pass that
+# only builds on a missing binary silently exercises the last binary that happened to be there:
+# the stack restarts fine, every request answers, and a route added this tick 404s — which reads
+# as a broken screen rather than as a stale build. A newer mtime is the only signal available
+# without asking cargo, and it is exactly the one that matters (source edited → rebuild).
+NEEDS_BUILD=0
 if [ ! -x target/debug/omnion-api ]; then
-  step "building the API (first pass only)"
+  NEEDS_BUILD=1
+  step "building the API (no binary yet)"
+elif [ -n "$(find src crates/omnion-api Cargo.toml -newer target/debug/omnion-api -print -quit 2>/dev/null)" ]; then
+  NEEDS_BUILD=1
+  step "building the API (sources are newer than the binary)"
+fi
+if [ "$NEEDS_BUILD" = "1" ]; then
   cargo build -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
