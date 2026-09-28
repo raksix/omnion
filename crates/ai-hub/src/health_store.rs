@@ -23,7 +23,7 @@ use crate::health::{HealthStatus, Sample, health_status, p95_latency_ms, uptime_
 const SAMPLE_COLUMNS: &str = "id, provider_id, status, latency_ms, http_status, error, checked_at";
 
 /// One probe sample, as the Health tab reads it.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct HealthSample {
     /// Row id.
     pub id: i64,

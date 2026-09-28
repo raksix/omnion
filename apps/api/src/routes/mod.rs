@@ -536,6 +536,22 @@ pub fn router(state: AppState) -> Router {
 
     let ai_model = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
 
+    // Health, usage and the failover chain (REQ-097 slice 3). Reading a provider's health is the
+    // same power as reading the provider list, so a team that can see the connection can see
+    // whether it works. "Probe now" dials the endpoint and reorders the chain, so both are
+    // `manage` — a reader must not be able to spend the installation's quota or reroute traffic.
+    let ai_provider_health =
+        get(ai::provider_health).layer(guards::require(&state, "ai.providers.read"));
+    let ai_provider_usage =
+        get(ai::provider_usage).layer(guards::require(&state, "ai.providers.read"));
+    let ai_provider_probe =
+        post(ai::probe_provider).layer(guards::require(&state, "ai.providers.manage"));
+    let ai_failover = get(ai::failover_chain)
+        .layer(guards::require(&state, "ai.providers.read"))
+        .merge(
+            put(ai::set_failover_order).layer(guards::require(&state, "ai.providers.manage")),
+        );
+
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
 
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
@@ -877,6 +893,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/ai/protocols", ai_protocols)
         .route("/ai/providers/{id}/test", ai_provider_test)
+        .route("/ai/providers/{id}/health", ai_provider_health)
+        .route("/ai/providers/{id}/usage", ai_provider_usage)
+        .route("/ai/providers/{id}/probe", ai_provider_probe)
+        .route("/ai/failover", ai_failover)
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)

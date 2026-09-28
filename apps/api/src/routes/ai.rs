@@ -957,6 +957,278 @@ pub struct ProtocolListResponse {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Handlers — health, usage and the failover chain
+// ---------------------------------------------------------------------------------------------
+
+/// The window the Health and Usage tabs read, when the caller does not name one.
+const DEFAULT_WINDOW_HOURS: i64 = 24;
+
+/// Every window the tabs offer. A caller may ask for any of them; a caller that asks for
+/// something absurd is answered from the disk rather than refused, because "show me a year of
+/// health" is a real question an operator asks while a provider is misbehaving.
+const WINDOW_CHOICES: &[(&str, i64)] = &[
+    ("1h", 1),
+    ("6h", 6),
+    ("24h", 24),
+    ("7d", 24 * 7),
+    ("30d", 24 * 30),
+];
+
+/// `GET /api/v1/ai/providers/{id}/health?window=24h` — the Health tab in one call.
+///
+/// The header, the samples and the sparkline come from a single request on purpose: three calls
+/// would let the header and the list describe two different moments, and a panel whose uptime
+/// disagrees with the samples under it is a panel nobody trusts during an incident.
+#[derive(Debug, Deserialize)]
+pub struct HealthQuery {
+    /// The window key from [`WINDOW_CHOICES`]; an unknown key falls back to 24 h.
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+/// The resolved window, echoed back so the client renders the same label the server used.
+#[derive(Debug, Serialize)]
+pub struct HealthView {
+    /// Provider the view is about.
+    pub provider_id: Uuid,
+    /// Provider name, for the tab header.
+    pub provider_name: String,
+    /// The window key that was applied.
+    pub window: &'static str,
+    /// The computed status and its numbers.
+    pub summary: omnion_ai_hub::health_store::HealthSummary,
+    /// The recent samples, newest first.
+    pub samples: Vec<omnion_ai_hub::health_store::HealthSample>,
+    /// The window keys the tab offers.
+    pub windows: Vec<&'static str>,
+}
+
+/// `GET /api/v1/ai/providers/{id}/health`.
+pub async fn provider_health(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<HealthQuery>,
+) -> Result<Json<HealthView>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+    let (key, hours) = resolve_window(query.window.as_deref());
+
+    Ok(Json(HealthView {
+        provider_id: provider.id,
+        provider_name: provider.name,
+        window: key,
+        summary: omnion_ai_hub::health_store::health_summary(state.db().pool(), id, hours).await?,
+        samples: omnion_ai_hub::health_store::recent_samples(state.db().pool(), id, hours, 50)
+            .await?,
+        windows: WINDOW_CHOICES.iter().map(|(key, _)| *key).collect(),
+    }))
+}
+
+/// `GET /api/v1/ai/providers/{id}/usage?window=24h` — the Usage tab in one call.
+pub async fn provider_usage(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<HealthQuery>,
+) -> Result<Json<UsageView>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+    let (key, hours) = resolve_window(query.window.as_deref());
+
+    Ok(Json(UsageView {
+        provider_id: provider.id,
+        provider_name: provider.name,
+        window: key,
+        summary: omnion_ai_hub::health_store::usage_summary(state.db().pool(), id, hours).await?,
+        windows: WINDOW_CHOICES.iter().map(|(key, _)| *key).collect(),
+    }))
+}
+
+/// The Usage tab's payload: the totals and the per-day breakdown, in one call.
+#[derive(Debug, Serialize)]
+pub struct UsageView {
+    /// Provider the view is about.
+    pub provider_id: Uuid,
+    /// Provider name, for the tab header.
+    pub provider_name: String,
+    /// The window key that was applied.
+    pub window: &'static str,
+    /// Totals over the window.
+    pub summary: omnion_ai_hub::health_store::UsageSummary,
+    /// The window keys the tab offers.
+    pub windows: Vec<&'static str>,
+}
+
+/// `POST /api/v1/ai/providers/{id}/probe` — "Probe now": exactly one sample, taken now.
+///
+/// This is the same [`probe_now`](omnion_ai_hub::health_store::probe_now) the background runner
+/// calls, so the button and the tick cannot disagree about what a probe is. It runs the stored
+/// provider's own connection test and records what that saw — a sample with the endpoint's own
+/// words, not a synthetic "the button was pressed" row.
+pub async fn probe_provider(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ProbeOutcome>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+
+    let known: Vec<String> = omnion_ai_hub::list_models(state.db().pool(), Some(id))
+        .await?
+        .into_iter()
+        .map(|model| model.model_key)
+        .collect();
+    let report = omnion_ai_hub::test_provider(&provider, &known).await;
+
+    let failing = report
+        .steps
+        .iter()
+        .find(|step| matches!(step.status, StepStatus::Failed));
+    let sample = omnion_ai_hub::health_store::NewSample {
+        provider_id: id,
+        ok: report.ok,
+        // The report is a whole five-step test; its total is the honest cost of the probe, and a
+        // sample that reported 0 ms would make every p95 a lie.
+        latency_ms: report.total_ms.clamp(0, i32::MAX as i64) as i32,
+        http_status: None,
+        error: failing
+            .and_then(|step| step.error.clone())
+            .or_else(|| (!report.ok).then(|| report.summary.clone())),
+    };
+
+    let transition = omnion_ai_hub::health_store::probe_now(state.db().pool(), id, sample).await?;
+    let summary = omnion_ai_hub::health_store::health_summary(state.db().pool(), id, 24).await?;
+
+    // The status changed, so the event fires — the same trigger a background transition emits, so
+    // an automation on "a provider went down" cannot tell the button from the tick.
+    if let Some((from, to)) = &transition {
+        let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.health_changed")
+            .organization(current.user.organization_id)
+            .target("ai_provider", provider.id.to_string())
+            .metadata(json!({
+                "name": provider.name,
+                "from": from.as_str(),
+                "to": to.as_str(),
+                "source": "manual_probe",
+            }))
+            .ip_address(address.as_text());
+        omnion_audit::record(state.db().pool(), entry).await?;
+    }
+
+    let failing_step = report.failing_step.clone();
+    Ok(Json(ProbeOutcome {
+        provider_id: provider.id,
+        ok: report.ok,
+        latency_ms: report.total_ms,
+        failing_step,
+        transition: transition
+            .as_ref()
+            .map(|(from, to)| json!({ "from": from.as_str(), "to": to.as_str() })),
+        summary,
+        report,
+    }))
+}
+
+/// What "Probe now" answers with: the sample's own outcome, the transition it caused (if any) and
+/// the refreshed header the tab swaps in — no reload, because the caller already has everything.
+#[derive(Debug, Serialize)]
+pub struct ProbeOutcome {
+    /// Provider that was probed.
+    pub provider_id: Uuid,
+    /// Whether the endpoint answered.
+    pub ok: bool,
+    /// How long the probe took.
+    pub latency_ms: i64,
+    /// The step that failed, when one did.
+    pub failing_step: Option<String>,
+    /// The status transition, when the status actually changed.
+    pub transition: Option<serde_json::Value>,
+    /// The header as it reads after the probe.
+    pub summary: omnion_ai_hub::health_store::HealthSummary,
+    /// The full five-step report.
+    pub report: TestReport,
+}
+
+/// `GET /api/v1/ai/failover` — the chain as the router walks it right now.
+pub async fn failover_chain(
+    State(state): State<AppState>,
+) -> Result<Json<FailoverView>, ApiError> {
+    let chain = omnion_ai_hub::health_store::failover_preview(state.db().pool()).await?;
+    Ok(Json(FailoverView {
+        chain,
+        // Every enabled provider, so the panel can offer a row the operator forgot to rank
+        // instead of leaving it unreachable from the order editor.
+        providers: omnion_ai_hub::health_store::enabled_providers(state.db().pool()).await?,
+    }))
+}
+
+/// The chain preview and the membership it is drawn from.
+#[derive(Debug, Serialize)]
+pub struct FailoverView {
+    /// The ordered chain.
+    pub chain: Vec<omnion_ai_hub::health_store::FailoverEntry>,
+    /// Every provider the chain may contain, in order.
+    pub providers: Vec<Uuid>,
+}
+
+/// Body of `PUT /api/v1/ai/failover`.
+#[derive(Debug, Deserialize)]
+pub struct FailoverOrderBody {
+    /// The provider ids, in the order a request should try them.
+    pub provider_ids: Vec<Uuid>,
+}
+
+/// `PUT /api/v1/ai/failover` — persist the failover order.
+///
+/// The store rejects an empty list, a repeat and a stranger, so this handler does not re-check
+/// them: a validation that exists twice is a validation that will disagree with itself. What the
+/// handler adds is the audit entry and the answer, which is the chain as it now stands — the
+/// client renders the server's order rather than its own guess at it.
+pub async fn set_failover_order(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<FailoverOrderBody>,
+) -> Result<Json<FailoverView>, ApiError> {
+    omnion_ai_hub::health_store::set_failover_order(state.db().pool(), &body.provider_ids).await?;
+
+    let view = FailoverView {
+        chain: omnion_ai_hub::health_store::failover_preview(state.db().pool()).await?,
+        providers: omnion_ai_hub::health_store::enabled_providers(state.db().pool()).await?,
+    };
+
+    let names: Vec<&str> = view
+        .chain
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let entry = NewAuditEntry::by_user(current.user.id, "ai.failover.reordered")
+        .organization(current.user.organization_id)
+        .target("ai_failover", "chain".to_owned())
+        .metadata(json!({ "order": names }))
+        .ip_address(address.as_text());
+    omnion_audit::record(state.db().pool(), entry).await?;
+
+    Ok(Json(view))
+}
+
+/// Resolve a window key to `(label, hours)`; an unknown or missing key is the 24 h default.
+///
+/// The label is returned as a `&'static str` from the same table the hours came from, so a client
+/// can never render a window the server did not actually apply.
+fn resolve_window(window: Option<&str>) -> (&'static str, i64) {
+    let key = window.unwrap_or("24h");
+    WINDOW_CHOICES
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .copied()
+        .unwrap_or(("24h", DEFAULT_WINDOW_HOURS))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------------------------
 

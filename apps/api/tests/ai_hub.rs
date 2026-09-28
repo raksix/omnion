@@ -1991,6 +1991,243 @@ async fn health_samples_compute_a_status_and_the_order_is_a_permutation() {
     harness.dispose().await;
 }
 
+/// Slice 3 (REQ-097): the health, usage, probe and failover surface, as the panel calls it.
+///
+/// The store walk above proves the SQL; this one proves the **shape** the four endpoints hand the
+/// Health and Usage tabs, the two permission splits, and the fact that "Probe now" writes exactly
+/// one sample instead of one per step of the test it runs.
+#[tokio::test]
+async fn the_health_and_usage_endpoints_answer_the_tabs_and_the_probe_writes_one_sample() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let owner_token = token_of(&owner);
+    let (member_id, member_token) = account(
+        &harness,
+        &format!("member-{}@omnion.test", Uuid::new_v4().simple()),
+    )
+    .await;
+    let member_role = role_store::find_role_by_key(harness.db.pool(), None, "member")
+        .await
+        .expect("the member role must be readable")
+        .expect("the member role exists");
+    bindings::grant_if_missing(
+        harness.db.pool(),
+        NewBinding {
+            role_id: member_role.id,
+            user_id: member_id,
+            scope: Scope::Global,
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the member binding must be written");
+
+    // Two providers, so the chain and the reorder have something to order.
+    let mut ids = Vec::new();
+    for (name, base_url, priority) in [
+        ("First in line", mock.base_url.clone(), 10),
+        ("Second in line", "http://127.0.0.1:1/v1".to_owned(), 20),
+    ] {
+        let created = harness
+            .call(post(
+                "/api/v1/ai/providers",
+                json!({
+                    "name": name,
+                    "base_url": base_url,
+                    "priority": priority,
+                    "models": ["mock-small"],
+                }),
+                Some(&owner_token),
+            ))
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        ids.push(created.body["id"].as_str().expect("an id").to_owned());
+    }
+
+    // An empty installation chain is a refusal with a name, not a silent 500.
+    let empty = harness
+        .call(request(
+            Method::PUT,
+            "/api/v1/ai/failover",
+            Some(&owner_token),
+            Some(json!({ "provider_ids": [] })),
+        ))
+        .await;
+    assert!(
+        empty.status.is_client_error(),
+        "an empty chain must be refused, got {:?}",
+        empty.status
+    );
+
+    let order = harness
+        .call(request(
+            Method::PUT,
+            "/api/v1/ai/failover",
+            Some(&owner_token),
+            Some(json!({ "provider_ids": [ids[1], ids[0]] })),
+        ))
+        .await;
+    assert_eq!(order.status, StatusCode::OK, "{:?}", order.body);
+    assert_eq!(
+        order.body["chain"][0]["id"].as_str(),
+        Some(ids[1].as_str()),
+        "the answer is the order the server stored, not the order the client hoped for"
+    );
+    assert_eq!(order.body["chain"][0]["rank"], 1);
+
+    // Reading the chain is a read; a member without the provider permission cannot.
+    let chain = harness
+        .call(get("/api/v1/ai/failover", Some(&owner_token)))
+        .await;
+    assert_eq!(chain.status, StatusCode::OK, "{:?}", chain.body);
+    assert_eq!(chain.body["chain"].as_array().map(Vec::len), Some(2));
+
+    let member_chain = harness
+        .call(get("/api/v1/ai/failover", Some(&member_token)))
+        .await;
+    assert_eq!(member_chain.status, StatusCode::FORBIDDEN);
+    let member_reorder = harness
+        .call(request(
+            Method::PUT,
+            "/api/v1/ai/failover",
+            Some(&member_token),
+            Some(json!({ "provider_ids": [ids[0]] })),
+        ))
+        .await;
+    assert_eq!(
+        member_reorder.status,
+        StatusCode::FORBIDDEN,
+        "reordering the chain is a manage power even for somebody who may read it"
+    );
+
+    // "Probe now" is a `manage` power too — it dials the endpoint.
+    let member_probe = harness
+        .call(request(
+            Method::POST,
+            &format!("/api/v1/ai/providers/{}/probe", ids[0]),
+            Some(&member_token),
+            None,
+        ))
+        .await;
+    assert_eq!(member_probe.status, StatusCode::FORBIDDEN);
+
+    // The Health tab reads a never-probed provider as `unknown` with no uptime, and the window
+    // key it sent back is the one the server applied.
+    let fresh = harness
+        .call(get(
+            &format!("/api/v1/ai/providers/{}/health?window=7d", ids[0]),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(fresh.status, StatusCode::OK, "{:?}", fresh.body);
+    assert_eq!(fresh.body["summary"]["status"], "unknown");
+    assert_eq!(fresh.body["summary"]["uptime_percent"], Value::Null);
+    assert_eq!(fresh.body["window"], "7d", "the tab renders the window that was applied");
+    assert_eq!(fresh.body["samples"].as_array().map(Vec::len), Some(0));
+    assert!(
+        fresh.body["windows"]
+            .as_array()
+            .is_some_and(|windows| windows.iter().any(|w| w == "1h")),
+        "the tab learns the windows it may offer from the same call"
+    );
+
+    // An unknown window key falls back rather than erroring: the label that comes back is the one
+    // the hours were taken from, so the header can never describe a window nobody queried.
+    let odd = harness
+        .call(get(
+            &format!("/api/v1/ai/providers/{}/health?window=99y", ids[0]),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(odd.status, StatusCode::OK);
+    assert_eq!(odd.body["window"], "24h");
+
+    // One probe against the live mock: one sample, the provider's own verdict, and a header that
+    // reads it. A probe that wrote a row per test step would be five rows for one button press.
+    let probed = harness
+        .call(request(
+            Method::POST,
+            &format!("/api/v1/ai/providers/{}/probe", ids[0]),
+            Some(&owner_token),
+            None,
+        ))
+        .await;
+    assert_eq!(probed.status, StatusCode::OK, "{:?}", probed.body);
+    assert_eq!(probed.body["ok"], true, "{:?}", probed.body);
+    assert_eq!(
+        probed.body["transition"]["to"], "degraded",
+        "the first success is not yet an `ok` — the provider has no history to be healthy against"
+    );
+    let sampled: (i64,) = sqlx::query_as(
+        "select count(*) from ai_provider_health where provider_id = $1::uuid",
+    )
+    .bind(&ids[0])
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the count reads");
+    assert_eq!(sampled.0, 1, "one button press is one sample");
+
+    // The refreshed header comes back in the probe's own answer, so the tab swaps it in without a
+    // second request and cannot show a status the samples contradict.
+    assert_eq!(probed.body["summary"]["status"], "degraded");
+    assert_eq!(probed.body["summary"]["sample_count"], 1);
+
+    // Probing the dead endpoint records the failure in the endpoint's own words.
+    let dead = harness
+        .call(request(
+            Method::POST,
+            &format!("/api/v1/ai/providers/{}/probe", ids[1]),
+            Some(&owner_token),
+            None,
+        ))
+        .await;
+    assert_eq!(dead.status, StatusCode::OK, "{:?}", dead.body);
+    assert_eq!(dead.body["ok"], false);
+    assert!(
+        dead.body["failing_step"].is_string(),
+        "a failed probe names the step that failed"
+    );
+
+    // Usage answers the same shape: zero calls is a real zero, not a null to guess at.
+    let usage = harness
+        .call(get(
+            &format!("/api/v1/ai/providers/{}/usage", ids[0]),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(usage.status, StatusCode::OK, "{:?}", usage.body);
+    assert_eq!(usage.body["summary"]["requests"], 0);
+    assert_eq!(usage.body["summary"]["errors"], 0);
+    assert_eq!(usage.body["window"], "24h");
+    assert_eq!(usage.body["summary"]["by_day"].as_array().map(Vec::len), Some(0));
+
+    // A provider that does not exist is a 404 on every one of the four, not a blank tab.
+    let missing = harness
+        .call(get(
+            &format!("/api/v1/ai/providers/{}/health", Uuid::new_v4()),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+    harness.dispose().await;
+}
+
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
 async fn live_db(config: &Config) -> Option<Db> {
     match Db::connect(&DatabaseConfig {
