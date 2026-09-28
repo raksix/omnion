@@ -47,7 +47,17 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[notif-http] building the API"
-cargo build -q -p omnion-api 2>&1 | grep -E "^(error|warning: unused)" && { echo "  build failed"; exit 1; }
+# The build's own exit status is the authority. Piping into `grep` and testing *its* status
+# reports a failure whenever the word "error" appears anywhere in a *warning* — and this
+# crate's unused-import warnings quote their own source line, so `warning: unused import:
+# \`Query\`` matched and the gate printed "build failed" over a build that had just succeeded.
+# That is a gate that reports the opposite of the truth, which is worse than no gate: it
+# burned two full runs before anyone read what it was actually matching.
+if ! cargo build -q -p omnion-api 2>/tmp/notif-http-build.log; then
+  grep -E "^error" /tmp/notif-http-build.log || tail -20 /tmp/notif-http-build.log
+  echo "  build failed"
+  exit 1
+fi
 
 echo "[notif-http] creating a disposable database"
 "${PSQL[@]}" -c "drop database if exists $DB" >/dev/null
