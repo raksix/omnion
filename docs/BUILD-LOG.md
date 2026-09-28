@@ -2252,3 +2252,66 @@
   quarantine and release, retention policies with the daily worker, and reference-based purge
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
+
+## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
+
+**What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
+could render a badge and the badge could only ever read `pending`. This tick gives that column a
+pipeline behind it — `0044_media_scanning.sql` (a per-site policy, a quarantine table with a
+history, a run log, plus the two `media` columns the pipeline needs and `0025` never created), the
+crate module `crates/media/src/scanning.rs`, the API in `apps/api/src/routes/media_scan.rs`, and
+the **Scanning** tab on `/media/settings`. Seven routes; the gate is on *every* serve path, not
+just the one the spec names: the panel raw route, the public renderer, the preset path **including
+its cached derivatives**, both version paths, and the share token route.
+
+**Seven decisions, each a shortcut that produces a plausible wrong answer.** An unrecognised
+scanner answer is an *error*, never a pass (pinned against a scanner that answers
+`{"verdict_code": 3}` over a real socket); a file above the size ceiling is `skipped` and never
+`clean`; a clean scan leaves `scan_detail` **empty** so a report that greps it cannot find a
+positive on every file; a quarantine row is closed and never deleted, so a file flagged twice has
+two events; a release requires a reason and lands the row on `skipped`, not `clean`, because
+nobody has said the file is *safe*; another tenant's quarantine is a `404` and not a `403`; and a
+**flag is a fact rather than a policy question** — `on_error` speaks to the *absent* verdict
+(`pending`, `error`) and never overrules a `flagged` row.
+
+**Three defects found by the walks, none of which a unit test could have seen.** The claim query
+selected `id` while the row type called the field `media_id`, and sqlx's `FromRow` maps by
+*column name* — so the sweep died with `no column found for name: media_id` on the first file,
+which reads as a broken query rather than a missing alias. `0025` never created `media.scanned_at`
+at all, so **every verdict write failed**, and because the route counted the error both as a
+verdict and as a write failure, a one-file run reported `errors = 2` — a number with no reading
+an operator can act on. And `sum(bigint)` decodes as NUMERIC, so the quarantine byte total could
+not be listed at all.
+
+**The one that matters was found by a suite I did not write.** `media_shares.rs`'s
+`a_link_stops_serving_when_its_file_stops_being_servable` failed on my change: the first gate had
+an early return for a site with scanning *disabled*, and the walk switches the scanner off before
+flagging a file by hand. The regression was real and it was the shape of the bug: a flag is a fact
+about the bytes, and turning the scanner off is a decision about *future* uploads, not a way of
+forgetting a verdict somebody already reached. Fixed in the crate (`may_serve` now reads
+`enabled` itself, with a test that runs all four `enabled`×`on_error` combinations) rather than at
+the call site, so the panel and the share link cannot drift apart again.
+
+**Proof.** `--test media_scan` → **10 walks, 0 failures**, each against a **hand-rolled scanner on
+a real loopback socket** rather than a stubbed function: the client is where an outage lives, and
+a sub-app would share every assumption the client makes. A **dead port** proves the ingest rule
+(upload succeeds, row reads `error`, `hold` refuses with `file_scan_failed`, and flipping
+`on_error` to `serve` changes the answer on the *next* request because the policy is read per
+request, not cached). A `Nonsense` scanner proves fail-closed. A clean scanner proves a clean file
+serves with its real bytes and an empty sweep still writes a run. A trashed file is never claimed.
+Both walks that assert a row read it **out of PostgreSQL**, because a response that omits a field
+is indistinguishable from one that stored it and chose not to say so. `cargo test -p omnion-media
+--lib` → **148** (was 122), `-p omnion-api --lib` → **127** (was 122); `--test media` (13),
+`--test media_shares` (5) and `--test media_transform` (5) are green against the routes this
+touches. `apps/admin` `tsc --noEmit` clean.
+
+**Environment.** Two things worth recording. The shared development database has a sibling wave's
+migrations applied, so `cargo test --test media_*` dies with `VersionMissing(19)` before it reaches
+a single assertion — `scripts/qa/run-media-walk.sh` gives each suite its own disposable database,
+which is what a suite that must be *believed* to have run needs. And `reqwest` was a **dev**
+dependency of the API crate: the scanner client needs it at runtime, so it is now a real one.
+
+**Next.** Slice 4's remaining half — folder and file grants with inheritance, a deny beating an
+inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
+and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
+the raw route and a retention run removes exactly the eligible rows.
