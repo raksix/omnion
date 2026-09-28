@@ -25,7 +25,10 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use omnion_audit::NewAuditEntry;
+use omnion_telemetry::metric_catalog::{self, FamilyDeclaration};
+use omnion_telemetry::metrics::{self, LabelCatalogue, MAX_POINTS};
 use omnion_telemetry::store::{self, LogFilter, LogSettings};
 use omnion_telemetry::{LogLevel, LogSource, TelemetryError};
 use serde::Serialize;
@@ -382,6 +385,303 @@ pub async fn save_settings(
     })?;
 
     Ok(Json(SettingsView::from(saved)))
+}
+
+/* ── the metric registry and its catalogue (REQ-126, slice 2) ────────────────────────────────────
+ *
+ * Three endpoints: the exposition a Prometheus scrapes, the catalogue the panel reads, and the
+ * bounded query a chart is drawn from. The selector rule is the part worth stating once: a
+ * selector may only name a declared family and label values the registry has actually seen, and
+ * anything else is a `400` naming the family — because a chart that renders an empty graph for an
+ * unknown selector is indistinguishable from a chart of a metric that is genuinely idle, and an
+ * operator cannot act on the first.
+ */
+
+/// The exposition's content type, verbatim.
+///
+/// Prometheus's text format has a canonical content type and a scraper that receives
+/// `text/plain` instead of it will, in most configurations, refuse the body rather than guess.
+const EXPOSITION_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// `GET /metrics` — the Prometheus exposition.
+///
+/// Unauthenticated, and that is a deliberate decision the request states rather than an oversight:
+/// a scraper on the same network has no session, and the alternative (a token) is the operator's
+/// to configure for a public interface. What is *not* exposed by accident is anything the registry
+/// does not declare — the exposition is a rendering of the declared families and nothing else, so
+/// there is no path by which a future field becomes public without appearing in `FAMILIES` and
+/// being reviewed as a family.
+pub async fn metrics_exposition() -> impl IntoResponse {
+    let registry = metrics::global();
+    let text = registry.render();
+    // The response is `text/plain` and nothing else: a JSON error body on this path would be read
+    // by a scraper as a malformed exposition, so a failure here is logged rather than shaped.
+    tracing::debug!(bytes = text.len(), "metrics exposition rendered");
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                EXPOSITION_CONTENT_TYPE,
+            ),
+            // A scrape must never be answered from a cache: a stale `/metrics` is a monitoring
+            // system reporting numbers that stopped happening.
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        text,
+    )
+}
+
+/// One catalogue row, in the panel's shape.
+#[derive(Debug, Serialize)]
+pub struct CatalogEntryView {
+    /// The exposition name.
+    pub name: String,
+    /// `counter`, `gauge` or `histogram`.
+    pub kind: String,
+    /// The unit shown next to the chart.
+    pub unit: String,
+    /// The one-sentence description.
+    pub description: String,
+    /// The label names, positionally.
+    pub labels: Vec<String>,
+    /// `core`, `module` or `worker`.
+    pub source: String,
+    /// The series the registry holds right now.
+    pub cardinality_estimate: i32,
+    /// The cap this family is held to.
+    pub cardinality_budget: i32,
+    /// Whether the cap is enforced for this family.
+    pub budgeted: bool,
+    /// When the family last recorded a sample, if it ever has.
+    pub last_seen_at: Option<String>,
+    /// `true` when this build emits it and has samples.
+    pub live: bool,
+    /// `true` when the family is over its cap and is folding samples into `other`.
+    pub over_budget: bool,
+}
+
+impl From<metric_catalog::CatalogRow> for CatalogEntryView {
+    fn from(row: metric_catalog::CatalogRow) -> Self {
+        // Computed before the move: a family this build does not declare keeps its row, so
+        // "documented" and "live" are two different columns rather than one value the panel has
+        // to interpret.
+        let live = metrics::family(&row.name).is_some();
+        Self {
+            name: row.name,
+            kind: row.kind,
+            unit: row.unit,
+            description: row.description,
+            labels: row.labels,
+            source: row.source,
+            cardinality_estimate: row.cardinality_estimate,
+            cardinality_budget: row.cardinality_budget,
+            budgeted: row.budgeted,
+            last_seen_at: row
+                .last_seen_at
+                .map(|at| at.format(&Rfc3339).unwrap_or_default()),
+            live,
+            over_budget: false,
+        }
+    }
+}
+
+/// The catalogue response.
+#[derive(Debug, Serialize)]
+pub struct CatalogResponse {
+    /// The families, grouped by source then name.
+    pub families: Vec<CatalogEntryView>,
+    /// The label positions and the values observed, so the selector builder is fed from data.
+    pub label_catalogues: Vec<LabelCatalogue>,
+    /// The families currently folding samples into their overflow series.
+    pub over_budget: Vec<String>,
+    /// The registry's global series cap.
+    pub global_budget: usize,
+    /// The cap on the points one chart may return.
+    pub max_points: usize,
+}
+
+/// `GET /api/v1/observability/metrics/catalog` — the documented families.
+pub async fn read_catalog(
+    State(state): State<AppState>,
+    _session: CurrentSession,
+) -> Result<Json<CatalogResponse>, ApiError> {
+    let rows = metric_catalog::list_with_state(state.db().pool())
+        .await
+        .map_err(map_error)?;
+    let over = metric_catalog::over_budget_families(state.db().pool())
+        .await
+        .map_err(map_error)?;
+    let families: Vec<CatalogEntryView> = rows
+        .into_iter()
+        .map(|row| {
+            let mut view = CatalogEntryView::from(row);
+            view.over_budget = over.iter().any(|name| *name == view.name);
+            view
+        })
+        .collect();
+    Ok(Json(CatalogResponse {
+        families,
+        label_catalogues: metrics::label_catalogues(),
+        over_budget: over,
+        global_budget: metrics::global().global_budget(),
+        max_points: MAX_POINTS,
+    }))
+}
+
+/// The chart query's query string.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct MetricQuery {
+    /// The family name.
+    pub metric: Option<String>,
+    /// One window in minutes, capped at `MAX_POINTS`.
+    pub window_minutes: Option<i64>,
+}
+
+/// One chart's worth of data.
+#[derive(Debug, Serialize)]
+pub struct MetricQueryResponse {
+    /// The family requested.
+    pub metric: String,
+    /// Its kind, so the panel renders a rate and a total differently.
+    pub kind: String,
+    /// Its unit.
+    pub unit: String,
+    /// The label names, positionally — the x-axis of a multi-series chart.
+    pub labels: Vec<String>,
+    /// The window the points cover, in minutes.
+    pub window_minutes: usize,
+    /// The cap on points, so a caller can see it was clamped.
+    pub max_points: usize,
+    /// The series, each with its labels and its minute buckets.
+    pub series: Vec<metrics::SeriesSnapshot>,
+    /// The PromQL for the same selection, ready to paste into a dashboard.
+    pub promql: String,
+    /// `true` when the family is declared but has never recorded a sample in this process.
+    pub no_samples: bool,
+}
+
+/// `GET /api/v1/observability/metrics/query` — a bounded chart for one catalogue selector.
+///
+/// The window is minutes, and it is refused above [`MAX_POINTS`]. A 30-day window on a
+/// one-minute-resolution ring is not a chart with fewer points, it is a chart that silently
+/// resampled — so the caller is told the cap and the cap is also returned in the body.
+pub async fn read_metric_query(
+    // The state is part of the handler's shape and unused by the body: the registry is
+    // process-wide, which is the whole reason a chart does not need a database round trip.
+    _state: State<AppState>,
+    _session: CurrentSession,
+    Query(query): Query<MetricQuery>,
+) -> Result<Json<MetricQueryResponse>, ApiError> {
+    let name = query.metric.unwrap_or_default();
+    let spec = metrics::family(&name).ok_or_else(|| {
+        // A refusal that names the family, not a blank graph: an unknown selector and an idle
+        // metric look identical on screen, and only one of them is the operator's to fix.
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unknown_metric",
+            format!("`metric` must be a declared family; `{name}` is not one of them"),
+        )
+    })?;
+
+    let window = query.window_minutes.unwrap_or(60);
+    if window < 1 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_window",
+            "`window_minutes` must be at least 1",
+        ));
+    }
+    let window = window.min(MAX_POINTS as i64) as usize;
+
+    let series = metrics::global().series_of(spec.name, window);
+    let labels: Vec<String> = spec.labels.iter().map(|label| (*label).to_owned()).collect();
+    let promql = promql_for(spec, &series.first().map(|s| s.labels.clone()).unwrap_or_default());
+
+    Ok(Json(MetricQueryResponse {
+        metric: spec.name.to_owned(),
+        kind: spec.kind.as_str().to_owned(),
+        unit: spec.unit.to_owned(),
+        labels,
+        window_minutes: window,
+        max_points: MAX_POINTS,
+        no_samples: series.is_empty(),
+        series,
+        promql,
+    }))
+}
+
+/// The PromQL for a selection, so the panel's "copy as PromQL" affordance copies something real.
+///
+/// A histogram is rendered as a `rate(...)` over the matching series, the others as a raw
+/// selector: a gauge's `rate()` is meaningless and an operator who pasted one would spend an
+/// afternoon wondering why it was flat.
+fn promql_for(spec: &metrics::FamilySpec, values: &[String]) -> String {
+    let matcher = if values.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = spec
+            .labels
+            .iter()
+            .zip(values.iter())
+            .map(|(name, value)| format!("{name}=\"{}\"", value.replace('"', "\\\"")))
+            .collect();
+        format!("{{{}}}", parts.join(","))
+    };
+    match spec.kind {
+        metrics::MetricKind::Histogram => format!("rate({}_sum{matcher}[5m])", spec.name),
+        metrics::MetricKind::Counter => {
+            if spec.name.ends_with("_total") {
+                format!("rate({}{matcher}[5m])", spec.name)
+            } else {
+                format!("increase({}{matcher}[5m])", spec.name)
+            }
+        }
+        metrics::MetricKind::Gauge => format!("{}{matcher}", spec.name),
+    }
+}
+
+/// `POST /api/v1/observability/metrics/sync` — re-seed the catalogue from the registry.
+///
+/// The boot already does this, so this endpoint exists for the one case boot cannot cover: a
+/// module that is enabled at runtime and registers its families after the API started. It is a
+/// write and it is audited, because "the catalogue now documents a family that did not exist five
+/// minutes ago" is a change an operator wants a trail for.
+pub async fn sync_catalog(
+    State(state): State<AppState>,
+    session: CurrentSession,
+) -> Result<Json<CatalogResponse>, ApiError> {
+    let declarations: Vec<FamilyDeclaration> = metrics::FAMILIES
+        .iter()
+        .map(|spec| {
+            let series = metrics::global()
+                .family_states()
+                .into_iter()
+                .find(|state| state.name == spec.name)
+                .map_or(0, |state| state.series);
+            FamilyDeclaration::from_spec(spec, series)
+        })
+        .collect();
+    let written = metric_catalog::sync_from_registry(state.db().pool(), &declarations)
+        .await
+        .map_err(map_error)?;
+
+    omnion_audit::record(
+        state.db().pool(),
+        NewAuditEntry::by_user(session.user.id, "observability.metrics.catalog_synced")
+            .organization(session.user.organization_id)
+            .target("catalog", "obs_metric_catalog")
+            .metadata(serde_json::json!({ "families_written": written })),
+    )
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit_write_failed",
+            error.to_string(),
+        )
+    })?;
+
+    read_catalog(State(state), session).await
 }
 
 fn parse_levels(values: &[String]) -> Result<Vec<LogLevel>, ApiError> {

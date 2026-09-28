@@ -867,12 +867,30 @@ pub fn router(state: AppState) -> Router {
             "/observability/logs/settings",
             get(observability::read_settings),
         )
+        // The metric catalogue and the chart behind it (REQ-126, slice 2). Both are reads of
+        // telemetry, so both are `observability.read`; a caller who may see what happened may see
+        // what the instance counts.
+        .route(
+            "/observability/metrics/catalog",
+            get(observability::read_catalog),
+        )
+        .route(
+            "/observability/metrics/query",
+            get(observability::read_metric_query),
+        )
         .route_layer(guards::require(&state, "observability.read"));
 
-    let observability_write = Router::new().route(
-        "/observability/logs/settings",
-        put(observability::save_settings),
-    );
+    let observability_write = Router::new()
+        .route(
+            "/observability/logs/settings",
+            put(observability::save_settings),
+        )
+        // Re-seeding the catalogue is a write, not a read: it changes what the panel documents and
+        // it writes an audit row, so it takes `observability.manage` like the other mutations.
+        .route(
+            "/observability/metrics/sync",
+            post(observability::sync_catalog),
+        );
 
     let secrets_lease_redeem = Router::new().route(
         "/secret-leases/{id}/redeem",
@@ -1113,6 +1131,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
+        // The Prometheus exposition (REQ-126, slice 2). Unversioned and unauthenticated, beside
+        // the probes and for the same reason: a scraper has no session, and a versioned
+        // telemetry path is a path that has to be kept compatible with itself. The exposure is a
+        // deliberate, documented decision — the bodies it can emit are exactly the families in
+        // `omnion_telemetry::metrics::FAMILIES`, and nothing else has a route into them.
+        .route("/metrics", get(observability::metrics_exposition))
         .nest("/api/v1", v1)
         // The request id, the trace and the one line per request (REQ-126 slice 1). Installed on
         // the OUTER router, not on `v1`, so the probes are described too — a probe that fails is

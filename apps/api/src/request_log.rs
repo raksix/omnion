@@ -170,6 +170,37 @@ pub async fn request_context(
     .source(LogSource::Api)
     .build_with(&context);
 
+    // The two HTTP metric families, recorded from the SAME completed context the line is built
+    // from, so a family can never report a route the line disagrees with. The label is the route
+    // *template* — the request is explicit about this, and it is a cardinality rule as much as a
+    // privacy one: a literal id would make every request its own series.
+    //
+    // The status label is the class, not the code. A 4xx and a 5xx are the two things an operator
+    // alerts on, and a family keyed by the exact code has a series per code per route per method
+    // for no query anybody writes.
+    {
+        let route = context.route.clone().unwrap_or_else(|| "(unmatched)".to_owned());
+        let status = context.status.unwrap_or(0);
+        let class = if status >= 500 {
+            "5xx"
+        } else if status >= 400 {
+            "4xx"
+        } else {
+            "2xx"
+        };
+        let registry = omnion_telemetry::metrics::global();
+        registry.counter_add(
+            "omnion_http_requests_total",
+            &[route.as_str(), method.as_str(), class],
+            1.0,
+        );
+        registry.observe(
+            "omnion_http_request_duration_seconds",
+            &[route.as_str(), method.as_str()],
+            context.duration_ms.unwrap_or(0) as f64 / 1000.0,
+        );
+    }
+
     // A telemetry write that fails must not fail the request. It goes to stderr — the one channel
     // that does not depend on the store being writable.
     if let Err(error) = omnion_telemetry::store::write(&state_for_line.db().pool(), &entry).await {

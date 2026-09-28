@@ -49,6 +49,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     db.migrate().await?;
     tracing::info!("database ready and migrations applied");
 
+    // The metric registry's durable catalogue (REQ-126, slice 2). Seeded here, right after the
+    // migrations, because the panel's metric screen reads the table and not the registry: the
+    // table is the one place a module can add its own families without the core knowing their
+    // names in advance. A failure is logged and the boot continues — an instance with no
+    // catalogue still serves `/metrics`, and a metrics screen that is temporarily empty is a much
+    // smaller problem than an API that will not start.
+    if let Err(error) = seed_metric_catalog(&db).await {
+        tracing::warn!(error = %error, "the metric catalogue could not be seeded");
+    }
+
     bootstrap_admin(&config, &db).await?;
     seed_iam(&db).await?;
 
@@ -151,6 +161,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Driven by `OMNION_ADMIN_EMAIL` / `OMNION_ADMIN_PASSWORD` (docs/07-IAM.md): the account is
 /// created only when the `users` table is still empty, and the password is hashed here at
 /// boot — never stored or logged in plain text.
+/// Seed `obs_metric_catalog` from the registry, and publish the build info family.
+///
+/// `omnion_build_info` is the one family the process has to record itself: every other family
+/// is recorded by the layer that does the work, and this one exists so a dashboard can attribute
+/// a spike to the release it arrived in. The commit label is `env!("OMNION_COMMIT")` when the
+/// build set it and `unknown` when it did not — a made-up sha is worse than an honest `unknown`,
+/// because a wrong one points an incident review at a release that did not ship.
+async fn seed_metric_catalog(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pool = db.pool();
+    let declarations: Vec<omnion_telemetry::metric_catalog::FamilyDeclaration> =
+        omnion_telemetry::metrics::FAMILIES
+            .iter()
+            .map(|spec| omnion_telemetry::metric_catalog::FamilyDeclaration::from_spec(spec, 0))
+            .collect();
+    omnion_telemetry::metric_catalog::sync_from_registry(pool, &declarations).await?;
+
+    let version = env!("CARGO_PKG_VERSION").to_owned();
+    let commit = option_env!("OMNION_COMMIT").unwrap_or("unknown").to_owned();
+    let registry = omnion_telemetry::metrics::global();
+    registry.gauge_set("omnion_build_info", &[version.as_str(), commit.as_str()], 1.0);
+
+    // The families that were recorded before the first boot finished are marked as seen, so the
+    // screen's "never recorded" column stays meaningful instead of being zero for everything the
+    // process did during its own startup.
+    let seen: Vec<&str> = omnion_telemetry::metrics::FAMILIES
+        .iter()
+        .map(|spec| spec.name)
+        .collect();
+    omnion_telemetry::metric_catalog::mark_seen(pool, &seen).await?;
+    Ok(())
+}
+
 async fn bootstrap_admin(config: &Config, db: &Db) -> Result<(), omnion_identity::IdentityError> {
     match &config.admin {
         Some(admin) => {

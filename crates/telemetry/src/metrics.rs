@@ -673,6 +673,12 @@ impl Registry {
                 continue;
             }
             if set.len() >= BOUNDED_SET_CAP {
+                // Folded, and counted. The counter is shared with the series cap on purpose: both
+                // are "a sample was taken out of the series it asked for", and one counter an
+                // operator can alert on is worth more than two that each answer a narrower
+                // question. The value itself is not lost — it lands in the `other` series — so the
+                // number is samples folded, not samples dropped.
+                *guard.budget_events.entry(spec.name.to_owned()).or_insert(0) += 1;
                 out[index] = OTHER.to_owned();
                 continue;
             }
