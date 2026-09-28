@@ -18,8 +18,8 @@
 //! * [`provider`] — the adapter seam the purge worker dispatches through, and the
 //!   catalogue of adapters that actually ship.
 //!
-//! Slice 1 of REQ-011 is rules plus headers; the purge queue, worker and history
-//! (slice 2) are the persistence layer above [`provider`].
+//! The purge *adapters* are here; the queue, worker and history that drive them (slice 2)
+//! are the persistence layer in `apps/api` on top of [`provider`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -36,5 +36,8 @@ pub use error::CdnError;
 pub use etag::{etag_for_file, etag_for_page, if_none_match_hits, vary_for};
 pub use headers::{headers_for, surrogate_keys};
 pub use matcher::{CacheKey, PathPattern, PatternError, RequestShape};
-pub use provider::{AdapterInfo, Provider, Purge, PurgeOutcome, catalogue, is_shipped};
+pub use provider::{
+    AdapterInfo, CloudflareStyleProvider, GenericHttpProvider, Provider, ProviderSettings, Purge,
+    PurgeOutcome, catalogue, is_shipped, provider_for,
+};
 pub use rule::{Bypass, CacheRule, Decision, RuleError, decide};
