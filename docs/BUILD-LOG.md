@@ -2861,3 +2861,45 @@ Only then may the status line read `done`, and that close tick runs the w4 QA br
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+## 2026-09-28 — REQ-051 · the request id, one error state, and the panel that was stricter than its API
+
+**What.** The empty/loading/error box was the last thing left on REQ-051 and it turned out to be
+three defects wearing one label. The API's refusal carried a code, a message and sometimes a
+`details` object and **no request id**, so the "error state with retry button and request id" the
+box asks for had no id to show. `apps/api/src/request_id.rs` now stamps `x-request-id` on every
+response and `error.request_id` in the body, honouring an inbound id only when it is safe to
+reflect and replacing a hostile one rather than sanitising it. `lib/crm.ts` was also dropping
+`error.details`, which is why every field-level refusal rendered as a generic banner with nothing
+under the input it was about. `components/error-state.tsx` replaces six hand-rolled error blocks —
+three shapes, and two of them with no retry at all — and the board's empty column got a sentence
+and an action instead of a grey "No deals".
+
+**Then the QA pass told a different story.** It reported the *whole* CRM suite false: no company
+created, no contact created, no email refusal, no shortcut sheet. The first screenshot answered it.
+The QA owner is a **platform account** (`organization_id = NULL`) holding exactly one binding, and
+`crm-tenant.tsx` drew its organization chooser for that account, so no CRM screen ever issued a
+list read. `organization_of` in `apps/api/src/routes/crm.rs` does not do this — it falls back to
+the caller's single binding and refuses with `organization_ambiguous` only for two or more. The
+panel had re-decided the tenant rule independently and decided it more strictly. Two ticks of CRM
+acceptance evidence had been collected from a chooser, and every "proved in the browser" claim in
+the REQ was resting on it.
+
+**Proof.**
+- `cargo test -p omnion-api --lib request_id` — **10/10** (a hostile header value, the CSV
+  passthrough, both homes of the id, and the details object surviving the rewrite).
+- `cargo test -p omnion-module-crm --lib` — **172/172**.
+- `pnpm turbo run typecheck --force` — **2/2** (twice; a cached typecheck is not a typecheck).
+- Live, against the QA API: `GET /api/v1/crm/contacts?limit=1` unauthenticated answers **401** with
+  `x-request-id: 2ec164d9…` **and** `{"error":{…,"request_id":"2ec164d9…"}}` — the same value in
+  both homes, on a real refusal.
+- First QA pass (`20260928-141747`): 1006 clicks, 1068 screenshots, `crmStates` **23 of 27 false**,
+  and the 98 high findings are **all** `media/settings` — the main writer's surface, not this one.
+  The pass is re-running with the tenant fix as its first job.
+
+**Commits.** `63512c5` the request id · `c0e51fe` the client and one `ErrorState` for six screens ·
+`225425e` the REQ · `1e0af8f` the empty column · `8477c2f` the tenant fix.
+
+**Next.** The re-run decides whether REQ-051's error box closes, or whether the state sweep finds
+that a screen with a working error state still has a broken *load* state. Then the 390×844 pass and
+the keyboard sheet, which are the two boxes after it.
