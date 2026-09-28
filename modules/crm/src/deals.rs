@@ -970,8 +970,31 @@ pub async fn default_pipeline(pool: &PgPool, organization_id: Uuid) -> Result<Pi
         .push(" order by is_default desc, created_at limit 1");
 
     let found: Option<PipelineId> = builder.build_query_as().fetch_optional(pool).await?;
-    let id = found.ok_or(CrmError::NotFound("pipeline"))?.id;
+    let id = match found {
+        Some(row) => row.id,
+        // An organization with no pipeline is a state the board can repair, not a dead end. The
+        // trigger in `0043_crm_pipeline_for_every_organization.sql` makes it unreachable for an
+        // organization created through the product, but a database restored from a dump taken
+        // before that migration, or one whose triggers were not carried across, is still
+        // reachable — and `404 pipeline` for a tenant that simply has not sold anything yet is a
+        // sentence that explains nothing. The seed is the same function the trigger calls, so the
+        // pipeline created here is byte-for-byte the one a fresh install would have had.
+        None => seed_default_pipeline(pool, organization_id).await?,
+    };
     get_pipeline(pool, organization_id, id).await
+}
+
+/// Build the organization's default pipeline with the database's own seed function.
+///
+/// Deliberately one call and not a second Rust implementation of the stages: the trigger, the
+/// backfill in the migration and this repair all go through `crm_seed_default_pipeline`, so there
+/// is exactly one answer to "what stages does a new organization start with".
+async fn seed_default_pipeline(pool: &PgPool, organization_id: Uuid) -> Result<Uuid> {
+    let id: Option<Uuid> = sqlx::query_scalar("select crm_seed_default_pipeline($1)")
+        .bind(organization_id)
+        .fetch_one(pool)
+        .await?;
+    id.ok_or(CrmError::NotFound("pipeline"))
 }
 
 /// The per-stage totals of a board, in board order.

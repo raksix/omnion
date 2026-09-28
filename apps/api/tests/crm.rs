@@ -1627,6 +1627,90 @@ async fn the_default_pipeline_is_seeded_for_every_organization() {
     assert_eq!(pipelines.len(), 1, "an organization has exactly one default pipeline");
 }
 
+/// An organization created *the way the product creates one* owns a pipeline, so the board has
+/// columns before a single deal exists.
+///
+/// The rest of this file cannot see this bug, and the reason is worth writing down: the fixture
+/// calls `crm_seed_default_pipeline` by hand for its own organizations, so every board test in the
+/// suite starts from a pipeline that the product would never have created on its own. This test
+/// therefore seeds nothing — it inserts the organization row and immediately reads the board.
+///
+/// Before `0043` this answered `404 NotFound("pipeline")`: the seed function was written in
+/// `0022_crm.sql` and called once, in the statement that created it, so an organization born after
+/// that migration had no pipeline, no stages and no board. The stage editor was a screen over an
+/// empty table and the board was a 404.
+#[tokio::test]
+async fn an_organization_created_after_the_migration_still_owns_a_board() {
+    let Some((state, db)) = live_state().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&db, "unseeded").await;
+
+    // Nothing was seeded: this is the organization row and nothing else.
+    let pipelines: (i64,) =
+        sqlx::query_as("select count(*) from crm_pipelines where organization_id = $1")
+            .bind(organization_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("the pipelines must read");
+    assert_eq!(
+        pipelines.0, 1,
+        "creating an organization seeds its default pipeline, without anybody calling the seed"
+    );
+
+    // The stages come with it, in board order, so a column exists to drop a card into.
+    let stages: Vec<(String,)> = sqlx::query_as(
+        "select s.name from crm_pipeline_stages s \
+         join crm_pipelines p on p.id = s.pipeline_id \
+         where p.organization_id = $1 and p.is_default order by s.position",
+    )
+    .bind(organization_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("the stages must read");
+    let names: Vec<&str> = stages.iter().map(|row| row.0.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["New", "Qualified", "Proposal", "Negotiation", "Won", "Lost"],
+        "a new organization starts with the documented stages"
+    );
+
+    // And the board itself answers 200 with those columns, rather than 404.
+    let (owner_id, email) = create_account(&db, Some(organization_id), "Board Owner").await;
+    // `MANAGER_PERMISSIONS` is the suite's set that carries the deal keys; the granter is the
+    // account itself because this organization has no platform owner to hand them out.
+    grant(
+        &db,
+        organization_id,
+        owner_id,
+        owner_id,
+        &MANAGER_PERMISSIONS,
+    )
+    .await;
+    let token = login(&state, &email).await;
+
+    let board = call(
+        &state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=board&organization_id={organization_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        board.status,
+        StatusCode::OK,
+        "the board of a new organization answers, not 404: {}",
+        board.body
+    );
+    let columns = board.body["board"]["columns"]
+        .as_array()
+        .expect("the board carries its columns");
+    assert_eq!(columns.len(), 6, "six columns on a board with no deals yet");
+}
+
 /// The whole API answers for a signed-in account, with a request id, and the account is scoped.
 #[tokio::test]
 async fn the_surface_answers_a_platform_account_and_scopes_a_tenant_account() {
