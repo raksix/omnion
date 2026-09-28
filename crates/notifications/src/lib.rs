@@ -21,6 +21,7 @@ pub mod error;
 pub mod model;
 pub mod preference_store;
 pub mod preferences;
+pub mod push;
 pub mod store;
 pub mod vocabulary;
 
