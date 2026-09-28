@@ -44,6 +44,13 @@ use crate::state::AppState;
 
 use super::tenancy_members::organization_in_scope;
 
+/// Rows the Audit tab asks for when the panel does not say.
+const DEFAULT_ORGANIZATION_AUDIT_LIMIT: i64 = 50;
+
+/// The most rows one request may pull; a CSV of an unbounded feed is not a download, it is a
+/// denial of service with a `.csv` extension.
+const MAX_ORGANIZATION_AUDIT_LIMIT: i64 = 200;
+
 // ---------------------------------------------------------------------------------------------
 // Response bodies
 // ---------------------------------------------------------------------------------------------
@@ -648,6 +655,219 @@ fn ceiling_below_usage(
             "ai_monthly_micros",
         )
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Audit tab
+// ---------------------------------------------------------------------------------------------
+
+/// Query of the Audit tab: which rows, and in what shape.
+///
+/// The action filter is an *exact* name, chosen from the list the same response returns, rather
+/// than a free-text search. A substring search over a namespaced action (`organization.*`) is
+/// either a prefix the reader has to guess or a fragment that matches the wrong family, and the
+/// difference between "1 of 812 rows" and "812 of 812 rows" is exactly the kind of thing an
+/// audit screen must not get wrong quietly.
+#[derive(Debug, Deserialize)]
+pub struct OrganizationAuditQuery {
+    /// Page size, 1..=200 (default 50).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Action filter; matches an action or a `|`-separated alternative (`invited|released`).
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Actor filter: an account id, or `system` for the rows nobody performed.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Only rows from this date (RFC 3339) onwards.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// `csv` downloads the same rows the tab renders.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// One row of the Audit tab.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrganizationAuditEntry {
+    /// Row id.
+    pub id: i64,
+    /// Action name.
+    pub action: String,
+    /// `user`, `agent`, `service` or `system`.
+    pub actor_type: String,
+    /// The account that acted, when a person did.
+    pub actor_user_id: Option<Uuid>,
+    /// Their display name, so the feed is readable without a second request.
+    pub actor_name: Option<String>,
+    /// Kind of the target.
+    pub target_type: Option<String>,
+    /// Identifier of the target.
+    pub target_id: Option<String>,
+    /// Structured detail.
+    pub metadata: serde_json::Value,
+    /// Peer address, when known.
+    pub ip_address: Option<String>,
+    /// When it was recorded, RFC 3339.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Response of `GET /api/v1/organizations/{id}/audit`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrganizationAuditResponse {
+    /// The organization the feed belongs to.
+    pub organization_id: Uuid,
+    /// Rows, newest first.
+    pub entries: Vec<OrganizationAuditEntry>,
+    /// The distinct actions present in this organization's history, for the filter.
+    ///
+    /// Read from the tenant's own rows rather than from a fixed list, so the filter offers what
+    /// this organization has actually done — and it stops being a list of endpoints.
+    pub actions: Vec<String>,
+    /// How many rows the unfiltered feed holds, so a truncated list can say so.
+    pub total: i64,
+}
+
+/// `GET /api/v1/organizations/{id}/audit` — the tenant's own trail, as a feed or a CSV.
+///
+/// The tenant is resolved through `organization_in_scope` like every other route here, so another
+/// tenant's id is a `404` and its feed cannot be read by guessing. `audit.read` is the
+/// permission; an organization administrator who holds only `organizations.read` is refused,
+/// because a trail names every privileged act and is not a listing of members.
+pub async fn get_audit(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(organization_id): Path<Uuid>,
+    Query(query): Query<OrganizationAuditQuery>,
+) -> Result<Response, ApiError> {
+    let organization = organization_in_scope(&state, &current, organization_id).await?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_ORGANIZATION_AUDIT_LIMIT)
+        .clamp(1, MAX_ORGANIZATION_AUDIT_LIMIT);
+
+    // `system` is a *type*, not an account: the rows nobody performed. It is spelled the same way
+    // in the filter and in the column, so the panel needs no second control for it.
+    let is_system = query.actor.as_deref() == Some("system");
+    let actor = match query.actor.as_deref() {
+        None => None,
+        Some("system") => None,
+        Some(value) => Some(Uuid::parse_str(value).map_err(|_| {
+            // An `actor` that is neither `system` nor a uuid is a typo, not a filter that matches
+            // nothing: a silently empty feed reads as "this tenant has no history", which is the
+            // one reading this screen must never give by accident.
+            ApiError::bad_request(
+                "invalid_actor_filter",
+                format!("{value:?} is neither an account id nor the word `system`"),
+            )
+        })?),
+    };
+
+    let filter = omnion_audit::AuditFilter {
+        organization_id: Some(organization.id),
+        action: query.action.clone(),
+        actor_user_id: actor,
+        actor_type: is_system.then(|| "system".to_owned()),
+        since: match query.since.as_deref() {
+            Some(raw) => Some(
+                OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| {
+                        ApiError::bad_request(
+                            "invalid_since",
+                            format!("{raw:?} is not an RFC 3339 timestamp"),
+                        )
+                    })?,
+            ),
+            None => None,
+        },
+    };
+
+    let (rows, total) = omnion_audit::filtered(state.db().pool(), &filter, limit).await?;
+    let names = actor_names(state.db().pool(), &rows).await;
+
+    let entries: Vec<OrganizationAuditEntry> = rows
+        .into_iter()
+        .map(|row| OrganizationAuditEntry {
+            id: row.id,
+            action: row.action,
+            actor_type: row.actor_type,
+            actor_user_id: row.actor_user_id,
+            actor_name: row.actor_user_id.and_then(|id| names.get(&id).cloned()),
+            target_type: row.target_type,
+            target_id: row.target_id,
+            metadata: row.metadata,
+            ip_address: row.ip_address,
+            created_at: row.created_at,
+        })
+        .collect();
+
+    if query.format.as_deref() == Some("csv") {
+        return Ok(audit_csv(organization.slug.clone(), &entries));
+    }
+
+    let actions = omnion_audit::distinct_actions(state.db().pool(), organization.id).await?;
+
+    Ok(Json(OrganizationAuditResponse {
+        organization_id: organization.id,
+        entries,
+        actions,
+        total,
+    })
+    .into_response())
+}
+
+/// Display names for the actors in one page, resolved in a single query.
+///
+/// `fetch_all` of one row per distinct actor is a page-sized query; a per-row lookup would be
+/// the N+1 that makes an audit feed feel broken on a busy tenant.
+async fn actor_names(
+    pool: &sqlx::PgPool,
+    rows: &[omnion_audit::AuditEntry],
+) -> std::collections::HashMap<Uuid, String> {
+    let ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = rows.iter().filter_map(|row| row.actor_user_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    sqlx::query_as::<_, (Uuid, String)>(
+        "select id, coalesce(nullif(display_name, ''), email) from users where id = any($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect()
+}
+
+/// The Audit tab's CSV: the same rows, with the columns a reader would filter in a spreadsheet.
+fn audit_csv(slug: String, entries: &[OrganizationAuditEntry]) -> Response {
+    let mut csv = String::from("id,action,actor,actor_type,target_type,target_id,ip_address,created_at\n");
+    for entry in entries {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            entry.id,
+            csv_field(&entry.action),
+            csv_field(entry.actor_name.as_deref().unwrap_or_default()),
+            csv_field(&entry.actor_type),
+            csv_field(entry.target_type.as_deref().unwrap_or_default()),
+            csv_field(entry.target_id.as_deref().unwrap_or_default()),
+            csv_field(entry.ip_address.as_deref().unwrap_or_default()),
+            entry.created_at,
+        ));
+    }
+
+    let filename = format!(
+        "omnion-audit-{slug}-{}.csv",
+        OffsetDateTime::now_utc().date()
+    );
+    csv_response(csv, &filename, entries.len())
 }
 
 // ---------------------------------------------------------------------------------------------

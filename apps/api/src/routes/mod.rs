@@ -385,6 +385,17 @@ pub fn router(state: AppState) -> Router {
     let organization_invitation = delete(tenancy_members::revoke_invitation)
         .layer(guards::require(&state, "organizations.manage"));
 
+    // The `owner_approval` queue (REQ-005, slice 3). Reading it is the same `organizations.read`
+    // the Members tab already has; releasing is `organizations.manage` *plus* the owner check
+    // inside the handler, because "who may release" is a per-tenant fact the permission catalogue
+    // cannot express — a manager manages the organization and still cannot approve here.
+    let organization_invitation_queue =
+        get(tenancy_members::list_queued_invitations)
+            .layer(guards::require(&state, "organizations.read"));
+
+    let organization_invitation_approval = post(tenancy_members::approve_invitation)
+        .layer(guards::require(&state, "organizations.manage"));
+
     // Departments (REQ-005, slice 2). Reads ride `organizations.read`, writes
     // `organizations.manage`; binding a role to a department is an IAM change, so it asks for
     // `iam.bindings.manage` as well rather than being reachable by a tenant administrator alone.
@@ -453,6 +464,13 @@ pub fn router(state: AppState) -> Router {
 
     let organization_usage =
         get(tenancy_limits::get_usage).layer(guards::require(&state, "organizations.read"));
+
+    // The Audit tab. `audit.read`, not `organizations.read`: a trail names every privileged act
+    // in the tenant, and "can see the member list" is not a reason to be able to see it. The
+    // tenant is still resolved from the session, so the id in the path is a selection rather
+    // than an access decision.
+    let organization_audit =
+        get(tenancy_limits::get_audit).layer(guards::require(&state, "audit.read"));
 
     // The switcher's two routes are session-scoped by design (the request's own table says
     // "session only"): they only ever return the caller's own memberships and switch to one
@@ -967,9 +985,18 @@ pub fn router(state: AppState) -> Router {
         .route("/organizations/{id}/modules", organization_modules)
         .route("/organizations/{id}/limits", organization_limits)
         .route("/organizations/{id}/usage", organization_usage)
+        .route("/organizations/{id}/audit", organization_audit)
         .route(
             "/organizations/{id}/invitations/{invitation_id}",
             organization_invitation,
+        )
+        .route(
+            "/organizations/{id}/invitations/queue",
+            organization_invitation_queue,
+        )
+        .route(
+            "/organizations/{id}/invitations/{invitation_id}/release",
+            organization_invitation_approval,
         )
         .route("/sites", sites)
         .route("/sites/{id}", site)
