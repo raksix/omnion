@@ -34,6 +34,13 @@ import {
 import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
+import {
+  AuditPanel,
+  OPERATIONS_TABS,
+  RunsPanel,
+  VersionsPanel,
+  type OperationsTab,
+} from "@/features/automations/operations-views";
 import { LoadingTable } from "@/components/loading-table";
 import { useSession } from "@/lib/session";
 import {
@@ -319,6 +326,10 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
   const [lastRun, setLastRun] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
+  // Which of the three operations tabs is open (REQ-003 slice 4). The default is `runs`,
+  // because "what did this rule actually do?" is the question a person opens a rule to ask.
+  const [operationsTab, setOperationsTab] = useState<OperationsTab>("runs");
+
   // The gates parked runs are waiting on (REQ-003 slice 3). `null` is "not loaded yet" and
   // is drawn as a loading strip, not as an empty panel — an empty panel and an unanswered
   // question look identical otherwise, and one of them is a lie.
@@ -516,6 +527,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
     setHookUrl(null);
     setLastRun(null);
     setPayloadText(JSON.stringify(SAMPLE_PAYLOAD, null, 2));
+    setOperationsTab("runs");
     setDraft({ ...EMPTY_DRAFT, steps: EMPTY_DRAFT.steps.map((step) => ({ ...step })) });
   }, []);
 
@@ -526,6 +538,7 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
     setReport(null);
     setHookUrl(null);
     setPayloadText(JSON.stringify(SAMPLE_PAYLOAD, null, 2));
+    setOperationsTab("runs");
     setDraft({
       id: automation.id,
       name: automation.name,
@@ -550,6 +563,27 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
       setListeners([]);
     }
   }, []);
+
+  /**
+   * Re-open an editor from the server, addressed by id.
+   *
+   * A restore rewrites the rule underneath the open editor, and the open draft would then
+   * hold a definition the panel no longer agrees with — so the caller re-reads the rule
+   * rather than patching its own copy. Refusing a miss instead of throwing: the tab strip
+   * calls this from a click handler, and a rejection there is an unhandled promise.
+   */
+  const openEditById = useCallback(
+    async (automationId: string) => {
+      try {
+        openEdit(await fetchAutomation(automationId));
+      } catch (cause) {
+        setNotice(
+          cause instanceof ApiError ? cause.message : "That rule could not be re-read.",
+        );
+      }
+    },
+    [openEdit],
+  );
 
   // `/automations/[id]` opens that rule's editor as soon as the list has arrived. The id is
   // remembered so a later reload (a filter change, a save) does not fight the route.
@@ -1137,6 +1171,17 @@ export function AutomationsView({ openId }: { openId?: string } = {}) {
           onArmDelete={setConfirmDelete}
           runAsChoices={runAsAccounts}
           organizationId={organizationId}
+          operationsTab={operationsTab}
+          onOperationsTabChange={setOperationsTab}
+          onReloadRule={() => {
+            // A restore rewrites the rule underneath this editor, and the open draft would
+            // then hold a definition the panel no longer agrees with — so the rule is
+            // re-read from the server rather than patched from the panel's own copy.
+            if (draft.id) {
+              void openEditById(draft.id);
+            }
+            reload();
+          }}
         />
       ) : null}
 
@@ -1185,6 +1230,18 @@ type EditorProps = {
   runAsChoices: { id: string; label: string }[];
   /** The organization the rule belongs to, for the account list. */
   organizationId: string | null;
+  /** Which operations tab is open (REQ-003 slice 4). */
+  operationsTab: OperationsTab;
+  /** Open another one. */
+  onOperationsTabChange: (tab: OperationsTab) => void;
+  /**
+   * Re-read the open rule from the server.
+   *
+   * Called after a restore: a restore rewrites the rule, and the open draft would otherwise
+   * keep showing a definition the panel no longer agrees with — so the rule is re-read
+   * rather than patched from the panel's own copy.
+   */
+  onReloadRule: () => void;
 };
 
 /** The rule editor: trigger, conditions, actions, and the test-fire surface. */
@@ -1209,6 +1266,9 @@ function AutomationEditor({
   onArmDelete,
   runAsChoices,
   organizationId,
+  operationsTab,
+  onOperationsTabChange,
+  onReloadRule,
 }: EditorProps) {
   const eventFields = fieldsFor(catalogue, draft.event);
   const maxDepth = catalogue?.max_group_depth ?? 3;
@@ -2072,6 +2132,41 @@ function AutomationEditor({
             </ul>
           ) : null}
         </fieldset>
+      ) : null}
+
+      {/*
+        The operations tabs (REQ-003 slice 4). Drawn only for a rule that already exists: a
+        rule being written has no run history, no versions and no audit rows, and three tabs
+        that are all empty on a brand-new rule read as three broken features rather than as
+        a rule that has not been saved yet.
+      */}
+      {draft.id ? (
+        <section className="flex flex-col gap-2 border-t border-line pt-3">
+          <div role="tablist" aria-label="Rule operations" className="flex flex-wrap gap-1">
+            {OPERATIONS_TABS.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                role="tab"
+                aria-selected={operationsTab === tab.key}
+                data-automation-tab={tab.key}
+                onClick={() => onOperationsTabChange(tab.key)}
+                className={`rounded-md px-2.5 py-1 text-[12px] ${
+                  operationsTab === tab.key
+                    ? "bg-ink text-paper"
+                    : "border border-line text-muted hover:text-ink"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          {operationsTab === "runs" ? <RunsPanel automationId={draft.id} /> : null}
+          {operationsTab === "versions" ? (
+            <VersionsPanel automationId={draft.id} onRestored={onReloadRule} />
+          ) : null}
+          {operationsTab === "audit" ? <AuditPanel automationId={draft.id} /> : null}
+        </section>
       ) : null}
 
       {/* The sticky footer the plan asks for. */}

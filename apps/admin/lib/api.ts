@@ -3370,8 +3370,16 @@ export type AutomationExecution = {
   workflow_id: string;
   /** `running`, `completed`, `failed` or `cancelled`. */
   status: string;
-  /** How the run started. */
+  /**
+   * How the run started.
+   *
+   * The list endpoint names this `trigger` and the detail `trigger_kind`; both are mapped
+   * onto this one field by the fetcher below, so the panel never has to know which endpoint
+   * answered.
+   */
   trigger_kind: string;
+  /** The list endpoint's spelling of {@link trigger_kind}, normalised onto it. */
+  trigger?: string;
   /** When it started. */
   started_at: string;
   /** When it finished, if it has. */
@@ -3406,6 +3414,14 @@ export type AutomationRunStep = {
   output: Record<string, unknown> | null;
   /** The last failure's message. */
   error: string | null;
+  /**
+   * When the current attempt started, and when the step reached a terminal state.
+   *
+   * Both are what makes the trace's duration column honest: without them every step reads
+   * as having taken no time, which is indistinguishable from having run instantly.
+   */
+  started_at?: string | null;
+  finished_at?: string | null;
 };
 
 /** The run detail: the run, its steps and the payload it started from. */
@@ -4009,4 +4025,266 @@ export function fetchSsoProviders(): Promise<{
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * The automation operations surfaces (REQ-003 slice 4)
+ *
+ * Three reads an operator reaches for when a rule is not doing what its author expected —
+ * "what did this look like on Tuesday", "who changed it", "what would a starter look like" —
+ * and one write among them, the restore. The restore is a **definition write**, so the API
+ * guards it with `workflows.manage` and audits it exactly like a save; the reads carry
+ * `workflows.read`, the same power that reads the rule.
+ * ------------------------------------------------------------------------------------------- */
+
+/** One stored version of a rule, as the Versions tab lists it. */
+export type AutomationVersion = {
+  /** Version row id — what *Restore* is addressed by. */
+  id: string;
+  /** The rule it belongs to. */
+  automation_id: string;
+  /** The number it was written as. */
+  version: number;
+  /** `created`, `updated` or `restored`. */
+  change: string;
+  /**
+   * What changed, in words.
+   *
+   * `{ changed: [{ field, from, to }], count }`, and `{ first: true }` for the version a
+   * rule was born as — which has nothing to be different from and says so rather than
+   * reporting an empty change set that reads like "you changed nothing".
+   */
+  summary: AutomationVersionSummary;
+  /** The whole definition as it was written. */
+  definition: Record<string, unknown>;
+  /** Who wrote it; `null` when the account has since been deleted. */
+  created_by: string | null;
+  /** When, RFC 3339. */
+  created_at: string;
+  /** The version whose content was restored, when this row is a restore. */
+  restored_from: string | null;
+  /** `true` when the rule as it stands is this row. */
+  current: boolean;
+};
+
+/** One line of a version's diff: the field, and the two values it moved between. */
+export type AutomationVersionChange = {
+  /** Which field of the definition moved. */
+  field: string;
+  /** What it was. */
+  from: unknown;
+  /** What it became. */
+  to: unknown;
+};
+
+/**
+ * What one write changed.
+ *
+ * A fixed list of fields rather than a structural diff: a structural walk reports every key
+ * a later slice added as a change on every edit, and needs rewriting the first time the
+ * definition's shape changes — which is the thing that happens most often here.
+ */
+export type AutomationVersionSummary = {
+  /** The fields that moved, in the order the panel lists them. */
+  changed?: AutomationVersionChange[];
+  /** How many, derived from the list so the number cannot disagree with the rows. */
+  count?: number;
+  /** `true` for the version a rule was created as. */
+  first?: boolean;
+};
+
+/** The Versions tab payload. */
+export type AutomationVersionList = {
+  /** The rule the history belongs to. */
+  automation_id: string;
+  /** The number the rule is on now. */
+  current_version: number;
+  /** History, newest first. */
+  versions: AutomationVersion[];
+  /**
+   * `true` when the rule has no history row at all.
+   *
+   * A rule written before this feature shipped is *untracked*, not *unchanged*, and the tab
+   * says which one it is looking at.
+   */
+  untracked: boolean;
+};
+
+/** One version with its diff, as `GET …/versions/{id}` answers it. */
+export type AutomationVersionComparison = {
+  /** The version being looked at. */
+  version: AutomationVersion;
+  /** The number it was compared against, or `null` for the first version. */
+  compared_to: number | null;
+  /** What changed, in words. */
+  summary: AutomationVersionSummary;
+};
+
+/** A rule's definition history, newest first. */
+export function fetchAutomationVersions(
+  automationId: string,
+): Promise<AutomationVersionList> {
+  return request<AutomationVersionList>(
+    `/api/v1/automations/${encodeURIComponent(automationId)}/versions`,
+  );
+}
+
+/** One version, with what it changed against the one before it. */
+export function fetchAutomationVersion(
+  automationId: string,
+  versionId: string,
+): Promise<AutomationVersionComparison> {
+  return request<AutomationVersionComparison>(
+    `/api/v1/automations/${encodeURIComponent(automationId)}/versions/${encodeURIComponent(
+      versionId,
+    )}`,
+  );
+}
+
+/**
+ * Put a stored definition back.
+ *
+ * **Appends** rather than rewinds: the old content becomes the next version and
+ * `restored_from` says where it came from, so the history stays a line and "v3 → v1 → v3"
+ * never looks like a bug. The rule keeps its id, its run history and its webhook token.
+ *
+ * The body is empty by design — a caller that could send its own definition here would be
+ * able to write a rule the panel never validated.
+ */
+export function restoreAutomationVersion(
+  automationId: string,
+  versionId: string,
+): Promise<AutomationVersion> {
+  return request<AutomationVersion>(
+    `/api/v1/automations/${encodeURIComponent(automationId)}/versions/${encodeURIComponent(
+      versionId,
+    )}/restore`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/** One audit row, as the Audit tab lists it. */
+export type AutomationAuditEntry = {
+  /** Row id. */
+  id: number;
+  /** Stable action name, e.g. `automation.updated`. */
+  action: string;
+  /** Who did it, when a person did. */
+  actor_user_id: string | null;
+  /** `user`, `agent`, `service` or `system`. */
+  actor_type: string;
+  /** What was acted on. */
+  target_type: string | null;
+  /** Its id, as text. */
+  target_id: string | null;
+  /** Structured detail; never carries secrets. */
+  metadata: Record<string, unknown>;
+  /** When, RFC 3339. */
+  created_at: string;
+};
+
+/** Who changed this rule, and when. */
+export function fetchAutomationAudit(
+  automationId: string,
+  input: { limit?: number } = {},
+): Promise<{ automation_id: string; entries: AutomationAuditEntry[] }> {
+  const query = input.limit ? `?limit=${input.limit}` : "";
+  return request(`/api/v1/automations/${encodeURIComponent(automationId)}/audit${query}`);
+}
+
+/** One starter rule in the gallery. */
+export type AutomationTemplate = {
+  /** Stable key; the gallery's row identity. */
+  key: string;
+  /** Display name. */
+  name: string;
+  /** One line about what it does. */
+  description: string;
+  /** The category the gallery groups by. */
+  category: string;
+  /** The event the rule listens for. */
+  event: string;
+  /** How many conditions it starts with. */
+  condition_count: number;
+  /** How many actions it starts with. */
+  action_count: number;
+  /**
+   * What has to be filled in before it can run.
+   *
+   * Named rather than guessed: a template that says "needs a destination" is honest, and the
+   * request's criterion is that a starter is savable "without edits beyond its missing
+   * credentials".
+   */
+  requires: string[];
+  /** `false` when an action's host is not on the allow-list yet. */
+  installable: boolean;
+  /** Why it is not installable, when it is not. */
+  blocked_reason: string | null;
+  /** The request body `POST /api/v1/automations` takes, verbatim. */
+  body: Record<string, unknown>;
+};
+
+/** The six starter rules, in gallery order. */
+export function fetchAutomationTemplates(): Promise<{ templates: AutomationTemplate[] }> {
+  return request<{ templates: AutomationTemplate[] }>("/api/v1/automations/templates");
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * The run history and the two controls that act on a run
+ *
+ * A rule is a workflow whose trigger is an event, so the run history is the *workflow*
+ * execution list — inventing an automation-specific one would mean two answers to "what did
+ * this rule do last week". The two controls that repair a run (retry and resume) are the same
+ * write on purpose: re-running only the failed step would let a run whose middle failed march
+ * on to completion, which is not what "try that again" means to anybody reading a trace.
+ * ------------------------------------------------------------------------------------------- */
+
+/** One run of a rule, as the run **list** answers it (no steps). */
+export type AutomationRunSummary = {
+  /** Execution id — the trace route is addressed by it. */
+  id: string;
+  /** The rule that ran. */
+  workflow_id: string;
+  /** `running`, `completed`, `failed`, `cancelled` or `awaiting_approval`. */
+  status: string;
+  /** `manual`, `schedule` or `event`. */
+  trigger: string;
+  /** When it started, RFC 3339. */
+  started_at: string;
+  /** When it settled. */
+  finished_at: string | null;
+  /** The failing step's message, when the run failed. */
+  error: string | null;
+  /** How many steps the run carries. */
+  step_count?: number;
+};
+
+/**
+ * The run history of one rule, newest first.
+ *
+ * `step_count` is filled here when the API sent a step array and left `undefined` when it
+ * did not, so the column shows an em dash rather than a fabricated zero — "the API did not
+ * say" and "the run had no steps" are different facts.
+ */
+export async function fetchAutomationRunHistory(
+  automationId: string,
+  limit = 50,
+): Promise<AutomationRunSummary[]> {
+  const answer = await request<{
+    workflow_id: string;
+    executions: (AutomationRunSummary & { steps?: unknown[] })[];
+  }>(`/api/v1/workflows/${encodeURIComponent(automationId)}/executions?limit=${limit}`);
+
+  return answer.executions.map((run) => ({
+    ...run,
+    step_count: Array.isArray(run.steps) ? run.steps.length : undefined,
+  }));
+}
+
+/** Stop a running execution. */
+export function cancelAutomationRun(executionId: string): Promise<AutomationRunDetail> {
+  return request<AutomationRunDetail>(
+    `/api/v1/workflow-executions/${encodeURIComponent(executionId)}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
 }
