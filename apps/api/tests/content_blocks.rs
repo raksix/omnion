@@ -1631,22 +1631,47 @@ async fn two_revisions_compare_block_by_block() {
     )
     .await;
     assert_eq!(with_itself.status, StatusCode::BAD_REQUEST, "{}", with_itself.body);
-    assert_eq!(with_itself.body["code"], json!("diff_same_revision"));
+    assert_eq!(with_itself.body["error"]["code"], json!("diff_same_revision"));
 
-    // The first revision on a page has nothing before it. Saying so beats comparing it with
-    // the empty tree and reporting that every block was added.
+    // The FIRST revision on a page has nothing before it. It has to be looked up rather than
+    // assumed: creating the page already wrote revision 1, so the revision this test saved first
+    // is revision 2 and it does have a base.
+    let history = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/revisions"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(history.status, StatusCode::OK, "{}", history.body);
+    let first_on_page = history.body["revisions"]
+        .as_array()
+        .expect("revisions")
+        .iter()
+        .find(|entry| entry["revision_no"] == json!(1))
+        .expect("revision 1")
+        .clone();
     let first_diff = call(
         &fixture.state,
         request(
             Method::GET,
-            &format!("/api/v1/pages/{page_id}/revisions/{first_revision}/diff"),
+            &format!(
+                "/api/v1/pages/{page_id}/revisions/{}/diff",
+                first_on_page["id"].as_str().expect("an id")
+            ),
             Some(&editor),
             None,
         ),
     )
     .await;
     assert_eq!(first_diff.status, StatusCode::BAD_REQUEST, "{}", first_diff.body);
-    assert_eq!(first_diff.body["code"], json!("no_earlier_revision"));
+    assert_eq!(
+        first_diff.body["error"]["code"],
+        json!("no_earlier_revision")
+    );
 
     fixture.cleanup().await;
 }
@@ -1799,6 +1824,288 @@ async fn comparing_revisions_needs_the_pages_read_key() {
     // The editor passes the guard; the revision id is a page id, so the request fails later —
     // which is exactly the point being asserted (the guard, not the lookup).
     assert_ne!(allowed.status, StatusCode::FORBIDDEN, "{}", allowed.body);
+
+    fixture.cleanup().await;
+}
+
+/// The preview frame reads the DRAFT and hands back a tree the server filtered (REQ-063
+/// acceptance 14: "inline editing saves one draft revision per save, shows the revision number
+/// in the toast, and never publishes").
+///
+/// The frame is the one screen where the REQ's rule has to hold by construction rather than by
+/// convention: an author typing in a rendered page is one click away from putting a
+/// half-finished sentence in front of visitors. So the claims asserted here are the three that
+/// make that impossible — it reads the draft, not the published revision; a save is an ordinary
+/// `PATCH` that appends a draft revision; and there is no publish verb anywhere on the route.
+#[tokio::test]
+async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "frame").await;
+
+    let mut wide_only = block("text", json!({ "text": "Wide-only line" }));
+    wide_only["meta"] = json!({ "hide_on": "mobile" });
+    let everywhere = block("text", json!({ "text": "Every line" }));
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [wide_only, everywhere] })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+    // Publish, so the frame has BOTH revisions and the difference between them is observable.
+    let published = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/publish"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(published.status, StatusCode::OK, "{}", published.body);
+    let live_no = published.body["published"]["revision_no"].as_i64().expect("a number");
+
+    // An edit that is only a draft: the frame must show it, the site must not.
+    let draft_edit = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({
+                "blocks": [wide_only.clone(), everywhere.clone(), block("text", json!({ "text": "Draft only" }))]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(draft_edit.status, StatusCode::OK, "{}", draft_edit.body);
+    let draft_no = draft_edit.body["draft"]["revision_no"]
+        .as_i64()
+        .expect("a number");
+
+    let frame = |query: &str| {
+        call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("/api/v1/pages/{page_id}/preview{query}"),
+                Some(&editor),
+                None,
+            ),
+        )
+    };
+    let texts = |body: &Value| -> Vec<String> {
+        body["visible_blocks"]
+            .as_array()
+            .expect("the visible blocks are an array")
+            .iter()
+            .map(|entry| entry["props"]["text"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+
+    // 1. It reads the DRAFT. The published revision still has two blocks, so a frame that
+    //    answered from it would be missing the line the author just wrote.
+    let desktop = frame("").await;
+    assert_eq!(desktop.status, StatusCode::OK, "{}", desktop.body);
+    assert_eq!(desktop.body["revision_no"].as_i64(), Some(draft_no));
+    assert_eq!(
+        desktop.body["published_revision_no"].as_i64(),
+        Some(live_no),
+        "the frame names the live revision so the author sees their edit is not public"
+    );
+    assert!(
+        texts(&desktop.body).contains(&"Draft only".to_owned()),
+        "the frame must draw the draft: {:?}",
+        texts(&desktop.body)
+    );
+    assert_eq!(desktop.body["block_count"].as_i64(), Some(3));
+
+    // 2. The server filters, and it keeps BOTH trees. A frame that only received the filtered
+    //    tree could not tell a hidden block from a deleted one.
+    let phone = frame("?viewport=mobile").await;
+    assert_eq!(phone.status, StatusCode::OK, "{}", phone.body);
+    assert_eq!(phone.body["viewport"], json!("mobile"));
+    assert_eq!(
+        texts(&phone.body),
+        vec!["Every line", "Draft only"],
+        "the phone frame must not carry the block hidden from phones"
+    );
+    assert_eq!(phone.body["block_count"].as_i64(), Some(3));
+    assert_eq!(
+        phone.body["visible_count"].as_i64(),
+        Some(2),
+        "the stored tree and the phone render are different sizes, and the frame says so"
+    );
+    assert!(
+        phone.body["blocks"]
+            .to_string()
+            .contains("Wide-only line"),
+        "the unfiltered tree travels beside the filtered one"
+    );
+
+    // 3. An unreadable viewport word is the wide render, not a 400 and not a filter of its own:
+    //    the query addresses a display choice, so a typo must still produce a working frame.
+    let nonsense = frame("?viewport=tablet").await;
+    assert_eq!(nonsense.status, StatusCode::OK, "{}", nonsense.body);
+    assert_eq!(nonsense.body["viewport"], json!("desktop"));
+
+    fixture.cleanup().await;
+}
+
+/// An inline save appends exactly one draft revision and never moves the published one.
+///
+/// This is the criterion's real content: "saves one draft revision per save … and never
+/// publishes". A test that only checked the draft moved would pass against an implementation
+/// that also published, which is the failure that matters here.
+#[tokio::test]
+async fn an_inline_save_writes_one_draft_revision_and_leaves_the_page_alone() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "inline-save").await;
+
+    let first = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [block("text", json!({ "text": "First draft" }))] })),
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let before = first.body["draft"]["revision_no"].as_i64().expect("a number");
+
+    let published = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/publish"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(published.status, StatusCode::OK, "{}", published.body);
+    let live = published.body["published"]["revision_no"].as_i64().expect("a number");
+
+    // The frame's save is the page's own PATCH — there is no other verb on the route, and the
+    // method list says so: a preview that could publish would need one.
+    let inline_save = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [block("text", json!({ "text": "Typed in the frame" }))] })),
+        ),
+    )
+    .await;
+    assert_eq!(inline_save.status, StatusCode::OK, "{}", inline_save.body);
+    assert_eq!(
+        inline_save.body["draft"]["revision_no"].as_i64(),
+        Some(before + 1),
+        "one save appends exactly one revision"
+    );
+    assert_eq!(
+        inline_save.body["published"]["revision_no"].as_i64(),
+        Some(live),
+        "an inline save must not move the published revision"
+    );
+    assert!(
+        inline_save.body["published"]["blocks"]
+            .to_string()
+            .contains("First draft"),
+        "the live revision still carries its own text"
+    );
+
+    // The page as visitors get it is untouched, which is the assertion the draft/live split
+    // exists for.
+    let public = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/public/pages/inline-save?site={}", fixture.site_key),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(public.status, StatusCode::OK, "{}", public.body);
+    assert!(
+        public.body.to_string().contains("First draft")
+            && !public.body.to_string().contains("Typed in the frame"),
+        "an inline save is invisible to the public render"
+    );
+
+    // Only GET and PATCH belong to the frame. A POST here would be a publish with extra steps.
+    let published_again = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/preview"),
+            Some(&editor),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(
+        published_again.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the preview route must carry no verb that could publish"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// The frame carries the pages read key, like the screen it draws.
+#[tokio::test]
+async fn the_preview_frame_needs_the_pages_read_key() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "frame-guarded").await;
+    let member = fixture.member_token().await;
+
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/preview"),
+            Some(&member),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+
+    let allowed = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/preview"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::OK, "{}", allowed.body);
 
     fixture.cleanup().await;
 }
