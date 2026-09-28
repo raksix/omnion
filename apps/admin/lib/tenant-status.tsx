@@ -28,6 +28,18 @@ type TenantStatusValue = {
   isFrozen: boolean;
   /** Why writes are refused, in the panel's own words. */
   reason: string | null;
+  /**
+   * The modules the current tenant has switched off, by key (REQ-005, slice 4).
+   *
+   * Empty until the list has loaded, and empty for a platform account — which is the correct
+   * answer for one, not a placeholder: it belongs to no tenant and has no module decisions. The
+   * sidebar therefore renders in full for the first paint and, for a tenant with a module off,
+   * loses that entry once the answer arrives. A momentary extra link beats a sidebar that is
+   * empty until a request completes, which reads as a broken panel.
+   */
+  disabledModules: string[];
+  /** `true` when the module list is known — `false` only while loading. */
+  modulesLoaded: boolean;
   /** Re-read the list (a status change is made from the list screen). */
   reload: () => void;
 };
@@ -47,25 +59,38 @@ export function TenantStatusProvider({ children }: { children: React.ReactNode }
   const { status: sessionStatus } = useSession();
   const [organizations, setOrganizations] = useState<AccountOrganization[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const [disabledModules, setDisabledModules] = useState<string[]>([]);
+  const [modulesLoaded, setModulesLoaded] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
     if (sessionStatus !== "signed-in") {
       setOrganizations([]);
       setCurrentId(null);
+      setDisabledModules([]);
+      setModulesLoaded(true);
       return;
     }
     let cancelled = false;
+    setModulesLoaded(false);
     fetchMyOrganizations()
       .then((body) => {
         if (cancelled) return;
         setOrganizations(body.organizations);
         setCurrentId(body.current_organization_id);
+        setDisabledModules(body.disabled_modules ?? []);
+        setModulesLoaded(true);
       })
       .catch(() => {
         // A banner that cannot load must not take the panel down: the API is the enforcement
-        // point, and a person who hits a refused write is told the reason there.
-        if (!cancelled) setOrganizations([]);
+        // point, and a person who hits a refused write is told the reason there. The same is true
+        // of the module filter — a failure must not *hide* navigation, because a missing menu
+        // looks like a lost feature rather than a failed request.
+        if (!cancelled) {
+          setOrganizations([]);
+          setDisabledModules([]);
+          setModulesLoaded(true);
+        }
       });
     return () => {
       cancelled = true;
@@ -81,9 +106,11 @@ export function TenantStatusProvider({ children }: { children: React.ReactNode }
       status,
       isFrozen,
       reason: isFrozen ? (REASONS[status!] ?? REASONS.suspended!) : null,
+      disabledModules,
+      modulesLoaded,
       reload: () => setReloadToken((token) => token + 1),
     };
-  }, [organizations, currentId]);
+  }, [organizations, currentId, disabledModules, modulesLoaded]);
 
   return <TenantStatusContext.Provider value={value}>{children}</TenantStatusContext.Provider>;
 }

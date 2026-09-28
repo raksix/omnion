@@ -4023,6 +4023,8 @@ export async function acceptInvitation(
 export async function fetchMyOrganizations(): Promise<{
   current_organization_id: string | null;
   organizations: AccountOrganization[];
+  /** Module keys the current tenant has switched off (REQ-005, slice 4). */
+  disabled_modules: string[];
 }> {
   return request("/api/v1/me/organizations");
 }

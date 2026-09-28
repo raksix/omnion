@@ -4,9 +4,9 @@
  * The panel's frame: a sidebar with the sections, a sticky header with the current screen and
  * the site switcher, and the screen itself. Below `lg` the sidebar becomes a drawer.
  */
-import { useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { BarChart3, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
+import { BarChart3, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -15,15 +15,24 @@ import { OrganizationSwitcher } from "@/components/organization-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { TenantStatusBanner } from "@/components/tenant-status-banner";
 import { useSession } from "@/lib/session";
+import { useTenantStatus } from "@/lib/tenant-status";
 
-const NAV = [
+/** One sidebar entry. `module` is the switch that hides it (REQ-005, slice 4). */
+type NavItem = {
+  href: string;
+  label: string;
+  icon: LucideIcon;
+  module?: string;
+};
+
+const NAV: readonly NavItem[] = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
-  { href: "/media", label: "Media", icon: Images },
-  { href: "/analytics", label: "Analytics", icon: BarChart3 },
+  { href: "/media", label: "Media", icon: Images, module: "media" },
+  { href: "/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
-  { href: "/ai", label: "AI Hub", icon: Sparkles },
+  { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
@@ -38,7 +47,7 @@ const NAV = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
-] as const;
+];
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
@@ -83,7 +92,40 @@ export function AppShell({ title, description, children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { user, signOut } = useSession();
+  const { disabledModules, modulesLoaded } = useTenantStatus();
   const [navOpen, setNavOpen] = useState(false);
+
+  // A module switched off for this tenant takes its sidebar entry with it. The API refuses the
+  // module's routes with `403 organization.module.disabled` (REQ-005, slice 4), so leaving the
+  // link would be a menu entry that cannot be followed — the REQ's acceptance line asks for the
+  // entry to *hide*, and a hidden entry is the only version of this that is not a bug report.
+  //
+  // `modulesLoaded` is the load-bearing part: before the answer arrives the list is complete,
+  // because a sidebar that empties itself while a request is in flight and refills afterwards
+  // flickers, and a flicker in a menu reads as a broken panel rather than a pending one.
+  const hiddenModules = useMemo(
+    () => (modulesLoaded ? new Set(disabledModules) : new Set<string>()),
+    [disabledModules, modulesLoaded],
+  );
+  const navItems = useMemo(
+    () => NAV.filter((item) => !item.module || !hiddenModules.has(item.module)),
+    [hiddenModules],
+  );
+
+  // A person who was already inside a module when it was switched off is left on a screen whose
+  // menu entry no longer exists. Sending them to the overview is the honest answer: the screen
+  // they are on answers `403`, and a panel that shows a dead screen is worse than one that
+  // explains where they are.
+  const inHiddenModule = useMemo(
+    () =>
+      NAV.some(
+        (item) => item.module && hiddenModules.has(item.module) && isActive(item.href, pathname),
+      ),
+    [hiddenModules, pathname],
+  );
+  useEffect(() => {
+    if (inHiddenModule) router.replace("/");
+  }, [inHiddenModule, router]);
 
   const handleSignOut = async () => {
     await signOut();
@@ -106,7 +148,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
       </Link>
 
       <nav aria-label="Sections" className="flex flex-col gap-1">
-        {NAV.map((item) => {
+        {navItems.map((item) => {
           const active = isActive(item.href, pathname);
           const Icon = item.icon;
           return (

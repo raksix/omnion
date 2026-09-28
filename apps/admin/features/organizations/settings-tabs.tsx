@@ -89,10 +89,28 @@ function LoadFailure({ message, onRetry }: { message: string; onRetry: () => voi
 // Modules
 // ---------------------------------------------------------------------------------------------
 
-/** What switching a module off changes, in one sentence the operator can act on. */
+/**
+ * What switching this module off changes, in one sentence the operator can act on.
+ *
+ * Named per module rather than written once, because slice 4 made the sentence true and a true
+ * generic sentence is the *least* useful form of it: "hides its navigation" does not tell
+ * anybody which screen is about to disappear, and the person deciding is usually looking at a
+ * module they do not use. Each row names the entry that goes, so the consequence is legible
+ * before the switch is clicked rather than discovered after it.
+ */
 function consequenceOf(key: string, enabled: boolean): string {
+  const screen = {
+    "ai-hub": "the AI Hub section in the sidebar",
+    automation: "the automation routes, which the panel reaches through the command centre",
+    media: "the Media section and the media library screens",
+    analytics: "the Analytics section and every report it holds",
+    webhooks: "the webhook endpoints and their delivery history",
+  }[key];
+
   if (enabled) {
-    return "Switching this off hides its navigation and makes its API answer 403 naming the module.";
+    return screen
+      ? `Switching this off removes ${screen} from this organization, and its API answers 403 naming the module.`
+      : "Switching this off hides its navigation and makes its API answer 403 naming the module.";
   }
   return "Switching this on restores its navigation and its API.";
 }
