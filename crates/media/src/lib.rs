@@ -17,7 +17,9 @@ pub mod folder_store;
 pub mod folders;
 pub mod library;
 pub mod model;
+pub mod pixels;
 pub mod probe;
+pub mod transform;
 pub mod validation;
 pub mod versions;
 
@@ -38,7 +40,13 @@ pub use folders::{
 };
 pub use library::{delete_media, find_media, insert_media, list_media};
 pub use model::{MAX_FILENAME_LENGTH, MAX_UPLOAD_BYTES, Media, MediaFile, NewMedia};
+pub use pixels::{Box2, Transformed, apply, decode, target_box, transform_bytes};
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
+pub use transform::{
+    Derivative, Fit, ImageFormat, MAX_PRESET_DIMENSION, MAX_PRESET_NAME_LENGTH, NewPreset, Preset,
+    Recipe, derivative_prefix, validate_dimensions, validate_new, validate_preset_name,
+    validate_quality,
+};
 pub use validation::{
     INLINE_CONTENT_TYPES, ServePlan, normalize_content_type, object_key, sanitize_filename,
     serve_plan,
