@@ -416,6 +416,16 @@ fn post(uri: &str, body: Value, token: Option<&str>) -> Request<Body> {
     request(Method::POST, uri, token, Some(body))
 }
 
+/// A DELETE request, with a session cookie when one is given.
+fn delete(id: &str, token: &str) -> Request<Body> {
+    request(
+        Method::DELETE,
+        &format!("/api/v1/ai/providers/{id}"),
+        Some(token),
+        None,
+    )
+}
+
 /// A chat request: one user message.
 fn chat(model: Option<&str>) -> Value {
     let mut body = json!({
@@ -2403,18 +2413,54 @@ async fn the_probe_runner_samples_each_enabled_provider_and_announces_a_transiti
         assert!(metadata["to"].is_string(), "{metadata}");
     }
 
-    // A tick that changes nothing emits nothing: the second tick sees the same verdicts.
+    // A tick that changes nothing emits nothing — but the first steady state is the **third**
+    // tick, not the second, and that is the run rule earning its keep rather than a bug in the
+    // runner. `ok` needs `SUCCESSES_BEFORE_OK` (two) consecutive clean samples, so the live
+    // provider sits at `degraded` after tick 1 and only reaches `ok` on tick 2. The dead one
+    // needs three failures for the same reason. A runner that flipped a provider to `ok` after a
+    // single sample would announce a recovery nobody has evidence for, so this asserts the
+    // ladder instead of asserting a number that happens to be zero.
     let second = omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
     assert_eq!(
-        second.transitions, 0,
-        "an unchanged status must not announce itself every minute"
+        second.transitions, 1,
+        "tick 2 is the live provider's second clean sample, and only that one transitions: \
+         {second:?}"
+    );
+    let live_after_two =
+        omnion_ai_hub::health_store::health_summary(harness.db.pool(), live_id, 24)
+            .await
+            .expect("the summary reads");
+    assert_eq!(
+        live_after_two.status, "ok",
+        "two clean samples read as recovered"
+    );
+    let dead_after_two =
+        omnion_ai_hub::health_store::health_summary(harness.db.pool(), dead_id, 24)
+            .await
+            .expect("the summary reads");
+    assert_eq!(
+        dead_after_two.status, "degraded",
+        "two failures are not yet an outage — three are"
     );
 
-    // Three consecutive failures take the dead provider to `down`; the two before that are the
-    // rule the panel draws, computed from the samples the tick wrote.
-    for _ in 0..2 {
-        omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
-    }
+    // Now both verdicts have settled, and this is the tick that must be silent: a runner that
+    // announced an unchanged status every minute would fill the audit log with noise and make
+    // the real transitions unfindable.
+    let third = omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
+    assert_eq!(
+        third.transitions, 1,
+        "tick 3 is the dead provider's third failure, the last transition either provider makes: \
+         {third:?}"
+    );
+
+    let fourth = omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
+    assert_eq!(
+        fourth.transitions, 0,
+        "an unchanged status must not announce itself every minute: {fourth:?}"
+    );
+
+    // Three consecutive failures take the dead provider to `down`; the ladder above is the rule
+    // the panel draws, computed from the samples the tick wrote.
     let down = omnion_ai_hub::health_store::health_summary(harness.db.pool(), dead_id, 24)
         .await
         .expect("the summary reads");
@@ -2499,12 +2545,6 @@ async fn a_task_routed_chat_fails_over_and_a_pinned_one_does_not() {
         .await;
     assert_eq!(standby.status, StatusCode::CREATED, "{:?}", standby.body);
     let standby_id = Uuid::parse_str(standby.body["id"].as_str().expect("an id")).expect("a uuid");
-    let standby_model_id =
-        Uuid::parse_str(standby.body["models"][0]["id"].as_str().expect("an id")).expect("a uuid");
-    assert!(
-        standby_model_id != Uuid::nil(),
-        "the standby serves a real model, so the chain has something to answer with"
-    );
 
     // The preferred: ranked first, pointed at nothing, serving the same model key.
     let preferred = harness
@@ -2528,12 +2568,38 @@ async fn a_task_routed_chat_fails_over_and_a_pinned_one_does_not() {
     let preferred_id =
         Uuid::parse_str(preferred.body["id"].as_str().expect("an id")).expect("a uuid");
 
+    // The model ids come from the model registry, not from the provider body: `POST /ai/providers`
+    // answers with a **count** (`model_count`) and a provider's models are a separate collection,
+    // so asking the create response for a `models` array asks a question it never answers. This
+    // was the difference between a walk that ran and a walk that claimed to have run. The list
+    // is read **after** both providers exist, because a snapshot taken before `Preferred` was
+    // connected cannot contain Preferred's model.
+    let models = harness
+        .call(get("/api/v1/ai/models", Some(&owner_token)))
+        .await;
+    assert_eq!(models.status, StatusCode::OK, "{:?}", models.body);
+    let model_id_of = |provider_id: Uuid| -> Uuid {
+        models.body["models"]
+            .as_array()
+            .expect("a model list")
+            .iter()
+            .find(|model| model["provider_id"].as_str() == Some(&provider_id.to_string()))
+            .expect("a model this provider serves")["id"]
+            .as_str()
+            .expect("a model id")
+            .parse()
+            .expect("a uuid")
+    };
+    let standby_model_id = model_id_of(standby_id);
+    assert!(
+        standby_model_id != Uuid::nil(),
+        "the standby serves a real model, so the chain has something to answer with"
+    );
+
     // The installation default is the model a task-routed request with no name resolves to. It
     // has to be the **dead** provider's model, otherwise every task-routed call is already
     // served by the standby and the failover is never exercised at all.
-    let preferred_model_id =
-        Uuid::parse_str(preferred.body["models"][0]["id"].as_str().expect("an id"))
-            .expect("a uuid");
+    let preferred_model_id = model_id_of(preferred_id);
     let default_model = harness
         .call(request(
             Method::PATCH,
@@ -2695,5 +2761,169 @@ async fn a_task_routed_chat_fails_over_and_a_pinned_one_does_not() {
     );
 
     mock.task.abort();
+    harness.dispose().await;
+}
+
+/// Removing a provider is refused while it is the installation default, and the models and
+/// health samples a removable provider owns go with it.
+#[tokio::test]
+async fn the_default_provider_cannot_be_removed_and_a_removable_one_takes_its_rows_with_it() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let owner_token = token_of(&owner);
+
+    // Two providers, so the "set another default first" advice is actionable rather than a dead
+    // end: with only one provider connected the refusal would still be right, but here the
+    // operator has somewhere to move the default to.
+    let first = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Default provider",
+                "base_url": "http://127.0.0.1:1/v1",
+                "is_default": true,
+                "models": ["mock-small"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.body);
+    assert_eq!(
+        first.body["is_default"], true,
+        "the first provider is the default"
+    );
+    let first_id = first.body["id"].as_str().expect("an id").to_owned();
+    let first_uuid = Uuid::parse_str(&first_id).expect("a uuid");
+
+    let second = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Spare provider",
+                "base_url": "http://127.0.0.1:2/v1",
+                "models": ["mock-large", "mock-small"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{:?}", second.body);
+    let second_id = second.body["id"].as_str().expect("an id").to_owned();
+    let second_uuid = Uuid::parse_str(&second_id).expect("a uuid");
+
+    // A sample on the spare, so the cascade below has something to take with it.
+    omnion_ai_hub::health_store::record_sample(
+        harness.db.pool(),
+        omnion_ai_hub::health_store::NewSample {
+            provider_id: second_uuid,
+            ok: true,
+            latency_ms: 42,
+            http_status: Some(200),
+            error: None,
+        },
+    )
+    .await
+    .expect("the sample records");
+
+    // The **default** provider is refused, with a code the panel can branch on and a message
+    // that names the provider and the way out.
+    let refused = harness.call(delete(&first_id, &owner_token)).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "removing the default is a conflict, not a silent success: {:?}",
+        refused.body
+    );
+    assert_eq!(refused.body["error"]["code"], "provider_is_default");
+    let message = refused.body["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("Default provider") && message.contains("default"),
+        "the message names the provider and the fix: {message:?}"
+    );
+
+    // The refusal is the store's, so the row is still there and still default.
+    let survivors: Vec<(String, bool)> =
+        sqlx::query_as("select name, is_default from ai_providers where name = 'Default provider'")
+            .fetch_all(harness.db.pool())
+            .await
+            .expect("the row reads");
+    assert_eq!(
+        survivors,
+        vec![("Default provider".to_owned(), true)],
+        "a refused removal changes nothing"
+    );
+
+    // Moving the default makes the removal legal — the advice the message gave is the way out.
+    let promoted = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/providers/{second_id}"),
+            Some(&owner_token),
+            Some(json!({ "is_default": true })),
+        ))
+        .await;
+    assert_eq!(promoted.status, StatusCode::OK, "{:?}", promoted.body);
+
+    let removed = harness.call(delete(&first_id, &owner_token)).await;
+    assert_eq!(
+        removed.status,
+        StatusCode::NO_CONTENT,
+        "the same removal is accepted once the default moved: {:?}",
+        removed.body
+    );
+
+    // What the provider owned goes with it: the models it served and its health samples. The
+    // spare keeps both of its own, so the cascade is per provider and not a table wipe.
+    let (models, samples): (i64, i64) = sqlx::query_as(
+        "select
+            (select count(*) from ai_models where provider_id = $1),
+            (select count(*) from ai_provider_health where provider_id = $1)",
+    )
+    .bind(first_uuid)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the counts read");
+    assert_eq!(
+        (models, samples),
+        (0, 0),
+        "the removed provider leaves no rows behind"
+    );
+
+    let (spare_models, spare_samples): (i64, i64) = sqlx::query_as(
+        "select
+            (select count(*) from ai_models where provider_id = $1),
+            (select count(*) from ai_provider_health where provider_id = $1)",
+    )
+    .bind(second_uuid)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the counts read");
+    assert_eq!(
+        (spare_models, spare_samples),
+        (2, 1),
+        "another provider's models and samples are untouched"
+    );
+
+    // An id that never existed is still a plain `404` — the guard must not turn a missing row
+    // into a conflict.
+    let unknown = harness
+        .call(delete(&Uuid::new_v4().to_string(), &owner_token))
+        .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{:?}", unknown.body);
+
     harness.dispose().await;
 }
