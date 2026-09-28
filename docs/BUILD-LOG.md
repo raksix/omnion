@@ -1871,3 +1871,37 @@
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
 
+
+### Wave 5 · REQ-005 slice 2 — departments and department-scoped roles (`0c63b73`)
+
+- **What shipped.** The structure *inside* an organization. `crates/identity/src/departments.rs`
+  (the tree, validation, membership in a department, the ancestor expansion); the migration
+  `0028_organization_departments.sql` (`departments`, `department_members`, and the index the
+  department binding read needs); `/api/v1/organizations/{id}/departments` plus the member, role
+  and key sub-routes; the Departments tab in the panel, with its drawer, the
+  `?department=` parameter on `/iam/effective-permissions`, and the `organization-departments`
+  pass in `scripts/qa/walkthrough.cjs`. The tree is addressed by a **stable key**, because a
+  role binding stores a department as its `resource_id` string — a key that changed would
+  silently re-scope every role bound to it.
+- **Proof.** `cargo test -p omnion-identity -p omnion-permissions -p omnion-api --lib` →
+  **294 tests, 0 failures** (identity 123 · permissions 62 · api 109). `cargo test -p omnion-api
+  --test tenancy_departments` → **7 walks, 0 failures** against a live database
+  (`omnion_w5_dept_test`, the dev `omnion` database carries another branch's migration 19 and
+  refuses to migrate). `pnpm typecheck` → 2/2; `apps/admin` re-checked uncached with a direct
+  `tsc --noEmit` → 0 errors.
+- **Two defects the tests caught, both about the same word: inheritance.** The ancestor walk ran
+  *downward*, so a parent inherited its children's bindings instead of the other way round — the
+  exact opposite of what an operator binding a role at "division" means. And folding the
+  department load into `effective_permissions_for` had dropped the `scope.applies_to` filter
+  that `main` carried, which would have let a role bound to one site answer for a request
+  naming a different one. Both are now pinned by tests; the second by
+  `a_role_bound_to_one_site_never_answers_for_another`, because a unit test on `applies_to`
+  proves the matcher and not that the resolver still calls it.
+- **A third, found by reading the response rather than the assertion.** The tree read built its
+  parent map from each row's `parent_id`, which stored the *child's* key under the parent's id —
+  so every department reported itself as its own parent, and the row the test read said
+  `parent_key: "beta"`. A green `order` assertion sat right next to it and hid the problem.
+- **Next.** Slice 3: `organization_settings`, `organization_modules`, `organization_limits`, the
+  plan and usage endpoints, limit enforcement on invite/site/AI, and the Settings, Modules and
+  Billing tabs. That slice also closes the "backfill is proven" line, whose settings and limits
+  half is still open.

@@ -2,6 +2,8 @@
 
 > **Status:** in-progress · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
+>
+> Slices 1 and 2 shipped (`0c63b73` for slice 2).
 
 ## Request
 
@@ -160,7 +162,8 @@ automation engine uses; the token never appears in an event payload.
 - [x] Removing the last owner is refused by the API and disabled in the UI with the reason shown.
 - [x] A member with `content.pages.read` in organization A gets 404 for a page id of organization B, and cannot see B's audit feed.
 - [ ] A platform account can list every organization and must send `organization_id` on a write; omitting it is a 400 naming the field.
-- [ ] Department CRUD works, a department cannot become its own ancestor, and a role bound at department scope appears in `/iam/effective-permissions` for its members.
+- [x] Department CRUD works, a department cannot become its own ancestor, and a role bound at department scope appears in `/iam/effective-permissions` for its members.
+  _Proven by the 7 HTTP walks in `apps/api/tests/tenancy_departments.rs`: the cycle refused as `department_cycle`, the role resolving for a member and not for an outsider, the grant gone once the member leaves, a parent's binding reaching its child until it is archived, and another tenant's department a 404._
 - [ ] Switching a module off for an organization hides its navigation entry and makes its API answer 403 naming the module; switching it back on restores both.
 - [ ] Invite policy `closed` refuses new invitations; `self_serve` lets any member with `organizations.manage` invite; `owner_approval` queues the invitation until the owner releases it.
 - [ ] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
