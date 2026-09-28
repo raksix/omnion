@@ -595,7 +595,16 @@ pub async fn read_metric_query(
 
     let series = metrics::global().series_of(spec.name, window);
     let labels: Vec<String> = spec.labels.iter().map(|label| (*label).to_owned()).collect();
-    let promql = promql_for(spec, &series.first().map(|s| s.labels.clone()).unwrap_or_default());
+    // The PromQL is built from the first *real* series, never from the overflow bucket. The
+    // overflow series is sorted into the list like any other, and an operator who clicks "copy as
+    // PromQL" and pastes `omnion_circuit_state{provider="other"}` into a dashboard has been handed
+    // the aggregate of everything the cap folded — which is a number they did not ask for and
+    // cannot tell apart from a series the operator configured themselves.
+    let representative = series
+        .iter()
+        .find(|snapshot| !snapshot.labels.iter().all(|value| value == "other"))
+        .or_else(|| series.first());
+    let promql = promql_for(spec, &representative.map(|s| s.labels.clone()).unwrap_or_default());
 
     Ok(Json(MetricQueryResponse {
         metric: spec.name.to_owned(),
