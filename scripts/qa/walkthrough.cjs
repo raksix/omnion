@@ -5039,8 +5039,14 @@ async function runBlockEditorDepth(page, report) {
   // The count the author asked for and the structure the payload holds must agree, because the
   // renderer reads one and the validator checks the other.
   steps.columnCountGrew = Number(steps.columnCountAfterAdd) === Number(steps.columnCount) + 1;
-  steps.columnsStillValid = (await page.locator("[data-block-columns] [data-block-column]").count())
-    === Number(steps.columnCountAfterAdd);
+  // Scoped to the FIRST Columns block, not the page. Two Columns blocks exist by this point
+  // (one from the insert sequence, one from the nesting test) and their columns are drawn in
+  // separate frames, so counting the page's `[data-block-column]` compares this block's count
+  // against the sum of both — a number that can only ever be false, which is what it was.
+  const firstColumnsFrame = page.locator("[data-block-columns]").first();
+  steps.columnsStillValid =
+    (await firstColumnsFrame.locator("[data-block-column]").count()) ===
+    Number(steps.columnCountAfterAdd);
   steps.noColumnErrors = (await blockStatus("data-block-errors")) === "0";
   await shot(page, "page-block-editor-columns-three");
   note("built a nested columns layout");
