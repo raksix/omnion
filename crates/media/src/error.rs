@@ -112,4 +112,23 @@ pub enum MediaError {
         /// What the encoder said.
         reason: String,
     },
+    /// A duplicate merge cannot be performed, and says why.
+    ///
+    /// A `409` at the wire, not a `400`: the request was well-formed and every value in it was
+    /// legal — the library simply does not have the group the caller believes it has. Reporting
+    /// it as a bad request would tell an operator their form was wrong when their click raced a
+    /// colleague.
+    #[error("the duplicate group cannot be merged: {reason}")]
+    MergeRefused {
+        /// What is wrong, in a sentence the report screen can show.
+        reason: String,
+    },
+    /// A cross-site report named more sites than one pass may walk.
+    #[error("a cross-site report may cover at most {limit} sites; {requested} were named")]
+    TooManySites {
+        /// The bound.
+        limit: usize,
+        /// What the caller asked for.
+        requested: usize,
+    },
 }

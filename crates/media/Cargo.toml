@@ -10,6 +10,9 @@ publish = false
 image.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Share links (REQ-010 slice 3) mint their bearer token from the OS CSPRNG here rather than in
+# the route, so the width and the source cannot drift apart.
+rand.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
