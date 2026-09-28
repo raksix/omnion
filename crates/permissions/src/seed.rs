@@ -86,6 +86,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.delete",
             "media.manage",
             "media.settings.manage",
+            "media.scan.manage",
             "ai.providers.read",
             "ai.chat",
             "workflows.read",

@@ -108,10 +108,16 @@ pub struct MediaFile {
     pub scan_status: String,
     /// What the scanner reported.
     pub scan_detail: String,
+    /// When the scanner last wrote `scan_status`; null means it never has.
+    pub scanned_at: Option<OffsetDateTime>,
+    /// The engine name the scanner reported for the last verdict.
+    pub scan_engine: Option<String>,
     /// How many versions the file has.
     pub version_count: i32,
     /// Whether the public renderer may read it without a session.
     pub is_public: bool,
+    /// Whether a legal hold is on the file: no retention sweep may remove it (REQ-010).
+    pub legal_hold: bool,
 }
 
 impl MediaFile {
@@ -227,8 +233,11 @@ mod tests {
             exif: Some(json!({ "orientation": 6 })),
             scan_status: "clean".to_owned(),
             scan_detail: String::new(),
+            scanned_at: Some(OffsetDateTime::UNIX_EPOCH),
+            scan_engine: Some("stub".to_owned()),
             version_count: 1,
             is_public: false,
+            legal_hold: false,
         }
     }
 
