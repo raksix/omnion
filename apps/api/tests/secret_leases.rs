@@ -191,7 +191,11 @@ async fn login(state: &AppState, email: &str) -> String {
         )
         .await
         .expect("router must answer");
-    assert_eq!(response.status(), StatusCode::OK, "the account must sign in");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the account must sign in"
+    );
     response
         .headers()
         .get(header::SET_COOKIE)
@@ -270,7 +274,8 @@ async fn mint_key(
         "a deployment key must be mintable: {}",
         response.raw
     );
-    let id: Uuid = serde_json::from_value(response.body["id"].clone()).expect("an id must come back");
+    let id: Uuid =
+        serde_json::from_value(response.body["id"].clone()).expect("an id must come back");
     let value = response.body["value"]
         .as_str()
         .expect("the value must be in the create response and only there")
@@ -316,7 +321,10 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     let (member_id, member_email) = create_account(&db, Some(organization_id)).await;
     let owner_token = login(&state, &owner_email).await;
     let member_token = login(&state, &member_email).await;
-    assert!(!owner_token.is_empty(), "the owner must hold a session token");
+    assert!(
+        !owner_token.is_empty(),
+        "the owner must hold a session token"
+    );
 
     let payment_secret = sealed_secret(
         &db,
@@ -655,7 +663,9 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "a live key's value is equally unreadable afterwards"
     );
     assert!(
-        expired_row["fingerprint"].as_str().is_some_and(|f| f.starts_with("omnion-dk-")),
+        expired_row["fingerprint"]
+            .as_str()
+            .is_some_and(|f| f.starts_with("omnion-dk-")),
         "the panel offers a fingerprint an operator can compare without the value"
     );
 
@@ -704,7 +714,10 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     )
     .await;
     assert_eq!(live_lease.status, StatusCode::CREATED, "a lease must issue");
-    let live_token = live_lease.body["token"].as_str().expect("a token").to_owned();
+    let live_token = live_lease.body["token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
 
     let revoked = call(
         &state,
@@ -755,7 +768,10 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     .await;
     let delete_live = call(
         &state,
-        delete(&format!("/api/v1/deployment-keys/{}", doomed.0), &owner_token),
+        delete(
+            &format!("/api/v1/deployment-keys/{}", doomed.0),
+            &owner_token,
+        ),
     )
     .await;
     assert!(
@@ -799,10 +815,16 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     )
     .await;
     let prod_lease_id: Uuid = serde_json::from_value(prod_lease.body["id"].clone()).expect("an id");
-    let prod_lease_token = prod_lease.body["token"].as_str().expect("a token").to_owned();
+    let prod_lease_token = prod_lease.body["token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
     let staging_lease_id: Uuid =
         serde_json::from_value(staging_lease.body["id"].clone()).expect("an id");
-    let staging_lease_token = staging_lease.body["token"].as_str().expect("a token").to_owned();
+    let staging_lease_token = staging_lease.body["token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
     let _ = live_token; // issued above, superseded by the pair this assertion is about
 
     // The event is written the way a deployment centre by another writer would write it: nobody
@@ -810,7 +832,9 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     let event_id: i64 = sqlx::query_scalar(
         "insert into events (name, payload) values ('deployment.started', $1) returning id",
     )
-    .bind(json!({ "environment": "production", "release": format!("v{}", Uuid::new_v4().simple()) }))
+    .bind(
+        json!({ "environment": "production", "release": format!("v{}", Uuid::new_v4().simple()) }),
+    )
     .fetch_one(db.pool())
     .await
     .expect("the deployment event must be recorded");
@@ -1059,13 +1083,7 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     // An anonymous caller cannot reach the list or the redemption, whatever it presents.
     let anonymous = call(
         &state,
-        request(
-            Method::GET,
-            "/api/v1/secret-leases",
-            None,
-            None,
-            None,
-        ),
+        request(Method::GET, "/api/v1/secret-leases", None, None, None),
     )
     .await;
     assert_eq!(

@@ -114,7 +114,9 @@ const CONSUMER_BATCH: i64 = 100;
 ///   table;
 /// * the cursor moves only after the revocation succeeded, so a failed tick is retried rather
 ///   than skipped.
-pub async fn revoke_leases_for_deploys(state: &AppState) -> Result<usize, omnion_secrets::SecretsError> {
+pub async fn revoke_leases_for_deploys(
+    state: &AppState,
+) -> Result<usize, omnion_secrets::SecretsError> {
     let pool = state.db().pool();
     // A database that predates this migration has no cursor table at all. That is not an
     // error worth failing a tick over: the install simply has no deployment-driven revocation
@@ -197,10 +199,7 @@ pub async fn revoke_leases_for_deploys(state: &AppState) -> Result<usize, omnion
 }
 
 /// Move the consumer's cursor past one event.
-async fn advance(
-    pool: &sqlx::PgPool,
-    event_id: i64,
-) -> Result<(), omnion_secrets::SecretsError> {
+async fn advance(pool: &sqlx::PgPool, event_id: i64) -> Result<(), omnion_secrets::SecretsError> {
     sqlx::query(
         "update event_consumer_cursors \
             set last_event_id = $2, processed = processed + 1, updated_at = now() \

@@ -714,10 +714,7 @@ pub async fn delete_deployment_key(pool: &PgPool, id: Uuid) -> Result<()> {
 }
 
 /// One deployment key by id, or `None`.
-pub async fn find_deployment_key(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<Option<DeploymentKeyRow>> {
+pub async fn find_deployment_key(pool: &PgPool, id: Uuid) -> Result<Option<DeploymentKeyRow>> {
     let all = list_deployment_keys(pool).await?;
     Ok(all.into_iter().find(|key| key.id == id))
 }
@@ -872,8 +869,27 @@ pub async fn record_use(
 pub async fn list_key_uses(
     pool: &PgPool,
     key_id: Uuid,
-) -> Result<Vec<(String, Option<Uuid>, String, Option<String>, String, OffsetDateTime)>> {
-    let rows = sqlx::query_as::<_, (String, Option<Uuid>, String, Option<String>, String, OffsetDateTime)>(
+) -> Result<
+    Vec<(
+        String,
+        Option<Uuid>,
+        String,
+        Option<String>,
+        String,
+        OffsetDateTime,
+    )>,
+> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<Uuid>,
+            String,
+            Option<String>,
+            String,
+            OffsetDateTime,
+        ),
+    >(
         "select action, lease_id, identity, address, result, created_at \
          from deployment_key_uses where key_id = $1 order by created_at desc limit 200",
     )
@@ -941,7 +957,9 @@ pub async fn secret_name_for(pool: &PgPool, secret_id: Uuid) -> Result<String> {
 
 /// Whether a credential is one a deployment key could ever lease (it exists and is typed).
 pub async fn credential_exists(pool: &PgPool, secret_id: Uuid) -> Result<bool> {
-    Ok(find_credential(pool, secret_id).await.is_ok_and(|found| found.is_some()))
+    Ok(find_credential(pool, secret_id)
+        .await
+        .is_ok_and(|found| found.is_some()))
 }
 
 #[cfg(test)]
@@ -952,16 +970,28 @@ mod tests {
     fn a_ttl_is_clamped_into_the_documented_window() {
         assert_eq!(clamp_ttl(None).expect("the default is valid"), DEFAULT_TTL);
         assert_eq!(clamp_ttl(Some(60)).expect("a minute is valid"), 60);
-        assert_eq!(clamp_ttl(Some(MAX_TTL * 10)).expect("too long is clamped"), MAX_TTL);
-        assert!(clamp_ttl(Some(5)).is_err(), "a five second lease is refused");
+        assert_eq!(
+            clamp_ttl(Some(MAX_TTL * 10)).expect("too long is clamped"),
+            MAX_TTL
+        );
+        assert!(
+            clamp_ttl(Some(5)).is_err(),
+            "a five second lease is refused"
+        );
     }
 
     #[test]
     fn a_use_cap_is_clamped_and_zero_is_refused() {
         assert_eq!(clamp_uses(None).expect("the default is valid"), MIN_USES);
         assert_eq!(clamp_uses(Some(3)).expect("three is valid"), 3);
-        assert_eq!(clamp_uses(Some(999)).expect("too many is clamped"), MAX_USES);
-        assert!(clamp_uses(Some(0)).is_err(), "an unredeemable lease is refused");
+        assert_eq!(
+            clamp_uses(Some(999)).expect("too many is clamped"),
+            MAX_USES
+        );
+        assert!(
+            clamp_uses(Some(0)).is_err(),
+            "an unredeemable lease is refused"
+        );
     }
 
     #[test]
@@ -1006,8 +1036,14 @@ mod tests {
         let key = key_with("smtp.production,payments.*");
         assert!(scope_allows(&key, "smtp.production"));
         assert!(scope_allows(&key, "payments.stripe"));
-        assert!(!scope_allows(&key, "payments"), "a family match needs a member");
-        assert!(!scope_allows(&key, "storage.s3"), "an unlisted credential is refused");
+        assert!(
+            !scope_allows(&key, "payments"),
+            "a family match needs a member"
+        );
+        assert!(
+            !scope_allows(&key, "storage.s3"),
+            "an unlisted credential is refused"
+        );
     }
 
     #[test]
@@ -1069,16 +1105,24 @@ mod tests {
             last_address: None,
             version: 1,
         };
-        assert!(lease_refusal(&lease, now).is_none(), "a fresh lease is usable");
+        assert!(
+            lease_refusal(&lease, now).is_none(),
+            "a fresh lease is usable"
+        );
 
         lease.uses = 1;
-        assert!(lease_refusal(&lease, now).is_some(), "a spent lease is refused");
+        assert!(
+            lease_refusal(&lease, now).is_some(),
+            "a spent lease is refused"
+        );
 
         // Revocation outranks the budget: the operator's reason is the fact worth keeping.
         lease.revoked_at = Some(now);
-        assert!(lease_refusal(&lease, now)
-            .expect("revoked is refused")
-            .to_string()
-            .contains("revoked"));
+        assert!(
+            lease_refusal(&lease, now)
+                .expect("revoked is refused")
+                .to_string()
+                .contains("revoked")
+        );
     }
 }
