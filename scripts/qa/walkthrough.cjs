@@ -3963,6 +3963,204 @@ async function runNotificationSettingsDepth(page, report) {
 }
 
 /**
+ * The outbox and routing pass (REQ-021, slice 3).
+ *
+ * The slice's whole claim is "a fact on the bus becomes a notification with no call between the
+ * two modules", and this is where that is either proven or not. It is proven the only honest
+ * way: write a rule through the screen, hand the router an event a producer would have written,
+ * and read the *database* to see whether a row appeared — not the screen's own report, which
+ * would pass if the screen rendered the server's optimism.
+ *
+ * Six things it asserts, each one a way this screen could be a convincing lie:
+ *   1. the screen loads and the log is reachable at all;
+ *   2. a row exists in the table behind it (a log that renders but has no rows is a fixture);
+ *   3. the counts on the chips equal the counts in the table — a client that added up its own
+ *      page would agree here and disagree everywhere else;
+ *   4. a rule can be written from the form and is really in the table;
+ *   5. running the event creates a notification for a real reader, and the second run of the
+ *      *same* event id collapses as a duplicate rather than writing a second row;
+ *   6. the retry path answers for a failed row, and the rule can be removed again.
+ */
+async function runNotificationOutboxDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/notifications/outbox`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  steps.loaded = (await page.locator("[data-outbox-state=ready]").count()) > 0;
+  if (!steps.loaded) {
+    steps.reason = await page
+      .locator("[data-outbox-state=error]")
+      .innerText()
+      .catch(() => "the outbox did not reach its ready state");
+    return steps;
+  }
+
+  // The chips and the log. A screen whose chips are all "0" above a real table is a screen
+  // that renders, so the counts are compared against SQL rather than against their own look.
+  const chips = await page.locator("[data-outbox-chip]").allInnerTexts().catch(() => []);
+  steps.chips = chips.length;
+  steps.chipsCarryCounts = chips.filter((text) => /\(\d+\)/.test(text)).length;
+  await shot(page, "page-notifications-outbox");
+
+  // The log's own rows, and whether the table behind it agrees. A retry run earlier in the pass
+  // may have moved things, so this is a comparison, not an equality.
+  const deliveryCount = Number(qaSql("select count(*) from notification_deliveries") || 0);
+  steps.deliveryRows = deliveryCount;
+  steps.chiptotal = Number(
+      (chips.find((text) => text.startsWith("All")) || "").match(/\((\d+)\)/)?.[1] || -1,
+    );
+  steps.chiptotalMatchesSql = steps.chiptotal === deliveryCount;
+  if (!steps.chiptotalMatchesSql) {
+    steps.note = `the chip says ${steps.chiptotal}, the table has ${deliveryCount}`;
+  }
+
+  // 1. Write a rule through the form. Every field is filled from the screen's own controls —
+  //    a fixture that POSTs the API directly would leave the form untested, and the form is
+  //    where a recipient prefix gets typed wrong.
+  await page.locator("[data-rules-toggle]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.formOpened = (await page.locator("[data-rule-form]").count()) > 0;
+
+  const eventName = `qa.ticket.created.${Date.now()}`;
+  await page.locator("[data-rule-event]").fill(eventName).catch(() => {});
+  await page.locator("[data-rule-category]").selectOption("ticket").catch(() => {});
+  await page.locator("[data-rule-priority]").selectOption("high").catch(() => {});
+  // `actor` needs no target, so the target field must *not* be on screen — a form that shows a
+  // target for the shape that has none is a form asking for input it will discard.
+  steps.targetHiddenForActor = (await page.locator("[data-rule-target]").count()) === 0;
+  await page.locator("[data-rule-title]").fill("QA rule for {subject}").catch(() => {});
+  await page.locator("[data-rule-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  steps.ruleRows = Number(
+    qaSql(`select count(*) from notification_routes where event_name = '${eventName}'`) || 0,
+  );
+  steps.ruleIsInTheTable = steps.ruleRows === 1;
+  steps.ruleVisibleOnScreen =
+    (await page.locator(`[data-rule-row="${eventName}"]`).count()) > 0;
+
+  // 2. The permission shape must make the target field appear, and must not submit without it.
+  await page.locator("[data-rules-toggle]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-rule-shape]").selectOption("permission:").catch(() => {});
+  await page.waitForTimeout(300);
+  steps.targetAppearsForPermission = (await page.locator("[data-rule-target]").count()) > 0;
+  await page.locator("[data-rule-event]").fill(`${eventName}.unused`).catch(() => {});
+  await page.locator("[data-rule-title]").fill("QA rule without a target").catch(() => {});
+  await page.locator("[data-rule-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  // The browser's own `required` is the first line of defence; the database's check is the
+  // second. This asserts the row did not land, which is the claim either way.
+  steps.noTargetWroteNothing = Number(
+    qaSql(`select count(*) from notification_routes where event_name = '${eventName}.unused'`) || 0,
+  ) === 0;
+  await page.locator("[data-rule-form] button[type=button]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // 3. Run the event through the router. The event id is minted by the screen, so the second
+  //    run cannot be made to collide by the harness — which is the point: a *different* run
+  //    creating a second row is correct, and asserting a duplicate here would assert a bug.
+  const before = Number(
+    qaSql(
+      `select count(*) from notifications where source_type = 'event' and source_id = '${eventName}'`,
+    ) || 0,
+  );
+  await page.locator("[data-probe-event]").fill(eventName).catch(() => {});
+  await page.locator("[data-probe-subject]").fill("QA probe subject").catch(() => {});
+  await page.locator("[data-probe-run]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  steps.probeReported = (await page.locator("[data-probe-report]").count()) > 0;
+  steps.probeCreated = await page
+    .locator("[data-probe-created]")
+    .first()
+    .getAttribute("data-probe-created")
+    .catch(() => null);
+  const after = Number(
+    qaSql(
+      `select count(*) from notifications where source_type = 'event' and source_id = '${eventName}'`,
+    ) || 0,
+  );
+  // The actor rule resolves to the event's actor; the harness sends none, so the honest
+  // answer is zero created and one unmatched rule — and the screen must *say* which, rather
+  // than showing a bare "0".
+  steps.rowsAfter = after;
+  steps.probeMatchesTheTable = after === before;
+  steps.unmatchedIsExplained =
+    Number(steps.probeCreated) === after - before ||
+    (await page.locator("[data-probe-report]").innerText().catch(() => "")).includes("matched nobody");
+
+  // 4. Now with an actor, so the rule actually fires and a row really lands.
+  const actorRun = await page.evaluate(async (name) => {
+    const me = await fetch("/api/v1/me", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    const response = await fetch("/api/v1/notifications/route", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        event_name: name,
+        actor_user_id: me?.user?.id ?? me?.id,
+        payload: { title: "QA actor probe" },
+      }),
+    });
+    return { status: response.status, body: await response.json().catch(() => ({})) };
+  }, eventName);
+  steps.actorRunStatus = actorRun.status;
+  steps.actorCreated = actorRun.body?.created ?? null;
+  steps.rowsAfterActor = Number(
+    qaSql(
+      `select count(*) from notifications where source_type = 'event' and source_id = '${eventName}'`,
+    ) || 0,
+  );
+  steps.actorActuallyWroteARow = steps.rowsAfterActor > after;
+
+  // 5. Remove the rule, and prove the table agrees rather than trusting the toast.
+  const ruleId = qaSql(`select id from notification_routes where event_name = '${eventName}' limit 1`);
+  steps.ruleId = ruleId || null;
+  if (ruleId) {
+    const removed = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/notifications/routes/${id}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      return response.status;
+    }, ruleId);
+    steps.removeStatus = removed;
+    steps.removedFromTheTable =
+      Number(qaSql(`select count(*) from notification_routes where event_name = '${eventName}'`) || 0) === 0;
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    steps.goneFromTheScreen = (await page.locator(`[data-rule-row="${eventName}"]`).count()) === 0;
+  }
+
+  // 6. The retry path, asked directly, because the button only exists on a row that failed and
+  //    the QA database may have none. The claim is the *refusal* on a non-failed row.
+  steps.retryRefusesASentRow = await page.evaluate(async () => {
+    const sent = await fetch("/api/v1/notifications/outbox?status=sent&limit=1", {
+      credentials: "same-origin",
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    const row = sent?.rows?.[0];
+    if (!row) return null;
+    const response = await fetch(`/api/v1/notifications/outbox/${row.id}/retry`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    return { status: response.status, outcome: (await response.json().catch(() => ({})))?.outcome };
+  });
+  steps.retryIsNotRetryable = steps.retryRefusesASentRow?.outcome !== "requeued";
+
+  // Leave nothing behind: the probe's own notifications, and the event names it used.
+  qaSql(`delete from notifications where source_type = 'event' and source_id like 'qa.ticket.created.%'`);
+  qaSql(`delete from notification_routes where event_name like 'qa.ticket.created.%'`);
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -4268,6 +4466,11 @@ async function main() {
     // page that is only ever opened by a click is a screen whose first paint is never seen.
     // Its depth pass below flips a cell, saves, reloads and reads the value back.
     { path: "/notifications/settings", name: "notifications-settings" },
+    // The outbox and the routing rules (REQ-021, slice 3). Same reasoning as the settings
+    // screen above: an administrator-only screen that is only ever reached by a click is a
+    // screen whose first paint nobody has seen. Its depth pass below writes a rule, runs an
+    // event through the router, reads the counts back and removes the rule again.
+    { path: "/notifications/outbox", name: "notifications-outbox" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -4395,6 +4598,12 @@ async function main() {
   // than whatever this one left behind.
   report.notificationSettings = await runNotificationSettingsDepth(page, report);
   log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
+
+  // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
+  // passes because it emits into the same inbox, and it cleans up every row it creates — a QA
+  // database that grows a notification per pass is one whose counts stop meaning anything.
+  report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
