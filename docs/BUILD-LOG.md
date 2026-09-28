@@ -1,3 +1,78 @@
+## 2026-09-28 — REQ-010 slice 3 (four fifths) · duplicates, and the row that survives the merge
+
+- **What shipped.** **`0038_media_duplicates.sql`**, `crates/media/src/duplicates.rs`,
+  `apps/api/src/routes/media_duplicates.rs`, `apps/api/tests/media_duplicates.rs`,
+  `features/media/duplicates-view.tsx`, `/media/duplicates`, a `Duplicates` link on the media
+  browser, and `runMediaDuplicates` in the walkthrough. Five commits: `3d28b18`, `5baaa24`,
+  `6a07a68`, `c119975`, `aa6d382`, plus the harness and grammar fixes below.
+- **The shape of it.** A duplicate group is a **projection of `media` over its own checksum**, never
+  a table: a replace changes the checksum, a delete removes a row and a restore brings one back, so
+  a stored group would need a trigger on all three to stay true. `media_references` is the other new
+  table — the rows a merge repoints and the "used in" tab reads in slice 4.
+- **Seven decisions, each a shortcut that produces a plausible wrong answer.** A group of one is
+  not a duplicate, and neither is a trashed copy (it is already on its way out). Reclaimable
+  excludes the keeper: it is what a *purge* returns, not the group's size, because a merge frees
+  nothing. The report never picks the keeper and the merge **refuses** one from outside the group —
+  an automatic tie-break breaks a live page and is discovered from a 404, not from a report. A
+  merge **trashes** copies and never deletes, so a restore reverses the whole thing. The cross-site
+  mode is a different question rather than a wider default, and carries **no reclaimable column at
+  all** rather than a zero: no merge can decide which tenant keeps a file.
+- **The repoint is the interesting statement.** A page may reference two copies of the same file, so
+  a plain `update … set media_id = keeper` moves the first row and is then *refused* on the second —
+  a whole merge rolled back with a `duplicate key` message naming an index and not a cause. It is
+  written against the keeper's own rows instead, so nothing can collide afterwards by construction.
+  Proved directly against PostgreSQL 5433 rather than asserted: the plain update raises
+  `duplicate key value violates unique constraint "media_references_unique"`, the keeper-side
+  rewrite moves 1 and collapses 1, and the table then holds one live `page-1/hero` row.
+- **Four defects the router walks found, none visible to a unit test on a body builder.**
+  **(1)** The repoint's row type was `((i64, i64),)` — a composite column where the statement
+  returns two — so *every merge* answered `500: Rust type (i64,i64) (as RECORD) is not compatible
+  with INT8`. **(2)** The cross-site mode reported nothing: it read the per-site view with the site
+  filter lifted, which by construction still groups *per site*, so the two tenants each holding one
+  copy showed two empty reports to the one account allowed to ask. **(3)** The cross-site view's
+  `file_count` was the installation's, not the caller's — a checksum in nine sites reported `9` to
+  somebody who named two. It is now grouped over the named sites directly. **(4)** A share cannot
+  be created without `media.share`, which the walk's fixture had not been granted; the test now
+  proves the whole chain, because the merge closes links it did not create.
+- **Proof.** 6 walks over the real router → **0 failures**. The report ignores a lone file and a
+  trashed one; the merge keeps the **second** file (so it cannot pass by accident), moves
+  `page-1/hero` **once** rather than twice, closes a live share with its reason, and refuses an
+  outside keeper and an already-merged group with `409` — not `400`, because the request was legal
+  and the library moved on. Short checksums are `400` naming the field; a reader may read and may
+  not merge; the platform owner sees one checksum across two named sites and a tenant gets
+  `platform_only` before any row is read. The migration applies across the whole set on a fresh
+  database. `cargo test -p omnion-media --lib` → **98**, `-p omnion-api --lib` → **122**,
+  `--test media_shares` → **5** unchanged, `apps/admin` tsc clean.
+- **The browser pass, and a grammar defect only it could find.** `runMediaDuplicates` uploads the
+  same sample file twice (never a fabricated checksum), asserts the pair forms a group, asserts
+  **`Merge group` is disabled until a keeper is chosen** and enabled after, picks the *second* file
+  so a merge that quietly kept the first would fail, and checks the result. It produced:
+
+      "The 5 copies are in the trash and their bytes are is only reclaimed when the trash is purged."
+
+  The verb phrase and the `is` were carried by one branch, so the plural case got `are is`. Every
+  word was present and only the grammar was wrong — which is why neither the API walks nor the unit
+  tests saw it: they asserted on the substring `only reclaimed`, which survived. Fixed in `9bd3d58`
+  and pinned in both numbers.
+- **A cleanup script took out the quality gate it was making room for.** The first pass died with
+  `ENOENT …/clicks.jsonl` after four routes and produced **no report and no findings**: the sibling
+  commit `8fecbc4` added `scripts/qa/disk-guard.sh`, and it ran while the pass was writing,
+  deleting the artifact directory the pass had just created. Fixed in `9fa315f` — a directory
+  touched in the last hour belongs to a live walkthrough and is skipped. The second pass ran to
+  completion and produced the grammar defect above, so the fix is proved by use rather than by
+  inspection.
+- **Not mine, recorded honestly.** `media-presets` failed in the same pass with a `Failed to …` JSON
+  parse from a `page.evaluate` — a pre-existing depth pass reading a response that was not JSON —
+  and `media-file-detail` / `media-shares` reported `no file to open — the upload step did not
+  succeed`, a QA-database fixture race between passes rather than a product defect. Neither is
+  caused by this change and neither is claimed as fixed. The `media storage` pass reported a
+  `credential` leak category, which is its own standing finding (the settings screen shows a masked
+  credential); unchanged by this slice.
+- **Next.** Slice 3 closes with the CDN purge hook to REQ-011 and **EXIF** (still open from slice 2).
+  Slice 4 then brings folder and file grants with inheritance, the scanning pipeline with
+  quarantine and release, retention policies with the daily worker, and the reference-based purge
+  refusal — and with them the Usage and Activity tabs, which finally have rows to read.
+
 
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
@@ -1822,7 +1897,506 @@ fails only in a parallel run on its temporary-database teardown — a race betwe
 defect, and not in this wave. `apps/admin` `tsc --noEmit` → **0 errors**. The QA browser pass
 is **not** recorded here: this tick is not the slice's close tick and the run window closed
 ## 2026-09-28 — main merged, and slice 4's first half: activities and the merged record timeline
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part three: the copilot's two endpoints
 
+- **The merge first.** `origin/main` had moved 8 commits (the file manager's folder half, the QA
+  rebuild gate). One conflict, in the append-only build log, resolved as a union from the three
+  merge stages rather than by hand: `0 missing` from each side's added lines, no markers left, all
+  43 section headers intact.
+- **What shipped.** **`d2b9f74`** — `apps/api/src/routes/crm_copilot.rs` and its two routes.
+  `crm.copilot.use` has been in the catalogue and in the owner's role since slice 4 part two, with
+  nothing behind it; this is the thing that answers it. The route is thin the way slices 1-3 are:
+  the scoped context read, the two instructions and the sanitiser are the module's
+  (`modules/crm/src/copilot.rs`), the provider call is `omnion_ai_hub`'s, and what lives in the
+  HTTP layer is the audit row and the wiring.
+- **Two decisions worth writing down.**
+  1. **The scoped read runs before the model is resolved.** A deal in another organization is a
+     `404` from `CopilotContext::read` and never reaches a provider. Resolving the model first
+     would let the endpoint answer `409 no_default_model` for an id the caller may not look at —
+     which is the id space being confirmed, one status code at a time.
+  2. **Every call is audited, failures included** — `crm.copilot.summarized` /
+     `crm.copilot.follow_up_drafted`, and `crm.copilot.failed` on the error path. The catalogue
+     gives the reason the key exists at all: *a model that can read the whole CRM is a
+     data-exfiltration surface even when it only returns text, and the audit of the call is the
+     record of what it saw.* An unaudited failure makes "never used here" and "tried, could not
+     answer" the same answer. The metadata carries the deal, the action, the model and the size,
+     and deliberately **not** the draft and **not** the deal's title.
+- **Two defects the walk found while being written, both fixed in the same commit.**
+  - `grant_and_login` places its account in the **foreign** organization, so a cross-tenant
+    caller built with it reads a deal in the *other* tenant and the `404` passes for the wrong
+    reason. The walk now creates one account per organization explicitly and proves the scope in
+    **both** directions — one direction proves a scope exists, both prove it is the scope and not
+    a rule that happens to hide this one row.
+  - `crm_activities::tests::a_timeline_for_something_that_is_not_a_record_is_a_400` asserted
+    `invalid_list_query`, a code the API has never emitted. The mapping has been
+    `invalid_crm_query` since the surface was mounted, and `crm_deals.rs` and `tests/crm.rs`
+    already say so — the assertion was the stale thing, not the mapping. Two facts, one code: when
+    a whole assertion is off, read a *passing* neighbour's spelling before editing the code.
+- **No provider is faked.** This installation connects none, so a copilot call **fails** here —
+  and the walk asserts the audit precisely *because* a failure is still a call. The model's text
+  belongs to the provider and is not asserted; the sanitiser's text rules (fences, tags, control
+  characters, the length cap, the empty-answer refusal) are unit-tested in the module, which is
+  where they belong.
+- **Proof.** `cargo test -p omnion-module-crm --lib` → **146/146**. `cargo test -p omnion-api
+  --lib` → **129/129**. `cargo test -p omnion-api --test crm` against `omnion_test_w4_tick`, a
+  database created for this run → **36/36** (the 35 prior walks plus this one, all re-proved).
+  `pnpm typecheck` → **2/2**.
+- **Environment note.** `/mnt/apopic` sat at 97% again (2.0 GB free) with seven writers on the
+  mount. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2` and this worktree's own
+  `target/debug/incremental` kept the tick through; the seven `target/` directories still total
+  over 27 GB and a shared `CARGO_TARGET_DIR` remains the permanent fix.
+- **Next.** The last of slice 4: the global-search registration (REQ-002 — how
+  `crates/search` / `apps/api/src/routes/search.rs` collects its sources, and register
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part four: the CRM in the palette
+  contacts/companies/deals with a deep link), then the `form.submitted` consumer (REQ-064) creating
+- **What shipped.** **`5bedddb`** — `crates/search/src/providers.rs` gains three providers, and
+  `crates/search/src/indexer.rs` the three upserts, three prune arms and the `crm.*` event plans.
+  `database/migrations/0031_crm_search_providers.sql` enables the keys. **`241cf91`** — the three
+  screens read `?focus=<id>`, and the three walks that prove it.
+- **The split is the point, and it is the module's, not the index's.** `contacts` and `companies`
+  carry `crm.contacts.read` because the CRM already treats them as one surface; `deals` carries
+  `crm.deals.read` of its own. The palette filters a provider on the key of the screen it points
+  at, so a contact-only reader finds people and gets **no** deal rows — the same refusal
+  `/api/v1/crm/deals` already gives them. A search that answered with the pipeline would be the
+  wider door around a decision the module deliberately made.
+- **Three decisions worth writing down.**
+  1. **Archiving is a remove, not a refresh.** An archived record still *exists* as a row the
+     module can read, so an `Index` plan would bring it straight back. The CRM lists hide
+     archived rows by default, which means a document that outlived its archive would answer with
+     a record the panel will not show when the person follows the link. All three upserts also
+     carry `where archived_at is null`, so a full reindex agrees with the event drain.
+  2. **A contact's notes never reach the index.** The module flags them
+     `crm.fields.sensitive.read` precisely because a contract note is the CRM's most private
+     column, and a `tsvector` cannot answer a per-role question. The rule the module states is
+     the rule the index keeps — otherwise the palette would be a way to search the field the IAM
+     was built to hide.
+  3. **A deal carries its stage's *name*.** `won` is a word a person types and `4f2c…` is not, and
+     a move into a differently-named stage must answer under the new name without a reindex. The
+     lost reason is a tag only: a reason is "too expensive", and putting it in the vector would
+     make a competitor's objection the most findable word in the index.
+- **Two defects the walks were written to find, and one the fixture was.**
+  - The walks first signed the **CRM manager** in to run the reindex. `search.manage` is a
+    platform key a tenant manager does not hold, so the reindex answered `403` — the walk was
+    asking the wrong actor, and the fixture now keeps the owner's address for exactly this.
+  - They then searched with the same manager and got `403` on `search.read`. That is not a bug:
+    the **box** is its own surface and its own key, refused before any provider is considered. A
+    walk that wants to prove the provider split has to hand the box over explicitly, or it proves
+    the palette is closed rather than what is behind it. Both are now granted, and the second one
+    is worth remembering as a *fact about the system*, not only about the test.
+- **Proof.** `cargo test -p omnion-search` → **47/47** (five new: the registry's route/permission
+  contract, archive-is-a-remove, the deep link, the archived guard, the notes exclusion).
+  `cargo test -p omnion-module-crm --lib` → **146/146**. `cargo test -p omnion-api --lib` →
+  **129/129**. `cargo test -p omnion-api --test crm` against `omnion_test_w4_t6c`, a database
+  created for this run → **39/39** (the 36 prior walks plus the three new ones, all re-proved).
+  `tsc --noEmit` in `apps/admin` → **clean**.
+- **Environment note.** `/mnt/apopic` hit **100%** mid-tick: two `cargo` invocations ran at once
+  (a `--lib` run and a `--tests` run) and each links a ~290 MB test binary, so the second died
+  with `IO failure on output stream: No space left on device` and then a linker bus error. The
+  fix is not mysterious — `target/debug/deps` held **5 GB of re-linkable test binaries** from
+  earlier ticks. `find target/debug/deps -type f -executable -size +100M -delete` gave 4 GB back
+  instantly, and only the one suite under test needed to be rebuilt. **A test binary is a build
+  artifact, not a result**: deleting it costs a link, never a fact.
+- **Next.** The `form.submitted` consumer (REQ-064 — a submitted form becomes a contact and a
+  deal) and the workflow-trigger proof (that an automation rule on `crm.deal.stage_changed` runs
+  once), which needs wave 3's engine rather than this module's. Then the **w4 QA browser pass**,
+  which has still never run on this branch: `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103
+  QA_WEB_PORT=3203 bash scripts/qa/run.sh` (timeout 1500s). Before that run, add the **copilot
+  card** to `scripts/qa/walkthrough.cjs`'s depth passes — it is not in the route list yet, so the
+  walkthrough would not visit the screen the previous tick shipped and the pass would prove
+  nothing about it. It is the last gate for closing REQ-051.
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part five: the copilot gets a card, and the first w4 QA pass reaches the end of the route list
+
+**What.** The two copilot endpoints have been reachable only from `curl` since they shipped. They
+are proved, guarded by `crm.copilot.use`, audited on both paths and unit-tested — and no person has
+ever been able to ask for one. The DoD is explicit that a REQ is not done until a human can use it
+end to end, and an endpoint without a screen is that claim unfalsified. This adds the screen: a
+**Copilot** button on every board card, a side panel that answers `summarize` and `follow-up`, and
+`runCrmCopilotDepth` in the walkthrough.
+
+**Three decisions, and why.**
+
+- **The button is on the card, not in a row menu.** On the board the card *is* the record; a menu
+  would make every question begin with "which card?". The panel follows the focused card and takes
+  focus when it opens, so the keyboard is not stranded behind a layer. Escape closes it.
+- **A refusal is rendered as a sentence.** This installation connects no provider, so the honest
+  outcome is the failure path — and that is precisely the path that has to be legible. A button
+  that does nothing is not a bug report anyone can file.
+- **The draft marker is read, not assumed.** `is_draft` drives a visible flag that turns amber and
+  reads "written to the record" if a response ever claims otherwise. The client must not quietly
+  undo the promise the server makes from the other end. The answer renders in a **text node**: the
+  server's sanitiser already reduced it to plain text, and rendering markup here would hand that
+  guarantee back to a future refactor.
+
+`?focus=<id>&copilot=1` opens the panel on arrival, so a shared link — or a palette row added later
+— lands on the answer rather than on a card whose panel stays shut.
+
+**Proof.** `pnpm typecheck` → **2/2**. `cargo test -p omnion-module-crm --lib` → **146/146**. The
+w4 QA pass ran end to end on the private stack (`QA_STACK=w4`, ports 18083/3103/3203, database
+`omnion_qa_w4`).
+
+**Environment note — two disk deaths in one tick, both self-inflicted, both the same lesson.**
+`/mnt/apopic` is a 60 GB mount shared by seven writers. The first pass died at
+`ENOSPC … appendFileSync` in the walkthrough's own `clicks.jsonl`; a screenshot failure is a
+warning, a `record()` write is fatal. Recovery was mechanical: QA artefacts, `.rmeta` files, the
+incremental directory, and `target/debug/deps` binaries — **a re-linkable build artefact, never a
+result** — which returned 1.3 GB. Two details worth keeping:
+
+* `target/debug/omnion-api` is a **hard link** to `target/debug/deps/omnion_api-<hash>` (link count
+  2). Deleting the `deps` copy costs a link and leaves the running binary intact; deleting the
+  binary would make the next QA pass rebuild the whole API. Check `stat -c %h` before assuming a
+  file is the only copy.
+* Deleting the deps binaries **while** `run.sh` was between its build check and its `pm2 restart`
+  is what made the first pass's `omnion-qa-api-w4` answer nothing on `:18083`. A maintenance window
+  on a build directory is a window on a *running service*.
+
+**Next.** The `form.submitted` consumer (REQ-064) and the workflow-trigger proof (wave 3's engine).
+Then REQ-051's last three acceptance boxes — the empty/loading/error sweep, the 390×844 mobile pass
+and the keyboard sheet — and only then the status line may read `done`.
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part six: the workflow-trigger proof
+
+**What.** The acceptance criterion is one sentence — "an automation rule triggered by
+`crm.deal.stage_changed` runs once" — and it is the only part of this slice that could not be
+answered from inside the CRM. The CRM emits the event; the **matcher** decides what fires. So the
+proof drives the real `crates/automation/src/matcher.rs` over the real bus in this suite's own
+database, and the event the rule reads is the one the board's stage endpoint emitted. Three walks,
+in `apps/api/tests/crm.rs`.
+
+**What they assert, and why each one is a separate claim.**
+- A move to the stage a deal is **already in** starts nothing. The board's keyboard path posts on
+  every arrow press, so this is the assertion that keeps a rule from being a nuisance.
+- One move starts **one** run, and the run's step carries *this* move's values: the subject reads
+  "A deal entered open" and the body the deal's id, amount and currency. A retry therefore repeats
+  the first attempt rather than re-reading a bus that has moved on.
+- The second drain is **idle**. That is what "once" means — the absence of a second chance, not a
+  count — and the cursor is read back to prove it.
+- The match is audited (`automation.rule.matched`) against the execution.
+- A **second deal** starts a second run: exactly-once is per *event*, and a rule that collapsed two
+  customers into one run would silently drop one.
+- A rule whose condition does not hold is `skipped`, not `matched`.
+- The key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define
+  the rule watching them, and a rule for another organization is refused.
+
+**Three defects this found, and the fourth that was not mine.**
+- A token minted **before** the grant answered 403 on the very rule the walk writes: a session's
+  powers are read at login, so grant-then-sign-in is the order every workflow key needs.
+- The first draft read a token *twice* — once before the grant and once after — and the compiler's
+  unused-variable warning was the only thing that noticed the first line was dead.
+- The bus was **not empty** after the setup: creating a deal is itself an event. Two walks counted
+  their own fixture and read "a rule fired twice" or "two events on the bus" where the product was
+  right. Fixed with `flush_without_runs`, which asserts the drain started *nothing* — a setup flush
+  that silently ran a rule would hide exactly what these walks are for.
+- The fourth failure was **not a defect**: the suite's database was gone mid-run. `/mnt/apopic`
+  reached 100% earlier in the tick, the Postgres container restarted, and a database created before
+  that did not survive it. `RestartCount=0` with a fresh `pg_postmaster_start_time` is the tell, and
+  the lesson is the one the disk keeps teaching: on this mount a full disk takes the **database**
+  down, not just the build.
+
+**Disk, again.** The build died at `libomnion_identity-….rlib: No space left on device`. This time
+the reclaim was `apps/admin/.next/dev` and `apps/web/.next/dev` — 1.2 GB of turbopack dev cache,
+re-derivable, and inside **this** worktree only. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1` did the
+rest at roughly a third of the wall-clock.
+
+## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
+
+- **What.** The last open item of slice 3: what the *camera* said about its own picture. The
+  geometry probe already read a file's size from its header; this reads the other half of what an
+  editor asks about a photograph — which body took it, at what shutter speed, with which lens, on
+  which day. `crates/media/src/exif.rs` (the reader), `0042_media_exif.sql` (the column), the
+  `exif` column on `media` plus the `display_width`/`display_height` pair on the file response, and
+  the Metadata tab's **Camera** block.
+- **Six decisions, each a shortcut that produces a plausible wrong answer.**
+  1. *A TIFF header is not EXIF.* The IFD format is shared by TIFF, GeoTIFF and half a dozen
+     makers' proprietary blocks; what makes the block EXIF is the `Exif\0\0` signature inside a
+     JPEG `APP1`, an `EXIF` chunk in a WebP or an `eXIf` chunk in a PNG. The container is checked
+     before any TIFF parsing runs.
+  2. *Nothing is read from outside the prefix.* Every field's value may be an *offset*, and an
+     offset is attacker-controlled. Every read is a range request whose failure is the answer.
+  3. *A zero denominator is absent; `1/200` is not.* The first guard refused the normal case
+     (`den > num`) and kept the corrupt one — the exact inversion, which is how a reader ends up
+     with no shutter speed on every photograph and a divide-by-zero on the one broken file.
+  4. *Orientation changes the box, not the file.* Values 5–8 store the picture sideways and
+     browsers rotate it themselves, so a grid reserving `width × height` reserves the wrong box and
+     shifts every image below it. The stored columns carry the oriented pair, the raw value stays
+     in the record, and the API sends both readings.
+  5. *A GPS fix is a flag, never coordinates.* There is no field in the type a coordinate could
+     occupy, so a media library cannot quietly file an operator's home address into a row that
+     search, an API key and a share link can all read.
+  6. *A replacement replaces the record.* A screenshot over a camera original must not keep
+     claiming to have been shot on a body it was never near.
+- **The QA pass did not complete, and it found the tick's one real bug anyway.** The full pass ran
+  629 clicks and then died with `Target page, context or browser has been closed` — the
+  "browser context dies under parallel passes" case already documented for this box, with 21
+  sibling QA processes and 0 GB free at the moment it failed. So the gate is **not** claimed as
+  green this tick. What *did* run is `scripts/qa/probe-media-camera.cjs`, a one-screen probe added
+  because "the full pass crashed" and "the screen is broken" must not read the same in a log: it
+  signs in, uploads a JPEG that really carries a block, reads the block's rows and reads the
+  API's own response — **13/13 checks pass**.
+- **The bug it found: the rotation was applied twice.** The writer already stores the *oriented*
+  geometry (an orientation-6 4000×3000 frame is written as 3000×4000), and `display_size()` then
+  applied the swap again on the way out — so the panel reported a landscape picture for a portrait
+  photograph, and the facts list read `4000 × 3000` for a file every browser draws tall. The unit
+  test on `oriented_size` passed the whole time, because the function was correct; it was being
+  called on the wrong input. This is the case the QA pass exists for and the Rust suite cannot
+  see, and it is why the fix ships with a regression test shaped like the bug: a row carrying the
+  oriented columns *and* the record that produced them.
+- **Proof.** 19 new unit tests in `exif.rs`, 5 in `model.rs` and two walks over the real router →
+  0 failures. Both
+  walks read the column **out of PostgreSQL**, because a response that omits a field is
+  indistinguishable from one that stored it and chose not to say so. An orientation-6 frame of
+  4000×3000 stores 3000 and 4000; a text file grows no record; a replacement in a format with no
+  block clears it and the geometry falls back to the frame's own; a restore brings version 1's
+  record back; the serialised object is scanned for `lat`, `lon`, `GPSLatitude`, `GPSLongitude` and
+  `altitude`. `cargo test -p omnion-media --lib` → **122** (was 98), `-p omnion-api --lib` → **122**,
+  and `--test media` (13, was 11), `--test media_transform` (5), `--test media_settings` (2),
+  `--test media_duplicates` (6), `--test media_shares` (5) are unchanged and green. `pnpm
+  --filter @omnion/admin typecheck` clean. The migration applies across the whole set on a fresh
+  database.
+- **The QA pass had to grow a screen before it could test one.** The library pass uploads a PNG,
+  and a PNG carries no EXIF — so the Camera block would only ever have been seen in its empty
+  state, which the "no untested screen" rule forbids. The pass now *builds* a JPEG that carries a
+  real block, uploads it, opens its detail screen and asserts the body, `ISO 400`, `1/200 s`,
+  `f/1.8` and the rotated dimensions.
+- **Four bugs the walkthrough's own JPEG builder had, each of which produced a file that read as a
+  parser bug and was really a builder writing the format wrong.** The TIFF block is little-endian
+  while the JPEG framing around it is big-endian, so a segment length written with the block's
+  `u16` reads as a 57 KB segment in a 253-byte file and the block is then unreachable; a directory
+  is a count plus its entries plus a four-byte next-directory pointer, and the two that get
+  forgotten put every later offset on the wrong field; a value offset is measured from the start of
+  the *block*, not from the directory that holds the entry, so a value laid down before the
+  sub-directory exists is overwritten by it; and a RATIONAL is two words wide rather than four
+  bytes, so a cursor that steps by the entry's width lands every rational after the first on the
+  wrong field. None of the four would have been found by a screenshot — the file simply had no
+  camera record and the screen showed its empty state, correctly.
+- **Environment.** `/mnt/apopic` sat at **94 %** (3.6 GB free) on entry, and this worktree's own
+  `target/` was 9.9 GB of it. Reclaiming *only this worktree's* `target/debug/incremental`
+  (verified first: no live `cargo` holds it) returned 1.7 GB. **Owner action:** the worktrees under
+  `/mnt/apopic` still hold ~30 GB of `target/`; a shared `CARGO_TARGET_DIR` is the structural fix.
+- **Next.** Slice 4 — folder and file grants with inheritance, the scanning pipeline with
+  quarantine and release, retention policies with the daily worker, and reference-based purge
+  refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
+  and releasable, and a retention run removes exactly the eligible rows.
+
+**Proof.** `cargo test -p omnion-api --test crm` → **42 passed; 0 failed** against a database
+created for this run (`omnion_test_w4_t7c`), `--test-threads=1`. `cargo test -p omnion-module-crm
+--lib` → **146/146**. `pnpm typecheck` → **2/2**.
+
+**Next.** The `form.submitted` consumer (REQ-064 — a submitted form becomes a contact and a deal),
+which is the last part of this slice. Then REQ-051's final three acceptance boxes: the
+empty/loading/error sweep across all six screens, the 390×844 mobile pass and the keyboard sheet.
+Only then may the status line read `done`, and that close tick runs the w4 QA browser pass.
+
+## 2026-09-28 — REQ-051 slice 4 part seven · a submitted form becomes a contact and a deal
+
+- **The merge first.** `origin/main` had moved 10 commits (the media file manager's presets and
+  transform pipeline, the QA slot holder). One conflict, in the append-only build log, resolved
+  as a union from the three merge stages rather than by hand — and verified two ways, because
+  the last merge of this file had silently dropped 112 lines on the main side: the per-side
+  `SequenceMatcher` reported a shortfall of 112, and a **multiset** comparison of every line on
+  both sides against the merged file reported **zero missing on either side**. The line count
+  checks out too: 1874 base + 572 ours + 66 theirs = 2512.
+- **What shipped.** **`modules/crm/src/leads.rs`** — the consumer, 1262 lines with 26 unit tests ·
+  **`database/migrations/0034_crm_form_leads.sql`** (0034 was free; every other wave's highest is
+  0033) · **`apps/api/src/routes/crm_leads.rs`** — three routes and two permission keys ·
+  **`apps/api/src/lead_runner.rs`** — the background drain, wired in `main.rs` behind
+  `OMNION_LEAD_RUNNER` · `CrmConfig` in the core config (`OMNION_LEAD_POLL_MS`,
+  `OMNION_LEAD_BATCH`) · the inbox screen and its API client in the admin app · ten integration
+  walks.
+- **The producer is not in this build, and that shaped everything.** The form builder is REQ-064
+  (wave 2b, another worktree). So the consumer is written against the **event contract** —
+  `form.submitted` — and not against a form table, a form crate or a form type. It does not
+  import anything from a module that may never be installed, and the day the builder lands it
+  has to emit one documented string and nothing else. The walks emit the event through
+  `omnion_events::bus::emit` — the same call REQ-064's public endpoint will make — rather than
+  inserting a row, so what is proved is the contract and not the SQL.
+- **Three decisions that are the whole feature.**
+  1. **Exactly once, by the bus identity.** `crm_form_leads.event_id` is the primary key. An
+     `exists` check followed by an insert would be the obvious way and it is wrong: there is a
+     window between the two statements in which a second API process reads the same bus and
+     creates a second contact. So the ledger row is inserted **first**, with
+     `on conflict do nothing`, and the **row count** decides who acts. One of the three walks
+     rewinds the cursor and drains the same event again to prove the claim, not just the cursor,
+     holds.
+  2. **Deliberately not in a transaction.** `create_contact` and `create_deal` take a `&PgPool`,
+     so wrapping the drain in one transaction would mean changing the module's own write
+     signatures to take an executor. Claiming first buys a different failure: a crash between the
+     claim and the write leaves a ledger row that says `rejected` and names why, which the inbox
+     shows. A rolled-back transaction shows nothing and replays forever. The `restate` call is
+     what keeps the ledger honest when the contact write itself fails.
+  3. **Routing is a row, not a constant.** `crm_lead_settings` holds two toggles, two stage ids
+     and a source label, seeded for every organization that has a pipeline and created on first
+     use for the ones that do not. A feature that only works after somebody has opened a
+     settings screen is a hidden feature; the `GET` deliberately does **not** create the row (a
+     read that writes turns a read into a change), and the drain's `load_settings` does.
+- **Four defects the unit tests found, all of them in the extractor, all of them in the *happy*
+  path of a form nobody had written yet.**
+  1. **A form with both a "Name" and a "First name" field lost the first name.** The key list
+     had `name` first, so the combined two-word value won and "Augusta King" became the first
+     name `Augusta King`. The more specific key has to be read first — a form that collects both
+     has told us which one it means.
+  2. **A 400-character "name" and a name of `---` both passed.** The explicit name fields were
+     not passed through the same `clamp_name` the guessed split used, so a hostile or broken
+     producer reached the first-name column and `create_contact` then refused the whole
+     submission with a message a person reading a form never typed. Refusing at extraction turns
+     that into an honest `rejected` row.
+  3. **A message longer than the note cap was dropped entirely** — losing exactly the person who
+     cared enough to write a lot. It is truncated at a word boundary now, as the doc promised.
+  4. **A submission with only an address produced a contact with no first name**, because the
+     contact table requires one and `validate_contact` refuses. The local part of the address is
+     the honest fallback: it is what the person typed in that field, and a human can correct it. A
+     placeholder like "Unknown" is not — it looks like data and reads as an error.
+- **The `create_deal` signature changed, and that is a decision worth naming.** It took
+  `user_id: Uuid` and used it as the owner fallback, so a submission would have been filed into
+  whoever happened to run the drain. That is a stranger's lead in a colleague's list. The
+  parameter is now `owner_fallback: Option<Uuid>` and the drain passes `None`: an unassigned deal
+  is a deal the board shows as needing an owner. The one other caller passes `Some(current.user.id)`.
+- **Ten walks, over the real router and the real bus.** A submitted form becomes a contact and a
+
+## 2026-09-28 — REQ-051 · the request id, one error state, and the panel that was stricter than its API
+
+**What.** The empty/loading/error box was the last thing left on REQ-051 and it turned out to be
+three defects wearing one label. The API's refusal carried a code, a message and sometimes a
+`details` object and **no request id**, so the "error state with retry button and request id" the
+box asks for had no id to show. `apps/api/src/request_id.rs` now stamps `x-request-id` on every
+response and `error.request_id` in the body, honouring an inbound id only when it is safe to
+reflect and replacing a hostile one rather than sanitising it. `lib/crm.ts` was also dropping
+`error.details`, which is why every field-level refusal rendered as a generic banner with nothing
+under the input it was about. `components/error-state.tsx` replaces six hand-rolled error blocks —
+three shapes, and two of them with no retry at all — and the board's empty column got a sentence
+and an action instead of a grey "No deals".
+
+**Then the QA pass told a different story.** It reported the *whole* CRM suite false: no company
+created, no contact created, no email refusal, no shortcut sheet. The first screenshot answered it.
+The QA owner is a **platform account** (`organization_id = NULL`) holding exactly one binding, and
+`crm-tenant.tsx` drew its organization chooser for that account, so no CRM screen ever issued a
+list read. `organization_of` in `apps/api/src/routes/crm.rs` does not do this — it falls back to
+the caller's single binding and refuses with `organization_ambiguous` only for two or more. The
+panel had re-decided the tenant rule independently and decided it more strictly. Two ticks of CRM
+acceptance evidence had been collected from a chooser, and every "proved in the browser" claim in
+the REQ was resting on it.
+
+**Proof.**
+- `cargo test -p omnion-api --lib request_id` — **10/10** (a hostile header value, the CSV
+  passthrough, both homes of the id, and the details object surviving the rewrite).
+- `cargo test -p omnion-module-crm --lib` — **172/172**.
+- `pnpm turbo run typecheck --force` — **2/2** (twice; a cached typecheck is not a typecheck).
+- Live, against the QA API: `GET /api/v1/crm/contacts?limit=1` unauthenticated answers **401** with
+  `x-request-id: 2ec164d9…` **and** `{"error":{…,"request_id":"2ec164d9…"}}` — the same value in
+  both homes, on a real refusal.
+- First QA pass (`20260928-141747`): 1006 clicks, 1068 screenshots, `crmStates` **23 of 27 false**,
+  and the 98 high findings are **all** `media/settings` — the main writer's surface, not this one.
+  The pass is re-running with the tenant fix as its first job.
+
+**Commits.** `63512c5` the request id · `c0e51fe` the client and one `ErrorState` for six screens ·
+`225425e` the REQ · `1e0af8f` the empty column · `8477c2f` the tenant fix.
+
+**Next.** The re-run decides whether REQ-051's error box closes, or whether the state sweep finds
+that a screen with a working error state still has a broken *load* state. Then the 390×844 pass and
+the keyboard sheet, which are the two boxes after it.
+
+## 2026-09-28 — REQ-051, the CRM was unreachable on a first-run installation
+
+**What.** The scoped pass (`--only=crm`, added this tick) found that after the tenant fix every
+CRM read *and* write answers `organization_required`: no contact, company, deal or activity could
+be created or listed by the account the panel is used with. `organization_of` resolves a caller
+that cannot name an organization from the **tenant bindings** it holds, and the platform owner of
+a first-run installation holds the `global` Owner role and nothing else — the owner role is a
+`global` binding by construction, so the tenant list is empty. The refusal's own advice,
+"pass organization_id", is impossible to follow: naming a tenant requires the very permission that
+binding would have carried. The `[]` arm now falls back to the installation's organization when
+there is **exactly one**, and only then; two or more is still `organization_ambiguous`.
+
+**Proof.**
+- `cargo test -p omnion-api --lib routes::crm` — **27/27** (three new: the one-organization
+  fallback, the two-organization refusal, and the no-organization sentence no longer naming a
+  parameter the caller cannot supply).
+- `cargo test -p omnion-module-crm --lib` — **172/172**.
+- `pnpm turbo run typecheck --force` — **2/2**.
+- Live, before the fix: `GET /api/v1/crm/contacts` and `/api/v1/crm/contacts/export` as the QA owner
+  both answered `400 organization_required` with a `request_id`, and the database held **one**
+  organization and **zero** CRM rows — the empty state the pass reported was the refusal wearing an
+  empty list's clothes.
+- Scoped pass `20260928-155321-crm` (7 routes, `--only=crm`): `contactsEmptyState: true` against a
+  screen that had never loaded — the false green this tick exists to end.
+
+**Commits.** `a8e3f53` the scoped pass · `e7ba429` the one-organization fallback.
+
+**Next.** Restart the w4 QA API onto the rebuilt binary and re-run `--only=crm`: the depth passes
+that never got to run (deals, activities, copilot, leads, the state sweep) are what decide whether
+REQ-051's empty/loading/error box closes. The 390x844 and keyboard boxes are still open after it.
+
+**Environment.** `/mnt/apopic` hit 100% mid-build and the box-wide disk guard deleted this
+worktree's whole `target/`, so the build is now on `CARGO_TARGET_DIR=.tmp-target` (the repo's own
+convention, and it is the same tree the guard spares). Load sat at ~316 for ten minutes: seven
+writers compile at once, so a build can sit at 0% CPU for minutes before it is scheduled at all.
+  deal with the deal titled in the person's own words · the same bus drained twice files nothing
+  twice, **including** after the cursor is rewound onto the same event · a repeat from a
+  differently-cased address is the same person and lands in the repeat stage while the first deal
+  stays in the first open column · a submission with nothing usable is kept, is `rejected`, and
+  **carries the sentence** · a submission with no organization is `orphaned` and is in nobody's
+  inbox · an organization that turned leads off records the submission and writes nothing · the
+  two keys are genuinely separate (a watcher may read the inbox and is refused when it tries to
+  reconfigure it), unauthenticated is `401`, and a foreign tenant's save does not touch ours · a
+  stage from another pipeline's organization is refused **by name** in `error.details.field` ·
+  a routing change is audited and announced exactly once, and the same body again is neither ·
+  and the two keys are in the catalogue and in the owner's role, and **not** handed to a CRM
+  manager by default.
+- **Proof.** `cargo test -p omnion-module-crm --lib` → **172/172** (146 before, 26 new).
+  `cargo test -p omnion-api --test crm` → **52/52** (42 before, 10 new) against a database
+  created for this run, `--test-threads=1`. `pnpm typecheck` → **2/2**. `cargo check --workspace`
+  clean. The walkthrough route list gained `/crm/leads` and a `runCrmLeadsDepth` pass.
+- **The QA browser pass, honestly.** It ran on the private `w4` stack (`:18083` / `:3103` /
+  `:3203`, database `omnion_qa_w4`, `QA_SLOTS=0`) and got through the whole route list **until the
+  Chromium tab died**: `Target page, context or browser has been closed` from the analytics routes
+  onward, so `crm-leads` and the depth passes after it were recorded as failures of the *tab*,
+  not of the screen. The box is running seven writers and three concurrent QA passes; free memory
+  was 262 MiB against 32 GiB with 17 GiB already in swap. The screen is in the route list and the
+  pass is registered, so the next run on a quieter box proves it; **this tick does not claim a QA
+  pass on the new screen**, and REQ-051 stays `in-progress` for that reason as well as for the
+  last three acceptance boxes.
+- **One more disk death, and the file it cost.** `/mnt/apopic` reached 100% mid-tick and a
+  `write_file` of `leads.rs` left it **zero bytes** while `git status` still showed it as
+  untracked. The lesson is the one from `git commit` failing the same way two ticks ago: on this
+  image a write can succeed, a truncate the file, and report nothing. The file was rewritten from
+  the content the compile errors had already corrected.
+- **Next.** REQ-051's **last three acceptance boxes**, which are the whole of what remains: the
+  empty/loading/error sweep across every screen, the 390×844 mobile pass and the keyboard sheet.
+  The inbox screen already answers `/` for the search and is in the route list, so the sweep is
+  about the six screens that predate it. The close tick runs the w4 QA pass.
+
+## 2026-09-28 · REQ-051 · tick 10 — the platform account, and twelve failures that were five
+
+- **What shipped.** **The tenant fallback** (`b899f7f`) — the QA owner's five CRM screens
+  answered `400 organization_required` because a platform account has no primary organization
+  by design. The module now resolves the tenant itself and falls back to the single
+  organization a platform account is bound to, refusing when there are two (`organization_
+  ambiguous`) or none. `apps/admin/app/crm/layout.tsx` wraps the six screens in one
+  `CrmTenantProvider` so two screens cannot disagree about which tenant they are showing.
+- **And four real defects, found by running a suite whose walks had never executed.**
+  `29b202f` a doubled trailing backslash in a Rust SQL string (`\\`) is an escaped backslash,
+  not a line continuation, so a literal `\` reached Postgres: nine of the twelve failures were
+  one character, and it made every lead-settings read a 500. `c739ccf` `crm_form_leads.
+  organization_id` was `not null` while the migration's own header says a submission may belong
+  to nobody — so the orphan path, the branch that exists to *keep* such a submission, raised a
+  not-null violation and the drain reported `failures: 1` while every counter read zero.
+  `fe2d49b` `NAME_KEYS` held `"name"` beside `"first_name"`, so a form whose field is `name`
+  gave `Ada Lovelace Lovelace`: each half a valid name, which is why no validator caught it.
+- **Proof.** `cargo test -p omnion-module-crm --lib` → **172/172**. `cargo test -p omnion-api
+  --test crm` → **55/55** against a database created for the run, `--test-threads=1` (52 before,
+  12 of them failing, 3 new). `pnpm turbo run typecheck --force` → **2/2**. The other seven
+  failures were walks passing `fixture.owner` — an e-mail — where `request` takes a bearer
+  token, answering 401 before the route under test was reached.
+- **The environment.** `rustc` was **0 bytes, mode 000** (`Permission denied` on `rustc -vV`),
+  the known box-wide 0-byte corruption; `rustup toolchain install stable --profile minimal
+  --force` restored it, and `/mnt/apopic` was at 95% throughout.
+- **Next.** REQ-051's **last three acceptance boxes**: the empty/loading/error sweep across the
+  six screens, the 390×844 mobile pass and the keyboard sheet. The close tick runs the w4 QA
+  pass and requires 0 high findings before the status becomes `done`.
+  a contact + deal. Then the **w4 QA browser pass**, which has still never run on this branch:
+  `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`
+  (timeout 1500s). It is the last gate for closing REQ-051, and the copilot's panel card still
+  has to be added to the walkthrough route list before it is worth running.
 **What.** Two things in one tick, because the first was a prerequisite for measuring the second.
 
 **The merge.** `origin/main` had moved 17 commits (IAM SSO, the file manager, the authentication
@@ -2294,350 +2868,58 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
 
-## 2026-09-28 — wave 4 · REQ-051 slice 4 part three: the copilot's two endpoints
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
 
-- **The merge first.** `origin/main` had moved 8 commits (the file manager's folder half, the QA
-  rebuild gate). One conflict, in the append-only build log, resolved as a union from the three
-  merge stages rather than by hand: `0 missing` from each side's added lines, no markers left, all
-  43 section headers intact.
-- **What shipped.** **`d2b9f74`** — `apps/api/src/routes/crm_copilot.rs` and its two routes.
-  `crm.copilot.use` has been in the catalogue and in the owner's role since slice 4 part two, with
-  nothing behind it; this is the thing that answers it. The route is thin the way slices 1-3 are:
-  the scoped context read, the two instructions and the sanitiser are the module's
-  (`modules/crm/src/copilot.rs`), the provider call is `omnion_ai_hub`'s, and what lives in the
-  HTTP layer is the audit row and the wiring.
-- **Two decisions worth writing down.**
-  1. **The scoped read runs before the model is resolved.** A deal in another organization is a
-     `404` from `CopilotContext::read` and never reaches a provider. Resolving the model first
-     would let the endpoint answer `409 no_default_model` for an id the caller may not look at —
-     which is the id space being confirmed, one status code at a time.
-  2. **Every call is audited, failures included** — `crm.copilot.summarized` /
-     `crm.copilot.follow_up_drafted`, and `crm.copilot.failed` on the error path. The catalogue
-     gives the reason the key exists at all: *a model that can read the whole CRM is a
-     data-exfiltration surface even when it only returns text, and the audit of the call is the
-     record of what it saw.* An unaudited failure makes "never used here" and "tried, could not
-     answer" the same answer. The metadata carries the deal, the action, the model and the size,
-     and deliberately **not** the draft and **not** the deal's title.
-- **Two defects the walk found while being written, both fixed in the same commit.**
-  - `grant_and_login` places its account in the **foreign** organization, so a cross-tenant
-    caller built with it reads a deal in the *other* tenant and the `404` passes for the wrong
-    reason. The walk now creates one account per organization explicitly and proves the scope in
-    **both** directions — one direction proves a scope exists, both prove it is the scope and not
-    a rule that happens to hide this one row.
-  - `crm_activities::tests::a_timeline_for_something_that_is_not_a_record_is_a_400` asserted
-    `invalid_list_query`, a code the API has never emitted. The mapping has been
-    `invalid_crm_query` since the surface was mounted, and `crm_deals.rs` and `tests/crm.rs`
-    already say so — the assertion was the stale thing, not the mapping. Two facts, one code: when
-    a whole assertion is off, read a *passing* neighbour's spelling before editing the code.
-- **No provider is faked.** This installation connects none, so a copilot call **fails** here —
-  and the walk asserts the audit precisely *because* a failure is still a call. The model's text
-  belongs to the provider and is not asserted; the sanitiser's text rules (fences, tags, control
-  characters, the length cap, the empty-answer refusal) are unit-tested in the module, which is
-  where they belong.
-- **Proof.** `cargo test -p omnion-module-crm --lib` → **146/146**. `cargo test -p omnion-api
-  --lib` → **129/129**. `cargo test -p omnion-api --test crm` against `omnion_test_w4_tick`, a
-  database created for this run → **36/36** (the 35 prior walks plus this one, all re-proved).
-  `pnpm typecheck` → **2/2**.
-- **Environment note.** `/mnt/apopic` sat at 97% again (2.0 GB free) with seven writers on the
-  mount. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2` and this worktree's own
-  `target/debug/incremental` kept the tick through; the seven `target/` directories still total
-  over 27 GB and a shared `CARGO_TARGET_DIR` remains the permanent fix.
-- **Next.** The last of slice 4: the global-search registration (REQ-002 — how
-  `crates/search` / `apps/api/src/routes/search.rs` collects its sources, and register
-  contacts/companies/deals with a deep link), then the `form.submitted` consumer (REQ-064) creating
-  a contact + deal. Then the **w4 QA browser pass**, which has still never run on this branch:
-  `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh`
-  (timeout 1500s). It is the last gate for closing REQ-051, and the copilot's panel card still
-  has to be added to the walkthrough route list before it is worth running.
+- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  filtered listing against a real database — the walk that asserts the audit rows for
+  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  made the walk real and then fixed what it found.
+- **Six defects, none of them visible to the layer that owned them.**
+  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+     only exist where the value beside it was pushed.
+  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+     trash summary answered 500. Cast back to `bigint`.
+  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+     row against the pre-update snapshot, so no ordering is needed.
+  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+     new path, so `parent_id` became the folder itself on every move, and the first move of a
+     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+     *parent's* path.
+  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+  and a move to where a folder already is is a no-op.
+- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+  session and to an account with no media permission, a site created after the migration still
+  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  a file moves between folders without its storage key changing, a filter narrows the listing and
+  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  no new warning.
+- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  `target/debug/incremental` in this worktree returned 2.9 GB.
+- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+  history, the preview pipeline and the file detail screen do not.
 
-## 2026-09-28 — wave 4 · REQ-051 slice 4 part four: the CRM in the palette
+## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
 
-- **What shipped.** **`5bedddb`** — `crates/search/src/providers.rs` gains three providers, and
-  `crates/search/src/indexer.rs` the three upserts, three prune arms and the `crm.*` event plans.
-  `database/migrations/0031_crm_search_providers.sql` enables the keys. **`241cf91`** — the three
-  screens read `?focus=<id>`, and the three walks that prove it.
-- **The split is the point, and it is the module's, not the index's.** `contacts` and `companies`
-  carry `crm.contacts.read` because the CRM already treats them as one surface; `deals` carries
-  `crm.deals.read` of its own. The palette filters a provider on the key of the screen it points
-  at, so a contact-only reader finds people and gets **no** deal rows — the same refusal
-  `/api/v1/crm/deals` already gives them. A search that answered with the pipeline would be the
-  wider door around a decision the module deliberately made.
-- **Three decisions worth writing down.**
-  1. **Archiving is a remove, not a refresh.** An archived record still *exists* as a row the
-     module can read, so an `Index` plan would bring it straight back. The CRM lists hide
-     archived rows by default, which means a document that outlived its archive would answer with
-     a record the panel will not show when the person follows the link. All three upserts also
-     carry `where archived_at is null`, so a full reindex agrees with the event drain.
-  2. **A contact's notes never reach the index.** The module flags them
-     `crm.fields.sensitive.read` precisely because a contract note is the CRM's most private
-     column, and a `tsvector` cannot answer a per-role question. The rule the module states is
-     the rule the index keeps — otherwise the palette would be a way to search the field the IAM
-     was built to hide.
-  3. **A deal carries its stage's *name*.** `won` is a word a person types and `4f2c…` is not, and
-     a move into a differently-named stage must answer under the new name without a reindex. The
-     lost reason is a tag only: a reason is "too expensive", and putting it in the vector would
-     make a competitor's objection the most findable word in the index.
-- **Two defects the walks were written to find, and one the fixture was.**
-  - The walks first signed the **CRM manager** in to run the reindex. `search.manage` is a
-    platform key a tenant manager does not hold, so the reindex answered `403` — the walk was
-    asking the wrong actor, and the fixture now keeps the owner's address for exactly this.
-  - They then searched with the same manager and got `403` on `search.read`. That is not a bug:
-    the **box** is its own surface and its own key, refused before any provider is considered. A
-    walk that wants to prove the provider split has to hand the box over explicitly, or it proves
-    the palette is closed rather than what is behind it. Both are now granted, and the second one
-    is worth remembering as a *fact about the system*, not only about the test.
-- **Proof.** `cargo test -p omnion-search` → **47/47** (five new: the registry's route/permission
-  contract, archive-is-a-remove, the deep link, the archived guard, the notes exclusion).
-  `cargo test -p omnion-module-crm --lib` → **146/146**. `cargo test -p omnion-api --lib` →
-  **129/129**. `cargo test -p omnion-api --test crm` against `omnion_test_w4_t6c`, a database
-  created for this run → **39/39** (the 36 prior walks plus the three new ones, all re-proved).
-  `tsc --noEmit` in `apps/admin` → **clean**.
-- **Environment note.** `/mnt/apopic` hit **100%** mid-tick: two `cargo` invocations ran at once
-  (a `--lib` run and a `--tests` run) and each links a ~290 MB test binary, so the second died
-  with `IO failure on output stream: No space left on device` and then a linker bus error. The
-  fix is not mysterious — `target/debug/deps` held **5 GB of re-linkable test binaries** from
-  earlier ticks. `find target/debug/deps -type f -executable -size +100M -delete` gave 4 GB back
-  instantly, and only the one suite under test needed to be rebuilt. **A test binary is a build
-  artifact, not a result**: deleting it costs a link, never a fact.
-- **Next.** The `form.submitted` consumer (REQ-064 — a submitted form becomes a contact and a
-  deal) and the workflow-trigger proof (that an automation rule on `crm.deal.stage_changed` runs
-  once), which needs wave 3's engine rather than this module's. Then the **w4 QA browser pass**,
-  which has still never run on this branch: `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103
-  QA_WEB_PORT=3203 bash scripts/qa/run.sh` (timeout 1500s). Before that run, add the **copilot
-  card** to `scripts/qa/walkthrough.cjs`'s depth passes — it is not in the route list yet, so the
-  walkthrough would not visit the screen the previous tick shipped and the pass would prove
-  nothing about it. It is the last gate for closing REQ-051.
-
-## 2026-09-28 — wave 4 · REQ-051 slice 4 part five: the copilot gets a card, and the first w4 QA pass reaches the end of the route list
-
-**What.** The two copilot endpoints have been reachable only from `curl` since they shipped. They
-are proved, guarded by `crm.copilot.use`, audited on both paths and unit-tested — and no person has
-ever been able to ask for one. The DoD is explicit that a REQ is not done until a human can use it
-end to end, and an endpoint without a screen is that claim unfalsified. This adds the screen: a
-**Copilot** button on every board card, a side panel that answers `summarize` and `follow-up`, and
-`runCrmCopilotDepth` in the walkthrough.
-
-**Three decisions, and why.**
-
-- **The button is on the card, not in a row menu.** On the board the card *is* the record; a menu
-  would make every question begin with "which card?". The panel follows the focused card and takes
-  focus when it opens, so the keyboard is not stranded behind a layer. Escape closes it.
-- **A refusal is rendered as a sentence.** This installation connects no provider, so the honest
-  outcome is the failure path — and that is precisely the path that has to be legible. A button
-  that does nothing is not a bug report anyone can file.
-- **The draft marker is read, not assumed.** `is_draft` drives a visible flag that turns amber and
-  reads "written to the record" if a response ever claims otherwise. The client must not quietly
-  undo the promise the server makes from the other end. The answer renders in a **text node**: the
-  server's sanitiser already reduced it to plain text, and rendering markup here would hand that
-  guarantee back to a future refactor.
-
-`?focus=<id>&copilot=1` opens the panel on arrival, so a shared link — or a palette row added later
-— lands on the answer rather than on a card whose panel stays shut.
-
-**Proof.** `pnpm typecheck` → **2/2**. `cargo test -p omnion-module-crm --lib` → **146/146**. The
-w4 QA pass ran end to end on the private stack (`QA_STACK=w4`, ports 18083/3103/3203, database
-`omnion_qa_w4`).
-
-**Environment note — two disk deaths in one tick, both self-inflicted, both the same lesson.**
-`/mnt/apopic` is a 60 GB mount shared by seven writers. The first pass died at
-`ENOSPC … appendFileSync` in the walkthrough's own `clicks.jsonl`; a screenshot failure is a
-warning, a `record()` write is fatal. Recovery was mechanical: QA artefacts, `.rmeta` files, the
-incremental directory, and `target/debug/deps` binaries — **a re-linkable build artefact, never a
-result** — which returned 1.3 GB. Two details worth keeping:
-
-* `target/debug/omnion-api` is a **hard link** to `target/debug/deps/omnion_api-<hash>` (link count
-  2). Deleting the `deps` copy costs a link and leaves the running binary intact; deleting the
-  binary would make the next QA pass rebuild the whole API. Check `stat -c %h` before assuming a
-  file is the only copy.
-* Deleting the deps binaries **while** `run.sh` was between its build check and its `pm2 restart`
-  is what made the first pass's `omnion-qa-api-w4` answer nothing on `:18083`. A maintenance window
-  on a build directory is a window on a *running service*.
-
-**Next.** The `form.submitted` consumer (REQ-064) and the workflow-trigger proof (wave 3's engine).
-Then REQ-051's last three acceptance boxes — the empty/loading/error sweep, the 390×844 mobile pass
-and the keyboard sheet — and only then the status line may read `done`.
-
-## 2026-09-28 — wave 4 · REQ-051 slice 4 part six: the workflow-trigger proof
-
-**What.** The acceptance criterion is one sentence — "an automation rule triggered by
-`crm.deal.stage_changed` runs once" — and it is the only part of this slice that could not be
-answered from inside the CRM. The CRM emits the event; the **matcher** decides what fires. So the
-proof drives the real `crates/automation/src/matcher.rs` over the real bus in this suite's own
-database, and the event the rule reads is the one the board's stage endpoint emitted. Three walks,
-in `apps/api/tests/crm.rs`.
-
-**What they assert, and why each one is a separate claim.**
-- A move to the stage a deal is **already in** starts nothing. The board's keyboard path posts on
-  every arrow press, so this is the assertion that keeps a rule from being a nuisance.
-- One move starts **one** run, and the run's step carries *this* move's values: the subject reads
-  "A deal entered open" and the body the deal's id, amount and currency. A retry therefore repeats
-  the first attempt rather than re-reading a bus that has moved on.
-- The second drain is **idle**. That is what "once" means — the absence of a second chance, not a
-  count — and the cursor is read back to prove it.
-- The match is audited (`automation.rule.matched`) against the execution.
-- A **second deal** starts a second run: exactly-once is per *event*, and a rule that collapsed two
-  customers into one run would silently drop one.
-- A rule whose condition does not hold is `skipped`, not `matched`.
-- The key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define
-  the rule watching them, and a rule for another organization is refused.
-
-**Three defects this found, and the fourth that was not mine.**
-- A token minted **before** the grant answered 403 on the very rule the walk writes: a session's
-  powers are read at login, so grant-then-sign-in is the order every workflow key needs.
-- The first draft read a token *twice* — once before the grant and once after — and the compiler's
-  unused-variable warning was the only thing that noticed the first line was dead.
-- The bus was **not empty** after the setup: creating a deal is itself an event. Two walks counted
-  their own fixture and read "a rule fired twice" or "two events on the bus" where the product was
-  right. Fixed with `flush_without_runs`, which asserts the drain started *nothing* — a setup flush
-  that silently ran a rule would hide exactly what these walks are for.
-- The fourth failure was **not a defect**: the suite's database was gone mid-run. `/mnt/apopic`
-  reached 100% earlier in the tick, the Postgres container restarted, and a database created before
-  that did not survive it. `RestartCount=0` with a fresh `pg_postmaster_start_time` is the tell, and
-  the lesson is the one the disk keeps teaching: on this mount a full disk takes the **database**
-  down, not just the build.
-
-**Disk, again.** The build died at `libomnion_identity-….rlib: No space left on device`. This time
-the reclaim was `apps/admin/.next/dev` and `apps/web/.next/dev` — 1.2 GB of turbopack dev cache,
-re-derivable, and inside **this** worktree only. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1` did the
-rest at roughly a third of the wall-clock.
-
-**Proof.** `cargo test -p omnion-api --test crm` → **42 passed; 0 failed** against a database
-created for this run (`omnion_test_w4_t7c`), `--test-threads=1`. `cargo test -p omnion-module-crm
---lib` → **146/146**. `pnpm typecheck` → **2/2**.
-
-**Next.** The `form.submitted` consumer (REQ-064 — a submitted form becomes a contact and a deal),
-which is the last part of this slice. Then REQ-051's final three acceptance boxes: the
-empty/loading/error sweep across all six screens, the 390×844 mobile pass and the keyboard sheet.
-Only then may the status line read `done`, and that close tick runs the w4 QA browser pass.
-
-## 2026-09-28 — REQ-051 slice 4 part seven · a submitted form becomes a contact and a deal
-
-- **The merge first.** `origin/main` had moved 10 commits (the media file manager's presets and
-  transform pipeline, the QA slot holder). One conflict, in the append-only build log, resolved
-  as a union from the three merge stages rather than by hand — and verified two ways, because
-  the last merge of this file had silently dropped 112 lines on the main side: the per-side
-  `SequenceMatcher` reported a shortfall of 112, and a **multiset** comparison of every line on
-  both sides against the merged file reported **zero missing on either side**. The line count
-  checks out too: 1874 base + 572 ours + 66 theirs = 2512.
-- **What shipped.** **`modules/crm/src/leads.rs`** — the consumer, 1262 lines with 26 unit tests ·
-  **`database/migrations/0034_crm_form_leads.sql`** (0034 was free; every other wave's highest is
-  0033) · **`apps/api/src/routes/crm_leads.rs`** — three routes and two permission keys ·
-  **`apps/api/src/lead_runner.rs`** — the background drain, wired in `main.rs` behind
-  `OMNION_LEAD_RUNNER` · `CrmConfig` in the core config (`OMNION_LEAD_POLL_MS`,
-  `OMNION_LEAD_BATCH`) · the inbox screen and its API client in the admin app · ten integration
-  walks.
-- **The producer is not in this build, and that shaped everything.** The form builder is REQ-064
-  (wave 2b, another worktree). So the consumer is written against the **event contract** —
-  `form.submitted` — and not against a form table, a form crate or a form type. It does not
-  import anything from a module that may never be installed, and the day the builder lands it
-  has to emit one documented string and nothing else. The walks emit the event through
-  `omnion_events::bus::emit` — the same call REQ-064's public endpoint will make — rather than
-  inserting a row, so what is proved is the contract and not the SQL.
-- **Three decisions that are the whole feature.**
-  1. **Exactly once, by the bus identity.** `crm_form_leads.event_id` is the primary key. An
-     `exists` check followed by an insert would be the obvious way and it is wrong: there is a
-     window between the two statements in which a second API process reads the same bus and
-     creates a second contact. So the ledger row is inserted **first**, with
-     `on conflict do nothing`, and the **row count** decides who acts. One of the three walks
-     rewinds the cursor and drains the same event again to prove the claim, not just the cursor,
-     holds.
-  2. **Deliberately not in a transaction.** `create_contact` and `create_deal` take a `&PgPool`,
-     so wrapping the drain in one transaction would mean changing the module's own write
-     signatures to take an executor. Claiming first buys a different failure: a crash between the
-     claim and the write leaves a ledger row that says `rejected` and names why, which the inbox
-     shows. A rolled-back transaction shows nothing and replays forever. The `restate` call is
-     what keeps the ledger honest when the contact write itself fails.
-  3. **Routing is a row, not a constant.** `crm_lead_settings` holds two toggles, two stage ids
-     and a source label, seeded for every organization that has a pipeline and created on first
-     use for the ones that do not. A feature that only works after somebody has opened a
-     settings screen is a hidden feature; the `GET` deliberately does **not** create the row (a
-     read that writes turns a read into a change), and the drain's `load_settings` does.
-- **Four defects the unit tests found, all of them in the extractor, all of them in the *happy*
-  path of a form nobody had written yet.**
-  1. **A form with both a "Name" and a "First name" field lost the first name.** The key list
-     had `name` first, so the combined two-word value won and "Augusta King" became the first
-     name `Augusta King`. The more specific key has to be read first — a form that collects both
-     has told us which one it means.
-  2. **A 400-character "name" and a name of `---` both passed.** The explicit name fields were
-     not passed through the same `clamp_name` the guessed split used, so a hostile or broken
-     producer reached the first-name column and `create_contact` then refused the whole
-     submission with a message a person reading a form never typed. Refusing at extraction turns
-     that into an honest `rejected` row.
-  3. **A message longer than the note cap was dropped entirely** — losing exactly the person who
-     cared enough to write a lot. It is truncated at a word boundary now, as the doc promised.
-  4. **A submission with only an address produced a contact with no first name**, because the
-     contact table requires one and `validate_contact` refuses. The local part of the address is
-     the honest fallback: it is what the person typed in that field, and a human can correct it. A
-     placeholder like "Unknown" is not — it looks like data and reads as an error.
-- **The `create_deal` signature changed, and that is a decision worth naming.** It took
-  `user_id: Uuid` and used it as the owner fallback, so a submission would have been filed into
-  whoever happened to run the drain. That is a stranger's lead in a colleague's list. The
-  parameter is now `owner_fallback: Option<Uuid>` and the drain passes `None`: an unassigned deal
-  is a deal the board shows as needing an owner. The one other caller passes `Some(current.user.id)`.
-- **Ten walks, over the real router and the real bus.** A submitted form becomes a contact and a
-  deal with the deal titled in the person's own words · the same bus drained twice files nothing
-  twice, **including** after the cursor is rewound onto the same event · a repeat from a
-  differently-cased address is the same person and lands in the repeat stage while the first deal
-  stays in the first open column · a submission with nothing usable is kept, is `rejected`, and
-  **carries the sentence** · a submission with no organization is `orphaned` and is in nobody's
-  inbox · an organization that turned leads off records the submission and writes nothing · the
-  two keys are genuinely separate (a watcher may read the inbox and is refused when it tries to
-  reconfigure it), unauthenticated is `401`, and a foreign tenant's save does not touch ours · a
-  stage from another pipeline's organization is refused **by name** in `error.details.field` ·
-  a routing change is audited and announced exactly once, and the same body again is neither ·
-  and the two keys are in the catalogue and in the owner's role, and **not** handed to a CRM
-  manager by default.
-- **Proof.** `cargo test -p omnion-module-crm --lib` → **172/172** (146 before, 26 new).
-  `cargo test -p omnion-api --test crm` → **52/52** (42 before, 10 new) against a database
-  created for this run, `--test-threads=1`. `pnpm typecheck` → **2/2**. `cargo check --workspace`
-  clean. The walkthrough route list gained `/crm/leads` and a `runCrmLeadsDepth` pass.
-- **The QA browser pass, honestly.** It ran on the private `w4` stack (`:18083` / `:3103` /
-  `:3203`, database `omnion_qa_w4`, `QA_SLOTS=0`) and got through the whole route list **until the
-  Chromium tab died**: `Target page, context or browser has been closed` from the analytics routes
-  onward, so `crm-leads` and the depth passes after it were recorded as failures of the *tab*,
-  not of the screen. The box is running seven writers and three concurrent QA passes; free memory
-  was 262 MiB against 32 GiB with 17 GiB already in swap. The screen is in the route list and the
-  pass is registered, so the next run on a quieter box proves it; **this tick does not claim a QA
-  pass on the new screen**, and REQ-051 stays `in-progress` for that reason as well as for the
-  last three acceptance boxes.
-- **One more disk death, and the file it cost.** `/mnt/apopic` reached 100% mid-tick and a
-  `write_file` of `leads.rs` left it **zero bytes** while `git status` still showed it as
-  untracked. The lesson is the one from `git commit` failing the same way two ticks ago: on this
-  image a write can succeed, a truncate the file, and report nothing. The file was rewritten from
-  the content the compile errors had already corrected.
-- **Next.** REQ-051's **last three acceptance boxes**, which are the whole of what remains: the
-  empty/loading/error sweep across every screen, the 390×844 mobile pass and the keyboard sheet.
-  The inbox screen already answers `/` for the search and is in the route list, so the sweep is
-  about the six screens that predate it. The close tick runs the w4 QA pass.
-
-## 2026-09-28 · REQ-051 · tick 10 — the platform account, and twelve failures that were five
-
-- **What shipped.** **The tenant fallback** (`b899f7f`) — the QA owner's five CRM screens
-  answered `400 organization_required` because a platform account has no primary organization
-  by design. The module now resolves the tenant itself and falls back to the single
-  organization a platform account is bound to, refusing when there are two (`organization_
-  ambiguous`) or none. `apps/admin/app/crm/layout.tsx` wraps the six screens in one
-  `CrmTenantProvider` so two screens cannot disagree about which tenant they are showing.
-- **And four real defects, found by running a suite whose walks had never executed.**
-  `29b202f` a doubled trailing backslash in a Rust SQL string (`\\`) is an escaped backslash,
-  not a line continuation, so a literal `\` reached Postgres: nine of the twelve failures were
-  one character, and it made every lead-settings read a 500. `c739ccf` `crm_form_leads.
-  organization_id` was `not null` while the migration's own header says a submission may belong
-  to nobody — so the orphan path, the branch that exists to *keep* such a submission, raised a
-  not-null violation and the drain reported `failures: 1` while every counter read zero.
-  `fe2d49b` `NAME_KEYS` held `"name"` beside `"first_name"`, so a form whose field is `name`
-  gave `Ada Lovelace Lovelace`: each half a valid name, which is why no validator caught it.
-- **Proof.** `cargo test -p omnion-module-crm --lib` → **172/172**. `cargo test -p omnion-api
-  --test crm` → **55/55** against a database created for the run, `--test-threads=1` (52 before,
-  12 of them failing, 3 new). `pnpm turbo run typecheck --force` → **2/2**. The other seven
-  failures were walks passing `fixture.owner` — an e-mail — where `request` takes a bearer
-  token, answering 401 before the route under test was reached.
-- **The environment.** `rustc` was **0 bytes, mode 000** (`Permission denied` on `rustc -vV`),
-  the known box-wide 0-byte corruption; `rustup toolchain install stable --profile minimal
-  --force` restored it, and `/mnt/apopic` was at 95% throughout.
-- **Next.** REQ-051's **last three acceptance boxes**: the empty/loading/error sweep across the
-  six screens, the 390×844 mobile pass and the keyboard sheet. The close tick runs the w4 QA
-  pass and requires 0 high findings before the status becomes `done`.
 - **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
   replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
   one back *as a new version* rather than by rewriting history.
@@ -2861,81 +3143,3 @@ Only then may the status line read `done`, and that close tick runs the w4 QA br
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
-
-## 2026-09-28 — REQ-051 · the request id, one error state, and the panel that was stricter than its API
-
-**What.** The empty/loading/error box was the last thing left on REQ-051 and it turned out to be
-three defects wearing one label. The API's refusal carried a code, a message and sometimes a
-`details` object and **no request id**, so the "error state with retry button and request id" the
-box asks for had no id to show. `apps/api/src/request_id.rs` now stamps `x-request-id` on every
-response and `error.request_id` in the body, honouring an inbound id only when it is safe to
-reflect and replacing a hostile one rather than sanitising it. `lib/crm.ts` was also dropping
-`error.details`, which is why every field-level refusal rendered as a generic banner with nothing
-under the input it was about. `components/error-state.tsx` replaces six hand-rolled error blocks —
-three shapes, and two of them with no retry at all — and the board's empty column got a sentence
-and an action instead of a grey "No deals".
-
-**Then the QA pass told a different story.** It reported the *whole* CRM suite false: no company
-created, no contact created, no email refusal, no shortcut sheet. The first screenshot answered it.
-The QA owner is a **platform account** (`organization_id = NULL`) holding exactly one binding, and
-`crm-tenant.tsx` drew its organization chooser for that account, so no CRM screen ever issued a
-list read. `organization_of` in `apps/api/src/routes/crm.rs` does not do this — it falls back to
-the caller's single binding and refuses with `organization_ambiguous` only for two or more. The
-panel had re-decided the tenant rule independently and decided it more strictly. Two ticks of CRM
-acceptance evidence had been collected from a chooser, and every "proved in the browser" claim in
-the REQ was resting on it.
-
-**Proof.**
-- `cargo test -p omnion-api --lib request_id` — **10/10** (a hostile header value, the CSV
-  passthrough, both homes of the id, and the details object surviving the rewrite).
-- `cargo test -p omnion-module-crm --lib` — **172/172**.
-- `pnpm turbo run typecheck --force` — **2/2** (twice; a cached typecheck is not a typecheck).
-- Live, against the QA API: `GET /api/v1/crm/contacts?limit=1` unauthenticated answers **401** with
-  `x-request-id: 2ec164d9…` **and** `{"error":{…,"request_id":"2ec164d9…"}}` — the same value in
-  both homes, on a real refusal.
-- First QA pass (`20260928-141747`): 1006 clicks, 1068 screenshots, `crmStates` **23 of 27 false**,
-  and the 98 high findings are **all** `media/settings` — the main writer's surface, not this one.
-  The pass is re-running with the tenant fix as its first job.
-
-**Commits.** `63512c5` the request id · `c0e51fe` the client and one `ErrorState` for six screens ·
-`225425e` the REQ · `1e0af8f` the empty column · `8477c2f` the tenant fix.
-
-**Next.** The re-run decides whether REQ-051's error box closes, or whether the state sweep finds
-that a screen with a working error state still has a broken *load* state. Then the 390×844 pass and
-the keyboard sheet, which are the two boxes after it.
-
-## 2026-09-28 — REQ-051, the CRM was unreachable on a first-run installation
-
-**What.** The scoped pass (`--only=crm`, added this tick) found that after the tenant fix every
-CRM read *and* write answers `organization_required`: no contact, company, deal or activity could
-be created or listed by the account the panel is used with. `organization_of` resolves a caller
-that cannot name an organization from the **tenant bindings** it holds, and the platform owner of
-a first-run installation holds the `global` Owner role and nothing else — the owner role is a
-`global` binding by construction, so the tenant list is empty. The refusal's own advice,
-"pass organization_id", is impossible to follow: naming a tenant requires the very permission that
-binding would have carried. The `[]` arm now falls back to the installation's organization when
-there is **exactly one**, and only then; two or more is still `organization_ambiguous`.
-
-**Proof.**
-- `cargo test -p omnion-api --lib routes::crm` — **27/27** (three new: the one-organization
-  fallback, the two-organization refusal, and the no-organization sentence no longer naming a
-  parameter the caller cannot supply).
-- `cargo test -p omnion-module-crm --lib` — **172/172**.
-- `pnpm turbo run typecheck --force` — **2/2**.
-- Live, before the fix: `GET /api/v1/crm/contacts` and `/api/v1/crm/contacts/export` as the QA owner
-  both answered `400 organization_required` with a `request_id`, and the database held **one**
-  organization and **zero** CRM rows — the empty state the pass reported was the refusal wearing an
-  empty list's clothes.
-- Scoped pass `20260928-155321-crm` (7 routes, `--only=crm`): `contactsEmptyState: true` against a
-  screen that had never loaded — the false green this tick exists to end.
-
-**Commits.** `a8e3f53` the scoped pass · `e7ba429` the one-organization fallback.
-
-**Next.** Restart the w4 QA API onto the rebuilt binary and re-run `--only=crm`: the depth passes
-that never got to run (deals, activities, copilot, leads, the state sweep) are what decide whether
-REQ-051's empty/loading/error box closes. The 390x844 and keyboard boxes are still open after it.
-
-**Environment.** `/mnt/apopic` hit 100% mid-build and the box-wide disk guard deleted this
-worktree's whole `target/`, so the build is now on `CARGO_TARGET_DIR=.tmp-target` (the repo's own
-convention, and it is the same tree the guard spares). Load sat at ~316 for ten minutes: seven
-writers compile at once, so a build can sit at 0% CPU for minutes before it is scheduled at all.

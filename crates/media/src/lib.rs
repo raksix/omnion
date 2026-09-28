@@ -14,6 +14,7 @@
 pub mod browser;
 pub mod duplicates;
 pub mod error;
+pub mod exif;
 pub mod folder_store;
 pub mod folders;
 pub mod library;
@@ -39,6 +40,7 @@ pub use duplicates::{
     merge_group, reclaimable_total, record_reference, repoint_references, site_labels,
 };
 pub use error::{MediaError, Result};
+pub use exif::{EXIF_HEADER_BYTES, Exif, ORIENTATION_TAG, oriented_size, read as read_exif};
 pub use folder_store::{
     count_files_in_folder, delete_empty_folder, find_folder, insert_folder, list_folders,
     move_folder, root_folder,
@@ -65,9 +67,8 @@ pub use shares::{
 };
 pub use storage_settings::{
     ConnectionProbe, MAX_SIGNED_URL_TTL, MAX_UPLOAD_MB, MIN_SIGNED_URL_TTL, MIN_UPLOAD_MB,
-    NewSiteStorage, SiteStorage, describe_public_base, describe_target,
-    effective_max_upload_bytes, probe_key, read_storage_settings, validate_new as validate_storage,
-    write_storage_settings,
+    NewSiteStorage, SiteStorage, describe_public_base, describe_target, effective_max_upload_bytes,
+    probe_key, read_storage_settings, validate_new as validate_storage, write_storage_settings,
 };
 pub use transform::{
     Derivative, Fit, ImageFormat, MAX_PRESET_DIMENSION, MAX_PRESET_NAME_LENGTH, NewPreset, Preset,
@@ -81,5 +82,6 @@ pub use validation::{
 pub use versions::{
     MAX_NOTE_LENGTH, MediaVersion, NewVersion, VersionTransaction, all_storage_keys,
     append_version, begin_version, commit_version, count_versions, ensure_version_one,
-    fill_dimensions, find_version, list_versions, next_version, normalize_note, probe_of,
+    fill_dimensions, fill_exif, find_version, list_versions, next_version, normalize_note,
+    probe_of,
 };

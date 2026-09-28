@@ -192,6 +192,10 @@ pub async fn create_version(
         .await?;
 
     let probe = omnion_media::probe_of(&upload.bytes, &upload.content_type);
+    // A replacement is a different photograph, so it carries its own camera record — and a
+    // replacement in a format that has none *clears* the record rather than inheriting the
+    // previous body's, which is what a merged "the file says it is a Canon" line otherwise does.
+    let exif = omnion_media::read_exif(&upload.content_type, &upload.bytes);
     let version = omnion_media::NewVersion {
         version: next,
         storage_key: key.clone(),
@@ -205,7 +209,9 @@ pub async fn create_version(
     let columns = probe.columns();
 
     let appended =
-        match omnion_media::append_version(&mut *transaction, file_id, &version, columns).await {
+        match omnion_media::append_version(&mut *transaction, file_id, &version, columns, &exif)
+            .await
+        {
             Ok(row) => row,
             Err(error) => {
                 // The bytes are in the bucket but the history refused them: drop the object so the
@@ -314,6 +320,10 @@ pub async fn restore_version(
         .await?;
 
     let probe = omnion_media::probe_of(&bytes, &wanted.content_type);
+    // The record is read from the bytes being restored rather than copied off the version row:
+    // a version's geometry was stored, but restoring it re-reads the same bytes, so the record
+    // has to come from the same place or a rotation and its dimensions could disagree.
+    let exif = omnion_media::read_exif(&wanted.content_type, &bytes);
     let version = NewVersion {
         version: next,
         storage_key: key.clone(),
@@ -327,7 +337,7 @@ pub async fn restore_version(
     let columns = probe.columns();
 
     let appended =
-        omnion_media::append_version(&mut *transaction, file_id, &version, columns).await?;
+        omnion_media::append_version(&mut *transaction, file_id, &version, columns, &exif).await?;
     omnion_media::commit_version(transaction).await?;
 
     let updated = omnion_media::find_file(pool, file_id)

@@ -43,8 +43,25 @@ while read -r inc; do
 done < <(find "$ROOT"/omnion*/target/debug/incremental -maxdepth 0 -type d -mtime +1 2>/dev/null)
 
 # 2. old QA artifact folders
+#
+# A folder a pass is *writing into* is skipped, and the skip is decided by mtime rather than by
+# a marker file. `run.sh` creates its directory at the start of the pass and appends
+# `clicks.jsonl` to it throughout, so a directory touched in the last hour is one a live
+# walkthrough owns. Without this the guard deleted the folder a pass had just created: the
+# walkthrough's next `appendFileSync` then failed with `ENOENT ... clicks.jsonl`, the whole
+# pass died, and the run reported no findings at all — a cleanup script taking out the quality
+# gate it was making room for.
+#
+# `-mmin -60` rather than an age comparison against the loop count, because the loop already
+# keeps the newest N and the race is specifically with a pass that started *after* the ordering
+# was taken.
 while read -r art; do
   [ -n "$art" ] || continue
+  recent=$(find "$art" -maxdepth 1 -mmin -60 -print -quit 2>/dev/null)
+  if [ -n "$recent" ]; then
+    say "keep qa-artifacts (a pass is writing it): $art"
+    continue
+  fi
   m=$(dir_mb "$art"); freed=$((freed + m))
   say "rm qa-artifacts $(du -sh "$art" 2>/dev/null | cut -f1): $art"
   rm -rf "$art"
