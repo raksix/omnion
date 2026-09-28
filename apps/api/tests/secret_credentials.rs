@@ -381,7 +381,15 @@ async fn typed_credentials_and_slots_are_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(detail.status, StatusCode::OK);
+    // The body goes in the message: a bare `500` here says nothing about which of the store, the
+    // permission check or the serialiser failed, and the suite runs without a server to read a
+    // log from.
+    assert_eq!(
+        detail.status,
+        StatusCode::OK,
+        "the detail read must answer: {}",
+        detail.raw
+    );
     assert_eq!(detail.body["fields"]["host"], json!("smtp.example.com"));
     assert_eq!(detail.body["version"], json!(1));
     assert!(
@@ -556,7 +564,11 @@ async fn typed_credentials_and_slots_are_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(refused_bridge.status, StatusCode::BAD_REQUEST);
+    // `422`, not `400`. The payload is well-formed; the *resource* refuses the operation,
+    // because a `file`/`env` bridge is managed outside the platform and will never accept a
+    // write. The request's acceptance line asks for `405`/`422` for exactly this reason, and a
+    // `400` invites a caller to retry with different input when no input would help.
+    assert_eq!(refused_bridge.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         refused_bridge.body["error"]["code"],
         json!("secret_read_only")

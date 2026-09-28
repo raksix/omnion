@@ -166,9 +166,14 @@ pub(crate) fn map_error(error: omnion_secrets::SecretsError) -> ApiError {
         }
         omnion_secrets::SecretsError::RotationInProgress => StatusCode::CONFLICT,
         omnion_secrets::SecretsError::Invalid(_)
-        | omnion_secrets::SecretsError::ReadOnly
         | omnion_secrets::SecretsError::LeaseUnavailable(_)
         | omnion_secrets::SecretsError::DeploymentKeyUnavailable(_) => StatusCode::BAD_REQUEST,
+        // A read-only bridge is a well-formed request against a resource that refuses the
+        // operation, which is `422` rather than `400`: nothing about the payload is wrong, the
+        // secret is simply managed outside the platform and will never accept a write. The
+        // request's acceptance line asks for `405`/`422`, and the distinction matters to the
+        // caller — a `400` invites a retry with different input, a `422` does not.
+        omnion_secrets::SecretsError::ReadOnly => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let mut mapped = ApiError::new(status, error.code(), error.to_string());

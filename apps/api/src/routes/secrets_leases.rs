@@ -269,6 +269,15 @@ pub struct CreateDeploymentKeyInput {
     pub scopes: Vec<String>,
     /// The expiry, as an RFC 3339 timestamp. Required: a machine credential that never
     /// expires is a liability, not a convenience.
+    ///
+    /// The attribute is not decoration. Without it `time::OffsetDateTime` deserializes from a
+    /// *tuple* — `(year, ordinal, hour, …)` — so every real client, which sends what
+    /// `Date.prototype.toISOString()` produces, is answered `422 expires_at: invalid type:
+    /// string`. The panel sends an ISO string, which means the create drawer was a dead button
+    /// for every operator: the one field the request marks required was the one field the API
+    /// could not read. `time::serde::rfc3339` is on the *output* types already; this brings the
+    /// input into the same agreement.
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: time::OffsetDateTime,
     /// Optional comma-separated address allow-list (`203.0.113.7`, `10.0.0.0/8`).
     #[serde(default)]
@@ -989,5 +998,82 @@ mod tests {
     fn a_blank_header_is_no_identity_rather_than_an_empty_one() {
         let headers = headers_with(DEPLOYMENT_KEY_HEADER, "   ");
         assert!(presented_key(&headers).is_none());
+    }
+
+    /// The wire format of the create body, asserted where the DTO lives.
+    ///
+    /// This test exists because of a real defect rather than as a formality: the drawer's
+    /// `expires_at` was answered `422` for every operator. The panel sends
+    /// `new Date(...).toISOString()` and the field deserialized from a *tuple*, so the one
+    /// required field was the one field the API could not read — and the integration walk, which
+    /// posts the same ISO string, caught it only on the tick after the slice shipped.
+    ///
+    /// A round trip through the exact bytes the browser sends is the cheapest way to keep every
+    /// future timestamp in every future DTO honest. Written as deserialize-then-serialize rather
+    /// than as a string comparison, so it also proves the two directions agree with each other.
+    #[test]
+    fn the_create_body_reads_the_iso_string_the_panel_sends() {
+        let body = r#"{
+            "name": "release-runner",
+            "environment": "production",
+            "scopes": ["secrets.read"],
+            "expires_at": "2026-09-29T01:44:23.561667032Z"
+        }"#;
+        let input: CreateDeploymentKeyInput =
+            serde_json::from_str(body).expect("an ISO timestamp must be a readable expiry");
+        assert_eq!(input.name, "release-runner");
+        assert_eq!(input.expires_at.year(), 2026);
+        assert_eq!(input.expires_at.month(), time::Month::September);
+        assert_eq!(input.expires_at.day(), 29);
+
+        // And back out again, because the panel reads the same shape from the created response.
+        // A local one-field struct stands in for the view types rather than widening the input
+        // DTO to `Serialize`: the input's job is to *read* a body, and giving it a second,
+        // untested responsibility to write one would be the wrong fix for a test.
+        #[derive(serde::Serialize)]
+        struct Rendered {
+            #[serde(with = "time::serde::rfc3339")]
+            expires_at: time::OffsetDateTime,
+        }
+        let rendered = serde_json::to_string(&Rendered {
+            expires_at: input.expires_at,
+        })
+        .expect("serializable");
+        assert!(
+            rendered.contains('T') && !rendered.contains('['),
+            "the expiry must leave as a string, not as a tuple: {rendered}"
+        );
+    }
+
+    /// A tuple — what `time::OffsetDateTime` speaks natively — is not accepted. The point is not
+    /// to forbid it forever but to document that the contract is RFC 3339, so nobody "fixes" a
+    /// future failure by widening the parser and silently re-introducing the same bug.
+    ///
+    /// The assertion reads the *expected* form out of the message, not the field name. I wrote
+    /// the field name first and it failed: `serde_json::Error`'s `Display` renders
+    /// `invalid type: sequence, expected an RFC3339-formatted OffsetDateTime` with no path, so
+    /// `contains("expires_at")` is false for a *correct* refusal. The field name lives in
+    /// `err.line()/column()` and in the route's own `422` body, which the integration walk
+    /// already asserts; the unit test's job here is the narrower one — the parser demands
+    /// RFC 3339 and says so.
+    #[test]
+    fn a_tuple_expiry_is_refused_rather_than_guessed_at() {
+        let body = r#"{
+            "name": "release-runner",
+            "environment": "production",
+            "scopes": [],
+            "expires_at": [2026, 272, 1, 44, 23, 0]
+        }"#;
+        let error = serde_json::from_str::<CreateDeploymentKeyInput>(body)
+            .expect_err("a tuple is not an RFC 3339 timestamp");
+        let message = error.to_string();
+        assert!(
+            message.contains("RFC3339") || message.contains("RFC 3339"),
+            "the refusal states the format it wanted, which is the whole diagnostic: {message}"
+        );
+        assert!(
+            message.contains("sequence") || message.contains("tuple"),
+            "and it echoes what it actually received: {message}"
+        );
     }
 }

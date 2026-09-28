@@ -309,12 +309,27 @@ pub async fn issue_lease(
     let expires_at = now + time::Duration::seconds(clamp_ttl(ttl_seconds)?);
     let max_uses = clamp_uses(max_uses)?;
 
+    // The `returning` clause has to name *every* column of `LeaseRow`, or sqlx answers
+    // `no column found for name: <field>` — at the insert, which reads like a schema problem
+    // rather than a forgotten entry. `name` and `version` are the two the table does not own:
+    // they live in `secrets` and `secret_versions`, so the insert selects them with a lateral
+    // join. `version` also carries `#[sqlx(default)]`, but a default is a licence to omit a
+    // column from a *plain* select, not a reason to let an insert ship a lease with no name.
     let row: LeaseRow = sqlx::query_as(
-        "insert into secret_leases (secret_id, token_hash, consumer, issued_to_key_id, \
-                environment, expires_at, max_uses) \
-         values ($1, $2, $3, $4, $5, $6, $7) \
-         returning id, secret_id, consumer, environment, issued_at, expires_at, revoked_at, \
-                   revoke_reason, max_uses, uses, last_redeemed_at, issued_to_key_id, null as last_address",
+        "with inserted as ( \
+            insert into secret_leases (secret_id, token_hash, consumer, issued_to_key_id, \
+                    environment, expires_at, max_uses) \
+            values ($1, $2, $3, $4, $5, $6, $7) \
+            returning id, secret_id, consumer, environment, issued_at, expires_at, revoked_at, \
+                       revoke_reason, max_uses, uses, last_redeemed_at, issued_to_key_id \
+         ) \
+         select i.id, i.secret_id, s.name, i.consumer, i.environment, i.issued_at, i.expires_at, \
+                i.revoked_at, i.revoke_reason, i.max_uses, i.uses, i.last_redeemed_at, \
+                i.issued_to_key_id, null::text as last_address, \
+                coalesce((select max(v.version) from secret_versions v \
+                           where v.secret_id = i.secret_id and v.revoked_at is null), 0)::int \
+                   as version \
+           from inserted i join secrets s on s.id = i.secret_id",
     )
     .bind(secret_id)
     .bind(hash_token(LEASE_LABEL, &token))
@@ -330,29 +345,7 @@ pub async fn issue_lease(
     .fetch_one(pool)
     .await?;
 
-    let name = sqlx::query_scalar::<_, String>("select name from secrets where id = $1")
-        .bind(secret_id)
-        .fetch_optional(pool)
-        .await?
-        .unwrap_or_default();
-    let version = current_version(pool, secret_id).await?;
-
-    Ok(IssuedLease {
-        lease: LeaseRow { name, version, ..row },
-        token,
-    })
-}
-
-/// The current, unrevoked version number of a secret; `0` when it has none.
-async fn current_version(pool: &PgPool, secret_id: Uuid) -> Result<i32> {
-    let version: i32 = sqlx::query_scalar(
-        "select coalesce(max(version), 0)::int from secret_versions \
-         where secret_id = $1 and revoked_at is null",
-    )
-    .bind(secret_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(version)
+    Ok(IssuedLease { lease: row, token })
 }
 
 /// Every lease of an environment — live and recent — newest first.

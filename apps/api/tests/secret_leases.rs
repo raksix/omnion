@@ -420,10 +420,15 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         !browser_attempt.raw.contains(FIXTURE_VALUE),
         "a refused redemption must not echo the value either"
     );
+    // The error shape is `{"error": {code, message, details}}` — `details` is a child of the
+    // error, not a sibling. An assertion that reads `body["details"]` finds `null` and reports
+    // "the route forgot the header" when the route is in fact perfect; when a route and a test
+    // disagree about the shape, the route is the spec.
     assert_eq!(
-        browser_attempt.body["details"]["header"].as_str(),
+        browser_attempt.body["error"]["details"]["header"].as_str(),
         Some(KEY_HEADER),
-        "the refusal names the header a caller should have used, not the value"
+        "the refusal names the header a caller should have used, not the value: {}",
+        browser_attempt.raw
     );
 
     // The second half: a deployment key presented in the header may redeem inside its scope.
@@ -865,8 +870,9 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         denied_after_deploy.raw
     );
     assert!(
-        denied_after_deploy.body["details"]["request_id"].is_string(),
-        "a refusal carries a request id"
+        denied_after_deploy.body["error"]["details"]["request_id"].is_string(),
+        "a refusal carries a request id: {}",
+        denied_after_deploy.raw
     );
     assert!(
         !denied_after_deploy.raw.contains(FIXTURE_VALUE),
@@ -924,6 +930,103 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "and it is still the right value"
     );
     let _ = staging_key;
+
+    /* ---------------------------- a read-only bridge refuses every write, and says why ------ */
+
+    // A `file` / `env` provider is a pointer to a credential managed outside the platform. The
+    // only claim worth making about it is that Omnion can never become a second, worse copy of
+    // the operator's own file store — so the write path has to be refused structurally, not by
+    // hiding the button. The test writes straight at the API, which is the only way to prove a
+    // UI that is merely greyed out is not what is holding the line.
+    let bridge_id: Uuid = sqlx::query_scalar(
+        "insert into secrets (name, scope_type, organization_id, description, provider, \
+                              provider_locator, read_only) \
+         values ($1, 'organization', $2, 'A credential managed outside the platform', 'env', \
+                 'STRIPE_SECRET_KEY', true) returning id",
+    )
+    .bind(format!("bridge-live-{}", Uuid::new_v4().simple()))
+    .bind(organization_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the bridge must be created");
+
+    let typed = call(
+        &state,
+        post(
+            &format!("/api/v1/secrets/{bridge_id}/credential"),
+            &owner_token,
+            json!({ "kind": "api_key", "fields": { "endpoint": "https://api.example.test" } }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        typed.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "typing a read-only bridge must be refused with 422, not accepted: {}",
+        typed.raw
+    );
+    assert_eq!(
+        typed.body["error"]["code"].as_str(),
+        Some("secret_read_only"),
+        "the refusal names the reason a UI can render: {}",
+        typed.raw
+    );
+
+    // A lease is a write too: it hands a value to a machine, which a pointer cannot do.
+    let bridge_lease = call(
+        &state,
+        post(
+            &format!("/api/v1/secrets/{bridge_id}/lease"),
+            &owner_token,
+            json!({ "consumer": "release-runner", "environment": "production" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        bridge_lease.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a read-only bridge cannot be leased: {}",
+        bridge_lease.raw
+    );
+
+    // The list still shows it, and says so in words rather than pretending it is broken.
+    let credentials = call(&state, get("/api/v1/secrets/credentials", &owner_token)).await;
+    let bridge_row = credentials.body["credentials"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|entry| entry["id"] == bridge_id.to_string())
+        .expect("the bridge must be listed even without a profile");
+    assert_eq!(
+        bridge_row["read_only"].as_bool(),
+        Some(true),
+        "the row is marked read-only: {bridge_row}"
+    );
+    // Asserted as a containment, not an equality: the sentence is deliberately longer than a
+    // chip, and pinning the exact wording would make a copy edit a test failure for no gain.
+    let description = bridge_row["kind_description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        description.contains("managed outside the platform"),
+        "the panel explains the state instead of showing a missing kind: {bridge_row}"
+    );
+    assert!(
+        description.contains("env"),
+        "and it names the provider that resolves it, so the operator knows which system is the \
+         real owner: {bridge_row}"
+    );
+    assert_eq!(
+        bridge_row["offline_checkable"].as_bool(),
+        Some(false),
+        "a bridge has no value here, so there is nothing to check offline: {bridge_row}"
+    );
+    assert_eq!(
+        bridge_row["provider"].as_str(),
+        Some("env"),
+        "the provider is named so the row is not an orphan: {bridge_row}"
+    );
 
     /* ------------------------------------------- the permission split: read is not lease or mint */
 

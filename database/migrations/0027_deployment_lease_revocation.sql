@@ -1,4 +1,4 @@
--- Omnion · 0026 · Deployment-driven lease revocation
+-- Omnion · 0027 · Deployment-driven lease revocation
 -- (REQ-125, slice 3 · docs/requests/REQ-125-secrets-management-depth.md).
 --
 -- Additive by design (docs/05-VERSIONING.md): one table, no existing table is touched, nothing
@@ -18,7 +18,13 @@
 -- moves the cursor. A deploy is therefore honoured even when the deploy was recorded by a
 -- writer that has never heard of this request, and a restart resumes from the cursor rather
 -- than re-revoking the same leases.
-
+--
+-- Numbering note: the version slot is global across the parallel waves, and wave 7 had already
+-- opened 0026 for the AI model capabilities. sqlx keys a migration on version *and* checksum, so
+-- two files claiming 0026 would make every database that applied one refuse the other. 0027 was
+-- chosen from `ls` of the sibling worktrees at write time, not from a counter that pretends the
+-- branch is alone.
+--
 -- How far one consumer has read the event stream.
 --
 -- The event stream is a single table shared by every consumer (crates/events), so the cursor is
@@ -38,7 +44,7 @@ create table event_consumer_cursors (
 
 comment on table event_consumer_cursors is
     'Per-consumer read position in the events stream, so two consumers of the same events do not '
-    'move each other''s position. Added by 0026 for the deployment-driven lease revocation of '
+    'move each other''s position. Added by 0027 for the deployment-driven lease revocation of '
     'REQ-125; the mechanism is generic so the next consumer does not need its own migration.';
 
 -- The seeds are data, not schema, and they are the whole content of this migration's data half:
@@ -52,37 +58,23 @@ select 'secrets.lease_revocation', coalesce(max(id), 0), 0
 from events
 on conflict (consumer) do nothing;
 
--- The runner reads forward by id, so the hot path is "everything newer than the cursor for this
--- one name". The partial index keeps the read to the unread tail instead of the whole table
--- once the stream is large.
-create index event_consumer_cursors_unread_idx
-    on event_consumer_cursors (last_event_id)
-    where last_event_id < 9223372036854775807;
-
--- Why a lease went away is worth keeping even after the deploy event itself has been
--- compacted, so the reason is written onto the lease row (the UPDATE in
--- `revoke_environment_leases` does that) rather than reconstructed from the event log.
---
--- The deployment key use log is the second place a deploy shows up: revoking a deployment key
--- writes a `revoke` row, and an environment-wide revocation has no key to attribute it to. The
--- existing `deployment_key_uses` table already accepts that shape, so no column is needed here
--- — this migration exists only to give the consumer a cursor.
-
--- A lease whose environment is empty would be revoked by a deploy that named no environment,
--- which `revoke_environment_leases` refuses. The 0019 default already covers it, and this
--- index makes the "live leases of one environment" read a single scan.
-create index if not exists secret_leases_environment_live_idx
-    on secret_leases (environment, issued_at desc)
-    where revoked_at is null and expires_at > now();
-
 -- Reversal, in the order REQ-129's policy asks for: drop what this file created, nothing else.
--- The partial index goes with its table, and the seeded cursor row is removed on its own since
--- nothing else references it.
+-- The seeded cursor row goes with its table and nothing else references it.
 --
---   drop index if exists event_consumer_cursors_unread_idx;
---   drop index if exists secret_leases_environment_live_idx;
 --   drop table if exists event_consumer_cursors;
+
+-- A note on the index this file deliberately does *not* create. The obvious addition is a partial
+-- index over one environment's outstanding leases:
 --
--- The index on `secret_leases` is dropped explicitly rather than implicitly because the table
--- it belongs to predates this migration: dropping `event_consumer_cursors` would not remove it,
--- and a reversal that leaves an index behind is not a reversal.
+--   create index on secret_leases (environment, issued_at desc)
+--     where revoked_at is null and expires_at > now();
+--
+-- and it is wrong twice over. The predicate is refused outright — `42P17 functions in index
+-- predicate must be marked IMMUTABLE`, because `now()` is STABLE, not IMMUTABLE: its answer
+-- depends on the statement's timestamp rather than its arguments, and a partial index may only
+-- test a column. And the thing it was supposed to add already exists: 0019 creates
+-- `secret_leases_live_idx` on exactly those columns with exactly the `revoked_at is null`
+-- predicate. A second index over the same rows on the same read is a write tax, not a speed-up.
+--
+-- Expiry is therefore left to the scan, and the scan is a range read of at most one
+-- environment's outstanding leases — the set the revocation updates anyway.

@@ -202,7 +202,9 @@ async fn advance(
     event_id: i64,
 ) -> Result<(), omnion_secrets::SecretsError> {
     sqlx::query(
-        "update event_consumer_cursors set last_event_id = $2, processed = processed + 1,                 updated_at = now()          where consumer = $1 and last_event_id < $2",
+        "update event_consumer_cursors \
+            set last_event_id = $2, processed = processed + 1, updated_at = now() \
+          where consumer = $1 and last_event_id < $2",
     )
     .bind(LEASE_REVOCATION_CONSUMER)
     .bind(event_id)

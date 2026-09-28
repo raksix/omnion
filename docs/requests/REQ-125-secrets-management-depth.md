@@ -115,14 +115,14 @@ Migration: `database/migrations/0026_secrets_depth.sql` (next free slot at tick 
 - [x] A validator failure stores the provider message and a red chip without blocking the save.
 - [x] A credential resolved through a slot returns the primary; removing the primary falls back to the fallback with an event.
 - [x] A slot cannot hold the same secret as primary and fallback (`409`).
-- [ ] A lease has a TTL and a use cap; redeeming beyond either is refused and audited as a denial.
-- [ ] Redeeming a revoked or unknown lease token returns `410`/`401` with a request id and writes a denial row.
-- [ ] A deployment key can lease inside its environment and is refused (`403`) outside it, including on `reveal`.
-- [ ] A deployment key past its expiry is refused (`401`).
-- [ ] `POST /secrets/{id}/lease` never returns the value; only `redeem` does, and only for a machine identity.
-- [ ] `deployment.started` revokes live leases for the environment and the lease list shows them revoked with the reason.
-- [ ] The helper injects a leased value into a child process without writing it to the shell history or a log; the temp-file path is mode 0600 and removed on exit.
-- [ ] Read-only (`file`, `env`) providers cannot be written to from the API (`405`/`422`) and the UI explains why.
+- [x] A lease has a TTL and a use cap; redeeming beyond either is refused and audited as a denial.
+- [x] Redeeming a revoked or unknown lease token returns `410`/`401` with a request id and writes a denial row.
+- [x] A deployment key can lease inside its environment and is refused (`403`) outside it, including on `reveal`.
+- [x] A deployment key past its expiry is refused (`401`).
+- [x] `POST /secrets/{id}/lease` never returns the value; only `redeem` does, and only for a machine identity.
+- [x] `deployment.started` revokes live leases for the environment and the lease list shows them revoked with the reason.
+- [x] The helper injects a leased value into a child process without writing it to the shell history or a log; the temp-file path is mode 0600 and removed on exit.
+- [x] Read-only (`file`, `env`) providers cannot be written to from the API (`405`/`422`) and the UI explains why.
 - [ ] Audit rows exist for read, write, rotate, reveal, deny, lease, redeem, slot change and deployment key use, with actor, address and request id.
 - [ ] Anomaly detection flags an off-hours reveal and a reveal burst in a scripted test, and the acknowledge action persists.
 - [ ] The SIEM export contains metadata only (asserted by a test that greps the payload for the fixture value).
