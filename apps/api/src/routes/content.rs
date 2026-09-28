@@ -583,13 +583,24 @@ pub async fn preview_page(
     // A page with no draft at all is a page that has never been edited since creation, which the
     // model makes impossible — but the frame says so rather than rendering an empty page, since
     // "nothing here" and "nothing to preview" are different answers.
-    let draft = draft.ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "no_draft_revision",
-            "this page has no working draft to preview",
-        )
-    })?;
+    //
+    // The one page that *does* land here is a page that was published and never touched again,
+    // which is most of them. `publish_page` promotes the draft row to `published` in place, so
+    // after a publish the page has no `draft` row at all and this frame answered `404
+    // no_draft_revision` — the preview of a published, working page was a dead screen, and the
+    // author who opened it after publishing saw a 404 where their page should be. A preview
+    // falls back to the revision visitors are actually seeing, which is the honest answer when
+    // there is no newer work than the published copy.
+    let draft = match draft {
+        Some(revision) => revision,
+        None => published.clone().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "no_draft_revision",
+                "this page has no working draft to preview",
+            )
+        })?,
+    };
 
     let viewport = preview_viewport(query.viewport.as_deref());
     // The filter is the same call the public renderer makes, so "what the phone sees" has one

@@ -1963,7 +1963,81 @@ async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
     fixture.cleanup().await;
 }
 
-/// An inline save appends exactly one draft revision and never moves the published one.
+/// A published page that nobody has edited since still has a working preview frame.
+///
+/// The preview frame reads the *draft*, and `publish_page` promotes the draft row to `published`
+/// in place rather than copying it. So the moment a page was published and left alone — the
+/// ordinary state of a live site — it had no `draft` row at all and the frame answered
+/// `404 no_draft_revision`. The author who opened Preview after publishing saw a 404 where their
+/// own page was, and the walkthrough recorded it as `publicRendered: false` on a page that had
+/// in fact published. There is nothing to preview *newer than* the live copy, so the live copy is
+/// the answer.
+#[tokio::test]
+async fn the_preview_frame_survives_a_publish_and_falls_back_to_the_live_revision() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "frame-after-publish").await;
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": [block("text", json!({ "text": "Live copy" }))] })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+    let published = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/publish"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(published.status, StatusCode::OK, "{}", published.body);
+    let live_no = published.body["published"]["revision_no"]
+        .as_i64()
+        .expect("a number");
+
+    // The state the fix is about: no draft row, one published row.
+    let frame = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/preview"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        frame.status,
+        StatusCode::OK,
+        "a published page with no newer draft must still preview: {}",
+        frame.body
+    );
+    assert_eq!(
+        frame.body["revision_no"].as_i64(),
+        Some(live_no),
+        "the frame shows the live revision, because it is the only one there is: {}",
+        frame.body
+    );
+    let text = frame.body["visible_blocks"][0]["props"]["text"]
+        .as_str()
+        .expect("the block's own text");
+    assert_eq!(text, "Live copy", "{}", frame.body);
+
+    fixture.cleanup().await;
+}
 ///
 /// This is the criterion's real content: "saves one draft revision per save … and never
 /// publishes". A test that only checked the draft moved would pass against an implementation
