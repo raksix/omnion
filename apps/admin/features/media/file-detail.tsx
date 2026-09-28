@@ -3,10 +3,11 @@
 /**
  * The file detail screen (docs/requests/REQ-010, slice 2): preview on the left, tabs on the right.
  *
- * One file, one screen, and the three things an editor needs about it: what it is (the preview and
- * its facts), what happened to it (the version history) and what is written about it (the
- * metadata). Permissions, usage and activity tabs arrive with slices 3 and 4 — a tab that cannot
- * answer yet is not on the screen, rather than being there and refusing.
+ * One file, one screen, and the things an editor needs about it: what it is (the preview and
+ * its facts), what happened to it (the version history), what is written about it (the
+ * metadata) and who outside the platform can fetch it (the share links). Usage and activity
+ * tabs arrive with slice 4 — a tab that cannot answer yet is not on the screen, rather than
+ * being there and refusing.
  *
  * The version list is not decoration. Replacing a file writes a new version and restoring an old
  * one appends a *new* version rather than rewriting history, so this screen has to show both, and
@@ -21,6 +22,7 @@ import {
   Download,
   History,
   Info,
+  Link2,
   Plus,
   RotateCcw,
   Tag as TagIcon,
@@ -33,6 +35,7 @@ import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { FilePreview, formatDuration, previewKind } from "@/features/media/file-preview";
 import { ScanBadge } from "@/features/media/media-shared";
+import { SharesTab } from "@/features/media/shares-tab";
 import {
   ApiError,
   createMediaVersion,
@@ -47,7 +50,7 @@ import { formatBytes, formatTimestamp } from "@/lib/format";
 import type { MediaFile, MediaVersion, MediaVersionList } from "@/lib/types";
 
 /** Which tab of the right-hand panel is on screen. */
-type Tab = "metadata" | "versions";
+type Tab = "metadata" | "versions" | "shares";
 
 /** The file detail screen. */
 export function MediaFileDetail() {
@@ -322,6 +325,13 @@ export function MediaFileDetail() {
               icon={<History className="h-3.5 w-3.5" aria-hidden />}
               label={`Versions${history ? ` (${history.version_total})` : ""}`}
             />
+            <TabButton
+              id="media-tab-shares"
+              active={tab === "shares"}
+              onClick={() => setTab("shares")}
+              icon={<Link2 className="h-3.5 w-3.5" aria-hidden />}
+              label="Share"
+            />
           </div>
 
           <div className="min-h-0 flex-1 overflow-auto p-3">
@@ -334,7 +344,7 @@ export function MediaFileDetail() {
                 }}
                 onError={setError}
               />
-            ) : (
+            ) : tab === "versions" ? (
               <VersionsTab
                 history={history}
                 previewing={previewVersion}
@@ -342,6 +352,8 @@ export function MediaFileDetail() {
                 onPreview={setPreviewVersion}
                 onRestore={onRestore}
               />
+            ) : (
+              <SharesTab mediaId={fileId} />
             )}
           </div>
         </div>

@@ -5,6 +5,7 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  CreatedMediaShare,
   Media,
   MediaBulkResult,
   MediaFile,
@@ -13,6 +14,7 @@ import type {
   MediaFolder,
   MediaFolderTree,
   MediaPreset,
+  MediaShare,
   MediaStorageProbe,
   MediaStorageSettings,
   MediaStorageSettingsInput,
@@ -510,6 +512,57 @@ export function restoreMediaVersion(
 /** Panel read path of one version's bytes. */
 export function mediaVersionRawUrl(mediaId: string, version: number): string {
   return `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/raw`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Share links (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** Every share over one file, newest first, including revoked ones. */
+export function fetchMediaShares(mediaId: string): Promise<MediaShare[]> {
+  return request<MediaShare[]>(`/api/v1/media/${encodeURIComponent(mediaId)}/shares`);
+}
+
+/**
+ * Create a share link.
+ *
+ * `expiresInDays` omitted means "until revoked" and sends **no body at all** — the API accepts
+ * an empty POST, and sending `{}` would only be a workaround for a rule that does not exist.
+ */
+export function createMediaShare(
+  mediaId: string,
+  options: { expiresInDays?: number; password?: string } = {},
+): Promise<CreatedMediaShare> {
+  const hasChoices = options.expiresInDays !== undefined || options.password !== undefined;
+  return request<CreatedMediaShare>(`/api/v1/media/${encodeURIComponent(mediaId)}/shares`, {
+    method: "POST",
+    ...(hasChoices
+      ? {
+          body: JSON.stringify({
+            ...(options.expiresInDays !== undefined
+              ? { expires_in_days: options.expiresInDays }
+              : {}),
+            ...(options.password !== undefined ? { password: options.password } : {}),
+          }),
+        }
+      : {}),
+  });
+}
+
+/** Revoke one link. Immediate: the next request against the token is refused. */
+export function revokeMediaShare(mediaId: string, shareId: string, reason = ""): Promise<void> {
+  return request<void>(
+    `/api/v1/media/${encodeURIComponent(mediaId)}/shares/${encodeURIComponent(shareId)}`,
+    { method: "DELETE", ...(reason ? { body: JSON.stringify({ reason }) } : {}) },
+  );
+}
+
+/** Revoke every live link over a file — for when the file itself stops being servable. */
+export function revokeAllMediaShares(mediaId: string): Promise<{ revoked: number }> {
+  return request<{ revoked: number }>(
+    `/api/v1/media/${encodeURIComponent(mediaId)}/shares/revoke-all`,
+    { method: "POST" },
+  );
 }
 
 // ---------------------------------------------------------------------------------------------

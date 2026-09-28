@@ -213,6 +213,43 @@ export type MediaVersionList = {
   versions: MediaVersion[];
 };
 
+/**
+ * One share link, as the panel reads it (REQ-010, slice 3).
+ *
+ * There is no `token` field here, and that is not an oversight: the API cannot return one after
+ * creation, because the row stores only its hash. A type that carried a token would be a lie
+ * that shows up as an empty column in the table.
+ */
+export type MediaShare = {
+  id: string;
+  media_id: string;
+  /** When the link stops working; `null` means "until revoked". */
+  expires_at: string | null;
+  /** Whether the link needs a password. The password itself is never returned. */
+  has_password: boolean;
+  /** Downloads that produced bytes. */
+  download_count: number;
+  created_at: string;
+  /** When it was revoked; `null` while it is live. */
+  revoked_at: string | null;
+  revoked_reason: string;
+  /** `live`, `expired` or `revoked`, resolved by the API against the clock. */
+  state: "live" | "expired" | "revoked";
+};
+
+/**
+ * A freshly created share, with the token shown once.
+ *
+ * `token` and `url` exist on this type and on no other — which is how the screen knows to put
+ * the one-time copy panel on screen and to never try to show a link it cannot re-derive.
+ */
+export type CreatedMediaShare = {
+  share: MediaShare;
+  url: string;
+  token: string;
+  notice: string;
+};
+
 /** What a replace or a restore did. */
 export type MediaReplaceResult = {
   file: MediaFile;
