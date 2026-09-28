@@ -393,7 +393,14 @@ pub async fn issue_lease(
                 "consumer": issued.lease.consumer,
                 "environment": issued.lease.environment,
                 "max_uses": issued.lease.max_uses,
-                "expires_at": issued.lease.expires_at,
+                // RFC 3339 text, not the `OffsetDateTime`'s own serialization: `json!` renders an
+                // `OffsetDateTime` as a nine-element array, so the stored metadata — and every
+                // export built from it — carried `[2026, 271, 6, 14, 57, ...]`.
+                "expires_at": issued
+                    .lease
+                    .expires_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
             }))
             .ip_address(address.as_text()),
     )

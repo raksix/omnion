@@ -37,6 +37,7 @@ use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use serde_json::{Value, json};
+use std::net::SocketAddr;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -63,7 +64,20 @@ struct TestResponse {
 }
 
 /// Drive the real router without a network socket.
+///
+/// `oneshot` bypasses the connect layer `main.rs` installs, so the peer address has to be attached
+/// the way `into_make_service_with_connect_info::<SocketAddr>()` would attach it. Without this the
+/// `ClientAddress` extractor sees no extension and every audit row is written with a null
+/// `ip_address` — the suite would then be asserting that a missing address is fine, which is the
+/// exact opposite of the acceptance line this walk exists to prove.
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
+    let peer: SocketAddr = "198.51.100.7:51234"
+        .parse()
+        .expect("a literal is a valid peer");
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
     let response = routes::router(state.clone())
         .oneshot(request)
         .await
@@ -276,10 +290,7 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
     // and every one of these processes is its own single-threaded test binary, so no other thread
     // can observe the environment mid-test.
     unsafe {
-        std::env::set_var(
-            omnion_secrets::KEY_ENCRYPTION_ENV,
-            SUITE_OPERATOR_KEY,
-        );
+        std::env::set_var(omnion_secrets::KEY_ENCRYPTION_ENV, SUITE_OPERATOR_KEY);
     }
 
     let Some((state, db)) = live_state().await else {
@@ -418,7 +429,8 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
         .filter_map(|row| row["action"].as_str())
         .collect();
     assert!(
-        actions_written.contains(&"secret.lease.issued") && actions_written.contains(&"secret.lease.revoked"),
+        actions_written.contains(&"secret.lease.issued")
+            && actions_written.contains(&"secret.lease.revoked"),
         "a lease operation must name what it did, not a family: {actions_written:?}"
     );
     let lease_row = lease_rows[0];
@@ -426,9 +438,14 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
         lease_row["request_id"].is_string(),
         "every row must carry the request id the caller was handed: {lease_row}"
     );
+    // The column is `inet`, so a bare IPv4 comes back in CIDR form (`198.51.100.7/32`). Assert the
+    // host, not the exact string: pinning the rendering would break the day the column type
+    // changes, and the property that matters is "the row names the peer it was served to".
     assert!(
-        lease_row["ip_address"].is_string(),
-        "every row must carry the peer address: {lease_row}"
+        lease_row["ip_address"]
+            .as_str()
+            .is_some_and(|address| address.starts_with("198.51.100.7")),
+        "every row must carry the peer address it was served to: {lease_row}"
     );
 
     // ── claim 3: an off-hours reveal raises a flag, and the acknowledge persists ─────────────────
@@ -445,7 +462,8 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
         .find(|row| row["pattern"] == "off_hours_reveal")
         .expect("a 03:00 reveal must raise the off-hours flag");
     assert_eq!(
-        off_hours["request_id"], off_hours_request.to_string(),
+        off_hours["request_id"],
+        off_hours_request.to_string(),
         "the flag must join to the request that raised it"
     );
     assert_eq!(
@@ -453,7 +471,8 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
         "a flag is advisory; the hard rule is what would make it blocking and it ships off"
     );
     assert_eq!(
-        off_hours["acknowledged_at"], Value::Null,
+        off_hours["acknowledged_at"],
+        Value::Null,
         "a fresh flag is unacknowledged"
     );
 
@@ -508,16 +527,24 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
     // The feed is the one path that leaves the installation, so it gets the raw-bytes grep rather
     // than a field check: a field check would pass against a redaction pass that had not yet
     // heard of the next column someone adds to `audit_log`.
-    let exported = call(&state, get("/api/v1/secrets/audit/export?limit=200", &token)).await;
+    let exported = call(
+        &state,
+        get("/api/v1/secrets/audit/export?limit=200", &token),
+    )
+    .await;
     assert_eq!(exported.status, StatusCode::OK, "{}", exported.raw);
     assert!(
         !exported.raw.contains(FIXTURE_VALUE),
         "the SIEM feed must carry no credential value: {}",
         exported.raw
     );
+    // The real masked hint, computed the way the redaction helper computes it. A hand-written
+    // stand-in string ("wrapping-key-id-not-a-value") is a key id the suite put in `metadata`
+    // deliberately and has nothing to do with a mask, so asserting its absence proved nothing.
+    let hint = omnion_secrets::hint_for(FIXTURE_VALUE);
     assert!(
-        !exported.raw.contains("wrapping-key-id-not-a-value"),
-        "the feed must carry no masked fragment either: {}",
+        !exported.raw.contains(&hint),
+        "the feed must carry no masked fragment of the value either: {hint} in {}",
         exported.raw
     );
 
@@ -527,7 +554,11 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    assert!(!lines.is_empty(), "the export must not be empty: {}", exported.raw);
+    assert!(
+        !lines.is_empty(),
+        "the export must not be empty: {}",
+        exported.raw
+    );
     for line in &lines {
         let record: Value = serde_json::from_str(line)
             .unwrap_or_else(|err| panic!("every line must be one JSON object ({err}): {line}"));
@@ -557,7 +588,10 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
     // `secrets.audit` surface into a way to read another feature's audit rows.
     let narrowed = call(
         &state,
-        get("/api/v1/secrets/audit?action=iam.role.created&limit=200", &token),
+        get(
+            "/api/v1/secrets/audit?action=iam.role.created&limit=200",
+            &token,
+        ),
     )
     .await;
     assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.raw);
@@ -592,11 +626,7 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
 
     // A malformed `since` is refused by name rather than silently ignored — a filter that quietly
     // does nothing is worse than one that says it could not be read.
-    let bad_since = call(
-        &state,
-        get("/api/v1/secrets/audit?since=yesterday", &token),
-    )
-    .await;
+    let bad_since = call(&state, get("/api/v1/secrets/audit?since=yesterday", &token)).await;
     assert_eq!(
         bad_since.status,
         StatusCode::BAD_REQUEST,
