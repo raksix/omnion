@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, BadgeCheck, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, LayoutDashboard, LockKeyhole, LogOut, Menu, Network, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, KeyRound } from "lucide-react";
+import { Activity, BarChart3, BadgeCheck, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Network, Scale, ScrollText, Send, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -45,6 +45,8 @@ const NAV = [
   // (slice 1) has no screen of its own yet and lands with the rest of the screens, and the other
   // routes in this request are named in the plan rather than being half-linked here.
   { href: "/observability/metrics", label: "Observability", icon: Activity },
+  { href: "/observability/traces", label: "Traces", icon: Waypoints },
+  { href: "/observability/exporters", label: "Exporters", icon: Send },
 ] as const;
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against

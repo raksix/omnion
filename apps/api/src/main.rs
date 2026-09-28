@@ -149,7 +149,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the API from serving traffic, and every failure inside a sweep is logged and the next
     // sweep runs anyway.
     if state.config().telemetry.exporter_flush_enabled {
-        let _flush = omnion_telemetry::exporter_flush::run(db.pool().clone());
+        // The pool is cloned from the STATE, not from `db`: `db` moved into `AppState` at the
+        // line above, and a loop that held the whole handle would keep a second reference to
+        // configuration the server no longer owns.
+        let _flush = omnion_telemetry::exporter_flush::run(state.db().pool().clone());
     } else {
         tracing::info!("the exporter flush loop is disabled (OMNION_EXPORTER_FLUSH=false)");
     }

@@ -4385,3 +4385,163 @@ export function fetchMetricQuery(
 export function syncMetricCatalog(): Promise<MetricCatalogResponse> {
   return request<MetricCatalogResponse>("/api/v1/observability/metrics/sync", { method: "POST" });
 }
+
+
+/* ── the trace search, the trace detail and the exporter centre (REQ-126, slice 3) ─────────── */
+
+/** One row of the trace index, as `/observability/traces` returns it. */
+export interface TraceSummary {
+  trace_id: string;
+  root_name: string;
+  service: string;
+  route: string | null;
+  request_id: string | null;
+  started_at: string;
+  duration_ms: number;
+  span_count: number;
+  spans_kept: number;
+  spans_truncated: boolean;
+  status: "ok" | "error";
+  sampled: boolean;
+  /** WHY a trace is here: `error`, `ratio`, `upstream` or `always`. */
+  sampling: string;
+}
+
+/** The trace search's response. */
+export interface TracesResponse {
+  traces: TraceSummary[];
+  total: number;
+  window_minutes: number;
+}
+
+/** One span of a waterfall, already redacted. */
+export interface TraceSpan {
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string | null;
+  name: string;
+  service: string;
+  offset_ms: number;
+  duration_ms: number;
+  failed: boolean;
+  attributes: Record<string, unknown>;
+  root: boolean;
+}
+
+/** One trace with its bounded waterfall. */
+export interface TraceDetail extends TraceSummary {
+  spans: TraceSpan[];
+  /** The operator's tracing backend, when one is configured. `null` means there is none. */
+  backend_trace_url: string | null;
+}
+
+/** One exporter as the screen reads it. */
+export interface ExporterRow {
+  id: string;
+  name: string;
+  kind: "otlp" | "prometheus_remote_write" | "syslog" | "webhook";
+  endpoint: string;
+  protocol: string | null;
+  /** `true` when a secret is REFERENCED. The secret itself never comes here. */
+  auth_configured: boolean;
+  batch_ms: number;
+  timeout_ms: number;
+  enabled: boolean;
+  health: "unknown" | "ok" | "degraded" | "down";
+  buffered: number;
+  capacity: number;
+  dropped_total: number;
+  last_flush_at: string | null;
+  last_error: string | null;
+}
+
+/** The exporter list, with the egress statement the request requires on the payload. */
+export interface ExportersResponse {
+  exporters: ExporterRow[];
+  kinds: string[];
+  egress_notice: string;
+}
+
+/** The body of a create or edit. */
+export interface ExporterInput {
+  name: string;
+  kind: string;
+  endpoint: string;
+  protocol?: string | null;
+  /** A secret id from the store — never a value. */
+  auth_secret_id?: string | null;
+  batch_ms?: number;
+  timeout_ms?: number;
+  enabled?: boolean;
+}
+
+/** What a `Test` reported. */
+export interface ExporterTestResult {
+  name: string;
+  kind: string;
+  ok: boolean;
+  detail: string;
+  health: string;
+}
+
+/** Search the trace index. Every filter is optional and the API validates each one. */
+export function fetchTraces(filters: {
+  request_id?: string;
+  route?: string;
+  status?: "ok" | "error";
+  min_duration_ms?: number;
+  window_minutes?: number;
+  limit?: number;
+}): Promise<TracesResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<TracesResponse>(`/api/v1/observability/traces?${query}`);
+}
+
+/** One trace with its waterfall. */
+export function fetchTrace(traceId: string): Promise<TraceDetail> {
+  return request<TraceDetail>(`/api/v1/observability/traces/${encodeURIComponent(traceId)}`);
+}
+
+/** The exporter rows, their health and their drop counters. */
+export function fetchExporters(): Promise<ExportersResponse> {
+  return request<ExportersResponse>("/api/v1/observability/exporters");
+}
+
+/** Add an exporter. A write: it audits, and it takes `observability.exporters.manage`. */
+export function createExporter(input: ExporterInput): Promise<{ id: string; name: string }> {
+  return request<{ id: string; name: string }>("/api/v1/observability/exporters", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Edit an exporter, including switching it off — which drains and counts its backlog. */
+export function updateExporter(id: string, input: ExporterInput): Promise<{ id: string; name: string }> {
+  return request<{ id: string; name: string }>(`/api/v1/observability/exporters/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove an exporter and its buffer. */
+export function deleteExporter(id: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(`/api/v1/observability/exporters/${id}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * Send a synthetic batch to the endpoint and report the backend's own answer.
+ *
+ * A failure is a `200` with `ok: false` and the backend's words, not an error page: the button
+ * exists to tell the operator what the backend said, and an error page tells them nothing they
+ * could not have learned by waiting.
+ */
+export function testExporter(id: string): Promise<ExporterTestResult> {
+  return request<ExporterTestResult>(`/api/v1/observability/exporters/${id}/test`, {
+    method: "POST",
+  });
+}
