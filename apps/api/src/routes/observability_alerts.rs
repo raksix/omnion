@@ -150,7 +150,12 @@ pub async fn read_alert_rules(
 }
 
 /// The rule body. `deny_unknown_fields`, like every other write in this surface.
-#[derive(Debug, serde::Deserialize)]
+///
+/// `Clone` because the validation table test derives one input from a valid one by overriding a
+/// single field, and hand-copying seven fields per case is how a case ends up asserting against a
+/// slightly different rule than the one the table says. The derive was missing and
+/// `cargo test -p omnion-api --lib` therefore did not compile at all — see the build-log entry.
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertRuleInput {
     /// Unique name.
