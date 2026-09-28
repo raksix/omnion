@@ -131,6 +131,18 @@ pub enum IdentityError {
     /// An account status is not one the schema allows.
     #[error("{0}")]
     InvalidUser(String),
+    /// A settings field is not usable (locale, timezone, invite policy, accent, retention).
+    #[error("invalid organization settings: {0}")]
+    InvalidSettings(String),
+    /// A limit or plan field is not usable (unknown plan, non-positive ceiling).
+    #[error("invalid organization limits: {0}")]
+    InvalidLimits(String),
+    /// A module key is not usable as an address.
+    #[error("invalid module key: {0}")]
+    InvalidModule(String),
+    /// The installation does not ship the module the request named.
+    #[error("this installation does not ship the module {0:?}")]
+    ModuleNotInstalled(String),
 }
 
 /// Result alias used across the identity crate.

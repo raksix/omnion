@@ -13,11 +13,11 @@
 #![forbid(unsafe_code)]
 
 pub mod authentication;
-pub mod devices;
 pub mod departments;
+pub mod devices;
 pub mod error;
-pub mod mfa;
 pub mod memberships;
+pub mod mfa;
 pub mod organizations;
 pub mod password;
 pub mod provisioning;
@@ -27,6 +27,7 @@ pub mod sessions;
 pub mod signin;
 pub mod sites;
 pub mod sso;
+pub mod tenancy_limits;
 pub mod totp;
 pub mod users;
 pub mod webauthn;

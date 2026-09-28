@@ -177,11 +177,13 @@ pub async fn add_member(pool: &PgPool, new: NewMembership) -> Result<Membership>
     // Same ordering rule as [`update_membership`]: the partial unique index over
     // `user_id where is_primary` means the old primary has to be cleared first.
     if new.is_primary {
-        sqlx::query("update organization_members set is_primary = false, updated_at = now() \
-                     where user_id = $1 and is_primary")
-            .bind(new.user_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "update organization_members set is_primary = false, updated_at = now() \
+                     where user_id = $1 and is_primary",
+        )
+        .bind(new.user_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     let membership: Membership = sqlx::query_as(
@@ -212,7 +214,11 @@ pub async fn add_member(pool: &PgPool, new: NewMembership) -> Result<Membership>
 }
 
 /// Look one membership up.
-pub async fn find_member(pool: &PgPool, organization_id: Uuid, user_id: Uuid) -> Result<Option<Membership>> {
+pub async fn find_member(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<Membership>> {
     let membership = sqlx::query_as::<_, Membership>(
         "select id, organization_id, user_id, status, is_primary, joined_at, created_at, updated_at \
          from organization_members where organization_id = $1 and user_id = $2",
@@ -314,12 +320,14 @@ pub async fn update_membership(
     // is_primary`, so setting the new row first would collide with the old one and the whole
     // promotion would fail on the second switch.
     if is_primary == Some(true) {
-        sqlx::query("update organization_members set is_primary = false, updated_at = now() \
-                     where user_id = $1 and is_primary and organization_id <> $2")
-            .bind(user_id)
-            .bind(organization_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "update organization_members set is_primary = false, updated_at = now() \
+                     where user_id = $1 and is_primary and organization_id <> $2",
+        )
+        .bind(user_id)
+        .bind(organization_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     let updated: Membership = sqlx::query_as(
@@ -348,11 +356,13 @@ pub async fn update_membership(
             .await?;
     } else if let Some(status) = &changes.status {
         if status == "suspended" {
-            sqlx::query("update users set updated_at = now() where id = $1 and organization_id = $2")
-                .bind(user_id)
-                .bind(organization_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "update users set updated_at = now() where id = $1 and organization_id = $2",
+            )
+            .bind(user_id)
+            .bind(organization_id)
+            .execute(&mut *tx)
+            .await?;
         }
     }
 
@@ -368,13 +378,15 @@ pub async fn update_membership(
 pub async fn remove_member(pool: &PgPool, organization_id: Uuid, user_id: Uuid) -> Result<bool> {
     let mut tx = pool.begin().await?;
 
-    let removed = sqlx::query("delete from organization_members \
-                               where organization_id = $1 and user_id = $2")
-        .bind(organization_id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
+    let removed = sqlx::query(
+        "delete from organization_members \
+                               where organization_id = $1 and user_id = $2",
+    )
+    .bind(organization_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
         > 0;
 
     if removed {
@@ -394,11 +406,12 @@ pub async fn remove_member(pool: &PgPool, organization_id: Uuid, user_id: Uuid) 
 
 /// Make `organization_id` the account's primary membership, joining the organization when the
 /// account is not a member yet. This is what the switcher's `POST /me/organization` calls.
-pub async fn make_primary(pool: &PgPool, organization_id: Uuid, user_id: Uuid) -> Result<Membership> {
-    if find_member(pool, organization_id, user_id)
-        .await?
-        .is_none()
-    {
+pub async fn make_primary(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<Membership> {
+    if find_member(pool, organization_id, user_id).await?.is_none() {
         add_member(
             pool,
             NewMembership {
@@ -450,15 +463,12 @@ pub struct NewInvitation {
 /// An address that already holds a live invitation in this organization gets that pending
 /// invitation back instead of a second one — the caller can then answer with it rather than
 /// mail the same address twice.
-pub async fn create_invitation(
-    pool: &PgPool,
-    new: NewInvitation,
-) -> Result<CreatedInvitation> {
+pub async fn create_invitation(pool: &PgPool, new: NewInvitation) -> Result<CreatedInvitation> {
     let email = normalize_email(&new.email)?;
     let message = validate_message(&new.message)?;
-    let expires_at = new.expires_at.unwrap_or(
-        OffsetDateTime::now_utc() + Duration::days(DEFAULT_INVITATION_TTL_DAYS),
-    );
+    let expires_at = new
+        .expires_at
+        .unwrap_or(OffsetDateTime::now_utc() + Duration::days(DEFAULT_INVITATION_TTL_DAYS));
 
     if let Some(pending) = find_pending_invitation(pool, new.organization_id, &email).await? {
         if pending.expires_at > OffsetDateTime::now_utc() {
@@ -558,11 +568,7 @@ pub async fn revoke_invitation(pool: &PgPool, id: Uuid) -> Result<bool> {
 /// A `pending` invitation whose token has expired is marked `expired` and refused with
 /// [`IdentityError::InvitationExpired`], so the second attempt sees the same answer as the
 /// first instead of a fresh acceptance.
-pub async fn accept_invitation(
-    pool: &PgPool,
-    token: &str,
-    user_id: Uuid,
-) -> Result<Invitation> {
+pub async fn accept_invitation(pool: &PgPool, token: &str, user_id: Uuid) -> Result<Invitation> {
     let invitation = find_invitation_by_token(pool, token)
         .await?
         .ok_or(IdentityError::InvitationNotFound)?;
@@ -586,10 +592,11 @@ pub async fn accept_invitation(
     // The account's home organization before the acceptance: when it had none, this
     // organization becomes its home and the membership becomes the primary one, so the
     // switcher has something to show the moment the invitation is accepted.
-    let had_home: bool = sqlx::query_scalar("select organization_id is not null from users where id = $1")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await?;
+    let had_home: bool =
+        sqlx::query_scalar("select organization_id is not null from users where id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
 
     let mut tx = pool.begin().await?;
 
@@ -712,15 +719,15 @@ mod tests {
 
     #[test]
     fn member_statuses_come_from_the_schema_set() {
-        assert_eq!(
-            validate_member_status(" Active ").expect("valid"),
-            "active"
-        );
+        assert_eq!(validate_member_status(" Active ").expect("valid"), "active");
         for status in MEMBER_STATUSES {
             assert!(validate_member_status(status).is_ok());
         }
         for bad in ["", "banned", "deleted"] {
-            assert!(validate_member_status(bad).is_err(), "{bad:?} must be rejected");
+            assert!(
+                validate_member_status(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
     }
 
@@ -741,16 +748,20 @@ mod tests {
     #[test]
     fn membership_change_sets_report_emptiness() {
         assert!(MembershipChanges::default().is_empty());
-        assert!(!MembershipChanges {
-            status: Some("suspended".to_owned()),
-            is_primary: None,
-        }
-        .is_empty());
-        assert!(!MembershipChanges {
-            status: None,
-            is_primary: Some(false),
-        }
-        .is_empty());
+        assert!(
+            !MembershipChanges {
+                status: Some("suspended".to_owned()),
+                is_primary: None,
+            }
+            .is_empty()
+        );
+        assert!(
+            !MembershipChanges {
+                status: None,
+                is_primary: Some(false),
+            }
+            .is_empty()
+        );
     }
 
     #[test]

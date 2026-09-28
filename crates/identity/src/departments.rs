@@ -439,12 +439,11 @@ pub async fn delete_department(
         .await?
         .ok_or(IdentityError::DepartmentNotFound)?;
 
-    let members: i64 = sqlx::query_scalar(
-        "select count(*) from department_members where department_id = $1",
-    )
-    .bind(department_id)
-    .fetch_one(pool)
-    .await?;
+    let members: i64 =
+        sqlx::query_scalar("select count(*) from department_members where department_id = $1")
+            .bind(department_id)
+            .fetch_one(pool)
+            .await?;
     if members > 0 {
         return Err(IdentityError::InvalidDepartment(format!(
             "{members} account(s) are still in this department — remove them or archive it"
@@ -537,13 +536,14 @@ pub async fn remove_department_member(
     department_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool> {
-    let removed = sqlx::query("delete from department_members where department_id = $1 and user_id = $2")
-        .bind(department_id)
-        .bind(user_id)
-        .execute(pool)
-        .await?
-        .rows_affected()
-        > 0;
+    let removed =
+        sqlx::query("delete from department_members where department_id = $1 and user_id = $2")
+            .bind(department_id)
+            .bind(user_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            > 0;
     Ok(removed)
 }
 
@@ -569,10 +569,7 @@ pub async fn list_departments_of_user(
 }
 
 /// The accounts in one department.
-pub async fn list_department_member_ids(
-    pool: &PgPool,
-    department_id: Uuid,
-) -> Result<Vec<Uuid>> {
+pub async fn list_department_member_ids(pool: &PgPool, department_id: Uuid) -> Result<Vec<Uuid>> {
     Ok(sqlx::query_scalar(
         "select user_id from department_members where department_id = $1 order by user_id",
     )
@@ -583,12 +580,12 @@ pub async fn list_department_member_ids(
 
 /// How many accounts sit in a department.
 pub async fn count_department_members(pool: &PgPool, department_id: Uuid) -> Result<i64> {
-    Ok(sqlx::query_scalar(
-        "select count(*) from department_members where department_id = $1",
+    Ok(
+        sqlx::query_scalar("select count(*) from department_members where department_id = $1")
+            .bind(department_id)
+            .fetch_one(pool)
+            .await?,
     )
-    .bind(department_id)
-    .fetch_one(pool)
-    .await?)
 }
 
 /// The keys of every department an account sits in — the extra roles the resolver must fold
@@ -726,7 +723,9 @@ fn map_department_insert_error(err: sqlx::Error) -> IdentityError {
             }
         }
         // The `parent_id <> id` check is the database's last word on a self-parenting insert.
-        sqlx::Error::Database(ref db_err) if db_err.constraint() == Some("departments_not_own_parent") => {
+        sqlx::Error::Database(ref db_err)
+            if db_err.constraint() == Some("departments_not_own_parent") =>
+        {
             IdentityError::DepartmentCycle
         }
         other => IdentityError::Database(other),
@@ -749,7 +748,14 @@ mod tests {
     #[test]
     fn an_unaddressable_key_is_refused() {
         // A key that could never be named in a role binding is worse than no key at all.
-        for bad in ["", "-marketing", "marketing-", "mark eting", "a/b", "ünicode"] {
+        for bad in [
+            "",
+            "-marketing",
+            "marketing-",
+            "mark eting",
+            "a/b",
+            "ünicode",
+        ] {
             assert!(
                 validate_department_key(bad).is_err(),
                 "{bad:?} should not be a usable department key"
@@ -761,7 +767,10 @@ mod tests {
     fn a_name_has_to_carry_something() {
         assert!(validate_department_name("   ").is_err());
         assert!(validate_department_name(&"x".repeat(121)).is_err());
-        assert_eq!(validate_department_name(" Marketing ").unwrap(), "Marketing");
+        assert_eq!(
+            validate_department_name(" Marketing ").unwrap(),
+            "Marketing"
+        );
     }
 
     #[test]
