@@ -38,7 +38,6 @@ import type {
   MediaScanSettingsInput,
   MediaSweepResult,
   MediaStorageSettingsInput,
-  MediaReplaceResult,
   MediaRetentionList,
   MediaRetentionPolicy,
   MediaRetentionPolicyInput,
