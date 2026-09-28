@@ -87,7 +87,8 @@ pub mod me;
 pub mod media;
 pub mod media_files;
 pub mod media_duplicates;
-pub mod media_settings;
+pub mod media_scan;
+mod media_settings;
 pub mod media_shares;
 pub mod media_transform;
 pub mod media_versions;
@@ -440,6 +441,9 @@ pub fn router(state: AppState) -> Router {
     // The raw path takes `?preset=` (REQ-010 slice 3). Without the parameter it serves the
     // original bytes exactly as before, so every existing caller and every published page keeps
     // working; with it, the answer is a generated derivative.
+    // The raw path takes `?preset=` (REQ-010 slice 3) and refuses a file the scanning policy
+    // holds (slice 4) — a derivative of a quarantined file is still a quarantined file, and
+    // the obvious place to forget that is the path a *published page* fetches.
     let media_raw: MethodRouter<AppState, Infallible> =
         get(media_transform::raw_with_preset).layer(guards::require(&state, "media.read"));
 
@@ -535,6 +539,27 @@ pub fn router(state: AppState) -> Router {
         get(media_duplicates::report).layer(guards::require(&state, "media.read"));
     let media_duplicates_merge: MethodRouter<AppState, Infallible> =
         post(media_duplicates::merge).layer(guards::require(&state, "media.manage"));
+
+    // Scanning (REQ-010, slice 4). Reading the policy, the run log and the quarantine list is
+    // `media.read` — the file browser shows a scan badge and an editor needs to know what it
+    // means. Changing the policy, running a sweep, probing a scanner and **releasing** a
+    // quarantined file are all `media.scan.manage`, which is deliberately its own key: a
+    // release is the action that undoes a safety decision, and neither `media.manage`
+    // (organise a library) nor `media.delete` (remove a file) is that power.
+    let media_scan_route: MethodRouter<AppState, Infallible> =
+        get(media_scan::read).layer(guards::require(&state, "media.read"));
+    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
+        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
+        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_runs_route: MethodRouter<AppState, Infallible> =
+        get(media_scan::runs).layer(guards::require(&state, "media.read"));
+    let media_quarantine: MethodRouter<AppState, Infallible> =
+        get(media_scan::list_held).layer(guards::require(&state, "media.read"));
+    let media_quarantine_release: MethodRouter<AppState, Infallible> =
+        post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
+        .layer(guards::require(&state, "media.scan.manage"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -939,6 +964,16 @@ pub fn router(state: AppState) -> Router {
         .route("/media/settings", media_settings_route)
         .route("/media/settings", media_settings_write)
         .route("/media/settings/test-connection", media_settings_test)
+        // Scanning. `scan-settings`, `scan` and `quarantine` are all *static* segments declared
+        // here, so axum ranks them ahead of `/media/{id}/…` — the same reason `/media/settings`
+        // is spelled as a literal rather than a parameter.
+        .route("/media/scan-settings", media_scan_route)
+        .route("/media/scan-settings", media_scan_write)
+        .route("/media/scan/test", media_scan_test)
+        .route("/media/scan/run", media_scan_run)
+        .route("/media/scan/runs", media_scan_runs_route)
+        .route("/media/quarantine", media_quarantine)
+        .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/transformation-presets", media_preset_create)
         .route("/media/transformation-presets/{id}", media_preset)
         .route(

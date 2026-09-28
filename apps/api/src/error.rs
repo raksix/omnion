@@ -704,6 +704,20 @@ impl From<MediaError> for ApiError {
                 Self::bad_request("invalid_storage_setting", message)
                     .with_details(serde_json::json!({ "field": field }))
             }
+            // Same rule for the scanning settings, with its own code so a client can tell a
+            // bad scanner endpoint from a bad storage endpoint — they are different screens
+            // and different people fix them.
+            MediaError::InvalidScanSetting { field, reason } => {
+                Self::bad_request("invalid_scan_setting", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
+            // A release with no reason is a `400`, not a `409`: the request was well-formed and
+            // the refusal is about an empty field, so the caller can fix it and try again
+            // without a state having changed underneath them.
+            MediaError::InvalidReleaseReason => {
+                Self::bad_request("release_reason_required", MediaError::InvalidReleaseReason.to_string())
+                    .with_details(serde_json::json!({ "field": "reason" }))
+            }
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }
