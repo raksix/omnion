@@ -2044,37 +2044,50 @@ async function runOrganizationTenantTabs(page, report, organizationId) {
   // ---- Settings ------------------------------------------------------------------------------
   const settingsUrl = `${URL_ADMIN}/organizations/${organizationId}?tab=settings`;
   await page.goto(settingsUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("select", { timeout: 15000 }).catch(() => {});
+  // Targeted hooks, not "the first select on the page": the header carries a site switcher that
+  // is itself a `<select>`, and a bare `locator("select").first()` writes the locale into the
+  // *site* picker and then waits forever for an option that is not there. This cost a whole
+  // QA pass to find.
+  await page.waitForSelector("[data-organization-settings-locale]", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(600);
 
-  await page.locator("select").first().selectOption("tr").catch(() => {});
-  await page.locator('input[placeholder="Europe/Istanbul"]').first().fill("Europe/Istanbul").catch(() => {});
-  await page.locator('input[placeholder="Platform default"]').first().fill("#2f6f4f").catch(() => {});
+  const localeField = page.locator("[data-organization-settings-locale]").first();
+  const accentField = page.locator("[data-organization-settings-accent]").first();
+  const zoneField = page.locator("[data-organization-settings-timezone]").first();
+
+  await localeField.selectOption("tr").catch(() => {});
+  await zoneField.fill("Europe/Istanbul").catch(() => {});
+  await accentField.fill("#2f6f4f").catch(() => {});
   await shot(page, "page-organization-settings");
   await page.locator('button:has-text("Save settings")').first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1400);
 
   // Reload and read the stored values back: a form that only looks right is not saved.
   await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("select", { timeout: 15000 }).catch(() => {});
+  await page.waitForSelector("[data-organization-settings-locale]", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(700);
 
-  const storedLocale = await page.locator("select").first().inputValue().catch(() => "");
-  const storedAccent = await page
-    .locator('input[placeholder="Platform default"]')
+  const storedLocale = await page
+    .locator("[data-organization-settings-locale]")
     .first()
     .inputValue()
     .catch(() => "");
-  const storedZone = await page
-    .locator('input[placeholder="Europe/Istanbul"]')
-    .first()
-    .inputValue()
-    .catch(() => "");
-  note({ step: "settings-saved", locale: storedLocale, accent: storedAccent, timezone: storedZone });
+  const storedAccent = await accentField.inputValue().catch(() => "");
+  const storedZone = await zoneField.inputValue().catch(() => "");
+  note({
+    step: "settings-saved",
+    locale: storedLocale,
+    accent: storedAccent,
+    timezone: storedZone,
+    localePersisted: storedLocale === "tr",
+    accentPersisted: storedAccent === "#2f6f4f",
+  });
   await shot(page, "page-organization-settings-saved");
 
-  // Put the locale back so the next pass reads the screen in the language it started in.
-  await page.locator("select").first().selectOption("en").catch(() => {});
+  // Put it back so the next pass reads the screen in the language it started in.
+  await localeField.selectOption("en").catch(() => {});
+  await zoneField.fill("UTC").catch(() => {});
+  await accentField.fill("").catch(() => {});
   await page.locator('button:has-text("Save settings")').first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1000);
 
@@ -2089,6 +2102,7 @@ async function runOrganizationTenantTabs(page, report, organizationId) {
     nodes.map((node) => ({
       label: node.getAttribute("aria-label"),
       now: node.getAttribute("aria-valuenow"),
+      text: node.getAttribute("aria-valuetext"),
     })),
   );
   // A bar that names neither a metric nor a number is decoration; the REQ asks for a number and

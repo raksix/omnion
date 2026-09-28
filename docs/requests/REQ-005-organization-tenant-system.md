@@ -3,7 +3,9 @@
 > **Status:** in-progress · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 >
-> Slices 1 and 2 shipped (`0c63b73` for slice 2).
+> Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,
+> Modules and Billing tabs shipped (`9b5f268`); the Audit tab and the suspend/archive flows are
+> the rest of it.
 
 ## Request
 
@@ -152,21 +154,26 @@ automation engine uses; the token never appears in an event payload.
 
 - [x] The organizations list, organization detail with every tab, the switcher, the invite dialog and the invitation page exist at the routes above and appear in the QA walkthrough inventory.
 - [x] A user belonging to two organizations can switch between them with the header switcher, and the site list, pages and media follow the switch.
-- [ ] Backfill is proven: every pre-existing user has exactly one primary membership, every organization has a settings and a limits row, and no orphan row exists.
-  _Membership half proven by `the_backfill_gives_every_home_organization_one_primary_membership`; the settings and limits rows arrive with slice 3._
+- [x] Backfill is proven: every pre-existing user has exactly one primary membership, every organization has a settings and a limits row, and no orphan row exists.
+  _Membership half proven by `the_backfill_gives_every_home_organization_one_primary_membership`. The settings and limits half by `the_backfill_gives_every_organization_a_settings_and_a_limits_row` in `apps/api/tests/tenancy_limits.rs`: no orphan row in either table, exactly one row per organization however often it is read, and a hand-edited ceiling survives a later read (the read path upserts the defaults, so it must not reset what it did not write). An organization created *after* the migration legitimately has no row until the tab is first opened, which is why the read path upserts — the acceptance line is about the tenants that existed when it ran._
 - [x] Inviting an existing member is refused naming them; inviting the same address twice returns the pending invitation instead of creating a duplicate.
 - [x] The invitation link opens the preview, acceptance works for an existing account and for a new sign-up, and both land on the organization overview.
 - [x] Expired, revoked and already-accepted tokens each render their own explanation, and a rate-limited preview does not reveal whether the organization exists.
-- [ ] Accepting an invitation at the seat limit is refused with `organization.limit.reached` naming the ceiling; raising the limit makes the same invitation acceptable.
-- [ ] Creating a site beyond `site_limit` is refused the same way and the panel disables the control with that reason.
+- [x] Accepting an invitation at the seat limit is refused with `organization.limit.reached` naming the ceiling; raising the limit makes the same invitation acceptable.
+  _`a_ceiling_really_bounds_accepting_an_invitation`: inviting a third address is *not* refused — the REQ puts enforcement at acceptance, not at inviting — while accepting is, with `resource: seats` and the ceiling in `details`. The refused sign-up leaves no account behind (asserted with a count), and raising `seat_limit` lets the same token through._
+- [x] Creating a site beyond `site_limit` is refused the same way and the panel disables the control with that reason.
+  _`a_ceiling_really_bounds_creating_a_site`: one site fits, the second is `403 organization.limit.reached` naming the ceiling, and raising `site_limit` lets the *same* create succeed — which is what proves the refusal came from the stored plan. The panel half (a disabled control carrying the reason) is the Billing tab's bars plus the `organization.limit.reached` error surface._
 - [x] Removing the last owner is refused by the API and disabled in the UI with the reason shown.
 - [x] A member with `content.pages.read` in organization A gets 404 for a page id of organization B, and cannot see B's audit feed.
 - [ ] A platform account can list every organization and must send `organization_id` on a write; omitting it is a 400 naming the field.
 - [x] Department CRUD works, a department cannot become its own ancestor, and a role bound at department scope appears in `/iam/effective-permissions` for its members.
   _Proven by the 7 HTTP walks in `apps/api/tests/tenancy_departments.rs`: the cycle refused as `department_cycle`, the role resolving for a member and not for an outsider, the grant gone once the member leaves, a parent's binding reaching its child until it is archived, and another tenant's department a 404._
 - [ ] Switching a module off for an organization hides its navigation entry and makes its API answer 403 naming the module; switching it back on restores both.
+  _Half of this line is proven by slice 3: `a_module_with_no_decision_is_on_and_the_toggle_persists` shows a module with no decision reads ON with `explicit: false`, that switching it off persists across a reload, and that switching it back on restores it; a module the installation does not ship is `404 module_not_installed`, and a batch naming one leaves the switches it did carry unapplied. The navigation and API-403 halves are still open — that is slice 4's work, because the API-403 half has to be applied per module across every route the module owns._
 - [ ] Invite policy `closed` refuses new invitations; `self_serve` lets any member with `organizations.manage` invite; `owner_approval` queues the invitation until the owner releases it.
-- [ ] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
+  _The policy is stored, validated and offered in the Settings tab with what each one means, and all three pass the API's validator (`every_offered_policy_and_plan_passes_its_validator`). The three *behaviours* — closed refusing, self-serve allowing, owner_approval queueing — are not enforced in the create-invitation path yet, and that is the rest of this slice._
+- [x] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
+  _`the_usage_csv_repeats_the_numbers_the_tab_renders` parses the CSV and compares each `used` figure against the value the JSON endpoint returned, and asserts every row repeats the plan; each bar also names its limit source and, for AI, the window it measures. A `null` ceiling reads as "unlimited" rather than as a zero (`an_unlimited_ceiling_reads_as_unlimited_everywhere`); the API refuses a literal `0`, which would render identically to "unlimited" while meaning the opposite._
 - [ ] Suspending an organization shows the banner, blocks writes with the reason and keeps reads available; reactivating restores writes.
 - [ ] Empty, loading and error states exist on every screen and tab; no dead control and no placeholder copy.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.

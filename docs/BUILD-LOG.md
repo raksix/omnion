@@ -1905,3 +1905,35 @@
   plan and usage endpoints, limit enforcement on invite/site/AI, and the Settings, Modules and
   Billing tabs. That slice also closes the "backfill is proven" line, whose settings and limits
   half is still open.
+
+### 2026-09-28 · wave5 · REQ-005 slice 3 — settings, modules, limits and the ceilings that bind
+
+- **What.** The tenant layer could not be configured, could not be restricted and could not be
+  bounded. This slice adds `organization_settings`, `organization_modules` and
+  `organization_limits` (migration `0030`, with a defaults backfill for existing tenants);
+  `crates/identity::tenancy_limits` (validators, the three stores, the usage aggregate and the
+  limit checks); four routes under `/api/v1/organizations/{id}` with `?format=csv` on usage; the
+  enforcement call sites in `create_site` and invitation acceptance; and the Settings, Modules
+  and Billing tabs with the `organization-tenant-tabs` walkthrough pass.
+- **Proof.** `cargo test -p omnion-identity -p omnion-api --lib` → **257 tests, 0 failures**
+  (identity 136 · api 121). `cargo test -p omnion-api --test tenancy_limits` → **12 walks, 0
+  failures** against `omnion_w5_tenant_test` (the dev `omnion` database refuses to migrate with
+  `VersionMismatch(19)`, another branch's migration). `pnpm typecheck` → 2/2.
+- **Two decisions worth naming.** A missing module row reads as **enabled**, not disabled: the
+  table records a decision and a fresh tenant has made none, so reading it as off would ship
+  every new organization with the platform switched off. And usage is *computed* at read time
+  rather than denormalised into counters — a seat count that drifts is worse than a cheap
+  `count(*)`, and the CSV is served from the same call the bars render so the two cannot differ.
+- **The defect the walk caught, and the walk that caught it.** The lowering guard compared two
+  `Option`s directly, so `Some(1) < None` read as false and *putting a ceiling on an unlimited
+  tenant was never checked* — the transition a plan makes the moment somebody starts bounding a
+  tenant. `None` now maps to `i64::MAX` first. The unit test that had been asserting "raising is
+  always allowed" then failed, and it was the test that was wrong: it set a 1 MB storage ceiling
+  against 4 MB in use, which the guard refuses, correctly.
+- **Enforcement sits where the REQ puts it.** The site ceiling is checked in `create_site`; the
+  seat ceiling in invitation acceptance, and *before* the sign-up account is created — a refused
+  acceptance must not strand a new account holding no membership that cannot get in. Inviting
+  is deliberately **not** refused: the plan is charged for people who have joined.
+- **Next.** The rest of slice 3: the Audit tab with its CSV, the suspend/archive flows and the
+  invite-policy behaviours (`closed` refusing, `self_serve` allowing, `owner_approval` queueing)
+  in the create-invitation path.

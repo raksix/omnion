@@ -330,6 +330,7 @@ export function SettingsTab({ organization }: { organization: Organization }) {
           <select
             value={locale}
             onChange={(event) => setLocale(event.target.value)}
+            data-organization-settings-locale
             className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px]"
           >
             {payload.available_locales.map((entry) => (
@@ -346,6 +347,7 @@ export function SettingsTab({ organization }: { organization: Organization }) {
             value={timezone}
             onChange={(event) => setTimezone(event.target.value)}
             placeholder="Europe/Istanbul"
+            data-organization-settings-timezone
             className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px]"
           />
         </label>
@@ -399,6 +401,7 @@ export function SettingsTab({ organization }: { organization: Organization }) {
               value={accent}
               onChange={(event) => setAccent(event.target.value)}
               placeholder="Platform default"
+              data-organization-settings-accent
               className="w-32 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] font-mono"
             />
             {accent === "" ? (
@@ -494,12 +497,17 @@ function UsageBar({
           {unlimited ? "unlimited" : render(limit)}
         </p>
       </div>
+      {/* An unlimited bar has no maximum, and `role="progressbar"` without `aria-valuemax`
+          announces as indeterminate — which is honest about the ceiling but says nothing about
+          the figure. `aria-valuetext` carries the readable "3 of unlimited" in that case, so a
+          screen reader gets the number either way rather than a bar that only says "busy". */}
       <div
         role="progressbar"
         aria-label={label}
-        aria-valuenow={unlimited ? undefined : used}
+        aria-valuenow={used}
         aria-valuemin={0}
         aria-valuemax={unlimited ? undefined : limit ?? undefined}
+        aria-valuetext={`${render(used)} of ${unlimited ? "unlimited" : render(limit)}`}
         className="h-1.5 w-full overflow-hidden rounded-full bg-canvas"
       >
         <div
@@ -676,6 +684,7 @@ export function BillingTab({ organization }: { organization: Organization }) {
           <select
             value={draft.plan ?? "standard"}
             onChange={(event) => setDraft((prev) => ({ ...prev, plan: event.target.value }))}
+            data-organization-billing-plan
             className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px]"
           >
             {limitsPayload.available_plans.map((entry) => (
