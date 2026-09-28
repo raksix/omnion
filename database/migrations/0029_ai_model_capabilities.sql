@@ -1,4 +1,4 @@
--- Omnion · 0026 · AI model capabilities and the discovery diff (REQ-097 slice 2)
+-- Omnion · 0029 · AI model capabilities and the discovery diff (REQ-097 slice 2)
 --
 -- 0008 registered a model with four flags: tools, vision, streaming and embeddings. REQ-097 asks
 -- for the full typed set — "chat, stream, embeddings, image generation, audio, transcription,
