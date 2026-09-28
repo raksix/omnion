@@ -30,8 +30,10 @@ use axum::response::{IntoResponse, Response};
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use omnion_identity::security;
+use omnion_identity::sso::attributes::TargetField;
 use omnion_identity::sso::challenges::{self, SsoChallenge};
 use omnion_identity::sso::claims::{self, Identity};
+use omnion_identity::sso::mappings;
 use omnion_identity::sso::oidc::{self, Discovery, HttpClient, MetadataCache, VerifiedAssertion};
 use omnion_identity::sso::providers::{self, AuthProvider, ProviderKind};
 use omnion_identity::sso::provisioning::{self, ProvisionOutcome};
@@ -514,6 +516,26 @@ async fn finish_sign_in(
     let ip_address = client.as_text();
     let agent = user_agent(&headers);
 
+    // The attribute map is applied *before* anything looks at the identity, because everything
+    // downstream — account matching, JIT creation, the audit line — reads the email, and an email
+    // the map produced is the one the operator configured. A provider with no map is unaffected.
+    let mut identity = identity;
+    if let Err(error) = project_through_map(pool, provider, &mut identity).await {
+        log_event(
+            pool,
+            provider,
+            None,
+            Some(&identity.subject),
+            "refused",
+            Some(error.code()),
+            &[],
+            ip_address.clone(),
+            agent.clone(),
+        )
+        .await;
+        return Err(error);
+    }
+
     let provisioned = match provisioning::provision(pool, provider, &identity).await {
         Ok(provisioned) => provisioned,
         Err(error) => {
@@ -918,6 +940,66 @@ fn identity_from_verified(
         provider.group_claim.as_deref(),
     )
     .map_err(|error| ApiError::bad_request("claims_refused", error.to_string()))
+}
+
+/// Re-project a claims payload through the provider's **attribute map**.
+///
+/// This is the point where the map stops being a panel setting and becomes the sign-in path.
+/// The claims reduction above reads `email` and guesses at mail-shaped claim names, which is
+/// right for a well-behaved provider and wrong for every one that names its fields its own way —
+/// Azure sends `userPrincipalName`, many directories send `mail` with the case spelled differently,
+/// and an attribute is frequently a *path*. When an operator has mapped the provider, that map is
+/// the authority: the same `AttributeMap::project()` the preview runs, so a sign-in cannot disagree
+/// with the rehearsal.
+///
+/// A provider with **no** map keeps the old guessing behaviour, deliberately. A new provider has
+/// no map yet, and refusing its sign-ins until somebody configures one would turn "not set up
+/// yet" into "nobody can sign in" — the exact lock-out the local sign-in invariant forbids.
+async fn project_through_map(
+    pool: &PgPool,
+    provider: &AuthProvider,
+    identity: &mut Identity,
+) -> Result<(), ApiError> {
+    let map = mappings::load_map(pool, provider.id).await?;
+    if map.rows.is_empty() {
+        return Ok(());
+    }
+
+    let payload = Value::Object(identity.attributes.clone());
+    let projection = map.project(&payload);
+    if !projection.ok() {
+        // Name the field rather than the claim: the operator's question is "what is missing from
+        // the payload", and the panel field is the thing they configured.
+        let missing: Vec<&str> = projection
+            .missing
+            .iter()
+            .map(|field| field.as_str())
+            .collect();
+        return Err(ApiError::bad_request(
+            "attributes_incomplete",
+            format!(
+                "the provider's answer has no {} — check the attribute map",
+                missing.join(", ")
+            ),
+        )
+        .with_details(json!({ "missing": missing })));
+    }
+
+    // The mapped values overwrite what the claim reduction guessed. The subject, the group list
+    // and the raw attributes are left alone: the map maps *fields*, and an operator who has not
+    // mapped groups should not find that mapping them broke the role rules.
+    if let Some(email) = projection.get(TargetField::Email) {
+        identity.email = email.to_ascii_lowercase();
+    }
+    if let Some(display_name) = projection.get(TargetField::DisplayName) {
+        identity.display_name = Some(display_name.to_owned());
+    }
+    for (field, value) in &projection.values {
+        identity
+            .attributes
+            .insert(field.as_str().to_owned(), Value::String(value.clone()));
+    }
+    Ok(())
 }
 
 /// The claim reduction of [`identity_from_verified`] without a provider row.
