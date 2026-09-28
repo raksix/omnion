@@ -2406,3 +2406,24 @@
   mount have had the volume between 94% and 100% all tick, and the last several attempts died on
   `Page crashed` and `Execution context was destroyed` under host load rather than on anything in
   the code. The REQ stays open until the real pass runs.
+- **The QA pass, and an honest reading of it.** `QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104
+  QA_WEB_PORT=3204 bash scripts/qa/run.sh` was run and **did not complete**: the API built and the
+  stack came up clean (`/healthz` 200, admin 307, web 404 before the first request), and the
+  walkthrough visited **33 pages and 18 interaction passes** — overview, pages, media,
+  media-trash, media-settings, sites, ai, search, search-settings and eight IAM screens — before
+  the browser tab died at `iam-authentication` with `Target page, context or browser has been
+  closed`, and every later route reported the same. It never reached the organization routes, so
+  it says **nothing** about the screens this REQ is about, and the REQ stays open: this is the
+  sixth consecutive pass on this branch to die the same way, and the ledger's earlier entries
+  name the same two errors. The host reading, taken at the time of the failure: `MemAvailable`
+  4.5G (the precondition is >8G), **six** other `qa/run.sh` processes live (w2, w4, w7 and
+  friends), 40 Chrome processes, load 8.5. The tab did not die *at* the failing route — it died
+  before it, and every subsequent route failed identically, which is the signature of a killed
+  browser rather than a broken page. The `qa-artifacts` run directory (43M) was removed after
+  reading `summary.json`, which contains only the fatal line and no findings; `/mnt/apopic` went
+  95% → 83% on that and on the other writers finishing.
+- **What this tick changed, precisely.** No production code. The walk lives in
+  `apps/api/tests/events.rs` and runs against a live database over the real router; the docs
+  record it. A REQ cannot close on a pass that did not run, so the next tick starts with the
+  mobile pass and a retry, and checks `MemAvailable` and the sibling-pass count *before* launching
+  one rather than interpreting the failure afterwards.
