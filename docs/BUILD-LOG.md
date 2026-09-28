@@ -1,3 +1,39 @@
+## 2026-09-28 — REQ-005 slice 4a · the module switch stops being a stored intention
+
+- **What shipped.** **`0d95b2d`** (five atomic commits) — the per-organization module switch now
+  *applies*. Slice 3 stored the decision in `organization_modules` and proved the toggle; nothing
+  consumed it, so a switch that changed a row and no observable behaviour was exactly the "limit
+  that only decorates the UI is a lie" the REQ warns about, one layer down.
+  - **`d89ddc2`** — `module_routes()` / `route_module()` / `navigation_without()` in
+    `crates/identity::tenancy_limits`. One table of which module owns which path, in the crate the
+    Modules tab already reads its list from.
+  - **`40fced2`** — `apps/api/src/module_guard.rs`, one layer over the whole `/api/v1` router.
+    Refuses with `403 organization.module.disabled` carrying `module` and `module_name`.
+  - **`8adb813`** — `/api/v1/me/organizations` grows `disabled_modules`, measured for the *current*
+    tenant only, so the shell hides the entry without a second request.
+  - **`66f86d7`** — the sidebar is filtered on those keys, a person already inside a switched-off
+    module is sent to the overview, and the Modules tab's consequence sentence names the screen
+    that disappears instead of repeating one now-true generic line.
+  - **`0d95b2d`** — `switching_a_module_off_hides_its_api_and_switching_it_back_restores_it`.
+- **Also.** **`644a129`** — `0028_organization_departments.sql` → `0029`. Merging `origin/main`
+  collided with main's own `0028_site_presets.sql`; git merged the files and sqlx then refused to
+  migrate with `duplicate key value violates unique constraint "_sqlx_migrations_pkey"`. It reads
+  as a schema bug and is only a numbering collision, so the fix is the *file*, never the database.
+- **Proof.** `cargo test -p omnion-identity --lib` → **144 passed** (9 new: path→module, the
+  `/api/v1` mount, the core-is-never-a-module list, `/public/*` survives, segment boundaries, no
+  installed module without a route). `cargo test -p omnion-api --lib` → **131 passed** (3 new).
+  `tsc -p apps/admin/tsconfig.json --noEmit` → **clean**.
+  `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1` → **20 passed, 3 failed**,
+  and the same three fail at `644a129` with the change stashed — baseline proven by re-running, not
+  assumed (`a_ceiling_really_bounds_accepting_an_invitation`, `a_queued_link_never_works_and_says_so`,
+  `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`).
+- **Next.** The per-organization retention sweep (`organization_settings.audit_retention_days` is
+  stored and validated and read by nothing), then the `organization.member.joined` webhook-isolation
+  walk that closes the slice, then the mobile pass. The QA walkthrough still has not run green on
+  this branch; four other writers were mid-pass for most of the tick and the volume sat at 98–100%
+  (reclaimed a dangling docker volume, my own stale test binaries and `~/.npm/_cacache` to get
+  back to ~1G), so the full pass is the first thing the next quiet window should do.
+
 
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
