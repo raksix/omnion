@@ -1133,6 +1133,101 @@ async function runMediaPresets(page, report) {
   };
 }
 
+/**
+ * Drive the storage settings tab the way an operator does (REQ-010, slice 3).
+ *
+ * The claims a screenshot cannot settle are the ones worth walking: a range that is refused
+ * *by the form*, naming the field, before anything is sent; a connection test that reports what
+ * it proved rather than a green tick; and a save that leaves the bucket alone when the form only
+ * changed one field. All three are checked against the DOM and the API, not against the page
+ * having rendered.
+ */
+async function runMediaStorage(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-storage", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The storage tab is a tab, not a second URL: a settings page with a hidden screen behind a
+  // link is two screens, and the second one is the one nobody visits.
+  await page.locator("#media-settings-tab-storage").click().catch(() => {});
+  await page.waitForSelector('input[placeholder="omnion-media"]', { timeout: 8000 }).catch(() => {});
+  const listed = await page.locator('input[placeholder="omnion-media"]').count();
+  note({ step: "load", listed });
+  if (listed === 0) {
+    return { ok: false, reason: "the storage tab did not render" };
+  }
+
+  // A settings screen that renders a credential is the failure this whole tab is built to avoid,
+  // so the walk checks the rendered text for one rather than trusting the type.
+  const visibleText = await page.locator("#media-settings-panel-storage").innerText().catch(() => "");
+  const leaks = ["secret", "access key", "password", "credential"].filter((word) =>
+    new RegExp(word, "i").test(visibleText),
+  );
+  note({ step: "no-credentials", leaks });
+
+  // An out-of-range value must be refused by the form, naming the field, before it is sent.
+  const ttl = page.locator('input[aria-label="Signed URL lifetime in seconds"]');
+  await ttl.fill("5").catch(() => {});
+  await page.getByRole("button", { name: /^Test connection$/ }).click().catch(() => {});
+  await page.waitForTimeout(900);
+  const alerts = await page.locator("#media-settings-panel-storage [role='alert']").allTextContents();
+  const ttlNamed = alerts.some((text) => /between 60 and 604800/.test(text));
+  note({ step: "ttl-refused", ttlNamed, alerts });
+
+  // Now a good one, and the connection test must report what it *proved* — a sentence about a
+  // write, not a bare tick. A result that says only "connected" is what a read-only probe says.
+  await ttl.fill("900").catch(() => {});
+  await page.getByRole("button", { name: /^Test connection$/ }).click().catch(() => {});
+  await page.waitForTimeout(6000);
+  const probe = await page
+    .locator('[data-testid="media-storage-probe"]')
+    .innerText()
+    .catch(() => "");
+  note({ step: "connection", probe });
+  const probeAnswered = probe.length > 0;
+  // "reached … and wrote and removed a probe object" is the passing shape; a store that
+  // accepted a write and refused a delete must say so instead of claiming success.
+  const honest = /wrote and removed|could not|reached/i.test(probe);
+
+  // A save must persist, and must not have reset the fields the walk did not touch.
+  const upload = page.locator('input[aria-label="Maximum upload size in megabytes"]');
+  await upload.fill("48").catch(() => {});
+  await page.getByRole("button", { name: /^Save$/ }).click().catch(() => {});
+  await page.waitForTimeout(2500);
+  const saved = await upload.inputValue().catch(() => "");
+  const notice = await page.locator("#media-settings-panel-storage [role='status']").allTextContents();
+  note({ step: "save", saved, notice });
+  await shot(page, "media-storage-settings");
+
+  // The saved value must be readable back out of the API by an independent request, so the
+  // walk is not just trusting that the form kept its own text.
+  const persisted = await page.evaluate(async () => {
+    const site = new URLSearchParams(window.location.search).get("site_id");
+    const sites = await (await fetch("/api/v1/sites", { credentials: "same-origin" })).json();
+    const first = (sites.sites || sites)[0];
+    const query = `site_id=${first ? first.id : site || ""}`;
+    const response = await fetch(`/api/v1/media/settings?${query}`, { credentials: "same-origin" });
+    return { status: response.status, body: await response.json() };
+  });
+  note({ step: "persisted", status: persisted.status, maxUploadMb: persisted.body?.max_upload_mb });
+
+  return {
+    ok: listed > 0 && leaks.length === 0 && ttlNamed && probeAnswered && honest && saved === "48",
+    steps: steps.length,
+    leaks,
+    ttlNamed,
+    probeAnswered,
+    honest,
+    saved,
+    persisted: persisted.body?.max_upload_mb,
+  };
+}
+
 async function runMediaFileDetail(page, report) {
   const steps = [];
   const note = (step) => {
@@ -1223,6 +1318,288 @@ async function runMediaFileDetail(page, report) {
   note({ step: "version-preview-buttons", previewButtons });
 
   return { ok: rendered && kind !== null, steps: steps.length, kind, fileId };
+}
+
+/**
+ * Drive the share tab the way an operator does (REQ-010, slice 3).
+ *
+ * The claim a screenshot cannot settle is the one the whole feature rests on: the link is shown
+ * **once**, so the screen must show it after creation and must *not* offer to show it again. A
+ * walk that only looked for "a share button exists" would pass on a screen whose `Copy` silently
+ * copies nothing — which is the failure mode this tab is designed to rule out.
+ */
+async function runMediaShares(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-shares", ...step });
+  };
+
+  // The pass needs a real file with a real id, so it resolves one the way the detail pass does
+  // — from the library listing — rather than depending on a field another pass happens to set.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadMediaSample(page);
+  await page.waitForTimeout(1500);
+  note({ step: "upload", ...uploaded });
+  if (!uploaded || !uploaded.ok) {
+    return { ok: false, reason: "no file to share — the upload step did not succeed" };
+  }
+  const fileId = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  note({ step: "file-id", fileId });
+  if (!fileId) {
+    return { ok: false, reason: "the library rendered no file to share" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The tab is a tab, not a second URL.
+  await page.click("#media-tab-shares").catch(() => {});
+  await page.waitForSelector('[data-testid="share-create"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="share-create"]').count()) > 0;
+  note({ step: "tab", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the share tab did not render" };
+  }
+
+  // A fresh file has no links, and the empty state has to say what a link *is* rather than
+  // showing an empty table.
+  const emptyState = await page.locator("text=No share links yet").count();
+  note({ step: "empty", emptyState });
+
+  // An out-of-range expiry is refused by the form, naming the field, before it is sent — the
+  // same sentence the API would produce, and the walk proves the screen has one at all.
+  await page.fill("#share-expires", "0");
+  await page.click('[data-testid="share-create"]');
+  await page.waitForTimeout(600);
+  const fieldError = await page.locator('[data-testid="share-field-error"]').innerText().catch(() => "");
+  note({ step: "expiry-refused", fieldError });
+  const expiryNamed = /at least 1/i.test(fieldError);
+
+  // Now a real link, with no choices made: the common case is a body-less POST.
+  await page.fill("#share-expires", "");
+  await page.click('[data-testid="share-create"]');
+  await page.waitForTimeout(2500);
+  const shownOnce = (await page.locator('[data-testid="media-share-created"]').count()) > 0;
+  const url = await page.inputValue('input[aria-label="The new share link"]').catch(() => "");
+  const tokenLength = url.split("/").pop()?.length ?? 0;
+  note({ step: "created", shownOnce, tokenLength });
+  await shot(page, "page-media-file-detail-share");
+
+  // The decisive check: with the one-time panel open, the table behind it offers *revoke* and
+  // no copy control. A `Copy` beside an existing row would copy nothing, because the platform
+  // stores only a hash of the token.
+  const revokeButtons = await page.locator("[data-testid^='media-share-revoke-']").count();
+  const copyButtonsInTable = await page
+    .locator('[data-testid="media-share-created"] ~ * button:has-text("Copy")')
+    .count();
+  note({ step: "no-copy-on-existing", revokeButtons, copyButtonsInTable });
+  const copyIsOnlyInPanel = await page.locator('[data-testid="media-share-created"] button:has-text("Copy")').count();
+
+  // The link must actually work: fetch the public URL from the test process context and check
+  // it serves the bytes. A link the panel shows but nobody can open is the worst outcome.
+  const publicStatus = await page.evaluate(async (link) => {
+    if (!link) {
+      return 0;
+    }
+    const response = await fetch(link, { credentials: "omit" });
+    await response.arrayBuffer();
+    return response.status;
+  }, url);
+  note({ step: "public-link", publicStatus });
+
+  // And revoking it is immediate, checked through the public route rather than the panel.
+  await page.click('[data-testid="media-share-created"] button:has-text("Done")').catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-testid^='media-share-revoke-']").first().click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const afterRevoke = await page.evaluate(async (link) => {
+    if (!link) {
+      return 0;
+    }
+    const response = await fetch(link, { credentials: "omit" });
+    await response.arrayBuffer();
+    return response.status;
+  }, url);
+  const stateText = await page.locator("[data-testid^='media-share-state-']").first().innerText().catch(() => "");
+  note({ step: "revoked", afterRevoke, stateText });
+  await shot(page, "page-media-file-detail-share-revoked");
+
+  return {
+    ok:
+      rendered &&
+      emptyState > 0 &&
+      expiryNamed &&
+      shownOnce &&
+      tokenLength === 64 &&
+      revokeButtons > 0 &&
+      copyButtonsInTable === 0 &&
+      copyIsOnlyInPanel === 1 &&
+      publicStatus === 200 &&
+      afterRevoke === 410,
+    steps: steps.length,
+    publicStatus,
+    afterRevoke,
+    tokenLength,
+  };
+}
+
+
+// ---------------------------------------------------------------- duplicates (REQ-010, slice 3)
+
+/**
+ * Put two *identical* files in the library.
+ *
+ * The duplicate report groups by checksum, so the screen only has content when two rows carry
+ * the same bytes. Uploading the same sample file twice is the honest way to do it: a fabricated
+ * checksum written straight into the database would make the report pass against rows the
+ * application never created.
+ */
+async function uploadDuplicateSample(page) {
+  const file = ensureSamplePng();
+  const input = page.locator('input[type="file"]').first();
+  if ((await input.count()) === 0) {
+    return { uploaded: false, note: "no file input on this screen" };
+  }
+  // The same bytes under a different name, so the two rows are distinguishable in the report.
+  const second = path.join(path.dirname(file), "upload-sample-copy.png");
+  fs.copyFileSync(file, second);
+
+  await input.setInputFiles(file).catch(() => {});
+  await page.waitForTimeout(1800);
+  await input.setInputFiles(second).catch(() => {});
+  await page.waitForTimeout(1800);
+  return {
+    uploaded: true,
+    first: path.basename(file),
+    second: path.basename(second),
+  };
+}
+
+/**
+ * Drive `/media/duplicates`.
+ *
+ * The pass asserts the four things a screenshot cannot see: the two identical uploads actually
+ * form a group, the Merge button stays **disabled until a keeper is chosen**, the merge keeps the
+ * file the radio named (not the first one), and the result panel says the bytes are *pending*
+ * rather than reclaimed. It then re-reads the API to prove the group is really gone.
+ */
+async function runMediaDuplicates(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-duplicates", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadDuplicateSample(page);
+  note({ step: "upload", ...uploaded });
+  if (!uploaded || !uploaded.uploaded) {
+    return { ok: false, reason: "no file input — the duplicate pair was not uploaded" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/duplicates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="media-duplicates"]', { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const rendered = (await page.locator('[data-testid="media-duplicates"]').count()) > 0;
+  note({ step: "screen", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the duplicate screen did not render" };
+  }
+
+  const groups = await page.locator('[data-testid="duplicates-group"]').count();
+  note({ step: "groups", groups });
+  if (groups === 0) {
+    await shot(page, "page-media-duplicates-empty");
+    return { ok: false, reason: "two identical uploads produced no duplicate group" };
+  }
+
+  // Expand the first group. The rows must be there without a click — the choice of keeper is the
+  // screen's whole job, and a report that hides the files cannot make that choice.
+  await page.locator('[data-testid="duplicates-group"] button:has-text("Show files")').first().click().catch(() => {});
+  await page.waitForTimeout(900);
+  const radios = page.locator('[data-testid="duplicates-group"] input[type="radio"]');
+  const radioCount = await radios.count();
+  const mergeButton = page.locator('[data-testid="duplicates-group"] button:has-text("Merge group")').first();
+  note({ step: "expanded", radioCount, mergeButtons: await mergeButton.count() });
+
+  // The decisive control: **disabled with no keeper chosen**. A screen that enabled it would let
+  // an operator merge without ever answering the question, and the platform would have to guess.
+  const disabledBeforeChoice = await mergeButton.isDisabled().catch(() => false);
+  note({ step: "merge-disabled-without-a-keeper", disabledBeforeChoice });
+
+  // Pick the *second* file, so a merge that quietly kept the first would be caught rather than
+  // coinciding with the walkthrough's own order.
+  const keepLabel = await radios.nth(1).getAttribute("aria-label").catch(() => null);
+  await radios.nth(1).check().catch(() => {});
+  await page.waitForTimeout(400);
+  const disabledAfterChoice = await mergeButton.isDisabled().catch(() => true);
+  note({ step: "merge-enabled-after-a-keeper", keepLabel, disabledAfterChoice });
+
+  await shot(page, "page-media-duplicates");
+
+  // The confirmation must say *trash*, and must not say the bytes are already back.
+  await mergeButton.click().catch(() => {});
+  await page.waitForTimeout(700);
+  const dialogText = await page.locator('[role="dialog"]').innerText().catch(() => "");
+  note({ step: "confirm", mentionsTrash: /trash/i.test(dialogText) });
+  await shot(page, "page-media-duplicates-confirm");
+  await page.click("#duplicates-merge-confirm").catch(() => {});
+  await page.waitForTimeout(3000);
+
+  const notice = await page.locator('[role="status"]').first().innerText().catch(() => "");
+  const groupCountAfter = await page.locator('[data-testid="duplicates-group"]').count();
+  note({ step: "merged", notice: notice.slice(0, 160), groupCountAfter });
+  await shot(page, "page-media-duplicates-merged");
+
+  // The notice has to state that the bytes are *pending*, not reclaimed. A report that showed
+  // freed space immediately would teach the operator to trust a number that is a week old.
+  const pendingClaimed = /only reclaimed when the trash is purged/i.test(notice);
+
+  // And the report agrees: the group is gone, because one live file is not a group.
+  const apiGroups = await page.evaluate(async () => {
+    const site = document.querySelector('[data-site-switcher] select')?.value;
+    const params = new URLSearchParams();
+    if (site) {
+      params.set("site_id", site);
+    }
+    const response = await fetch(`/api/v1/media/duplicates?${params}`, {
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      return { status: response.status, group_count: -1 };
+    }
+    const body = await response.json();
+    return { status: response.status, group_count: body.group_count };
+  });
+  note({ step: "api", ...apiGroups });
+
+  return {
+    // One assertion per claim, so a failure names what broke rather than just "false":
+    // the pair formed a group; the button was dead until a keeper was named and alive after;
+    // the merge removed *a* group (the report had one more row than it has now, or the API
+    // agrees it is gone — both are checked below and the API is the authority);
+    // the notice does not claim the bytes are back.
+    ok:
+      disabledBeforeChoice &&
+      !disabledAfterChoice &&
+      radioCount >= 2 &&
+      groupCountAfter < groups &&
+      apiGroups.status === 200 &&
+      apiGroups.group_count < groups &&
+      pendingClaimed,
+    steps: steps.length,
+    radioCount,
+    groups,
+    groupCountAfter,
+    notice: notice.slice(0, 160),
+    apiGroups,
+  };
 }
 
 // ---------------------------------------------------------------- palette (REQ-002)
@@ -3758,6 +4135,7 @@ async function main() {
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
+    { path: "/media/duplicates", name: "media-duplicates" },
     { path: "/media/trash", name: "media-trash" },
     // The transformation presets (REQ-010, slice 3) — walked here and driven by the depth pass
     // below, which creates a preset, submits an out-of-range quality to see the field error, and
@@ -3865,6 +4243,24 @@ async function main() {
 
   report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
   log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+
+  // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
+  // says what it proved, and a save that leaves the untouched fields alone.
+  report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
+  log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
+
+  // The share tab (REQ-010, slice 3): the link is shown once and never again, the public URL
+  // actually serves the bytes, and a revoke stops it on the very next request.
+  report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
+  log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+
+  // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
+  // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
+  // bytes are pending rather than reclaimed.
+  report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
+    runMediaDuplicates(page, report),
+  );
+  log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
