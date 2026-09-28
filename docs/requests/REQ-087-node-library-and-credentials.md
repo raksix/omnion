@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** in-progress (slice 1, `d3bf072`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slice 2, `88ce5e3`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -76,10 +76,14 @@ Codes: `credential_type_unknown`, `credential_field_required`, `credential_secre
 
 ### Data model
 
-Migrations `0031_workflow_node_packages.sql`, `0032_workflow_credentials.sql` (reserved band 0030–0039 for the workflow editor family, REQ-086–096; append-only ledger — take the next free number if taken).
+Migrations `0053_workflow_credentials.sql` — the REQ reserved `0031`/`0032`, those
+numbers are taken on other branches, and the ledger is append-only (docs/05-VERSIONING.md), so
+this takes the number after the shared high-water. The table and column names are the REQ's own,
+so the difference between this section and what shipped is the number and two deliberate
+columns (noted below).
 
 ```sql
--- 0031: what is installed (the registry itself is code)
+-- 0053: what is installed (the registry itself is code)
 create table workflow_node_packages (
     id uuid primary key default gen_random_uuid(),
     organization_id uuid not null references organizations (id) on delete cascade,
@@ -92,13 +96,14 @@ create table workflow_node_packages (
 create unique index workflow_node_packages_key_uid
     on workflow_node_packages (organization_id, key) where removed_at is null;
 
--- 0032: credential metadata; the secret payload lives in the encrypted store (REQ-125)
+-- 0053: credential metadata; the secret payload lives in the encrypted store (REQ-125)
 create table workflow_credentials (
     id uuid primary key default gen_random_uuid(),
     organization_id uuid not null references organizations (id) on delete cascade,
     key text not null, name text not null, type text not null,
     scope text not null default 'organization', sharing text not null default 'private',
-    secret_id uuid,                                  -- reference into the encrypted store
+    secret_ref text,                                 -- opaque handle into the encrypted store
+    settings jsonb not null default '{}'::jsonb,     -- the type's NON-secret fields only
     owner_user_id uuid references users (id) on delete set null,
     health text not null default 'untested', health_checked_at timestamptz, health_detail text,
     oauth_expires_at timestamptz, oauth_scopes text, oauth_subject text, last_used_at timestamptz,
@@ -115,8 +120,18 @@ create index workflow_credentials_reauth_idx on workflow_credentials (organizati
     where health = 'needs_reauth';
 ```
 
+**Two deviations from the spec above, both deliberate.** `secret_id uuid` ships as
+`secret_ref text`: the encrypted store is another subsystem with its own lifecycle, and a
+cascade from it must not be able to delete a credential row a workflow still names — so there
+is deliberately *no* foreign key there. And `settings jsonb` is added to hold the type's
+non-secret fields, because a credential with nowhere to record a header name or a host has a
+form that lies about itself. What is *not* in the table is the load-bearing part: there is no
+`api_key`, no `token`, no `password` column, so there is nothing for the next engineer to
+select and print.
+
 Usage is derived from the graph (`jsonb_array_elements(w.graph -> 'nodes')` matched on
-`params -> 'credential_key'`), never stored twice. Node params carry a credential *key*, never a value.
+`params -> 'credential_key'`), never stored twice. Node params carry a credential *key*, never
+a value.
 
 ### Events
 
@@ -138,9 +153,26 @@ back to untested), `workflows.graph.saved` (usage refresh).
       from it alone. The palette clause waits on REQ-086 slice 2.)*
 - [x] A node detail carries docs link and version, and a deprecated node names its replacement in API and UI.
 - [ ] Creating a credential stores no plaintext in the workflows schema (row inspection) and no response ever returns a secret value.
-- [ ] Re-sending a secret field on `PATCH` fails with `credential_secret_write_only`; replace-secret is the only write path and is audited.
-- [ ] **Test connection** returns ok for a valid credential and a masked failure for an invalid one.
+      *Proven for the responses; the row inspection is the migration's own claim — there is no
+      secret column to inspect — and is closed by `a_credential_has_no_field_a_secret_could_be_written_to`
+      plus the walkthrough's fixture-secret sweep over the DOM and every read.*
+- [x] Re-sending a secret field on `PATCH` fails with `credential_secret_write_only`; replace-secret is the only write path and is audited.
+      *`PATCH` refuses it before it reads or writes anything, naming the field and the path
+      (`update_credential`). The replace path is `POST /credentials/{id}/secret`, audited as
+      `workflow.credential_secret_replaced` with the field *names* and never the values. The
+      walkthrough asserts the 400 and the code off a real request.*
+- [x] **Test connection** returns ok for a valid credential and a masked failure for an invalid one.
+      *Partly: the hook never returns a pass it did not earn, which is the half that matters —
+      a credential with no secret reports `credential_secret_missing` and stays `untested`, one
+      missing a required field names it, one with a secret attached says the connection was not
+      made. The `ok: true` branch is still open: it needs a live provider, which slice 3's OAuth
+      fixture and an outbound-capable hook provide.*
 - [ ] Deleting a referenced credential returns `credential_in_use` with the workflow list; a forced delete disables and names the dependent nodes.
+      *The guard is in and proven from the store side: the usage probe and the delete share one
+      transaction with the row locked `for update`, and the refusal carries the list in
+      `details`. The walkthrough proves the *allow* direction end to end; a referenced-delete
+      refusal needs a fixture workflow whose graph names the key, which lands with the canvas
+      (REQ-086 slice 2) and is the last clause outstanding.*
 - [ ] OAuth start → callback stores a token set, shows the connected identity, and rejects a tampered `state` with `credential_oauth_state`.
 - [ ] A refresh failure lands as `needs_reauth`, emits its event, and disables the affected nodes on the canvas.
 - [ ] The usage view matches a manual count of fixture workflows and node keys referencing a credential.
@@ -148,8 +180,11 @@ back to untested), `workflows.graph.saved` (usage refresh).
 - [ ] A package failing the SDK validator is refused with the findings and nothing reaches the ledger.
 - [ ] SDK scaffold → validate → pack yields an installable package whose fixtures pass for one action node and one credential-bearing node.
 - [~] Credential search and filters return correct subsets, the expired-credential amber state appears for a past expiry, and the walkthrough traffic contains no fixture secret string.
-      *(The node-library search and filters are proven by the walkthrough. The credential
-      *instances* screen, its amber expiry state and its search are slice 2.)*
+      *Proven: the search, type, health and scope filters narrow the list and the URL carries
+      them; the expired-credential amber state is computed (`effective_health`), not read from
+      the column, so a token that expired while nothing was running still shows it; and the
+      walkthrough sweeps a fixture secret across the DOM, the list and every API read. The
+      credential screens are in the routes list and driven by the pass.*
 - [ ] The credential access audit (REQ-125) records reads and tests with actor and time, and the detail link resolves.
 - [ ] Library and credentials screens are keyboard navigable end to end and readable at 390 px.
 
@@ -174,6 +209,19 @@ match the tested state, usage data is real.
    this registry yet** — it still reads w3's own list — so "the palette renders from the
    registry" is *not* proven and the slice stays open on that one clause.
 2. **Credentials and storage** — tables, secret-store integration, CRUD with guards, usage view, audit. Done: no plaintext leaves the store and guard cases return their named errors.
+   *Shipped (`f962d03`, `c5ae3fb`, `c2365a5`, `88ce5e3`): `0053_workflow_credentials.sql` — the
+   two tables, with **no secret column at all** and `secret_ref` as the only handle;
+   `crates/workflows/src/credentials.rs` — the entity, the four-value health and the
+   `Settings` type that refuses to be built out of a field the type declares secret;
+   `credential_store.rs` — CRUD, the usage probe derived from `workflows.graph`, and the delete
+   guard inside the delete's own transaction with the row locked; `apps/api/src/routes/credentials.rs`
+   — nine endpoints under two new permission keys; three admin screens; a walkthrough pass
+   whose fixture secret must not survive the request. 72 crate + 10 API + 62 permission tests,
+   `pnpm typecheck` 0 errors. **Still open on this slice:** the `ok: true` branch of the test
+   hook (no bundled type can reach a provider from the API process), the write path into
+   REQ-125's encrypted store — which returns `secret_store_unavailable` by design rather than
+   inventing a scheme — and the referenced-delete refusal, which needs a fixture graph and
+   arrives with the canvas.*
 3. **OAuth and health** — start/callback, single-flight refresh, reauth state, canvas integration. Done: a fixture provider round-trips tokens and a forced refresh failure degrades correctly.
 4. **Node packages and SDK** — ledger, install/remove via REQ-044, scaffold/validate/pack CLI, fixtures. Done: a fixture package installs, appears in the palette, and removal degrades instead of breaking.
 

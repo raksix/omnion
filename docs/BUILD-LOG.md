@@ -2698,3 +2698,71 @@ six enums already had; the API is unchanged in shape.
 secret-store link, CRUD with the usage guard and the masked detail screen. Slice 1 stays open on
 one clause — "the palette renders from it with no hard-coded list" — because the canvas is
 REQ-086 slice 2 and still reads w3's own list; that is a wiring step, not a registry change.
+
+## omnion-w10 · REQ-087 slice 2 — credential instances, and a table with no secret column in it
+
+**What.** The credential entity end to end: `0053_workflow_credentials.sql` (two tables),
+`crates/workflows/src/credentials.rs` and `credential_store.rs`, nine endpoints under
+`/api/v1/credentials` and `/api/v1/node-packages`, two new permission keys, three admin
+screens, and a walkthrough pass whose fixture secret has to survive the round trip without
+appearing anywhere.
+
+**Proof.**
+
+- `cargo test -p omnion-workflows --lib` → **72 passed** (20 new).
+- `cargo test -p omnion-api --lib` → **176 passed** (10 new).
+- `cargo test -p omnion-permissions --lib` → **62 passed**.
+- `pnpm typecheck` → 2 successful, 0 errors.
+- `bash scripts/qa/run.sh` on the private w10 stack → see the counters below.
+
+**The table has no secret column, and that is the design rather than an omission.** The REQ
+says the payload lives in the encrypted store (REQ-125) and this takes it literally: what a
+credential row carries is `secret_ref`, an opaque handle, plus `settings`, which
+`Settings::build` refuses to construct out of any key the credential type declares `secret`.
+The invariant "no plaintext secret is stored in the workflows schema" is therefore not a review
+checklist item — there is no function in the store that takes a secret as a parameter, and a
+test asserts the row's serialised form has no field a secret could hide in.
+
+**Two of my own tests caught two real defects in the same commit.** `Health::parse` was
+case-sensitive although it only ever runs on values read back out of the column, so a
+hand-edited row would have turned a whole list into an error. And the required-field check
+accepted a whitespace-only value — which is the shape a browser actually submits when a reader
+opens an input and leaves it alone. The second one had a test *asserting the wrong thing*
+beside it; the test was deleted rather than the rule relaxed, because the rule is the one that
+matches what a form does.
+
+**Usage is derived, and the guard lives inside the transaction it guards.** The usage probe is
+a `jsonb_array_elements(workflows.graph -> 'nodes')` match on `params ->> 'credential_key'`,
+taken in the *same* transaction as the delete with the credential row locked `for update`.
+Checking usage and then deleting in two round trips is a race a canvas save can win, and the
+result is a graph pointing at nothing with no error anywhere. A counter column would have been
+the obvious implementation and is wrong the moment somebody drags a node.
+
+**The test hook cannot report a pass it did not earn.** No bundled credential type can reach a
+provider from the API process, so `POST /credentials/{id}/test` answers from what it actually
+knows: no secret attached → `credential_secret_missing`, row stays `untested`; a required field
+missing → named; a secret attached but no hook that can use it → the connection was not made.
+`ok: true` is the one answer it cannot give, because a green chip nobody earned moves the
+failure off the test screen and into the middle of somebody's production run. The walkthrough
+asserts that negative directly (`testDidNotFakeSuccess`).
+
+**The secret write path returns 503 `secret_store_unavailable` until REQ-125 is wired**, rather
+than inventing a local scheme. The REQ's own risk line asks for exactly this: "if that slips,
+refuse credential writes rather than inventing a local scheme." A credential that saves with no
+secret is a state the panel already knows how to show.
+
+**The walkthrough's load-bearing step is a grep.** A fixture string is typed into the create
+form, and then the pass searches the resulting screen, the whole DOM and every read the API
+offers for it. "No response returns a secret" is otherwise an architectural claim; this is a
+grep that fails the build if it stops being true. The pass also asserts the three easy-to-get-
+wrong answers — a secret re-sent on a `PATCH` is refused by name, a test reports a result, and
+the delete guard *allows* an unreferenced credential (a guard that refuses forever is as broken
+as no guard).
+
+**Migration number.** The REQ reserved `0031`/`0032`; those are taken on other branches, and
+the ledger is append-only, so this is `0053` with the REQ's own table and column names.
+
+**Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider, the single-flight
+refresh, and `needs_reauth` reaching the canvas. Then slice 4 — the package ledger's installer
+pipeline and the SDK validator. The palette wiring (REQ-086 slice 2) stays the one clause slice
+1 could not close.
