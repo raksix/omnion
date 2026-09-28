@@ -84,6 +84,11 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.manage",
             "media.settings.manage",
             "ai.providers.read",
+            // A manager may read what the AI hub spent and which model served what — the cost
+            // screens are a reporting surface, not a control one. They deliberately do NOT get
+            // `ai.settings.manage`: rewriting the task map is a platform-wide change that
+            // silently re-points every copilot on every site, which is an owner's decision.
+            "ai.usage.read",
             "ai.chat",
             "workflows.read",
             "workflows.manage",

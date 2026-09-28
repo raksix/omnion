@@ -110,6 +110,23 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Connect and configure AI providers",
     },
+    // REQ-098: reading the registry and rewriting the task map are *different* powers. An
+    // operator who may look at what a request cost may not get to decide which model serves it,
+    // and one who may decide may not read the bill. Splitting them is what makes the audit trail
+    // for a routing change attributable to somebody.
+    PermissionDef {
+        key: "ai.settings.manage",
+        category: "ai",
+        description: "Rewrite task routes and per-feature model overrides",
+    },
+    // REQ-104 will own the cost screens; the key lands here because the catalog's own usage
+    // counts and the price columns read the same store, and a permission added in whichever
+    // request ships second is a migration that has to be backdated.
+    PermissionDef {
+        key: "ai.usage.read",
+        category: "ai",
+        description: "Read AI usage, cost and routing decision logs",
+    },
     PermissionDef {
         key: "ai.chat",
         category: "ai",

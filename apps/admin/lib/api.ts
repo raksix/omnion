@@ -1222,8 +1222,50 @@ export type AiModel = {
   capability_catalog: AiCapabilityInfo[];
   /** The capabilities this model actually claims, in catalog order. */
   capabilities: AiCapability[];
+  /** What it costs, in both precisions (REQ-098 slice 1). */
+  price: AiModelPrice;
+  /** Where the capability flags came from: `manual`, `discovery` or `probe`. */
+  capabilities_source: string;
+  /** When the capability flags were last confirmed against something. */
+  capabilities_verified_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+/**
+ * One model's price.
+ *
+ * Both the per-million figure the column stores and the per-1K rendering the table shows, so
+ * the panel can switch between them without rounding differently from the export. `complete` is
+ * the important one: a model with only an input price has an *unknown* cost, and rendering the
+ * missing half as zero would make every estimate built from this row too small.
+ */
+export type AiModelPrice = {
+  input_micros_per_mtok: number | null;
+  output_micros_per_mtok: number | null;
+  input_micros_per_1k: number | null;
+  output_micros_per_1k: number | null;
+  /** `manual`, `discovery` or `probe`. */
+  source: string;
+  /** What that source means, so the panel does not have to hard-code the wording. */
+  source_note: string;
+  updated_at: string | null;
+  complete: boolean;
+  age_days: number | null;
+  stale: boolean;
+};
+
+/** How a catalog listing is narrowed; every field is optional and independent. */
+export type AiModelQuery = {
+  /** Matches the model key, the display name and the provider name. */
+  q?: string;
+  /** Capabilities a row must **all** claim; empty means no filter. */
+  capabilities?: AiCapability[];
+  providerId?: string;
+  /** `enabled` or `disabled`; absent is both. */
+  status?: "enabled" | "disabled";
+  /** Which column the table is sorted by. */
+  sort?: "model" | "provider" | "context" | "price" | "updated";
 };
 
 /** A model to register on a provider. */
@@ -1291,9 +1333,29 @@ export async function fetchAiProviders(): Promise<AiProvider[]> {
   return body.providers;
 }
 
-/** The model registry, across every provider. */
-export async function fetchAiModels(): Promise<AiModel[]> {
-  const body = await request<{ models: AiModel[] }>("/api/v1/ai/models");
+/**
+ * The model registry, narrowed (REQ-098 slice 1).
+ *
+ * The narrowing is sent to the server rather than applied here: the API and the table have to
+ * agree about which rows a query means, and a client-side filter would make the acceptance
+ * criterion that the capability chips narrow the *listing* true of the panel and false of the
+ * endpoint. An empty result therefore means the server found nothing — never "the panel hid
+ * them".
+ */
+export async function fetchAiModels(query: AiModelQuery = {}): Promise<AiModel[]> {
+  const params = new URLSearchParams();
+  // A blank search is omitted rather than sent as `q=`: an empty needle and no needle must mean
+  // the same thing, and the server treats a whitespace-only value as no filter anyway.
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.capabilities?.length) params.set("capability", query.capabilities.join(","));
+  if (query.providerId) params.set("provider_id", query.providerId);
+  if (query.status) params.set("status", query.status);
+  if (query.sort) params.set("sort", query.sort);
+
+  const suffix = params.toString();
+  const body = await request<{ models: AiModel[] }>(
+    suffix ? `/api/v1/ai/models?${suffix}` : "/api/v1/ai/models",
+  );
   return body.models;
 }
 
@@ -1590,6 +1652,24 @@ export function updateAiModel(
     supportsTranscription?: boolean;
     supportsJsonMode?: boolean;
     maxOutputTokens?: number | null;
+    /**
+     * Micros per million tokens, in and out. `null` forgets the stored half and `undefined`
+     * leaves it alone — three cases, because a price has to be erasable or an operator who
+     * mistyped it can only ever make it more wrong.
+     *
+     * A price edit changes the cost of the **next** request only. Nothing recomputes what an
+     * earlier call was billed at, because a bill that changes after the fact is worse than one
+     * that was approximately right.
+     */
+    inputCostMicrosPerMtok?: number | null;
+    outputCostMicrosPerMtok?: number | null;
+    /**
+     * `manual`, `discovery` or `probe`. Omitted by a flag toggle on purpose: restamping the
+     * source on every capability edit would claim the price had been re-verified today.
+     */
+    priceSource?: string;
+    capabilitiesSource?: string;
+    capabilitiesVerifiedAt?: string | null;
   },
 ): Promise<AiModel> {
   const body: Record<string, unknown> = {};
@@ -1609,6 +1689,14 @@ export function updateAiModel(
     body.supports_transcription = changes.supportsTranscription;
   if (changes.supportsJsonMode !== undefined) body.supports_json_mode = changes.supportsJsonMode;
   if (changes.maxOutputTokens !== undefined) body.max_output_tokens = changes.maxOutputTokens;
+  if (changes.inputCostMicrosPerMtok !== undefined)
+    body.input_cost_micros_per_mtok = changes.inputCostMicrosPerMtok;
+  if (changes.outputCostMicrosPerMtok !== undefined)
+    body.output_cost_micros_per_mtok = changes.outputCostMicrosPerMtok;
+  if (changes.priceSource !== undefined) body.price_source = changes.priceSource;
+  if (changes.capabilitiesSource !== undefined) body.capabilities_source = changes.capabilitiesSource;
+  if (changes.capabilitiesVerifiedAt !== undefined)
+    body.capabilities_verified_at = changes.capabilitiesVerifiedAt;
   return request<AiModel>(`/api/v1/ai/models/${encodeURIComponent(modelId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),

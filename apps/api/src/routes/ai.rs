@@ -169,12 +169,54 @@ pub struct ModelBody {
     pub capability_catalog: Vec<CapabilityInfo>,
     /// The capabilities this model actually claims, in catalog order.
     pub capabilities: Vec<ModelCapability>,
+    /// What this model costs, with both the per-million figure the column stores and the
+    /// per-1K rendering the table shows (REQ-098).
+    ///
+    /// Sent as one object rather than four loose fields so a client cannot read the per-1K
+    /// rendering of one half and the per-million figure of the other and print them side by
+    /// side as if they described the same number.
+    pub price: PriceBody,
+    /// Where the capability flags came from, and when they were last confirmed.
+    pub capabilities_source: String,
+    /// When the capability flags were last confirmed against something, when ever that was.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub capabilities_verified_at: Option<OffsetDateTime>,
     /// When it was registered.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it was last changed.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+/// One model's price, as the panel reads it.
+///
+/// The `complete` flag is what stops the catalog from quietly pretending a half-priced model is
+/// fully priced: without it a client would format a missing output rate as zero and every cost
+/// estimate built from the table would understate the model.
+#[derive(Debug, Clone, Serialize)]
+pub struct PriceBody {
+    /// Micros per million input tokens.
+    pub input_micros_per_mtok: Option<i64>,
+    /// Micros per million output tokens.
+    pub output_micros_per_mtok: Option<i64>,
+    /// The input half rendered per 1K.
+    pub input_micros_per_1k: Option<i64>,
+    /// The output half rendered per 1K.
+    pub output_micros_per_1k: Option<i64>,
+    /// `manual`, `discovery` or `probe`.
+    pub source: String,
+    /// What that source means, so the panel does not have to hard-code the wording.
+    pub source_note: String,
+    /// When the price was written down.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
+    /// `true` when both halves are known.
+    pub complete: bool,
+    /// How old the price is in whole days; `null` when none was ever written.
+    pub age_days: Option<i64>,
+    /// `true` when the price is older than the platform's staleness window.
+    pub stale: bool,
 }
 
 impl ModelBody {
@@ -208,6 +250,9 @@ impl ModelBody {
                 })
                 .collect(),
             capabilities: model.capabilities(),
+            price: PriceBody::build(&model.price()),
+            capabilities_source: model.capabilities_source.clone(),
+            capabilities_verified_at: model.capabilities_verified_at,
             created_at: model.created_at,
             updated_at: model.updated_at,
         }
@@ -476,6 +521,31 @@ pub struct UpdateModelBody {
     /// Absent = keep, `null` = clear, number = replace.
     #[serde(default, deserialize_with = "double_option_i32")]
     pub max_output_tokens: Option<Option<i32>>,
+    /// Absent = keep, `null` = clear, number = replace (REQ-098 slice 1).
+    #[serde(default, deserialize_with = "double_option_i64")]
+    pub input_cost_micros_per_mtok: Option<Option<i64>>,
+    /// Absent = keep, `null` = clear, number = replace.
+    #[serde(default, deserialize_with = "double_option_i64")]
+    pub output_cost_micros_per_mtok: Option<Option<i64>>,
+    /// New price source: `manual`, `discovery` or `probe`.
+    ///
+    /// Optional rather than defaulted because a PATCH that says nothing about the source must not
+    /// restamp one: setting it implicitly on every flag toggle would make a capability edit
+    /// silently claim the price had been re-verified today, which is the one claim this column
+    /// exists to keep honest.
+    pub price_source: Option<String>,
+    /// New capability source: `manual`, `discovery` or `probe`.
+    pub capabilities_source: Option<String>,
+    /// When the capability flags were last confirmed against something.
+    pub capabilities_verified_at: Option<OffsetDateTime>,
+}
+
+/// Read `null` as "forget this price", an absent field as "leave it".
+fn double_option_i64<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
 }
 
 /// Read `null` as "forget this limit", an absent field as "leave it".
@@ -486,11 +556,46 @@ where
     Option::<i32>::deserialize(deserializer).map(Some)
 }
 
+impl PriceBody {
+    /// Describe one model's price, with its age measured against the clock.
+    ///
+    /// The age is computed here rather than in the panel so the staleness window lives next to
+    /// the number it judges: a client with its own copy of the threshold would drift from the
+    /// server's the first time somebody tuned it, and the two would disagree about whether a
+    /// price is old.
+    fn build(price: &omnion_ai_hub::ModelPrice) -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            input_micros_per_mtok: price.input_micros_per_mtok,
+            output_micros_per_mtok: price.output_micros_per_mtok,
+            input_micros_per_1k: price.per_1k_micros(omnion_ai_hub::PriceHalf::Input),
+            output_micros_per_1k: price.per_1k_micros(omnion_ai_hub::PriceHalf::Output),
+            source: price.source.as_str().to_owned(),
+            source_note: price.source.note().to_owned(),
+            updated_at: price.updated_at,
+            complete: price.is_complete(),
+            age_days: omnion_ai_hub::price_age_days(price.updated_at, now),
+            stale: omnion_ai_hub::price_is_stale(price.updated_at, now),
+        }
+    }
+}
+
 /// Query of `GET /ai/models`.
+///
+/// Every narrowing is optional and independent, so a caller may send any combination — and a
+/// caller that sends none gets the whole registry, which is what the panel asks for on load.
 #[derive(Debug, Deserialize)]
 pub struct ModelQuery {
     /// Narrow the list to one provider.
     pub provider_id: Option<Uuid>,
+    /// Free text, matched against the model key, the display name and the provider name.
+    pub q: Option<String>,
+    /// Comma-separated capability flags a row must **all** claim (REQ-098).
+    pub capability: Option<String>,
+    /// `enabled` or `disabled`.
+    pub status: Option<String>,
+    /// Which column the table is sorted by; an unknown key falls back to `model`.
+    pub sort: Option<String>,
 }
 
 /// One message of a chat request.
@@ -681,17 +786,144 @@ pub async fn delete_provider(
 // Handlers — models
 // ---------------------------------------------------------------------------------------------
 
-/// `GET /api/v1/ai/models` — the model registry.
+/// `GET /api/v1/ai/models` — the model registry, narrowed (REQ-098 slice 1).
+///
+/// The narrowing happens here rather than in the panel so the API and the table agree about
+/// which rows a query means: a client that filtered client-side would see a different set than
+/// the server describes, and the acceptance criterion that the capability chips narrow the
+/// *listing* would be true of the panel but not of the endpoint.
 pub async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<ModelListResponse>, ApiError> {
     let providers = omnion_ai_hub::list_providers(state.db().pool()).await?;
-    let models = omnion_ai_hub::list_models(state.db().pool(), query.provider_id).await?;
+    let all = omnion_ai_hub::list_models(state.db().pool(), query.provider_id).await?;
 
-    Ok(Json(ModelListResponse {
-        models: models_in_provider_order(&providers, &models),
-    }))
+    // An unknown capability key or an unknown status is a refusal, not a silently empty list: a
+    // caller that misspells a filter and gets `[]` cannot tell a broken query from an empty
+    // registry, and will conclude the wrong one.
+    let capabilities =
+        omnion_ai_hub::CatalogQuery::capabilities_from_param(query.capability.as_deref())?;
+    let status = match query.status.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some("enabled") | Some("active") => Some(true),
+        Some("disabled") | Some("inactive") => Some(false),
+        Some(other) => {
+            return Err(ApiError::bad_request(
+                "invalid_status",
+                format!("status \"{other}\" is not one of (enabled, disabled)"),
+            ));
+        }
+    };
+
+    let query = omnion_ai_hub::CatalogQuery {
+        q: query.q,
+        capabilities,
+        provider_id: query.provider_id,
+        status,
+        sort: omnion_ai_hub::CatalogSort::parse(query.sort.as_deref().unwrap_or_default()),
+    };
+
+    // The narrowing runs against the **stored** model rather than the response body, because the
+    // capability flags and the enabled flag the filter reads are the crate's own fields. Reading
+    // them off a `ModelBody` would make the filter a second implementation of the flags that
+    // could disagree with the router's — and a disagreement here means a table that offers a
+    // model the router will refuse.
+    let provider_name_of = |id: Uuid| {
+        providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| provider.name.clone())
+            .unwrap_or_default()
+    };
+    let kept: Vec<Uuid> = all
+        .iter()
+        // A model whose provider row is missing cannot happen (the foreign key cascades), but
+        // the fallback is the empty string rather than a panic: a text search that finds nothing
+        // is an absent row, not a 500.
+        .filter(|model| query.matches(model, &provider_name_of(model.provider_id)))
+        .map(|model| model.id)
+        .collect();
+
+    let mut models: Vec<ModelBody> = models_in_provider_order(&providers, &all)
+        .into_iter()
+        .filter(|model| kept.contains(&model.id))
+        .collect();
+
+    sort_catalog(&mut models, &providers, query.sort);
+
+    Ok(Json(ModelListResponse { models }))
+}
+
+/// Order a narrowed catalog the way the table's header says it is.
+///
+/// Done after the narrowing so the text search and the capability filter see the registry in
+/// provider order — the order the empty state and the row numbering read from — and so the
+/// `nulls last` rules live in one function rather than in two orderings that can disagree.
+fn sort_catalog(models: &mut [ModelBody], providers: &[Provider], sort: omnion_ai_hub::CatalogSort) {
+    let name_of = |id: Uuid| {
+        providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| provider.name.clone())
+            .unwrap_or_default()
+    };
+
+    match sort {
+        omnion_ai_hub::CatalogSort::Model => {
+            models.sort_by(|left, right| {
+                left.model_key
+                    .cmp(&right.model_key)
+                    .then_with(|| name_of(left.provider_id).cmp(&name_of(right.provider_id)))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Provider => {
+            models.sort_by(|left, right| {
+                name_of(left.provider_id)
+                    .cmp(&name_of(right.provider_id))
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Context => {
+            // A model whose window nobody recorded sorts last rather than first: an unknown
+            // window is not the smallest one, and putting the least-known row at the top of a
+            // column an operator reads to find the model that can hold a document inverts it.
+            models.sort_by(|left, right| {
+                right
+                    .context_window
+                    .cmp(&left.context_window)
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Price => {
+            models.sort_by(|left, right| {
+                // `cmp_price`, not the raw `Option::cmp`: the derived ordering ranks `None`
+                // **first**, which would print every unpriced model as the cheapest one in a
+                // column the operator reads to answer "what can I afford". The `nulls last`
+                // in `CatalogSort::order_by` says the same thing for the SQL path, so both
+                // orderings now express one rule instead of two that can disagree.
+                omnion_ai_hub::cmp_price(
+                    left.price.input_micros_per_mtok,
+                    right.price.input_micros_per_mtok,
+                )
+                .then_with(|| {
+                    omnion_ai_hub::cmp_price(
+                        left.price.output_micros_per_mtok,
+                        right.price.output_micros_per_mtok,
+                    )
+                })
+                .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Updated => {
+            models.sort_by(|left, right| {
+                right
+                    .updated_at
+                    .cmp(&left.updated_at)
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+    }
 }
 
 /// `PUT /api/v1/ai/providers/{id}/models` — replace the set one provider serves.
@@ -811,6 +1043,11 @@ pub async fn update_model(
             supports_transcription: body.supports_transcription,
             supports_json_mode: body.supports_json_mode,
             max_output_tokens: body.max_output_tokens,
+            input_cost_micros_per_mtok: body.input_cost_micros_per_mtok,
+            output_cost_micros_per_mtok: body.output_cost_micros_per_mtok,
+            price_source: body.price_source,
+            capabilities_source: body.capabilities_source,
+            capabilities_verified_at: body.capabilities_verified_at,
         },
     )
     .await?;
@@ -830,6 +1067,12 @@ pub async fn update_model(
             "capabilities": model.capabilities(),
             "context_window": model.context_window,
             "max_output_tokens": model.max_output_tokens,
+            // The price is in the audit trail because a price edit is the change an operator
+            // would want explained six months later: "why did last month's bill look like that"
+            // is answered by this row and by nothing else.
+            "input_cost_micros_per_mtok": model.input_cost_micros_per_mtok,
+            "output_cost_micros_per_mtok": model.output_cost_micros_per_mtok,
+            "price_source": model.price_source,
         }))
         .ip_address(address.as_text());
     omnion_audit::record(state.db().pool(), entry).await?;

@@ -59,6 +59,7 @@ import {
 import { formatTimestamp } from "@/lib/format";
 
 import { AiHealthPanels } from "./ai-health-panel";
+import { ModelCatalog } from "./model-catalog";
 
 /**
  * The PATCH body for one capability toggle.
@@ -1356,6 +1357,27 @@ export function AiView() {
               </li>
             ))}
           </ul>
+        )}
+      </section>
+
+      {/* Catalog (REQ-098 slice 1). It sits *below* the per-provider model list rather than
+          replacing it: the list above is how you edit which models a provider serves, and the
+          catalog is how you read the whole registry — what everything costs, what it can do and
+          what will ever ask for it. Merging them would make a table cell a place to type a model
+          key, and a list is a bad place to compare prices. */}
+      <section className="rounded-xl border border-line bg-surface">
+        <header className="border-b border-line px-4 py-3">
+          <h2 className="text-[13.5px] font-semibold">Model catalog</h2>
+          <p className="text-[12px] text-muted">
+            Every registered model with its capabilities and what it costs. A price is an
+            operator&apos;s estimate unless the provider reported it; a price nobody has revisited
+            in three months says so.
+          </p>
+        </header>
+        {models === null || providers === null ? (
+          <LoadingTable columns={6} rows={3} />
+        ) : (
+          <ModelCatalog providers={providers} models={models} onReload={reload} />
         )}
       </section>
 
