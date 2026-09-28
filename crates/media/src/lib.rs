@@ -17,6 +17,7 @@ pub mod error;
 pub mod exif;
 pub mod folder_store;
 pub mod folders;
+pub mod grants;
 pub mod library;
 pub mod model;
 pub mod pixels;
@@ -53,6 +54,10 @@ pub use exif::{EXIF_HEADER_BYTES, Exif, ORIENTATION_TAG, oriented_size, read as 
 pub use folder_store::{
     count_files_in_folder, delete_empty_folder, find_folder, insert_folder, list_folders,
     move_folder, root_folder,
+};
+pub use grants::{
+    Capabilities, Chain, ChainNode, Decision, Grant, GrantTarget, MAX_CHAIN_DEPTH, NewGrant,
+    SUBJECT_KINDS, delete_grant, group_ids_of, list_grants, load_chain, put_grant, resolve,
 };
 pub use folders::{
     Folder, FolderMove, MAX_FOLDER_NAME_LENGTH, MAX_FOLDER_PATH_LENGTH, NewFolder,

@@ -114,6 +114,17 @@ impl ApiError {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    /// The human-readable explanation, for assertions and for a log line.
+    ///
+    /// The companion of [`ApiError::code`]: the code is what a client branches on and the
+    /// message is what a person reads, so a test that checks one without the other pins half
+    /// the contract — and it is the message that has to name the field and the three legal
+    /// values, which is the part a client cannot reconstruct.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl From<CoreError> for ApiError {

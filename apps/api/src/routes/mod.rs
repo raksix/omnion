@@ -86,6 +86,7 @@ pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod media_files;
+pub mod media_grants;
 pub mod media_duplicates;
 pub mod media_scan;
 mod media_settings;
@@ -561,6 +562,32 @@ pub fn router(state: AppState) -> Router {
     let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
         .layer(guards::require(&state, "media.scan.manage"));
 
+    // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
+    // platform decided for you are both `media.read` — the file browser shows who can see a
+    // file, and a person who cannot open one needs to be able to ask *why*. Writing is
+    // `media.manage`, deliberately: narrowing somebody out of a folder is a library
+    // organisation decision, and a contributor who may upload is not somebody who should be
+    // able to decide who else may read what they uploaded.
+    let media_folder_grants: MethodRouter<AppState, Infallible> =
+        get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
+        .layer(guards::require(&state, "media.manage"));
+    let media_file_grants: MethodRouter<AppState, Infallible> =
+        get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
+        .layer(guards::require(&state, "media.manage"));
+    // Two independent routers rather than one value mounted twice: `MethodRouter` is moved
+    // into each `.route()` call, so sharing it would move out of the first and fail the second
+    // at runtime rather than at compile time.
+    let media_folder_grant_delete: MethodRouter<AppState, Infallible> =
+        delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
+    let media_file_grant_delete: MethodRouter<AppState, Infallible> =
+        delete(media_grants::delete_one).layer(guards::require(&state, "media.manage"));
+    let media_subjects: MethodRouter<AppState, Infallible> =
+        get(media_grants::subjects).layer(guards::require(&state, "media.read"));
+    let media_grant_effective: MethodRouter<AppState, Infallible> =
+        get(media_grants::effective).layer(guards::require(&state, "media.read"));
+
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
     let public_pages = get(public::get_published_page);
@@ -974,6 +1001,14 @@ pub fn router(state: AppState) -> Router {
         .route("/media/scan/runs", media_scan_runs_route)
         .route("/media/quarantine", media_quarantine)
         .route("/media/quarantine/{id}/release", media_quarantine_release)
+        .route("/media/folders/{id}/grants", media_folder_grants)
+        .route("/media/folders/{id}/grants", media_folder_grant_write)
+        .route("/media/folders/{id}/grants/{grant_id}", media_folder_grant_delete)
+        .route("/media/{id}/grants", media_file_grants)
+        .route("/media/{id}/grants", media_file_grant_write)
+        .route("/media/{id}/grants/{grant_id}", media_file_grant_delete)
+        .route("/media/grant-subjects", media_subjects)
+        .route("/media/{id}/grant-effective", media_grant_effective)
         .route("/media/transformation-presets", media_preset_create)
         .route("/media/transformation-presets/{id}", media_preset)
         .route(
