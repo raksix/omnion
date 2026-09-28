@@ -4028,3 +4028,51 @@ place and is walking. **No new report yet, so the last two boxes stay unticked.*
 `56464c4`; only then tick the empty/loading/error and keyboard boxes and set REQ-051 to `done`.
 Then REQ-052 (sales & quotes), which has no code yet: `modules/sales`, migration **0051** (0050
 was taken by main's notifications in this very merge), and a walkthrough route list.
+
+## 2026-09-28 · tick 19b · REQ-052 slice 1 · the money, and the bug that came from a scale
+
+**What.** REQ-051's last two boxes are still waiting on the QA pass (it holds a place behind w6),
+so the tick spent itself on the start of the next request. **REQ-052 slice 1 — the catalog and
+price lists** — as a schema, a module and tests. No route, no screen yet: that is slice 1's second
+half and the next tick's work, so nothing here is claimed as a shipped feature.
+
+**The schema (`51f5eae`, migration `0051`).** Nine tables. The constraints carry the rules rather
+than the forms, because a rule that lives only in a form is a rule the API, the CSV import and a
+future storefront each re-implement slightly differently: money is `numeric(14,2)` and quantity
+`numeric(14,3)`; `tax_percent` is a snapshot with **no** FK to an accounting rate, so editing a
+rate today cannot rewrite a document a customer already read; a public link stores only its hash;
+`(status='sent') = (sent_at is not null)` and `(status='declined') = (reason is not null)` are
+checked at the row; a price row may not mix organizations, by trigger, because the join across two
+tables is a convenience a buggy query could drop; settings are seeded and created by trigger, the
+same shape CRM's `0043` fixed for the default pipeline.
+
+Verified by applying the **whole** migration set to a fresh database and walking the boundaries —
+settings trigger fires, decline-without-reason refused, sent and expired accepted, duplicate number
+refused, "sent" without a `sent_at` refused.
+
+**The module (`8505d13`).** `modules/sales`: money, catalog, model, error. The decision worth
+recording: **money is `i128` hundredths, not `f64`.** The spec's rule ("round half-up once per line
+and sum the rounded values so the printed PDF, the panel and the invoice agree") cannot be kept
+with a binary float, because a float cannot hold `0.1`. A decimal dependency was deliberately
+**not** added to a public repo: an integer count of minor units is exact, needs no dependency, and
+matches the `numeric(14,2)` the schema already stores. `Quantity` is a separate type at three
+decimals so a quantity cannot be summed into a money figure by accident.
+
+**The bug, which is the reason the money code is written the way it is.** The first version let a
+line total keep whatever scale its arithmetic left it at, so a line priced at three decimals
+produced a total at scale 3 while its neighbours were at scale 2. Summing their `minor` values
+then added `0.105`-scale numbers to `0.11`-scale numbers and yielded a total that was **neither the
+printed column nor the stored value** — which is exactly the failure the spec's rule exists to
+prevent, arriving through the back door. The fix is not a patch on the arithmetic: a `Money`'s
+`minor` is meaningless without its `scale`, so every document figure now goes through
+`at_document_scale`, and the sum is correct by construction instead of by convention. Found by a
+test asserting a number it had itself got wrong, which is the only reason it was found at all.
+
+**Proof.** `cargo test -p omnion-module-sales --lib` **54/54** · `cargo clippy -p omnion-module-sales
+--all-targets` **0 warnings** · `cargo test -p omnion-module-crm --lib` **172/172** (no regression) ·
+`cargo metadata` parses. `51f5eae`/`8505d13`/`a875c7f` pushed.
+
+**Next.** Slice 1's second half: the `sales.*` permission keys, the product and price-list routes
+in `apps/api/src/routes/sales.rs`, and the catalog screens. Then REQ-051's two boxes the moment a
+pass reports — read `crmStates` and `crmKeyboardMobile` from the first w4 report written after
+`56464c4` and only then tick them.
