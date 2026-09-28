@@ -207,6 +207,8 @@ async function diagnostics(page) {
       lowContrast: [],
       tinyTargets: [],
       offscreen: [],
+      /** Past the right edge but inside a horizontal scroller — reachable, so not a defect. */
+      scrollable: [],
       h1Count: document.querySelectorAll("h1").length,
     };
 
@@ -231,10 +233,36 @@ async function diagnostics(page) {
       }
       const b = el.getBoundingClientRect();
       if (tag === "BUTTON" || el.getAttribute("role") === "button") {
-        if (b.width < 24 || b.height < 24) r.tinyTargets.push({ name, w: Math.round(b.width), h: Math.round(b.height) });
+        if (b.width < 24 || b.height < 24) {
+          r.tinyTargets.push({ name, w: Math.round(b.width), h: Math.round(b.height) });
+        }
       }
+      // An element past the right edge is only a *defect* when nothing can bring it into view.
+      // A horizontal scroller is a container whose whole purpose is to hold more than fits, so
+      // the tab strip of a phone-sized screen is off-screen by design and reachable by dragging.
+      // Reporting it as unreachable makes the measured layout the thing a reader cannot get to,
+      // which is the opposite of the truth — and it would push every responsive tab strip
+      // toward a wrapped row, which the spec's own "tabs a horizontal scroller" line rules out.
+      const scrollableAncestor = (() => {
+        let node = el.parentElement;
+        while (node && node !== document.body) {
+          const style = getComputedStyle(node);
+          if (
+            (style.overflowX === "auto" || style.overflowX === "scroll") &&
+            node.scrollWidth > node.clientWidth + 1
+          ) {
+            return true;
+          }
+          node = node.parentElement;
+        }
+        return false;
+      })();
       if (b.right > innerWidth + 8 || b.left < -8) {
-        r.offscreen.push({ tag, name, left: Math.round(b.left), right: Math.round(b.right) });
+        if (scrollableAncestor) {
+          r.scrollable.push({ tag, name, right: Math.round(b.right) });
+        } else {
+          r.offscreen.push({ tag, name, left: Math.round(b.left), right: Math.round(b.right) });
+        }
       }
     });
 
@@ -4460,7 +4488,13 @@ async function main() {
           Math.round(row.getBoundingClientRect().height),
         );
         const overflowX = document.documentElement.scrollWidth > innerWidth + 2;
+        // The control is one component with two shapes: a bottom sheet below `sm` and a panel
+        // beside the button from `sm` up. Which one is on screen is read rather than assumed,
+        // because asserting the sheet's anchoring at desktop width measures the *panel* and
+        // reports a correct layout as a defect.
+        const isSheet = getComputedStyle(dialog).position === "fixed";
         return {
+          shape: isSheet ? "sheet" : "panel",
           width: Math.round(rect.width),
           height: Math.round(rect.height),
           bottom: Math.round(rect.bottom),
@@ -4594,14 +4628,19 @@ async function main() {
     if (sheet.minRow > 0 && sheet.minRow < 40) {
       pushFindings("high", "tiny-target", `mobile organization switcher: rows are ${sheet.minRow}px tall (44 is the floor for a touch target)`);
     }
-    if (sheet.bottom < sheet.viewport.h - 2) {
-      pushFindings("high", "sheet-not-anchored", `mobile organization switcher: the sheet ends ${sheet.viewport.h - sheet.bottom}px above the bottom of the screen`);
-    }
-    if (!sheet.overlay) {
-      pushFindings("medium", "sheet-no-overlay", "mobile organization switcher: the sheet opens without a backdrop, so the page behind it stays visible and tappable");
+    // Only the *sheet* is anchored to the bottom edge; the panel that replaces it from `sm` up
+    // is meant to hang beside its button. Asserting the sheet's anchoring on the panel reports
+    // a correct layout as a defect, which is worse than asserting nothing.
+    if (sheet.shape === "sheet") {
+      if (sheet.bottom < sheet.viewport.h - 2) {
+        pushFindings("high", "sheet-not-anchored", `mobile organization switcher: the sheet ends ${sheet.viewport.h - sheet.bottom}px above the bottom of the screen`);
+      }
+      if (!sheet.overlay) {
+        pushFindings("medium", "sheet-no-overlay", "mobile organization switcher: the sheet opens without a backdrop, so the page behind it stays visible and tappable");
+      }
     }
     if (sheet.pageOverflow) {
-      pushFindings("high", "overflow-mobile", "mobile organization switcher: the page scrolls horizontally with the sheet open");
+      pushFindings("high", "overflow-mobile", "mobile organization switcher: the page scrolls horizontally with the switcher open");
     }
   }
   const refusedOnPurpose = [];
