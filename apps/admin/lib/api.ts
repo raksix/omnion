@@ -4545,3 +4545,235 @@ export function testExporter(id: string): Promise<ExporterTestResult> {
     method: "POST",
   });
 }
+
+/* ── alert rules, the alert timeline and the settings row (REQ-126, slice 4) ────────────────── */
+
+/** One rule, with the state the evaluator's last pass left it in. */
+export interface AlertRuleRow {
+  id: string;
+  name: string;
+  /** The stored expression, verbatim — the form edits what is stored, not a re-render. */
+  expr: string;
+  /** The expression as the evaluator understood it, or `null` when it does not parse. */
+  parsed: string | null;
+  severity: "info" | "warning" | "critical";
+  for_seconds: number;
+  summary: string;
+  runbook_url: string | null;
+  labels: Record<string, unknown>;
+  /** `bundled` rules are re-seeded at every boot and cannot be deleted. */
+  source: "bundled" | "custom";
+  enabled: boolean;
+  state: "pending" | "firing" | null;
+  value: number | null;
+  silenced: boolean;
+  silenced_until: string | null;
+  /** `false` means the stored expression stopped parsing — a rule that looks configured. */
+  expression_valid: boolean;
+  expression_error: string | null;
+}
+
+/** The rules, plus what a rule may name. */
+export interface AlertRulesResponse {
+  rules: AlertRuleRow[];
+  families: string[];
+  severities: string[];
+  max_for_seconds: number;
+}
+
+/** The body of a create. */
+export interface AlertRuleInput {
+  name: string;
+  expr: string;
+  severity: string;
+  for_seconds?: number;
+  summary?: string;
+  runbook_url?: string | null;
+  labels?: Record<string, unknown>;
+}
+
+/** One open or resolved event. */
+export interface AlertEventRow {
+  id: number;
+  rule_id: string;
+  state: "pending" | "firing" | "resolved";
+  value: number | null;
+  firing_value: number | null;
+  started_at: string;
+  ended_at: string | null;
+  fired_at: string | null;
+  /** `true` once a notification was claimed — the "notifies once" line, made visible. */
+  notified: boolean;
+  /** `threshold`, `dwell` or `silenced`. */
+  reason: string;
+  context: Record<string, unknown>;
+}
+
+/** One silence window. */
+export interface SilenceRow {
+  id: string;
+  rule_id: string | null;
+  reason: string;
+  starts_at: string | null;
+  ends_at: string;
+  active: boolean;
+  minutes_remaining: number;
+}
+
+/** The firing / pending / resolved states and the silences. */
+export interface AlertsResponse {
+  counts: {
+    firing: number;
+    pending: number;
+    silenced: number;
+    worst_severity: string | null;
+  };
+  firing: AlertEventRow[];
+  pending: AlertEventRow[];
+  resolved: AlertEventRow[];
+  silences: SilenceRow[];
+}
+
+/** What a preview found, without saving anything. */
+export interface AlertPreview {
+  rendered: string;
+  family: string;
+  value: number | null;
+  series: number;
+  breaching: boolean;
+  /**
+   * `true` when the family has no samples at all.
+   *
+   * This is the distinction the screen has to make out loud: `breaching: false` because the
+   * value is under the threshold and `breaching: false` because nothing is being recorded look
+   * identical on a chip, and only one of them is the operator's to fix.
+   */
+  no_data: boolean;
+}
+
+/** The one settings row, with the caps it is held to. */
+export interface ObservabilitySettings {
+  sampling_ratio: number;
+  logs_retention_days: number;
+  traces_retention_days: number;
+  log_level_default: string;
+  log_level_overrides: Record<string, unknown>;
+  cardinality_budget: number;
+  prometheus_public: boolean;
+  caps: {
+    logs_retention_max: number;
+    traces_retention_max: number;
+    sampling_max: number;
+    cardinality_max: number;
+    log_levels: string[];
+  };
+  egress_note: string;
+  level_overrides: {
+    target: string;
+    level: string;
+    expires_at: string | null;
+    expired: boolean;
+  }[];
+}
+
+/** The body of a settings save. */
+export interface ObservabilitySettingsInput {
+  sampling_ratio: number;
+  logs_retention_days: number;
+  traces_retention_days: number;
+  log_level_default: string;
+  log_level_overrides?: Record<string, unknown>;
+  cardinality_budget: number;
+  prometheus_public?: boolean;
+}
+
+/** The probe contract, and where this process is in it. */
+export interface LifecycleResponse {
+  draining: boolean;
+  in_flight: number;
+  drain_timeout_ms: number;
+  probes: {
+    liveness: { path: string; alias: string; fails_on_drain: boolean };
+    readiness: { path: string; fails_on_drain: boolean };
+  };
+  note: string;
+  summary: Record<string, unknown> | null;
+}
+
+export function fetchAlertRules(): Promise<AlertRulesResponse> {
+  return request<AlertRulesResponse>("/api/v1/observability/alert-rules");
+}
+
+export function createAlertRule(input: AlertRuleInput): Promise<AlertRuleRow> {
+  return request<AlertRuleRow>("/api/v1/observability/alert-rules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateAlertRule(
+  id: string,
+  patch: Partial<AlertRuleInput> & { enabled?: boolean },
+): Promise<AlertRuleRow> {
+  return request<AlertRuleRow>(`/api/v1/observability/alert-rules/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteAlertRule(id: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(`/api/v1/observability/alert-rules/${id}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * Evaluate an expression against live data, saving nothing.
+ *
+ * A POST and not a GET: it evaluates a caller-supplied expression, and every proxy, cache and
+ * browser in the path treats a GET as safe to replay.
+ */
+export function previewAlertRule(expr: string): Promise<AlertPreview> {
+  return request<AlertPreview>("/api/v1/observability/alert-rules/preview", {
+    method: "POST",
+    body: JSON.stringify({ expr }),
+  });
+}
+
+export function fetchAlerts(): Promise<AlertsResponse> {
+  return request<AlertsResponse>("/api/v1/observability/alerts");
+}
+
+export function createSilence(input: {
+  rule_id: string | null;
+  reason: string;
+  ends_at: string;
+}): Promise<SilenceRow> {
+  return request<SilenceRow>("/api/v1/observability/silences", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteSilence(id: string): Promise<{ deleted: string }> {
+  return request<{ deleted: string }>(`/api/v1/observability/silences/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export function fetchObservabilitySettings(): Promise<ObservabilitySettings> {
+  return request<ObservabilitySettings>("/api/v1/observability/settings");
+}
+
+export function saveObservabilitySettings(
+  input: ObservabilitySettingsInput,
+): Promise<ObservabilitySettings> {
+  return request<ObservabilitySettings>("/api/v1/observability/settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function fetchLifecycle(): Promise<LifecycleResponse> {
+  return request<LifecycleResponse>("/api/v1/observability/lifecycle");
+}

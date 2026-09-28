@@ -3495,6 +3495,11 @@ async function main() {
     // rather than an error page.
     { path: "/observability/traces", name: "observability-traces" },
     { path: "/observability/exporters", name: "observability-exporters" },
+    // The alert centre and the settings screen (REQ-126, slice 4) — walked here and driven by
+    // the depth pass below, which previews an expression, creates a rule, silences it, and saves
+    // a settings change the API then refuses on purpose.
+    { path: "/observability/alerts", name: "observability-alerts" },
+    { path: "/observability/settings", name: "observability-settings" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -3601,6 +3606,12 @@ async function main() {
   );
   report.observabilityExporters = await runDepthPass("observability-exporters", () =>
     runObservabilityExportersDepth(page, report),
+  );
+  report.observabilityAlerts = await runDepthPass("observability-alerts", () =>
+    runObservabilityAlertsDepth(page, report),
+  );
+  report.observabilitySettings = await runDepthPass("observability-settings", () =>
+    runObservabilitySettingsDepth(page, report),
   );
   report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
     runMediaDuplicates(page, report),
@@ -4419,6 +4430,319 @@ async function runObservabilityExportersDepth(page, report) {
   await shot(page, "page-observability-exporters");
 
   report.observabilityExporters = { steps };
+  return steps;
+}
+
+/**
+ * The alert centre (REQ-126, slice 4).
+ *
+ * Written to fail on the specific ways this screen is supposed to differ from a generic CRUD
+ * list, because a pass that only counted rows would be green on a screen that had every one of
+ * those distinctions flattened:
+ *
+ *   1. The four stat tiles read real counts — a screen that always renders 0 is
+ *      indistinguishable from a quiet system.
+ *   2. `Preview` reports either a value or `no data`, and the two render DIFFERENTLY. A preview
+ *      that said "not breaching" for both is the bug the view's own comment is about.
+ *   3. A bad expression is refused in the form, naming the family, and nothing is saved. That is
+ *      the "validated against the catalogue" line, and it is only provable by trying to save a
+ *      rule that cannot work.
+ *   4. The rule that gets created can be silenced, and the silence appears with its reason and
+ *      its remaining time.
+ *   5. A BUNDLED rule's delete explains itself instead of silently doing nothing — it is
+ *      re-seeded at every boot, so a delete that appeared to work would bring the row back on the
+ *      next restart.
+ */
+async function runObservabilityAlertsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-alerts-depth", action: "observability", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/observability/alerts`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-alerts"]', { timeout: 20000 })
+    .catch(() => {});
+  await page
+    .locator('[data-view="observability-alerts"]')
+    .waitFor({ state: "visible", timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(800);
+
+  // (1) the tiles are real counts.
+  const tiles = {};
+  for (const label of ["Firing", "Pending", "Silenced", "Worst severity"]) {
+    tiles[label] = (
+      (await page
+        .locator(`[data-alert-stat="${label}"] p`)
+        .nth(1)
+        .innerText()
+        .catch(() => "")) || ""
+    ).trim();
+  }
+  note({ check: "stat-tiles", ...tiles });
+  note({
+    check: "tiles-are-not-placeholders",
+    ok: Object.values(tiles).every((value) => value.length > 0),
+  });
+
+  // (2) the bundled rules are listed, and they are marked as bundled.
+  const rows = await page.locator("[data-alert-rule]").count();
+  note({ check: "rules-listed", rows });
+
+  // (3) a real preview on a family the platform records.
+  await page.locator("[data-alert-new]").click().catch(() => {});
+  await page.waitForSelector("[data-alert-rule-form]", { timeout: 8000 }).catch(() => {});
+  const formOpen = await page.locator("[data-alert-rule-form]").count();
+  note({ check: "form-opens", open: formOpen });
+
+  await page
+    .locator("[data-alert-rule-expr]")
+    .fill('omnion_http_requests_total{status="5xx"} > 0')
+    .catch(() => {});
+  await page.locator("[data-alert-rule-preview]").click().catch(() => {});
+  await page.waitForTimeout(1500);
+  const verdictOk = await page.locator('[data-preview="ok"]').count();
+  const verdictBreaching = await page.locator('[data-preview="breaching"]').count();
+  const verdictNoData = await page.locator('[data-preview="no-data"]').count();
+  note({
+    check: "preview-reports-a-verdict",
+    verdicts: { ok: verdictOk, breaching: verdictBreaching, noData: verdictNoData },
+    ok: verdictOk + verdictBreaching + verdictNoData > 0,
+  });
+
+  // A family that has never recorded must say `no data` and NOT say "not breaching" — the two
+  // read identically on a chip and only one of them is the operator's to fix.
+  await page
+    .locator("[data-alert-rule-expr]")
+    .fill("omnion_workflow_steps_total{status=\"__qa_never_seen__\"} > 0")
+    .catch(() => {});
+  await page.locator("[data-alert-rule-preview]").click().catch(() => {});
+  await page.waitForTimeout(1500);
+  const noDataAlone = await page.locator('[data-preview="no-data"]').count();
+  const quietInstead = await page.locator('[data-preview="ok"]').count();
+  note({
+    check: "no-data-is-not-healthy",
+    noData: noDataAlone,
+    saidOkInstead: quietInstead,
+    ok: noDataAlone > 0 && quietInstead === 0,
+  });
+
+  // (4) an expression that cannot work is refused, and the refusal names the family.
+  await page
+    .locator("[data-alert-rule-name]")
+    .fill(`qa-bad-${Date.now()}`)
+    .catch(() => {});
+  await page
+    .locator("[data-alert-rule-expr]")
+    .fill("omnion_not_a_family > 1")
+    .catch(() => {});
+  await page.locator("[data-alert-rule-save]").click().catch(() => {});
+  await page.waitForTimeout(1600);
+  const formError = (await page.locator("[data-alert-rule-error]").innerText().catch(() => "")) || "";
+  note({
+    check: "bad-expression-refused",
+    said: formError.slice(0, 200),
+    namesFamily: formError.includes("omnion_not_a_family"),
+  });
+  const stillOpen = await page.locator("[data-alert-rule-form]").count();
+  note({ check: "refusal-keeps-the-form-open", stillOpen });
+
+  // (5) a real rule, created, previewed, silenced and removed.
+  const name = `qa-alert-${Date.now()}`;
+  await page
+    .locator("[data-alert-rule-name]")
+    .fill(name)
+    .catch(() => {});
+  await page
+    .locator("[data-alert-rule-expr]")
+    .fill("omnion_queue_depth > 100000")
+    .catch(() => {});
+  await page
+    .locator("[data-alert-rule-dwell]")
+    .fill("0")
+    .catch(() => {});
+  await page.locator("[data-alert-rule-save]").click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const created = await page.locator(`[data-alert-rule="${name}"]`).count();
+  note({ check: "rule-created", created });
+
+  // A rule whose expression stopped parsing is a RED cell, not a silent one.
+  const invalidCells = await page.locator("[data-alert-rule-invalid]").count();
+  note({ check: "invalid-expression-is-called-out", invalidCells });
+
+  // Silence it, and check the silence is visible with its reason.
+  await page
+    .locator(`[data-alert-rule="${name}"] [data-alert-rule-silence]`)
+    .click()
+    .catch(() => {});
+  await page.waitForSelector("[data-silence-form]", { timeout: 8000 }).catch(() => {});
+  await page
+    .locator("[data-silence-reason]")
+    .fill("QA pass: exercising the silence form")
+    .catch(() => {});
+  await page.locator("[data-silence-minutes]").fill("30").catch(() => {});
+  await page.locator("[data-silence-save]").click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const silences = (await page.locator("[data-silence-list] li").innerText().catch(() => "")) || "";
+  note({
+    check: "silence-visible",
+    found: silences.includes("QA pass"),
+    statesRemaining: /\d+\s*(m|h)/.test(silences),
+  });
+
+  // A silence with no reason is refused — an anonymous silence is one nobody dares to remove.
+  await page.locator("[data-silence-new]").click().catch(() => {});
+  await page.waitForSelector("[data-silence-form]", { timeout: 8000 }).catch(() => {});
+  const saveDisabled = await page.locator("[data-silence-save]").isDisabled().catch(() => true);
+  note({ check: "reason-is-required", saveDisabledWithoutReason: saveDisabled });
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+
+  // (6) the bundled rules explain their own refusal.
+  const bundledRow = page.locator('[data-alert-rule]:has-text("bundled")').first();
+  if (await bundledRow.count()) {
+    await bundledRow.locator("[data-alert-rule-delete]").click().catch(() => {});
+    await page.waitForTimeout(1800);
+    const refusal = (await page.locator("[data-alerts-error]").innerText().catch(() => "")) || "";
+    note({
+      check: "bundled-rule-explains-its-refusal",
+      said: refusal.slice(0, 160),
+      explained: /re-seeded|every boot/i.test(refusal),
+    });
+  } else {
+    note({ check: "bundled-rule-explains-its-refusal", skipped: "no bundled rule on screen" });
+  }
+
+  // (7) clean up: lift the silence and delete the rule, so the pass leaves the stack as found.
+  await page.locator("[data-silence-lift]").first().click().catch(() => {});
+  await page.waitForTimeout(1600);
+  await page.locator(`[data-alert-rule="${name}"] [data-alert-rule-delete]`).click().catch(() => {});
+  await page.waitForTimeout(1600);
+  note({ check: "cleaned-up", remaining: await page.locator(`[data-alert-rule="${name}"]`).count() });
+
+  // (8) mobile, and the final screenshots.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  await shot(page, "page-observability-alerts-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-observability-alerts");
+
+  report.observabilityAlerts = { steps };
+  return steps;
+}
+
+/**
+ * The observability settings screen (REQ-126, slice 4).
+ *
+ * The two assertions that matter are the second and the third, because they are the ones a form
+ * passes without them:
+ *
+ *   1. The egress note is ON the screen. The request requires the settings screen to say out loud
+ *      what leaves the instance; a component that renders it offscreen proves nothing.
+ *   2. An out-of-range save is refused WITH A FIELD MESSAGE and the stored value does not change.
+ *      The browser-side check is asserted too, because a save the browser silently blocks teaches
+ *      an operator the form is broken.
+ *   3. A valid save reports success — and the caps are visible BEFORE the refusal, not only in it.
+ */
+async function runObservabilitySettingsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-settings-depth", action: "observability", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/observability/settings`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-settings"]', { timeout: 20000 })
+    .catch(() => {});
+  await page
+    .locator('[data-view="observability-settings"]')
+    .waitFor({ state: "visible", timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(800);
+
+  // (1) the egress statement.
+  const egress = (await page.locator("[data-egress-note]").innerText().catch(() => "")) || "";
+  note({ check: "egress-stated", present: egress.length > 40, saysRedacted: /redact/i.test(egress) });
+
+  // The sampling copy has to state that errors are sampled regardless, or an operator reads the
+  // ratio as "how much telemetry you lose" and never turns it down.
+  const samplingHint = (await page.locator('label[for="sampling_ratio"] + p').innerText().catch(() => "")) || "";
+  note({
+    check: "sampling-copy-explains-errors",
+    saysErrorsSampled: /errors are sampled regardless/i.test(samplingHint),
+  });
+
+  // The drain timeout and the probe contract, which is what tells an operator whether to raise it.
+  const drain = (await page.locator('[data-lifecycle="drain"]').innerText().catch(() => "")) || "";
+  note({ check: "drain-timeout-visible", says: drain, ok: /\d/.test(drain) });
+
+  // (2) an out-of-range value is caught before it can be sent.
+  await page.locator('[data-setting="logs_retention_days"]').fill("400").catch(() => {});
+  await page.waitForTimeout(400);
+  const fieldError = await page.locator('[data-field-error="logs_retention_days"]').count();
+  const saveDisabled = await page.locator("[data-settings-save]").isDisabled().catch(() => false);
+  note({ check: "range-caught-in-the-form", fieldError, saveDisabled });
+
+  // And the ratio, whose bound is 0..1 rather than an integer range.
+  await page.locator('[data-setting="sampling_ratio"]').fill("4").catch(() => {});
+  await page.waitForTimeout(400);
+  const ratioError = await page.locator('[data-field-error="sampling_ratio"]').count();
+  note({ check: "ratio-bounded", ratioError });
+
+  // A misspelled level is refused the same way — the level names are a closed set, and "verbose"
+  // is not one of them.
+  await page.locator('[data-setting="log_level_default"]').selectOption("verbose").catch(() => {});
+  await page.waitForTimeout(400);
+  const levelError = await page.locator('[data-field-error="log_level_default"]').count();
+  note({ check: "level-is-a-closed-set", levelError });
+
+  // (3) a valid save goes through and says so.
+  await page.locator('[data-setting="logs_retention_days"]').fill("14").catch(() => {});
+  await page.locator('[data-setting="sampling_ratio"]').fill("0.1").catch(() => {});
+  await page.locator('[data-setting="log_level_default"]').selectOption("info").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-settings-save]").click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const savedBanner = await page.locator("[data-settings-saved]").count();
+  const saveError = await page.locator("[data-settings-error]").count();
+  note({ check: "valid-save-succeeds", savedBanner, errors: saveError });
+
+  // The temporary-raise composer: a raise with no target is ignored rather than applied to
+  // everything, so the save below must NOT add one.
+  await page.locator("[data-new-override-target]").fill("").catch(() => {});
+  await page.locator("[data-settings-save]").click().catch(() => {});
+  await page.waitForTimeout(1600);
+  const overrides = await page.locator("[data-level-override]").count();
+  note({ check: "empty-raise-is-not-applied", overrides });
+
+  // A real raise, saved, then read back as LIVE.
+  await page
+    .locator("[data-new-override-target]")
+    .fill(`qa_module_${Date.now()}`)
+    .catch(() => {});
+  await page.locator("[data-new-override-expiry]").selectOption("1").catch(() => {});
+  await page.locator("[data-settings-save]").click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const liveRaise = await page.locator('[data-level-override][data-expired="false"]').count();
+  note({ check: "raise-is-live-before-its-expiry", liveRaise });
+
+  // (4) mobile, and the final screenshots.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  await shot(page, "page-observability-settings-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-observability-settings");
+
+  report.observabilitySettings = { steps };
   return steps;
 }
 

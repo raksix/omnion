@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, BadgeCheck, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Network, Scale, ScrollText, Send, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, X } from "lucide-react";
+import { Activity, BarChart3, BadgeCheck, BellRing, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Network, Scale, ScrollText, Send, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -47,6 +47,11 @@ const NAV = [
   { href: "/observability/metrics", label: "Observability", icon: Activity },
   { href: "/observability/traces", label: "Traces", icon: Waypoints },
   { href: "/observability/exporters", label: "Exporters", icon: Send },
+  // Alerts before exporters in the reading order: "is anything wrong" is the question an operator
+  // arrives with, and the answer is here rather than in a metric family. Settings last, because it
+  // is the one screen in the centre an operator opens deliberately rather than urgently.
+  { href: "/observability/alerts", label: "Alerts", icon: BellRing },
+  { href: "/observability/settings", label: "Obs. settings", icon: SlidersHorizontal },
 ] as const;
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
