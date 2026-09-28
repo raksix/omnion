@@ -28,15 +28,22 @@ count_places() { find "$LOCKDIR" -maxdepth 1 -type f | wc -l; }
 # A stale place from a killed pass would block the queue forever: reclaim one that is
 # older than the maximum wait and whose owning process is gone.
 reap() {
-  local f pid age
+  local f holder age
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
-    pid="$(basename "$f" | cut -d- -f1)"
-    age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
-    [ "$age" -gt $(( WAIT + 900 )) ] || continue
-    if ! kill -0 "$pid" 2>/dev/null; then
+    # The place is held by the background HOLDER (a sleep loop that outlives this script), not by
+    # the pid in the file's name: the naming process exits the moment it takes a place, so asking
+    # whether it is alive always says no and every live pass looks stale. The holder is the only
+    # pid whose liveness means anything, so that is the one to ask.
+    holder="$(cat "${HOLDERDIR}/${f##*/}" 2>/dev/null || true)"
+    if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+      age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+      # An empty or dead holder is only trusted once the place is old enough to be abandoned on
+      # age too: a holder file is written a moment after the place, so a pass that has just taken
+      # one looks holder-less for that window and must not be robbed of it.
+      [ "$age" -gt 120 ] || continue
       rm -f "$f" "${HOLDERDIR}/${f##*/}" 2>/dev/null || true
-      echo "[qa-slot] reclaimed a stale place from pid $pid (${age}s old)" >&2
+      echo "[qa-slot] reclaimed a stale place from holder ${holder:-none} (${age}s old)" >&2
     fi
   done
 }
