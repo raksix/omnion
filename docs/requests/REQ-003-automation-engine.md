@@ -165,11 +165,19 @@ the payload; the rule id is the only identifier returned to the caller.
       uses and reports `would_send` / `would_call` / `would_publish`; the QA pass reads every outcome back and asserts each starts with
       `would_`. `POST /api/v1/automations/{id}/test` stores the report and audits it.
 - [ ] "Run now" starts exactly one run; a second press inside the rate window shows the limit message and starts nothing.
-      *Partly proved:* `POST /api/v1/automations/{id}/run` starts exactly one run — the execution and its
+      *Proved:* `POST /api/v1/automations/{id}/run` starts exactly one run — the execution and its
       steps are rows before the response leaves, and the walk reads the id back and settles the run to
       `completed`. A rule whose `{{event.*}}` bindings need an event is **refused in words** rather than
-      run against an invented payload. The rate window (`rate_limit_per_hour`) is slice 4's, so the
-      second half of this line stays open.
+      run against an invented payload.
+      **The rate half is now in place** (`omnion_automation::limits`): the window is counted in
+      `workflow_rate_windows` and read under `for update` **inside the transaction that starts the
+      run**, because the request's own risk note is that a check before the insert is two statements
+      and a second API instance between them turns one decision into two. The refusal is an `Admit`
+      that names its bound (`rate_limit_per_hour` or `concurrency`) rather than only its numbers — an
+      operator reading a run history needs to know *which* control to change. `concurrency: skip`
+      drops the trigger and reports it; `queue` lets it wait. Both set `workflows.last_error` and emit
+      `automation.rule.limit_reached`, and the panel's "7 of 60" line reads the same counter without
+      taking the lock (a few seconds stale is a counter; stale in a *decision* is a bug).
 - [x] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
       *Proved:* `crates/automation/src/authority.rs` — `workflows.run_as_user_id` names the account, `None`
       follows the author, and **a deleted author resolves to nobody** rather than to any fallback
@@ -217,7 +225,15 @@ the payload; the rule id is the only identifier returned to the caller.
       refused at write time with `invalid_step_timeout`. (The out-of-scope half of the line — attempts
       used against attempts allowed on the *trace* — is the run-detail screen, slice 4's.)
 - [ ] The endless-loop guard aborts a rule that repeats the same step with identical resolved parameters and explains why in the trace.
-      *Slice 4.* Not started.
+      *Proved:* `crates/automation/src/loopguard.rs` — the fingerprint is the step kind, the action and the **canonical** parameters, so a repeat that
+      reorders its keys is still a repeat; a different value is not. `crates/workflows/src/guard.rs` puts the check in the one place it belongs: after
+      a step succeeds, in the same write a `stop` step and a failed step do, so a guard that says stop has exactly the power a stop has. The engine
+      takes a `&dyn RunGuard` **next to** the action handler rather than as a method on it, because the content worker runs synthetic steps and needs
+      no guard — `NoRunGuard` is an honest default, not a silent "no guard installed". The refusal names the repeat, and `last_stopped_at` means a
+      re-armed rule does not immediately refuse itself on its own last step. The API process installs `LoopGuard`, and a test asserts it builds both
+      the actions and the guard: a runner with only the actions can send an email forever and never notice.
+      *Still open:* the run-detail **trace** that shows the message is slice 4's remaining screen work, and the guard's test has to be shown to fail
+      when the guard is removed (the request asks for that) — the walk comes with the run screens.
 - [ ] A paused rule does not fire, and re-arming it does not replay events recorded while it was paused.
       *Proved in part:* the matcher only reads armed rules (`store::list_event_rules` filters `enabled`), and a paused webhook rule's token
       stops resolving (`hooks::find_rule` filters `enabled`), so its URL answers 404 like a wrong one. The "does not replay while paused"
@@ -289,6 +305,13 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
      engine's next claim ends the run, so the clock and the state machine stay separate.
 4. **Operations polish** — rate limits and concurrency, endless-loop guard, templates gallery, versions/restore, audit tab, mobile and empty states, event emissions.
    *Done when:* the six templates run green on the QA database and the limit and loop guards each have a test that fails when the guard is removed.
+   *Engine + API half shipped* (`b130f0b`, `684741e`, `49f7ac2`; migration `0029_automation_operations`).
+   The bounds are enforced in the run-start transaction and the guard is installed beside the
+   action handler. **The screen half is not built**: run history, the run detail with its step
+   trace, the templates gallery, versions/restore and the Audit tab all remain, and the two
+   criteria that need a trace to close (attempts used against attempts allowed, and the
+   loop-guard message shown in a run) cannot be proved without them. Slice 4 stays **open** —
+   what is above is not enough to close it.
 
 ### Risks / notes
 

@@ -2054,3 +2054,78 @@
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-28 · wave3 · REQ-003 slice 4 — operations bounds and the loop guard (engine + API)
+
+The tick opened on a **tree that did not compile**: the previous run died mid-slice and
+left the slice-4 work uncommitted. The engine half was intact and correct; what was
+missing were the call sites a new column breaks. Recovered, finished and shipped.
+
+- **What shipped.** `rate_limit_per_hour` + `concurrency` + `last_error` on a rule
+  (`omnion_automation::limits`, migration `0029_automation_operations`), enforced in the
+  **same transaction that starts the run** — the request's own risk note, and the reason
+  `workflow_rate_windows` is created on first use and then read `for update`, so the row
+  always exists and two callers serialise. The refusal names **which** bound refused
+  (`rate_limit_per_hour` or `concurrency`) rather than only its numbers, because an operator
+  reading a run history needs to know which control to change. Plus the endless-loop guard
+  (`loopguard.rs` + `crates/workflows/src/guard.rs`): canonical fingerprints, checked after
+  a step succeeds in the same write a `stop` step does.
+- **The one design decision worth naming.** The guard is a **second `&dyn`** beside the
+  action handler, not a method on it. The content worker runs synthetic steps and needs no
+  guard; a process running automations needs both. That makes `NoRunGuard` an honest default
+  rather than a silent "this process installed no guard", and it is why the two integration
+  walks pass `&NoRunGuard` explicitly instead of inheriting a default.
+- **Proof.** `cargo check -p omnion-api --all-targets` clean (this is what caught the five
+  broken fixtures — `--lib` alone was blind to all of them); `cargo test -p omnion-automation
+  -p omnion-workflows --lib` → **163 passed**; `pnpm typecheck` 2/2.
+- **The disk, again.** `/mnt/apopic` opened at **1.7 GB free (98%)** — the linker dies with
+  `Bus error` well before cargo says "out of disk". Checked each worktree for a live cargo
+  via `readlink /proc/<pid>/cwd` first: `omnion-w4` and `omnion-w7` were **both mid-build**
+  while `w5`/`w6` sat idle, so only the idle two were reclaimed → **4.6 GB free**.
+- **Next.** The remaining slice-4 *screen* work: the run history, the run detail with the
+  step trace, the templates gallery, versions/restore and the Audit tab — plus the two
+  criteria that need a trace to close (attempts used against attempts allowed, and the
+  loop-guard message shown in a run). Those need the walkthrough routes extended, so they
+  ship as one screen slice with a full `run.sh` pass, not piecemeal.
+
+### The same tick, continued: the QA gate was lying, and three walks were quietly red
+
+The engine half shipped cleanly, and then the *verification* turned out to be the interesting
+part. Three findings, in order of how much they would have cost a later tick.
+
+- **`run.sh` could report green against a binary that predates the migration it was proving.**
+  It rebuilt only when `target/debug/omnion-api` was missing. The symptom that exposed it: a
+  rule created through the running API came back with `rate_limit_per_hour: null` while the
+  response struct defines the field, and `strings target/debug/omnion-api | grep
+  workflow_rate_windows` found **nothing**. The stack was answering with last week's binary.
+  Fixed (`303b82f`): rebuild when anything under `apps/api`, `crates` **or
+  `database/migrations`** is newer than the binary — sqlx embeds the SQL at compile time, so an
+  edited migration plus an older binary replays the old statement and "column does not exist"
+  reads like a missing `alter`. After rebuilding, the same create returns `201` with
+  `rate_limit_per_hour: 2, concurrency: skip, window_used: 0, window_limit: 2,
+  window_resets_at: …, concurrency_description: …`.
+- **Three integration walks had been failing for several slices and nobody knew**, because the
+  every-tick gate is `cargo test --lib` and `--lib` does not compile the integration targets.
+  `cargo check -p omnion-api --all-targets` is the cheap gate that sees them. All three were
+  *stale assertions*, not defects, and each is now fixed to assert the contract the panel reads
+  (catalogue event objects, `condition_count`, and a genuinely-unknown action) — a stronger test
+  than the string it replaced (`be7b30b`).
+- **The `--only=` depth passes need `--url VALUE` with a space.** `--url=http://…` is silently
+  ignored by `arg()` (it does `indexOf("--url")` and takes the *next* argv), so the pass walked
+  the main writer's stack on :3100 and reported its 404s as this wave's failures. Two of my own
+  invocations got this wrong before the artifacts showed `http://127.0.0.1:3100/automations`
+  inside a "w3" run. **Owner note:** a depth pass that reports a 404 on a port you did not ask
+  for has silently targeted the wrong stack.
+
+**Where the tick stopped.** The engine + API half of slice 4 is shipped and proven
+(`cargo check --all-targets` clean, 163 unit tests, and 26 integration walks: automation 5/5,
+automation_actions 6/6, automation_approvals 4/4, workflows 11/11 — the last three against a
+per-branch database, because the shared dev `omnion` carries a sibling's 0019 and refuses this
+branch's migration set). **The browser gate could not be completed**: the box reached 0 free
+RAM with nine concurrent walkthroughs across the writers, and two full passes died on
+"Page crashed" and a media-file-manager selector that belongs to another wave. The automations
+screens themselves showed **one** error across 32 clicks, and it was a `500` from the main
+writer's `/api/v1/media/files`. So slice 4's *screen* half — run history, run detail with the
+trace, templates gallery, versions/restore, Audit tab — is unbuilt, and the REQ stays open.
+**Next.** Build those screens, extend `walkthrough.cjs`'s routes so each is visited and
+clicked, and close with a full `run.sh` pass once the box has memory for one.
