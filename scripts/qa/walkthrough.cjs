@@ -2838,19 +2838,31 @@ async function main() {
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
   ];
+  // The route loop is per-route isolated for the same reason the depth passes are: a crashed
+  // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
+  // memory) used to end the entire run, so every route after the crash and every depth pass
+  // were skipped and no report was written at all. A page that dies is a finding about that
+  // page; the pages after it still have to be looked at.
   for (const route of routes) {
     log(`page: ${route.name}`);
-    await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForTimeout(900);
-    if (route.name === "media") {
-      report.mediaUpload = await uploadMediaSample(page);
-      log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
-      await page.waitForTimeout(600);
+    try {
+      await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(900);
+      if (route.name === "media") {
+        report.mediaUpload = await uploadMediaSample(page);
+        log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
+        await page.waitForTimeout(600);
+      }
+      const diag = await diagnostics(page);
+      await shot(page, `page-${route.name}`);
+      await interact(page, route.name, report);
+      report.pages.push({ ...route, diagnostics: diag });
+    } catch (cause) {
+      const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+      log(`page ${route.name} failed: ${reason}`);
+      record({ page: route.name, action: "route-failed", reason });
+      report.pages.push({ ...route, failed: reason });
     }
-    const diag = await diagnostics(page);
-    await shot(page, `page-${route.name}`);
-    await interact(page, route.name, report);
-    report.pages.push({ ...route, diagnostics: diag });
   }
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
