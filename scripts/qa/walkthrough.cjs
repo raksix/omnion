@@ -6638,6 +6638,113 @@ async function runWorkflowBuilderDepth(page, report) {
     .trim();
   note({ step: "fit", toolbar: zoomLabel.slice(0, 120) });
 
+  // ---- The interaction depth (REQ-004 slice 2) ---------------------------------------------
+  // Everything below is the part of the builder a unit test cannot see: a minimap that does
+  // not overlap the graph, a marquee that catches the cards it visually covers, an undo that
+  // the server agrees with, and the keyboard routes (⌘A, Shift+click, ⌘P + Enter) that the
+  // keyboard-only acceptance pass depends on.
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // Select-all from the keyboard. The node count on the canvas is the assertion: ⌘A that
+  // highlights nothing is invisible in a screenshot and would otherwise pass every other gate.
+  await page.keyboard.press("Control+a");
+  await page.waitForTimeout(600);
+  const selectedAfterSelectAll = await page.locator("[data-node-id]").evaluateAll((cards) =>
+    cards.filter((card) => {
+      const style = card.getAttribute("style") ?? "";
+      return style.includes("outline: 2px") || style.includes("outline:2px");
+    }).length,
+  );
+  note({ step: "select-all", total: await page.locator("[data-node-id]").count(), selected: selectedAfterSelectAll });
+  await shot(page, "page-workflow-builder-select-all");
+
+  // Escape clears it again, so the next gesture starts from a known state.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+  const afterEscape = await page.locator("[data-node-id]").evaluateAll((cards) =>
+    cards.filter((card) => (card.getAttribute("style") ?? "").includes("outline")).length,
+  );
+  note({ step: "escape-clears", stillSelected: afterEscape });
+
+  // Shift+click adds a second node to the selection. Two cards drawn as selected is the
+  // whole point: a Shift+click that *replaces* the selection is a bug no count can hide.
+  const cardIds = await page.locator("[data-node-id]").evaluateAll((cards) =>
+    cards.map((card) => card.getAttribute("data-node-id")),
+  );
+  if (cardIds.length >= 2) {
+    await page.locator(`[data-node-id="${cardIds[0]}"]`).first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(250);
+    await page
+      .locator(`[data-node-id="${cardIds[1]}"]`)
+      .first()
+      .click({ timeout: 5000, modifiers: ["Shift"] })
+      .catch(() => {});
+    await page.waitForTimeout(500);
+    const multiSelected = await page.locator("[data-node-id]").evaluateAll((cards) =>
+      cards.filter((card) => (card.getAttribute("style") ?? "").includes("outline")).length,
+    );
+    note({ step: "shift-click-multi", expected: 2, selected: multiSelected });
+    await shot(page, "page-workflow-builder-multi");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  } else {
+    note({ step: "shift-click-multi", skipped: "fewer than two nodes on the canvas", nodes: cardIds.length });
+  }
+
+  // ⌘P focuses the palette, ArrowDown moves the focus, Enter adds. The node count before and
+  // after is the assertion — a palette that takes focus but does not add is a dead control.
+  const nodesBeforeKeyboardAdd = await page.locator("[data-node-id]").count();
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.keyboard.press("Control+p");
+  await page.waitForTimeout(500);
+  const paletteFocused = await page.evaluate(() => {
+    const active = document.activeElement;
+    return Boolean(active && active.getAttribute && active.getAttribute("data-palette-node"));
+  });
+  await page.keyboard.press("ArrowDown");
+  await page.waitForTimeout(250);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(700);
+  const afterKeyboardAdd = await page.locator("[data-node-id]").count();
+  note({ step: "palette-keyboard-add", paletteFocused, before: nodesBeforeKeyboardAdd, after: afterKeyboardAdd });
+  await shot(page, "page-workflow-builder-palette-keyboard");
+
+  // Undo removes the node the keyboard just added, and the *server* agrees — an undo that
+  // only rewinds the screen would save a graph the canvas no longer shows.
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.keyboard.press("Control+z");
+  await page.waitForTimeout(900);
+  const afterUndo = await page.locator("[data-node-id]").count();
+  note({ step: "undo", afterUndo, returned: afterUndo === nodesBeforeKeyboardAdd });
+
+  // The edge delete: select an edge, Del, and the server's edge count falls. An edge whose
+  // deletion the canvas shows but the graph keeps is a ghost edge that comes back on reload.
+  const edgesBefore = (await readGraph())?.edge_count ?? 0;
+  const edgeHit = await page
+    .locator("[data-edge] path")
+    .first()
+    .click({ timeout: 5000, force: true })
+    .then(() => true)
+    .catch(() => false);
+  await page.waitForTimeout(500);
+  const edgeSelected = (await page.locator("[data-edge-selected='true']").count()) > 0;
+  if (edgeSelected) {
+    await page.keyboard.press("Delete");
+    await page.waitForTimeout(1200);
+    const afterEdgeDelete = await page.locator("[data-edge]").count();
+    const edgesAfter = (await readGraph())?.edge_count ?? 0;
+    note({ step: "edge-delete", hit: edgeHit, edgesBefore, after: edgesAfter, canvas: afterEdgeDelete });
+    await shot(page, "page-workflow-builder-edge-deleted");
+    // Undo puts it back: the history has to know about edge deletes too.
+    await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(1200);
+    note({ step: "edge-delete-undo", edgesRestored: (await readGraph())?.edge_count ?? 0 });
+  } else {
+    note({ step: "edge-delete", hit: edgeHit, selected: false, reason: "no edge could be selected" });
+  }
+
   // ---- Cleanup: this pass owns the rule it made --------------------------------------------
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);

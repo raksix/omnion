@@ -173,6 +173,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   } | null>(null);
   // The minimap's own rectangle, and whether the author wants to see it.
   const [minimapOpen, setMinimapOpen] = useState(true);
+  // The selected *edge*, held apart from the node selection on purpose: the inspector is
+  // driven by `selected`, and an edge selected for deletion must not replace the node the
+  // user was editing with an inspector panel that has nothing to say about a line.
+  const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
 
   const nodeTypes = useMemo(() => {
     const map = new Map<string, GraphNodeType>();
@@ -635,10 +639,19 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const removeEdge = useCallback(
     (id: string) => {
-      setEdges((current) => current.filter((edge) => edge.id !== id));
-      queueSave();
+      // Routed through `commit` rather than `setEdges` + `queueSave` so an edge delete is one
+      // undoable step like every other change. A delete the history does not know about is a
+      // delete the user has to rebuild by hand, and the acceptance criteria ask for exactly
+      // that undo ("restores add, move, connect, delete … at least 50 steps deep").
+      const before = snapshotOf(graphRef.current.nodes, graphRef.current.edges);
+      const nextEdges = graphRef.current.edges.filter((edge) => edge.id !== id);
+      if (nextEdges.length === graphRef.current.edges.length) {
+        return;
+      }
+      setSelectedEdge((current) => (current === id ? null : current));
+      commit("edge-remove", before, graphRef.current.nodes, nextEdges);
     },
-    [queueSave],
+    [commit],
   );
 
   // ---- canvas interaction -----------------------------------------------------------------
@@ -844,6 +857,53 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     }
   }, [commitMove, dragging, marquee, marqueeSelection, panning]);
 
+  const filteredTypes = filterTypes(registry, paletteQuery);
+
+  /**
+   * Palette keyboard support: arrows move a roving focus, Enter adds.
+   *
+   * The buttons are natively focusable, so Tab already reaches them and Enter already fires
+   * onClick — what was missing is a way to *move* through the list without hunting for the
+   * next item with Tab, and a way to get into the palette from the canvas. `⌘P` focuses the
+   * first item, arrows walk it, Enter adds at the viewport centre. The focus is applied with
+   * `data-palette-node` rather than a React ref array so one query finds it, which also means
+   * a re-render after the add cannot leave focus pointing at a detached node.
+   */
+  const focusPaletteItem = useCallback((key: string) => {
+    const next = document.querySelector<HTMLButtonElement>(`[data-palette-node="${key}"]`);
+    next?.focus();
+  }, []);
+
+  const onPaletteKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLButtonElement>, key: string) => {
+      const order = filteredTypes.map((nodeType) => nodeType.key);
+      const at = order.indexOf(key);
+      if (at < 0) {
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        // Stop at the ends rather than wrapping: wrapping past the last node back to the first
+        // is a jump the user did not ask for, and on a short list it is a bigger jump than the
+        // arrow they pressed.
+        event.preventDefault();
+        const target = event.key === "ArrowDown" ? order[at + 1] : order[at - 1];
+        if (target) {
+          focusPaletteItem(target);
+        }
+        return;
+      }
+      if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        const target = event.key === "Home" ? order[0] : order[order.length - 1];
+        if (target) {
+          focusPaletteItem(target);
+        }
+        return;
+      }
+    },
+    [filteredTypes, focusPaletteItem],
+  );
+
   // Space is the pan modifier; tracked in a ref because a keydown does not re-render.
   const spaceHeld = useRef(false);
   useEffect(() => {
@@ -905,9 +965,37 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         duplicateSelected();
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "p") {
+        // ⌘P brings focus to the palette, as the keyboard map promises. It is the entry point
+        // that makes the palette reachable from the keyboard at all: without it, adding a
+        // node without a pointer means Tab-ing through the whole toolbar first.
+        event.preventDefault();
+        if (filteredTypes.length > 0) {
+          focusPaletteItem(filteredTypes[0].key);
+        }
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+        // Select every node. The inspector shows the last one in the array, so a select-all
+        // still lands somewhere the user can act on rather than clearing everything.
+        if (nodes.length > 0) {
+          event.preventDefault();
+          selectionRef.current = new Set(nodes.map((node) => node.id));
+          setSelectionCount(nodes.length);
+          setSelected(nodes[nodes.length - 1].id);
+        }
+        return;
+      }
       if (event.key === "Escape") {
         // Escape clears the selection, which is also the only way out of a marquee that the
-        // user started by accident and cannot see the end of.
+        // user started by accident and cannot see the end of. An edge is cleared with it:
+        // Escape is the gesture that says "I did not mean that", and it has to reach the
+        // thing that is currently drawn as selected.
+        if (selectedEdge) {
+          event.preventDefault();
+          setSelectedEdge(null);
+          return;
+        }
         if (selectionCount > 0 || selected) {
           event.preventDefault();
           selectionRef.current = new Set();
@@ -918,6 +1006,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       }
 
       if (event.key === "Delete" || event.key === "Backspace") {
+        // An edge wins over the node selection: a selected edge means the user is pointing at
+        // a line, and pressing Delete should remove the line they are pointing at rather than
+        // every node they happened to have selected earlier.
+        if (selectedEdge) {
+          event.preventDefault();
+          removeEdge(selectedEdge);
+          return;
+        }
         const doomed = selectionRef.current.size > 0 ? [...selectionRef.current] : selected ? [selected] : [];
         if (doomed.length > 0) {
           event.preventDefault();
@@ -956,7 +1052,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       );
       commit("nudge", before, nextNodes, edges);
     },
-    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, nodes, pasteClipboard, removeNodes, selected, selectionCount],
+    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusPaletteItem, nodes, pasteClipboard, removeEdge, removeNodes, selected, selectedEdge, selectionCount],
   );
 
   // ---- actions ----------------------------------------------------------------------------
@@ -1046,7 +1142,6 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const errorCount = findings.filter((finding) => finding.severity === "error").length;
   const selectedNode = nodes.find((node) => node.id === selected) ?? null;
-  const filteredTypes = filterTypes(registry, paletteQuery);
   const style = canvasStyle(viewport);
 
   return (
@@ -1231,6 +1326,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                         <button
                           type="button"
                           onClick={() => addNode(nodeType)}
+                          onKeyDown={(event) => onPaletteKeyDown(event, nodeType.key)}
                           className="w-full rounded-md border border-line bg-canvas px-2 py-1.5 text-left hover:border-accent"
                           data-palette-node={nodeType.key}
                           title={nodeType.summary}
@@ -1293,14 +1389,31 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                   return null;
                 }
                 const path = edgePath(from.position, to.position);
+                const isSelected = selectedEdge === edge.id;
                 return (
-                  <g key={edge.id} data-edge={edge.id}>
+                  <g key={edge.id} data-edge={edge.id} data-edge-selected={isSelected ? "true" : undefined}>
+                    {/* A fat transparent stroke under the visible line: a 2px bezier is close
+                        to unclickable, and an edge you cannot select is an edge you cannot
+                        delete. The hit area is the line's real geometry, not a bounding box. */}
                     <path
                       d={path}
                       fill="none"
-                      stroke="var(--color-line)"
-                      strokeWidth={2}
+                      stroke="transparent"
+                      strokeWidth={14}
+                      style={{ pointerEvents: "stroke", cursor: "pointer" }}
+                      onPointerDown={(event) => {
+                        event.stopPropagation();
+                        setSelectedEdge(edge.id);
+                        setSelected(null);
+                      }}
+                    />
+                    <path
+                      d={path}
+                      fill="none"
+                      stroke={isSelected ? "var(--color-ink)" : "var(--color-line)"}
+                      strokeWidth={isSelected ? 3 : 2}
                       markerEnd="url(#wf-arrow)"
+                      style={{ pointerEvents: "none" }}
                     />
                     <text
                       x={(from.position.x + to.position.x) / 2 + CARD_W / 2}
@@ -1360,6 +1473,23 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                   }}
                   onClick={(event) => {
                     event.stopPropagation();
+                    // Shift+click extends the multi-selection, which is what every canvas
+                    // does and what the marquee's additive mode already implies. Without it
+                    // a user who marquee-selects a group and then adds one more node has to
+                    // start the whole selection over.
+                    if (event.shiftKey) {
+                      const next = new Set(selectionRef.current);
+                      if (next.has(node.id)) {
+                        next.delete(node.id);
+                      } else {
+                        next.add(node.id);
+                      }
+                      selectionRef.current = next;
+                      setSelectionCount(next.size);
+                      setSelected(node.id);
+                      return;
+                    }
+                    setSelectedEdge(null);
                     setSelected(node.id);
                   }}
                   data-node-id={node.id}
