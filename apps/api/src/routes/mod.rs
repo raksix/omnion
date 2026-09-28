@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod commands;
 pub mod content;
+pub mod crm_intake;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -85,9 +86,9 @@ pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
+pub mod media_duplicates;
 pub mod media_files;
 pub mod media_grants;
-pub mod media_duplicates;
 pub mod media_retention;
 pub mod media_scan;
 mod media_settings;
@@ -511,8 +512,8 @@ pub fn router(state: AppState) -> Router {
     // permission as repointing where every file in it lives.
     let media_settings_route: MethodRouter<AppState, Infallible> =
         get(media_settings::read).layer(guards::require(&state, "media.read"));
-    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
-        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -552,18 +553,18 @@ pub fn router(state: AppState) -> Router {
     // (organise a library) nor `media.delete` (remove a file) is that power.
     let media_scan_route: MethodRouter<AppState, Infallible> =
         get(media_scan::read).layer(guards::require(&state, "media.read"));
-    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
-        .layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
         get(media_scan::list_held).layer(guards::require(&state, "media.read"));
     let media_quarantine_release: MethodRouter<AppState, Infallible> =
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -573,12 +574,12 @@ pub fn router(state: AppState) -> Router {
     // able to decide who else may read what they uploaded.
     let media_folder_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
-    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
-    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     // A grant is removed by its own id alone — the row knows the node it was written on, so
     // putting the node in the URL as well would make a two-parameter path with a one-parameter
     // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
@@ -791,11 +792,9 @@ pub fn router(state: AppState) -> Router {
         post(notifications::emit).layer(guards::require(&state, "notifications.send"));
     let notifications_entry = get(notifications::get)
         .layer(guards::require(&state, "notifications.read"))
-        .merge(
-            delete(notifications::delete).layer(guards::require(&state, "notifications.read")),
-        );
-    let notifications_read = post(notifications::set_read)
-        .layer(guards::require(&state, "notifications.read"));
+        .merge(delete(notifications::delete).layer(guards::require(&state, "notifications.read")));
+    let notifications_read =
+        post(notifications::set_read).layer(guards::require(&state, "notifications.read"));
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -916,6 +915,78 @@ pub fn router(state: AppState) -> Router {
         .route("/notifications/emit", notifications_emit)
         .route("/notifications/{id}", notifications_entry)
         .route("/notifications/{id}/read", notifications_read)
+        // CRM intake (REQ-117, slice 1). The public capture endpoint carries no guard: it
+        // authenticates by the source's own hashed key, and the panel surface splits into
+        // three powers — reading the inbox, working a lead, and editing the capture surface
+        // that decides what is stored about the people who write in.
+        //
+        // `/leads/duplicates` is declared before `/leads/{id}` because axum ranks static
+        // segments ahead of parameters, and "duplicates" read as a lead id would be a `400`
+        // a panel shows as "this screen is broken".
+        .route("/crm/intake/{source_key}", post(crm_intake::capture))
+        .route(
+            "/crm/intake/sources",
+            get(crm_intake::list_sources)
+                .layer(guards::require(&state, "crm.intake.manage"))
+                .merge(
+                    post(crm_intake::create_source)
+                        .layer(guards::require(&state, "crm.intake.manage")),
+                ),
+        )
+        .route(
+            "/crm/intake/sources/{id}",
+            get(crm_intake::get_source)
+                .layer(guards::require(&state, "crm.intake.manage"))
+                .merge(
+                    patch(crm_intake::update_source)
+                        .layer(guards::require(&state, "crm.intake.manage")),
+                )
+                .merge(
+                    delete(crm_intake::delete_source)
+                        .layer(guards::require(&state, "crm.intake.manage")),
+                ),
+        )
+        .route(
+            "/crm/intake/sources/{id}/rotate-key",
+            post(crm_intake::rotate_key).layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/intake/sources/{id}/test",
+            post(crm_intake::test_mapping).layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/leads",
+            get(crm_intake::list_leads).layer(guards::require(&state, "crm.leads.read")),
+        )
+        .route(
+            "/crm/leads/duplicates",
+            get(crm_intake::duplicates).layer(guards::require(&state, "crm.leads.read")),
+        )
+        .route(
+            "/crm/leads/{id}",
+            get(crm_intake::get_lead)
+                .layer(guards::require(&state, "crm.leads.read"))
+                .merge(
+                    patch(crm_intake::patch_lead)
+                        .layer(guards::require(&state, "crm.leads.manage")),
+                )
+                .merge(
+                    delete(crm_intake::delete_lead)
+                        .layer(guards::require(&state, "crm.leads.manage")),
+                ),
+        )
+        .route(
+            "/crm/leads/{id}/respond",
+            post(crm_intake::respond).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        .route(
+            "/crm/leads/{id}/reject",
+            post(crm_intake::reject).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        .route(
+            "/crm/leads/{id}/spam",
+            post(crm_intake::mark_spam).layer(guards::require(&state, "crm.leads.manage")),
+        )
         .route(
             "/analytics/settings",
             analytics_settings_read.merge(analytics_settings_write),
@@ -1079,7 +1150,6 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
         .route("/media/grants/{grant_id}", media_grant_delete)

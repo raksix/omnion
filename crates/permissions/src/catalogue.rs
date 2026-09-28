@@ -424,6 +424,47 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "notifications",
         description: "Change your notification channels and preferences",
     },
+    // CRM intake (docs/requests/REQ-117, slice 1). Split by *what a power is over* rather
+    // than by which screen it lives on, because the inbox is the screen people ask for the
+    // narrowest version of:
+    //
+    // * `crm.leads.read` is the inbox and the lead detail, the duplicate queue and the
+    //   counters beside them.
+    // * `crm.leads.manage` is editing a lead and moving it between the working statuses,
+    //   including the two terminal verdicts (`rejected`, `spam`). It deliberately does NOT
+    //   include deletion: a lead holds a person's submitted details, and a mistake there is
+    //   not something a manager should be able to make disappear quietly.
+    // * `crm.leads.convert` is turning a lead into a contact, an opportunity and a
+    //   quotation — the step that touches the sales pipeline, so it is its own power rather
+    //     than a wing of `manage`.
+    // * `crm.intake.manage` is the capture surface: the sources, their field mappings and
+    //   their endpoint keys. An account that can edit a mapping can decide what a business
+    //   stores about the people who write in, which is a different and larger thing than
+    //   working the leads it produced.
+    //
+    // The public endpoint (`POST /crm/intake/{key}`) is not in this list and cannot be:
+    // there is no session on it to evaluate. It authenticates by the source's own hashed
+    // key (see `apps/api/src/routes/crm_intake.rs`).
+    PermissionDef {
+        key: "crm.leads.read",
+        category: "crm",
+        description: "Read the lead inbox, the lead detail and the duplicate queue",
+    },
+    PermissionDef {
+        key: "crm.leads.manage",
+        category: "crm",
+        description: "Edit leads and move them between statuses, including rejecting and flagging spam",
+    },
+    PermissionDef {
+        key: "crm.leads.convert",
+        category: "crm",
+        description: "Convert a lead into a contact, an opportunity and a quotation",
+    },
+    PermissionDef {
+        key: "crm.intake.manage",
+        category: "crm",
+        description: "Manage intake sources, their field mappings and their endpoint keys",
+    },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each
     // provider's own read permission; `search.manage` is index maintenance, not searching.

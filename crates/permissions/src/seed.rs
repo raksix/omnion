@@ -142,6 +142,14 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            // The lead inbox (REQ-117): a moderator is the person who answers the quote
+            // requests, so it grants reading and working a lead. It does NOT grant
+            // `crm.intake.manage` — editing a field mapping decides what the business stores
+            // about every person who writes in, which is a different promise from working the
+            // leads that already arrived. Nor `crm.leads.convert`, which is slice 3's step into
+            // the sales pipeline.
+            "crm.leads.read",
+            "crm.leads.manage",
             // The bell is on every route, so every role that can open the panel needs to read
             // its own inbox. `notifications.manage` is deliberately NOT here: it is the
             // channel-configuration power slice 2 introduces, and a role that may read an
@@ -181,6 +189,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.read",
             "media.read",
             "search.read",
+            // The member may see the lead inbox. Reading somebody's submitted quote request
+            // is not the same power as acting on it, and a sales team where the person who
+            // picks up a lead cannot open it is a sales team that asks somebody else to.
+            "crm.leads.read",
             // The member is the smallest role that can open the panel at all, and the bell sits
             // in the header of every screen — so this row decides whether a member sees a badge
             // they cannot click, or a header with a hole in it. Read only, never manage: the
@@ -521,10 +533,16 @@ mod tests {
                 "content.pages.read",
                 "media.read",
                 "search.read",
+                "crm.leads.read",
                 "notifications.read"
             ],
-            "the member reads content, media, the search box and its own inbox"
+            "the member reads content, media, the search box, the lead inbox and its own inbox"
         );
+        // The member can *see* a lead and cannot touch one. This pair is the whole of the
+        // CRM surface at member level, and a future slice that adds `crm.leads.manage` here
+        // is the change this line exists to make somebody think twice about.
+        assert!(!keys.contains(&"crm.leads.manage"));
+        assert!(!keys.contains(&"crm.intake.manage"));
         assert!(!keys.contains(&"iam.roles.manage"));
         assert!(!keys.contains(&"users.delete"));
         assert!(
