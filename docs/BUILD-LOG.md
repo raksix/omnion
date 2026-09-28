@@ -1992,6 +1992,23 @@
   it. The pre-existing `--test media` → **11 walks, 0 failures**, unchanged, against the raw route
   that now takes a query parameter. `cargo test -p omnion-permissions --lib` → 62 pass.
   `pnpm --filter @omnion/admin typecheck` green.
+- **The QA pass (`bash scripts/qa/run.sh`, default stack) — clean for this slice.** 954 clicks,
+  988 screenshots, the new `/media/settings` route walked and clicked (28 elements), and the depth
+  pass drove it: created a preset, submitted an out-of-range quality and **the field error named
+  it**. Vision review returned **0 high / 0 medium / 0 low**. The page's own diagnostics read
+  *overflow: no · offscreen: 0 · broken images: 0 · low contrast: 0 · unlabeled inputs: 0 ·
+  duplicate ids: 0 · h1: 1*. The four high findings the run reports are the walkthrough's **own
+  deliberate error-state probes** — `/media?folder=nonexistent-folder` and the 400/404 they
+  produce — none of them from this slice.
+- **Two things the pass taught about this slice's own screen.** The seeded `standard` preset *is*
+  present on a QA site (checked directly in `omnion_qa`, and the trigger in `0028` fires for a
+  site created afterwards), so the walkthrough's `seeded: 0` was its own text match, not a gap —
+  which is why the number was checked against the database rather than believed. And the preset
+  example URL is a `<code>`, not an anchor: the first depth pass looked for `a[href^="/api/v1/
+  media/"]`, found none, and reported "no preset example URL" for a screen that had one on it. An
+  `<a>` pointing at a placeholder id would only have proven a 404 — the same mistake the route
+  inventory already made once with `/media/files`. The pass now reads the query the screen
+  actually renders and builds a real URL with a real file id.
 - **A compiler lesson, fought out over a long wrong turn.** Every guarded route in this codebase
   is written `get(handler).layer(guards::require(...))`, and the new routes refused to compile
   with a bare `type annotations needed for MethodRouter<AppState, _>`. The guard's service impl
