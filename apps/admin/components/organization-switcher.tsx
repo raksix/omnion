@@ -10,7 +10,8 @@
  *
  * Keyboard: `⌘⇧O` (or `Ctrl+Shift+O`) opens it, `↑`/`↓` move, `Enter` switches, `Esc` closes.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect as useReactLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { Building2, Check, ChevronDown, Search, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
@@ -23,6 +24,17 @@ import {
 } from "@/lib/api";
 import { useSession } from "@/lib/session";
 import { useTenantStatus } from "@/lib/tenant-status";
+
+/**
+ * `useLayoutEffect` that does not warn when it is server rendered.
+ *
+ * The switcher's two shapes are decided by the viewport before the first paint, which is exactly
+ * what a layout effect is for — a plain `useEffect` lets the sheet flash one frame in the wrong
+ * place. React, however, logs a warning for a layout effect that runs on the server, and the
+ * header is server rendered. `useEffect` on the server is a no-op that React is happy with, so
+ * the alias picks the effect there and the layout effect everywhere else.
+ */
+const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useReactLayoutEffect;
 
 /** Read the list once per mount and after every switch. */
 export function OrganizationSwitcher() {
@@ -37,7 +49,36 @@ export function OrganizationSwitcher() {
   const [active, setActive] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isPhone, setIsPhone] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const sheetRef = useRef<HTMLDivElement | null>(null);
+
+  // The switcher is one control with two shapes, and the shape decides *where the box lives in
+  // the DOM*, not just how it is styled. On a phone it is a full-width bottom sheet and is
+  // portalled to <body>; from `sm` up it is a panel that drops out of the button and stays where
+  // it is. The reason is `position: fixed` — it resolves against its nearest containing block,
+  // and an ancestor with a filter (a `backdrop-filter` reports as `filter` too) or a transform
+  // *becomes* that block. The panel's own header is `sticky` with `backdrop-blur`, so a sheet
+  // rendered beside the button put `bottom: 0` 738px above the floor of a 390×844 phone: the CSS
+  // said "bottom of the screen" and the browser honoured "bottom of the header". Only measuring
+  // the rendered box catches that — the class list was right.
+  //
+  // Portalling on the phone fixes the placement by construction, because the sheet's ancestors
+  // are then `<body>` and `<html>`, neither of which establishes a containing block. Above `sm`
+  // the box is `absolute` and belongs beside its own trigger, so it is not portalled at all and
+  // the header's containing block is irrelevant to an absolutely positioned element.
+  //
+  // `useReactLayoutEffect` + `matchMedia`, not `typeof window` at the call site: the header must
+  // be measured *before* first paint or the sheet renders for one frame in the wrong place. The
+  // hook itself is the isomorphic one, so server rendering does not warn about a layout effect
+  // that only ever runs in a browser.
+  useBrowserLayoutEffect(() => {
+    const query = window.matchMedia("(max-width: 639px)");
+    const apply = () => setIsPhone(query.matches);
+    apply();
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -57,10 +98,16 @@ export function OrganizationSwitcher() {
   }, [sessionStatus, load]);
 
   // A click outside closes the dropdown; the panel's own overlay does not cover the header.
+  // The sheet is portalled to <body>, so it is no longer inside `rootRef` and has to be tested
+  // separately — otherwise the very first click *inside* the sheet counts as an outside click and
+  // the control closes under the finger.
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target)) return;
+      if (sheetRef.current?.contains(target)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
@@ -147,6 +194,131 @@ export function OrganizationSwitcher() {
     return null;
   }
 
+  // The sheet is rendered into a portal on <body> rather than next to its own button.
+  //
+  // `position: fixed` resolves against its nearest *containing block*, and an ancestor with a
+  // filter — including `backdrop-filter`, which `getComputedStyle` also reports as `filter` — or
+  // a transform becomes one. The panel's own header is `sticky` with `backdrop-blur`, so a sheet
+  // rendered there put `bottom: 0` 738px above the bottom of a 390×844 phone: the CSS said
+  // "bottom of the screen" and the browser honoured "bottom of the header". The class list was
+  // right, the sheet was not, and only a measurement of the rendered box caught it.
+  //
+  // Portalling fixes the placement by construction: the sheet's ancestors are now <body> and
+  // <html>, neither of which establishes a containing block, so `fixed` means what the class
+  // says. The panel still anchors from `sm` up, where the dropdown is the correct shape, and
+  // keeps the same open state, keyboard handling and data.
+  // One body, two shapes. The class list carries *no* `sm:` variants, because the shape is
+  // already decided above: on a phone this is a bottom sheet fixed to the viewport floor, above
+  // `sm` it is a panel anchored to its own button. Leaving a responsive fallback in the classes
+  // would reintroduce the exact ambiguity this refactor removes — a box whose position depends
+  // on a breakpoint it is not rendered in.
+  const sheet = (
+    <div
+      ref={sheetRef}
+      role="dialog"
+      aria-label="Switch organization"
+      data-org-switcher="sheet"
+      className={
+        isPhone
+          ? "fixed inset-x-0 bottom-0 z-50 flex max-h-[85vh] flex-col overflow-hidden rounded-t-2xl border-t border-line bg-surface shadow-2xl"
+          : "absolute right-0 z-50 mt-1.5 flex max-h-none w-72 flex-col overflow-hidden rounded-xl border border-line bg-surface shadow-xl"
+      }
+    >
+      <div className="flex items-center gap-1.5 border-b border-line px-3 py-2">
+        <Search className="size-3.5 text-muted" aria-hidden />
+        <span className="sr-only">Search organizations</span>
+        <input
+          value={query}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setActive(0);
+          }}
+          placeholder="Search organizations"
+          className="w-full bg-transparent text-[12.5px] outline-none"
+        />
+        {isPhone ? (
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            aria-label="Close"
+            className="shrink-0 rounded-md p-1.5 text-muted transition hover:bg-quiet-soft hover:text-ink"
+          >
+            <X className="size-4" aria-hidden />
+          </button>
+        ) : null}
+      </div>
+
+      <ul
+        role="listbox"
+        aria-label="Your organizations"
+        className={`min-h-0 flex-1 overflow-y-auto py-1 ${isPhone ? "" : "max-h-72"}`}
+      >
+        {visible.map((organization, index) => {
+          const selected = organization.organization_id === currentId;
+          return (
+            <li key={organization.organization_id}>
+              <button
+                type="button"
+                role="option"
+                aria-selected={selected}
+                onMouseEnter={() => setActive(index)}
+                onClick={() => void choose(organization)}
+                disabled={busyId === organization.organization_id}
+                // 44px on touch, 32px on a pointer: the row is the whole target and a
+                // two-line row is taller than both, so the floor is the *minimum* here.
+                className={`flex w-full items-center gap-2 px-3 py-2 text-left transition ${
+                  isPhone ? "min-h-11" : ""
+                } ${index === active ? "bg-quiet-soft" : ""}`}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate text-[13px] font-medium">
+                      {organization.name}
+                    </span>
+                    {organization.organization_status !== "active" ? (
+                      <span className="rounded-full bg-caution-soft px-1.5 py-0.5 text-[10.5px] font-medium text-caution">
+                        {organization.organization_status}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="mt-0.5 flex flex-wrap gap-1">
+                    {organization.roles.length === 0 ? (
+                      <span className="text-[11px] text-muted">No roles</span>
+                    ) : (
+                      organization.roles.map((role) => (
+                        <span
+                          key={role.key}
+                          className="max-w-32 truncate rounded-md border border-line px-1.5 py-0.5 text-[10.5px] text-muted"
+                        >
+                          {role.name}
+                        </span>
+                      ))
+                    )}
+                  </span>
+                </span>
+                {selected ? (
+                  <Check className="size-3.5 shrink-0 text-accent-strong" aria-hidden />
+                ) : null}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+
+      <div className="border-t border-line px-3 py-2 text-[11.5px] text-muted">
+        <span onKeyDown={onListKeyDown} tabIndex={-1} className="block outline-none">
+          Switch with ↑ ↓ and Enter · <kbd>⌘⇧O</kbd> toggles
+        </span>
+      </div>
+
+      {error ? (
+        <p role="alert" className="border-t border-line px-3 py-2 text-[12px] text-accent-strong">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+
   return (
     <div ref={rootRef} className="relative">
       <button
@@ -170,115 +342,19 @@ export function OrganizationSwitcher() {
 
       {open ? (
         <>
-          {/* A phone has no room for a floating panel beside the header, and a dropdown that
-              hangs off the right edge of a 390px screen puts the longest organization name in
-              the one place a reader cannot scroll to. Under `sm` the switcher is therefore a
-              bottom sheet that covers the screen, with 44px rows and a close control; from `sm`
-              up it is the panel that drops out of the button. Same state, same keyboard, two
-              shapes — the layout is the only thing that changes. */}
-          <button
-            type="button"
-            aria-label="Close the organization switcher"
-            onClick={() => setOpen(false)}
-            className="fixed inset-0 z-40 bg-ink/40 sm:hidden"
-          />
-          <div
-            role="dialog"
-            aria-label="Switch organization"
-            data-org-switcher="sheet"
-            className="fixed inset-x-0 bottom-0 z-50 flex max-h-[85vh] flex-col overflow-hidden rounded-t-2xl border-t border-line bg-surface shadow-2xl sm:absolute sm:inset-x-auto sm:bottom-auto sm:right-0 sm:mt-1.5 sm:max-h-none sm:w-72 sm:rounded-xl sm:border sm:shadow-xl"
-          >
-          <div className="flex items-center gap-1.5 border-b border-line px-3 py-2">
-            <Search className="size-3.5 text-muted" aria-hidden />
-            <span className="sr-only">Search organizations</span>
-            <input
-              value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                setActive(0);
-              }}
-              placeholder="Search organizations"
-              className="w-full bg-transparent text-[12.5px] outline-none"
-            />
+          {/* The backdrop belongs to the sheet shape only: on a phone the sheet covers the
+              screen, so the page behind it has to be inert. Above `sm` the panel sits beside the
+              button and the rest of the page stays usable, so a full-screen scrim there would be
+              a control that blocks the page it does not cover. */}
+          {isPhone ? (
             <button
               type="button"
+              aria-label="Close the organization switcher"
               onClick={() => setOpen(false)}
-              aria-label="Close"
-              className="shrink-0 rounded-md p-1.5 text-muted transition hover:bg-quiet-soft hover:text-ink sm:hidden"
-            >
-              <X className="size-4" aria-hidden />
-            </button>
-          </div>
-
-          <ul
-            role="listbox"
-            aria-label="Your organizations"
-            className="min-h-0 flex-1 overflow-y-auto py-1 sm:max-h-72"
-          >
-            {visible.map((organization, index) => {
-              const selected = organization.organization_id === currentId;
-              return (
-                <li key={organization.organization_id}>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={selected}
-                    onMouseEnter={() => setActive(index)}
-                    onClick={() => void choose(organization)}
-                    disabled={busyId === organization.organization_id}
-                    // 44px on touch, 32px on a pointer: the row is the whole target and a
-                    // two-line row is taller than both, so the floor is the *minimum* here.
-                    className={`flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition sm:min-h-0 ${
-                      index === active ? "bg-quiet-soft" : ""
-                    }`}
-                  >
-                    <span className="min-w-0 flex-1">
-                      <span className="flex min-w-0 items-center gap-1.5">
-                        <span className="truncate text-[13px] font-medium">
-                          {organization.name}
-                        </span>
-                        {organization.organization_status !== "active" ? (
-                          <span className="rounded-full bg-caution-soft px-1.5 py-0.5 text-[10.5px] font-medium text-caution">
-                            {organization.organization_status}
-                          </span>
-                        ) : null}
-                      </span>
-                      <span className="mt-0.5 flex flex-wrap gap-1">
-                        {organization.roles.length === 0 ? (
-                          <span className="text-[11px] text-muted">No roles</span>
-                        ) : (
-                          organization.roles.map((role) => (
-                            <span
-                              key={role.key}
-                              className="max-w-32 truncate rounded-md border border-line px-1.5 py-0.5 text-[10.5px] text-muted"
-                            >
-                              {role.name}
-                            </span>
-                          ))
-                        )}
-                      </span>
-                    </span>
-                    {selected ? (
-                      <Check className="size-3.5 shrink-0 text-accent-strong" aria-hidden />
-                    ) : null}
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-
-          <div className="border-t border-line px-3 py-2 text-[11.5px] text-muted">
-            <span onKeyDown={onListKeyDown} tabIndex={-1} className="block outline-none">
-              Switch with ↑ ↓ and Enter · <kbd>⌘⇧O</kbd> toggles
-            </span>
-          </div>
-
-          {error ? (
-            <p role="alert" className="border-t border-line px-3 py-2 text-[12px] text-accent-strong">
-              {error}
-            </p>
+              className="fixed inset-0 z-40 bg-ink/40"
+            />
           ) : null}
-          </div>
+          {isPhone ? createPortal(sheet, document.body) : sheet}
         </>
       ) : null}
     </div>

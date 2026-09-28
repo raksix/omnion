@@ -2604,6 +2604,19 @@ async function runOrganizationDepth(page, report) {
   await page.goto(`${URL_ADMIN}/organizations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);
 
+  // An organization account has exactly one organization, and the panel sends it straight to
+  // that tenant's overview instead of rendering a list it could only read one row of. The pass's
+  // owner is such an account, so `/organizations` is a *redirect*, not a list — and a harness
+  // that kept looking for a row link there found none, concluded "no organization to open", and
+  // skipped all five tenant depth passes with a reason that read like a product gap. The
+  // redirect is the product behaving correctly; the id is simply further down the URL.
+  const landed = /\/organizations\/([0-9a-f-]+)/.exec(page.url());
+  if (landed) {
+    note({ step: "redirected-to-tenant", organizationId: landed[1], url: page.url() });
+    const out = await runTenantDepthFromDetail(page, report, landed[1]);
+    return out;
+  }
+
   const rows = await page.locator("table tbody tr").count();
   const emptyState = await page.locator("text=No organizations yet").count();
   note({ step: "list", rows, emptyState: emptyState > 0 });
@@ -2632,8 +2645,37 @@ async function runOrganizationDepth(page, report) {
   await firstLink.click().catch(() => {});
   await page.waitForSelector("[data-members-heading]", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(900);
-  const detailUrl = page.url();
-  const organizationId = /\/organizations\/([0-9a-f-]+)/.exec(detailUrl)?.[1] || "";
+  const organizationId = /\/organizations\/([0-9a-f-]+)/.exec(page.url())?.[1] || "";
+  return runTenantDepthFromDetail(page, report, organizationId, { steps, note, email });
+}
+
+/**
+ * The tenant depth pass, starting from an organization that is already on screen.
+ *
+ * Both ways in converge here. A platform account reaches it by clicking a row of the list; an
+ * organization account is redirected to its own overview before the pass can look for a row, and
+ * arrives with the id already in the URL. Keeping one body means the two entry points cannot
+ * drift apart — a second copy of these assertions is a second set of things to forget to update.
+ */
+async function runTenantDepthFromDetail(page, report, organizationId, context) {
+  const steps = context ? context.steps : [];
+  const email = (context && context.email) || `qa-invite-${Date.now()}@omnion.test`;
+  const note =
+    context &&
+    context.note ||
+    ((step) => {
+      steps.push(step);
+      record({ page: "organizations-depth", action: "organizations", ...step });
+    });
+
+  if (!organizationId) {
+    const out = { steps, organizationId: null, email };
+    report.organizations = out;
+    log(`organizations depth: ${JSON.stringify(steps)}`);
+    return out;
+  }
+  await page.waitForSelector("[data-members-heading]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(900);
   const memberRows = await page.locator("[data-member-row]").count();
   note({ step: "detail", organizationId: Boolean(organizationId), memberRows });
   await shot(page, "page-organization-detail-members");
