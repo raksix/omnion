@@ -2741,3 +2741,42 @@
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+
+- **The mobile pass, and a QA failure that was the machine's and the harness's, not the code's.**
+  - **What.** The spec's own `Mobile (<1024px)` line was the last unbuilt acceptance item in
+    REQ-005, and it turned out to be *six* surfaces rather than the three the sentence names.
+    Every table in the tenant surface (organizations, members, invitations, the department tree
+    and the audit trail) now renders as cards below `md`; the organization switcher becomes a
+    bottom sheet under `sm`; the member drawer takes the whole screen below `sm`. Each card
+    carries the **same `data-*` hooks as the row it replaces** — the part that is easy to get
+    wrong, because a `data-organization-suspend` that lives in only one of the two renderings
+    silently halves what the desktop depth passes can drive, and the mobile pass then photographs
+    a layout no interaction has ever reached.
+  - **Why the switcher is a sheet.** A dropdown anchored to the right edge of a 390px screen puts
+    the longest organization name in the one place a thumb cannot reach it. The sheet is anchored
+    to the bottom edge, carries a backdrop and a close control, and its rows have a 44px floor —
+    and the pass reads that geometry rather than asserting that it opened, because "it opens" is
+    not a claim and a sheet can be open and still be wrong in four ways (rows under 44px, not
+    anchored, no backdrop, page scrolls sideways underneath it). Each is a finding.
+  - **Proof.** `cargo test -p omnion-identity --lib` → **144**, `cargo test -p omnion-api --lib`
+    → **146**, both green. `pnpm --filter @omnion/admin typecheck` clean and
+    `pnpm --filter @omnion/admin build` completes (the 44 routes, `ƒ Proxy (Middleware)`). The
+    walkthrough parses (`vm.Script`) and now walks `/organizations` and four tenant tabs at
+    390×844, plus the sheet's geometry, each recorded as a finding.
+  - **The QA pass failed, and the reason is worth more than the screens.** The first run walked
+    every route on schedule and reported `interact: iam-devices → 3 elements`,
+    `interact: organizations → 3 elements`, and the same for all ten analytics screens. Three
+    elements is the *sign-in form*. The cause is in the harness, not the panel: the generic
+    filler writes a sample value into every input, and on the sign-in form a sample address is a
+    real failed attempt — after ten, `sign_in_attempts` records `blocked / "10 recent failures
+    from this address"` and the address is refused. From that moment every later page renders the
+    login screen and the pass measures three elements, **with no error anywhere**. The failure is
+    silent because the sign-out is deferred and the session is renewed, so the run looks healthy
+    right up until it is not; the media depth passes after it all reported "no file to share"
+    because the session was gone. `b2a4e33` fills the sign-in form with the account that exists,
+    detected by the *path* rather than by the field's label — an `email` input is also how a
+    stranger's invite form asks for an address, and the QA owner must never be submitted into one.
+  - **Next.** Run the pass again on the fixed harness for the green walkthrough that closes slice
+    4, then the last acceptance line (`cargo test --workspace` + `pnpm build` + zero high
+    findings) and REQ-005's close. After that, the queue moves to REQ-017 (sandbox/staging).

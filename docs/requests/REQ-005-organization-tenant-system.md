@@ -8,8 +8,8 @@
 > shipped with them (`337c5bc`), and the suspend/archive flows closed the slice (`a25267a`).
 > **Slice 3 is complete** — a frozen tenant keeps every read, refuses every write by name, and
 > the status change itself is the one write that gets through, so a tenant can always be brought
-> back. Slice 4's events, retention sweep and webhook-isolation walk shipped earlier; **the
-> member drawer shipped with them** — the one screen the spec and the QA plan both name and
+> back. Slice 4's events, retention sweep and webhook-isolation walk shipped earlier; the
+> member drawer shipped with them — the one screen the spec and the QA plan both name and
 > neither had. What remains in slice 4 is the mobile pass and the green QA walkthrough.
 
 ## Request
@@ -215,6 +215,23 @@ automation engine uses; the token never appears in an event payload.
   tenant is a platform fact, queues 0 deliveries, and the following tick claims 0 — the endpoints
   subscribed to that very name must not receive it._
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
+- [x] Below 1024px the member table becomes cards, the department tree an indented list, tabs a
+  horizontal scroller, the switcher a sheet, and the usage bars stay labelled.
+  _`296bb84`. The tabs were already a scroller and the billing bars were already labelled (the
+  bars are a two-column grid that collapses to one, each `role="progressbar"` keeping its
+  `aria-valuetext`); the rest of the sentence was unbuilt and turned out to be **six** surfaces
+  rather than the three it names. Every table in the tenant surface now has a card rendering
+  below `md` — the organization list, members, invitations, the department tree and the audit
+  trail — and each card carries the same `data-*` hook as the row it replaces, so the existing
+  desktop depth passes keep driving the same elements and the mobile measurements are of a
+  layout some interaction can actually reach. The switcher is a bottom sheet under `sm`: a
+  dropdown anchored to the right edge of a 390px screen puts the longest organization name in
+  the one place a thumb cannot reach, and the sheet is anchored to the bottom edge with a
+  backdrop and a close control. The member drawer takes the whole screen below `sm`, because
+  `max-w-lg` beside a 390px viewport leaves every far-side control out of reach. The QA pass
+  walks all four tenant screens at 390×844 and reads the sheet's geometry — row height against
+  the 44px touch floor, bottom anchoring, backdrop presence and page overflow — each recorded as
+  a finding rather than a screenshot._
 
 ### QA plan
 
@@ -247,6 +264,20 @@ clipped copy on any tab.
    *Status:* **slice 4, first unit shipped** (`0d95b2d`). The module switch is no longer a stored intention: `module_routes()` in the identity crate is the single table of which module owns which path, one layer on the whole `/api/v1` router reads it, the refusal is `403 organization.module.disabled` naming the module and its product name, `/me/organizations` reports the tenant's disabled keys so the sidebar can drop the entry, and the round trip is proven in `switching_a_module_off_hides_its_api_and_switching_it_back_restores_it`. The lifecycle events named in the spec's table were already emitted by slices 1–3 (`organization.created/.updated/.suspended/.archived`, `.member.invited/.joined/.removed/.status_changed/.role_changed`, `.department.created/.updated/.archived`, `.limit.reached`, `.module.enabled/.disabled`), so what is left in this slice is the mobile pass and the `organization.member.joined` webhook-isolation walk. The retention sweep shipped after it (`b8f4c21`): `organization_settings.audit_retention_days` is no longer a stored intention. `omnion_audit::purge_before` is the only place a row leaves the trail, scoped by `organization_id` in the statement itself, and `apps/api/src/retention_runner.rs` walks the tenants whose own window has closed, removes what fell out of it, then files a system `organization.retention.swept` row and announces the same event with the count and the cutoff. Proven by `the_retention_sweep_applies_each_tenants_own_window` (two tenants, two windows, and the only assertion that catches a platform-wide default is the one on the tenant that *kept* its 100-day-old row) and `a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept` (a tenant with no settings row is held to the 365-day default rather than skipped, because a settings row missing after the backfill would otherwise keep a history forever).
    *Status:* **slice 4's done-when is now proven** (`d9e2ab3`). `a_members_join_reaches_only_the_tenant_it_belongs_to` in `apps/api/tests/events.rs` gives each of two tenants an endpoint subscribed to `organization.member.joined` and a real loopback receiver, adds a third endpoint *inside tenant A subscribed to a different name* — subscription filtering and organization filtering are separate rules, and a walk that only tests the first can pass an implementation that ignores the second — and then drives **both** routes that emit the name: the administrative add-member and the invitation acceptance. Each tenant's join reaches its own receiver naming its own organization and member; the delivery history and the event feed agree; tenant B's receiver does not move when tenant A accepts somebody. The walk's last third is the direction a name-only fan-out gets wrong: a fact belonging to **no** tenant is a platform fact, and it must queue 0 deliveries and leave the next tick idle, rather than reaching every endpoint subscribed to that very name.
    *Status:* **the member drawer shipped** — the screen the spec's Members bullet and the QA plan both name ("open a member drawer and extend a binding") and which did not exist until this slice. Reading it first turned up a gap that is worth recording on its own: the spec lists three operations — **add / extend / revoke** — and the platform had verbs for two of them. `POST /api/v1/iam/bindings` granted and `DELETE /iam/bindings/{id}` revoked, but nothing could *lengthen* a temporary grant, so giving somebody another month meant revoking and re-granting. `bindings::extend_expiry` is the new store operation and it deliberately updates **the same row**: the alternative leaves two live bindings for one role and scope, which the effective-permissions screen then renders as the same role twice with two different windows, neither of them the truth. `a_temporary_grant_is_extended_in_place_and_never_into_a_second_row` is the walk that catches that, and the assertion that catches it is a *count* — a revoke-and-re-grant passes every other line. The drawer's own surface is `GET /api/v1/organizations/{id}/members/{user_id}` (one request, so a half-filled panel is not a rendering choice but a failure), plus the three binding operations beside it; a member of another tenant is a `404`, and a grant is refused when the subject is not a member or the role belongs elsewhere, so a tenant cannot end up with a binding applying to nobody.
+   *Status:* **the mobile pass shipped** (`296bb84`) — the spec's own `Mobile (<1024px)` line was
+   the last unbuilt acceptance item in the whole request, and it turned out to be *six* surfaces
+   with no phone layout at all rather than one. Every table in the tenant surface (the
+   organization list, members, invitations, the department tree and the audit trail) now renders
+   as cards below `md`; the switcher becomes a bottom sheet under `sm`; the member drawer takes
+   the whole screen below `sm`. Each card carries the **same `data-*` hooks as the row it
+   replaces**, which is the part that matters and is easy to get wrong: a `data-organization-suspend`
+   or a `data-audit-row` that exists in only one of the two renderings silently halves what the
+   desktop depth passes can drive, and the mobile pass then measures a layout no interaction has
+   ever reached. The pass walks all four tenant screens at 390px and reads the switcher sheet's
+   *geometry* — row height against the 44px floor, whether the sheet reaches the bottom edge,
+   whether a backdrop exists, and whether the page scrolls sideways underneath it — because
+   "it opens" is not a claim; "it opens and every row is thumb-sized and the screen behind it is
+   inert" is.
 
 ### Risks / notes
 
