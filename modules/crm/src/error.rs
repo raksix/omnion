@@ -40,6 +40,11 @@ pub enum CrmError {
     /// deal without a reason).
     #[error("invalid stage change: {0}")]
     InvalidStageChange(String),
+    /// A model answered with nothing a person could read — only markup, only whitespace. Distinct
+    /// from a failure: the call worked, the answer did not, and the panel has to say so rather
+    /// than render an empty draft as though the model had written one.
+    #[error("the assistant returned an empty answer — try again")]
+    EmptyAnswer,
     /// PostgreSQL refused or could not answer.
     #[error("crm storage error: {0}")]
     Database(#[from] sqlx::Error),

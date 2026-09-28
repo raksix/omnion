@@ -22,6 +22,7 @@
 
 pub mod activities;
 pub mod contacts;
+pub mod copilot;
 pub mod csv;
 pub mod dates;
 pub mod deals;
