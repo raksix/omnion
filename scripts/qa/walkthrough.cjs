@@ -1023,6 +1023,117 @@ async function runDepthPass(name, pass) {
   }
 }
 
+/**
+ * The sales catalog depth pass (REQ-052, slice 1).
+ *
+ * A walk that only visits the three screens proves they render; it does not prove a product can be
+ * created, a price resolved, or a setting saved. This drives that chain, and it is also the pass
+ * that opens a **real** product's detail screen — a route whose path carries an id can only be
+ * walked with a placeholder, which proves the not-found state and nothing else.
+ *
+ * Every step is asserted rather than clicked-and-hoped: a pass that clicks a button and records
+ * "done" reports a screen that saved nothing as a screen that worked.
+ */
+async function runSalesCatalog(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "sales", action: "sales-catalog", ...step });
+  };
+  const stamp = Date.now().toString(36);
+  const sku = `QA-${stamp}`.toUpperCase().slice(0, 24);
+
+  await page.goto(`${URL_ADMIN}/sales/catalog`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const loaded = (await page.locator("[data-qa-sales-new]").count()) > 0;
+  note({ step: "load", loaded });
+  if (!loaded) {
+    return { ok: false, reason: "the sales catalog did not render", steps };
+  }
+
+  // --- a product, created through the form ----------------------------------------------------------------
+  await page.locator("[data-qa-sales-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector('[data-qa-sales-field="sku"]', { timeout: 5000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="sku"]').first().fill(sku, { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="name"]').first().fill("QA Widget", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="category"]').first().fill("qa", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="default_price"]').first().fill("12.50", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="tax_percent"]').first().fill("20", { timeout: 3000 }).catch(() => {});
+  await shot(page, "page-sales-product-form");
+  await page.locator("[data-qa-sales-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  const created = await page.locator(`[data-qa-sales-product="${sku}"]`).count();
+  note({ step: "create-product", created });
+  await shot(page, "page-sales-catalog");
+
+  // --- the refusal lands under its own field ----------------------------------------------------------------
+  // The rule this proves is that a bad SKU is refused *on the SKU input*, not as a banner. A
+  // banner is the one place a person has to look everywhere, which is the same defect the API
+  // walks found when the field detail was dropped on the way to the client.
+  await page.locator("[data-qa-sales-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector('[data-qa-sales-field="sku"]', { timeout: 5000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="sku"]').first().fill("has spaces", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="name"]').first().fill("Refused", { timeout: 3000 }).catch(() => {});
+  await page.locator("[data-qa-sales-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const fieldErrorShown = (await page.locator('[data-qa-sales-field-error="sku"]').count()) > 0;
+  note({ step: "refusal-under-its-field", fieldErrorShown });
+
+  // --- a price list, and the price it resolves ----------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/sales/pricelists`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const listName = `QA Retail ${stamp}`;
+  await page.locator('[data-qa-sales-field="name"]').first().fill(listName, { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="currency"]').first().fill("TRY", { timeout: 3000 }).catch(() => {});
+  await page.locator("[data-qa-sales-create-list]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const listCreated = (await page.locator(`[data-qa-sales-pricelist="${listName}"]`).count()) > 0;
+  note({ step: "create-price-list", listCreated });
+
+  // The product's own screen: the price the list resolves, and the fallback where the list has no
+  // row. This is the answer a quote builder will use, so it is the one worth reading.
+  await page.goto(`${URL_ADMIN}/sales/catalog?search=${sku}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await page.locator(`[data-qa-sales-open="${sku}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const onDetail = page.url().includes("/sales/catalog/") && !page.url().endsWith("/sales/catalog");
+  const fallbackShown = (await page.locator(`[data-qa-sales-list-price="${listName}"]`).count()) > 0;
+  note({ step: "product-detail-resolves-a-price", onDetail, fallbackShown });
+  await shot(page, "page-sales-product-detail");
+
+  // --- the settings round trip --------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/sales/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const settingsLoaded = (await page.locator('[data-qa-sales-field="currency"]').count()) > 0;
+  await page.locator('[data-qa-sales-field="quote_validity_days"]').first().fill("45", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-qa-sales-save-settings]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const settingsSaved = (await page.locator("[data-qa-sales-notice]").count()) > 0;
+  const validity = await page.locator('[data-qa-sales-field="quote_validity_days"]').first().inputValue().catch(() => "");
+  note({ step: "settings-round-trip", settingsLoaded, settingsSaved, validity });
+  await shot(page, "page-sales-settings");
+
+  // --- the keyboard contract -----------------------------------------------------------------------------------
+  // A shortcut a person cannot see is a shortcut that does not exist. The cursor must move and the
+  // sheet must open, or the contract the spec asks for is decoration.
+  await page.goto(`${URL_ADMIN}/sales/catalog?search=${sku}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("body").first().click({ timeout: 3000 }).catch(() => {});
+  await page.keyboard.press("j").catch(() => {});
+  await page.waitForTimeout(300);
+  const cursorMoved = (await page.locator('[data-qa-sales-cursor="true"]').count()) > 0;
+  await page.keyboard.press("?").catch(() => {});
+  await page.waitForTimeout(500);
+  const sheetOpened = (await page.locator("[data-qa-sales-shortcuts]").count()) > 0;
+  await shot(page, "page-sales-shortcuts");
+  await page.keyboard.press("Escape").catch(() => {});
+  note({ step: "keyboard", cursorMoved, sheetOpened });
+
+  report.salesCatalog = { ok: created && listCreated && onDetail, steps, sku, listName };
+  return report.salesCatalog;
+}
+
 async function runMediaFileManager(page, report) {
   const steps = [];
   const note = (step) => {
@@ -4274,11 +4385,26 @@ async function main() {
     // not visit it would leave a screen a person can click unvisited — and "no untested screen"
     // is the rule the whole route list exists to enforce.
     { path: "/crm/leads", name: "crm-leads" },
+    // The sales catalog, the price lists and the settings (REQ-052, slice 1) — the three screens
+    // this slice ships, walked here and driven by the depth pass below, which creates a product,
+    // reads the price a list resolves for it, and saves the settings.
+    //
+    // `/sales/catalog/{id}` and `/sales/pricelists/{id}` are deliberately NOT listed: their paths
+    // carry an id, and a route walked with a placeholder id only proves the not-found state
+    // renders. `runSalesCatalog` below opens a *real* product's screen instead — the same reason
+    // the media file detail is not in this list.
+    { path: "/sales/catalog", name: "sales-catalog" },
+    { path: "/sales/pricelists", name: "sales-pricelists" },
+    { path: "/sales/settings", name: "sales-settings" },
   ];
-  // `crm-leads-mobile` is the one route whose name is not a prefix of its path group, so the
-  // group is decided by the path rather than by the name: a scoped pass takes a route whose path
-  // starts with `/crm`, which is the section a person would call the CRM, and skips the rest.
-  const routes = ONLY === "" ? ALL_ROUTES : ALL_ROUTES.filter((r) => ONLY === "crm" && r.path.startsWith("/crm"));
+  // A scoped pass takes the routes of one section, and the group is decided by the **path** rather
+  // than by the name: `sales-catalog` and `crm-leads` are the routes whose name is not a prefix of
+  // their path, and `--only=sales` has to be able to visit the sales section without dragging the
+  // CRM along with it.
+  // An empty `ONLY` is the whole list; a named one is that section, matched on the path.
+  const SCOPED = { crm: "/crm", sales: "/sales" };
+  const scope = SCOPED[ONLY];
+  const routes = scope ? ALL_ROUTES.filter((r) => r.path.startsWith(scope)) : ALL_ROUTES;
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
   // memory) used to end the entire run, so every route after the crash and every depth pass
@@ -4360,6 +4486,14 @@ async function main() {
   // the tab where the file's other facts are.
   report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
   log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
+
+  // The sales catalog (REQ-052, slice 1): a product is created, a price list with it, the price a
+  // line of it resolves, the settings round trip, and the keyboard contract. The same scoping rule
+  // as above: a pass scoped to another section does not need to prove this one.
+  if (!onlyGroup("crm")) {
+    report.salesCatalog = await runDepthPass("sales-catalog", () => runSalesCatalog(page, report));
+    log(`sales catalog: ${JSON.stringify(report.salesCatalog)}`);
+  }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);

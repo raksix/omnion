@@ -246,7 +246,14 @@ impl Fixture {
 
 /// Create an organization row with a unique slug.
 async fn create_organization_row(db: &Db, label: &str) -> Uuid {
-    let slug = format!("sales-fix-{label}-{}", Uuid::new_v4().simple());
+    // The slug column is `[a-z0-9-]` only, so a readable label has to be folded into it here. A
+    // helper that silently cannot be called with a word in capitals is a helper whose second call
+    // site is a schema error instead of a row.
+    let slug = format!(
+        "sales-fix-{}-{}",
+        label.to_lowercase().replace([' ', '_'], "-"),
+        Uuid::new_v4().simple()
+    );
     sqlx::query_scalar("insert into organizations (name, slug) values ($1, $2) returning id")
         .bind(format!("Sales Test {label}"))
         .bind(&slug)
@@ -387,17 +394,25 @@ fn sku(label: &str) -> String {
 }
 
 /// Create a product and return its id, failing loudly with the body if the create was refused.
+///
+/// `organization` is named when the caller is a platform account. A tenant-bound account ignores
+/// it, and an account that is bound to nothing cannot be left to guess.
 async fn create_product(state: &AppState, token: &str, body: Value) -> Uuid {
-    let response = call(
-        state,
-        request(
-            Method::POST,
-            "/api/v1/sales/products",
-            Some(token),
-            Some(body),
-        ),
-    )
-    .await;
+    create_product_in(state, token, body, None).await
+}
+
+/// [`create_product`] with the organization named.
+async fn create_product_in(
+    state: &AppState,
+    token: &str,
+    body: Value,
+    organization: Option<Uuid>,
+) -> Uuid {
+    let uri = match organization {
+        Some(id) => format!("/api/v1/sales/products?organization_id={id}"),
+        None => "/api/v1/sales/products".to_owned(),
+    };
+    let response = call(state, request(Method::POST, &uri, Some(token), Some(body))).await;
     assert_eq!(
         response.status,
         StatusCode::CREATED,
@@ -407,16 +422,25 @@ async fn create_product(state: &AppState, token: &str, body: Value) -> Uuid {
     Uuid::parse_str(response.body["id"].as_str().expect("an id")).expect("an id")
 }
 
-/// Create a price list and return its id.
+/// Create a price list and return its id, naming the organization when the caller must.
 async fn create_price_list(state: &AppState, token: &str, name: &str) -> Uuid {
+    create_price_list_in(state, token, name, None).await
+}
+
+/// [`create_price_list`] with the organization named.
+async fn create_price_list_in(
+    state: &AppState,
+    token: &str,
+    name: &str,
+    organization: Option<Uuid>,
+) -> Uuid {
+    let uri = match organization {
+        Some(id) => format!("/api/v1/sales/pricelists?organization_id={id}"),
+        None => "/api/v1/sales/pricelists".to_owned(),
+    };
     let response = call(
         state,
-        request(
-            Method::POST,
-            "/api/v1/sales/pricelists",
-            Some(token),
-            Some(json!({ "name": name })),
-        ),
+        request(Method::POST, &uri, Some(token), Some(json!({ "name": name }))),
     )
     .await;
     assert_eq!(
@@ -1435,7 +1459,7 @@ async fn the_catalog_list_filters_and_refuses_an_unknown_sort() {
         state,
         request(
             Method::GET,
-            &format!("/api/v1/sales/products?category=markers"),
+            "/api/v1/sales/products?category=markers",
             Some(&manager),
             None,
         ),
@@ -1738,6 +1762,141 @@ async fn a_reader_may_look_and_may_not_touch() {
             refused.body
         );
     }
+}
+
+/// A platform account follows its own links, on an installation with more than one organization.
+///
+/// The tenant has to be **nameable on every route**, not only on the lists. The lists carried
+/// `organization_id` and the single-record routes did not, so the platform Owner could open
+/// `/sales/catalog`, see three tenants' worth of rows, and then be refused by
+/// `organization_ambiguous` the moment it clicked one — a screen whose own list is unreachable by
+/// its own links. This is that click, as a walk.
+#[tokio::test]
+async fn a_platform_account_may_follow_its_own_row_on_a_multi_tenant_installation() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let (_owner_id, owner) = fixture.owner_account().await;
+    let token = fixture.token(&owner).await;
+
+    // A second organization is what makes the installation ambiguous on purpose: with only one,
+    // the single-organization fallback would answer for it and this walk would prove nothing.
+    let other_org = create_organization_row(&fixture.db, "Ambiguity").await;
+    assert_ne!(other_org, fixture.org);
+
+    let product = create_product_in(
+        state,
+        &token,
+        json!({ "sku": sku("PLAT"), "name": "Platform reachable", "default_price": "12.50" }),
+        Some(fixture.org),
+    )
+    .await;
+    let list = create_price_list_in(
+        state,
+        &token,
+        &format!("Platform {}", &Uuid::new_v4().simple().to_string()[..6]),
+        Some(fixture.org),
+    )
+    .await;
+
+    // Without the tenant named, the account is refused with advice it cannot follow — that is the
+    // shape of the bug, and it is worth proving so the fix cannot be undone quietly.
+    let ambiguous = call(
+        state,
+        request(Method::GET, &format!("/api/v1/sales/products/{product}"), Some(&token), None),
+    )
+    .await;
+    assert_eq!(
+        ambiguous.status,
+        StatusCode::BAD_REQUEST,
+        "with two organizations the account must be told to name one: {}",
+        ambiguous.body
+    );
+
+    // Every read and write on a single record accepts it, which is the whole point.
+    let read = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/sales/products/{product}?organization_id={}", fixture.org),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "body: {}", read.body);
+    // The row the list linked to is the row that answers, by its own fields.
+    assert_eq!(read.body["id"], product.to_string());
+    assert_eq!(read.body["name"], "Platform reachable");
+
+    let priced = call(
+        state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/sales/products/{product}/price?quantity=2&organization_id={}",
+                fixture.org
+            ),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(priced.status, StatusCode::OK, "body: {}", priced.body);
+    // The answer is the **unit** price, not a line total: the quantity multiplies in the quote,
+    // and a resolver that answered a total would make the builder multiply it a second time.
+    assert_eq!(priced.body["unit_price"], "12.50", "body: {}", priced.body);
+    assert_eq!(priced.body["quantity"], "2.000", "the quantity echoes with its scale: {}", priced.body);
+    assert_eq!(
+        priced.body["source"], "default",
+        "with no list named the answer is the product's own price, and says so: {}",
+        priced.body
+    );
+
+    let list_read = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/sales/pricelists/{list}?organization_id={}", fixture.org),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(list_read.status, StatusCode::OK, "body: {}", list_read.body);
+
+    let edited = call(
+        state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/sales/products/{product}?organization_id={}", fixture.org),
+            Some(&token),
+            Some(json!({ "name": "Platform renamed" })),
+        ),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::OK, "body: {}", edited.body);
+    assert_eq!(edited.body["name"], "Platform renamed");
+
+    // And the tenant may not be swapped for another one on a write — the parameter names which
+    // catalog to look in, it does not move the row.
+    let foreign = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/sales/products/{product}?organization_id={other_org}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign.status,
+        StatusCode::NOT_FOUND,
+        "naming another tenant's organization must not reach our row: {}",
+        foreign.body
+    );
 }
 
 impl Fixture {
