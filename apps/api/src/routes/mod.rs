@@ -93,10 +93,12 @@ pub mod media_scan;
 mod media_settings;
 pub mod media_shares;
 pub mod media_transform;
+pub mod media_usage;
 pub mod media_versions;
 pub mod observability;
 pub mod observability_alerts;
 pub mod observability_traces;
+pub mod notifications;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -619,6 +621,16 @@ pub fn router(state: AppState) -> Router {
     let media_file_hold: MethodRouter<AppState, Infallible> =
         put(media_retention::set_file_hold).layer(guards::require(&state, "media.settings.manage"));
 
+    // Usage and activity (REQ-010, slice 4). Both reads are `media.read` on purpose: where a
+    // file is used and what has been done to it are the same power as opening it, and neither
+    // list contains anything the caller could not already read from the file itself. A separate
+    // key would be a second opinion rather than a boundary — and the reader who most needs the
+    // trail is the one with the fewest keys.
+    let media_references: MethodRouter<AppState, Infallible> =
+        get(media_usage::references).layer(guards::require(&state, "media.read"));
+    let media_activity: MethodRouter<AppState, Infallible> =
+        get(media_usage::activity).layer(guards::require(&state, "media.read"));
+
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
     let public_pages = get(public::get_published_page);
@@ -765,6 +777,32 @@ pub fn router(state: AppState) -> Router {
         .merge(delete(commands::clear))
         .layer(guards::require(&state, "search.read"));
     let command_run = post(commands::run);
+
+    // Notifications (docs/requests/REQ-021, slice 1). Two powers, split by *whose* inbox:
+    // `notifications.read` is a person's own (owner-scoped in the store, so it grants nothing
+    // about anybody else and belongs to every role), and `notifications.send` writes into
+    // *other* people's inboxes — the one worth guarding, because an account that may only
+    // notify itself cannot be used to reach the rest of the organization.
+    //
+    // The static segments are declared before `/notifications/{id}` so axum ranks them ahead
+    // of the parameter route — the same reason `/media/settings` is spelled as a literal.
+    let notifications_list =
+        get(notifications::list).layer(guards::require(&state, "notifications.read"));
+    let notifications_summary =
+        get(notifications::summary).layer(guards::require(&state, "notifications.read"));
+    let notifications_bulk =
+        post(notifications::bulk).layer(guards::require(&state, "notifications.read"));
+    let notifications_mark_all =
+        post(notifications::mark_all_read).layer(guards::require(&state, "notifications.read"));
+    let notifications_emit =
+        post(notifications::emit).layer(guards::require(&state, "notifications.send"));
+    let notifications_entry = get(notifications::get)
+        .layer(guards::require(&state, "notifications.read"))
+        .merge(
+            delete(notifications::delete).layer(guards::require(&state, "notifications.read")),
+        );
+    let notifications_read = post(notifications::set_read)
+        .layer(guards::require(&state, "notifications.read"));
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -1150,6 +1188,16 @@ pub fn router(state: AppState) -> Router {
         .route("/command-center/context", command_context)
         .route("/command-center/resolve", command_resolve)
         .route("/command-center/recent", command_recent)
+        // Notifications (REQ-021, slice 1). The static segments (`summary`, `bulk`,
+        // `mark-all-read`, `emit`) are declared before the `{id}` routes, which is what makes
+        // axum rank them ahead of the parameter route.
+        .route("/notifications", notifications_list)
+        .route("/notifications/summary", notifications_summary)
+        .route("/notifications/bulk", notifications_bulk)
+        .route("/notifications/mark-all-read", notifications_mark_all)
+        .route("/notifications/emit", notifications_emit)
+        .route("/notifications/{id}", notifications_entry)
+        .route("/notifications/{id}/read", notifications_read)
         .route(
             "/analytics/settings",
             analytics_settings_read.merge(analytics_settings_write),
@@ -1285,6 +1333,10 @@ pub fn router(state: AppState) -> Router {
         .route("/media/{id}/shares", media_share_create)
         .route("/media/{id}/shares/revoke-all", media_share_revoke_all)
         .route("/media/{id}/shares/{share_id}", media_share_revoke)
+        // Usage and activity (REQ-010, slice 4): the two reads the file-detail screen's last
+        // two tabs are made of.
+        .route("/media/{id}/references", media_references)
+        .route("/media/{id}/activity", media_activity)
         .route("/media/transformation-presets", media_presets)
         // The duplicate report and its merge. `duplicates` is a static segment declared before
         // `/media/{id}/…`, so axum ranks it ahead of the parameter route — same rule the

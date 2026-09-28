@@ -281,6 +281,44 @@ pub async fn recent(
     Ok(entries)
 }
 
+/// Every entry recorded **against one record**, newest first.
+///
+/// `target_types` is a list rather than one string because a platform surfaces legitimately
+/// disagree about what a record's target is called: the media library writes `media` for the
+/// bytes of a file and `media_file` for a grant placed on it, and both are things that happened
+/// *to that file*. A single target type would therefore answer half the story, and the half it
+/// dropped is the half about access — which is the part a reader asks the trail for.
+///
+/// `target_id` is text, not a uuid, because `audit_log.target_id` deliberately is (it may hold a
+/// slug). Binding a `&str` against a uuid column fails at runtime rather than at compile time on
+/// sqlx's untyped path, so the cast is written here once rather than by every caller.
+pub async fn for_target(
+    pool: &PgPool,
+    target_id: &str,
+    target_types: &[&str],
+    limit: i64,
+) -> Result<Vec<AuditEntry>> {
+    if target_types.is_empty() {
+        // An empty `any()` is `false`, so this would answer "nothing happened" — a plausible
+        // empty list for a screen that is about to render it as an empty state. Say so instead.
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "select {AUDIT_COLUMNS} from audit_log \
+         where target_id = $1 and target_type = any($2) \
+         order by created_at desc, id desc limit $3"
+    );
+
+    let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
+        .bind(target_id)
+        .bind(target_types)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

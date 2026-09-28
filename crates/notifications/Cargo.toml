@@ -1,0 +1,16 @@
+[package]
+name = "omnion-notifications"
+description = "Omnion notifications: the in-app record, its per-user matrix and its delivery queue."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
