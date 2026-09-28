@@ -96,6 +96,7 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod notifications;
 pub mod onboarding;
 pub mod patterns;
 pub mod public;
@@ -830,6 +831,32 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "search.read"));
     let command_run = post(commands::run);
 
+    // Notifications (docs/requests/REQ-021, slice 1). Two powers, split by *whose* inbox:
+    // `notifications.read` is a person's own (owner-scoped in the store, so it grants nothing
+    // about anybody else and belongs to every role), and `notifications.send` writes into
+    // *other* people's inboxes — the one worth guarding, because an account that may only
+    // notify itself cannot be used to reach the rest of the organization.
+    //
+    // The static segments are declared before `/notifications/{id}` so axum ranks them ahead
+    // of the parameter route — the same reason `/media/settings` is spelled as a literal.
+    let notifications_list =
+        get(notifications::list).layer(guards::require(&state, "notifications.read"));
+    let notifications_summary =
+        get(notifications::summary).layer(guards::require(&state, "notifications.read"));
+    let notifications_bulk =
+        post(notifications::bulk).layer(guards::require(&state, "notifications.read"));
+    let notifications_mark_all =
+        post(notifications::mark_all_read).layer(guards::require(&state, "notifications.read"));
+    let notifications_emit =
+        post(notifications::emit).layer(guards::require(&state, "notifications.send"));
+    let notifications_entry = get(notifications::get)
+        .layer(guards::require(&state, "notifications.read"))
+        .merge(
+            delete(notifications::delete).layer(guards::require(&state, "notifications.read")),
+        );
+    let notifications_read = post(notifications::set_read)
+        .layer(guards::require(&state, "notifications.read"));
+
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
     // resolve the site through the caller's own organization. The collection endpoint is the
@@ -939,6 +966,16 @@ pub fn router(state: AppState) -> Router {
         .route("/command-center/context", command_context)
         .route("/command-center/resolve", command_resolve)
         .route("/command-center/recent", command_recent)
+        // Notifications (REQ-021, slice 1). The static segments (`summary`, `bulk`,
+        // `mark-all-read`, `emit`) are declared before the `{id}` routes, which is what makes
+        // axum rank them ahead of the parameter route.
+        .route("/notifications", notifications_list)
+        .route("/notifications/summary", notifications_summary)
+        .route("/notifications/bulk", notifications_bulk)
+        .route("/notifications/mark-all-read", notifications_mark_all)
+        .route("/notifications/emit", notifications_emit)
+        .route("/notifications/{id}", notifications_entry)
+        .route("/notifications/{id}/read", notifications_read)
         .route(
             "/analytics/settings",
             analytics_settings_read.merge(analytics_settings_write),

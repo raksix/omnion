@@ -975,3 +975,83 @@ export type OwnerSetupResult = {
   user: User;
   onboarding: OnboardingStatus;
 };
+
+
+// ---------------------------------------------------------------------------------------------
+// Notifications (docs/requests/REQ-021, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** One notification as the panel reads it. */
+export type NotificationRow = {
+  id: string;
+  category: string;
+  priority: string;
+  title: string;
+  body: string;
+  /** Where its link goes; `null` means the panel must not render a link. */
+  url: string | null;
+  source_type: string | null;
+  source_id: string | null;
+  payload: unknown;
+  read_at: string | null;
+  archived_at: string | null;
+  created_at: string;
+};
+
+/** One grouped line of the bell. */
+export type NotificationCategoryCount = {
+  category: string;
+  count: number;
+};
+
+/** The bell's numbers: one total, and one line per category including the empty ones. */
+export type NotificationSummary = {
+  unread: number;
+  by_category: NotificationCategoryCount[];
+};
+
+/** A page of the list, with the cursor for the next one. */
+export type NotificationPage = {
+  notifications: NotificationRow[];
+  has_more: boolean;
+  next_before: string | null;
+};
+
+/** What one bulk action really changed, and the unread count after it. */
+export type NotificationBulkResult = {
+  action: string;
+  changed: number;
+  unread: number;
+};
+
+/** The filters the list accepts; every field is optional and every one is shareable in a URL. */
+export type NotificationFilters = {
+  category?: string;
+  read?: "unread" | "read";
+  priority?: string;
+  channel?: string;
+  archived?: boolean;
+  with_read?: boolean;
+  before?: string;
+  limit?: number;
+};
+
+/** The closed vocabulary, so the panel never hard-codes what the server already knows. */
+export const NOTIFICATION_CATEGORIES = [
+  "approval",
+  "security",
+  "update",
+  "ticket",
+  "system",
+  "mention",
+] as const;
+
+export const NOTIFICATION_PRIORITIES = ["low", "normal", "high", "critical"] as const;
+
+export const NOTIFICATION_CHANNELS = [
+  "in_app",
+  "email",
+  "web_push",
+  "webhook",
+  "chat",
+] as const;

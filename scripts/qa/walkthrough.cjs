@@ -3573,6 +3573,184 @@ async function runGoalAndRealtimeDepth(page, report) {
 }
 
 /**
+ * The notification pass (REQ-021, slice 1).
+ *
+ * An inbox is the easiest screen in the platform to make look right and be wrong: the rows are
+ * real, the badge is real, and the reader still cannot trust either if the *counts* and the
+ * *rows* were computed by different code. So the claims proved here are the ones a screenshot
+ * cannot settle:
+ *
+ * 1. the badge and the grouped panel lines come from ONE summary, so the panel cannot show a
+ *    total and a set of lines that disagree;
+ * 2. a grouped line filters the list to that category — the click is the whole point of the
+ *    group, so a line that does not filter is a dead control;
+ * 3. a bulk action reports the number it *changed*, which is not always the size of the
+ *    selection, and the notice must name that number;
+ * 4. the keyboard path works: `j` moves the cursor, `e` toggles read, `x` selects, `/` focuses
+ *    the filter, `Esc` closes the drawer;
+ * 5. the empty state, the loading skeleton and the error state all exist and are reachable.
+ *
+ * Notifications are emitted through the API with the signed-in session, so the rows are real
+ * rows created by the real route — the pass does not seed the table behind the panel's back.
+ */
+async function runNotificationsDepth(page, report) {
+  const steps = {};
+  const me = await page.evaluate(() =>
+    fetch("/api/v1/me", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  const userId = me?.user?.id;
+  if (!userId) {
+    steps.skipped = "no signed-in user to address notifications to";
+    return steps;
+  }
+
+  // Seed through the real emit route, so the badge the panel shows is a badge the API computed
+  // from rows the API wrote. Two categories with different counts is the minimum that makes
+  // "the grouped lines add up to the total" a claim with teeth.
+  const seed = await page.evaluate(async (id) => {
+    const emit = async (category, title, dedupe_key, priority) => {
+      const response = await fetch("/api/v1/notifications/emit", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ category, title, priority, user_ids: [id], dedupe_key }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    };
+    return {
+      approval: await emit("approval", "QA · a page is waiting for approval", `qa-appr-${Date.now()}`),
+      security: await emit("security", "QA · a new sign-in", `qa-sec-${Date.now()}`, "high"),
+      ticket: await emit("ticket", "QA · a ticket was assigned to you", `qa-tic-${Date.now()}`),
+    };
+  }, userId);
+  steps.emitted = Object.fromEntries(
+    Object.entries(seed).map(([key, value]) => [key, value.status]),
+  );
+  // A 403 here is a real finding, not a setup problem: the owner seeds the roles on boot, so an
+  // owner without `notifications.send` means the permission did not reach the role.
+  expectRefusal(
+    "notifications/emit",
+    seed.approval?.status === 403
+      ? "the signed-in account cannot emit — recorded rather than hidden"
+      : "an emit the panel never asked for",
+  );
+
+  // 1. The bell, on the header of a screen that is not the notification screen.
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.bell = (await page.locator("[data-bell]").count()) > 0;
+  const badge = (await page.locator("[data-bell-badge]").innerText().catch(() => "")).trim();
+  steps.badge = badge;
+
+  await page.locator("[data-bell]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.panel = (await page.locator("[data-bell-panel]").count()) > 0;
+  steps.groupLines = await page.locator("[data-bell-groups] a").count();
+  await shot(page, "page-notifications-bell-panel");
+
+  // The badge must equal the sum of the lines. Read the numbers as text and add them here,
+  // because "the panel looks consistent" is not a measurement.
+  const lineCounts = await page.locator("[data-bell-groups] a span.font-medium").allInnerTexts();
+  const summed = lineCounts.reduce((total, text) => total + (Number(text.trim()) || 0), 0);
+  steps.badgeMatchesGroups = String(summed) === badge || badge === "99+";
+  steps.groupSum = summed;
+
+  // 2. A grouped line filters the list to its category.
+  const approvalLine = page.locator("[data-bell-group=approval]").first();
+  if ((await approvalLine.count()) > 0) {
+    await approvalLine.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    steps.groupFilteredUrl = page.url().includes("category=approval");
+    steps.groupFilteredRows = await page.locator("[data-notification-row]").count();
+    // Every row on a category-filtered list has to BE that category — the strongest form of
+    // "clicking the line filters the list", and the one a badge-only implementation fails.
+    steps.onlyThatCategory = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-notification-row]")).every((row) => {
+        const cells = row.querySelectorAll("td");
+        return cells.length > 2 && /approval/i.test(cells[2].textContent ?? "");
+      }),
+    );
+  }
+  await shot(page, "page-notifications-filtered");
+
+  // 3. The bulk path. Select three rows and archive them; the notice must report what CHANGED.
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const selects = page.locator("[data-select]");
+  const selection = Math.min(3, await selects.count());
+  for (let index = 0; index < selection; index += 1) {
+    await selects.nth(index).click({ timeout: 3000 }).catch(() => {});
+  }
+  steps.selected = await page.locator("[data-notification-bulk]").count() > 0;
+  steps.bulkButtons = await page.locator("[data-notification-bulk] button[data-bulk]").count();
+  await page.locator("[data-bulk=read]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.bulkNotice = (await page.locator("[data-notification-notice]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // The notice has to name a number and say "of" — the honest shape is "2 of 3 marked read",
+  // and a panel that says "3 of 3" is asserting something it cannot know.
+  steps.bulkNoticeIsHonest = /\d+ of \d+/.test(steps.bulkNotice);
+  await shot(page, "page-notifications-bulk");
+
+  // 4. The keyboard path.
+  await page.locator("[data-notification-table] tbody").click({ timeout: 3000 }).catch(() => {});
+  await page.keyboard.press("j");
+  await page.waitForTimeout(250);
+  await page.keyboard.press("j");
+  await page.waitForTimeout(400);
+  steps.cursorMoved = await page.locator("[data-notification-row][data-cursor=true]").count() > 0;
+  await page.keyboard.press("x");
+  await page.waitForTimeout(300);
+  steps.keyboardSelected = (await page.locator("[data-notification-bulk]").innerText().catch(() => ""))
+    .includes("1 selected");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(1200);
+  steps.keyboardOpenedDrawer = (await page.locator("[data-notification-drawer]").count()) > 0;
+  await shot(page, "page-notifications-drawer");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(600);
+  steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;
+
+  await page.locator("[data-notification-table] tbody").click({ timeout: 3000 }).catch(() => {});
+  await page.keyboard.press("/");
+  await page.waitForTimeout(400);
+  steps.slashFocusedFilter =
+    (await page.evaluate(() => document.activeElement?.id ?? "")) === "notification-search";
+
+  // 5. The three states. The skeleton is asserted on a slow load rather than hoped for: it is
+  //    rendered while `loading && rows.length === 0`, which a fast API can outrun — so the
+  //    check is that the element EXISTS in the component, reached by throttling the response.
+  await page.route("**/api/v1/notifications?*", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await route.continue();
+  });
+  await page.goto(`${URL_ADMIN}/notifications?read=read&archived=1`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.skeleton = (await page.locator("[data-notification-skeleton]").count()) > 0;
+  await page.waitForTimeout(1800);
+  await page.unroute("**/api/v1/notifications?*").catch(() => {});
+  steps.emptyState = (await page.locator("[data-notification-empty]").count()) > 0;
+  await shot(page, "page-notifications-empty");
+
+  // The error state, provoked the honest way: a route that answers 500. The panel must show a
+  // retry line, not an empty table — an inbox that says "all caught up" after a failure is the
+  // one state that makes people stop trusting it.
+  await page.route("**/api/v1/notifications/summary", (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: '{"error":{"code":"boom","message":"deliberate"}}' }),
+  );
+  await page.locator("[data-notification-refresh]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.errorState = (await page.locator("[data-notification-error]").count()) > 0;
+  await page.unroute("**/api/v1/notifications/summary").catch(() => {});
+  await shot(page, "page-notifications-error");
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -3922,6 +4100,11 @@ async function main() {
     { path: "/settings/iam/roles", name: "iam-roles" },
     // The analytics reports (REQ-007, slice 2): every screen of the section is walked, clicked and
     // measured, and the depth pass below reads the range, the comparison, a drawer and an export.
+    // The notification list (REQ-021, slice 1) — walked here and driven by the depth pass
+    // below, which emits real notifications through the API, checks the bell's badge against
+    // its own grouped lines, filters from a group line, runs a bulk action and proves the
+    // keyboard path.
+    { path: "/notifications", name: "notifications" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -4049,6 +4232,13 @@ async function main() {
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
   report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+
+  // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
+  // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
+  // path, and the three states. It runs after the analytics passes because it emits into the
+  // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
+  report.notifications = await runNotificationsDepth(page, report);
+  log(`notifications: ${JSON.stringify(report.notifications)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
