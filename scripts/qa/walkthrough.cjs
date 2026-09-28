@@ -856,10 +856,16 @@ async function interact(page, pageName, report) {
     page.context().off("page", onPopup);
     for (const p of popups) await p.close().catch(() => {});
 
-    // Close the submission window as soon as the click has settled, before the outcome is judged.
-    // The allowance covers what *this* submit provoked and nothing after it, so a real failure two
-    // clicks later cannot inherit it.
-    if (submitsAForm) endRefusalWindow("/api/v1/");
+    // The submission window has to stay open until the *response* has been recorded, not until
+    // the click has settled. `settleAfterClick` waits for a URL change and gives up after one
+    // tick when there is none — and a form refused in the field never navigates — so closing here
+    // ended the window before the 400 ever reached `netFailures`. The registration then claimed
+    // nothing, and the report filed the pass's own refusal as a defect again. The dialog path
+    // already waited; this one has to as well.
+    if (submitsAForm) {
+      await page.waitForTimeout(900);
+      endRefusalWindow("/api/v1/");
+    }
 
     const after = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     let outcome = "ok";
@@ -1326,6 +1332,23 @@ async function toggleOneCapability(page) {
 
 /** Discover, read the diff, apply it, and discover again — the second run must be empty. */
 async function discoverTwice(page, fake) {
+  // **Discover lives inside the provider's Models drawer.** `{editing === provider.id ? … : null}`
+  // means the button does not exist in the DOM until that row is opened, so a pass that goes
+  // straight for it clicks nothing, finds no `[data-discovery-diff]`, and reports `first: null` —
+  // which reads exactly like "the endpoint served no models". Opening the drawer is the whole
+  // difference between proving discovery and not proving it.
+  const opened = await page
+    .locator('[data-provider-models="QA Local"]')
+    .first()
+    .click({ timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
+  await page.waitForTimeout(900);
+  const discoverVisible = await page.locator('[data-provider-discover="QA Local"]').isVisible().catch(() => false);
+  if (!discoverVisible) {
+    return { first: null, applied: "skipped", second: null, fakeEndpoint: fake.baseUrl, drawerOpened: opened, discoverVisible: false };
+  }
+
   await page
     .locator('[data-provider-discover="QA Local"]')
     .first()
