@@ -944,7 +944,15 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "image");
   await page.waitForTimeout(1200);
   const imageRows = await page.locator("tbody tr").count();
-  const footer = await page.locator("text=/Showing \\d+ of \\d+/").first().textContent();
+  // `.first().textContent()` has no timeout argument, so a footer that renders no "Showing n of
+  // n" line hangs the WHOLE pass for 30s and then throws — taking the vision review and the
+  // report with it, long after the step that failed. The footer is a nicety here (the row count
+  // above is the claim), so read it as a value that may be absent instead of a wait.
+  const footer = await page
+    .locator("text=/Showing \\d+ of \\d+/")
+    .first()
+    .textContent({ timeout: 4000 })
+    .catch(() => null);
   note({ step: "filter-kind", imageRows, footer });
   await shot(page, "media-filtered");
   await page.selectOption("#media-kind", "");
@@ -4183,9 +4191,16 @@ async function runBlockEditorDepth(page, report) {
   // The page id is the editor's own path (`/pages/<uuid>/edit`), so the revisions screen is one
   // hop from where the pass already is — and deriving the URL from the editor is what keeps the
   // step pointed at *this* page rather than whichever one sorts first.
+  //
+  // It is a FUNCTION, not an inline block, and it runs after the preview frame below. Order is
+  // the whole point: a compare run before the frame's save reads a history whose newest two
+  // revisions are both block-empty, so the server correctly answers "nothing changed" and the
+  // pass records zero rows for a screen that works. Waiting for a richer history is the fix;
+  // relaxing the assertion would hide a real empty-compare case.
   const pageId = (steps.path || "").match(/\/pages\/([^/]+)\/edit/)?.[1] || null;
   steps.revisionsPageId = pageId;
-  if (pageId) {
+  const runRevisionCompare = async () => {
+    if (!pageId) return;
     await page
       .goto(`${URL_ADMIN}/pages/${pageId}/revisions`, { waitUntil: "domcontentloaded" })
       .catch(() => {});
@@ -4226,7 +4241,7 @@ async function runBlockEditorDepth(page, report) {
       await shot(page, "page-revisions-diff-other-base");
     }
     note("compared two revisions of the QA page");
-  }
+  };
 
   // ---- The inline-editing preview frame (REQ-063 slice 2) ---------------------------------
   // "Inline editing saves one draft revision per save, shows the revision number in the toast,
@@ -4322,6 +4337,11 @@ async function runBlockEditorDepth(page, report) {
     await shot(page, "page-block-preview-saved");
     note("typed in the frame and saved a draft revision");
   }
+
+  // The compare runs LAST, on purpose: the frame's save above is what gives the history a pair
+  // of revisions that differ. Run before it, the newest two revisions are both block-empty and
+  // the screen correctly reports "nothing changed" — a true answer that proves nothing.
+  await runRevisionCompare();
 
   report.blockEditor = steps;
   return steps;
