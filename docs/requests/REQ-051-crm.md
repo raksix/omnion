@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — **slice 4 is complete: all seven of its parts are in**, the last being the `form.submitted` consumer (REQ-064's producer, REQ-117). Slices 1-3 shipped earlier; slice 4 part one (activities, feed, log form, merged timeline), part two (the copilot module), part three (its two endpoints), part four (the global-search registration, REQ-002), part five (the copilot's **screen**), part six (the **workflow-trigger proof** — a rule on `crm.deal.stage_changed` runs once) and part seven (the **form → lead ingress** — a submitted form becomes a contact and a deal) are all in. `pnpm typecheck` 2/2 · `cargo test -p omnion-module-crm --lib` **172/172** · `cargo test -p omnion-api --test crm` **52/52** against a database created for the run, `--test-threads=1`. What is left is the **last three acceptance boxes**, which are the whole of what remains: the empty/loading/error sweep across every screen, the 390×844 mobile pass and the keyboard sheet · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
+> **Status:** in-progress — the **error state** of the empty/loading/error box is in (`63512c5` the request id, `c0e51fe` one `ErrorState` for the six screens), and the tenant half was in `b899f7f`. A screen whose read failed now shows a sentence, the machine code, the **request id the API named** and a retry that recovers — and nothing invents an id for a failure that never reached the server. What is left of the box is the empty state on the two places that still draw a bare paragraph instead of `EmptyState`: the board's per-column body and the activities filter bar. Then the 390×844 pass and the keyboard sheet. · `cargo test -p omnion-api --lib request_id` **10/10** · `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force` **2/2** · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -151,9 +151,33 @@ Payloads carry ids and the changed field list only — never a rendered document
 - [x] Global search (REQ-002) finds contacts, companies and deals by name/e-mail and deep-links to the record. (**Shipped** in `5bedddb`/`241cf91`: three providers in `crates/search/src/providers.rs` — `contacts` and `companies` behind `crm.contacts.read`, `deals` behind `crm.deals.read`, each pointing at its own screen — with the three upserts, the three prune arms and the `crm.*` event plans in `crates/search/src/indexer.rs`, plus `database/migrations/0031_crm_search_providers.sql` to enable the keys. A contact's **notes** are excluded: the module flags them `crm.fields.sensitive.read` and a vector cannot answer a per-role question. The deep link is `?focus=<id>`: the two lists open that row's editor, the board marks that card. Proved by three walks in the **39/39** run — the hit carries the right `url`, `type:contacts` narrows to contact rows only, a reader holding only the contact key finds the contact and gets **no** deal rows (the same split `/api/v1/crm/deals` enforces), and archiving a company takes its document out of the index. **⌘K "New contact" / "New deal" is not done** — the command centre (REQ-032) is wave 1 and owns the palette's own rows.)
 - [x] An automation rule triggered by `crm.deal.stage_changed` runs **once**. (Proved by driving the **real** matcher — `crates/automation/src/matcher.rs` — over the **real** bus in this suite's own database, so the event the rule reads is the one the board's stage endpoint emitted rather than a hand-written row. Three walks: `a_rule_on_a_deal_stage_change_runs_exactly_once`, `a_rule_whose_condition_does_not_hold_starts_nothing` and `defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home`, all in the **42/42** run. They assert: a move to the stage a deal is **already in** starts nothing (the board's `ctrl + ←/→` posts on every key press); one move starts **one** run whose step carries *this* move's resolved values — the subject reads "A deal entered open" and the body the deal's id, amount and currency, so a retry would repeat the first attempt rather than re-reading a bus that has moved on; a second drain over the same bus is **idle**, which is what "once" means rather than a count; the match is audited as `automation.rule.matched` against the execution; a second deal starts a second run, because exactly-once is per *event* and collapsing two customers into one run would lose one; and a condition that does not hold is `skipped`, not `matched`. The rule's key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define the rule that watches them, and a rule for another organization is refused.)
 - [ ] Empty, loading and error states exist on all six screens; no dead buttons and no placeholder rows.
-  *The tenant-resolution part of this is in (`b899f7f`): a platform account that has no
-  organization is now a state with a sentence and an action rather than a 400 with a code
-  nobody can draw from. The per-screen empty/loading/error sweep is what is left.*
+  *Two thirds are in, and both halves were defects rather than omissions.*
+
+  *The **tenant resolution** (`b899f7f`): a platform account that has no organization is now a
+  state with a sentence and an action rather than a 400 with a code nobody can draw from.*
+
+  *The **error state** (`63512c5`, `c0e51fe`). The box asks for "error state with retry button and
+  request id" and the request id did not exist: the refusal body carried a code, a message and
+  sometimes a details object, and nothing that named the exchange. So the id was built —
+  `apps/api/src/request_id.rs` stamps `x-request-id` on every response (so an id captured from a
+  successful call can correlate the next failure of the same operation) and `error.request_id` in
+  the body (so a refusal pasted into a ticket still carries it). Installed outside the `/api/v1`
+  nest, so the liveness probes are stamped too. An inbound id is honoured only when it is safe to
+  reflect, and a hostile value is **replaced**, not sanitised.
+  Then the six screens: each had hand-rolled its own block, they had drifted into three shapes,
+  and the settings editor and the lead inbox had lost the retry. `components/error-state.tsx` is
+  the one shape — sentence, code, the id **when the server named one**, and a retry. A network
+  failure never reached the server, so no id is invented for it: a fabricated correlation number
+  would look more useful than it is and send an operator to a log line that does not exist.
+  `lib/crm.ts` was also dropping `error.details`, which is why every field-level refusal was a
+  generic banner with nothing under the input it was about.
+  Proved by `runCrmStateSweep`: a real 503 with a real body at the network layer, five screens
+  checked for a sentence / a retry / the id, the retry **pressed** and the recovery watched, and
+  the no-id case asserted to invent nothing. 10/10 unit tests, typecheck 2/2.*
+
+  *What is left is the **empty state** on the two screens that still fall back to a bare paragraph
+  rather than `EmptyState`: the board's per-column body and the activities filter bar. Both exist;
+  both need the sentence-and-action shape the other four have.*
 - [ ] Mobile 390×844: lists are usable, the board scrolls horizontally with sticky stage headers, and forms are single-column.
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
 
