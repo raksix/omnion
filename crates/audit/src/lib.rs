@@ -13,5 +13,5 @@
 pub mod entries;
 pub mod error;
 
-pub use entries::{ActorType, AuditEntry, NewAuditEntry, recent, record};
+pub use entries::{ActorType, AuditEntry, AuditFilter, NewAuditEntry, distinct_actions, filtered, recent, record};
 pub use error::{AuditError, Result};

@@ -193,6 +193,77 @@ pub async fn recent(
     Ok(entries)
 }
 
+/// A filter for one organization's trail.
+///
+/// Deliberately a *type* rather than three loose parameters: the Audit tab always sends all
+/// three, a caller almost never wants one, and the SQL is built from the presence of each field
+/// rather than from a string the caller controls. Every value is still a bind — the *shape* of
+/// the statement varies, its *values* never do.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    /// Only this tenant's rows. `None` is the platform-wide trail.
+    pub organization_id: Option<Uuid>,
+    /// Exact action name, case-insensitive.
+    pub action: Option<String>,
+    /// The account that acted.
+    pub actor_user_id: Option<Uuid>,
+    /// Only rows this actor type (`system` for the ones nobody performed).
+    pub actor_type: Option<String>,
+    /// Only rows at or after this moment.
+    pub since: Option<OffsetDateTime>,
+}
+
+/// The matching rows, newest first, plus how many there are in total.
+///
+/// The count is a second statement rather than a window function because the two are used
+/// differently: the list is a page, the count is a "showing 50 of 812" that has to be right even
+/// when the page is short.
+pub async fn filtered(pool: &PgPool, filter: &AuditFilter, limit: i64) -> Result<(Vec<AuditEntry>, i64)> {
+    let where_clause = "($1::uuid is null or organization_id = $1) \
+        and ($2::text is null or lower(action) = lower($2)) \
+        and ($3::uuid is null or actor_user_id = $3) \
+        and ($4::text is null or actor_type = $4) \
+        and ($5::timestamptz is null or created_at >= $5::timestamptz)";
+
+    let total: i64 = sqlx::query_scalar(&format!("select count(*) from audit_log where {where_clause}"))
+        .bind(filter.organization_id)
+        .bind(filter.action.as_deref())
+        .bind(filter.actor_user_id)
+        .bind(filter.actor_type.as_deref())
+        .bind(filter.since)
+        .fetch_one(pool)
+        .await?;
+
+    let rows: Vec<AuditEntry> = sqlx::query_as(&format!(
+        "select {AUDIT_COLUMNS} from audit_log where {where_clause} \
+         order by created_at desc, id desc limit $6"
+    ))
+    .bind(filter.organization_id)
+    .bind(filter.action.as_deref())
+    .bind(filter.actor_user_id)
+    .bind(filter.actor_type.as_deref())
+    .bind(filter.since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok((rows, total))
+}
+
+/// The distinct action names in one organization's history, for a feed's filter.
+///
+/// Read from the tenant's own rows rather than from a fixed list: the filter then offers what
+/// this organization has actually done, and it cannot drift from the code as actions are added.
+pub async fn distinct_actions(pool: &PgPool, organization_id: Uuid) -> Result<Vec<String>> {
+    let actions: Vec<String> = sqlx::query_scalar(
+        "select distinct action from audit_log where organization_id = $1 order by action",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(actions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
