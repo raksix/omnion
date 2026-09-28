@@ -39,7 +39,7 @@ static CRM_WALK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const READER_PERMISSIONS: [&str; 2] = ["crm.contacts.read", "sites.read"];
 
 /// What a manager adds on top.
-const MANAGER_PERMISSIONS: [&str; 13] = [
+const MANAGER_PERMISSIONS: [&str; 15] = [
     "crm.contacts.read",
     "crm.contacts.create",
     "crm.contacts.update",
@@ -56,14 +56,12 @@ const MANAGER_PERMISSIONS: [&str; 13] = [
     "crm.deals.update",
     "crm.deals.delete",
     "crm.pipelines.manage",
-    "sites.read",
-];
-
-/// What the reader additionally is *not* given: the flagged fields. The suite proves the
-/// redaction with a reader and without it.
-const SENSITIVE_PERMISSIONS: [&str; 3] = [
-    "crm.contacts.read",
-    "crm.fields.sensitive.read",
+    // Slice 4: logging an activity and reading a record's merged timeline. `crm.copilot.use` is
+    // deliberately NOT here and is not yet granted to anyone — the copilot's two endpoints land
+    // later in this slice and get their own account then, so a manager is not silently handed a
+    // model that can read the whole CRM.
+    "crm.activities.read",
+    "crm.activities.create",
     "sites.read",
 ];
 
@@ -2892,4 +2890,616 @@ async fn the_deal_form_refuses_what_it_names() {
         );
         assert_eq!(refused.body["error"]["details"]["entity"], json!("deal"));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4: activities and the merged timeline
+// ---------------------------------------------------------------------------------------------
+
+/// A company, a contact on it and a deal, logged in the order a person would.
+///
+/// Returns `(company_id, contact_id, deal_id, marker)` so each test can name the record it is
+/// about; the marker is a per-test string so a leftover row from a previous run is never matched.
+async fn crm_trio(
+    fixture: &Fixture,
+    token: &str,
+    marker: &str,
+) -> (Uuid, Uuid, Uuid, String) {
+    let company = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/companies",
+            Some(token),
+            Some(json!({ "name": format!("Walk Co {marker}") })),
+        ),
+    )
+    .await;
+    assert_eq!(company.status, StatusCode::CREATED, "{}", company.body);
+    let company_id: Uuid = serde_json::from_value(company.body["id"].clone()).expect("an id");
+
+    let contact = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/contacts",
+            Some(token),
+            Some(json!({
+                "first_name": "Walk",
+                "last_name": marker,
+                "email": format!("walk-{marker}@omnion.test"),
+                "company_id": company_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(contact.status, StatusCode::CREATED, "{}", contact.body);
+    let contact_id: Uuid = serde_json::from_value(contact.body["id"].clone()).expect("an id");
+
+    let deal = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/deals",
+            Some(token),
+            Some(json!({
+                "title": format!("Walk deal {marker}"),
+                "company_id": company_id,
+                "contact_id": contact_id,
+                "amount": "1000.00",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(deal.status, StatusCode::CREATED, "{}", deal.body);
+    let deal_id: Uuid = serde_json::from_value(deal.body["id"].clone()).expect("an id");
+
+    (company_id, contact_id, deal_id, marker.to_string())
+}
+
+#[tokio::test]
+async fn every_activity_route_is_permission_guarded() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (_, contact_id, deal_id, marker) =
+        crm_trio(&fixture, &fixture.manager, "guard").await;
+    let reader = fixture.token(&fixture.reader).await;
+
+    // 401 without a session, 403 with a session that lacks the key, 200 with it.
+    for (method, uri, body) in [
+        (Method::GET, "/api/v1/crm/activities".to_string(), None),
+        (
+            Method::GET,
+            format!("/api/v1/crm/contacts/{contact_id}/timeline"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/crm/activities/{deal_id}/done"),
+            Some(json!({ "done": true })),
+        ),
+        (
+            Method::POST,
+            "/api/v1/crm/activities".to_string(),
+            Some(json!({
+                "kind": "note",
+                "subject": format!("guard {marker}"),
+                "deal_id": deal_id,
+            })),
+        ),
+    ] {
+        let anonymous = call(&fixture.state, request(method.clone(), &uri, None, body.clone())).await;
+        assert_eq!(
+            anonymous.status,
+            StatusCode::UNAUTHORIZED,
+            "{uri} must refuse an unauthenticated caller"
+        );
+
+        let refused = call(
+            &fixture.state,
+            request(method.clone(), &uri, Some(&reader), body.clone()),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{uri} must refuse a reader: {}", refused.body);
+
+        let allowed = call(
+            &fixture.state,
+            request(method, &uri, Some(&fixture.manager), body.clone()),
+        )
+        .await;
+        assert!(allowed.status.is_success(), "{uri} must answer the manager: {}", allowed.body);
+    }
+}
+
+#[tokio::test]
+async fn a_logged_activity_appears_in_the_feed_and_on_the_records_timeline() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let manager = fixture.token(&fixture.manager).await;
+    let (company_id, contact_id, deal_id, marker) =
+        crm_trio(&fixture, &fixture.manager, "log").await;
+
+    let logged = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({
+                "kind": "call",
+                "subject": format!("Rang about the renewal {marker}"),
+                "body": "Asked for a decision by Friday.",
+                "contact_id": contact_id,
+                "occurred_at": "2026-09-20T09:00:00Z",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(logged.status, StatusCode::CREATED, "{}", logged.body);
+    let activity_id: Uuid = serde_json::from_value(logged.body["id"].clone()).expect("an id");
+    assert_eq!(logged.body["kind"], "call");
+    // The row comes back with the dates a person can read, not the crate's internal tuple.
+    assert!(
+        logged.body["occurred_at"].as_str().is_some_and(|v| v.starts_with("2026-09-20")),
+        "occurred_at must be an RFC 3339 string: {}",
+        logged.body["occurred_at"]
+    );
+
+    // The audit row names the actor and the fields; the event carries ids and the kind but NOT
+    // the subject or the body — those are the record's own words about a person.
+    let audits = audit_rows(&fixture.db, "crm.activity.logged").await;
+    let entry = audits
+        .iter()
+        .find(|row| row["metadata"]["request_id"] == json!(activity_id.to_string()))
+        .unwrap_or_else(|| panic!("the log must be audited: {audits:?}"));
+    assert_eq!(entry["actor_user_id"], json!(fixture.manager_id.to_string()));
+    let fields = entry["metadata"]["fields"].as_array().expect("a field list");
+    assert!(fields.iter().any(|f| f == "kind"), "{fields:?}");
+
+    let events = event_payloads(&fixture.db, "crm.activity.logged").await;
+    let event = events
+        .iter()
+        .find(|row| row["activity_id"] == json!(activity_id.to_string()))
+        .unwrap_or_else(|| panic!("the log must emit its event: {events:?}"));
+    assert_eq!(event["kind"], "call");
+    assert_eq!(event["contact_id"], json!(contact_id.to_string()));
+    assert!(
+        event.get("subject").is_none() && event.get("body").is_none(),
+        "an event a third party receives must not carry the note somebody took: {event}"
+    );
+
+    // The feed sees it.
+    let feed = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/crm/activities", Some(&manager), None),
+    )
+    .await;
+    assert_eq!(feed.status, StatusCode::OK, "{}", feed.body);
+    assert!(
+        feed.body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|row| row["id"] == json!(activity_id.to_string()))),
+        "the activity must be in the feed: {}",
+        feed.body
+    );
+
+    // The contact's timeline sees it, and the company's does not (it hangs off the contact).
+    let contact_timeline = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/contacts/{contact_id}/timeline"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(contact_timeline.status, StatusCode::OK, "{}", contact_timeline.body);
+    assert!(
+        contact_timeline.body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|row| row["id"] == json!(activity_id.to_string()))),
+        "the activity must be on the contact's timeline: {}",
+        contact_timeline.body
+    );
+
+    // A contact's timeline also carries its deal's stage change, in one ordered stream.
+    let sources: Vec<String> = contact_timeline.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|row| row["source"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        sources.contains(&"activity".to_string()),
+        "the activity arm: {sources:?}"
+    );
+    assert!(
+        sources.contains(&"stage_change".to_string()),
+        "a contact's timeline must carry its deal's stage change too: {sources:?}"
+    );
+
+    // The company timeline reaches the deal's stage change through the contact, and does not
+    // claim the call (which hangs off the contact, not the company).
+    let company_timeline = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/companies/{company_id}/timeline"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(company_timeline.status, StatusCode::OK, "{}", company_timeline.body);
+    assert!(
+        !company_timeline.body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|row| row["id"] == json!(activity_id.to_string()))),
+        "a contact's call is not the company's: {}",
+        company_timeline.body
+    );
+    let _ = deal_id;
+}
+
+#[tokio::test]
+async fn the_activity_feed_filters_by_kind_and_by_state() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let manager = fixture.token(&fixture.manager).await;
+    let (_, contact_id, _, marker) = crm_trio(&fixture, &fixture.manager, "filter").await;
+
+    let note = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({
+                "kind": "note", "subject": format!("Note {marker}"), "contact_id": contact_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
+
+    let task = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({
+                "kind": "task", "subject": format!("Task {marker}"),
+                "contact_id": contact_id, "due_at": "2026-10-01T09:00:00Z",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(task.status, StatusCode::CREATED, "{}", task.body);
+    let task_id: Uuid = serde_json::from_value(task.body["id"].clone()).expect("an id");
+
+    let ids = |body: &Value| -> Vec<String> {
+        body["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let only_notes = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/activities?kind=note&search=Note%20{marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(only_notes.status, StatusCode::OK, "{}", only_notes.body);
+    let notes = ids(&only_notes.body);
+    assert!(notes.contains(&note.body["id"].as_str().unwrap().to_string()), "{notes:?}");
+    assert!(!notes.contains(&task_id.to_string()), "the kind filter must exclude a task: {notes:?}");
+
+    let open = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/activities?done=open&search={marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(open.status, StatusCode::OK, "{}", open.body);
+    assert!(ids(&open.body).contains(&task_id.to_string()), "an open task must be listed: {}", open.body);
+
+    // Close it, and it leaves the open list and joins the done one.
+    let closed = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/activities/{task_id}/done"),
+            Some(&manager),
+            Some(json!({ "done": true })),
+        ),
+    )
+    .await;
+    assert_eq!(closed.status, StatusCode::OK, "{}", closed.body);
+    assert!(
+        closed.body["done_at"].as_str().is_some(),
+        "closing a task must stamp it: {}",
+        closed.body["done_at"]
+    );
+
+    let after = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/activities?done=open&search={marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        !ids(&after.body).contains(&task_id.to_string()),
+        "a closed task must leave the open list: {}",
+        after.body
+    );
+
+    // An unknown kind is refused with the four that exist, rather than silently matching nothing.
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/crm/activities?kind=email",
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    let message = refused.body["error"]["message"].as_str().unwrap_or_default().to_string();
+    for kind in ["call", "meeting", "note", "task"] {
+        assert!(message.contains(kind), "{message} should offer {kind}");
+    }
+}
+
+#[tokio::test]
+async fn the_activity_form_refuses_what_it_names() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let manager = fixture.token(&fixture.manager).await;
+    let (_, contact_id, deal_id, marker) = crm_trio(&fixture, &fixture.manager, "refuse").await;
+
+    // No record: the refusal lands on the field the form renders the message under.
+    let floating = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({ "kind": "note", "subject": format!("Floating {marker}") })),
+        ),
+    )
+    .await;
+    assert_eq!(floating.status, StatusCode::BAD_REQUEST, "{}", floating.body);
+    assert_eq!(floating.body["error"]["details"]["field"], json!("contact_id"));
+
+    // No subject.
+    let blank = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({ "kind": "note", "subject": "   ", "contact_id": contact_id })),
+        ),
+    )
+    .await;
+    assert_eq!(blank.status, StatusCode::BAD_REQUEST, "{}", blank.body);
+    assert_eq!(blank.body["error"]["details"]["field"], json!("subject"));
+
+    // A task with neither a due date nor a done mark cannot appear on the open-task list.
+    let dateless = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({ "kind": "task", "subject": format!("Call {marker}"), "deal_id": deal_id })),
+        ),
+    )
+    .await;
+    assert_eq!(dateless.status, StatusCode::BAD_REQUEST, "{}", dateless.body);
+    assert_eq!(dateless.body["error"]["details"]["field"], json!("due_at"));
+
+    // Two records at once satisfies the schema's `crm_activities_attached` and is still refused.
+    let two = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({
+                "kind": "note", "subject": format!("Ambiguous {marker}"),
+                "contact_id": contact_id, "deal_id": deal_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(two.status, StatusCode::BAD_REQUEST, "{}", two.body);
+
+    // A record that is not there is a 404, not a 400 — the form was well-formed.
+    let missing = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&manager),
+            Some(json!({
+                "kind": "note", "subject": format!("Ghost {marker}"),
+                "contact_id": Uuid::new_v4(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.body);
+
+    // Nothing above was written.
+    let feed = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/activities?search={marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(feed.status, StatusCode::OK, "{}", feed.body);
+    assert_eq!(
+        feed.body["items"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "a refused write must leave nothing behind: {}",
+        feed.body
+    );
+}
+
+#[tokio::test]
+async fn an_activity_of_another_organization_is_invisible() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (company_id, contact_id, _, marker) = crm_trio(&fixture, &fixture.manager, "tenant").await;
+
+    // Logged by the manager, in `fixture.org`.
+    let logged = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/crm/activities",
+            Some(&fixture.manager),
+            Some(json!({
+                "kind": "note", "subject": format!("Private {marker}"), "contact_id": contact_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(logged.status, StatusCode::CREATED, "{}", logged.body);
+    let activity_id: Uuid = serde_json::from_value(logged.body["id"].clone()).expect("an id");
+
+    // The other tenant's feed must not carry it, and its timeline must not either. The other
+    // writer holds `crm.activities.read` in its own organization, so the rule is exercised for a
+    // caller who genuinely has the power — a 403 would only prove the guard, not the filter.
+    let other = grant_and_login(&fixture, "activity-cross-tenant", &OTHER_ACTIVITY_PERMISSIONS).await;
+    let foreign_feed = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/crm/activities", Some(&other), None),
+    )
+    .await;
+    assert_eq!(foreign_feed.status, StatusCode::OK, "{}", foreign_feed.body);
+    assert!(
+        !foreign_feed.body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|row| row["id"] == json!(activity_id.to_string()))),
+        "another tenant must not see the activity: {}",
+        foreign_feed.body
+    );
+
+    let foreign_timeline = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/contacts/{contact_id}/timeline"),
+            Some(&other),
+            None,
+        ),
+    )
+    .await;
+    // The contact is another organization's, so the timeline is either empty or 404 — never its
+    // history. Both are acceptable; a populated one is not.
+    if foreign_timeline.status == StatusCode::OK {
+        assert_eq!(
+            foreign_timeline.body["items"].as_array().map(Vec::len).unwrap_or(0),
+            0,
+            "another tenant must not read this contact's timeline: {}",
+            foreign_timeline.body
+        );
+    } else {
+        assert_eq!(foreign_timeline.status, StatusCode::NOT_FOUND, "{}", foreign_timeline.body);
+    }
+
+    // And it cannot be closed from outside the organization.
+    let foreign_close = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/crm/activities/{activity_id}/done"),
+            Some(&other),
+            Some(json!({ "done": true })),
+        ),
+    )
+    .await;
+    assert_eq!(foreign_close.status, StatusCode::NOT_FOUND, "{}", foreign_close.body);
+    let _ = company_id;
+}
+
+/// The powers the cross-tenant activity walk needs, in the *other* organization.
+const OTHER_ACTIVITY_PERMISSIONS: [&str; 3] = [
+    "crm.activities.read",
+    "crm.activities.create",
+    "sites.read",
+];
+
+/// An account in the other organization, granted `permissions`, already signed in.
+async fn grant_and_login(fixture: &Fixture, label: &str, permissions: &[&str]) -> String {
+    let (user_id, email) = create_account(&fixture.db, Some(fixture.other_org), label).await;
+    grant(
+        &fixture.db,
+        fixture.other_org,
+        user_id,
+        fixture.accounts[0],
+        permissions,
+    )
+    .await;
+    login(&fixture.state, &email).await
+}
+
+#[tokio::test]
+async fn the_new_activity_keys_are_in_the_catalogue_and_the_owner_holds_them() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    for key in ["crm.activities.read", "crm.activities.create", "crm.copilot.use"] {
+        assert!(omnion_permissions::catalogue::is_known(key), "{key} must be a known key");
+    }
+    // The owner is the account every seeded role is built from, so the new keys have to be in it
+    // or a fresh install cannot read its own activity feed.
+    let held: Vec<String> = sqlx::query_scalar(
+        "select rp.permission from role_permissions rp
+         join roles r on r.id = rp.role_id
+         where r.organization_id is null
+           and r.key = 'owner'
+           and rp.permission in ('crm.activities.read', 'crm.activities.create', 'crm.copilot.use')",
+    )
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the owner's permissions must read");
+    assert!(
+        held.contains(&"crm.activities.read".to_string())
+            && held.contains(&"crm.activities.create".to_string())
+            && held.contains(&"crm.copilot.use".to_string()),
+        "the owner must hold slice 4's keys: {held:?}"
+    );
 }

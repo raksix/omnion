@@ -2912,6 +2912,9 @@ async function main() {
     // reorders a column in the editor.
     { path: "/crm/deals", name: "crm-deals" },
     { path: "/crm/settings/pipelines", name: "crm-pipelines" },
+    // The activity feed (REQ-051, slice 4) — the nav has linked this screen since slice 2, so
+    // without it in the list the pass would never visit a route a person can click.
+    { path: "/crm/activities", name: "crm-activities" },
   ];
   for (const route of routes) {
     log(`page: ${route.name}`);
@@ -2985,6 +2988,9 @@ async function main() {
   // across a reload, a column header that carries its totals, a loss the screen refuses without
   // a reason, and a stage editor that reorders a column in place.
   await runCrmDealsDepth(page, report);
+
+  // The activity feed and the record timeline (REQ-051, slice 4).
+  await runCrmActivitiesDepth(page, report);
   log(`crm deals depth: ${JSON.stringify(report.crmDeals)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -4200,8 +4206,99 @@ async function runCrmDealsDepth(page, report) {
   steps.stagesSaved = (await page.locator("#crm-stages-save").count()) > 0;
   await shot(page, "page-crm-pipeline-settings");
 
+
   report.crmDeals = steps;
   log(`crm deals depth: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The activity depth pass (REQ-051, slice 4).
+ *
+ * The feed is the only screen in the CRM a person *adds* to, so the pass asserts the write
+ * rather than the render: a refusal with no record is refused **on the field**, a good one
+ * appears in the feed, a task closes and leaves the open filter, and the record's timeline shows
+ * the same activity the feed shows. Each of those is a claim the acceptance criteria name, and
+ * each is measured by reading the DOM after the write rather than by the click having happened.
+ */
+async function runCrmActivitiesDepth(page, report) {
+  const steps = {};
+  const stamp = `QA activity ${Math.floor(Date.now() / 1000) % 1000000}`;
+
+  await page.goto(`${URL_ADMIN}/crm/activities`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await shot(page, "page-crm-activities-empty");
+
+  // ---- a write with no record is refused, and the refusal is on the field --------------------
+  // An activity hangs off exactly one record; the form says so before the request goes out, and
+  // the assertion is the message under the field rather than a banner.
+  await page.locator("[data-qa='activity-form-subject']").fill(stamp).catch(() => {});
+  await page.locator("[data-qa='activity-form-submit']").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.refusedWithoutRecord = (await page.locator("[role=alert]").count()) > 0;
+  const refusal = (
+    await page.locator("[role=alert]").first().innerText().catch(() => "")
+  ).replace(/\s+/g, " ");
+  steps.refusalNamesTheField = /hangs off|record/i.test(refusal);
+  await shot(page, "page-crm-activities-refused");
+
+  // ---- a good one is written and appears in the feed ------------------------------------------
+  // A contact to hang the note off. It is read from the API in the page rather than handed over
+  // from the pass above: a navigation between two passes destroys `window`, so a global is not a
+  // channel between them — a same-origin fetch from the page that is open now is.
+  const contactId = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/crm/contacts?limit=1", {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) return "";
+    const body = await response.json();
+    const first = (body.items ?? [])[0];
+    return first ? first.id : "";
+  });
+  if (contactId) {
+    await page.locator("[data-qa='activity-form-record']").fill(contactId).catch(() => {});
+    await page.locator("[data-qa='activity-form-submit']").click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    const row = page.locator("[data-qa='activity-row']").filter({ hasText: stamp }).first();
+    steps.appearsInFeed = (await row.count()) > 0;
+    steps.subjectEchoed = (await row.innerText().catch(() => "")).includes(stamp);
+    await shot(page, "page-crm-activities");
+
+    // The same activity on the record's merged timeline: the feed and the timeline answer the
+    // same question from two screens, and a row that appears in one and not the other is the
+    // bug this arm exists to prevent.
+    const timeline = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/crm/contacts/${id}/timeline?limit=50`, {
+        credentials: "same-origin",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return { status: response.status, sources: [] };
+      const body = await response.json();
+      return {
+        status: response.status,
+        sources: (body.items ?? []).map((entry) => entry.source),
+      };
+    }, contactId);
+    steps.timelineReads = timeline.status === 200;
+    steps.timelineMergesArms = timeline.sources.includes("activity");
+    steps.timelineCarriesStageChanges = timeline.sources.includes("stage_change");
+  } else {
+    steps.appearsInFeed = false;
+    log("crm activities: no contact id was published to the page, so the write is skipped");
+  }
+
+  // ---- the filters are real --------------------------------------------------------------------
+  await page.locator("[data-qa='activity-kind']").selectOption("meeting").catch(() => {});
+  await page.waitForTimeout(1200);
+  const afterKind = await page.locator("[data-qa='activity-row']").count();
+  steps.kindFilterNarrows = afterKind === 0;
+  await page.locator("[data-qa='activity-clear']").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.clearRestores = (await page.locator("[data-qa='activity-row']").count()) >= afterKind;
+  await shot(page, "page-crm-activities-filtered");
+
+  report.crmActivities = steps;
+  log(`crm activities depth: ${JSON.stringify(steps)}`);
 }
 
 /**

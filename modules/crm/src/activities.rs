@@ -362,26 +362,37 @@ pub fn relative_label(then: OffsetDateTime, at: OffsetDateTime) -> String {
     // The bucket bounds are consts, not expressions inside the match arms: a range *pattern*
     // cannot hold arithmetic, and writing the arithmetic there is a compile error rather than a
     // boundary anybody can read.
-    const FIRST_MINUTE: u64 = 45;
-    const FIRST_HOUR: u64 = 3_600;
-    const FIRST_DAY: u64 = 86_400;
-    // The week label deliberately does not start at 7 days. Fourteen days is 1_209_600s, below
-    // this bound, so a two-week-old row reads "14d" and not "2w": an age is more useful at a
-    // glance than a week count. The month label starts at 30 days past it.
-    const FIRST_WEEK: u64 = 2_592_000;
-    const FIRST_MONTH: u64 = FIRST_WEEK + 86_400 * 30;
+    // A range *pattern* cannot hold arithmetic at either end, so every bound is a `const` that
+    // the arithmetic is already done inside. They are named as a pair per bucket — the first
+    // second of the bucket and the last second of it — because a bucket has to end one second
+    // before the next one begins or the ranges overlap on their endpoints and the compiler says
+    // so.
     const MINUTE: u64 = 60;
     const HOUR: u64 = 3_600;
     const DAY: u64 = 86_400;
     const WEEK: u64 = 604_800;
     const MONTH: u64 = 2_629_800;
 
+    // "N m" starts at 45s, not 60: below that a timestamp is "just now", because "0m ago" reads
+    // as a mistake rather than as a moment.
+    const MINUTE_FROM: u64 = 45;
+    const MINUTE_TO: u64 = HOUR - 1;
+    const HOUR_FROM: u64 = HOUR;
+    const HOUR_TO: u64 = DAY - 1;
+    // The week label deliberately does not start at 7 days. Fourteen days is 1_209_600s, below
+    // `DAY_FROM` + 30 days, so a two-week-old row reads "14d" and not "2w": an age is more
+    // useful at a glance than a week count.
+    const DAY_FROM: u64 = DAY;
+    const DAY_TO: u64 = DAY * 30 - 1;
+    const WEEK_FROM: u64 = DAY * 30;
+    const WEEK_TO: u64 = DAY * 60 - 1;
+
     let label = match magnitude {
         0..=44 => return "just now".to_string(),
-        FIRST_MINUTE..=FIRST_HOUR => format!("{}m", magnitude / MINUTE),
-        FIRST_HOUR..=FIRST_DAY => format!("{}h", magnitude / HOUR),
-        FIRST_DAY..=FIRST_WEEK => format!("{}d", magnitude / DAY),
-        FIRST_WEEK..=FIRST_MONTH => format!("{}w", magnitude / WEEK),
+        MINUTE_FROM..=MINUTE_TO => format!("{}m", magnitude / MINUTE),
+        HOUR_FROM..=HOUR_TO => format!("{}h", magnitude / HOUR),
+        DAY_FROM..=DAY_TO => format!("{}d", magnitude / DAY),
+        WEEK_FROM..=WEEK_TO => format!("{}w", magnitude / WEEK),
         _ => format!("{}mo", magnitude / MONTH),
     };
     let label: String = label.chars().take(MAX_RELATIVE_LABEL).collect();
