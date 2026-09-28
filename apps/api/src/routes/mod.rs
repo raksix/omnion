@@ -1178,9 +1178,14 @@ pub fn router(state: AppState) -> Router {
             page_revision_comments,
         );
 
+    // The request id (REQ-051's error state) is installed **outside** the nest, so `/healthz` and
+    // `/readyz` are stamped too: a liveness probe that answers 503 is exactly the case where an
+    // operator needs the id, and a request id that stopped at the `/api/v1` boundary would leave
+    // the two most-queried endpoints as the only uncorrelatable ones.
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         .nest("/api/v1", v1)
+        .layer(axum::middleware::from_fn(crate::request_id::request_id))
         .with_state(state)
 }

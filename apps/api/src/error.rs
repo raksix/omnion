@@ -933,6 +933,15 @@ struct ErrorDetail {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Value>,
+    /// The request this refusal answers, so a person reading a broken screen can quote it and an
+    /// operator can find the same request in the log.
+    ///
+    /// It travels in the body as well as in the `x-request-id` header on purpose: the panel reads
+    /// the header, but a refusal quoted from a terminal, a webhook delivery or a support ticket
+    /// carries the body, and one request id with two homes is better than one that is only
+    /// reachable through a browser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 impl IntoResponse for ApiError {
@@ -942,6 +951,7 @@ impl IntoResponse for ApiError {
                 code: self.code,
                 message: self.message,
                 details: self.details,
+                request_id: None,
             },
         };
         (self.status, Json(body)).into_response()

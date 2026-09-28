@@ -16,6 +16,7 @@ pub mod event_runner;
 pub mod guards;
 pub mod intent_resolver;
 pub mod lead_runner;
+pub mod request_id;
 pub mod routes;
 pub mod scope;
 pub mod search_runner;
