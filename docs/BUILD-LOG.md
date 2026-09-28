@@ -2780,3 +2780,23 @@
   - **Next.** Run the pass again on the fixed harness for the green walkthrough that closes slice
     4, then the last acceptance line (`cargo test --workspace` + `pnpm build` + zero high
     findings) and REQ-005's close. After that, the queue moves to REQ-017 (sandbox/staging).
+
+  - **The pass, run on the fixed harness.** 991 clicks, 1,039 shots, every route reporting a
+    full element count — `iam-policies` 40, and all ten analytics screens 40 where the first run
+    said 3. `sign_in_attempts` held **one** row, `success`, against eleven `blocked` before: the
+    lockout is not merely bypassed, it no longer happens. The mobile switcher reads 390px wide,
+    anchored, a 59px row, a backdrop and no page overflow, and the palette still 44px per row.
+  - **78 findings, 72 high — and the count is the wrong thing to read.** 28 are `422`s and 33
+    their console errors: the generic filler submitting sample data to forms it does not own, on
+    every writer's screens. Three findings were mine and two of those were the harness measuring
+    the wrong thing (`1818c50`): the sheet's bottom-anchoring was asserted against a component
+    that is a *panel* from `sm` up, and a tab strip inside a horizontal scroller was reported as
+    unreachable when the spec asks for a scroller. The third — two 500s on `/members` — is the
+    shared box, not the code: the API log for the window shows `pool timed out while waiting for
+    an open connection`, which is what seven concurrent QA stacks do to one Postgres. So the
+    honest count of findings **caused by this change** is zero, and the pass is not green.
+  - **Next.** Re-run the pass with the corrected assertions for a run whose findings are only
+    the pre-existing 422/console-error family, then the last acceptance line and REQ-005's close.
+    The two remaining known-pre-existing items are named here so the next tick does not
+    rediscover them: the media depth passes report "no file to open" although the upload step
+    reports success, and the IAM sessions screen answers 401 for a scoped read.
