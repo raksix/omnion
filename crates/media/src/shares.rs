@@ -21,6 +21,7 @@
 //!   investigable afterwards.
 //! * **The counter counts bytes that were served.** See [`count_download`].
 
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -162,6 +163,23 @@ pub fn servable(share: &Share, now: OffsetDateTime) -> std::result::Result<(), S
         return Err(ShareRefusal::Expired);
     }
     Ok(())
+}
+
+/// Mint a bearer token: `TOKEN_BYTES` from the OS RNG, hex encoded.
+///
+/// The token is the whole security of the link, so the source is the operating system's CSPRNG
+/// and the width is [`TOKEN_BYTES`] — a token minted from weak entropy, or shortened to
+/// "something a human can read", is a link that can be guessed. This lives in the crate rather
+/// than in the route so that the width and the source cannot be changed independently, and so a
+/// second caller (a future e-mail or a CLI) gets the same guarantee without copying the code.
+pub fn mint_token() -> String {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
 }
 
 /// Hash a bearer token the way the table stores it.
