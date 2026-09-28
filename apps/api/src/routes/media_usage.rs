@@ -18,9 +18,11 @@
 //!   read from the file itself, so a second permission would be a second opinion, not a
 //!   boundary — and the file may be in the trash, where the reader must still be able to ask
 //!   why.
-//! * **The scope check is the file's own site, loaded before either row is read.** A `404` and
-//!   not a `403`: these ids are walkable, and "that is not yours" must not be distinguishable
-//!   from "that is not real".
+//! * **The scope check is the file's own site, loaded before either row is read.** Another
+//!   tenant's file is a `403 cross_organization` and not a `404`: `site_in_scope` is what every
+//!   media route loads, so a `404` here would make these the only two screens in the library
+//!   where a foreign file is *invisible* rather than forbidden — and an id that is invisible on
+//!   one route and forbidden on its neighbours is a better oracle than either alone.
 //! * **A file in the trash is not a `404` here.** `file_in_scope` reads live files only, and a
 //!   trash screen that cannot say *why* a file was deleted — which is exactly when somebody
 //!   opens the activity tab — would answer a blank page for the one question it exists to
