@@ -11,6 +11,11 @@
 //!   REQ-037 owns (`omnion_secrets::redaction`) decides what a secret looks like, and this one
 //!   decides what a *field* may contain, so a log line, a span attribute and an exporter payload
 //!   are all filtered by the same rule.
+//! * [`metrics`] — the metric registry. The families are declared, the labels are positional and
+//!   closed, and the cardinality budget is enforced in one place with the loss counted and
+//!   labelled rather than swallowed.
+//! * [`metric_catalog`] — the registry's durable projection, so the panel documents what the
+//!   process can record rather than what someone remembered to write down.
 //! * [`store`] — the bounded store. The explorer reads it and nothing else; a request path never
 //!   blocks on it.
 //!
@@ -24,12 +29,16 @@
 
 pub mod context;
 pub mod error;
+pub mod metric_catalog;
+pub mod metrics;
 pub mod redact;
 pub mod schema;
 pub mod store;
 
 pub use context::{LogContext, mint_span_id, mint_trace_id, trace_id_from_header};
 pub use error::TelemetryError;
+pub use metric_catalog::FamilyDeclaration;
+pub use metrics::{FamilySpec, MetricKind, Registry, global as metrics_registry};
 pub use redact::{REDACTED, redact_fields, redact_text};
 pub use schema::{LogEntry, LogLevel, LogSource, NewLogEntry};
 
