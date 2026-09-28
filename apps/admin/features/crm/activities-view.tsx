@@ -47,6 +47,7 @@ import {
   type CrmTimelineSource,
 } from "@/lib/crm";
 import { CRM_NAV } from "./crm-parts";
+import { useCrmTenant } from "./crm-tenant";
 
 /** The icon and the word each kind is shown with, so a kind is never a bare string in a list. */
 const KIND_ICON: Record<string, typeof Phone> = {
@@ -119,6 +120,9 @@ export function ActivitiesView() {
 
   const filtered = search !== "" || kind !== "" || done !== "";
 
+  // The organization the panel is reading (REQ-051): a platform account has no primary one.
+  const { organizationId } = useCrmTenant();
+
   const load = useCallback(async () => {
     setError(null);
     try {
@@ -126,6 +130,7 @@ export function ActivitiesView() {
         search: search || undefined,
         kind: kind || undefined,
         done: (done || undefined) as "open" | "done" | undefined,
+        organization_id: organizationId ?? undefined,
         limit: 50,
       });
       setRows(page.items ?? []);
@@ -133,7 +138,7 @@ export function ActivitiesView() {
       setError(failure instanceof Error ? failure.message : "The activity feed could not be read.");
       setRows([]);
     }
-  }, [search, kind, done, reloadToken]);
+  }, [search, kind, done, reloadToken, organizationId]);
 
   useEffect(() => {
     void load();

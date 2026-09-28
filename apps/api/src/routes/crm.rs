@@ -201,9 +201,71 @@ pub struct NewCompany {
 // Resolution helpers
 // ---------------------------------------------------------------------------------------------
 
-/// The organization this request works in.
-pub(crate) fn organization_of(current: &CurrentSession, requested: Option<Uuid>) -> Result<Uuid, ApiError> {
-    resolve_organization(current, requested)
+/// The organization this request works in, for a caller that cannot name one.
+///
+/// [`resolve_organization`] is right for the tenancy routes, where a platform account picking a
+/// tenant is a **decision**: two answers for "which of these forty" is not a fallback, it is a
+/// coin toss that reads as an answer. It is wrong for a module route, where a screen opened on
+/// `/crm/contacts` with no query string has asked to see *its* contacts and not to be told to
+/// pick an organization first.
+///
+/// So the CRM resolves the tenant itself, and this is the rule:
+///
+/// * an **organization account** answers its own tenant, and a request naming another one is
+///   still `403 cross_organization` — nothing is relaxed;
+/// * a **platform account** that names one gets it;
+/// * a **platform account that names none** falls back to the organizations it holds a live
+///   binding in, and **only when there is exactly one**: a screen that silently opened the
+///   wrong tenant's records is a data leak wearing the costume of a convenience, so an account
+///   with two tenants is told to say which one, and an account with none is told the same.
+///
+/// A `global` binding is not a tenant — it is the platform-wide role an `owner` holds — so it
+/// does not count towards the fallback. An expired or revoked binding does not count either: an
+/// organization the caller can no longer act in is not a place this route may read.
+pub(crate) async fn organization_of(
+    state: &AppState,
+    current: &CurrentSession,
+    requested: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    if current.user.organization_id.is_some() || requested.is_some() {
+        return resolve_organization(current, requested);
+    }
+
+    let organizations = organizations_bound_to(state, current.user.id).await;
+    match organizations.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(ApiError::bad_request(
+            "organization_required",
+            "this account belongs to no organization; pass organization_id to name the one to read",
+        )),
+        many => Err(ApiError::bad_request(
+            "organization_ambiguous",
+            format!(
+                "this account is bound to {} organizations; pass organization_id to name the one to read",
+                many.len()
+            ),
+        )),
+    }
+}
+
+/// The organizations an account holds a **live organization-scoped** binding in, oldest first.
+///
+/// The tie-break is deliberate: with no caller preference two tenants are still ordered the same
+/// way for everybody, so a link that worked for one person works for the next.
+async fn organizations_bound_to(state: &AppState, user_id: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "select distinct rb.organization_id \
+         from role_bindings rb \
+         where rb.user_id = $1 \
+           and rb.organization_id is not null \
+           and rb.revoked_at is null \
+           and (rb.expires_at is null or rb.expires_at > now()) \
+         order by rb.organization_id",
+    )
+    .bind(user_id)
+    .fetch_all(state.db().pool())
+    .await
+    .unwrap_or_default()
 }
 
 /// How much of the organization the caller reads.
@@ -414,7 +476,7 @@ pub async fn list_contacts(
     current: CurrentSession,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Page<Contact>>, ApiError> {
-    let organization_id = organization_of(&current, params.organization_id)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let sensitive = may_read_sensitive(&state, &current).await;
     let query = params.into_query()?;
@@ -430,7 +492,7 @@ pub async fn get_contact(
     current: CurrentSession,
     Path(contact_id): Path<Uuid>,
 ) -> Result<Json<Contact>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let sensitive = may_read_sensitive(&state, &current).await;
 
@@ -446,7 +508,7 @@ pub async fn create_contact(
     address: ClientAddress,
     body: Json<NewContact>,
 ) -> Result<(StatusCode, Json<Contact>), ApiError> {
-    let organization_id = organization_of(&current, body.organization_id)?;
+    let organization_id = organization_of(&state, &current, body.organization_id).await?;
     let body = body.0;
 
     let changes = ContactChanges {
@@ -500,7 +562,7 @@ pub async fn update_contact(
     Path(contact_id): Path<Uuid>,
     body: Json<ContactPatch>,
 ) -> Result<Json<Contact>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let before = contacts::get_contact(state.db().pool(), &scope, contact_id, true).await?;
@@ -549,7 +611,7 @@ pub async fn archive_contact(
     address: ClientAddress,
     Path(contact_id): Path<Uuid>,
 ) -> Result<Json<Contact>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let before = contacts::get_contact(state.db().pool(), &scope, contact_id, true).await?;
     let after = contacts::archive_contact(state.db().pool(), &scope, contact_id).await?;
@@ -587,7 +649,7 @@ pub async fn merge_contacts(
     address: ClientAddress,
     body: Json<MergeRequest>,
 ) -> Result<Json<Contact>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let before = contacts::get_contact(state.db().pool(), &scope, body.0.survivor, true).await?;
     let after = contacts::merge_contacts(state.db().pool(), &scope, &body.0).await?;
@@ -633,7 +695,7 @@ pub async fn list_companies(
     current: CurrentSession,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Page<contacts::Company>>, ApiError> {
-    let organization_id = organization_of(&current, params.organization_id)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let sensitive = may_read_sensitive(&state, &current).await;
     let query = params.into_query()?;
@@ -649,7 +711,7 @@ pub async fn get_company(
     current: CurrentSession,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<contacts::CompanyDetail>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let sensitive = may_read_sensitive(&state, &current).await;
 
@@ -665,7 +727,7 @@ pub async fn create_company(
     address: ClientAddress,
     body: Json<NewCompany>,
 ) -> Result<(StatusCode, Json<contacts::Company>), ApiError> {
-    let organization_id = organization_of(&current, body.organization_id)?;
+    let organization_id = organization_of(&state, &current, body.organization_id).await?;
     let body = body.0;
 
     let changes = CompanyChanges {
@@ -714,7 +776,7 @@ pub async fn update_company(
     Path(company_id): Path<Uuid>,
     body: Json<contacts::CompanyPatch>,
 ) -> Result<Json<contacts::Company>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let before = contacts::get_company(state.db().pool(), &scope, company_id, true)
@@ -757,7 +819,7 @@ pub async fn archive_company(
     address: ClientAddress,
     Path(company_id): Path<Uuid>,
 ) -> Result<Json<contacts::Company>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let before = contacts::get_company(state.db().pool(), &scope, company_id, true)
         .await?

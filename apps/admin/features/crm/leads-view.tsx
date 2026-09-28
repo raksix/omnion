@@ -40,6 +40,8 @@ import {
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+
+import { useCrmTenant } from "./crm-tenant";
 import { ApiError } from "@/lib/api";
 import {
   CRM_LEAD_OUTCOME_HINT,
@@ -106,6 +108,9 @@ export function LeadsView() {
   const [search, setSearch] = useState(params.get("search") ?? "");
   const searchRef = useRef<HTMLInputElement | null>(null);
 
+  // The organization the panel is reading (REQ-051): a platform account has no primary one.
+  const { organizationId } = useCrmTenant();
+
   // The outcome filter is a URL parameter, not local state: it is the one a person shares.
   const outcome = (params.get("outcome") ?? "") as CrmLeadOutcome | "";
   const filtered = outcome !== "" || (params.get("search") ?? "") !== "";
@@ -114,13 +119,14 @@ export function LeadsView() {
     fetchCrmLeads({
       outcome: outcome === "" ? undefined : outcome,
       search: params.get("search") ?? undefined,
+      organization_id: organizationId ?? undefined,
       limit: 100,
     })
       .then(setInbox)
       .catch((problem) =>
         setError(problem instanceof ApiError ? problem.message : "The lead inbox could not be loaded."),
       );
-  }, [outcome, params.get("search"), reloadToken]);
+  }, [outcome, params.get("search"), reloadToken, organizationId]);
 
   // `/` focuses the search, and the typing is debounced into the URL so a person does not
   // produce a history entry per keystroke.
@@ -434,8 +440,12 @@ function LeadRouting({
   const [saving, setSaving] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
 
+  // The organization the routing policy belongs to: the policy is a row, and the row is the
+  // tenant's, so a platform account looking into a second customer must not save the first's.
+  const { organizationId } = useCrmTenant();
+
   useEffect(() => {
-    fetchCrmLeadSettings()
+    fetchCrmLeadSettings(organizationId ?? undefined)
       .then((loaded) => {
         setView(loaded);
         setDraft({
@@ -451,7 +461,7 @@ function LeadRouting({
           problem instanceof ApiError ? problem.message : "The routing could not be loaded.",
         ),
       );
-  }, [reloadToken]);
+  }, [reloadToken, organizationId]);
 
   const save = useCallback(async () => {
     setSaving(true);
@@ -466,7 +476,7 @@ function LeadRouting({
         stage_id: draft.stage_id === "" ? null : draft.stage_id,
         repeat_stage_id: draft.repeat_stage_id === "" ? null : draft.repeat_stage_id,
         source_label: draft.source_label,
-      });
+      }, organizationId ?? undefined);
       setView(saved);
       onSaved("The routing was saved. Submissions from now on are filed this way.");
     } catch (problem) {

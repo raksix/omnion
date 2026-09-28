@@ -71,6 +71,9 @@ pub struct ActivityParams {
     /// Opaque cursor of the previous page.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Organization to read (platform accounts only).
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 impl From<ActivityParams> for ListQuery {
@@ -106,7 +109,7 @@ pub async fn list_activities(
     current: CurrentSession,
     Query(params): Query<ActivityParams>,
 ) -> Result<Json<Page<Activity>>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     // `kind` and `done` are *this screen's* filters, not part of the shared `ListQuery` the
@@ -134,7 +137,7 @@ pub async fn create_activity(
     address: ClientAddress,
     body: Json<ActivityChanges>,
 ) -> Result<(axum::http::StatusCode, Json<Activity>), ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let activity = activities::log_activity(
@@ -198,7 +201,7 @@ pub async fn complete_activity(
     Path(activity_id): Path<Uuid>,
     body: Json<CompleteBody>,
 ) -> Result<Json<Activity>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let activity = set_activity_done(state.db().pool(), &scope, activity_id, body.0.done).await?;
@@ -286,7 +289,7 @@ async fn timeline(
     Query(params): Query<TimelineParams>,
     record: &'static str,
 ) -> Result<Json<Page<TimelineEntry>>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let page =

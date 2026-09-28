@@ -257,7 +257,7 @@ pub async fn list_deals(
     current: CurrentSession,
     Query(params): Query<DealParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let organization_id = organization_of(&current, params.organization_id)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let view = params.view.clone().unwrap_or_else(|| "board".to_owned());
 
@@ -287,7 +287,7 @@ pub async fn get_deal(
     current: CurrentSession,
     Path(deal_id): Path<Uuid>,
 ) -> Result<Json<Deal>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     Ok(Json(scoped_deal(state.db().pool(), &scope, deal_id).await?))
 }
@@ -299,7 +299,7 @@ pub async fn create_deal(
     address: ClientAddress,
     body: Json<NewDeal>,
 ) -> Result<(StatusCode, Json<Deal>), ApiError> {
-    let organization_id = organization_of(&current, body.0.organization_id)?;
+    let organization_id = organization_of(&state, &current, body.0.organization_id).await?;
     let body = body.0;
 
     let changes = DealChanges {
@@ -354,7 +354,7 @@ pub async fn update_deal(
     Path(deal_id): Path<Uuid>,
     body: Json<DealPatch>,
 ) -> Result<Json<Deal>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let before = scoped_deal(state.db().pool(), &scope, deal_id).await?;
@@ -397,7 +397,7 @@ pub async fn archive_deal(
     address: ClientAddress,
     Path(deal_id): Path<Uuid>,
 ) -> Result<Json<Deal>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let before = scoped_deal(state.db().pool(), &scope, deal_id).await?;
@@ -443,7 +443,7 @@ pub async fn move_deal_stage(
     Path(deal_id): Path<Uuid>,
     body: Json<StageMove>,
 ) -> Result<Json<Deal>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     let before = scoped_deal(state.db().pool(), &scope, deal_id).await?;
@@ -592,12 +592,24 @@ fn deal_changes(before: &Deal, after: &Deal) -> Vec<String> {
 // Pipelines
 // ---------------------------------------------------------------------------------------------
 
+/// The only query a route that names one tenant needs.
+///
+/// A shared shape rather than a struct per route: these are the routes that take nothing but the
+/// organization, and three copies of a two-line struct is three places to forget the fallback.
+#[derive(Debug, Default, Deserialize)]
+pub struct OrganizationParam {
+    /// Organization to read (platform accounts only).
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
 /// `GET /api/v1/crm/pipelines` — every pipeline with its stages.
 pub async fn list_pipelines(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(params): Query<OrganizationParam>,
 ) -> Result<Json<Vec<Pipeline>>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     Ok(Json(
         deals::list_pipelines(state.db().pool(), organization_id).await?,
     ))
@@ -611,7 +623,7 @@ pub async fn save_pipeline_stages(
     Path(pipeline_id): Path<Uuid>,
     body: Json<SaveStages>,
 ) -> Result<Json<Pipeline>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
 
     // The set is validated in the module *before* anything is written, so a refused edit leaves
     // the pipeline exactly as it was rather than half-reordered.

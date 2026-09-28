@@ -145,6 +145,14 @@ export type CrmListQuery = {
   inactive_days?: number;
   created_from?: string;
   created_to?: string;
+  /**
+   * The organization to read, for an account with no primary one.
+   *
+   * It is a **query** field like every other filter on these screens rather than a piece of
+   * ambient config, because the tenant is list state: a link with two organizations' boards on
+   * it has to be able to say which one it means.
+   */
+  organization_id?: string;
 };
 
 /** A saved view: the filter, the column set and the sort a person keeps. */
@@ -233,6 +241,7 @@ function listParams(query: CrmListQuery = {}): string {
   if (query.inactive_days) params.set("inactive_days", String(query.inactive_days));
   if (query.created_from) params.set("created_from", query.created_from);
   if (query.created_to) params.set("created_to", query.created_to);
+  if (query.organization_id) params.set("organization_id", query.organization_id);
   return params.toString();
 }
 
@@ -369,9 +378,12 @@ export function archiveCrmCompany(id: string): Promise<CrmCompany> {
 // ---------------------------------------------------------------------------------------------
 
 /** The caller's views and the organization's shared ones. */
-export async function fetchCrmViews(entity?: string): Promise<CrmView[]> {
-  const query = entity ? `?entity=${encodeURIComponent(entity)}` : "";
-  const body = await crmRequest<{ views: CrmView[] }>(`/api/v1/crm/views${query}`);
+export async function fetchCrmViews(entity?: string, organizationId?: string): Promise<CrmView[]> {
+  const query = new URLSearchParams();
+  if (entity) query.set("entity", entity);
+  if (organizationId) query.set("organization_id", organizationId);
+  const suffix = query.toString();
+  const body = await crmRequest<{ views: CrmView[] }>(`/api/v1/crm/views${suffix ? `?${suffix}` : ""}`);
   return body.views;
 }
 
@@ -389,9 +401,14 @@ export function deleteCrmView(id: string): Promise<CrmView> {
 }
 
 /** The columns the chooser may offer, and the statuses the status filter may hold. */
-export async function fetchCrmColumnCatalogue(entity: string): Promise<CrmColumnCatalogue> {
+export async function fetchCrmColumnCatalogue(
+  entity: string,
+  organizationId?: string,
+): Promise<CrmColumnCatalogue> {
+  const query = new URLSearchParams({ entity });
+  if (organizationId) query.set("organization_id", organizationId);
   const body = await crmRequest<{ entity: string; columns: string[]; statuses: string[] }>(
-    `/api/v1/crm/views/columns?entity=${encodeURIComponent(entity)}`,
+    `/api/v1/crm/views/columns?${query.toString()}`,
   );
   return body;
 }
@@ -570,9 +587,13 @@ export const CRM_CURRENCIES = ["USD", "EUR", "GBP", "TRY", "CHF", "CAD", "AUD", 
  * The default is the board because `/crm/deals` is the screen a person opens to see where the
  * pipeline stands; the list is `?view=list` and is the one a saved view is stored against.
  */
-export function fetchCrmDealsBoard(pipelineId?: string): Promise<{ view: string; board: CrmBoard }> {
+export function fetchCrmDealsBoard(
+  pipelineId?: string,
+  organizationId?: string,
+): Promise<{ view: string; board: CrmBoard }> {
   const query = new URLSearchParams({ view: "board" });
   if (pipelineId) query.set("pipeline_id", pipelineId);
+  if (organizationId) query.set("organization_id", organizationId);
   return crmRequest(`/api/v1/crm/deals?${query.toString()}`);
 }
 
@@ -587,8 +608,10 @@ export function fetchCrmDeals(query: CrmListQuery = {}): Promise<{ view: string;
 }
 
 /** Every pipeline with its stages — the editor's and the board selector's one call. */
-export function fetchCrmPipelines(): Promise<CrmPipeline[]> {
-  return crmRequest("/api/v1/crm/pipelines");
+export function fetchCrmPipelines(organizationId?: string): Promise<CrmPipeline[]> {
+  return crmRequest(
+    `/api/v1/crm/pipelines${organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : ""}`,
+  );
 }
 
 /** What the create form sends. `amount` is text so the form sends what it displays. */
@@ -910,6 +933,8 @@ export type CrmLeadQuery = {
   search?: string;
   limit?: number;
   offset?: number;
+  /** The organization to read, for an account with no primary one. */
+  organization_id?: string;
 };
 
 /** What one drain did, as the button that asks for one reports it. */
@@ -964,25 +989,33 @@ export function fetchCrmLeads(query: CrmLeadQuery = {}): Promise<CrmLeadInbox> {
 }
 
 /** Read the routing policy, without creating the row. */
-export function fetchCrmLeadSettings(): Promise<CrmLeadSettingsView> {
-  return crmRequest("/api/v1/crm/leads/settings");
+export function fetchCrmLeadSettings(organizationId?: string): Promise<CrmLeadSettingsView> {
+  return crmRequest(
+    `/api/v1/crm/leads/settings${organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : ""}`,
+  );
 }
 
 /**
  * Save the routing policy. Every field is optional: an absent key keeps what it has, which is
  * what a form that only sent the two toggles has to mean.
  */
-export function saveCrmLeadSettings(input: {
-  create_contact?: boolean;
-  create_deal?: boolean;
-  stage_id?: string | null;
-  repeat_stage_id?: string | null;
-  source_label?: string;
-}): Promise<CrmLeadSettingsView> {
-  return crmRequest("/api/v1/crm/leads/settings", {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
+export function saveCrmLeadSettings(
+  input: {
+    create_contact?: boolean;
+    create_deal?: boolean;
+    stage_id?: string | null;
+    repeat_stage_id?: string | null;
+    source_label?: string;
+  },
+  organizationId?: string,
+): Promise<CrmLeadSettingsView> {
+  return crmRequest(
+    `/api/v1/crm/leads/settings${organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : ""}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(input),
+    },
+  );
 }
 
 /** Run one drain now, and report what it filed. */

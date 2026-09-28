@@ -56,6 +56,7 @@ import {
   CrmStatusBadge,
   CrmTag,
 } from "./crm-parts";
+import { useCrmTenant } from "./crm-tenant";
 
 /** What the contact form holds while it is open. */
 type ContactForm = {
@@ -126,6 +127,9 @@ export function ContactsView() {
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
+  // The organization the panel is reading (REQ-051): a platform account has no primary one.
+  const { organizationId } = useCrmTenant();
+
   // The filters the shell writes into the URL are read here as the list's query.
   const query = useMemo(
     () => ({
@@ -136,8 +140,11 @@ export function ContactsView() {
       include_archived: searchParams.get("include_archived") === "true" || undefined,
       sort: searchParams.get("sort") || undefined,
       direction: (searchParams.get("direction") as "asc" | "desc") ?? undefined,
+      // The tenant is list state like the rest of this query: a shared URL says whose contacts
+      // it is, and the API stops refusing a platform account that named no organization.
+      organization_id: organizationId ?? undefined,
     }),
-    [searchParams],
+    [searchParams, organizationId],
   );
 
   const columns = useMemo(() => {
@@ -166,7 +173,7 @@ export function ContactsView() {
   // list the screen invented.
   useEffect(() => {
     let cancelled = false;
-    fetchCrmColumnCatalogue("contacts")
+    fetchCrmColumnCatalogue("contacts", organizationId ?? undefined)
       .then((answer) => {
         if (!cancelled) {
           setCatalogue({ columns: answer.columns, statuses: answer.statuses });
@@ -184,7 +191,7 @@ export function ContactsView() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchCrmViews("contacts")
+    fetchCrmViews("contacts", organizationId ?? undefined)
       .then((answer) => {
         if (!cancelled) {
           setViews(answer);
@@ -205,7 +212,7 @@ export function ContactsView() {
   // The companies the form's picker offers. Capped: a person picks from the ones they can see.
   useEffect(() => {
     let cancelled = false;
-    fetchCrmCompanies({ limit: 200, sort: "name", direction: "asc" })
+    fetchCrmCompanies({ limit: 200, sort: "name", direction: "asc", organization_id: organizationId ?? undefined })
       .then((page) => {
         if (!cancelled) {
           setCompanies(page.items);

@@ -43,6 +43,7 @@ import {
 } from "@/lib/crm";
 
 import { CrmAvatar, CrmShell, CrmTag } from "./crm-parts";
+import { useCrmTenant } from "./crm-tenant";
 
 /** What the deal form holds while it is open. */
 type DealForm = {
@@ -191,6 +192,9 @@ export function DealsView() {
 
   const stages = board?.pipeline.stages ?? [];
 
+  // The organization the panel is reading (REQ-051): a platform account has no primary one.
+  const { organizationId } = useCrmTenant();
+
   /** Load whichever view is on screen. The board is the default because it is the screen. */
   const load = useCallback(async () => {
     setError(null);
@@ -198,25 +202,27 @@ export function DealsView() {
       if (mode === "board") {
         // The route answers `{ view, board }` so a list mode can share the path; the screen
         // wants the board itself, and unwrapping it here keeps that envelope in one place.
-        const response = await fetchCrmDealsBoard(pipelineId || undefined);
+        const response = await fetchCrmDealsBoard(pipelineId || undefined, organizationId ?? undefined);
         setBoard(response.board);
         setList(null);
       } else {
-        const response = await fetchCrmDeals(search ? { search } : {});
+        const response = await fetchCrmDeals(
+          search || organizationId ? { search: search || undefined, organization_id: organizationId ?? undefined } : {},
+        );
         setList(response.page.items);
         setBoard(null);
       }
     } catch (problem) {
       setError(problem instanceof ApiError ? problem.message : "The board could not be loaded.");
     }
-  }, [mode, pipelineId, search]);
+  }, [mode, pipelineId, search, organizationId]);
 
   useEffect(() => {
     void load();
   }, [load, reloadToken]);
 
   useEffect(() => {
-    fetchCrmPipelines()
+    fetchCrmPipelines(organizationId ?? undefined)
       .then((rows) => {
         setPipelines(rows);
         setPipelineId((current) => current || (rows[0]?.id ?? ""));
@@ -1125,8 +1131,11 @@ export function PipelinesSettingsView() {
   const [saving, setSaving] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
 
+  // The editor edits a *tenant's* stages, so it needs the same tenant the board drew.
+  const { organizationId } = useCrmTenant();
+
   useEffect(() => {
-    fetchCrmPipelines()
+    fetchCrmPipelines(organizationId ?? undefined)
       .then((rows_) => {
         setPipelines(rows_);
         const first = rows_[0]?.id ?? "";
@@ -1135,7 +1144,7 @@ export function PipelinesSettingsView() {
       .catch((problem) =>
         setError(problem instanceof ApiError ? problem.message : "The pipelines could not be loaded."),
       );
-  }, [reloadToken]);
+  }, [reloadToken, organizationId]);
 
   useEffect(() => {
     const pipeline = pipelines?.find((entry) => entry.id === selected);

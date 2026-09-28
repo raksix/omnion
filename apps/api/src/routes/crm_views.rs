@@ -32,7 +32,6 @@ use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::routes::crm::{emit, may_read_sensitive, organization_of, scope_of};
 use crate::routes::iam::record;
-use crate::scope::resolve_organization;
 use crate::state::AppState;
 
 /// A `sqlx` failure in the view store, in the module's own vocabulary.
@@ -129,7 +128,7 @@ pub async fn list_views(
     current: CurrentSession,
     Query(params): Query<ViewListParams>,
 ) -> Result<Json<ViewList>, ApiError> {
-    let organization_id = organization_of(&current, params.organization_id)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
 
     let mut sql = String::from(
         "select id, organization_id, owner_user_id, entity, name, filters, columns, sort, \
@@ -168,7 +167,7 @@ pub async fn create_view(
     address: ClientAddress,
     body: Json<ViewChanges>,
 ) -> Result<(StatusCode, Json<View>), ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let normalised = views::validate(body.0.entity.trim(), &body.0)?;
 
     let view: View = sqlx::query_as(
@@ -225,7 +224,7 @@ pub async fn delete_view(
     address: ClientAddress,
     Path(view_id): Path<Uuid>,
 ) -> Result<Json<View>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
 
     let view: View = sqlx::query_as(
         "select id, organization_id, owner_user_id, entity, name, filters, columns, sort, \
@@ -273,12 +272,16 @@ pub async fn delete_view(
 /// The chooser reads this rather than hard-coding a list: a column the API would not accept in
 /// a saved view must not be offered as one.
 pub async fn view_columns(
+    State(state): State<AppState>,
     current: CurrentSession,
     Query(params): Query<ViewListParams>,
 ) -> Result<Json<Value>, ApiError> {
     // Reading the chooser needs no record, but it does need a session and an organization: the
-    // guard below refuses an anonymous caller, which is what the chooser needs to know.
-    resolve_organization(&current, None)?;
+    // guard below refuses an anonymous caller, which is what the chooser needs to know. The
+    // answer is thrown away, so this is the tenancy check and nothing more — but it is the
+    // *same* check the lists do, or a platform account would get a column catalogue for a
+    // tenant whose records it may not read.
+    organization_of(&state, &current, params.organization_id).await?;
     let entity = params.entity.as_deref().unwrap_or("contacts");
 
     Ok(Json(json!({
@@ -304,7 +307,7 @@ pub async fn import_contacts(
     address: ClientAddress,
     body: Json<ImportRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let organization_id = organization_of(&current, body.0.organization_id)?;
+    let organization_id = organization_of(&state, &current, body.0.organization_id).await?;
     let mode = body.0.mode.as_deref().unwrap_or("dry_run").trim().to_lowercase();
     if !matches!(mode.as_str(), "dry_run" | "commit") {
         return Err(CrmError::InvalidQuery(format!(
@@ -575,7 +578,7 @@ pub async fn export_contacts(
     current: CurrentSession,
     Query(params): Query<ExportParams>,
 ) -> Result<axum::response::Response, ApiError> {
-    let organization_id = organization_of(&current, params.organization_id)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let sensitive = may_read_sensitive(&state, &current).await;
 
@@ -605,7 +608,7 @@ pub async fn export_companies(
     current: CurrentSession,
     Query(params): Query<ExportParams>,
 ) -> Result<axum::response::Response, ApiError> {
-    let organization_id = organization_of(&current, params.organization_id)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let scope = scope_of(&state, &current, organization_id).await;
     let sensitive = may_read_sensitive(&state, &current).await;
 

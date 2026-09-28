@@ -35,6 +35,7 @@ use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::routes::crm::{emit, organization_of};
 use crate::routes::iam::record;
+use crate::routes::crm_deals::OrganizationParam;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -56,6 +57,9 @@ pub struct LeadParams {
     /// How many rows to skip.
     #[serde(default)]
     pub offset: Option<i64>,
+    /// Organization to read (platform accounts only).
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 /// What the inbox screen renders: the rows, the counters and where the drain got to.
@@ -126,7 +130,7 @@ pub async fn list_leads(
     current: CurrentSession,
     Query(params): Query<LeadParams>,
 ) -> Result<Json<LeadInbox>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
 
     let query = LeadQuery {
         outcome: params.outcome,
@@ -158,8 +162,9 @@ pub async fn list_leads(
 pub async fn get_lead_settings(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(params): Query<OrganizationParam>,
 ) -> Result<Json<LeadSettingsView>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let existing = leads::read_settings_row(state.db().pool(), organization_id).await?;
 
     Ok(Json(LeadSettingsView {
@@ -173,9 +178,10 @@ pub async fn update_lead_settings(
     State(state): State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
+    Query(params): Query<OrganizationParam>,
     body: Json<UpdateLeadSettings>,
 ) -> Result<Json<LeadSettingsView>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let pool = state.db().pool();
 
     // The current row is read first so an absent key keeps what it has. `load_settings` would

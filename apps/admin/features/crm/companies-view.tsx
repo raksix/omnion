@@ -41,6 +41,7 @@ import {
 import { formatTimestamp } from "@/lib/format";
 
 import { CrmAvatar, CrmShell, CrmSortHeader, CrmStatusBadge, CrmTag } from "./crm-parts";
+import { useCrmTenant } from "./crm-tenant";
 
 /** What the company form holds while it is open. */
 type CompanyForm = {
@@ -94,6 +95,9 @@ export function CompaniesView() {
   const [fieldError, setFieldError] = useState<{ field: string; message: string } | null>(null);
   const [saving, setSaving] = useState(false);
 
+  // The organization the panel is reading (REQ-051): a platform account has no primary one.
+  const { organizationId } = useCrmTenant();
+
   const query = useMemo(
     () => ({
       search: searchParams.get("search") || undefined,
@@ -103,8 +107,9 @@ export function CompaniesView() {
       include_archived: searchParams.get("include_archived") === "true" || undefined,
       sort: searchParams.get("sort") || undefined,
       direction: (searchParams.get("direction") as "asc" | "desc") ?? undefined,
+      organization_id: organizationId ?? undefined,
     }),
-    [searchParams],
+    [searchParams, organizationId],
   );
 
   const columns = useMemo(() => {
@@ -129,7 +134,7 @@ export function CompaniesView() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchCrmColumnCatalogue("companies")
+    fetchCrmColumnCatalogue("companies", organizationId ?? undefined)
       .then((answer) => {
         if (!cancelled) {
           setCatalogue({ columns: answer.columns, statuses: answer.statuses });
@@ -147,7 +152,7 @@ export function CompaniesView() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchCrmViews("companies")
+    fetchCrmViews("companies", organizationId ?? undefined)
       .then((answer) => {
         if (!cancelled) {
           setViews(answer);

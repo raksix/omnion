@@ -121,7 +121,7 @@ async fn answer(
     body: Option<Json<CopilotBody>>,
     action: CopilotAction,
 ) -> Result<Json<CopilotAnswer>, ApiError> {
-    let organization_id = organization_of(&current, None)?;
+    let organization_id = organization_of(&state, &current, None).await?;
     let scope = scope_of(&state, &current, organization_id).await;
 
     // 1. The read. Scoped exactly as the card that renders this button was drawn, so the copilot
