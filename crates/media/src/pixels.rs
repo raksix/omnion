@@ -219,7 +219,7 @@ fn encode(
     background: [u8; 3],
 ) -> Result<(Vec<u8>, u32, u32)> {
     let mut bytes = Vec::new();
-    let quality = u8::from(recipe.quality);
+    let quality = recipe.quality;
 
     match recipe.format {
         // WebP: the lossless range is a different scale from the lossy one, so a quality of 100
