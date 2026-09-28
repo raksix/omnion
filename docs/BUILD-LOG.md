@@ -2657,3 +2657,53 @@ Publish button not re-enabling after a fix — then re-run for the acceptance-7 
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+## 2026-09-28 · REQ-063 slice 4 — acceptance 7 closed, and the assertion that could never have passed
+
+**What.** Merged `origin/main` first (18 commits; two conflicts, both unions: the `import type` list in
+`apps/admin/lib/api.ts` and the append-only `docs/BUILD-LOG.md`, spliced with `git merge-file --union` and
+verified by **multiset** — every content line of both sides present, no markers, rather than a line count
+which would hide a duplicated block). Then worked the last two open boxes: acceptance 7's recovery half, and
+the first of the two defects behind it.
+
+**The finding that changed the shape of the tick.** Acceptance 7 had been red for two ticks and the note on
+it said the editor "did not recover from a fix". It does. A probe that reproduces *only* the provoke/fix pair
+reported `warnings 1 → 0` with Publish enabled throughout, and a second probe that replays the full pass's own
+sequence found where the reading came apart: `data-block-warnings` is the **page-wide** advisory count, and
+the pass deliberately leaves an unrelated `block_column_empty` on screen (a Columns block whose second column
+is empty). So `outlineWarningCleared`, which asserted that counter `=== "0"`, reported failure with the
+heading warning genuinely gone — a step that no fix to the heading could ever clear. The same conflation sat
+in `outlineWarningIsNotBlocking`, which read the page's whole error count and so let one unrelated missing
+`src` decide a sentence about heading warnings.
+
+Both are now stated where the claim actually lives: the bar is read once, and the step looks for the
+heading-order **text** (`outlineWarningCleared`, `outlineWarningIsAdvisory`) rather than for a total.
+
+**The product defect underneath, and the one worth keeping.** `block_column_empty` had to stay — the pass
+creates it, and the page is right to mention it. That exposed the real gap: a **warning had no way to be
+reached at all**. The blocking branch of the status bar has had a `— show me` jump since it was found dead
+once before, and a warning was the same dead end with a softer voice: it cannot block a publish, so nothing
+in the flow ever leads the author to it, and the issue list itself lives in the inspector — visible only for
+the block you already have selected. The bar now derives `warnings` once and offers the same way in
+(`data-block-first-warning`). Proven live: `1 warning — show me` → click → the block is selected and its
+issues are on screen.
+
+**Proof.**
+- `scripts/qa/probe-outline-recovery-full.cjs` against `QA_STACK=w2` — `outlineWarningShown` true,
+  `outlineWarningIsAdvisory` true, `outlineWarningIsNotBlocking` true, `outlineWarningCleared` true,
+  `clearedAfterFix` true, `publishEnabledAfterFix` true, `warningJumpOffered` true, `warningReachable` true.
+  The provoke/fix pair runs at steps 6 and 7, and the bar is reported at all seven so the step that first
+  turns `errors` non-zero is *named*, not inferred.
+- `cargo test -p omnion-content --quiet` → **107 passed, 0 failed**. `pnpm typecheck` → **2/2**.
+
+**Commits.** `ad5e623` (dedupe the import union the merge left behind — my union block had been built from
+the hunk only, so the 27 context lines the merge kept below it were re-added as duplicates and
+`TS2300 Duplicate identifier 'Site' / 'User'` failed the gate), `9759049` (the warning way-in), `3dce5af`
+(the walkthrough assertion + the new probe gate).
+
+**Next.** Acceptance 17, and only that: the pass holds 555 high findings, most of them main's media screens
+(`422` on `media/*/raw?preset=…`, `404` on `media/files?folder_id=…`). The `publicRendered: false` reading
+from `20260928-124117` is very likely the same artefact this tick removed — publish is gated on
+`blocking.length > 0`, and that pass ended with `errors: 1`, so nothing was ever published for the public
+render to show. Re-run and count only what wave 2 owns. The pass is ~70 min and costs ~1.5 G of browser heap
+on a box four writers share: check `free -g` first, and budget 1500s+.
