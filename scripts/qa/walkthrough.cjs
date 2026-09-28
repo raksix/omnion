@@ -6104,11 +6104,49 @@ async function runCrmKeyboardAndMobile(page, report) {
   );
   // A sheet is a claim about what the screen listens for. If it promises a key and the key does
   // nothing, the screen is offering a control it cannot deliver — the one thing the box forbids.
-  const advertised = (sheetText.match(/\bg then ([a-z])\b/) || [])[1] ?? "";
-  steps.theSheetOnlyPromisesLiveKeys = advertised.length === 0;
+  //
+  // The first version of this step read the sheet and asserted that it advertised **no** `g then X`
+  // row at all, on the theory that a prefix is a binding nobody listens for. Two things were wrong
+  // with that. The sheet *deliberately* advertises four live destinations (`g then d/a/l/s`, each
+  // built from `CRM_NAV`), so the assertion was false against a correct screen and would have
+  // blocked this box for good. And it was checking the *text* rather than the *behaviour*, which is
+  // the mistake this whole pass exists to stop: a sheet that prints `g then d` and navigates
+  // nowhere reads exactly the same as one that works.
+  //
+  // So every advertised destination is collected and each one is **pressed** below, in a loop, and
+  // the step is the conjunction. A row the screen advertises and does not honour now fails here,
+  // which is the defect the box is about — and a row it does not advertise is no longer this
+  // step's business.
+  const advertisedDestinations = [...sheetText.matchAll(/\bg then ([a-z])\b/g)].map((m) => m[1]);
+  steps.theSheetAdvertisesDestinations = advertisedDestinations.length > 0;
   await shot(page, "page-crm-shortcut-sheet");
 
-  // `?` again closes it, so the toggle is a toggle and not a one-way door.
+  // Each advertised `g then <key>` is pressed for real: the prefix arms, the letter navigates, and
+  // the assertion is the URL. `/crm/contacts` is the launch point, so a destination is only a real
+  // test if it is a *different* screen — which is why the launch is repeated before each press.
+  const destinationsTried = [];
+  steps.everyAdvertisedGoKeyNavigates = true;
+  for (const key of advertisedDestinations) {
+    await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(700);
+    await page.keyboard.press("g");
+    await page.keyboard.press(key);
+    await page.waitForTimeout(1200);
+    const landed = new URL(page.url()).pathname;
+    const moved = !/^\/crm\/contacts\/?$/.test(landed);
+    destinationsTried.push({ key, landed, moved });
+    if (!moved) steps.everyAdvertisedGoKeyNavigates = false;
+  }
+  steps.theGoKeysAreListed = destinationsTried;
+
+  // The `?` toggle is asserted **before** the go-key loop moves the page off this screen, and the
+  // loop ends by returning here, so the close still has a sheet in front of it to close.
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.keyboard.press("?");
+  await page.waitForTimeout(400);
+  steps.theSheetReopensAfterNavigation =
+    (await page.locator("[data-qa='crm-shortcut-sheet']").count()) > 0;
   await page.keyboard.press("?");
   await page.waitForTimeout(300);
   steps.theSheetCloses = (await page.locator("[data-qa='crm-shortcut-sheet']").count()) === 0;
