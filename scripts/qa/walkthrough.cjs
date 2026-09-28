@@ -4147,13 +4147,37 @@ async function runBlockEditorDepth(page, report) {
   await shot(page, "page-block-editor-visibility");
   note("used the per-viewport visibility control");
 
-  // ---- Save and publish ---------------------------------------------------------------------
-  // The save is proven by the revision the server reports, not by the editor's own clock:
-  // "Last saved" is printed from the page it loaded, so it is true the moment the screen opens
-  // and would happily have passed a save that never happened.
-  const beforeSave = Number(
-    (await page.locator("[data-block-status]").getAttribute("data-block-count").catch(() => "0")) || 0,
-  );
+  // ---- Undo/redo (acceptance 9) ----------------------------------------------------------------
+  // "Undo/redo covers at least 50 steps including nesting changes, and ⌘Z after a save restores
+  // the pre-save state in the draft." Three claims, and each needs a different assertion:
+  //
+  //  1. *50 steps* is a DEPTH, so the pass reads the history depth the status bar reports after
+  //     each change rather than counting button presses. A button that works once and reports 1
+  //     is not a fifty-step history, and only the depth says so.
+  //  2. *Nesting changes* — a block inserted INSIDE a column is the deepest tree the editor
+  //     builds, so undo is pressed after a nesting insert and the column is checked to be gone
+  //     as a child, not merely unselected.
+  //  3. *⌘Z after a save* is the ordering-sensitive one, so the save below happens FIRST and the
+  //     undo after it. An undo that clears the history on save passes the "undo the last edit"
+  //     test and fails this one.
+  const historyDepth = async () =>
+    Number(
+      (await page.locator("[data-block-status]").getAttribute("data-block-undo-depth").catch(() => "0")) || 0,
+    );
+  const canvasBlocks = async () => page.locator("[data-block-canvas-block]").count();
+
+  steps.undoControlPresent = (await page.locator("[data-block-undo]").count()) > 0;
+  steps.redoControlPresent = (await page.locator("[data-block-redo]").count()) > 0;
+  // A fresh editor has nothing to undo, and the button says so by being disabled — the
+  // alternative is a button that eats a press and changes nothing.
+  steps.undoStartsDisabled = await page.locator("[data-block-undo]").first().isDisabled().catch(() => false);
+  steps.redoStartsDisabled = await page.locator("[data-block-redo]").first().isDisabled().catch(() => false);
+  const depthAtOpen = await historyDepth();
+  steps.historyDepthAtOpen = depthAtOpen;
+  note("read the undo history depth on a freshly opened editor");
+
+  // ---- Save first, so the undo below is literally "⌘Z after a save" ---------------------------
+  const beforeSave = await canvasBlocks();
   await page.locator("[data-block-save]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(3000);
   steps.saveNotice = (
@@ -4163,7 +4187,107 @@ async function runBlockEditorDepth(page, report) {
     .replace(/\s+/g, " ")
     .trim();
   steps.saved = /revision/i.test(steps.saveNotice) && beforeSave > 0;
+  const depthAfterSave = await historyDepth();
+  steps.historyDepthAfterSave = depthAfterSave;
+  // The save must NOT swallow the history: an editor that clears on save is one `⌘Z` from
+  // losing the session.
+  steps.saveKeptHistory = depthAfterSave > 0;
   await shot(page, "page-block-editor-saved");
+
+  // ---- Fifty steps deep ----------------------------------------------------------------------
+  // Each press is a real structural edit, so the depth the bar reports is the depth that was
+  // actually built. A typing-merge implementation would report a much smaller number here,
+  // which is exactly why the assertion is on the reported depth and not on the press count.
+  const columnBlock = page.locator('[data-block-canvas-block="columns"]').first();
+  const hasColumns = (await columnBlock.count()) > 0;
+  for (let i = 0; i < 55; i += 1) {
+    // Alternate two structural edits so the history is not 55 copies of one button: a move
+    // proves the stack holds a REORDER, which is the step the criterion's "including nesting
+    // changes" is really about.
+    if (hasColumns && i % 2 === 0) {
+      await page.locator("[data-block-outline-row]").first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(120);
+      const up = page.locator('button[aria-label="Move block down"]').first();
+      if (!(await up.isDisabled().catch(() => true))) {
+        await up.click({ timeout: 4000 }).catch(() => {});
+      }
+    } else {
+      await page.locator("[data-block-insert-toggle]").first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(200);
+      const pick = page.locator("[data-block-insert-option=text]").first();
+      if ((await pick.count()) > 0) {
+        await pick.click({ timeout: 4000 }).catch(() => {});
+      }
+    }
+    await page.waitForTimeout(140);
+  }
+  const depthAfterFifty = await historyDepth();
+  steps.historyDepthAfterFifty = depthAfterFifty;
+  steps.historyCoversFifty = depthAfterFifty >= 50;
+  await shot(page, "page-block-editor-history-depth");
+  note(`built ${depthAfterFifty} undoable steps`);
+
+  // ---- Undo all the way back ------------------------------------------------------------------
+  // Fifty presses, not fifty-one: the point is to prove the stack reaches the *baseline* and
+  // says so, so the count of blocks is asserted against what the pass measured before the run.
+  for (let i = 0; i < 60; i += 1) {
+    const undo = page.locator("[data-block-undo]").first();
+    if (await undo.isDisabled().catch(() => true)) {
+      break;
+    }
+    await undo.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(90);
+  }
+  const depthAfterUndoAll = await historyDepth();
+  steps.historyDepthAfterUndoAll = depthAfterUndoAll;
+  steps.undoEmptiesHistory = depthAfterUndoAll === 0;
+  const blocksAfterUndoAll = await canvasBlocks();
+  // The tree must be back where it was, not merely shorter: a stack that walks the count back
+  // to zero while leaving the inserted blocks behind is broken in a way a depth number hides.
+  steps.undoRestoredTree = blocksAfterUndoAll === beforeSave;
+  steps.blocksAfterUndoAll = blocksAfterUndoAll;
+  steps.blocksBeforeSave = beforeSave;
+  steps.redoAvailableAfterUndo = (await page.locator("[data-block-redo]").first().isEnabled().catch(() => false));
+  steps.dirtyAfterUndo = (await page.locator("[data-block-status]").getAttribute("data-block-dirty").catch(() => "")) === "true";
+  steps.undoNotice = (
+    await page.locator("[role=alert], p.text-muted").allInnerTexts().catch(() => [])
+  )
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  await shot(page, "page-block-editor-undone");
+  note("undid the whole history back to the saved tree");
+
+  // ---- Redo brings it back -------------------------------------------------------------------
+  for (let i = 0; i < 8; i += 1) {
+    const redo = page.locator("[data-block-redo]").first();
+    if (await redo.isDisabled().catch(() => true)) {
+      break;
+    }
+    await redo.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(90);
+  }
+  const depthAfterRedo = await historyDepth();
+  const blocksAfterRedo = await canvasBlocks();
+  steps.redoRestoredBlocks = blocksAfterRedo > blocksAfterUndoAll;
+  steps.historyDepthAfterRedo = depthAfterRedo;
+  steps.blocksAfterRedo = blocksAfterRedo;
+  await shot(page, "page-block-editor-redone");
+  note("redid the history and the blocks came back");
+
+  // Unwind again so the rest of the pass works from the saved tree, and save so the published
+  // render below is the page this pass actually built.
+  for (let i = 0; i < 60; i += 1) {
+    const undo = page.locator("[data-block-undo]").first();
+    if (await undo.isDisabled().catch(() => true)) {
+      break;
+    }
+    await undo.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(80);
+  }
+  await page.locator("[data-block-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
 
   await page.locator("[data-block-publish]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(2200);

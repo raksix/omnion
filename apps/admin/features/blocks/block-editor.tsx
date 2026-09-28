@@ -22,13 +22,16 @@ import {
   ArrowUp,
   Copy,
   Eye,
+  History as HistoryIcon,
   Layers,
   Library,
   Pencil,
   Plus,
+  Redo2,
   Rocket,
   Save,
   Trash2,
+  Undo2,
 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
@@ -42,6 +45,18 @@ import { BlockCanvas } from "@/features/blocks/block-canvas";
 import { BlockInspector, InsertPanel } from "@/features/blocks/block-inspector";
 import { blockLabel, blockSummary, definitionFor } from "@/features/blocks/block-library";
 import { PatternTools } from "@/features/blocks/pattern-tools";
+import {
+  canRedo,
+  canUndo,
+  emptyHistory,
+  isTypingStep,
+  peekUndo,
+  record,
+  redo,
+  undo,
+  type History,
+  type StepIdentity,
+} from "@/features/blocks/block-history";
 import {
   MAX_COLUMNS,
   MAX_DEPTH,
@@ -88,6 +103,33 @@ function issuesByBlock(issues: BlockIssue[]): Map<string, BlockIssue[]> {
   return map;
 }
 
+/**
+ * A setting in the words an author used to find it.
+ *
+ * The undo label is the only place a step says what it did, and "set hide_on" is a database key
+ * rather than an action. "Hide on mobile" is the phrase on the control, so it is the phrase in
+ * the history — which is also what makes the two directions readable: pressing *everywhere*
+ * stores absence, and the label says it reset rather than claiming it set something.
+ */
+function settingLabel(key: string): string {
+  switch (key) {
+    case "hide_on":
+      return "Visibility";
+    case "align":
+      return "Alignment";
+    case "anchor":
+      return "Anchor";
+    case "id":
+      return "DOM id";
+    case "class":
+      return "CSS class";
+    case "aria_label":
+      return "Accessible name";
+    default:
+      return key;
+  }
+}
+
 /** The block editor of one page. */
 export function BlockEditor() {
   const params = useParams<{ id: string }>();
@@ -113,7 +155,101 @@ export function BlockEditor() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
+  // The undo/redo stack (acceptance 9). It holds trees, not diffs: every helper in
+  // `block-tree.ts` is pure and returns a new array, so a snapshot is a value that cannot be
+  // mutated later, and undoing is an assignment rather than an inverse operation that would
+  // have to know what "inverse" means for each of the nine tree helpers.
+  const [history, setHistory] = useState<History>(emptyHistory);
+  // The tree as it is RIGHT NOW, outside React's render cycle. Recording a step needs the
+  // "before" tree at the moment the author pressed the button, and a `setBlocks` updater runs
+  // later — by then the closure may be stale. The ref is written by `apply` and by undo/redo,
+  // which are the only things that change the working tree.
+  const blocksRef = useRef<ContentBlock[]>([]);
+  // The tree the server last acknowledged. Identity is the whole comparison: `blocksRef` is
+  // this same array until the author changes something, so `dirty` is a pointer check and not
+  // a deep-equal of 400 blocks on every keystroke.
+  const savedTreeRef = useRef<ContentBlock[]>([]);
+  const [dirty, setDirty] = useState(false);
+  // The newest step's identity. Two prop edits in a row on the same block collapse into one
+  // undoable step: without this, a paragraph of typing evicts every structural edit the author
+  // made before it from a 100-step history, and undo starts feeling broken.
+  const lastStep = useRef<StepIdentity | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * The one way the working tree changes.
+   *
+   * Every structural edit and every prop edit goes through here, so the history cannot be
+   * bypassed: a mutation applied with a bare `setBlocks` is invisible to undo, which is exactly
+   * what an author reports as "undo is broken" and cannot reproduce.
+   */
+  const apply = useCallback(
+    (
+      label: string,
+      change: (current: ContentBlock[]) => ContentBlock[],
+      step: StepIdentity = { blockId: null, kind: label },
+    ) => {
+      const current = blocksRef.current;
+      const next = change(current);
+      if (next === current) {
+        // The helper refused the operation (the first block cannot move up, a path no longer
+        // exists). Recording it would make undo a button that eats a press and changes
+        // nothing.
+        return false;
+      }
+      blocksRef.current = next;
+      setBlocks(next);
+      // Undo can walk the tree back to exactly the saved one, so "dirty" is recomputed from
+      // identity here rather than set to true — otherwise undoing back to the saved state
+      // still reads as unsaved work.
+      setDirty(next !== savedTreeRef.current);
+      // A run of typing is ONE step. The snapshot the first keystroke took is already the
+      // tree from before the run began, so a later keystroke must not push another one.
+      const merge = isTypingStep(lastStep.current, step);
+      if (!merge) {
+        setHistory((existing) => record(existing, { blocks: current, selected, label }, true));
+      }
+      lastStep.current = step;
+      return true;
+    },
+    [selected],
+  );
+
+  /** Undo one step, and say which one in the status bar. */
+  const undoStep = useCallback(() => {
+    setHistory((existing) => {
+      const taken = undo(existing, blocksRef.current, selected);
+      if (!taken) {
+        return existing;
+      }
+      blocksRef.current = taken.entry.blocks;
+      setBlocks(taken.entry.blocks);
+      setSelected(taken.entry.selected);
+      setDirty(taken.entry.blocks !== savedTreeRef.current);
+      setNotice(`Undone — ${taken.entry.label.toLowerCase()}.`);
+      // The next step starts a new run, so the next prop edit is its own entry rather than a
+      // continuation of the one just taken back.
+      lastStep.current = null;
+      return taken.history;
+    });
+  }, [selected]);
+
+  /** Redo one step. */
+  const redoStep = useCallback(() => {
+    setHistory((existing) => {
+      const taken = redo(existing, blocksRef.current, selected);
+      if (!taken) {
+        return existing;
+      }
+      blocksRef.current = taken.entry.blocks;
+      setBlocks(taken.entry.blocks);
+      setSelected(taken.entry.selected);
+      setDirty(taken.entry.blocks !== savedTreeRef.current);
+      setNotice(`Redone — ${taken.entry.label.toLowerCase()}.`);
+      lastStep.current = null;
+      return taken.history;
+    });
+  }, [selected]);
 
   // The registry is the same document for every page, so it is fetched once per screen.
   useEffect(() => {
@@ -151,9 +287,17 @@ export function BlockEditor() {
         setPage(loaded);
         const draft = loaded.draft ?? loaded.published;
         const tree = Array.isArray(draft?.blocks) ? (draft.blocks as ContentBlock[]) : [];
+        blocksRef.current = tree;
+        savedTreeRef.current = tree;
+        setDirty(false);
         setBlocks(tree);
         setSelected(tree.length > 0 ? [0] : null);
         setSavedAt(draft?.created_at ?? null);
+        // A newly opened page starts with nothing to undo: the draft it loaded IS the
+        // baseline, and an undo that reached back past it would restore a tree this page
+        // never had.
+        setHistory(emptyHistory());
+        lastStep.current = null;
       })
       .catch((cause: unknown) => {
         if (!cancelled) {
@@ -235,7 +379,7 @@ export function BlockEditor() {
       // with it, because "two of these side by side" needs each column to be its own node. The
       // author lands inside the first column, which is the block they are about to fill.
       if (definition.key === "columns") {
-        setBlocks((current) => {
+        apply(`Add ${definition.label}`, (current) => {
           const placed = insertColumns(current, selected ?? [], definition);
           setSelected(placed.path);
           return placed.blocks;
@@ -245,7 +389,10 @@ export function BlockEditor() {
         return;
       }
       const block = newBlock(definition);
-      setBlocks((current) => {
+      // A *nesting* insert (into a column, into any container) is the case the criterion names
+      // explicitly, and it arrives here through the same two lines as a top-level one — so
+      // undo cannot tell them apart, which is right: the author pressed one button either way.
+      apply(`Add ${definition.label}`, (current) => {
         // The new block is selected as it lands. An author who pressed *Heading* is about to
         // type a heading, and an editor that makes them find the new row in the outline first
         // is an editor they will use once and then stop opening.
@@ -270,7 +417,7 @@ export function BlockEditor() {
       setInsertOpen(false);
       setActionError(null);
     },
-    [selected],
+    [apply, selected],
   );
 
   const save = async () => {
@@ -280,13 +427,30 @@ export function BlockEditor() {
     setSaving(true);
     setActionError(null);
     setNotice(null);
+    // The tree the server is about to be given. Captured before the await because a keystroke
+    // during the round trip must not be what gets saved, and `blocks` in this closure is the
+    // tree as of the click.
+    const treeToSave = blocksRef.current;
     try {
-      const updated = await updatePage(pageId, { blocks });
+      const updated = await updatePage(pageId, { blocks: treeToSave });
       setPage(updated);
       setSavedAt(new Date().toISOString());
       setNotice(
         `Saved as draft revision ${updated.draft?.revision_no ?? "?"}. Publishing is a separate step.`,
       );
+      // A save does NOT clear the history and does NOT become a step of its own — it is the
+      // boundary between "what the server holds" and "what the author is doing". Clearing the
+      // history would satisfy the criterion for exactly one press and then lose everything
+      // the author did before it; recording the save AS a step is just as wrong, because the
+      // tree at the moment of the save is the tree that is already on screen, so the first
+      // `⌘Z` after a save would restore an identical tree and appear to do nothing.
+      //
+      // What the author needs instead is to know the server is now AHEAD of the editor once
+      // they undo, which is what `savedTree` is for: the bar says the draft still holds the
+      // saved revision and that the change is unsaved again.
+      savedTreeRef.current = treeToSave;
+      setDirty(false);
+      lastStep.current = null;
     } catch (cause: unknown) {
       setActionError(
         cause instanceof ApiError ? cause.message : "The page could not be saved.",
@@ -332,19 +496,35 @@ export function BlockEditor() {
       const typing =
         target instanceof HTMLInputElement ||
         target instanceof HTMLTextAreaElement ||
-        target instanceof HTMLSelectElement;
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable);
+      // Undo/redo come FIRST and are the only shortcuts that work with nothing selected: an
+      // author who has just deleted the block they were looking at has no selection, and
+      // `⌘Z` is exactly what they press. Inside a text field the browser's own undo is the
+      // better one — it undoes the keystroke, not the whole field edit — so it is left alone.
+      if (!typing && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          redoStep();
+        } else {
+          undoStep();
+        }
+        return;
+      }
       if (typing || !selected) {
         return;
       }
       if (event.metaKey && event.key === "d") {
         event.preventDefault();
-        setBlocks((current) => duplicateBlock(current, selected));
+        apply("Duplicate block", (current) => duplicateBlock(current, selected));
         return;
       }
       if (event.metaKey && event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
         event.preventDefault();
         const delta = event.key === "ArrowUp" ? -1 : 1;
-        setBlocks((current) => moveBlock(current, selected, delta));
+        apply(delta < 0 ? "Move block up" : "Move block down", (current) =>
+          moveBlock(current, selected, delta),
+        );
         return;
       }
       if (event.key === "Escape") {
@@ -353,7 +533,7 @@ export function BlockEditor() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selected]);
+  }, [apply, redoStep, selected, undoStep]);
 
   if (loadError) {
     return (
@@ -447,6 +627,34 @@ export function BlockEditor() {
           </button>
           <button
             type="button"
+            data-block-undo
+            onClick={undoStep}
+            disabled={!canUndo(history)}
+            aria-label="Undo"
+            title={
+              canUndo(history)
+                ? `Undo — ${peekUndo(history)?.label.toLowerCase()} (⌘Z)`
+                : "Nothing to undo"
+            }
+            className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas disabled:opacity-40"
+          >
+            <Undo2 className="size-3.5" aria-hidden />
+            Undo
+          </button>
+          <button
+            type="button"
+            data-block-redo
+            onClick={redoStep}
+            disabled={!canRedo(history)}
+            aria-label="Redo"
+            title={canRedo(history) ? "Redo (⇧⌘Z)" : "Nothing to redo"}
+            className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas disabled:opacity-40"
+          >
+            <Redo2 className="size-3.5" aria-hidden />
+            Redo
+          </button>
+          <button
+            type="button"
             data-block-save
             onClick={save}
             disabled={saving}
@@ -504,7 +712,10 @@ export function BlockEditor() {
             // A pattern lands where the author is: inside a container they just made, after the
             // block they just selected, or — with nothing selected — at the end of the page.
             // `insertGroup` owns those three cases; the reason for each lives there.
-            setBlocks((current) => insertGroup(current, selected, patternBlocks));
+            apply(
+              `Insert pattern (${patternBlocks.length} block${patternBlocks.length === 1 ? "" : "s"})`,
+              (current) => insertGroup(current, selected, patternBlocks),
+            );
             setPatternToolsOpen(false);
           }}
           onClose={() => setPatternToolsOpen(false)}
@@ -581,14 +792,32 @@ export function BlockEditor() {
               registry={registry}
               block={selectedBlock}
               issues={selectedIssues}
-              onChange={(key, value) =>
-                setBlocks((current) => (selected ? setProp(current, selected, key, value) : current))
-              }
-              onSetting={(key, value) =>
-                setBlocks((current) =>
-                  selected ? setSetting(current, selected, key, value) : current,
-                )
-              }
+              onChange={(key, value) => {
+                if (!selected || !selectedBlock) {
+                  return;
+                }
+                // A prop edit fires per keystroke, so it is keyed by BLOCK id: consecutive
+                // edits to the same block collapse into one undoable step, and moving to a
+                // different block starts a new one.
+                const label = `Edit ${blockLabel(registry, selectedBlock)}`;
+                apply(
+                  label,
+                  (current) => setProp(current, selected, key, value),
+                  { blockId: selectedBlock.id, kind: "prop" },
+                );
+              }}
+              onSetting={(key, value) => {
+                if (!selected || !selectedBlock) {
+                  return;
+                }
+                // A setting is one press of a `<select>`, never a keystroke, so it is its own
+                // step and never merges with the prop edit before it.
+                const label =
+                  value === ""
+                    ? `Reset ${settingLabel(key)}`
+                    : `${settingLabel(key)} — ${value}`;
+                apply(label, (current) => setSetting(current, selected, key, value));
+              }}
               breadcrumb={crumbs}
               onCrumb={setSelected}
               actions={
@@ -598,7 +827,7 @@ export function BlockEditor() {
                       type="button"
                       data-block-add-column
                       onClick={() =>
-                        setBlocks((current) => addColumn(current, columnsPath))
+                        apply("Add column", (current) => addColumn(current, columnsPath))
                       }
                       disabled={!canAddColumn}
                       aria-label="Add a column"
@@ -636,7 +865,7 @@ export function BlockEditor() {
                           return;
                         }
                         setActionError(null);
-                        setBlocks((current) =>
+                        apply("Remove column", (current) =>
                           removeColumn(current, columnParentPath, columnIndex),
                         );
                         setSelected(columnParentPath);
@@ -656,7 +885,7 @@ export function BlockEditor() {
                   <button
                     type="button"
                     onClick={() =>
-                      selected && setBlocks((current) => moveBlock(current, selected, -1))
+                      selected && apply("Move block up", (current) => moveBlock(current, selected, -1))
                     }
                     disabled={!canMoveUp}
                     aria-label="Move block up"
@@ -669,7 +898,7 @@ export function BlockEditor() {
                   <button
                     type="button"
                     onClick={() =>
-                      selected && setBlocks((current) => moveBlock(current, selected, 1))
+                      selected && apply("Move block down", (current) => moveBlock(current, selected, 1))
                     }
                     disabled={!canMoveDown}
                     aria-label="Move block down"
@@ -682,7 +911,8 @@ export function BlockEditor() {
                   <button
                     type="button"
                     onClick={() =>
-                      selected && setBlocks((current) => duplicateBlock(current, selected))
+                      selected &&
+                      apply("Duplicate block", (current) => duplicateBlock(current, selected))
                     }
                     aria-label="Duplicate block"
                     title="Duplicate (⌘D)"
@@ -694,14 +924,20 @@ export function BlockEditor() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (!selected) {
+                      if (!selected || !selectedBlock) {
                         return;
                       }
-                      setBlocks((current) => removeBlock(current, selected));
+                      // Deleting the selection clears it, which is why the criterion's
+                      // "`⌘Z` after a save" scenario needs an undo that works with nothing
+                      // selected — the author is already in that state here.
+                      apply(`Delete ${blockLabel(registry, selectedBlock)}`, (current) =>
+                        removeBlock(current, selected),
+                      );
                       setSelected(selected.length > 1 ? selected.slice(0, -1) : null);
                     }}
                     aria-label="Delete block"
                     title="Delete"
+                    data-block-delete
                     className="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11.5px] text-accent-strong transition hover:bg-accent-soft"
                   >
                     <Trash2 className="size-3" aria-hidden />
@@ -727,6 +963,9 @@ export function BlockEditor() {
         data-block-count={blockCount}
         data-block-errors={blocking.length}
         data-block-warnings={issues.length - blocking.length}
+        data-block-undo-depth={history.past.length}
+        data-block-redo-depth={history.future.length}
+        data-block-dirty={dirty ? "true" : "false"}
         className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-line bg-surface px-4 py-2.5 text-[12px] text-muted"
       >
         <span className="flex items-center gap-1.5">
@@ -751,6 +990,14 @@ export function BlockEditor() {
         ) : (
           <span className="text-positive">Ready to publish</span>
         )}
+        {/* The history depth, in words. A number alone says nothing about whether the button
+            does anything, and the "can I undo" question is the one an author asks when they
+            reach for ⌘Z. */}
+        <span data-block-history className="flex items-center gap-1.5">
+          <HistoryIcon className="size-3" aria-hidden />
+          {history.past.length} undoable
+          {canRedo(history) ? ` · ${history.future.length} redoable` : ""}
+        </span>
         <span className="ml-auto">
           {savedAt ? `Last saved ${new Date(savedAt).toLocaleTimeString()}` : "Not saved yet"}
           {validated
