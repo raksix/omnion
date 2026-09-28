@@ -17,6 +17,7 @@
 pub mod client;
 pub mod connection_test;
 pub mod error;
+pub mod failover;
 pub mod health;
 pub mod health_store;
 pub mod model;
@@ -30,6 +31,9 @@ pub use client::{
 };
 pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
 pub use error::{AiHubError, Result};
+pub use failover::{
+    Attempt, Plan, Progress, Routing, chain_of, final_error, is_retryable, next, plan,
+};
 pub use model::{
     AiModel, ApiKeyChange, DEFAULT_PROTOCOL, DiscoveryAction, DiscoveryDiff, DiscoveryLine,
     HEALTH_STATUSES, MAX_MODEL_KEY_LEN, MAX_NAME_LEN, MAX_PRIORITY, MAX_RETRIES_CEILING,
