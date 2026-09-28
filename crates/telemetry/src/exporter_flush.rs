@@ -183,6 +183,12 @@ pub async fn sweep(pool: &PgPool, collector: &Collector) -> Result<usize, crate:
         };
         let outcome = send(kind, &row, &batch).await;
         let items_sent = batch.len();
+        // The chip BEFORE the outcome, because the event this tick adds is about the MOVE and
+        // the move is the difference between the two readings. Reading it afterwards would make
+        // every transition look like it started from whatever it is now.
+        let before = collector
+            .status(&row.name)
+            .map_or_else(|| "unknown".to_owned(), |status| status.health);
         collector.record_outcome(&row.name, &outcome);
 
         match &outcome {
@@ -197,10 +203,62 @@ pub async fn sweep(pool: &PgPool, collector: &Collector) -> Result<usize, crate:
 
         if let Some(after) = collector.status(&row.name) {
             persist(pool, &row, &after).await?;
+            // Once per STATE CHANGE. A backend that is down fails every sweep, and a subscriber
+            // that received `exporter.degraded` every second would learn to ignore the name and
+            // would also bury the `recovered` that follows it in a hundred identical rows. The
+            // request says "notifies holders of `observability.exporters.manage` once per state
+            // change, not per retry" — the notification, and by extension the event it is
+            // derived from.
+            if before != after.health {
+                emit_health_change(pool, &row, &before, &after).await;
+            }
         }
         flushed += 1;
     }
     Ok(flushed)
+}
+
+/// Record `exporter.degraded` or `exporter.recovered` for one health move.
+///
+/// The direction is DERIVED from the two readings rather than passed in, so a caller cannot
+/// announce `recovered` for an exporter that is now `down` — the same reason the alert payload
+/// derives its state. Which event name goes out is therefore not a decision any caller can make
+/// wrong, only one they can fail to call.
+async fn emit_health_change(
+    pool: &PgPool,
+    row: &Configured,
+    before: &str,
+    after: &exporter::ExporterStatus,
+) {
+    let name = match after.health.as_str() {
+        "degraded" | "down" => crate::events::EXPORTER_DEGRADED,
+        "ok" => crate::events::EXPORTER_RECOVERED,
+        // `unknown` is where an exporter starts, not a state it recovers into. A configured
+        // exporter that has never flushed is not news — the screen says `unknown` and the
+        // operator can see why.
+        _ => return,
+    };
+    let transition = crate::events::ExporterTransition {
+        name: row.name.clone(),
+        kind: row.kind.clone(),
+        health: match after.health.as_str() {
+            "degraded" => "degraded",
+            "down" => "down",
+            _ => "ok",
+        },
+        previous: match before {
+            "ok" => "ok",
+            "degraded" => "degraded",
+            "down" => "down",
+            _ => "unknown",
+        },
+        // The backend's own words, already truncated at the transport. Not the endpoint: an
+        // OTLP endpoint commonly carries its token in the path, and this is a payload that
+        // reaches a subscriber's inbox.
+        error: after.last_error.clone(),
+        dropped_total: after.dropped_total,
+    };
+    crate::events::try_emit(pool, name, transition.payload()).await;
 }
 
 /// Whether this exporter's `batch_ms` has elapsed since its last flush.
