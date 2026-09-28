@@ -22,6 +22,7 @@ pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod scanning;
 pub mod shares;
 pub mod storage_settings;
 pub mod transform;
@@ -32,6 +33,14 @@ pub use browser::{
     FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
     purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+};
+pub use scanning::{
+    MAX_SCAN_MB, MAX_TIMEOUT_SECONDS, MIN_SCAN_MB, MIN_TIMEOUT_SECONDS, NewSiteScan,
+    PendingScan, Quarantine, ScanRequest, ScanResponse, ScanRun, ServeRefusal, SiteScan,
+    SweepCounts, Verdict, apply_verdict, begin_run, claim_pending, close_quarantine, finish_run,
+    interpret, is_quarantined, list_quarantines, list_runs, may_serve, parse_response,
+    quarantine_totals,
+    read_scan_settings, scan_identity, write_scan_settings,
 };
 pub use duplicates::{
     CrossSiteCopy, CrossSiteGroup, DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES,
