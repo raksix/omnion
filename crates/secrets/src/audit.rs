@@ -677,13 +677,17 @@ pub async fn acknowledge_anomaly(
     actor_user_id: Uuid,
     at: OffsetDateTime,
 ) -> Result<bool> {
+    // `count(*)` is `int8` and the cast has to keep it that way for the `i64` decoder. Casting it
+    // down to `int` instead makes Postgres report `INT4` against a Rust `INT8` expectation, and the
+    // acknowledge then 500s on a perfectly healthy database — the row is written, the count is
+    // right, and the decode is what fails.
     let updated: i64 = sqlx::query_scalar(
         "with changed as ( \
              update secret_audit_anomalies \
              set acknowledged_by = $2, acknowledged_at = $3 \
              where id = $1 and acknowledged_at is null \
              returning 1) \
-         select count(*)::int from changed",
+         select count(*) from changed",
     )
     .bind(id)
     .bind(actor_user_id)
