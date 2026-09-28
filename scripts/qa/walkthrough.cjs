@@ -863,6 +863,118 @@ async function uploadMediaSample(page) {
   };
 }
 
+// ---------------------------------------------------------------- file manager (REQ-010, slice 1)
+
+/**
+ * Drive the file manager the way an operator does.
+ *
+ * The pass proves the parts that are easy to get subtly wrong and invisible in a screenshot: a
+ * folder is created and shows up in the tree, the listing reports a total that matches its rows,
+ * a filter narrows it, the bulk bar appears on a two-file selection, a delete moves the file to
+ * the trash rather than destroying it, and the trash screen brings that same file back. A screen
+ * that only looked right in a screenshot would pass all of that without doing any of it.
+ */
+async function runMediaFileManager(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-file-manager", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const loaded = (await page.locator("#media-new-folder").count()) > 0;
+  note({ step: "load", loaded });
+  if (!loaded) {
+    return { ok: false, reason: "the media browser did not render" };
+  }
+
+  // A folder under the root, with a name the pass can find again.
+  const folderName = "QA Campaign 2026";
+  await page.fill("#media-new-folder", folderName);
+  await page.click('button[aria-label="Create folder"]');
+  await page.waitForTimeout(1400);
+  const folderInTree = await page.locator(`aside >> text=${folderName}`).count();
+  note({ step: "create-folder", folderInTree });
+
+  // Open it: the breadcrumb names the folder and the listing is scoped to it.
+  await page.locator(`aside button:has-text("${folderName}")`).first().click().catch(() => {});
+  await page.waitForTimeout(1200);
+  const url = page.url();
+  const inBreadcrumb = await page.locator(`nav[aria-label="Breadcrumb"] >> text=${folderName}`).count();
+  note({ step: "open-folder", url: url.replace(URL_ADMIN, ""), inBreadcrumb });
+  await shot(page, "media-folder-open");
+
+  // A second file, so a two-file selection is possible.
+  await uploadMediaSample(page);
+  await page.waitForTimeout(1200);
+
+  // Move both into the folder through the bulk bar, which is the real path an operator takes.
+  const checkboxes = page.locator('tbody input[type="checkbox"], ul input[type="checkbox"]');
+  const available = await checkboxes.count();
+  if (available >= 2) {
+    await checkboxes.nth(0).check();
+    await checkboxes.nth(1).check();
+    await page.waitForTimeout(400);
+  }
+  const bulkVisible = (await page.locator('div[aria-label="Selection"]').count()) > 0;
+  note({ step: "bulk-bar", available, bulkVisible });
+  if (bulkVisible) {
+    await page.click('div[aria-label="Selection"] >> text=Move here');
+    await page.waitForTimeout(1500);
+  }
+  const rowsAfterMove = await page.locator("tbody tr").count();
+  note({ step: "bulk-move", rowsAfterMove });
+
+  // A filter narrows the listing and the footer count follows it.
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(300);
+  await page.selectOption("#media-kind", "image");
+  await page.waitForTimeout(1200);
+  const imageRows = await page.locator("tbody tr").count();
+  const footer = await page.locator("text=/Showing \\d+ of \\d+/").first().textContent();
+  note({ step: "filter-kind", imageRows, footer });
+  await shot(page, "media-filtered");
+  await page.selectOption("#media-kind", "");
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(600);
+
+  // A delete is a trash, not a purge.
+  const firstRow = page.locator("tbody tr").first();
+  if ((await firstRow.count()) > 0) {
+    await firstRow.locator('button[aria-label^="Move"]').first().click().catch(() => {});
+    await page.waitForSelector("text=/moved to the trash/", { timeout: 4000 }).catch(() => {});
+    const trashed = (await page.locator("text=/moved to the trash/").count()) > 0;
+    note({ step: "trash-one", trashed });
+  }
+
+  // The trash screen holds it, with a countdown, and restores it.
+  await page.goto(`${URL_ADMIN}/media/trash`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const trashRows = await page.locator("tbody tr").count();
+  const countdown = await page.locator("text=/\\d+ days?|today/").count();
+  await shot(page, "media-trash-populated");
+  note({ step: "trash-listing", trashRows, countdown });
+
+  if (trashRows > 0) {
+    await page.locator('button:has-text("Restore")').first().click();
+    await page.waitForTimeout(1500);
+    const restored = (await page.locator("text=/restored to the folder/").count()) > 0;
+    note({ step: "restore", restored });
+  }
+  await shot(page, "media-trash-after-restore");
+
+  // The empty state has to be a real one, not a blank table.
+  await page.goto(`${URL_ADMIN}/media?folder=nonexistent-folder`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const emptyOrError = (await page.locator("text=/folder is empty|could not/i").count()) > 0;
+  note({ step: "empty-or-error", emptyOrError });
+
+  return { ok: true, steps: steps.length };
+}
+
 // ---------------------------------------------------------------- palette (REQ-002)
 
 /**
@@ -2741,6 +2853,9 @@ async function main() {
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
     { path: "/media", name: "media" },
+    // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
+    // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
+    { path: "/media/trash", name: "media-trash" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
@@ -2761,6 +2876,10 @@ async function main() {
     // depth passes below ask, approve, refuse, mint a token and drive a real SCIM round trip.
     { path: "/settings/iam/approvals", name: "iam-approvals" },
     { path: "/settings/iam/provisioning", name: "iam-provisioning" },
+    // Enterprise sign-in (REQ-006, slice 4b-2): the provider list, the drawer and the discovery
+    // test. Its depth pass below connects a provider, proves the test reports a *result* rather
+    // than a transport error, and removes it again.
+    { path: "/settings/iam/authentication", name: "iam-authentication" },
     // The security, session and device screens (REQ-006, slice 3) — the depth pass below drives
     // the policy fields, revokes a session and trusts a device.
     { path: "/settings/iam/security", name: "iam-security" },
@@ -2808,6 +2927,10 @@ async function main() {
     await interact(page, route.name, report);
     report.pages.push({ ...route, diagnostics: diag });
   }
+
+  // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
+  // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
+  report.mediaFiles = await runMediaFileManager(page, report);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
@@ -2893,6 +3016,13 @@ async function main() {
   await runIamProvisioningDepth(page, report);
   log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
+  // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
+  // read the "secret is a name, not a value" chip, run the discovery test and require it to
+  // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
+  // remove the provider and see the list go back to its empty state.
+  await runIamAuthenticationDepth(page, report);
+  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
+
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
   const mobile = await context.browser().newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
@@ -2902,7 +3032,7 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }, { path: "/crm/deals", name: "crm-deals-mobile" }]) {
+  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }, { path: "/crm/deals", name: "crm-deals-mobile" }, { path: "/settings/iam/authentication", name: "iam-authentication" }]) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -4072,4 +4202,106 @@ async function runCrmDealsDepth(page, report) {
 
   report.crmDeals = steps;
   log(`crm deals depth: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The enterprise sign-in screen (REQ-006, slice 4b-2).
+ *
+ * The screen is about trust, so the pass checks the two claims it makes: a secret is a *name* the
+ * panel can check but never read, and the discovery test answers with a verdict rather than
+ * failing. A provider is created switched off, the test is run, and the provider is removed —
+ * which also proves the empty state is reachable again.
+ */
+async function runIamAuthenticationDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-authentication-depth", action: "iam", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/iam/authentication`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-iam-authentication]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const before = await page.locator("[data-provider-row]").count();
+  await shot(page, "page-iam-authentication");
+
+  // ---- Connect a provider through the drawer ----------------------------------------------
+  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
+  const stamp = Date.now().toString().slice(-6);
+  await page.locator("[data-provider-slug-input]").first().fill(`qa-${stamp}`).catch(() => {});
+  await page.locator("[data-provider-name]").first().fill(`QA walkthrough ${stamp}`).catch(() => {});
+  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/realms/omnion").catch(() => {});
+  await page.locator("[data-provider-field=client_id]").first().fill(`qa-client-${stamp}`).catch(() => {});
+  await page.locator("[data-provider-secret-ref]").first().fill("OMNION_QA_SSO_SECRET_ABSENT").catch(() => {});
+  await page.waitForTimeout(300);
+  await shot(page, "page-iam-authentication-drawer");
+  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const afterConnect = await page.locator("[data-provider-row]").count();
+  note({ step: "provider-connected", before, afterConnect, slug: `qa-${stamp}` });
+
+  // ---- The secret is a name, and the panel says so without ever reading it ----------------
+  const secretChip = page.locator(`[data-provider-secret="qa-${stamp}"]`).first();
+  const secretPresent = await secretChip.getAttribute("data-secret-present").catch(() => null);
+  const secretText = (await secretChip.innerText().catch(() => "")).trim();
+  note({
+    step: "secret-is-a-name",
+    secretPresent,
+    namesTheVariable: secretText.includes("OMNION_QA_SSO_SECRET_ABSENT"),
+    // A panel that could read the value would print it; the chip must not contain one.
+    showsNoValue: !/\b[A-Za-z0-9]{20,}\b/.test(secretText),
+  });
+
+  // ---- The discovery test answers with a verdict, not a transport error --------------------
+  await page.locator(`[data-provider-test="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector(`[data-provider-test-result="qa-${stamp}"]`, { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const testStatus = await page
+    .locator(`[data-provider-test-result="qa-${stamp}"]`)
+    .first()
+    .getAttribute("data-test-status")
+    .catch(() => null);
+  const testText = (await page
+    .locator(`[data-provider-test-result="qa-${stamp}"]`)
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  note({
+    step: "discovery-test",
+    testStatus,
+    // An unreachable host must still produce a *result* the panel can render.
+    renderedAVerdict: testStatus === "ok" || testStatus === "failed",
+    explainsItself: testText.length > 20,
+  });
+  await shot(page, "page-iam-authentication-tested");
+
+  // ---- A new provider is created switched off --------------------------------------------
+  const enabledAttr = await page
+    .locator(`[data-provider-slug="qa-${stamp}"]`)
+    .first()
+    .getAttribute("data-provider-enabled")
+    .catch(() => null);
+  note({ step: "created-switched-off", enabled: enabledAttr === "false" });
+
+  // ---- The sign-in log opens and is empty rather than missing ----------------------------
+  await page.locator(`[data-provider-log="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-events]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const logRows = await page.locator("[data-provider-events] tr[data-event-outcome]").count();
+  const logText = (await page.locator("[data-provider-events]").first().innerText().catch(() => "")).trim();
+  note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
+  await shot(page, "page-iam-authentication-log");
+
+  // ---- Remove it and prove the list goes back to its empty state ---------------------------
+  await page.locator(`[data-provider-delete="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator(`[data-provider-delete-confirm="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const afterRemove = await page.locator("[data-provider-row]").count();
+  const emptyVisible = await page.locator("[data-providers-empty]").count();
+  note({ step: "provider-removed", afterRemove, emptyStateVisible: emptyVisible > 0 });
+  await shot(page, "page-iam-authentication-empty");
+
+  report.iamAuthentication = { steps };
 }

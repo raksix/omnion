@@ -372,8 +372,8 @@ pub async fn authenticate_begin(
     Json(body): Json<AssertionBeginBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let pool = state.db().pool();
-    let Some(user_id) = signin::peek_challenge(pool, &body.challenge, signin::PURPOSE_LOGIN)
-        .await?
+    let Some(user_id) =
+        signin::peek_challenge(pool, &body.challenge, signin::PURPOSE_LOGIN).await?
     else {
         return Err(ApiError::unauthorized(
             "invalid_challenge",
@@ -391,15 +391,13 @@ pub async fn authenticate_begin(
     }
 
     let challenge =
-        webauthn::create_challenge(pool, user_id, webauthn::PURPOSE_AUTHENTICATION, &rp_id)
-            .await?;
+        webauthn::create_challenge(pool, user_id, webauthn::PURPOSE_AUTHENTICATION, &rp_id).await?;
 
     let allow: Vec<serde_json::Value> = passkeys
         .iter()
         .filter_map(|factor| {
             factor.credential_id.as_deref().map(|id| {
-                let transports: Vec<&str> =
-                    factor.transports.iter().map(String::as_str).collect();
+                let transports: Vec<&str> = factor.transports.iter().map(String::as_str).collect();
                 if transports.is_empty() {
                     json!({ "type": "public-key", "id": id })
                 } else {
@@ -445,8 +443,8 @@ pub async fn authenticate_complete(
         .map(str::to_owned);
     let ip_address = client.as_text();
 
-    let Some(user_id) = signin::peek_challenge(pool, &body.challenge, signin::PURPOSE_LOGIN)
-        .await?
+    let Some(user_id) =
+        signin::peek_challenge(pool, &body.challenge, signin::PURPOSE_LOGIN).await?
     else {
         return Err(ApiError::unauthorized(
             "invalid_challenge",
@@ -517,8 +515,8 @@ pub async fn authenticate_complete(
         }
     };
 
-    let Some(user_id) = signin::consume_challenge(pool, &body.challenge, signin::PURPOSE_LOGIN)
-        .await?
+    let Some(user_id) =
+        signin::consume_challenge(pool, &body.challenge, signin::PURPOSE_LOGIN).await?
     else {
         return Err(ApiError::unauthorized(
             "invalid_challenge",

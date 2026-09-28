@@ -7,7 +7,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 time.workspace = true
 uuid.workspace = true
