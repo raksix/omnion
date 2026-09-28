@@ -2217,3 +2217,58 @@
   settings with a connection test, the CDN purge hook, share links and duplicate detection with
   merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
   serve path, and EXIF extraction.
+## 2026-09-28 — REQ-005 slice 3, closed · the suspend/archive *behaviour*, and the panel that says so
+
+- **What.** The `organizations.status` column and the list's Suspend/Reactivate controls had
+  existed since slice 1, and nothing read the status: a suspended tenant accepted every write.
+  This tick makes the column mean something. `Organization::accepts_writes` in
+  `crates/identity` says which statuses are frozen; `scope::ensure_writable` turns that into a
+  `409 organization_not_writable` whose message names the tenant and its status and whose
+  `details` carry `reads: true`, because a refusal that reads like a deletion sends an operator
+  looking for a backup instead of for a reactivation. The routes reach the guard through
+  `organization_in_scope_for_write` (members, invitations, departments, settings, modules,
+  limits) and `site_in_scope_for_write` (site rename, site delete, all three domain routes) plus
+  the explicit check in `create_site`. Eighteen write paths, one rule.
+- **The exception is the point.** A tenant that could not be reactivated could be suspended and
+  never brought back, so `scope::is_status_change` lets a payload carrying a status through the
+  guard. A *rename* of a frozen tenant is still refused — the escape hatch is for a status change,
+  not for any request that happens to include one — and the walk proves both halves.
+- **The audit action is not a rename.** A status move files `organization.suspended` /
+  `.archived` / `.reactivated` and emits the matching event, instead of `organization.updated`.
+  "Who suspended this tenant, and when" is a question the trail exists to answer, and a trail
+  that says "someone edited the organization" cannot answer it.
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **19 walks, 3 failures, and the 3
+  are the pre-existing baseline** — confirmed by stashing this tick's changes and re-running at
+  HEAD (`16 passed; 3 failed`, the same three: `a_ceiling_really_bounds_accepting_an_invitation`,
+  `a_queued_link_never_works_and_says_so`, `the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`,
+  all three a cross-test interference between parallel walks sharing one database).
+  `cargo test -p omnion-identity -p omnion-audit -p omnion-api --lib` → **261 unit tests, 0
+  failures** (123 + 2 + 136), including the two new `scope` tests. `pnpm typecheck` in
+  `apps/admin` → clean. The three new walks each prove something a single assertion cannot:
+  ten reads of a suspended tenant all answering 200 while eight writes across every family answer
+  409; the three refused writes read back out of the database to prove the refusal left nothing
+  behind; and the suspend → reactivate → archive round trip with the rename staying refused.
+- **The panel half.** `TenantStatusProvider` + a banner inside the sticky header, so a frozen
+  tenant says so on *every* screen rather than letting a person find out one refused Save at a
+  time. `role="status"`, not `role="alert"`: a standing condition re-announcing itself on every
+  navigation is noise. The list's Suspend and the switcher's change both reload it. The walkthrough
+  gained `runOrganizationSuspend`, which proves the banner on screen and always re-activates in
+  its tail.
+- **A 403 from the wrong layer passes for a 403 from the right one — twice.** The fixture's
+  administrator had `sites.create` and not `sites.update`, so the site-rename assertion read
+  `403 permission_denied` where it expected `409`; the guard never ran. Adding `sites.update`
+  moved the failure one line down, to `domains.manage`. A walk that stops at the first 403 is a
+  walk that cannot tell "refused" from "never got there", and the fix is to grant the fixture
+  *every* permission the walks touch rather than to discover them one run at a time.
+- **A `PUT` that is not a patch.** `PUT /organizations/{id}/settings` is a whole-row replace:
+  `timezone`, `invite_policy` and `audit_retention_days` are required, so a body carrying only the
+  field under test answers `422` and the walk fails for a reason that has nothing to do with the
+  freeze. The three walks share a `settings_body()` helper so the full shape lives in one place.
+- **Environment.** The box rebooted mid-tick and `/mnt/apopic` has been between 100% and 96% all
+  tick: a `rustc` link died with "No space left on device" and a QA pass cannot start on 496M.
+  Reclaimed what is mine and regenerable (`apps/*/.next` = 1.4G, `qa-artifacts`, `target/debug/
+  {build,incremental}`, `*.rcgu.o`); the rest of the volume belongs to the other six writers.
+  `CARGO_PROFILE_DEV_DEBUG=0` kept the linker's peak low enough to finish.
+- **Next.** Slice 4: events and hardening — the per-organization audit retention sweep, the module
+  toggle events, and the mobile pass. The lifecycle events a status move emits are already in
+  place here, which is one item of that slice already done.

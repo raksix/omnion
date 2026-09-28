@@ -1,13 +1,15 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** in-progress (`337c5bc`) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** in-progress (`a25267a`) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 >
 > Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,
 > Modules and Billing tabs shipped (`9b5f268`); the invite-policy behaviours and the Audit tab
-> shipped with them (`337c5bc`). **The suspend/archive flows are the only part of slice 3 still
-> open** — the status column and the organizations-list controls exist, but suspending a tenant
-> does not yet block writes with the reason, which is the half the acceptance line asks for.
+> shipped with them (`337c5bc`), and the suspend/archive flows closed the slice (`a25267a`).
+> **Slice 3 is complete** — a frozen tenant keeps every read, refuses every write by name, and
+> the status change itself is the one write that gets through, so a tenant can always be brought
+> back. What remains is slice 4: the per-organization retention sweep, the module toggle events
+> and the mobile pass.
 
 ## Request
 
@@ -176,7 +178,23 @@ automation engine uses; the token never appears in an event payload.
   _All three behaviours are enforced in the create-invitation path, and the queue is a real state rather than a stored intention. `a_closed_organization_refuses_an_invitation_and_names_its_policy` proves `closed` refuses *by name* with the policy in `details` **and** leaves no row behind — a policy could otherwise "refuse" by writing a dead invitation — then the same address succeeds once the tenant is opened. `self_serve_hands_over_a_working_link_to_anyone_who_may_manage` proves the link it returns actually opens (`usable: true`). `owner_approval_queues_the_link_until_an_owner_releases_it` is the whole policy: the create answers **202 with no token at all** (a manager who cannot release has nothing to forward), the queue lists the row, the manager who raised it is refused `not_an_organization_owner` — the only thing that can refuse them is the owner check, since they already hold `organizations.manage` — the owner's release mints the link once, and a *second* release is refused `invitation_not_queued` rather than minting a second link and orphaning the first. `a_queued_link_never_works_and_says_so` holds a leaked token directly from the store and proves it is inert *and* that it is indistinguishable from a token nobody issued. `an_owner_inviting_into_their_own_tenant_is_not_stuck_behind_the_queue` proves the policy cannot deadlock on the owner. `one_tenants_queue_is_another_tenants_invisible_row` proves the isolation rule._
 - [x] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
   _`the_usage_csv_repeats_the_numbers_the_tab_renders` parses the CSV and compares each `used` figure against the value the JSON endpoint returned, and asserts every row repeats the plan; each bar also names its limit source and, for AI, the window it measures. A `null` ceiling reads as "unlimited" rather than as a zero (`an_unlimited_ceiling_reads_as_unlimited_everywhere`); the API refuses a literal `0`, which would render identically to "unlimited" while meaning the opposite._
-- [ ] Suspending an organization shows the banner, blocks writes with the reason and keeps reads available; reactivating restores writes.
+- [x] Suspending an organization shows the banner, blocks writes with the reason and keeps reads available; reactivating restores writes.
+  _`a_suspended_organization_keeps_reads_and_refuses_writes_by_name`: ten reads of a suspended
+  tenant (the organization, its members, departments, settings, modules, limits, usage, one site,
+  one site's domains, and the switcher's own list) all answer 200, while eight writes spread
+  across every family — settings, modules, limits, departments, invitations, sites, a site rename
+  and a domain — all answer `409 organization_not_writable` naming the tenant and its status and
+  carrying `reads: true` so a panel can say "still readable" rather than "gone". The three
+  refused writes are then read back out of the database, because a refusal that left the row
+  behind would be a refusal that failed. `reactivating_restores_writes_and_archives_freeze_them_too`
+  covers the round trip: suspend → 409, reactivate (which is the one write the freeze must not
+  block) → writes work again, archive → 409 again, reads still 200, and a *rename* of a frozen
+  tenant is still refused because the escape hatch is for a status change, not for any payload
+  that happens to carry one. `a_status_move_is_audited_and_announced_as_its_own_event` proves the
+  lifecycle action and the bus event. The panel half is `runOrganizationSuspend` in the
+  walkthrough: the banner is absent while active, present on a *frozen tenant* screen with the
+  right status, a settings save is refused with the reason on screen, and the reactivation takes
+  the banner away._
 - [x] The Audit tab lists the tenant's own trail, filters it by action, actor and date, and exports a CSV of exactly what it renders.
   _`the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`: the route is guarded by `audit.read` and **not** by `organizations.read`, and the walk asserts the refusal first — a trail names every privileged act, so "can see the member list" must not imply it. An auditor then sees the writes the walk just made, every human row names its human and a system row says `system` rather than rendering blank, the action filter is exact and narrows both the rows and the count, a typo'd actor is refused `invalid_actor_filter` rather than answered as an empty history, the CSV carries the same page (`rows == entries.len`), and another tenant's trail is a `404`._
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
@@ -206,7 +224,7 @@ clipped copy on any tab.
    *Done when:* a role bound to a department shows up in `/iam/effective-permissions` for its members and disappears when a member leaves the department.
 3. **Settings, modules, limits, billing** — `organization_settings`, `organization_modules`, `organization_limits`, plan and usage endpoints, limit enforcement on invite/site/AI, the Settings, Modules and Billing tabs, suspend/archive flows, the Audit tab with CSV.
    *Done when:* each ceiling has a test that passes only when the enforcement exists, and suspend/reactivate behaves exactly as specified.
-   *Status:* everything but the suspend/archive **behaviour* is shipped. The ceilings are enforced and proven (`a_ceiling_really_bounds_creating_a_site`, `a_ceiling_really_bounds_accepting_an_invitation`, `the_usage_csv_repeats_the_numbers_the_tab_renders`), the invite policy is enforced in all three modes with a real queue (`1f09d86`…`ba4f6b9`), and the Audit tab lists, filters and exports (`3fae4f3`, `0199709`). The next tick writes the write-path guard a suspended tenant needs.
+   *Status:* **slice 3 is complete.** The ceilings are enforced and proven (`a_ceiling_really_bounds_creating_a_site`, `a_ceiling_really_bounds_accepting_an_invitation`, `the_usage_csv_repeats_the_numbers_the_tab_renders`), the invite policy is enforced in all three modes with a real queue (`1f09d86`…`ba4f6b9`), the Audit tab lists, filters and exports (`3fae4f3`, `0199709`), and the suspend/archive **behaviour** ships with a real write-path guard (`a25267a`): a frozen tenant keeps every read and refuses every write by name, the status change is the one write that gets through so a tenant can always be brought back, and the panel says so in a banner on every screen rather than letting a person discover it one refused Save at a time.
 4. **Events and hardening** — tenant lifecycle events, `organization.limit.reached`, module toggle events, per-organization retention sweep, mobile pass and empty states.
    *Done when:* an org-scoped webhook endpoint subscribed to `organization.member.joined` delivers only that organization's events, and the QA walkthrough is green.
 
