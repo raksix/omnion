@@ -1699,6 +1699,61 @@
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
 
+## 2026-09-27 — REQ-006 slice 4b-1 · Permission requests → approvals, and SCIM 2.0 provisioning
+
+- **What shipped.** `crates/identity` gained the SCIM provisioning token store (`mc_…`-style
+  secrets hashed at rest, mint/verify, revocation, and the sync log the panel reads);
+  `crates/permissions` gained `approvals` — a request asks for ONE permission with a reason and a
+  window, a decision turns it into a **time-boxed binding** (`grant-<permission>`, priority 100,
+  `expires_at`), so an approved request grants exactly inside its window and expires on its own with
+  nobody acting. The API serves `GET/POST /iam/approval-requests`, `POST /{id}/approve|reject`,
+  `GET/POST /iam/provisioning/tokens`, `DELETE /iam/provisioning/tokens/{id}` and the SCIM 2.0
+  surface (`GET /scim/v2/Users`, `POST /scim/v2/Users`, `PATCH /scim/v2/Users/{id}`,
+  `GET /scim/v2/ServiceProviderConfig`) behind a bearer token, with `iam.approval.requested|
+  approved|rejected` events and audit rows. The panel gained `/settings/iam/approvals` (inbox with
+  a request form, approve/reject with a note, the window chip, the decided tabs) and
+  `/settings/iam/provisioning` (token minting with the secret shown once, revocation, and the sync
+  log with created/updated/deactivated rows).
+- **Proof (Rust).** `cargo test --workspace` → **660 tests, 0 failures** (exit 0, 54 suites; +7 on
+  this slice: `apps/api/tests/iam_approvals.rs::an_approved_request_grants_only_inside_its_window`
+  — the granted window is moved into the past and the permission leaves with nobody acting, the
+  member cannot read the inbox, decide, or read the user list after a refusal, and the audit trail
+  carries the three events — and `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs`,
+  which creates → patches → deactivates a user over the real router and reads the sync log back).
+  **Run it against a database of your own:** the shared development database now carries migrations
+  0019/0020 applied by the concurrent sibling clones (branches for later REQs), so every suite that
+  migrates dies with `Migration(VersionMissing(19))`. `docker exec omnion-postgres psql -U omnion
+  -d postgres -c "CREATE DATABASE omnion_tickbuild"` then
+  `OMNION_DATABASE_URL=…/omnion_tickbuild cargo test --workspace` is green; the failures are
+  cross-branch interference, not the tree.
+- **Proof (web).** `pnpm typecheck && pnpm build` → exit 0, both apps.
+- **Proof (QA).** `bash scripts/qa/run.sh` (stack `b`: ports 18090/3110/3240, database
+  `omnion_qa_b`) → `qa-artifacts/20260927-175102`: **29 pages, 855 clicks, 72 field fills, 887
+  screenshots, 5 findings (0 high** · 5 medium · 0 low — the five carried-forward
+  public-renderer root 404s; the renderer correctly answers “nothing published here” for a site
+  with no page at its root and the pass still records it)**, vision review 3 items on the analytics
+  screens (medium ×2: the analytics-settings snippet block clips its last line; low ×1: the legend
+  names a `Page views` series the chart does not draw — REQ-007 territory, untouched here). The new
+  passes read: **iam-approvals** — request created (0 → 1 pending) → approved (window chip
+  `expires 9/27/2026, 7:04:07 PM · 30m`) → rejected (1 in the decided tab) → an unshaped
+  permission key refused in the field; **iam-provisioning** — token minted (1 → 2, secret shown
+  once) → SCIM round trip (create `201` active, patch `200` deactivated, listed once) → sync log (2
+  rows: one created, one deactivated, with its sentence) → revoked (2 revoked, the next SCIM call
+  `401`). Both screens are walked on desktop and mobile.
+- **The pass caught its own machinery, and that was the finding to fix.** Run `20260927-163614`
+  reported 13 high hydration console errors across six screens (`/search`, `/settings/search`,
+  `/settings/iam`, `/users`, `/groups`, `/sessions`) and a media `503`. Root cause of the hydration
+  reports: the pass stamps `data-qa-idx` on every element and clicks the moment a document is
+  ready — inside `next dev`'s hydration window; five out-of-band Playwright probes could not
+  reproduce a mismatch without the pass's own writes, the markup involved carries no data, and the
+  same pages were clean in every earlier pass. The apps now announce hydration
+  (`apps/admin/components/app-ready.tsx` sets `data-app-ready="1"` from an effect) and every
+  navigation in `scripts/qa/walkthrough.cjs` waits for that mark before anything touches the page —
+  the next pass: **0 hydration reports, 0 high findings**. Two more run-time lessons: the media
+  `503` did not survive re-checking (30 consecutive list requests plus the page's own loads, all
+  `200` — a transient of the disposable stack), and the web checks had been reading port `3220`,
+  which on this box belongs to an unrelated application (the published-page check read a stranger's
+  login screen). The stack now names its own ports (`QA_WEB_PORT=3240`), its own database and its
 ## 2026-09-27 — REQ-063 · slice 1 · the block registry, block storage and the block editor
 
 - **What.** Blocks are typed JSON on the revision that owns them, and the vocabulary those
@@ -1766,114 +1821,11 @@
   (`0de1798`, `3e96b29`): a free-space check before the reset, and a retention policy that
   prunes to the last two passes *before* checking.
 
-## 2026-09-27 — REQ-006 slice 4b-1 · Permission requests → approvals, and SCIM 2.0 provisioning
-
-- **What shipped.** `crates/identity` gained the SCIM provisioning token store (`mc_…`-style
-  secrets hashed at rest, mint/verify, revocation, and the sync log the panel reads);
-  `crates/permissions` gained `approvals` — a request asks for ONE permission with a reason and a
-  window, a decision turns it into a **time-boxed binding** (`grant-<permission>`, priority 100,
-  `expires_at`), so an approved request grants exactly inside its window and expires on its own with
-  nobody acting. The API serves `GET/POST /iam/approval-requests`, `POST /{id}/approve|reject`,
-  `GET/POST /iam/provisioning/tokens`, `DELETE /iam/provisioning/tokens/{id}` and the SCIM 2.0
-  surface (`GET /scim/v2/Users`, `POST /scim/v2/Users`, `PATCH /scim/v2/Users/{id}`,
-  `GET /scim/v2/ServiceProviderConfig`) behind a bearer token, with `iam.approval.requested|
-  approved|rejected` events and audit rows. The panel gained `/settings/iam/approvals` (inbox with
-  a request form, approve/reject with a note, the window chip, the decided tabs) and
-  `/settings/iam/provisioning` (token minting with the secret shown once, revocation, and the sync
-  log with created/updated/deactivated rows).
-- **Proof (Rust).** `cargo test --workspace` → **660 tests, 0 failures** (exit 0, 54 suites; +7 on
-  this slice: `apps/api/tests/iam_approvals.rs::an_approved_request_grants_only_inside_its_window`
-  — the granted window is moved into the past and the permission leaves with nobody acting, the
-  member cannot read the inbox, decide, or read the user list after a refusal, and the audit trail
-  carries the three events — and `apps/api/tests/scim.rs::a_scim_round_trip_provisions_and_logs`,
-  which creates → patches → deactivates a user over the real router and reads the sync log back).
-  **Run it against a database of your own:** the shared development database now carries migrations
-  0019/0020 applied by the concurrent sibling clones (branches for later REQs), so every suite that
-  migrates dies with `Migration(VersionMissing(19))`. `docker exec omnion-postgres psql -U omnion
-  -d postgres -c "CREATE DATABASE omnion_tickbuild"` then
-  `OMNION_DATABASE_URL=…/omnion_tickbuild cargo test --workspace` is green; the failures are
-  cross-branch interference, not the tree.
-- **Proof (web).** `pnpm typecheck && pnpm build` → exit 0, both apps.
-- **Proof (QA).** `bash scripts/qa/run.sh` (stack `b`: ports 18090/3110/3240, database
-  `omnion_qa_b`) → `qa-artifacts/20260927-175102`: **29 pages, 855 clicks, 72 field fills, 887
-  screenshots, 5 findings (0 high** · 5 medium · 0 low — the five carried-forward
-  public-renderer root 404s; the renderer correctly answers “nothing published here” for a site
-  with no page at its root and the pass still records it)**, vision review 3 items on the analytics
-  screens (medium ×2: the analytics-settings snippet block clips its last line; low ×1: the legend
-  names a `Page views` series the chart does not draw — REQ-007 territory, untouched here). The new
-  passes read: **iam-approvals** — request created (0 → 1 pending) → approved (window chip
-  `expires 9/27/2026, 7:04:07 PM · 30m`) → rejected (1 in the decided tab) → an unshaped
-  permission key refused in the field; **iam-provisioning** — token minted (1 → 2, secret shown
-  once) → SCIM round trip (create `201` active, patch `200` deactivated, listed once) → sync log (2
-  rows: one created, one deactivated, with its sentence) → revoked (2 revoked, the next SCIM call
-  `401`). Both screens are walked on desktop and mobile.
-- **The pass caught its own machinery, and that was the finding to fix.** Run `20260927-163614`
-  reported 13 high hydration console errors across six screens (`/search`, `/settings/search`,
-  `/settings/iam`, `/users`, `/groups`, `/sessions`) and a media `503`. Root cause of the hydration
-  reports: the pass stamps `data-qa-idx` on every element and clicks the moment a document is
-  ready — inside `next dev`'s hydration window; five out-of-band Playwright probes could not
-  reproduce a mismatch without the pass's own writes, the markup involved carries no data, and the
-  same pages were clean in every earlier pass. The apps now announce hydration
-  (`apps/admin/components/app-ready.tsx` sets `data-app-ready="1"` from an effect) and every
-  navigation in `scripts/qa/walkthrough.cjs` waits for that mark before anything touches the page —
-  the next pass: **0 hydration reports, 0 high findings**. Two more run-time lessons: the media
-  `503` did not survive re-checking (30 consecutive list requests plus the page's own loads, all
-  `200` — a transient of the disposable stack), and the web checks had been reading port `3220`,
-  which on this box belongs to an unrelated application (the published-page check read a stranger's
-  login screen). The stack now names its own ports (`QA_WEB_PORT=3240`), its own database and its
   own report file, and the published sample reads back as `200 · “QA Sample Page · QA Site” ·
   heading “QA Sample Page” · Revision 2`.
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
-
-## 2026-09-27 — REQ-063 slice 2 (1/4) · `raw_html` sanitisation, and making a QA pass survivable
-
-- **What shipped.** `crates/content/src/sanitize.rs` is the sanitiser REQ-063 names as the
-  security surface of the block editor. It is an allow-list scanner, not an escaping pass: a tag
-  or attribute that is not on the list is **removed**, so `<script>`, `<style>`, `<iframe>`,
-  `<form>`, every `on*` handler and a `javascript:`/`data:` target are gone, and the content of a
-  removed container goes with it (a stripped `<script>` must not leave its source behind as page
-  text). `SanitizeReport` names every removed tag and attribute so the editor can tell the author
-  what their paste lost, and it is stable for identical input. `embed_host_is_allowed` ships
-  alongside it with an **empty** allow-list: no host is framed until an operator names one.
-  `blocks::sanitize_tree` walks a payload on the way *into* storage — `update_page` calls it — so
-  a stored value is already safe and a theme override, a cache, an export or a future renderer
-  cannot resurrect markup that was only stripped for the one page that happened to draw it.
-- **Proof (rust).** `cargo test -p omnion-content --lib` → **66 passed / 0 failed** (22 sanitiser
-  tests, 4 tree-sanitiser tests, 40 pre-existing). Built with `CARGO_TARGET_DIR` on tmpfs: the
-  shared volume was at 0 bytes and the crate could not even write a fingerprint.
-- **Three defects the tests found, all of which would have shipped silently.** (1) Spreading the
-  JPEG `quality` option into a PNG screenshot is a hard throw from Playwright, and the walkthrough
-  reported it as "Target page, context or browser has been closed" — it killed passes for *every*
-  writer (`996ed04`). (2) A void-element list holding only the allow-listed members meant removing
-  a `<form>` scanned forward for a `</input>` that never arrives and swallowed the rest of the
-  document — a sanitiser bug that reads as content loss. (3) Emitting the attribute separator only
-  between attributes, not after the tag name, produced `<ahref="/x">`: an unknown element that
-  renders as nothing at all.
-- **The volume.** `/mnt/apopic` (60G) is shared by seven worktrees and reached **0 bytes free**
-  twice this tick. A QA pass writes ~1.6G of screenshots into it, so it was never going to finish.
-  Three changes, all in `scripts/qa/`: the pass **degrades** to viewport JPEG shots instead of
-  refusing when the volume is tight (`2c04f81`, `cacca79`); the artifacts can be written to another
-  filesystem with `QA_OUT_ROOT`, and run on `/dev/shm` the pass has 32G and no longer races six
-  other writers' Rust builds (`41f5530`); and `vision-review.cjs` detects a JPEG under a `.png`
-  name, because a JPEG announced as PNG is a decode failure, not a finding.
-- **QA state.** Two passes ran on the tmpfs and both got past the point where the volume used to
-  kill them — 14 screens deep, through `/blocks`, `/pages` and the IAM group — before the browser
-  page itself crashed at `iam-simulator` ("Page crashed"), which is a box resource event on a
-  container running seven Next dev servers and several JVMs, not a finding from this change.
-  **The acceptance gate is still open**: no full pass has yet completed with zero high findings,
-  and the new screen work in the rest of slice 2 is not started. Reporting slice 1 as proven on a
-  probe would repeat exactly the mistake the previous tick logged.
-- **Next.** The rest of slice 2: nested `columns` with breadcrumb selection, `hide_on` applied
-  server-side, heading-order linting surfaced as block warnings, the block-level diff on
-  `/pages/<id>/revisions` and the inline-editing frame at `/pages/<id>/preview`.
-- **Second pass, on the tmpfs.** `QA_OUT_ROOT=/dev/shm/omnion-qa-w2` → the pass reached **screen 24 of 42**
-  (`/analytics/pages`) with **733 control interactions and 495 screenshots** before the browser
-  page crashed. Both earlier failures were the volume; this one is the container: the box runs
-  seven Next dev servers, three Next production servers, a 4.2G JVM and the whole QA stack at
-  once, and a `Page crashed` is that, not a finding. `summary.json` records the crash as its
-  `fatal` and holds no findings, so nothing here is being reported as a pass.
 
 ## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
 
@@ -1992,10 +1944,108 @@
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
 
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
+
+- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  filtered listing against a real database — the walk that asserts the audit rows for
+  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  made the walk real and then fixed what it found.
+- **Six defects, none of them visible to the layer that owned them.**
+  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+     only exist where the value beside it was pushed.
+  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+     trash summary answered 500. Cast back to `bigint`.
+  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+     row against the pre-update snapshot, so no ordering is needed.
+  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+     new path, so `parent_id` became the folder itself on every move, and the first move of a
+     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+     *parent's* path.
+  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+  and a move to where a folder already is is a no-op.
+- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+  session and to an account with no media permission, a site created after the migration still
+  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  a file moves between folders without its storage key changing, a filter narrows the listing and
+  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  no new warning.
+- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  `target/debug/incremental` in this worktree returned 2.9 GB.
+- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+  history, the preview pipeline and the file detail screen do not.
+
 ## 2026-09-27 — REQ-063 slice 2 (2/4) · nested columns, and the `Column` block
 
 - **What shipped.** Acceptance 4 — "a `columns` container accepts 2–4 child columns, each
   accepting child blocks, and the editor's breadcrumb selects a nested block directly" — as a
+
+## 2026-09-27 — REQ-063 slice 2 (1/4) · `raw_html` sanitisation, and making a QA pass survivable
+
+- **What shipped.** `crates/content/src/sanitize.rs` is the sanitiser REQ-063 names as the
+  security surface of the block editor. It is an allow-list scanner, not an escaping pass: a tag
+  or attribute that is not on the list is **removed**, so `<script>`, `<style>`, `<iframe>`,
+  `<form>`, every `on*` handler and a `javascript:`/`data:` target are gone, and the content of a
+  removed container goes with it (a stripped `<script>` must not leave its source behind as page
+  text). `SanitizeReport` names every removed tag and attribute so the editor can tell the author
+  what their paste lost, and it is stable for identical input. `embed_host_is_allowed` ships
+  alongside it with an **empty** allow-list: no host is framed until an operator names one.
+  `blocks::sanitize_tree` walks a payload on the way *into* storage — `update_page` calls it — so
+  a stored value is already safe and a theme override, a cache, an export or a future renderer
+  cannot resurrect markup that was only stripped for the one page that happened to draw it.
+- **Proof (rust).** `cargo test -p omnion-content --lib` → **66 passed / 0 failed** (22 sanitiser
+  tests, 4 tree-sanitiser tests, 40 pre-existing). Built with `CARGO_TARGET_DIR` on tmpfs: the
+  shared volume was at 0 bytes and the crate could not even write a fingerprint.
+- **Three defects the tests found, all of which would have shipped silently.** (1) Spreading the
+  JPEG `quality` option into a PNG screenshot is a hard throw from Playwright, and the walkthrough
+  reported it as "Target page, context or browser has been closed" — it killed passes for *every*
+  writer (`996ed04`). (2) A void-element list holding only the allow-listed members meant removing
+  a `<form>` scanned forward for a `</input>` that never arrives and swallowed the rest of the
+  document — a sanitiser bug that reads as content loss. (3) Emitting the attribute separator only
+  between attributes, not after the tag name, produced `<ahref="/x">`: an unknown element that
+  renders as nothing at all.
+- **The volume.** `/mnt/apopic` (60G) is shared by seven worktrees and reached **0 bytes free**
+  twice this tick. A QA pass writes ~1.6G of screenshots into it, so it was never going to finish.
+  Three changes, all in `scripts/qa/`: the pass **degrades** to viewport JPEG shots instead of
+  refusing when the volume is tight (`2c04f81`, `cacca79`); the artifacts can be written to another
+  filesystem with `QA_OUT_ROOT`, and run on `/dev/shm` the pass has 32G and no longer races six
+  other writers' Rust builds (`41f5530`); and `vision-review.cjs` detects a JPEG under a `.png`
+  name, because a JPEG announced as PNG is a decode failure, not a finding.
+- **QA state.** Two passes ran on the tmpfs and both got past the point where the volume used to
+  kill them — 14 screens deep, through `/blocks`, `/pages` and the IAM group — before the browser
+  page itself crashed at `iam-simulator` ("Page crashed"), which is a box resource event on a
+  container running seven Next dev servers and several JVMs, not a finding from this change.
+  **The acceptance gate is still open**: no full pass has yet completed with zero high findings,
+  and the new screen work in the rest of slice 2 is not started. Reporting slice 1 as proven on a
+  probe would repeat exactly the mistake the previous tick logged.
+- **Next.** The rest of slice 2: nested `columns` with breadcrumb selection, `hide_on` applied
+  server-side, heading-order linting surfaced as block warnings, the block-level diff on
+  `/pages/<id>/revisions` and the inline-editing frame at `/pages/<id>/preview`.
+- **Second pass, on the tmpfs.** `QA_OUT_ROOT=/dev/shm/omnion-qa-w2` → the pass reached **screen 24 of 42**
+  (`/analytics/pages`) with **733 control interactions and 495 screenshots** before the browser
+  page crashed. Both earlier failures were the volume; this one is the container: the box runs
+  seven Next dev servers, three Next production servers, a 4.2G JVM and the whole QA stack at
+  once, and a `Page crashed` is that, not a finding. `summary.json` records the crash as its
+  `fatal` and holds no findings, so nothing here is being reported as a pass.
   seventeenth registry entry, `column`. The REQ's sentence is only satisfiable if a child column
   is a *node*: a `columns` block whose children are content blocks can express a list that
   happens to be indented, never "these two, side by side". The wrapper is marked

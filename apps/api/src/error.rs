@@ -573,6 +573,32 @@ impl From<MediaError> for ApiError {
                 "media_not_found",
                 "no such media in this library",
             ),
+            // A folder that is gone is a `404` naming the folder, not a generic bad request: the
+            // browser deep-links a folder id, and a stale link has to say what is missing.
+            MediaError::FolderNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "folder_not_found",
+                "no such folder in this library",
+            ),
+            // A name that collides with a sibling is a `409`, so a client can distinguish "try
+            // again" from "you typed something impossible".
+            MediaError::FolderNameTaken => Self::new(
+                StatusCode::CONFLICT,
+                "folder_name_taken",
+                "a folder with this name already exists here",
+            ),
+            // The library root is structural. Renaming or deleting it is not a bad request, it is
+            // a refusal of an operation that has no valid form.
+            MediaError::RootFolderProtected => Self::new(
+                StatusCode::CONFLICT,
+                "root_folder_protected",
+                "the library root cannot be renamed, moved or deleted",
+            ),
+            MediaError::FolderNotEmpty { what, count } => Self::new(
+                StatusCode::CONFLICT,
+                "folder_not_empty",
+                format!("the folder still holds {count} {what}"),
+            ),
             MediaError::SizeTooLarge { limit } => Self::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
@@ -584,7 +610,26 @@ impl From<MediaError> for ApiError {
                 "this object key is already in the media library",
             ),
             // Everything else is the caller's: an empty upload, an unusable file name, an
-            // unusable content type or a key the store refuses.
+            // unusable content type, a key the store refuses, a cycle, a folder of another site
+            // or a file that is in the trash. Each one names itself so the panel can put the
+            // message on the field that caused it.
+            MediaError::InvalidFolderName(message) => {
+                Self::bad_request("invalid_folder_name", message)
+                    .with_details(serde_json::json!({ "field": "name" }))
+            }
+            MediaError::FolderCycle { path } => Self::new(
+                StatusCode::CONFLICT,
+                "folder_cycle",
+                format!("a folder cannot be moved inside itself (target path `{path}`)"),
+            ),
+            MediaError::FolderSiteMismatch => {
+                Self::bad_request("folder_site_mismatch", "the folder belongs to another site")
+            }
+            MediaError::FileTrashed => Self::new(
+                StatusCode::CONFLICT,
+                "file_trashed",
+                "the file is in the trash; restore it before changing it",
+            ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

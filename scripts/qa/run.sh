@@ -124,18 +124,26 @@ step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
-# Build whenever the binary is missing OR older than the sources it is built from. A pass that
-# only builds on a missing binary silently exercises the last binary that happened to be there:
-# the stack restarts fine, every request answers, and a route added this tick 404s — which reads
-# as a broken screen rather than as a stale build. A newer mtime is the only signal available
-# without asking cargo, and it is exactly the one that matters (source edited → rebuild).
+# Build when the binary is missing OR older than something it was built from. A pass that only
+# builds on a missing binary silently exercises the last binary that happened to be there: the
+# stack restarts fine, every request answers, and a route added this tick 404s — which reads as a
+# broken screen rather than as a stale build. Two things make a binary stale, and both are here:
+#
+#   * source — a route/handler edit that is not compiled in, and
+#   * migrations — sqlx embeds `database/migrations/*.sql` at compile time, so a migration edited
+#     after the last build silently replays the previous one, and a syntax error in it looks like
+#     a duplicate table on the next attempt.
+#
+# The source list must be the paths that actually exist in this workspace (apps, crates, modules,
+# database, the manifests). A `find` over paths that do not exist returns nothing and looks exactly
+# like "nothing changed" — the mtime check silently disabled itself. `-print -quit` keeps it cheap.
 NEEDS_BUILD=0
 if [ ! -x target/debug/omnion-api ]; then
   NEEDS_BUILD=1
   step "building the API (no binary yet)"
-elif [ -n "$(find src crates/omnion-api Cargo.toml -newer target/debug/omnion-api -print -quit 2>/dev/null)" ]; then
+elif [ -n "$(find apps crates modules database Cargo.toml -newer target/debug/omnion-api -print -quit 2>/dev/null)" ]; then
   NEEDS_BUILD=1
-  step "building the API (sources are newer than the binary)"
+  step "building the API (sources or migrations are newer than the binary)"
 fi
 if [ "$NEEDS_BUILD" = "1" ]; then
   cargo build -p omnion-api

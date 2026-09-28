@@ -126,29 +126,91 @@ enum Filter {
 }
 
 impl Filter {
-    /// The SQL clause of this filter, with `$n` as its placeholder.
-    fn clause(&self, index: usize) -> String {
+    /// Write this filter onto the builder: the clause *and* every value it needs.
+    ///
+    /// The clause and its placeholders are written together on purpose. An earlier version built
+    /// the clause as a string containing `$n` and then pushed the value as a bind, which produced
+    /// `folder_id = $2$2` — a statement PostgreSQL refuses with "syntax error at or near $2", so
+    /// *every* filtered listing failed while the unfiltered one worked. Letting the builder own
+    /// the numbering means a placeholder can only exist where the value beside it was pushed.
+    ///
+    /// A clause that mentions the same value more than once binds it once per mention, because
+    /// `$n` is positional in PostgreSQL: `$2` is never a second name for `$2`. The subtree test is
+    /// the only such clause, and it is a join against the folder table rather than a string match
+    /// on the path — the path is that table's own invariant, and reusing it here would let a bug
+    /// in one place silently widen a listing.
+    fn push(&self, builder: &mut QueryBuilder<'_, Postgres>) {
         match self {
-            Self::Folder { subtree: false, .. } => format!("folder_id = ${index}"),
-            // The subtree test is a join against the folder table, not a string match on the
-            // path: the path is that table's own invariant, and reusing it here would make a bug
-            // in one place silently widen a listing.
-            Self::Folder { subtree: true, .. } => format!(
-                "exists (select 1 from media_folders f where f.id = media.folder_id and ( \
-                   f.id = ${index} \
-                   or f.path = (select path from media_folders where id = ${index}) \
-                   or f.path like (select path from media_folders where id = ${index}) || '/%'))"
-            ),
-            Self::NameContains(_) => format!("filename ilike ${index}"),
-            Self::KindPrefix(_) => format!("content_type like ${index}"),
-            Self::MinBytes(_) => format!("size_bytes >= ${index}"),
-            Self::MaxBytes(_) => format!("size_bytes <= ${index}"),
-            Self::UploadedBy(_) => format!("created_by = ${index}"),
-            Self::CreatedAfter(_) => format!("created_at >= ${index}"),
-            Self::CreatedBefore(_) => format!("created_at < ${index}"),
-            Self::Tag(_) => format!("${index} = any(tags)"),
-            Self::ScanStatus(_) => format!("scan_status = ${index}"),
-            Self::HasVersions => "version_count > 1".to_owned(),
+            Self::Folder { subtree: false, .. } => {
+                builder.push("folder_id = ");
+                builder.push_bind(self.value());
+            }
+            Self::Folder { subtree: true, .. } => {
+                builder.push(
+                    "exists (select 1 from media_folders f where f.id = media.folder_id and ( \
+                       f.id = ",
+                );
+                builder.push_bind(self.value());
+                builder.push(" or f.path = (select path from media_folders where id = ");
+                builder.push_bind(self.value());
+                builder.push(") or f.path like (select path from media_folders where id = ");
+                builder.push_bind(self.value());
+                builder.push(") || '/%'))");
+            }
+            Self::NameContains(pattern) => {
+                builder.push("filename ilike ");
+                builder.push_bind(pattern.clone());
+            }
+            Self::KindPrefix(prefix) => {
+                builder.push("content_type like ");
+                builder.push_bind(format!("{prefix}%"));
+            }
+            Self::MinBytes(bytes) => {
+                builder.push("size_bytes >= ");
+                builder.push_bind(*bytes);
+            }
+            Self::MaxBytes(bytes) => {
+                builder.push("size_bytes <= ");
+                builder.push_bind(*bytes);
+            }
+            Self::UploadedBy(user) => {
+                builder.push("created_by = ");
+                builder.push_bind(*user);
+            }
+            Self::CreatedAfter(moment) => {
+                builder.push("created_at >= ");
+                builder.push_bind(*moment);
+            }
+            Self::CreatedBefore(moment) => {
+                builder.push("created_at < ");
+                builder.push_bind(*moment);
+            }
+            Self::Tag(tag) => {
+                // The clause is `$n = any(tags)` — the placeholder is on the LEFT of the
+                // comparison, so the value is bound *first* and the comparison is written after
+                // the bind. Writing the text first and binding after would read
+                // `any(tags) = $2`, which PostgreSQL rejects when it plans the query.
+                builder.push_bind(tag.clone());
+                builder.push(" = any(tags)");
+            }
+            Self::ScanStatus(state) => {
+                builder.push("scan_status = ");
+                builder.push_bind(state.clone());
+            }
+            Self::HasVersions => {
+                // No placeholder: the clause is `version_count > 1` and compares a column with a
+                // number, so there is nothing to bind.
+                builder.push("version_count > 1");
+            }
+        }
+    }
+
+    /// The value of a folder filter, read through one match so the subtree clause cannot bind a
+    /// different id than the direct-child clause.
+    fn value(&self) -> Uuid {
+        match self {
+            Self::Folder { id, .. } => *id,
+            _ => Uuid::nil(),
         }
     }
 }
@@ -289,8 +351,13 @@ pub async fn list_files(
     // clause and the value pushed after it can never drift apart — the failure mode that makes a
     // count disagree with the page it counts.
     push_filters(&mut builder, query, site_id);
+    // `limit`/`offset` need their keywords: the two values are pushed back to back, and
+    // without `offset` in between PostgreSQL parses `limit $n $n+1` as a syntax error. The
+    // clause is built here rather than in `Sort::order_by` so the keyword cannot be lost
+    // again, and so the numbering stays with the other pushes that come before it.
     builder.push(format!(" {} limit ", sort.order_by()));
     builder.push_bind(query.limit.clamp(1, 500));
+    builder.push(" offset ");
     builder.push_bind(query.offset.max(0));
 
     let files = builder
@@ -304,52 +371,18 @@ pub async fn list_files(
     })
 }
 
-/// Push `site_id = $1`, `deleted_at is null` and every filter, numbering the placeholders here.
+/// Push `site_id`, `deleted_at is null` and every filter.
+///
+/// One loop over ONE filter list, and each filter writes its own clause *and* its own values, so
+/// a placeholder can only exist where the value beside it was pushed. `count_files` runs the same
+/// function, which is what makes the count and the page it counts unable to disagree.
 fn push_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &ListQuery, site_id: Uuid) {
     builder.push("media.site_id = ");
     builder.push_bind(site_id);
     builder.push(" and media.deleted_at is null");
-    for (offset, filter) in query.filters().iter().enumerate() {
-        // `$1` is the site id, so the first filter is `$2`.
-        builder.push(format!(" and {}", filter.clause(offset + 2)));
-        push_filter(builder, filter);
-    }
-}
-
-/// Push a filter's value onto a builder.
-///
-/// Written as statements rather than one `push_bind` expression because the `has-versions` filter
-/// is a comparison against a constant and binds nothing.
-fn push_filter(builder: &mut QueryBuilder<'_, Postgres>, filter: &Filter) {
-    match filter {
-        Filter::Folder { id, .. } => {
-            builder.push_bind(*id);
-        }
-        Filter::NameContains(pattern) => {
-            builder.push_bind(pattern.clone());
-        }
-        Filter::KindPrefix(prefix) => {
-            builder.push_bind(format!("{prefix}%"));
-        }
-        Filter::MinBytes(bytes) | Filter::MaxBytes(bytes) => {
-            builder.push_bind(*bytes);
-        }
-        Filter::UploadedBy(user) => {
-            builder.push_bind(*user);
-        }
-        Filter::CreatedAfter(moment) | Filter::CreatedBefore(moment) => {
-            builder.push_bind(*moment);
-        }
-        Filter::Tag(tag) => {
-            builder.push_bind(tag.clone());
-        }
-        Filter::ScanStatus(state) => {
-            builder.push_bind(state.clone());
-        }
-        Filter::HasVersions => {
-            // No placeholder: the clause is `version_count > 1` and compares a column with a
-            // number, so there is nothing to bind.
-        }
+    for filter in query.filters() {
+        builder.push(" and ");
+        filter.push(builder);
     }
 }
 
@@ -467,8 +500,14 @@ pub async fn list_trash(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<TrashEntry>> {
+    // The retention window is a `bigint` because it arrives from a query string, and the
+    // interval arithmetic is written as a multiplication rather than `make_interval(days => $2)`:
+    // with a bound parameter PostgreSQL cannot infer the remaining arguments of a named-argument
+    // function, picks a different overload, and answers "mismatched types … NUMERIC" — or, without
+    // the cast, "function make_interval(days => bigint) does not exist". `bigint * interval` is
+    // unambiguous, so the countdown is the same number of days the operator configured.
     let query = format!(
-        "select {} , deleted_at + make_interval(days => $2) as purges_at \
+        "select {} , deleted_at + ($2::bigint * interval '1 day') as purges_at \
          from media where site_id = $1 and deleted_at is not null \
          order by deleted_at desc, id limit $3 offset $4",
         aliased_columns("media")
@@ -499,9 +538,14 @@ pub async fn trashed_ids(pool: &PgPool, site_id: Uuid) -> Result<Vec<Uuid>> {
 }
 
 /// How many files a site has in the trash, and how many bytes they still hold.
+///
+/// The sum is cast back to `bigint`: PostgreSQL's `sum(bigint)` returns `numeric`, and sqlx will
+/// not decode `numeric` into a Rust `i64` — without the cast the trash screen answers 500
+/// "mismatched types; Rust type i64 … not compatible with SQL type NUMERIC". `size_bytes` is
+/// bounded by the upload limit, so the sum cannot leave the range of a `bigint`.
 pub async fn trash_summary(pool: &PgPool, site_id: Uuid) -> Result<(i64, i64)> {
     let (files, bytes): (i64, i64) = sqlx::query_as(
-        "select count(*), coalesce(sum(size_bytes), 0) from media \
+        "select count(*), coalesce(sum(size_bytes), 0)::bigint from media \
          where site_id = $1 and deleted_at is not null",
     )
     .bind(site_id)
@@ -629,23 +673,96 @@ mod tests {
         assert!(sql.contains("media.deleted_at is null"), "{sql}");
     }
 
+    /// Build the statement a listing would send, so the assertions can look at the SQL itself.
+    fn statement(query: &ListQuery) -> String {
+        let mut builder = QueryBuilder::<Postgres>::new("select 1 from media where ");
+        push_filters(&mut builder, query, Uuid::nil());
+        builder.sql().to_owned()
+    }
+
     #[test]
-    fn the_placeholder_numbers_follow_the_filter_order() {
-        let filters = ListQuery {
-            folder_id: Some(Uuid::nil()),
-            search: Some("a".to_owned()),
-            has_versions: true,
-            ..ListQuery::new()
+    fn a_filter_never_writes_its_placeholder_twice() {
+        // The defect this guards: the clause string carried `$n` *and* the value was bound, so
+        // every filtered listing sent `folder_id = $2$2` and PostgreSQL refused it. An unfiltered
+        // listing still worked, which is why no earlier test saw it.
+        for (label, query) in [
+            ("folder", ListQuery { folder_id: Some(Uuid::nil()), ..ListQuery::new() }),
+            ("search", ListQuery { search: Some("a".to_owned()), ..ListQuery::new() }),
+            ("tag", ListQuery { tag: Some("hero".to_owned()), ..ListQuery::new() }),
+            ("size", ListQuery { min_bytes: Some(10), max_bytes: Some(99), ..ListQuery::new() }),
+            ("uploader", ListQuery { uploaded_by: Some(Uuid::nil()), ..ListQuery::new() }),
+            ("scan", ListQuery { scan_status: Some("clean".to_owned()), ..ListQuery::new() }),
+            (
+                "everything",
+                ListQuery {
+                    folder_id: Some(Uuid::nil()),
+                    include_subfolders: true,
+                    search: Some("a".to_owned()),
+                    kind: Some("image".to_owned()),
+                    min_bytes: Some(1),
+                    uploaded_by: Some(Uuid::nil()),
+                    created_after: Some(OffsetDateTime::UNIX_EPOCH),
+                    tag: Some("hero".to_owned()),
+                    scan_status: Some("clean".to_owned()),
+                    has_versions: true,
+                    ..ListQuery::new()
+                },
+            ),
+        ] {
+            let sql = statement(&query);
+            assert!(
+                !sql.contains("$$"),
+                "[{label}] a placeholder was written twice: {sql}"
+            );
+            // A placeholder is always followed by something that is not another placeholder.
+            for (index, part) in sql.split('$').enumerate().skip(1) {
+                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                assert!(!digits.is_empty(), "[{label}] a bare `$` in the clause: {sql}");
+                let after = &part[digits.len()..];
+                assert!(
+                    !after.starts_with('$'),
+                    "[{label}] two placeholders in a row: {sql}"
+                );
+                let _ = index;
+            }
         }
-        .filters();
-        let clauses: Vec<String> = filters
-            .iter()
-            .enumerate()
-            .map(|(offset, filter)| filter.clause(offset + 2))
-            .collect();
-        assert_eq!(clauses[0], "folder_id = $2");
-        assert_eq!(clauses[1], "filename ilike $3");
-        assert_eq!(clauses[2], "version_count > 1");
+    }
+
+    #[test]
+    fn a_subtree_filter_binds_its_folder_once_per_mention() {
+        // PostgreSQL placeholders are positional: `$2` is never a second name for `$2`, so a
+        // clause that names its value three times binds it three times — the same folder id, three
+        // distinct placeholders. The clause reads the path through the folder table rather than
+        // matching a string, so a bug in path maintenance cannot silently widen a listing.
+        let sql = statement(&ListQuery {
+            folder_id: Some(Uuid::nil()),
+            include_subfolders: true,
+            ..ListQuery::new()
+        });
+        assert!(
+            sql.ends_with(
+                "and exists (select 1 from media_folders f where f.id = media.folder_id and ( \
+                 f.id = $2 or f.path = (select path from media_folders where id = $3) \
+                 or f.path like (select path from media_folders where id = $4) || '/%'))"
+            ),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("$2").count(), 1, "no placeholder is reused: {sql}");
+    }
+
+    #[test]
+    fn the_tag_clause_compares_from_the_placeholder_side() {
+        // `$n = any(tags)`: writing the text first would produce `any(tags) = $2`, which plans
+        // against a whole array and never matches.
+        let sql = statement(&ListQuery { tag: Some("hero".to_owned()), ..ListQuery::new() });
+        assert!(sql.ends_with(" and $2 = any(tags)"), "{sql}");
+    }
+
+    #[test]
+    fn the_version_filter_needs_no_placeholder() {
+        let sql = statement(&ListQuery { has_versions: true, ..ListQuery::new() });
+        assert!(sql.ends_with(" and version_count > 1"), "{sql}");
+        assert_eq!(sql.matches('$').count(), 1, "only the site id is bound: {sql}");
     }
 
     #[test]
@@ -661,21 +778,20 @@ mod tests {
 
     #[test]
     fn a_subtree_filter_names_the_folder_and_everything_under_it() {
-        let clause = Filter::Folder {
-            id: Uuid::nil(),
-            subtree: true,
-        }
-        .clause(2);
-        assert!(clause.contains("f.path like"));
         // The direct-child filter is a plain equality, so a folder listing never walks the tree.
-        assert_eq!(
-            Filter::Folder {
-                id: Uuid::nil(),
-                subtree: false
-            }
-            .clause(2),
-            "folder_id = $2"
-        );
+        let direct = statement(&ListQuery {
+            folder_id: Some(Uuid::nil()),
+            ..ListQuery::new()
+        });
+        assert!(direct.ends_with(" and folder_id = $2"), "{direct}");
+        assert!(!direct.contains("exists"), "a folder listing does not walk the tree");
+
+        let subtree = statement(&ListQuery {
+            folder_id: Some(Uuid::nil()),
+            include_subfolders: true,
+            ..ListQuery::new()
+        });
+        assert!(subtree.contains("f.path like"), "{subtree}");
     }
 
     #[test]
