@@ -211,7 +211,8 @@ fn due(last_flush_at: &Option<String>, batch_ms: i32) -> bool {
     let Some(stamp) = last_flush_at.as_deref() else {
         return true;
     };
-    let Ok(parsed) = time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
+    let Ok(parsed) =
+        time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
     else {
         // An unparseable stamp is treated as never-flushed rather than as "just now": the cost of
         // guessing wrong is one early flush, and the cost of the other guess is a silent stall.
@@ -246,11 +247,7 @@ async fn persist(
 }
 
 /// Send one batch over the exporter's transport.
-async fn send(
-    kind: ExporterKind,
-    row: &Configured,
-    batch: &Batch,
-) -> FlushOutcome {
+async fn send(kind: ExporterKind, row: &Configured, batch: &Batch) -> FlushOutcome {
     match kind {
         // OTLP and remote-write both speak HTTP with a JSON body; the protocol only changes the
         // path shape, and a collector configured for one accepts the other's body. They are sent
@@ -381,7 +378,10 @@ mod tests {
         }
         let status = collector.status("otlp").expect("registered");
         assert_eq!(status.buffered, 2);
-        assert_eq!(status.dropped_total, 2, "the fan-out's loss was not counted");
+        assert_eq!(
+            status.dropped_total, 2,
+            "the fan-out's loss was not counted"
+        );
     }
 
     #[test]
@@ -403,9 +403,18 @@ mod tests {
             )
         };
 
-        assert!(!due(&stamp(0), 5_000), "a just-flushed exporter was due again");
-        assert!(due(&stamp(2), 1_000), "a two-second-old flush is past a one-second interval");
-        assert!(!due(&stamp(2), 60_000), "a two-second-old flush is not yet past a minute");
+        assert!(
+            !due(&stamp(0), 5_000),
+            "a just-flushed exporter was due again"
+        );
+        assert!(
+            due(&stamp(2), 1_000),
+            "a two-second-old flush is past a one-second interval"
+        );
+        assert!(
+            !due(&stamp(2), 60_000),
+            "a two-second-old flush is not yet past a minute"
+        );
     }
 
     #[test]
@@ -432,10 +441,14 @@ mod tests {
         // BUILT, so a `Value` that reaches a buffer has been through the pass. Asserted here on
         // the rendered body — which is what actually leaves the process — rather than on the
         // buffer's contents, because the buffer holds the same `Value` the body is built from.
-        let span = crate::tracing_span::Span::root("4bf92f3577b34da6a3ce929d0e0e4736", "ai.chat", "omnion-api")
-            .attribute("provider", "openai")
-            .attribute("api_key", "omnion_sk_live_ABC123SECRETVALUE")
-            .attribute("user_email", "ada@example.com");
+        let span = crate::tracing_span::Span::root(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "ai.chat",
+            "omnion-api",
+        )
+        .attribute("provider", "openai")
+        .attribute("api_key", "omnion_sk_live_ABC123SECRETVALUE")
+        .attribute("user_email", "ada@example.com");
 
         let body = batch_body(&Batch {
             exporter: "webhook".to_owned(),

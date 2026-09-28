@@ -31,10 +31,12 @@
 //! propagation, the redaction pass and the store. Two implementations of any of those drift, and
 //! drift in this area is a leak.
 
+pub mod alerts;
 pub mod context;
 pub mod error;
 pub mod exporter;
 pub mod exporter_flush;
+pub mod lifecycle;
 pub mod metric_catalog;
 pub mod metrics;
 pub mod redact;
@@ -44,12 +46,14 @@ pub mod trace_store;
 pub mod tracing_span;
 pub mod tracing_spine;
 
+pub use alerts::{Expression, PassReport, Preview, Rule, Silence, parse as parse_alert_expr};
 pub use context::{LogContext, mint_span_id, mint_trace_id, trace_id_from_header};
 pub use error::TelemetryError;
 pub use exporter::{
     Batch, Collector as ExporterCollector, ExporterHealth, ExporterKind, FlushOutcome,
 };
 pub use exporter_flush::{batch_body, fan_out};
+pub use lifecycle::{DrainOutcome, Lifecycle, ShutdownSummary, drain_and_flush};
 pub use metric_catalog::FamilyDeclaration;
 pub use metrics::{FamilySpec, MetricKind, Registry, global as metrics_registry};
 pub use redact::{REDACTED, redact_fields, redact_text};

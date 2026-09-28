@@ -341,6 +341,33 @@ pub const FAMILIES: &[FamilySpec] = &[
         max_series: 8,
         bounded_labels: true,
     },
+    // The two families below arrived with the lifecycle and the alert evaluator (REQ-126 slice 4).
+    // Both are declared here for the same reason as every other family: a counter the code
+    // records but the registry does not declare is a no-op on the scrape, and the acceptance
+    // lines they carry ("SIGTERM ... exits 0 with a summary", "notifies once") have nothing an
+    // operator can read.
+    FamilySpec {
+        name: "omnion_shutdowns_total",
+        kind: MetricKind::Counter,
+        unit: "1",
+        description: "Process shutdowns by outcome: `drained` when every request finished, \
+                        `timed_out` when the drain deadline won.",
+        labels: &["outcome"],
+        source: "core",
+        max_series: 4,
+        bounded_labels: true,
+    },
+    FamilySpec {
+        name: "omnion_alert_transitions_total",
+        kind: MetricKind::Counter,
+        unit: "1",
+        description: "Alert rule state transitions by the state they moved to: `pending`, \
+                        `firing` or `resolved`.",
+        labels: &["state"],
+        source: "core",
+        max_series: 4,
+        bounded_labels: true,
+    },
     FamilySpec {
         name: "omnion_registry_budget_exceeded",
         kind: MetricKind::Counter,
