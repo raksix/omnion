@@ -482,7 +482,7 @@ async fn storage_settings_round_trip_and_refuse() {
             "the save must refuse {payload}"
         );
         assert_eq!(
-            save.body["details"]["field"],
+            save.body["error"]["details"]["field"],
             json!(field),
             "the save must name `{field}` for {payload}, got: {}",
             save.body
@@ -504,7 +504,7 @@ async fn storage_settings_round_trip_and_refuse() {
             "the connection test must refuse {payload} too"
         );
         assert_eq!(
-            test.body["details"]["field"],
+            test.body["error"]["details"]["field"],
             json!(field),
             "the test and the save must agree about `{field}`, got: {}",
             test.body
