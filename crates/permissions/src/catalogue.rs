@@ -102,6 +102,19 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "media",
         description: "Manage folders and storage settings",
     },
+    // Slice 3 splits the storage-side powers out of `media.manage`. They are separate keys
+    // because they are separate risks: a team that may organise a library does not need the
+    // power to repoint a site's object store or mint a public link to a private file.
+    PermissionDef {
+        key: "media.settings.manage",
+        category: "media",
+        description: "Change transformation presets, storage and retention settings",
+    },
+    PermissionDef {
+        key: "media.share",
+        category: "media",
+        description: "Create public share links for files",
+    },
     // AI Hub (docs/06-AI-HUB.md §1, §7): connecting providers is an administrator-level power,
     // while using the platform's AI chat is an everyday one — the AI Hub's own permission sets
     // (§8) build on these keys in later phases.
