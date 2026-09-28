@@ -48,6 +48,14 @@ import type {
   Page,
   NotificationBulkResult,
   NotificationFilters,
+  NodeCategory,
+  NodeType,
+  NodeTypeFilters,
+  NodeTypePage,
+  CredentialType,
+  CredentialTypePage,
+  PortKindCatalogue,
+  RegistryLint,
   NotificationPage,
   NotificationRow,
   NotificationSummary,
@@ -4035,4 +4043,56 @@ export function emitNotification(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Node library and credential catalogue (REQ-087 slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build the node-type query string; an empty filter is left out, never sent as an empty value. */
+function nodeTypeQuery(filters: NodeTypeFilters): string {
+  const params = new URLSearchParams();
+  if (filters.search) params.set("search", filters.search);
+  if (filters.category) params.set("category", filters.category);
+  if (filters.capability) params.set("capability", filters.capability);
+  if (filters.include_deprecated === false) params.set("deprecated", "false");
+  if (filters.credential !== undefined) params.set("credential", String(filters.credential));
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+/** The node library, filtered. `matched` and `total` come from the server, not from this list. */
+export async function fetchNodeTypes(filters: NodeTypeFilters = {}): Promise<NodeTypePage> {
+  return request<NodeTypePage>(`/api/v1/node-types${nodeTypeQuery(filters)}`);
+}
+
+/** One node definition, in full. */
+export async function fetchNodeType(key: string): Promise<NodeType> {
+  return request<NodeType>(`/api/v1/node-types/${encodeURIComponent(key)}`);
+}
+
+/** The palette's category tree, with its counts. */
+export async function fetchNodeCategories(): Promise<{ categories: NodeCategory[] }> {
+  return request<{ categories: NodeCategory[] }>("/api/v1/node-types/categories");
+}
+
+/** The registry's own lint, as the running server sees it. */
+export async function fetchRegistryLint(): Promise<RegistryLint> {
+  return request<RegistryLint>("/api/v1/node-types/lint");
+}
+
+/** The credential catalogue with every field schema. */
+export async function fetchCredentialTypes(): Promise<CredentialTypePage> {
+  return request<CredentialTypePage>("/api/v1/credential-types");
+}
+
+/** One credential type, in full. */
+export async function fetchCredentialType(key: string): Promise<CredentialType> {
+  return request<CredentialType>(`/api/v1/credential-types/${encodeURIComponent(key)}`);
+}
+
+/** The three port kinds and what each means. */
+export async function fetchPortKinds(): Promise<PortKindCatalogue> {
+  return request<PortKindCatalogue>("/api/v1/port-kinds");
 }

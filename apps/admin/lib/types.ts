@@ -931,3 +931,148 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
+
+// ------------------------------------------------------------------------------------------
+// Node library and credential catalogue (REQ-087 slice 1)
+// ------------------------------------------------------------------------------------------
+
+/** The filters the node library takes. */
+export type NodeTypeFilters = {
+  search?: string;
+  category?: string;
+  capability?: string;
+  include_deprecated?: boolean;
+  credential?: boolean;
+};
+
+/** One port of a node, as the palette draws it. */
+export type NodePort = {
+  name: string;
+  kind: "main" | "error" | "ai_tool";
+  /** Data kinds the port accepts; empty means "anything". */
+  accepts: string[];
+  open: boolean;
+};
+
+/** How the inspector renders one parameter. */
+export type ParamUi = "text" | "textarea" | "code" | "select" | "number" | "boolean";
+
+/** One parameter of a node's inspector form. */
+export type NodeParam = {
+  name: string;
+  kind: string;
+  label: string;
+  required: boolean;
+  ui: ParamUi;
+  options: string[];
+  /** Where a select's options come from when they are not an enum. */
+  options_source: string | null;
+  placeholder: string | null;
+  help: string | null;
+  default: unknown;
+  /** Whether this field holds a credential *key* rather than a value. */
+  secret_field: boolean;
+};
+
+/** What a library row shows as its state. */
+export type NodeLibraryState = "available" | "deprecated" | "node_package_missing";
+
+/** One node in the library. */
+export type NodeType = {
+  key: string;
+  version: string;
+  label: string;
+  description: string;
+  category: string;
+  icon: string;
+  docs_url: string;
+  inputs: NodePort[];
+  outputs: NodePort[];
+  params: NodeParam[];
+  credential_types: string[];
+  capabilities: string[];
+  sandbox: "none" | "required";
+  default_max_attempts: number;
+  deprecated: boolean;
+  superseded_by: string | null;
+  state: NodeLibraryState;
+  /** Why the node is in that state, in words the row can show next to the chip. */
+  state_reason: string | null;
+};
+
+/** The node filters, as the server applied them. */
+export type AppliedNodeFilters = {
+  search: string | null;
+  category: string | null;
+  capability: string | null;
+  include_deprecated: boolean;
+  credential: boolean | null;
+  /** How many nodes ship with the release. */
+  bundled_count: number;
+};
+
+/** The library list payload. */
+export type NodeTypePage = {
+  nodes: NodeType[];
+  matched: number;
+  total: number;
+  filters: AppliedNodeFilters;
+};
+
+/** One field of a credential type's form. */
+export type CredentialTypeField = {
+  name: string;
+  label: string;
+  kind: "string" | "secret" | "url" | "number" | "boolean" | "select";
+  required: boolean;
+  options: string[];
+  help: string | null;
+  never_log: boolean;
+  /** `true` when the API will never return a value for this field. */
+  write_only: boolean;
+};
+
+/** One credential type in the catalogue. */
+export type CredentialType = {
+  key: string;
+  kind: string;
+  label: string;
+  description: string;
+  icon: string;
+  docs_url: string;
+  fields: CredentialTypeField[];
+  /** The nodes that accept this type, so the picker can say what it is for. */
+  used_by: string[];
+  oauth: boolean;
+  oauth_pkce: boolean | null;
+  oauth_scopes: string | null;
+  test_timeout_seconds: number;
+};
+
+/** The credential catalogue payload. */
+export type CredentialTypePage = {
+  types: CredentialType[];
+  total: number;
+};
+
+/** One group of the palette's category tree. */
+export type NodeCategory = {
+  key: string;
+  label: string;
+  count: number;
+  node_keys: string[];
+};
+
+/** The registry's own lint, as the running server sees it. */
+export type RegistryLint = {
+  ok: boolean;
+  findings: { code: string; subject: string; message: string }[];
+  node_count: number;
+  credential_type_count: number;
+};
+
+/** The three port kinds and what each means. */
+export type PortKindCatalogue = {
+  kinds: string[];
+  descriptions: Record<string, string>;
+};

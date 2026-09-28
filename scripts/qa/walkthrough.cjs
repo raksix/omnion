@@ -2841,6 +2841,128 @@ async function runIamSubjectsDepth(page, report) {
   return summary;
 }
 
+// The node-library pass (REQ-087, slice 1): the registry rendered from the API, the search and
+// filters narrowing it, a node detail opening, the deprecated state naming its replacement, and
+// the counts agreeing with what is on screen. Every number here is read off the page and
+// compared, because "the library looks populated" is not a measurement of anything.
+async function runNodeLibraryDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/workflows/nodes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  await shot(page, "page-node-library");
+
+  const rows = page.locator("[data-node-row]");
+  steps.rows = await rows.count();
+  steps.count = (await page.locator("[data-node-count]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // A library screen that rendered zero rows against a shipped registry is a broken screen, not
+  // an empty library: the registry is code and always holds at least a trigger.
+  steps.hasRows = steps.rows > 0;
+  steps.states = await page.locator("[data-node-state]").allInnerTexts();
+
+  // 1. A search narrows the list, and the URL carries it so the view is shareable.
+  const search = page.locator('input[type="search"]').first();
+  await search.click({ timeout: 4000 }).catch(() => {});
+  await search.fill("http").catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.searchUrl = page.url().includes("search=http");
+  steps.searched = await rows.count();
+  // The strongest form of "the search worked": every surviving row matches the needle.
+  steps.everyRowMatches = await page.evaluate(() => {
+    const needle = new URLSearchParams(location.search).get("search") ?? "";
+    if (!needle) return true;
+    return Array.from(document.querySelectorAll("[data-node-row]")).every((row) => {
+      const text = (row.textContent ?? "").toLowerCase();
+      return text.includes(needle.toLowerCase());
+    });
+  });
+  await shot(page, "page-node-library-searched");
+
+  // 2. A search that matches nothing says what it searched, and offers a way back.
+  await search.fill("zzz_no_such_node").catch(() => {});
+  await page.waitForTimeout(1600);
+  const emptyText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.emptyStatesTheSearch = /No node matches/i.test(emptyText);
+  steps.emptyNamesTheQuery = emptyText.includes("zzz_no_such_node");
+  await shot(page, "page-node-library-empty");
+
+  // 3. Back to everything, then a category filter that has to actually filter.
+  await page.goto(`${URL_ADMIN}/workflows/nodes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const allRows = await rows.count();
+  const selects = page.locator("select");
+  const selectCount = await selects.count();
+  // The category options come from the API, so the option count is read rather than assumed.
+  if (selectCount > 0) {
+    const options = await selects.nth(0).locator("option").allInnerTexts();
+    steps.categoryOptions = options.length - 1;
+    await selects.nth(0).selectOption({ index: 1 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.categoryUrl = /category=/.test(page.url());
+    steps.categoryRows = await rows.count();
+    steps.categoryNarrowed = steps.categoryRows < allRows;
+    await shot(page, "page-node-library-filtered");
+  }
+
+  // 4. A node detail opens, and the deprecated node names its replacement.
+  await page.goto(`${URL_ADMIN}/workflows/nodes/http_request`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.detailUrl = page.url().includes("/workflows/nodes/http_request");
+  steps.detailPorts = await page.locator("text=Ports").count();
+  steps.detailParams = await page.locator("text=Parameters").count();
+  await shot(page, "page-node-detail");
+
+  await page.goto(`${URL_ADMIN}/workflows/nodes/legacy_webhook`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const deprecatedText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.deprecatedBanner = /deprecated/i.test(deprecatedText);
+  steps.deprecatedNamesReplacement = deprecatedText.includes("http_request");
+  await shot(page, "page-node-detail-deprecated");
+
+  // 5. A key that is not registered is a 404 with the key echoed, not an empty detail page.
+  await page.goto(`${URL_ADMIN}/workflows/nodes/no_such_node_key`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const missingText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.unknownKeyExplains = /not in the registry/i.test(missingText);
+  steps.unknownKeyEchoes = missingText.includes("no_such_node_key");
+  await shot(page, "page-node-detail-missing");
+
+  // 6. The registry's own lint, straight off the running server. A registry that would fail its
+  // lint has to be visible here, not only in a test a deploy skips.
+  const lint = await page.evaluate(() =>
+    fetch("/api/v1/node-types/lint", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.lintOk = lint?.ok === true;
+  steps.lintNodeCount = lint?.node_count ?? 0;
+  steps.lintCredentialTypeCount = lint?.credential_type_count ?? 0;
+  steps.lintFindings = lint?.findings?.length ?? -1;
+
+  // 7. The credential catalogue, including that a secret field is declared write-only and that
+  // no type is orphaned.
+  const credentialTypes = await page.evaluate(() =>
+    fetch("/api/v1/credential-types", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.credentialTypes = credentialTypes?.total ?? 0;
+  steps.secretsAreWriteOnly = (credentialTypes?.types ?? []).every((type) =>
+    type.fields
+      .filter((f) => f.kind === "secret")
+      .every((f) => f.write_only === true && f.never_log === true),
+  );
+  steps.noOrphanCredentialType = (credentialTypes?.types ?? []).every(
+    (type) => type.used_by.length > 0,
+  );
+  // A payload carrying a token endpoint would be one more copy of an OAuth flow to keep in sync;
+  // the detail screen links the docs instead.
+  steps.noTokenEndpointInPayload = !JSON.stringify(credentialTypes ?? {}).includes("token_url");
+
+  return steps;
+}
+
 /**
  * The role-depth pass (REQ-006, slice 1).
  *
@@ -4143,6 +4265,13 @@ async function main() {
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
+  // The node-library pass (REQ-087, slice 1): the registry rendered from the API, search and
+  // filters, a node detail, the deprecated state naming its replacement, and the running
+  // server's own registry lint. It is a pure read pass, so it can run before the passes that
+  // write rows and cannot disturb their counts.
+  report.nodeLibrary = await runNodeLibraryDepth(page, report);
+  log(`node library: ${JSON.stringify(report.nodeLibrary)}`);
+
   report.iamRoles = await runIamRolesDepth(page, report);
 
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
