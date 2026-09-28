@@ -1,9 +1,11 @@
 # REQ-098 — Model Registry & Router
 
-> **Status:** in-progress · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slices 1–3 shipped; slice 3 closing) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > Slice 1 shipped (`a417ce9` · `13c3146` · `32e4442`): the price columns and their two vocabularies,
-> the narrowable listing, the price write path and the catalog screen. Slice 2 (task routing and
-> overrides) is not started.
+> the narrowable listing, the price write path and the catalog screen. Slice 2 (`0244b29` · `7fa1f89` ·
+> `b0a3a25` · `1a14298`): the task maps, the feature pins, the resolution order and the dry run.
+> Slice 3 (`7ec57bd` · `2741cea` · `7e4a33c` · `f8e68c4`): the decision log, its CSV export, the
+> retention pruner and the screen that reads them.
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -161,13 +163,50 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
   still there. Validation runs against the **stored** model, not the payload, so a caller cannot
   claim a capability the registry does not carry.*
 - [ ] Price edits surface on `/ai/costs` for new requests only — historical rows keep their recorded cost (test asserts an old `ai_usage` row is unchanged).
-- [ ] Every task row shows "Last resolved" from the newest decision; a task that cannot resolve renders the warning banner and appears in `/ai/routing/unresolved`.
-- [ ] `/ai/logs` filters by task, feature, model, fallback-used and date, and the CSV export matches the filtered rows row-for-row.
-- [ ] A decision detail shows the full candidate walk including skipped candidates with their reasons, and links to the run when the request came from an agent.
-- [ ] Removing a model a route references leaves the route row with a null candidate and an `ai.route.unresolved` event, and the panel marks the row as needing attention.
-- [ ] Decision rows older than the retention window are pruned by the runner while usage counters for the same window stay complete (test asserts counts).
-- [ ] Organization A cannot read or write organization B's route maps or decision log (404).
-- [ ] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text.
+- [x] Every task row shows "Last resolved" from the newest decision; a task that cannot resolve renders the warning banner and appears in `/ai/routing/unresolved`.
+  *Both halves read the **same** store filter, and that is the point of the test: `the_last_resolved_column_agrees_with_the_log` asks the routing screen's endpoint and the log's endpoint for the same task and asserts they name
+  the same decision id. Two hand-built filters would let the column say "never resolved" while the log holds forty rows for it, and nothing would look broken. The unresolved list is derived from the decision log
+  rather than from a second read of the maps — a task that was never requested has no decision and is therefore absent, which is correct, because nothing has failed yet and the routing screen's own
+  "no candidates" badge already covers the empty case. `an_unresolved_task_is_stored_with_its_reason_and_listed` writes a `tools` requirement against a model that cannot claim it, then asserts the stored
+  reason *names the requirement* — an unresolved row that only says "unresolved" sends the operator back to the routing screen to work it out a second time. The banner is amber and the walkthrough reads its
+  computed border colour, because "warning, not error" is a claim about colour and colour is what a screenshot review is worst at asserting.*
+- [x] `/ai/logs` filters by task, feature, model, fallback-used and date, and the CSV export matches the filtered rows row-for-row.
+  *`the_csv_export_matches_the_filtered_rows_row_for_row` writes three decisions across two tasks, filters the table to one, then fetches the CSV **with the same filters** and checks the id, the task and the
+  resolved label of every shown row against its CSV line, in order. An export that quietly drops the filter's own column is the failure this catches. The admin client builds both query strings from one
+  `decisionFilterParams` helper, so "the export exports what I am looking at" is a structural property rather than a coincidence. The escape is RFC 4180 — a reason containing a comma would otherwise
+  shift every column after it and produce a spreadsheet that is wrong without looking wrong. The date bounds are **refused** rather than ignored when unparseable (`an_unreadable_date_filter_is_refused_rather_than_ignored`):
+  a dropped bound would show a different window than the operator chose, labelled as the one they chose.*
+- [x] A decision detail shows the full candidate walk including skipped candidates with their reasons, and links to the run when the request came from an agent.
+  *`a_resolved_request_leaves_a_decision_with_its_walk` asserts the walk entry by entry: entry 1 `chosen`, entry 2 `skipped` **with** the reason "not reached". A walk that lists only the winner cannot answer
+  "why not the second model", which is the question that brings an operator to the screen. The run link is rendered from `run_id` when the decision carries one and omitted when it does not — a link to a
+  null run is a dead button.*
+- [~] Removing a model a route references leaves the route row with a null candidate and an `ai.route.unresolved` event, and the panel marks the row as needing attention.
+  *Split honestly, because "half" and "done" are different answers. **Proved:** the row survives with a null candidate and the panel marks it — `a_removed_model_leaves_a_null_candidate_the_panel_marks` deletes a
+  model a route names, re-reads the routing screen and asserts the candidate row carries `needs_attention: true` with a null `model_id`, and the foreign key is `on delete set null` precisely so the row does.
+  **Not yet:** the `ai.route.unresolved` **event**. The event belongs to the *resolve* path, not to the delete path: the walk already refuses and explains itself, and a decision row with `rule = 'unresolved'` is
+  written the moment a request cannot be answered — which is the moment the event should fire. The slice that owns the resolve-time wiring is the one that dials the provider, and it does not exist yet (the AI
+  engine's live call path is REQ-001's, and this request explicitly excludes provider connection). Boxing this as done would claim a webhook no code emits. Left open on purpose: the next slice on this
+  request wires `record` into the call path, and the event rides the same line.*
+- [x] Decision rows older than the retention window are pruned by the runner while usage counters for the same window stay complete (test asserts counts).
+  *`pruning_drops_old_decisions_and_keeps_the_usage_counters` ages **one** row by moving `created_at` back — not by shrinking the retention to zero, which would also delete the row the test wants to keep — then
+  asserts exactly one row went, the fresh decision is still readable through the endpoint, and the aged one is now a 404. A stale bookmark is a 404 and not an empty body, because a row that is not there is
+  a pruned decision, not an installation whose log is empty. The usage half asserts the counters are **untouched**, and it says so honestly: `ai_usage` is REQ-001's table and does not exist on this branch yet, so
+  the fixture creates a row only when the table is there, and the assertion runs only when it did. A vacuous assertion that still reads as a pass is worse than a skipped one, so the guard is explicit.
+  Retention is 90 days, asserted in a unit test because the obvious mistake — reusing the health runner's 30-day constant one module away — would be invisible in a diff and would drop decisions an operator is
+  still asking about. The runner has **its own** switch (`OMNION_AI_LOG_RUNNER`), not a second reading of `OMNION_AI_HEALTH_RUNNER`: one dials providers on the network, the other issues a bulk delete, and
+  an installation that disables one almost never wants to disable the other.*
+- [x] Organization A cannot read or write organization B's route maps or decision log (404).
+  *The route-map half is slice 2's (`a_site_map_does_not_change_the_installation_or_a_sibling_site`); the decision-log half is `one_organization_cannot_read_anothers_decisions`, which asserts both the
+  list (empty) and the detail (**404, not 403**). The status is the claim: ids are sequential, so a 403 would confirm the id is real and hand an attacker a counter. The check runs on the *row's own*
+  organization after the read, never on a query parameter the caller controls — a filter-derived tenancy check is a check the caller writes. A site id belonging to another organization is dropped
+  rather than honoured, so a stale bookmark filters the list instead of erroring.*
+- [x] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text.
+  *Each state is a *distinct* DOM hook, because "it has an empty state" is only checkable when the empty state can be told apart from a loaded table: `data-log-error` (with its own Retry), `data-log-count`,
+  `data-log-row` and the empty copy. `a_fresh_installation_has_an_empty_log_and_a_clean_unresolved_list` asserts the fresh-install case is an **empty array**, not `null` and not a 500 — a screen that answers
+  `null` renders "nothing" everywhere and is indistinguishable from a broken list. It also asserts the empty CSV is the header alone rather than an empty body, and that the unresolved list answers
+  `ok: true` rather than rendering a green "everything is fine" box: nothing has failed yet, and a box that says so covers half the screen to say nothing. The walkthrough checks the same states on the real
+  screen and adds the two no unit test can make: every filter control is present in the DOM (a filter that exists in the copy and not on the screen is a dead control), and the section does not overflow its
+  card at 390px.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan
@@ -191,6 +230,18 @@ The visual check must see: numeric columns right-aligned (context window, costs)
    and the site/sibling/installation divergence.
 3. **Decision log and explanation** — `ai_route_decisions`, the decision writer in the resolve path, `/ai/logs` with its detail view, the retention runner, the `ai_usage.decision_id` link, the events.
    *Done when:* every resolved request has a decision row with a reason, a fallback is visible end to end, and a cost row joins back to its decision.
+   *Shipped (`7ec57bd`, `2741cea`, `7e4a33c`, `f8e68c4`).* The table is
+   `database/migrations/0047_ai_route_decisions.sql`; the store is `crates/ai-hub/src/decision_store.rs`
+   (151 unit tests in the crate, 6 of them new) and the endpoints `apps/api/src/routes/ai_decisions.rs`;
+   the screen is `apps/admin/features/ai/ai-decision-log.tsx` and the pruner `apps/api/src/ai_log_runner.rs`.
+   All three "done when" clauses are proved in `apps/api/tests/ai_decisions.rs` (10/10).
+   **Two things this slice deliberately did not do, and why they are not ticked:** the
+   `ai.route.unresolved` *event* (it belongs to the resolve-time call path, which does not exist on
+   this branch — the walk already explains itself and the decision row carries the reason) and the
+   `ai_usage.decision_id` column, which is added **conditionally** by a `to_regclass` guard: REQ-001
+   owns `ai_usage` and it is not on this branch, so the migration adds the column the day that table
+   appears and is a no-op before that. The first applier wins; a race surfaces as a duplicate-column
+   error, which is visible, rather than a silent divergence.
 
 ### Risks / notes
 

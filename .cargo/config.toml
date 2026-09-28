@@ -1,0 +1,13 @@
+# Omnion build settings
+#
+# This box has 6 cores and the whole server runs on it: production apps, the QA
+# stacks, the agent, and up to seven worktree writers each running their own cargo.
+# Cargo's default of one job per core per invocation meant seven concurrent builds
+# asked for 42 runnable threads — the load average hit 20 and the box swapped.
+#
+# jobs = 3 caps every cargo invocation at half the machine. One build still gets three
+# cores (a full workspace build is a couple of minutes), and seven of them together ask
+# for the same 3×7 threads the box can actually serve instead of fighting over six.
+# Raise it when the box is otherwise idle.
+[build]
+jobs = 3
