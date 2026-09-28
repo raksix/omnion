@@ -252,6 +252,20 @@ export function NotificationList() {
       setCursorIndex((index) => Math.max(index - 1, 0));
       return;
     }
+    if (event.key === "Escape") {
+      // `Escape` is answered *before* the cursor is read. The drawer is a panel over the
+      // list, and the list is where this handler lives, so a reader who opens a row and
+      // presses Escape is asking the drawer to go — whether or not a row happens to be under
+      // the cursor at that moment. Reading the cursor first would mean Escape works on an
+      // empty list and silently does nothing on a list that has rows, which is the one
+      // combination in which a shortcut is worse than no shortcut: it looks broken, and it
+      // is broken *only* in the case people notice.
+      if (drawer) {
+        event.preventDefault();
+        setDrawer(null);
+      }
+      return;
+    }
     const row = rows[cursorIndex];
     if (!row) return;
     if (event.key === "Enter") {

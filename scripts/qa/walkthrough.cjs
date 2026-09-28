@@ -3697,6 +3697,27 @@ async function runNotificationsDepth(page, report) {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(600);
   steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;
+  // Escape is answered from the *list's* key handler, so a regression has a second, sharper
+  // form: the drawer stops closing on Escape, and every shortcut after it silently stops
+  // working too, because the open drawer holds the focus the next press needs. Asserting only
+  // the keys that follow therefore reports a keyboard problem when the fault is one Escape
+  // press earlier. Re-open it and press Escape again from a row that is not under the cursor.
+  if (steps.escapeClosedDrawer) {
+    const rowsNow = page.locator("[data-notification-row]");
+    if ((await rowsNow.count()) > 0) {
+      await rowsNow.first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(700);
+      const reopened = (await page.locator("[data-notification-drawer]").count()) > 0;
+      await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+      await page.keyboard.press("k");
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(500);
+      steps.escapeWithNoRowUnderCursor =
+        reopened && (await page.locator("[data-notification-drawer]").count()) === 0;
+    }
+  } else {
+    steps.escapeWithNoRowUnderCursor = "the drawer never closed, so the second form cannot run";
+  }
 
   // `e` toggles read and `Shift+E` marks the visible rows — the second one is the shortcut
   // most likely to be documented and missing, so it is asserted rather than assumed.
