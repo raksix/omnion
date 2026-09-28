@@ -525,7 +525,7 @@ export function DealsView() {
           />
         ) : (
           <div className="flex gap-3 overflow-x-auto p-4" data-qa-board="pipeline">
-            {board.columns.map((column) => {
+            {board.columns.map((column, index) => {
               const cards = board.deals.filter((deal) => deal.stage_id === column.stage_id);
               return (
                 <section
@@ -568,9 +568,35 @@ export function DealsView() {
 
                   <div className="flex flex-1 flex-col gap-2 p-2">
                     {cards.length === 0 ? (
-                      <p className="rounded-lg border border-dashed border-line px-2 py-4 text-center text-[11.5px] text-muted">
-                        No deals
-                      </p>
+                      /* An empty *column* is not an empty board, and it says something different:
+                          a deal exists somewhere on this pipeline, so the sentence is about this
+                          stage, and the action moves it there. "No deals" in grey said nothing and
+                          offered nothing, on the one screen where the most likely next act is a
+                          drag. The first column offers the create form; the others offer the drop
+                          target, because a card can only arrive by being dragged. */
+                      <div className="flex flex-1 flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-line px-2 py-5 text-center">
+                        <p className="text-[11.5px] text-muted">
+                          {column.kind === "open" ? "Nothing here yet" : `No ${column.name.toLowerCase()} yet`}
+                        </p>
+                        {column.kind === "open" && index === 0 ? (
+                          <button
+                            type="button"
+                            data-qa={`empty-stage-${column.stage_id}`}
+                            onClick={() => {
+                              // The stage is the only field the empty column knows: the form's
+                              // stage is prefilled with the column the button lives in, which is
+                              // the whole point of offering it there.
+                              setForm({ ...EMPTY_FORM, stage_id: column.stage_id });
+                              setOutcome(null);
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11.5px] transition hover:bg-surface"
+                          >
+                            <Plus className="size-3" aria-hidden /> New deal
+                          </button>
+                        ) : (
+                          <p className="text-[11px] text-muted/80">Drag a card here</p>
+                        )}
+                      </div>
                     ) : null}
                     {cards.map((deal) => (
                       <article
