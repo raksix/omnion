@@ -66,3 +66,9 @@ url = "2"
 
 # The `omnion` command line (tools/cli) reads the first-run password without echoing it.
 rpassword = "7"
+
+# Image transformation (crates/media/transform.rs, REQ-010 slice 3): a preset has to *produce*
+# pixels, so the platform decodes and re-encodes rather than shelling out to a binary. Only the
+# three codecs the presets can emit are pulled in — decoding is the same set the header probe
+# already understands, so a file the library accepts is a file the transformer can read.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

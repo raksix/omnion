@@ -104,7 +104,7 @@ pub struct FileBody {
 
 impl FileBody {
     /// Describe one row for the panel.
-    fn build(file: &MediaFile) -> Self {
+    pub fn build(file: &MediaFile) -> Self {
         Self {
             id: file.id,
             site_id: file.site_id,
@@ -1193,7 +1193,7 @@ async fn folder_in_scope(
 }
 
 /// Load a live file and refuse it when its site is out of the caller's scope.
-async fn file_in_scope(
+pub async fn file_in_scope(
     state: &AppState,
     current: &CurrentSession,
     file_id: Uuid,
@@ -1221,7 +1221,7 @@ async fn site_of_trashed(
 }
 
 /// Load a site by id.
-async fn site_of(state: &AppState, site_id: Uuid) -> std::result::Result<Site, ApiError> {
+pub async fn site_of(state: &AppState, site_id: Uuid) -> std::result::Result<Site, ApiError> {
     crate::routes::media::site_of(state, site_id).await
 }
 
