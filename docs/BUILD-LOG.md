@@ -3363,3 +3363,31 @@ the raw route and a retention run removes exactly the eligible rows.
 - **Next.** The admin screens — `/cdn`, `/cdn/rules` with the drag reorder, the rule form with
   its live match tester, `/cdn/purge`, `/cdn/purges`, `/cdn/settings` — and the media 304 walk.
   Then the walkthrough, which is still owed an honest pass on this box.
+
+- **Tick 14 · omnion-wave5 · platform & enterprise.** Resumed a merge that tick 13 left
+  half-finished (eight unmerged paths, text already resolved). The resolution turned out to hide
+  a real defect: `retention_runner` named two different workers on two branches, so one `spawn`
+  was wired to the other's module. The audit sweep (REQ-005 slice 4, per-tenant window) is now
+  `crate::audit_retention` behind `OMNION_AUDIT_RETENTION_SWEEP`; the media worker (REQ-010)
+  keeps `OMNION_RETENTION_RUNNER`. Commits `704d00b`, `3e58d69`, `6b7061d`.
+
+  Proof: `cargo build -p omnion-api -p omnion-core` exit 0; `cargo test -p omnion-api --test
+  tenancy_limits -- --test-threads=1` **29 passed / 0 failed** (was 26/3); `pnpm typecheck` 2/2.
+  The three failures were one bug: `InvalidSettings`, `InvalidLimits` and
+  `InvitationAwaitingApproval` had no arm in `From<IdentityError> for ApiError` and fell into the
+  catch-all, so a validation failure answered `500 internal_error` instead of 400/400/409.
+
+  Note for the next writer on this box: the `analytics` suite resolves `OMNION_DATABASE_URL` to
+  the **shared** `omnion` dev database, and `0047` changed in this merge, so it reports
+  `VersionMismatch(19)` against the main writer's DB. Do not drop that database — run the
+  workspace suite against your own isolated one.
+
+  Next: the REQ-011 CDN admin screens (`/cdn`, `/cdn/rules` with drag reorder, the rule form
+  with its live match tester, `/cdn/purge`, `/cdn/purges`, `/cdn/settings`) and the media 304
+  walk, then the browser walkthrough.
+
+- **One more copy of the same bug.** `media_settings.rs` carried a second instance of the
+  `whole_seconds() >= 1` "configured" race that `media_scan.rs` had already been fixed for, and
+  it failed its own walk in the same workspace run. Fixed to compare the instants directly
+  (commit `3988995`); `cargo test -p omnion-api --test media_settings` goes 1/2 -> 2/2. The other
+  two `whole_seconds()` uses in the tree are a file age and a lease duration, and are correct.
