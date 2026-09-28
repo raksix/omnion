@@ -527,7 +527,13 @@ pub async fn is_silenced(
 }
 
 /// What one evaluation pass did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Eq` is deliberately absent. This struct used to hold nothing but counts and derived it; it
+/// now also carries the transitions, whose `value` is a measured `f64`. `Eq` on a float is a
+/// claim about precision the type cannot make — NaN is not equal to itself — and deriving it here
+/// would be a rule that silently stops meaning anything. `PartialEq` is the honest bound, and no
+/// caller compared two reports for identity.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PassReport {
     /// Rules evaluated.
     pub evaluated: usize,
@@ -543,6 +549,14 @@ pub struct PassReport {
     pub silenced: usize,
     /// Rules whose expression no longer parses — kept, counted, and logged.
     pub invalid: usize,
+    /// What actually moved, in the shape the events are built from.
+    ///
+    /// It used to be that the only record of a transition was the row, and a subscriber learned
+    /// about it by polling the admin screen. The request documents `observability.alert.fired`
+    /// and `.resolved` as **emitted**, so a pass has to hand the transition to the loop rather
+    /// than only write it down — and carrying the details here is what lets the loop build the
+    /// payload without a second query against a table that has already moved on.
+    pub transitions: Vec<crate::events::AlertTransition>,
 }
 
 impl PassReport {
@@ -550,6 +564,20 @@ impl PassReport {
     #[must_use]
     pub fn is_quiet(&self) -> bool {
         self.fired == 0 && self.resolved == 0
+    }
+
+    /// The transitions that became `firing`.
+    ///
+    /// Two accessors rather than one list a caller filters, because the caller is a `match` on
+    /// the direction: a single list would let a loop emit `alert.fired` from a resolution with
+    /// nothing in the type objecting, and the name is what a subscriber's routing keys on.
+    pub fn fired_transitions(&self) -> impl Iterator<Item = &crate::events::AlertTransition> {
+        self.transitions.iter().filter(|item| item.is_firing())
+    }
+
+    /// The transitions that resolved.
+    pub fn resolved_transitions(&self) -> impl Iterator<Item = &crate::events::AlertTransition> {
+        self.transitions.iter().filter(|item| !item.is_firing())
     }
 }
 
@@ -654,7 +682,7 @@ pub async fn evaluate_pass(
             }
             (false, Some(event)) => {
                 if event.state == "firing" {
-                    resolve(pool, &event, evaluation.value, now, &mut report).await?;
+                    resolve(pool, &event, &rule, evaluation.value, now, &mut report).await?;
                 } else {
                     // A pending event that fell back below the threshold never fired, so it is
                     // discarded rather than resolved: "it was above the line for four seconds"
@@ -724,6 +752,7 @@ async fn fire(
     .await?;
     report.opened += 1;
     report.fired += 1;
+    report.transitions.push(transition_for(rule, value, None));
     Ok(())
 }
 
@@ -753,12 +782,17 @@ async fn promote(
     .execute(pool)
     .await?;
     report.fired += 1;
+    // `promote` is a promotion, not a new fire, so the event it moved is the one the panel
+    // already shows as `pending`. The transition carries the same five fields either way — a
+    // subscriber that handles `alert.fired` must not need a second shape for the dwell case.
+    report.transitions.push(transition_for(rule, value, None));
     Ok(())
 }
 
 async fn resolve(
     pool: &PgPool,
     event: &AlertEvent,
+    rule: &Rule,
     value: Option<f64>,
     now: OffsetDateTime,
     report: &mut PassReport,
@@ -772,7 +806,40 @@ async fn resolve(
     .execute(pool)
     .await?;
     report.resolved += 1;
+    // The duration is measured from the moment it FIRED, not from when the event opened: a rule
+    // with a 300-second dwell spent those 300 seconds as `pending`, and a subscriber reading
+    // `duration_seconds` means "how long was this incident", not "how long was the rule true
+    // including its dwell". The event row carries both instants, so the distinction is a choice
+    // this line makes rather than something the caller has to remember.
+    let opened = event.fired_at.unwrap_or(event.started_at);
+    report.transitions.push(transition_for(
+        rule,
+        value,
+        Some(i64::try_from((now - opened).whole_seconds()).unwrap_or(i64::MAX)),
+    ));
     Ok(())
+}
+
+/// The transition a pass hands to the loop, in the shape the event payload is built from.
+///
+/// One function for all three transitions, because the payload's five documented fields are the
+/// same for both directions — a subscriber must not need a second shape for `resolved`, and a
+/// caller that assembled the struct itself three times is three places to add a field.
+fn transition_for(
+    rule: &Rule,
+    value: Option<f64>,
+    duration_seconds: Option<i64>,
+) -> crate::events::AlertTransition {
+    crate::events::AlertTransition {
+        rule_id: rule.id,
+        rule: rule.name.clone(),
+        severity: rule.severity.clone(),
+        value,
+        window_seconds: rule.for_seconds,
+        runbook_url: rule.runbook_url.clone(),
+        labels: rule.labels.clone(),
+        duration_seconds,
+    }
 }
 
 /// Mark every open, un-notified `firing` event as notified and return the payloads.

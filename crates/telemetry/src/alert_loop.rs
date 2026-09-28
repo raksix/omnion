@@ -114,6 +114,13 @@ pub async fn tick(pool: &PgPool) -> Result<PassReport, crate::TelemetryError> {
         );
     }
 
+    // The transitions become events BEFORE the notification claim. Order matters in one
+    // direction only: a subscriber told "firing" after the panel already knows is not a problem,
+    // but a crash between the two loses the notification, not the event — and the event is the
+    // durable record the notification is derived from. So the cheap, restartable write goes
+    // first.
+    emit_transitions(pool, &report).await;
+
     // The claim runs on EVERY pass, quiet or not. It looks like it could be skipped when nothing
     // moved, and that would be a bug: a `firing` event raised by the OTHER instance during a
     // rolling restart would never be claimed, and the notification for an active incident would
@@ -121,6 +128,31 @@ pub async fn tick(pool: &PgPool) -> Result<PassReport, crate::TelemetryError> {
     // is the only thing that makes "notifies once" true across instances.
     deliver(pool).await?;
     Ok(report)
+}
+
+/// Write one event per transition this pass made.
+///
+/// A transition with no event is the state of slice 4 before this tick: the row moved, the
+/// screen moved, and a webhook endpoint subscribed to `observability.alert.fired` was never told.
+/// The request calls these **emitted**, and a webhook subscriber that never receives the event
+/// it subscribed to is a subscription that looks configured and is not.
+///
+/// Deliberately best-effort: [`crate::events::try_emit`] logs a failure instead of returning it,
+/// because a pass that aborts on the bus would skip the notification claim that follows it — and
+/// an incident with no notification is worse than an incident with no duplicate event.
+pub async fn emit_transitions(pool: &PgPool, report: &PassReport) -> usize {
+    let mut written = 0;
+    for transition in report.fired_transitions() {
+        if crate::events::try_emit(pool, crate::events::ALERT_FIRED, transition.payload()).await {
+            written += 1;
+        }
+    }
+    for transition in report.resolved_transitions() {
+        if crate::events::try_emit(pool, crate::events::ALERT_RESOLVED, transition.payload()).await {
+            written += 1;
+        }
+    }
+    written
 }
 
 /// Deliver the notifications this pass claimed.
