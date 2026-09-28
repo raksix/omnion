@@ -86,6 +86,7 @@ pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod media_files;
+pub mod media_duplicates;
 pub mod media_settings;
 pub mod media_shares;
 pub mod media_transform;
@@ -526,6 +527,15 @@ pub fn router(state: AppState) -> Router {
     // credential — that is what a share link is. Everything it checks is about the token.
     let public_media_shared = get(media_shares::public_shared);
 
+    // Duplicate detection and merge (REQ-010, slice 3). Reading the report is `media.read` —
+    // knowing what a site stores twice costs nothing and helps everybody. Merging is
+    // `media.manage`: it rewrites which row a published page resolves to, which is a different
+    // power from being able to organise the library.
+    let media_duplicates_route: MethodRouter<AppState, Infallible> =
+        get(media_duplicates::report).layer(guards::require(&state, "media.read"));
+    let media_duplicates_merge: MethodRouter<AppState, Infallible> =
+        post(media_duplicates::merge).layer(guards::require(&state, "media.manage"));
+
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
     let public_pages = get(public::get_published_page);
@@ -918,6 +928,11 @@ pub fn router(state: AppState) -> Router {
         .route("/media/{id}/shares/revoke-all", media_share_revoke_all)
         .route("/media/{id}/shares/{share_id}", media_share_revoke)
         .route("/media/transformation-presets", media_presets)
+        // The duplicate report and its merge. `duplicates` is a static segment declared before
+        // `/media/{id}/…`, so axum ranks it ahead of the parameter route — same rule the
+        // settings row below relies on, and the reason it is a literal here.
+        .route("/media/duplicates", media_duplicates_route)
+        .route("/media/duplicates/merge", media_duplicates_merge)
         // `/media/settings` is a *static* segment and `/media/{id}/…` is a parameter one.
         // Axum ranks the static match first, so the settings row is never read as a media
         // id — which is why the literal is declared here and not spelled as `{id}`.

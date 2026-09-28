@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod browser;
+pub mod duplicates;
 pub mod error;
 pub mod folder_store;
 pub mod folders;
@@ -30,6 +31,12 @@ pub use browser::{
     FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
     purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+};
+pub use duplicates::{
+    DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES, MergeOutcome, NewReference, Reference,
+    SiteLabel, clear_references, count_live_shares, count_references, duplicate_groups,
+    duplicate_groups_across, group_members, list_references, merge_group, reclaimable_total,
+    record_reference, repoint_references, site_labels,
 };
 pub use error::{MediaError, Result};
 pub use folder_store::{
