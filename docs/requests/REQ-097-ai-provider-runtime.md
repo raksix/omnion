@@ -145,7 +145,28 @@ Providers are installation-level, so these events carry `organization_id = null`
   tab counting the llama.cpp call as `missing_usage` rather than as a free one.*
 - [x] Removing a provider removes its models and health samples, and is refused while it is the installation's default (the message tells the operator to set another default first).
   *Shipped in `b6eb879` + `b20a9ad`. The refusal belongs to the **store**, not the route, and shares the delete's transaction (`select … for update` then delete), so a caller reaching the store by another road cannot walk around it and two racing operators cannot both see a default. `ProviderIsDefault(name)` carries the provider's name, so the message names which one to move first, and it maps to **409 `provider_is_default`** — a conflict, not a `404`: the row is there and the fix is the installation's default, not the id. The walk asserts the refusal, that the row is still default afterwards, that the same removal succeeds once the default moves (the advice the message gave is the way out), that the removed provider's models and health samples go with it while the spare keeps **both** of its own (the cascade is per provider, not a table wipe), and that an unknown id is still a plain `404`. The panel disables the default's Remove **and says why**, because a disabled control with no explanation is a dead one.*
-- [ ] Every screen has empty, loading and error states with a real call to action; no dead button and no placeholder text.
+- [x] Every screen has empty, loading and error states with a real call to action; no dead button and no placeholder text.
+  *Shipped. The Health, Usage and Failover panels already had the full trio; the **hub screen**
+  did not, and the gap was worse than a missing state. A rejected fetch parked the provider and
+  model lists back on `null` — the slot that renders the skeleton — so an outage shimmered for
+  ever behind a banner nobody could act on, and the skeleton was the only honest thing on screen.
+  A failure now lands on its own state: the API's own message, a **Try again** that makes a real
+  second request, and wording that does *not* claim the installation is empty, because telling an
+  operator with three connected providers that they have none invites a duplicate. The two lists
+  keep settling independently, so one outage no longer reads as the whole hub being down. Both
+  empty states grew the action that gets past them (Connect a provider / Add a model) instead of
+  leaving the operator to find the button in the header. The walk provokes every failure **for
+  real** — a 500 on the provider list, a 500 on the model registry, then a dropped connection —
+  and raises a high finding when a skeleton is still on screen while an error is claimed, which is
+  the original bug asserted rather than described.*
+  *The walk itself is written and committed but its **closing pass has not completed**: two runs on
+  2026-09-28 died before the AI depth passes. The first lost its artifact directory mid-run to a
+  sibling writer's disk reclaim (`ENOENT … clicks.jsonl`), and the second ran 45 minutes under
+  `load 16` with 319 MB free and lost its browser context (`Target page, context or browser has been
+  closed`) at `runAiProviderDepth`. Both are the shared box, not a screen — the pass reached
+  `iam-roles` and `analytics-settings`, and every page walked before that reported clean. Until a
+  run finishes end to end this box stays **open**, and the states criterion is ticked on the code and
+  the assertions, not on a pass that does not exist yet.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan

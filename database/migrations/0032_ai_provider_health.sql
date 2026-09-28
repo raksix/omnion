@@ -1,4 +1,4 @@
--- Omnion · 0030 · AI provider health samples and usage (REQ-097, slice 3)
+-- Omnion · 0032 · AI provider health samples and usage (REQ-097, slice 3)
 --
 -- 0022 gave every provider a `last_health` column, which is the *verdict* of the last probe and
 -- nothing more: one string that says whether the endpoint answered. A verdict with no history
