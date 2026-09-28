@@ -83,6 +83,46 @@ pub struct Exif {
 }
 
 impl Exif {
+    /// Read a record back out of the jsonb column.
+    ///
+    /// Deliberately lenient: the column is jsonb, so a row may carry a key this release does not
+    /// know (a future release wrote it) or one whose value is the wrong json type (a hand edit).
+    /// Neither makes a whole file listing fail to decode — a field that does not read as what it
+    /// claims to be is *absent*, which is the same answer the reader gives for a corrupt block.
+    #[must_use]
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty() && raw.len() <= MAX_STRING_BYTES)
+                .map(str::to_owned)
+        };
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_i64);
+        Self {
+            make: text("make"),
+            model: text("model"),
+            lens: text("lens"),
+            software: text("software"),
+            captured_at: text("captured_at").and_then(|raw| datetime(&raw)),
+            iso: number("iso").and_then(|value| i32::try_from(value).ok()),
+            exposure_ms: number("exposure_ms").and_then(|value| i32::try_from(value).ok()),
+            aperture_x100: number("aperture_x100").and_then(|value| i32::try_from(value).ok()),
+            focal_length_mm: number("focal_length_mm").and_then(|value| i32::try_from(value).ok()),
+            orientation: number("orientation").and_then(|value| i32::try_from(value).ok()),
+            gps: value
+                .get("gps")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    /// The record as the json that goes into the column.
+    #[must_use]
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::from_str(&to_json(self)).unwrap_or(serde_json::Value::Null)
+    }
     /// Whether the camera said nothing this reader understands.
     #[must_use]
     pub fn is_empty(&self) -> bool {

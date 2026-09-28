@@ -82,5 +82,6 @@ pub use validation::{
 pub use versions::{
     MAX_NOTE_LENGTH, MediaVersion, NewVersion, VersionTransaction, all_storage_keys,
     append_version, begin_version, commit_version, count_versions, ensure_version_one,
-    fill_dimensions, find_version, list_versions, next_version, normalize_note, probe_of,
+    fill_dimensions, fill_exif, find_version, list_versions, next_version, normalize_note,
+    probe_of,
 };
