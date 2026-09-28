@@ -20,6 +20,7 @@ pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod shares;
 pub mod storage_settings;
 pub mod transform;
 pub mod validation;
@@ -50,6 +51,11 @@ pub use preset_store::{
     list_presets, require_preset, require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
+pub use shares::{
+    CreatedShare, MAX_EXPIRY_DAYS, MIN_EXPIRY_MINUTES, NewShare, Share, ShareRefusal, TOKEN_BYTES,
+    count_download, create_share, find_by_token, find_share, hash_token, is_password_protected,
+    list_shares, revoke_for_media, revoke_share, servable,
+};
 pub use storage_settings::{
     ConnectionProbe, MAX_SIGNED_URL_TTL, MAX_UPLOAD_MB, MIN_SIGNED_URL_TTL, MIN_UPLOAD_MB,
     NewSiteStorage, SiteStorage, describe_public_base, describe_target,
