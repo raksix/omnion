@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod analytics_runner;
+pub mod audit_retention;
 pub mod auth;
 pub mod automation_runner;
 pub mod client_ip;
@@ -14,7 +15,6 @@ pub mod dto;
 pub mod error;
 pub mod event_runner;
 pub mod guards;
-pub mod audit_retention;
 pub mod intent_resolver;
 pub mod module_guard;
 pub mod retention_runner;

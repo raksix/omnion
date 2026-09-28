@@ -170,10 +170,7 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> Account {
     )
     .await
     .expect("the account must be created");
-    Account {
-        id: user.id,
-        email,
-    }
+    Account { id: user.id, email }
 }
 
 /// Create a role, write its permissions and bind it to one account at organization scope.
@@ -237,7 +234,12 @@ async fn login(state: &AppState, email: &str) -> String {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "login body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "login body: {}",
+        response.body
+    );
     response
         .set_cookie
         .clone()
@@ -290,14 +292,25 @@ async fn upload(state: &AppState, token: &str, site: Uuid, filename: &str, body:
 }
 
 /// Create a folder and return its id.
-async fn folder(state: &AppState, token: &str, site: Uuid, name: &str, parent: Option<Uuid>) -> Uuid {
+async fn folder(
+    state: &AppState,
+    token: &str,
+    site: Uuid,
+    name: &str,
+    parent: Option<Uuid>,
+) -> Uuid {
     let mut body = json!({ "name": name, "site_id": site });
     if let Some(parent) = parent {
         body["parent_id"] = json!(parent);
     }
     let response = call(
         state,
-        request(Method::POST, "/api/v1/media/folders", Some(token), Some(body)),
+        request(
+            Method::POST,
+            "/api/v1/media/folders",
+            Some(token),
+            Some(body),
+        ),
     )
     .await;
     assert_eq!(
@@ -310,17 +323,8 @@ async fn folder(state: &AppState, token: &str, site: Uuid, name: &str, parent: O
 }
 
 /// Write a grant through the real route.
-async fn put_grant(
-    state: &AppState,
-    token: &str,
-    path: &str,
-    body: Value,
-) -> TestResponse {
-    call(
-        state,
-        request(Method::PUT, path, Some(token), Some(body)),
-    )
-    .await
+async fn put_grant(state: &AppState, token: &str, path: &str, body: Value) -> TestResponse {
+    call(state, request(Method::PUT, path, Some(token), Some(body))).await
 }
 
 /// The fixture every walk shares: an organization, a site, an editor, a reader and
@@ -431,7 +435,14 @@ async fn a_deny_on_a_file_beats_an_allow_inherited_from_four_folders_up() {
 
     // root → campaigns → 2026 → drafts → launch
     let root = folder(&fx.state, &fx.editor_token, fx.site, "root", None).await;
-    let one = folder(&fx.state, &fx.editor_token, fx.site, "campaigns", Some(root)).await;
+    let one = folder(
+        &fx.state,
+        &fx.editor_token,
+        fx.site,
+        "campaigns",
+        Some(root),
+    )
+    .await;
     let two = folder(&fx.state, &fx.editor_token, fx.site, "2026", Some(one)).await;
     let three = folder(&fx.state, &fx.editor_token, fx.site, "drafts", Some(two)).await;
     let four = folder(&fx.state, &fx.editor_token, fx.site, "launch", Some(three)).await;
@@ -558,7 +569,10 @@ async fn a_deny_on_a_file_beats_an_allow_inherited_from_four_folders_up() {
     assert_eq!(effective.status, StatusCode::OK, "{}", effective.body);
     assert_eq!(effective.body["touched"], true);
     assert!(
-        effective.body["effective"].as_array().expect("a list").is_empty(),
+        effective.body["effective"]
+            .as_array()
+            .expect("a list")
+            .is_empty(),
         "the answer must be nothing: {}",
         effective.body
     );
@@ -658,7 +672,10 @@ async fn a_deny_that_removes_only_share_leaves_reading_alone() {
         Uuid::parse_str(share_denied.body["id"].as_str().unwrap()).unwrap(),
     )
     .await;
-    assert!(!dc_read && !dc_write && !dc_delete, "the deny names only share");
+    assert!(
+        !dc_read && !dc_write && !dc_delete,
+        "the deny names only share"
+    );
     assert!(dc_share);
     assert_eq!(dc_effect, "deny");
 
@@ -966,8 +983,14 @@ async fn a_folder_grant_reaches_the_files_beneath_it_and_the_chain_shows_where()
         "the folder we denied on carries the deny: {}",
         tab.body
     );
-    assert_eq!(chain[2]["has_deny"], false, "the library root carries nothing");
-    assert_eq!(tab.body["inherits"], false, "a file has no inheritance of its own");
+    assert_eq!(
+        chain[2]["has_deny"], false,
+        "the library root carries nothing"
+    );
+    assert_eq!(
+        tab.body["inherits"], false,
+        "a file has no inheritance of its own"
+    );
 
     // The folder's own tab says it does inherit, and names the state.
     let folder_tab = call(
@@ -1070,14 +1093,18 @@ async fn the_refusals_are_the_ones_the_screen_needs() {
         }),
     )
     .await;
-    assert_eq!(empty_deny.status, StatusCode::BAD_REQUEST, "{}", empty_deny.body);
+    assert_eq!(
+        empty_deny.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        empty_deny.body
+    );
     assert_eq!(empty_deny.body["error"]["code"], "effect");
-    let stored: i64 =
-        sqlx::query_scalar("select count(*) from media_grants where media_id = $1")
-            .bind(file)
-            .fetch_one(fx.db.pool())
-            .await
-            .expect("the count must read");
+    let stored: i64 = sqlx::query_scalar("select count(*) from media_grants where media_id = $1")
+        .bind(file)
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("the count must read");
     assert_eq!(stored, 0, "a refused grant must not be written");
 
     // An unknown subject kind names the field and the three legal values.
@@ -1092,9 +1119,16 @@ async fn the_refusals_are_the_ones_the_screen_needs() {
         }),
     )
     .await;
-    assert_eq!(bad_kind.status, StatusCode::BAD_REQUEST, "{}", bad_kind.body);
+    assert_eq!(
+        bad_kind.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_kind.body
+    );
     assert_eq!(bad_kind.body["error"]["code"], "subject_kind");
-    let message = bad_kind.body["error"]["message"].as_str().expect("a message");
+    let message = bad_kind.body["error"]["message"]
+        .as_str()
+        .expect("a message");
     assert!(message.contains("user") && message.contains("group") && message.contains("role"));
 
     // Another tenant's *site* is refused by the tenancy layer with `cross_organization` before
@@ -1188,7 +1222,10 @@ async fn the_refusals_are_the_ones_the_screen_needs() {
         .fetch_one(fx.db.pool())
         .await
         .expect("the count must read");
-    assert_eq!(still_there, 1, "the refusal must not have deleted their row");
+    assert_eq!(
+        still_there, 1,
+        "the refusal must not have deleted their row"
+    );
 
     // And the subject picker is scoped by site for the same reason. A *site* outside the
     // organization is `cross_organization` (403) — the same answer every other route gives —
@@ -1337,7 +1374,10 @@ async fn removing_a_grant_takes_effect_on_the_next_request() {
     .fetch_one(fx.db.pool())
     .await
     .expect("the audit count must read");
-    assert_eq!(audited, 2, "both the change and the removal must be recorded");
+    assert_eq!(
+        audited, 2,
+        "both the change and the removal must be recorded"
+    );
 }
 
 /// The picker offers the organization's own subjects, a group first, and a search narrows it.
@@ -1369,7 +1409,11 @@ async fn the_subject_picker_offers_this_organizations_subjects() {
     .await;
     assert_eq!(all.status, StatusCode::OK, "{}", all.body);
     let rows = all.body.as_array().expect("a list");
-    assert!(!rows.is_empty(), "the picker must offer something: {}", all.body);
+    assert!(
+        !rows.is_empty(),
+        "the picker must offer something: {}",
+        all.body
+    );
 
     let labels: Vec<&str> = rows
         .iter()
@@ -1387,7 +1431,10 @@ async fn the_subject_picker_offers_this_organizations_subjects() {
     assert_eq!(guild["id"].as_str().expect("an id"), group.to_string());
     assert_eq!(guild["suggested"], true, "a group is the row to reach for");
     assert!(
-        guild["detail"].as_str().expect("a detail").contains("members"),
+        guild["detail"]
+            .as_str()
+            .expect("a detail")
+            .contains("members"),
         "a group says how many: {}",
         guild["detail"]
     );
@@ -1399,8 +1446,7 @@ async fn the_subject_picker_offers_this_organizations_subjects() {
             Method::GET,
             &format!(
                 "/api/v1/media/grant-subjects?site_id={}&search={}",
-                fx.site,
-                fx.subject.email
+                fx.site, fx.subject.email
             ),
             Some(&fx.editor_token),
             None,
@@ -1411,5 +1457,8 @@ async fn the_subject_picker_offers_this_organizations_subjects() {
     let found = searched.body.as_array().expect("a list");
     assert_eq!(found.len(), 1, "the search must narrow: {}", searched.body);
     assert_eq!(found[0]["kind"], "user");
-    assert_eq!(found[0]["id"].as_str().expect("an id"), fx.subject.id.to_string());
+    assert_eq!(
+        found[0]["id"].as_str().expect("an id"),
+        fx.subject.id.to_string()
+    );
 }

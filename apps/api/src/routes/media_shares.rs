@@ -260,17 +260,13 @@ pub async fn create(
         Some(password) => {
             // Validated by the same function a sign-in uses, so a link cannot carry a password
             // the platform would refuse to check later.
-            Some(
-                hash_password(password)
-                    .await
-                    .map_err(|err| {
-                        ApiError::new(
-                            StatusCode::BAD_REQUEST,
-                            "password_rejected",
-                            format!("the share password was rejected: {err}"),
-                        )
-                    })?,
-            )
+            Some(hash_password(password).await.map_err(|err| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "password_rejected",
+                    format!("the share password was rejected: {err}"),
+                )
+            })?)
         }
     };
 
@@ -404,8 +400,8 @@ pub async fn revoke_all(
     Path(media_id): Path<Uuid>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let media = media_site_in_scope(&state, &current, media_id).await?;
-    let closed = revoke_for_media(state.db().pool(), media_id, "revoked for the whole file")
-        .await?;
+    let closed =
+        revoke_for_media(state.db().pool(), media_id, "revoked for the whole file").await?;
 
     if closed > 0 {
         record(
@@ -602,7 +598,10 @@ fn share_url(token: &str) -> String {
     if base.is_empty() {
         return format!("/api/v1/public/media/shared/{token}");
     }
-    format!("{}/api/v1/public/media/shared/{token}", base.trim_end_matches('/'))
+    format!(
+        "{}/api/v1/public/media/shared/{token}",
+        base.trim_end_matches('/')
+    )
 }
 
 /// Trim and cap a revocation reason so the audit trail cannot be used as a notes field.
@@ -614,7 +613,11 @@ fn normalize_reason(reason: &str) -> String {
             break;
         }
         // One line, so a reason cannot break the audit log's own rendering.
-        out.push(if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch });
+        out.push(if ch == '\n' || ch == '\r' || ch == '\t' {
+            ' '
+        } else {
+            ch
+        });
     }
     out
 }
@@ -626,7 +629,10 @@ fn normalize_reason(reason: &str) -> String {
 /// opaque domain is a page that runs script in the holder's browser with the platform's name on
 /// it. The platform's own upload validation already limits what can be stored, and an
 /// attachment sidesteps the case where it grows.
-async fn serve_shared(state: &AppState, media: &MediaFile) -> std::result::Result<Response, ApiError> {
+async fn serve_shared(
+    state: &AppState,
+    media: &MediaFile,
+) -> std::result::Result<Response, ApiError> {
     let bytes = state.storage().get(&media.storage_key).await?;
     let mut response = Response::new(axum::body::Body::from(bytes));
     let headers = response.headers_mut();
@@ -642,10 +648,7 @@ async fn serve_shared(state: &AppState, media: &MediaFile) -> std::result::Resul
     // a revocation is that it is immediate.
     headers.insert(header::CACHE_CONTROL, header_value("no-store")?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        header_value("nosniff")?,
-    );
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
     Ok(response)
 }
 
@@ -672,7 +675,10 @@ mod tests {
 
     #[test]
     fn a_revocation_reason_cannot_break_the_audit_line() {
-        assert_eq!(normalize_reason("  sent to the wrong client \n"), "sent to the wrong client");
+        assert_eq!(
+            normalize_reason("  sent to the wrong client \n"),
+            "sent to the wrong client"
+        );
         assert_eq!(normalize_reason("a\tb"), "a b");
         assert_eq!(normalize_reason(&"x".repeat(500)).chars().count(), 200);
         assert_eq!(normalize_reason(""), "");
@@ -731,7 +737,10 @@ mod tests {
         ] {
             let err = share_refusal(refusal);
             assert_eq!(err.code(), refusal.as_str());
-            assert!(!format!("{:?}", err).is_empty(), "{refusal:?} has nothing to say");
+            assert!(
+                !format!("{:?}", err).is_empty(),
+                "{refusal:?} has nothing to say"
+            );
         }
     }
 

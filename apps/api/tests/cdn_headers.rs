@@ -107,12 +107,7 @@ async fn call(state: &AppState, request: Request<Body>) -> Response {
     }
 }
 
-fn request(
-    method: Method,
-    uri: &str,
-    token: Option<&str>,
-    body: Option<Value>,
-) -> Request<Body> {
+fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
         Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
@@ -178,7 +173,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let suffix = Uuid::new_v4().simple().to_string();
         let organization: Uuid = sqlx::query_scalar(
@@ -249,7 +246,9 @@ impl Fixture {
             NewBinding {
                 role_id: role.id,
                 user_id: user.id,
-                scope: Scope::Organization { organization_id: organization },
+                scope: Scope::Organization {
+                    organization_id: organization,
+                },
                 granted_by: None,
                 expires_at: None,
             },
@@ -591,7 +590,9 @@ async fn a_conditional_read_for_another_revision_gets_the_whole_response() {
         }))
         .await;
 
-    let response = fixture.public_page(&[("if-none-match", "\"p99-deadbeef\"")]).await;
+    let response = fixture
+        .public_page(&[("if-none-match", "\"p99-deadbeef\"")])
+        .await;
     assert_eq!(
         response.status,
         StatusCode::OK,
@@ -680,9 +681,7 @@ async fn a_rule_that_keys_on_the_language_cookie_varies_on_cookie() {
         }))
         .await;
 
-    let response = fixture
-        .public_page(&[("cookie", "omnion_lang=tr")])
-        .await;
+    let response = fixture.public_page(&[("cookie", "omnion_lang=tr")]).await;
     assert_eq!(
         response.header("vary"),
         Some("Cookie"),
@@ -706,9 +705,7 @@ async fn a_rule_that_keys_on_nothing_extra_carries_no_vary() {
         }))
         .await;
 
-    let response = fixture
-        .public_page(&[("cookie", "omnion_lang=tr")])
-        .await;
+    let response = fixture.public_page(&[("cookie", "omnion_lang=tr")]).await;
     assert_eq!(
         response.header("vary"),
         None,
@@ -734,7 +731,10 @@ async fn an_authorized_visitor_is_never_served_from_a_cache() {
         .await;
 
     let anonymous = fixture.public_page(&[]).await;
-    assert_eq!(anonymous.header("cache-control"), Some("public, max-age=60"));
+    assert_eq!(
+        anonymous.header("cache-control"),
+        Some("public, max-age=60")
+    );
 
     let signed_in = fixture
         .public_page(&[("authorization", "Bearer a-token")])

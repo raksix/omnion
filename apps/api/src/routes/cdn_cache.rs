@@ -90,11 +90,7 @@ pub fn request_shape(path: &str, query: Option<&str>, headers: &HeaderMap) -> Re
 /// `None` for the site means the platform-default rules, which an installation with no
 /// per-site rules uses; an installation with no rules at all decides `Private`, which is
 /// the correct answer for a surface nobody has decided to share.
-pub async fn policy_for(
-    pool: &PgPool,
-    site_id: Uuid,
-    request: &RequestShape,
-) -> Policy {
+pub async fn policy_for(pool: &PgPool, site_id: Uuid, request: &RequestShape) -> Policy {
     match store::list_rules_compiled(pool, site_id).await {
         Ok((rules, broken)) => {
             let decision = omnion_cdn::decide(&rules, request);
@@ -206,10 +202,7 @@ pub fn apply(
     }
 
     if let Ok(value) = HeaderValue::from_str(&policy.tags.join(" ")) {
-        headers.insert(
-            HeaderName::from_static("surrogate-key"),
-            value,
-        );
+        headers.insert(HeaderName::from_static("surrogate-key"), value);
     }
     if let Ok(value) = HeaderValue::from_str(&etag) {
         headers.insert(header::ETAG, value);
@@ -344,7 +337,10 @@ mod tests {
             },
             &HeaderMap::new(),
         );
-        assert_eq!(header(&response, "cache-control").as_deref(), Some("public, max-age=60"));
+        assert_eq!(
+            header(&response, "cache-control").as_deref(),
+            Some("public, max-age=60")
+        );
         assert_eq!(
             header(&response, "cdn-cache-control").as_deref(),
             Some("public, max-age=3600")
@@ -555,24 +551,30 @@ mod tests {
         let headers = headers_of(&[("cookie", "omnion_lang=tr")]);
         let shape = request_shape("/blog", None, &headers);
         assert_eq!(shape.language.as_deref(), Some("tr"));
-        let rules = vec![omnion_cdn::CacheRule {
-            name: "reads".into(),
-            priority: 0,
-            pattern: omnion_cdn::PathPattern::parse("/blog").expect("compiles"),
-            methods: vec!["GET".into()],
-            edge_ttl_seconds: 300,
-            browser_ttl_seconds: 60,
-            swr_seconds: 0,
-            cache_key: CacheKey::default(),
-            bypass: omnion_cdn::Bypass::default(),
-            enabled: true,
-        }
-        .checked()
-        .expect("the fixture is a valid rule")];
+        let rules = vec![
+            omnion_cdn::CacheRule {
+                name: "reads".into(),
+                priority: 0,
+                pattern: omnion_cdn::PathPattern::parse("/blog").expect("compiles"),
+                methods: vec!["GET".into()],
+                edge_ttl_seconds: 300,
+                browser_ttl_seconds: 60,
+                swr_seconds: 0,
+                cache_key: CacheKey::default(),
+                bypass: omnion_cdn::Bypass::default(),
+                enabled: true,
+            }
+            .checked()
+            .expect("the fixture is a valid rule"),
+        ];
         assert!(matches!(
             omnion_cdn::decide(&rules, &shape),
             Decision::Cacheable { .. }
         ));
-        assert_eq!(shape.language.as_deref(), Some("tr"), "matching did not consume it");
+        assert_eq!(
+            shape.language.as_deref(),
+            Some("tr"),
+            "matching did not consume it"
+        );
     }
 }

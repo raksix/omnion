@@ -257,11 +257,7 @@ fn validate_subject_kind(kind: &str) -> Result<&'static str, ApiError> {
 /// before the operator ticks anything.
 fn validate_effect_and_bits(effect: &str, capabilities: Capabilities) -> Result<String, ApiError> {
     let effect = if effect.is_empty() { "allow" } else { effect };
-    let effect = if effect.is_empty() {
-        "allow"
-    } else {
-        effect
-    };
+    let effect = if effect.is_empty() { "allow" } else { effect };
     if effect != "allow" && effect != "deny" {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -696,10 +692,7 @@ async fn write_grant(
 
 /// The id of the node a grant is on, for the audit target.
 fn grant_target_id(grant: &Grant) -> Uuid {
-    grant
-        .folder_id
-        .or(grant.media_id)
-        .unwrap_or_else(Uuid::nil)
+    grant.folder_id.or(grant.media_id).unwrap_or_else(Uuid::nil)
 }
 
 /// The chain above a file, for the tab's "inherited from" line.
@@ -802,7 +795,9 @@ async fn join_subjects(rows: Vec<Grant>, state: &AppState) -> Vec<GrantBodyOut> 
                 id: row.id,
                 subject_kind: row.subject_kind.clone(),
                 subject_id: row.subject_id,
-                subject_label: names.get(&(row.subject_kind.clone(), row.subject_id)).cloned(),
+                subject_label: names
+                    .get(&(row.subject_kind.clone(), row.subject_id))
+                    .cloned(),
                 can_read: row.can_read,
                 can_write: row.can_write,
                 can_delete: row.can_delete,
@@ -883,7 +878,8 @@ mod tests {
     #[test]
     fn an_absent_effect_means_allow() {
         assert_eq!(
-            validate_effect_and_bits("", Capabilities::from_row(true, false, false, false)).unwrap(),
+            validate_effect_and_bits("", Capabilities::from_row(true, false, false, false))
+                .unwrap(),
             "allow"
         );
     }

@@ -502,7 +502,10 @@ async fn a_ttl_above_the_one_year_cap_is_refused_and_names_the_ttl_field() {
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert_eq!(response.body["error"]["code"], "invalid_ttl");
-    assert_eq!(response.body["error"]["details"]["field"], "edge_ttl_seconds");
+    assert_eq!(
+        response.body["error"]["details"]["field"],
+        "edge_ttl_seconds"
+    );
     fixture.cleanup().await;
 }
 
@@ -850,4 +853,3 @@ async fn a_mutation_writes_an_audit_entry_naming_the_actor_and_the_action() {
     assert_eq!(after, before + 1);
     fixture.cleanup().await;
 }
-
