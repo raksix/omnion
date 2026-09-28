@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slice 1, `d3bf072`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -133,8 +133,10 @@ back to untested), `workflows.graph.saved` (usage refresh).
 
 ### Acceptance criteria
 
-- [ ] `GET /api/v1/node-types` returns every node with ports, params schema, credential type and capabilities; the palette renders from it with no hard-coded list.
-- [ ] A node detail carries docs link and version, and a deprecated node names its replacement in API and UI.
+- [~] `GET /api/v1/node-types` returns every node with ports, params schema, credential type and capabilities; the palette renders from it with no hard-coded list.
+      *(API half proven: the endpoint returns every node in full and the library screen renders
+      from it alone. The palette clause waits on REQ-086 slice 2.)*
+- [x] A node detail carries docs link and version, and a deprecated node names its replacement in API and UI.
 - [ ] Creating a credential stores no plaintext in the workflows schema (row inspection) and no response ever returns a secret value.
 - [ ] Re-sending a secret field on `PATCH` fails with `credential_secret_write_only`; replace-secret is the only write path and is audited.
 - [ ] **Test connection** returns ok for a valid credential and a masked failure for an invalid one.
@@ -145,7 +147,9 @@ back to untested), `workflows.graph.saved` (usage refresh).
 - [ ] Installing a third-party node package adds its nodes to the registry and palette without a restart; removal disables them and flags dependent workflows.
 - [ ] A package failing the SDK validator is refused with the findings and nothing reaches the ledger.
 - [ ] SDK scaffold → validate → pack yields an installable package whose fixtures pass for one action node and one credential-bearing node.
-- [ ] Credential search and filters return correct subsets, the expired-credential amber state appears for a past expiry, and the walkthrough traffic contains no fixture secret string.
+- [~] Credential search and filters return correct subsets, the expired-credential amber state appears for a past expiry, and the walkthrough traffic contains no fixture secret string.
+      *(The node-library search and filters are proven by the walkthrough. The credential
+      *instances* screen, its amber expiry state and its search are slice 2.)*
 - [ ] The credential access audit (REQ-125) records reads and tests with actor and time, and the detail link resolves.
 - [ ] Library and credentials screens are keyboard navigable end to end and readable at 390 px.
 
@@ -163,6 +167,12 @@ match the tested state, usage data is real.
 ### Slices
 
 1. **Registry and discovery** — node and credential contracts, read-only registry, discovery endpoints, library screen. Done: palette and library render from the registry with schema-lint tests passing.
+   *Shipped (`c3ec2d0`, `d3bf072`):* `crates/workflows/src/registry.rs` — the contract, the bundled
+   registry and the lint; `apps/api/src/routes/node_types.rs` — seven read-only discovery
+   endpoints; `/workflows/nodes` and `/workflows/nodes/<key>`; a `runNodeLibraryDepth` walkthrough
+   pass. 52 crate tests + 7 API tests. **The palette itself (REQ-086 slice 2) is not wired to
+   this registry yet** — it still reads w3's own list — so "the palette renders from the
+   registry" is *not* proven and the slice stays open on that one clause.
 2. **Credentials and storage** — tables, secret-store integration, CRUD with guards, usage view, audit. Done: no plaintext leaves the store and guard cases return their named errors.
 3. **OAuth and health** — start/callback, single-flight refresh, reauth state, canvas integration. Done: a fixture provider round-trips tokens and a forced refresh failure degrades correctly.
 4. **Node packages and SDK** — ledger, install/remove via REQ-044, scaffold/validate/pack CLI, fixtures. Done: a fixture package installs, appears in the palette, and removal degrades instead of breaking.

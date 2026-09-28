@@ -2657,3 +2657,44 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+## omnion-w10 · REQ-087 slice 1 — the node library's registry, discovery API and screens
+
+**What.** The node and credential registry in code (`crates/workflows/src/registry.rs`), a lint
+that refuses a definition nobody could use, seven read-only discovery endpoints
+(`apps/api/src/routes/node_types.rs`), the `/workflows/nodes` library and `/workflows/nodes/<key>`
+detail, and a `runNodeLibraryDepth` walkthrough pass.
+
+**Proof.**
+
+- `cargo test -p omnion-workflows --lib` → **52 passed** (9 new registry tests).
+- `cargo test -p omnion-api --lib node_types` → **7 passed**.
+- `pnpm typecheck` → 2 successful, 0 errors.
+- The walkthrough measures instead of looking: a search that leaves a row not matching the
+  needle is a finding; an empty state that does not echo the query is a finding; a category
+  filter that does not narrow is a finding. The registry's own lint is read off the running
+  server through `/api/v1/node-types/lint`, so a registry that would fail it is visible without
+  a test.
+
+**The lint earned its place on the first run.** Four of the eight bundled definitions were
+refused, and every refusal was a real defect rather than a style opinion:
+
+- `send_email` declared the `smtp` credential type but had no `credential_key` parameter, so the
+  palette had no way to let a person pick one. Fixed in the data, not by relaxing the rule.
+- The `data`, `helper` and `error_handler` categories had no node at all, which would have
+  rendered three empty group headers. Three nodes were added.
+- Two of the four failures were *my tests* asserting the wrong thing, and fixing them found the
+  real rule: `stop_and_error` is a terminal error handler and legitimately has no main output.
+  The rule now carves that case out explicitly (`node_no_main_output` applies unless the node is
+  an error handler whose only open port is the error port) rather than forcing a port nothing can
+  connect to.
+
+**A compile error that was not in the code it named.** `ParamHint` was the one registry enum
+without `Copy`, so reading `param.ui` by value out of a `&NodeDefinition` moved out of a shared
+reference. `Copy` is the correct derive for a fieldless enum used that way and is what the other
+six enums already had; the API is unchanged in shape.
+
+**Next.** REQ-087 slice 2: the `workflow_credentials` and `workflow_node_packages` tables, the
+secret-store link, CRUD with the usage guard and the masked detail screen. Slice 1 stays open on
+one clause — "the palette renders from it with no hard-coded list" — because the canvas is
+REQ-086 slice 2 and still reads w3's own list; that is a wiring step, not a registry change.
