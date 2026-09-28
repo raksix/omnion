@@ -293,6 +293,29 @@ impl From<IdentityError> for ApiError {
                     .with_details(serde_json::json!({ "field": field }))
             }
             IdentityError::InvalidNetwork(message) => Self::bad_request("invalid_network", message),
+            // The organization settings screen (REQ-005): a refused field is a `400`, and the
+            // message names the rule that refused it so the panel can put it under the input
+            // instead of in a banner. These two fell through to the catch-all below, which
+            // answered a form the user can fix with a `500 internal_error` — a wrong status
+            // that tells a client the platform broke and shows a retry nobody needs.
+            IdentityError::InvalidSettings(message) => {
+                Self::bad_request("invalid_organization_settings", message)
+            }
+            // The ceilings tab. Same rule, its own code, because "this number is not a limit"
+            // and "this value is not usable" are different sentences to whoever reads them.
+            IdentityError::InvalidLimits(message) => {
+                Self::bad_request("invalid_organization_limits", message)
+            }
+            // A real invitation that this organization's `owner_approval` policy has not
+            // released yet is a `409`, not a `404`: the link is good, the state is temporary,
+            // and the holder has to be told to wait rather than to re-check the address they
+            // typed. It reveals nothing about another organization, because a token nobody
+            // issued already answered `InvitationNotFound`.
+            IdentityError::InvitationAwaitingApproval => Self::new(
+                StatusCode::CONFLICT,
+                "invitation_awaiting_approval",
+                "this invitation is waiting for an owner to release it",
+            ),
             IdentityError::FactorNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "factor_not_found",
@@ -719,8 +742,10 @@ impl From<MediaError> for ApiError {
             }
             MediaError::TooManySites { limit, requested } => Self::bad_request(
                 "too_many_sites",
-                format!("a cross-site report may cover at most {limit} sites; {requested} were \
-                         named"),
+                format!(
+                    "a cross-site report may cover at most {limit} sites; {requested} were \
+                         named"
+                ),
             ),
             // Every storage field error names the field that caused it, and carries it as a
             // detail — the settings form puts the message under that input, and a *save* and a
@@ -770,7 +795,9 @@ impl From<MediaError> for ApiError {
             // A purge that cannot happen: the request was legal, the file is past its window,
             // and something in the platform still resolves to it. A `400` would send an
             // operator to fix a form that was never wrong — the fix is to repoint a page.
-            MediaError::PurgeRefused { reason } => Self::new(StatusCode::CONFLICT, "purge_refused", reason),
+            MediaError::PurgeRefused { reason } => {
+                Self::new(StatusCode::CONFLICT, "purge_refused", reason)
+            }
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }
