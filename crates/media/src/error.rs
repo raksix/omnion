@@ -67,4 +67,37 @@ pub enum MediaError {
     /// The file is in the trash and the action needs it live (or the other way round).
     #[error("the file is in the trash")]
     FileTrashed,
+    /// A transformation preset is not usable as written.
+    #[error("{0}")]
+    InvalidPreset(String),
+    /// No preset with that name (or that id) on this site.
+    #[error("no transformation preset named `{name}` on this site")]
+    PresetNotFound {
+        /// The name the caller asked for.
+        name: String,
+    },
+    /// A sibling preset of that name already exists.
+    #[error("a preset named `{name}` already exists on this site")]
+    PresetNameTaken {
+        /// The name that is taken.
+        name: String,
+    },
+    /// The bytes could not be decoded as an image.
+    #[error("the file could not be decoded as an image: {reason}")]
+    Undecodable {
+        /// What the decoder said.
+        reason: String,
+    },
+    /// The bytes decode, but not as a raster image (an SVG, a PDF, a video).
+    #[error("`{content_type}` is not a raster image, so it cannot be transformed")]
+    NotAnImage {
+        /// The content type the file carries.
+        content_type: String,
+    },
+    /// The transformation itself failed after a successful decode.
+    #[error("the image could not be transformed: {reason}")]
+    TransformFailed {
+        /// What the encoder said.
+        reason: String,
+    },
 }

@@ -12,7 +12,10 @@ import type {
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
+  MediaPreset,
+  MediaReplaceResult,
   MediaTrash,
+  MediaVersionList,
   OnboardingStatus,
   Organization,
   OwnerSetupResult,
@@ -331,9 +334,16 @@ export function deleteMedia(mediaId: string): Promise<null> {
   return request<null>(`/api/v1/media/${encodeURIComponent(mediaId)}`, { method: "DELETE" });
 }
 
-/** Browser URL of one file's bytes, read with the session cookie. */
-export function mediaRawUrl(mediaId: string): string {
-  return `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
+/**
+ * Browser URL of one file's bytes, read with the session cookie.
+ *
+ * `preset` names a transformation (REQ-010 slice 3). Without it the URL serves the original
+ * bytes exactly as before, so every existing caller keeps working; with it the answer is a
+ * generated derivative, addressed by a hash of its inputs.
+ */
+export function mediaRawUrl(mediaId: string, preset?: string): string {
+  const base = `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
+  return preset ? `${base}?preset=${encodeURIComponent(preset)}` : base;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -457,6 +467,53 @@ export function mediaBulkAction(
     method: "POST",
     body: JSON.stringify({ site_id: siteId, action, ids, ...options }),
   });
+}
+
+/** One file of the library, with its folder and editorial fields. */
+export function fetchMediaFile(mediaId: string): Promise<MediaFile> {
+  return request<MediaFile>(`/api/v1/media/files/${encodeURIComponent(mediaId)}`);
+}
+
+/** The version history of one file. */
+export function fetchMediaVersions(mediaId: string): Promise<MediaVersionList> {
+  return request<MediaVersionList>(`/api/v1/media/${encodeURIComponent(mediaId)}/versions`);
+}
+
+/**
+ * Replace the bytes of a file, keeping the old ones.
+ *
+ * The note rides as its own multipart part rather than in the query, so a note with a newline in
+ * it cannot corrupt the URL — and the file name is deliberately *not* sent: a replace keeps the
+ * name the library already shows, and renaming is a separate, auditable action.
+ */
+export function createMediaVersion(
+  mediaId: string,
+  file: File,
+  note = "",
+): Promise<MediaReplaceResult> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("note", note);
+  return request<MediaReplaceResult>(`/api/v1/media/${encodeURIComponent(mediaId)}/versions`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+/** Bring an old version back as the newest one. */
+export function restoreMediaVersion(
+  mediaId: string,
+  version: number,
+): Promise<MediaReplaceResult> {
+  return request<MediaReplaceResult>(
+    `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/restore`,
+    { method: "POST" },
+  );
+}
+
+/** Panel read path of one version's bytes. */
+export function mediaVersionRawUrl(mediaId: string, version: number): string {
+  return `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/raw`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3426,4 +3483,56 @@ export function fetchSsoProviders(): Promise<{
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transformation presets (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** Every transformation preset of a site. */
+export function fetchMediaPresets(siteId: string): Promise<{ presets: MediaPreset[] }> {
+  return request<{ presets: MediaPreset[] }>(
+    `/api/v1/media/transformation-presets?${mediaQuery(siteId)}`,
+  );
+}
+
+/** What a create or edit carries. Every field is optional except the name and a dimension. */
+export type MediaPresetInput = {
+  name: string;
+  width?: number | null;
+  height?: number | null;
+  fit?: string;
+  format?: string;
+  quality?: number;
+};
+
+/** Create one preset. */
+export function createMediaPreset(
+  siteId: string,
+  input: MediaPresetInput,
+): Promise<MediaPreset> {
+  return request<MediaPreset>(
+    `/api/v1/media/transformation-presets?${mediaQuery(siteId)}`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+/** Edit one preset. An edit leaves the old derivatives in place, addressed by their old key. */
+export function updateMediaPreset(
+  siteId: string,
+  id: string,
+  input: MediaPresetInput,
+): Promise<MediaPreset> {
+  return request<MediaPreset>(
+    `/api/v1/media/transformation-presets/${encodeURIComponent(id)}?${mediaQuery(siteId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** Remove one preset, and with it every derivative built from it. */
+export function deleteMediaPreset(siteId: string, id: string): Promise<null> {
+  return request<null>(
+    `/api/v1/media/transformation-presets/${encodeURIComponent(id)}?${mediaQuery(siteId)}`,
+    { method: "DELETE" },
+  );
 }

@@ -109,6 +109,23 @@ export type MediaFolderTree = {
   folders: MediaFolder[];
 };
 
+/** One transformation preset (`GET /api/v1/media/transformation-presets`). */
+export type MediaPreset = {
+  id: string;
+  name: string;
+  width: number | null;
+  height: number | null;
+  /** `cover` | `contain` | `fill`. */
+  fit: string;
+  /** `webp` | `jpeg` | `png`. */
+  format: string;
+  quality: number;
+  /** What the settings screen reads: `1200 x 630 · cover · WebP q80`. */
+  summary: string;
+  /** The query a page appends, e.g. `?preset=card`. */
+  example_query: string;
+};
+
 /** One file as the browser reads it (`GET /api/v1/media/files`). */
 export type MediaFile = Media & {
   folder_id: string | null;
@@ -126,6 +143,39 @@ export type MediaFile = Media & {
   version_count: number;
   uploaded_by: string | null;
   updated_at: string | null;
+};
+
+/** One version of a file (`GET /api/v1/media/{id}/versions`). */
+export type MediaVersion = {
+  id: string;
+  version: number;
+  size_bytes: number;
+  checksum: string;
+  content_type: string;
+  width: number | null;
+  height: number | null;
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  /** Panel read path of *this* version's bytes. */
+  raw_path: string;
+  /** Whether this is the version the file currently serves. */
+  is_current: boolean;
+};
+
+/** The history of one file, newest first. */
+export type MediaVersionList = {
+  media_id: string;
+  current_version: number;
+  /** Counted from the history, not read off the row's counter. */
+  version_total: number;
+  versions: MediaVersion[];
+};
+
+/** What a replace or a restore did. */
+export type MediaReplaceResult = {
+  file: MediaFile;
+  version: MediaVersion;
 };
 
 /** One step of the breadcrumb above a folder. */
