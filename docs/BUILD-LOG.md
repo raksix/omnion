@@ -1969,3 +1969,42 @@
   provider events, the Health and Usage tabs, the drag-order UI and the substitution logic that
   reroutes a task-addressed call and refuses to reroute a pinned one.
 
+
+## 2026-09-28 — REQ-097 slice 3 · The health surface, the probe, and three panels
+
+- **What.** The rest of slice 3: the HTTP surface the operator drives and the panels that render
+  it. `GET /ai/providers/{id}/health` and `.../usage` answer the header, the samples and the totals
+  in **one** call each, `POST /ai/providers/{id}/probe` takes a single sample now, and
+  `GET`/`PUT /ai/failover` read and set the chain. The panel is `ai-health-panel.tsx` — Health
+  (status, uptime, p95 against the provider's own 7-day median, a latency sparkline, the last 50
+  samples), Usage (requests, errors, error rate, token totals, per-day breakdown) and Failover (the
+  chain with move-up/move-down), each with its own loading, empty and error state and a working
+  retry.
+- **The recovered half first.** The slice-3 *storage* commit landed last tick but its walk never
+  compiled, so none of the SQL was proven. Three faults, all in the test: `make_interval(hours =>
+  $2)` binds an int8 into an int argument, the delete call was built from a relative URI so the
+  request builder rejected it, and the delete route answers 204 while the walk expected 200. Fixed
+  and the walk goes green — commit `69f5c90`.
+- **One call per tab, on purpose.** Three calls for a header, a sample list and a chart would let
+  the header and the list describe two different moments, and a health screen whose uptime
+  disagrees with the samples under it is the one screen nobody trusts during an incident. The
+  window key the client sent is echoed back from the same table the hours were taken from, so the
+  label rendered is the window that was applied; an unknown key falls back to 24 h rather than
+  erroring.
+- **The button is the runner.** `POST .../probe` calls the same `probe_now` the background tick
+  will call, writes exactly one sample however many steps the test ran, and records the test's real
+  total as the latency — a 0 ms sample would make every p95 a lie. `ai.provider.health_changed`
+  fires only on an actual transition, so an automation on "a provider went down" cannot tell the
+  button from the tick.
+- **Proof.**
+  - `cargo test -p omnion-ai-hub --quiet` → **73 passed, 0 failed**.
+  - `cargo test -p omnion-api --test ai_hub` → **9 passed, 0 failed** (8 prior + the new
+    `the_health_and_usage_endpoints_answer_the_tabs_and_the_probe_writes_one_sample`), which
+    asserts the two permission splits (a member may read health and the chain but gets `403` on
+    probe and reorder), that one button press is one row, and that an empty chain is refused.
+  - `pnpm typecheck` → clean · `pnpm build` → clean.
+  - `QA_STACK=w7 … bash scripts/qa/run.sh` → see below.
+- **Not yet, and named in the REQ.** The background probe runner (the per-tick loop over the
+  enabled providers, which calls the same `probe_now` and prunes) and the substitution logic: a
+  task-routed call that falls over to the next provider and records `ai.provider.failover_used`.
+  Those are the last two halves of slice 3, and the slice closes when they are in.

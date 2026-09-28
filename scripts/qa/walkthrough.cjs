@@ -1311,7 +1311,14 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "image");
   await page.waitForTimeout(1200);
   const imageRows = await page.locator("tbody tr").count();
-  const footer = await page.locator("text=/Showing \\d+ of \\d+/").first().textContent();
+  // A missing footer must not end the pass: this is another wave's screen, and a screen that
+  // renders without its pager used to abort the whole walkthrough before the sections after it
+  // ever ran. An empty string is itself the finding — the note below records that it was absent.
+  const footer = await page
+    .locator("text=/Showing \\d+ of \\d+/")
+    .first()
+    .textContent({ timeout: 4000 })
+    .catch(() => "");
   note({ step: "filter-kind", imageRows, footer });
   await shot(page, "media-filtered");
   await page.selectOption("#media-kind", "");
