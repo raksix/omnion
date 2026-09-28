@@ -1,13 +1,16 @@
 "use client";
 
 /**
- * The file detail screen (docs/requests/REQ-010, slice 2): preview on the left, tabs on the right.
+ * The file detail screen (docs/requests/REQ-010, slices 2 and 4): preview on the left, tabs on
+ * the right.
  *
  * One file, one screen, and the things an editor needs about it: what it is (the preview and
  * its facts), what happened to it (the version history), what is written about it (the
- * metadata) and who outside the platform can fetch it (the share links). Usage and activity
- * tabs arrive with slice 4 — a tab that cannot answer yet is not on the screen, rather than
- * being there and refusing.
+ * metadata), who outside the platform can fetch it (the share links), who inside it can (the
+ * permissions), where the site uses it (usage) and what has been done to it (activity).
+ *
+ * The last two arrived with slice 4, which is what finally made the `media_references` table
+ * readable: until then the purge could refuse a file for ever and no screen could say why.
  *
  * The version list is not decoration. Replacing a file writes a new version and restoring an old
  * one appends a *new* version rather than rewriting history, so this screen has to show both, and
@@ -18,13 +21,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
+  Clock,
   Copy,
   Download,
   History,
   Info,
+  Link as LinkIcon,
   Link2,
   Plus,
   RotateCcw,
+  ShieldCheck,
+  ShieldOff,
   Tag as TagIcon,
   X,
 } from "lucide-react";
@@ -35,7 +42,10 @@ import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { FilePreview, formatDuration, previewKind } from "@/features/media/file-preview";
 import { ScanBadge } from "@/features/media/media-shared";
+import { GrantsTab } from "@/features/media/grants-tab";
 import { SharesTab } from "@/features/media/shares-tab";
+import { ActivityTab } from "@/features/media/activity-tab";
+import { UsageTab } from "@/features/media/usage-tab";
 import {
   ApiError,
   createMediaVersion,
@@ -44,13 +54,14 @@ import {
   mediaRawUrl,
   mediaVersionRawUrl,
   restoreMediaVersion,
+  setMediaHold,
   updateMediaFile,
 } from "@/lib/api";
 import { formatBytes, formatTimestamp } from "@/lib/format";
 import type { MediaExif, MediaFile, MediaVersion, MediaVersionList } from "@/lib/types";
 
 /** Which tab of the right-hand panel is on screen. */
-type Tab = "metadata" | "versions" | "shares";
+type Tab = "metadata" | "versions" | "permissions" | "shares" | "usage" | "activity";
 
 /** The file detail screen. */
 export function MediaFileDetail() {
@@ -326,11 +337,32 @@ export function MediaFileDetail() {
               label={`Versions${history ? ` (${history.version_total})` : ""}`}
             />
             <TabButton
+              id="media-tab-permissions"
+              active={tab === "permissions"}
+              onClick={() => setTab("permissions")}
+              icon={<ShieldCheck className="h-3.5 w-3.5" aria-hidden />}
+              label="Permissions"
+            />
+            <TabButton
               id="media-tab-shares"
               active={tab === "shares"}
               onClick={() => setTab("shares")}
               icon={<Link2 className="h-3.5 w-3.5" aria-hidden />}
               label="Share"
+            />
+            <TabButton
+              id="media-tab-usage"
+              active={tab === "usage"}
+              onClick={() => setTab("usage")}
+              icon={<LinkIcon className="h-3.5 w-3.5" aria-hidden />}
+              label="Usage"
+            />
+            <TabButton
+              id="media-tab-activity"
+              active={tab === "activity"}
+              onClick={() => setTab("activity")}
+              icon={<Clock className="h-3.5 w-3.5" aria-hidden />}
+              label="Activity"
             />
           </div>
 
@@ -352,6 +384,12 @@ export function MediaFileDetail() {
                 onPreview={setPreviewVersion}
                 onRestore={onRestore}
               />
+            ) : tab === "permissions" ? (
+              <GrantsTab targetKind="file" targetId={fileId} siteId={file.site_id} />
+            ) : tab === "usage" ? (
+              <UsageTab mediaId={fileId} />
+            ) : tab === "activity" ? (
+              <ActivityTab mediaId={fileId} />
             ) : (
               <SharesTab mediaId={fileId} />
             )}
@@ -559,6 +597,111 @@ function MetadataTab({
           {saving ? "Saving…" : "Save metadata"}
         </button>
       </div>
+
+      <LegalHold file={file} />
+    </div>
+  );
+}
+
+/**
+ * The legal hold, on the metadata tab rather than a fifth tab of its own.
+ *
+ * A hold is a fact about the *file*, so it belongs with the file's other facts rather than in
+ * a place an operator has to go looking. Three things on it are deliberate:
+ *
+ * - **the reason is required, and the input is always visible.** A hold with no reason is a
+ *   file nobody will ever be allowed to delete and nobody can explain; a release with no
+ *   reason is a file somebody bypassed the rules for. The platform refuses both.
+ * - **the consequence is stated before the button, not after.** "Retention will not remove
+ *   this file" is what somebody needs to know at the moment they decide, and discovering it
+ *   afterwards — when the file is still there — is the only way to be sure of it.
+ * - **a second identical press is a no-op and says so**, rather than writing a second audit
+ *   row: a log with three identical entries reads as three people and answers nothing about
+ *   who decided what.
+ */
+function LegalHold({ file }: { file: MediaFile }) {
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const held = file.legal_hold === true;
+
+  const apply = useCallback(
+    async (next: boolean) => {
+      setBusy(true);
+      setProblem(null);
+      setNote(null);
+      try {
+        const answer = await setMediaHold(file.id, next, reason.trim());
+        if (!answer.changed) {
+          setNote(`This file is already ${next ? "under a legal hold" : "not held"}. Nothing was recorded.`);
+        } else {
+          setReason("");
+          setNote(
+            next
+              ? "The file is under a legal hold. No retention run will remove it until the hold is cleared."
+              : "The hold is cleared. The next eligible run may remove this file if it is past its window.",
+          );
+        }
+      } catch (cause) {
+        setProblem(cause instanceof ApiError ? cause.message : "The hold was not changed.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [file.id, reason],
+  );
+
+  return (
+    <div
+      className="mt-3 space-y-2 border-t border-line pt-3"
+      data-testid="media-legal-hold"
+      data-held={held ? "true" : "false"}
+    >
+      <h3 className="text-[12.5px] font-medium">Legal hold</h3>
+      <p className="text-[12px] text-muted">
+        {held
+          ? "This file is held: retention will not remove it, at any depth, under any policy. It survives a purge, an emptied trash and a shortened window until somebody clears this."
+          : "A legal hold stops every retention rule from touching this file — versions, trash and purge. It is the switch to use for a file under litigation, an audit or a dispute, and clearing it is a decision somebody will be asked to justify."}
+      </p>
+
+      <label className="block text-[12px]">
+        <span className="text-ink">Reason</span>
+        <input
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder={held ? "Why the hold is being cleared" : "Litigation hold, case 2026-114"}
+          data-testid="media-hold-reason"
+          className="mt-0.5 w-full rounded-md border border-line bg-canvas px-2 py-1.5 text-[12px]"
+        />
+      </label>
+
+      {problem ? (
+        <p role="alert" className="text-[11.5px] text-danger">
+          {problem}
+        </p>
+      ) : null}
+      {note ? (
+        <p role="status" className="text-[11.5px] text-muted">
+          {note}
+        </p>
+      ) : null}
+
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void apply(!held)}
+        data-testid="media-hold-toggle"
+        className={[
+          "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[12px] transition-opacity disabled:opacity-50",
+          held
+            ? "border-warn/50 text-warn hover:bg-warn/5"
+            : "border-line hover:bg-canvas",
+        ].join(" ")}
+      >
+        {held ? <ShieldOff className="h-3.5 w-3.5" aria-hidden /> : <ShieldCheck className="h-3.5 w-3.5" aria-hidden />}
+        {held ? "Clear the hold" : "Put this file under a legal hold"}
+      </button>
     </div>
   );
 }

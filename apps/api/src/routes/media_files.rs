@@ -101,6 +101,12 @@ pub struct FileBody {
     pub scan_status: String,
     /// How many versions the file has.
     pub version_count: i32,
+    /// Whether a legal hold is on the file — no retention sweep may remove it.
+    ///
+    /// Carried on the file body rather than fetched on demand, because the detail screen's
+    /// hold switch has to know the file's current state to render the right button, and a
+    /// second request that can arrive *after* a hold changed is a button that lies.
+    pub legal_hold: bool,
     /// Panel read path of the bytes.
     pub raw_path: String,
     /// Public read path of the bytes.
@@ -145,6 +151,7 @@ impl FileBody {
             display_height: display.1,
             scan_status: file.scan_status.clone(),
             version_count: file.version_count,
+            legal_hold: file.legal_hold,
             raw_path: format!("/api/v1/media/{}/raw", file.id),
             public_path: format!("/api/v1/public/media/{}", file.id),
             uploaded_by: file.created_by,

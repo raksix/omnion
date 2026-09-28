@@ -83,6 +83,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.delete",
             "media.manage",
             "media.settings.manage",
+            "media.scan.manage",
             "ai.providers.read",
             // A manager may read what the AI hub spent and which model served what — the cost
             // screens are a reporting surface, not a control one. They deliberately do NOT get

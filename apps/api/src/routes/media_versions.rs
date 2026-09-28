@@ -392,7 +392,11 @@ pub async fn raw_version(
     current: CurrentSession,
     Path((file_id, version_number)): Path<(Uuid, i32)>,
 ) -> std::result::Result<Response, ApiError> {
-    let _ = file_in_scope(&state, &current, file_id).await?;
+    let file = file_in_scope(&state, &current, file_id).await?;
+    // An old version of a held file is still a held file: the scanner looked at these exact
+    // bytes once and flagged them, and the version history is the one place somebody with
+    // `media.read` would otherwise fetch them from.
+    crate::routes::media::ensure_servable(&state, &current, &file).await?;
     let version = omnion_media::find_version(state.db().pool(), file_id, version_number)
         .await?
         .ok_or_else(|| {
@@ -413,6 +417,7 @@ pub async fn download_version(
     Path((file_id, version_number)): Path<(Uuid, i32)>,
 ) -> std::result::Result<Response, ApiError> {
     let existing = file_in_scope(&state, &current, file_id).await?;
+    crate::routes::media::ensure_servable(&state, &current, &existing).await?;
     let version = omnion_media::find_version(state.db().pool(), file_id, version_number)
         .await?
         .ok_or_else(|| {

@@ -157,6 +157,208 @@ export type MediaStorageSettingsInput = Partial<
   Omit<MediaStorageSettings, "public_base_summary" | "configured" | "visibility_note">
 >;
 
+/**
+ * A site's virus-scanning policy (`GET /api/v1/media/scan-settings`).
+ *
+ * There is no field that could hold a secret: the row stores the *name* of the environment
+ * variable the deployment keeps the scanner's shared secret under, and `secret_available`
+ * says whether this process can actually see it. A screen that could render a credential is a
+ * screen a future change has to be trusted not to make.
+ */
+export type MediaScanSettings = {
+  enabled: boolean;
+  endpoint: string;
+  /** The *name* of the environment variable holding the shared secret — never the secret. */
+  secret_env: string;
+  timeout_seconds: number;
+  /** `hold` refuses to serve a file whose scan could not complete; `serve` serves it anyway. */
+  on_error: string;
+  max_scan_mb: number;
+  /** Whether this process can see `secret_env` in its own environment. */
+  secret_available: boolean;
+  /** What the current policy does to a file, in a sentence. */
+  behaviour: string;
+  /** How many files are still waiting for their first scan. */
+  pending_count: number;
+  configured: boolean;
+};
+
+/** What a save sends. Every field is optional and folded onto the stored row. */
+export type MediaScanSettingsInput = Partial<
+  Omit<MediaScanSettings, "secret_available" | "behaviour" | "pending_count" | "configured">
+>;
+
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-010, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** One retention policy. */
+export type MediaRetentionPolicy = {
+  id: string;
+  site_id: string;
+  name: string;
+  /** The folder it governs; `null` means the whole site. */
+  folder_id: string | null;
+  /** The folder's path, so the screen names a folder rather than printing a uuid. */
+  folder_path: string;
+  keep_versions_days: number;
+  trash_days: number;
+  purge_after_days: number;
+  legal_hold: boolean;
+  enabled: boolean;
+  /** What the policy does to a file, in one sentence. */
+  behaviour: string;
+  /** What the policy is scoped to, in words. */
+  scope: string;
+};
+
+/** The policy list of a site, with the numbers the screen cannot compute on its own. */
+export type MediaRetentionList = {
+  site_id: string;
+  policies: MediaRetentionPolicy[];
+  /** Trashed files whose restore window has closed. */
+  past_restore: number;
+  /** The bytes those files occupy. */
+  past_restore_bytes: number;
+  last_run: MediaRetentionRun | null;
+  /** One sentence about the site-wide rule. */
+  summary: string;
+};
+
+/** A policy as the editor sends it. Every field is optional so a save sends only what changed. */
+export type MediaRetentionPolicyInput = {
+  name?: string;
+  /**
+   * `undefined` leaves the scope alone; `null` widens the policy to the whole site.
+   *
+   * The distinction is load-bearing: the API reads the scope from the **key's presence**, so a
+   * form that sends `folder_id: undefined` (which `JSON.stringify` drops) edits the other two
+   * windows and leaves the scope exactly as it was.
+   */
+  folder_id?: string | null;
+  keep_versions_days?: number;
+  trash_days?: number;
+  purge_after_days?: number;
+  legal_hold?: boolean;
+  enabled?: boolean;
+};
+
+/** One row of the retention run log. */
+export type MediaRetentionRun = {
+  id: string;
+  kind: string;
+  versions_removed: number;
+  versions_bytes: number;
+  purged: number;
+  purged_bytes: number;
+  /** Files the sweep would not purge because something still points at them. */
+  refused: number;
+  /** Files the legal hold removed from the eligible set. */
+  held_back: number;
+  /** What stopped the run; empty when nothing did. */
+  error: string;
+  started_at: string;
+  finished_at: string | null;
+  /** One sentence — a number without a word is not an answer an operator can act on. */
+  summary: string;
+  bytes_reclaimed: number;
+};
+
+/** The run log of a site, newest first. */
+export type MediaRetentionRunList = {
+  site_id: string;
+  runs: MediaRetentionRun[];
+};
+
+/** One "this file is still referenced" line, naming the record that holds it. */
+export type MediaPurgeRefusal = {
+  media_id: string;
+  filename: string;
+  resource_kind: string;
+  resource_id: string;
+  field: string;
+  describe: string;
+};
+
+/** The answer to "run retention now". */
+export type MediaRetentionRunResult = {
+  run_id: string;
+  run: MediaRetentionRun;
+  remaining_files: number;
+  remaining_bytes: number;
+  refused: MediaPurgeRefusal[];
+};
+
+/** The answer to "repair the stale references". */
+export type MediaRetentionRepair = {
+  site_id: string;
+  references_removed: number;
+  summary: string;
+};
+
+/** One held file (`GET /api/v1/media/quarantine`). */
+export type MediaQuarantineEntry = {
+  id: string;
+  media_id: string;
+  /** What the scanner said, in its own words. */
+  detail: string;
+  quarantined_at: string;
+  run_id: string | null;
+};
+
+/** The quarantine list of a site, with its totals. */
+export type MediaQuarantineList = {
+  site_id: string;
+  file_count: number;
+  /** How many bytes the held files occupy — a held icon and a held video differ in urgency. */
+  total_bytes: number;
+  entries: MediaQuarantineEntry[];
+};
+
+/** One scanning pass (`GET /api/v1/media/scan/runs`). */
+export type MediaScanRun = {
+  id: string;
+  kind: string;
+  outcome: string;
+  scanned: number;
+  flagged: number;
+  errors: number;
+  skipped: number;
+  endpoint: string;
+  engine: string;
+  started_at: string;
+  finished_at: string | null;
+  /** One sentence, never a number without a word. */
+  summary: string;
+};
+
+/** The run log of a site. */
+export type MediaScanRunList = {
+  site_id: string;
+  runs: MediaScanRun[];
+};
+
+/** The answer to "run the sweep now" (`POST /api/v1/media/scan/run`). */
+export type MediaSweepResult = {
+  run_id: string;
+  scanned: number;
+  flagged: number;
+  errors: number;
+  skipped: number;
+  outcome: string;
+  summary: string;
+  quarantine: MediaQuarantineList;
+};
+
+/** The answer to a scanner probe (`POST /api/v1/media/scan/test`). */
+export type MediaScanProbe = {
+  ok: boolean;
+  status: string;
+  detail: string;
+  engine: string;
+  note: string;
+};
+
 /** The answer to a connection test (`POST /api/v1/media/settings/test-connection`). */
 export type MediaStorageProbe = {
   ok: boolean;
@@ -220,6 +422,15 @@ export type MediaFile = Media & {
   display_height: number | null;
   scan_status: string;
   version_count: number;
+  /**
+   * Whether a legal hold is on the file (REQ-010, slice 4).
+   *
+   * `false` rather than `absent` for a server that predates the column: the detail screen's
+   * hold switch reads this to decide which button to draw, and `undefined` would have to be
+   * treated as "not held" anyway — so the type says so rather than leaving it to a truthiness
+   * check that happens to work.
+   */
+  legal_hold: boolean;
   uploaded_by: string | null;
   updated_at: string | null;
 };
@@ -252,6 +463,79 @@ export type MediaVersionList = {
 };
 
 /**
+ * One place a file is used (REQ-010, slice 4).
+ *
+ * `resolved` is the field the whole tab exists for. A reference whose referent the platform
+ * cannot see is a row that will refuse a purge for ever, and the reader has to be able to see
+ * *which* row is stale before deciding between repointing the record and running the repair
+ * scan — so it travels on every row, not only as a total.
+ */
+export type MediaUsageEntry = {
+  id: string;
+  /** What kind of record points here (`page`, `theme`, …). */
+  resource_kind: string;
+  /** The referent's id, as text — it may be a slug, so it is never parsed in the panel either. */
+  resource_id: string;
+  /** Which field of that record points here; empty when the record *is* the file. */
+  field: string;
+  /** A name for the referent, when the platform can resolve one. */
+  label: string | null;
+  /** The referent's lifecycle state, for a page. */
+  status: string | null;
+  /** Where the referent lives in the panel, when it can be resolved. */
+  path: string | null;
+  /** Whether the platform can still see the referent. */
+  resolved: boolean;
+  created_at: string;
+};
+
+/**
+ * One file's usage.
+ *
+ * `records` and `rows` disagree in ordinary use — a page naming the same hero in three fields is
+ * one record and three rows — and "used in 3 places" beside one page is the number that makes
+ * somebody delete a page. `summary` is the API's sentence rather than something the panel builds
+ * out of two integers, so the screen and the API cannot disagree about what the numbers mean.
+ */
+export type MediaUsage = {
+  media_id: string;
+  /** Distinct records naming this file. */
+  records: number;
+  /** Of those, the ones the platform can still see. */
+  resolved: number;
+  /** Reference rows. */
+  rows: number;
+  /** Whether the read was cut short by the screen's bound. */
+  truncated: boolean;
+  /** One sentence saying what the numbers mean. */
+  summary: string;
+  usage: MediaUsageEntry[];
+};
+
+/** One audited action against a file. */
+export type MediaActivityEntry = {
+  id: number;
+  /** The stable action name (`media.deleted`, …) — never rendered raw. */
+  action: string;
+  /** The same action as a sentence, so the panel never builds a label out of a verb. */
+  summary: string;
+  /** Who did it, when the account still exists. */
+  actor: string | null;
+  /** `user`, `agent`, `service` or `system`. */
+  actor_type: string;
+  metadata: unknown;
+  occurred_at: string;
+};
+
+/** One file's activity, newest first. */
+export type MediaActivity = {
+  media_id: string;
+  total: number;
+  truncated: boolean;
+  activity: MediaActivityEntry[];
+};
+
+/**
  * One share link, as the panel reads it (REQ-010, slice 3).
  *
  * There is no `token` field here, and that is not an oversight: the API cannot return one after
@@ -281,6 +565,77 @@ export type MediaShare = {
  * `token` and `url` exist on this type and on no other — which is how the screen knows to put
  * the one-time copy panel on screen and to never try to show a link it cannot re-derive.
  */
+/**
+ * One grant on a folder or a file (docs/requests/REQ-010, slice 4).
+ *
+ * `subject_label` is `null` for a subject that has since been deleted. The panel prints
+ * "Deleted subject" rather than a raw uuid: a stale row refuses nobody and grants nobody, and
+ * the only action that matters on it is removal — a line showing a uuid teaches nobody which
+ * grant to remove.
+ */
+export type MediaGrant = {
+  id: string;
+  subject_kind: "user" | "group" | "role";
+  subject_id: string;
+  subject_label: string | null;
+  can_read: boolean;
+  can_write: boolean;
+  can_delete: boolean;
+  can_share: boolean;
+  effect: "allow" | "deny";
+  created_by: string | null;
+  created_at: string;
+  /** The capability words, for a summary line. */
+  capabilities: string[];
+};
+
+/** One folder on a file's chain, nearest first, with what it contributes. */
+export type MediaGrantChainNode = {
+  id: string;
+  /** The folder's materialised path, which is already the breadcrumb. */
+  path: string;
+  grant_count: number;
+  /** Whether it carries a deny that reaches this file's subject set. */
+  has_deny: boolean;
+};
+
+/** What the permissions tab reads: the rows on one node, and the chain above a file. */
+export type MediaGrantsResponse = {
+  target_kind: "file" | "folder";
+  target_id: string;
+  grants: MediaGrant[];
+  /** Whether a grant on this node reaches what is inside it. Always true for a folder. */
+  inherits: boolean;
+  chain: MediaGrantChainNode[];
+};
+
+/** What a grant is written with. Absent bits are `false`, never "unchanged". */
+export type NewMediaGrant = {
+  subject_kind: "user" | "group" | "role";
+  subject_id: string;
+  can_read?: boolean;
+  can_write?: boolean;
+  can_delete?: boolean;
+  can_share?: boolean;
+  effect?: "allow" | "deny";
+};
+
+/**
+ * One subject the picker may offer.
+ *
+ * `suggested` marks a group: it is the row that survives somebody joining and leaving a team,
+ * so a grant given to a person has to be rewritten when the person changes roles and a grant
+ * given to a group does not.
+ */
+export type MediaGrantSubject = {
+  id: string;
+  kind: "user" | "group" | "role";
+  label: string;
+  /** An email, a member count, or a role key — the second line of the picker's row. */
+  detail: string;
+  suggested: boolean;
+};
+
 export type CreatedMediaShare = {
   share: MediaShare;
   url: string;

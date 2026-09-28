@@ -35,6 +35,10 @@ export QA_DB
 export NODE_PATH="${QA_NODE_PATH:-/root/test-hermes/node_modules}"
 export QA_CHROME="${QA_CHROME:-/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"
 export PATH="$HOME/.cargo/bin:$PATH"
+# A browser pass on a six-core box is CPU work. Without this, seven concurrent passes
+# put the machine at a load average of 20 with a half-full swap. Half the cores per
+# build keeps a pass readable and leaves the rest of the box alone.
+export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -52,16 +56,33 @@ wait_http() { # url, seconds
 # The browser pass is the heaviest step in the loop and several worktrees may run
 # side by side. Take a slot first so the passes queue instead of all landing on the
 # machine at once; the wait is bounded and then the pass proceeds regardless.
+# One pass at a time on this box: it is the difference between load 20 and load 6.
 QA_SLOT_PID=""
-if [ "${QA_SLOTS:-2}" != "0" ]; then
-  step "waiting for a QA slot (max ${QA_SLOTS:-2} concurrent passes)"
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-900}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+if [ "${QA_SLOTS:-1}" != "0" ]; then
+  step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
+  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # Free the place whenever this pass ends, however it ends.
 if [ -n "$QA_SLOT_PID" ]; then
   trap 'kill "$QA_SLOT_PID" 2>/dev/null || true' EXIT INT TERM
 fi
+
+# The QA servers are disposable: a pass starts them, walks, and the next pass can
+# start them again. Leaving seven stacks of three servers running between passes cost
+# this box about 5 GB of resident memory. Stop this stack's servers now so a pass
+# begins from a clean set and the box is not carrying yesterday's processes.
+stop_stack() {
+  pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+}
+# One trap, both cleanups: a second trap would replace the first and leave the slot held.
+release() {
+  [ -n "$QA_SLOT_PID" ] && kill "$QA_SLOT_PID" 2>/dev/null
+  stop_stack
+  return 0
+}
+trap release EXIT INT TERM
+stop_stack
 
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
