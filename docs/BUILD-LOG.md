@@ -2072,6 +2072,17 @@
   account it never created. `c83af9b` waits for one of the two URLs to be true instead. The
   general rule: a URL read after a sleep is a guess about a *redirect chain*, and the client-side
   half of that chain is not observable from the server.
+- **The full walkthrough did not complete, and the REQ is not being closed on this tick.** Two
+  attempts. The first died at `media-trash` with `Page crashed`; the second got seven routes
+  further and then failed with `Execution context was destroyed` after stalling on `/search` for
+  roughly six minutes. Both are host, not code: at that point the box was running **six**
+  concurrent `qa/run.sh` passes (main, w2, w4, w7×2, w5) with 50 Chrome processes and a 4.3 GB
+  `java`, and the 1-minute load average reached **437**. This is the saturation the ledger warns
+  about, one order of magnitude past it. The evidence recorded above is therefore the tiered
+  gates (19 API walks, 136 unit tests, `tsc`) plus the focused probe — which is *not* a
+  substitute for the gate, and the slice still has the suspend/archive work outstanding, so no
+  REQ closes here. Re-run the full pass when the box is quiet; `c83af9b` (the wizard race) and
+  the new `runOrganizationInvitePolicy` are both unexercised end-to-end until it does.
 - **Environment note.** `/mnt/apopic` was at 100% twice mid-tick and a `rustc` link died with
   "No space left on device" — the known shared-volume failure with seven writers. Reclaimed what
   is mine and regenerable (`.rcgu.o`, the stale test binaries, `~/.npm/_cacache`, the cargo
