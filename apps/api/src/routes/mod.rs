@@ -79,16 +79,19 @@ pub mod health;
 pub mod iam;
 pub mod iam_approvals;
 pub mod iam_policy;
+pub mod iam_providers;
 pub mod iam_provisioning;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
+pub mod media_files;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod scim;
 pub mod search;
+pub mod sso;
 pub mod tenancy;
 pub mod tenancy_members;
 pub mod webauthn;
@@ -245,6 +248,45 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_log =
         get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage"));
+
+    // Enterprise sign-in providers (REQ-006, slice 4b-2): reading the connected providers is
+    // `iam.providers.read`, connecting/changing/testing/removing one is `iam.providers.manage`.
+    // The browser half of the same feature (`/auth/sso/...`) is public by nature — it *is* the
+    // sign-in — and lives in `crate::routes::sso`, which re-derives its own trust from the
+    // single-use challenge rather than from a session.
+    let iam_providers = get(iam_providers::list_providers)
+        .layer(guards::require(&state, "iam.providers.read"))
+        .merge(
+            post(iam_providers::create_provider)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        );
+
+    let iam_provider = get(iam_providers::get_provider)
+        .layer(guards::require(&state, "iam.providers.read"))
+        .merge(
+            patch(iam_providers::update_provider)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        )
+        .merge(
+            delete(iam_providers::delete_provider)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        );
+
+    let iam_provider_test =
+        post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage"));
+
+    let iam_provider_events = get(iam_providers::list_provider_events)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    // The public sign-in surface: no guard, because there is no session yet — the same reason
+    // `auth/login` and `auth/mfa/verify` carry none. `sso/{slug}/saml` is the panel page a SAML
+    // provider posts the assertion back from, and `sso/{slug}/callback` answers both a `code`
+    // query and a posted assertion.
+    let sso_providers = get(sso::list_providers);
+    let sso_start = get(sso::start);
+    let sso_saml_page = get(sso::saml_page);
+    let sso_callback = get(sso::callback);
+    let sso_saml_callback = post(sso::saml_callback);
 
     // Security policy, sessions, devices and second factors (REQ-006, slice 3). Reading a list
     // needs its read key; every mutation carries its own, and the dangerous ones (resetting
@@ -443,6 +485,34 @@ pub fn router(state: AppState) -> Router {
         .merge(delete(media::delete_media).layer(guards::require(&state, "media.delete")));
 
     let media_raw = get(media::raw_media).layer(guards::require(&state, "media.read"));
+
+    // File manager (REQ-010, slice 1): folders, the browser listing with its filters, the bulk bar
+    // and the trash. Reading the tree needs `media.read`; changing the shape of the library —
+    // creating, renaming or moving a folder, moving or deleting files, emptying the trash — needs
+    // `media.manage`, which is the folder-and-storage power the catalogue already grants to an
+    // editor. The trash routes are `media.manage` too: emptying it is irreversible.
+    let media_folders = get(media_files::folder_tree).layer(guards::require(&state, "media.read"));
+    let media_folder_create =
+        post(media_files::create_folder).layer(guards::require(&state, "media.manage"));
+    let media_folder = patch(media_files::move_folder)
+        .merge(delete(media_files::delete_folder))
+        .layer(guards::require(&state, "media.manage"));
+
+    let media_files_route =
+        get(media_files::list_files).layer(guards::require(&state, "media.read"));
+    let media_file = get(media_files::get_file)
+        .layer(guards::require(&state, "media.read"))
+        .merge(patch(media_files::update_file).layer(guards::require(&state, "media.update")))
+        .merge(delete(media_files::trash_file).layer(guards::require(&state, "media.delete")));
+    let media_file_restore =
+        post(media_files::restore_file).layer(guards::require(&state, "media.update"));
+    let media_file_purge =
+        post(media_files::purge_file).layer(guards::require(&state, "media.manage"));
+
+    let media_trash = get(media_files::list_trash).layer(guards::require(&state, "media.read"));
+    let media_trash_empty =
+        post(media_files::empty_trash).layer(guards::require(&state, "media.manage"));
+    let media_bulk = post(media_files::bulk_action).layer(guards::require(&state, "media.manage"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -663,6 +733,13 @@ pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/sso/providers", sso_providers)
+        .route("/auth/sso/{slug}/start", sso_start)
+        .route("/auth/sso/{slug}/saml", sso_saml_page)
+        .route(
+            "/auth/sso/{slug}/callback",
+            sso_callback.merge(sso_saml_callback),
+        )
         .route("/auth/mfa/verify", auth_mfa_verify)
         .route("/auth/step-up", auth_step_up)
         .route("/auth/webauthn/passkeys", webauthn_passkeys)
@@ -745,6 +822,10 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/provisioning/tokens", iam_provisioning_tokens)
         .route("/iam/provisioning/tokens/{id}", iam_provisioning_token)
         .route("/iam/provisioning/log", iam_provisioning_log)
+        .route("/iam/providers", iam_providers)
+        .route("/iam/providers/{id}", iam_provider)
+        .route("/iam/providers/{id}/test", iam_provider_test)
+        .route("/iam/providers/{id}/events", iam_provider_events)
         .route("/scim/v2/ServiceProviderConfig", scim_config)
         .route("/scim/v2/Schemas", scim_schemas)
         .route("/scim/v2/Users", scim_users)
@@ -813,6 +894,19 @@ pub fn router(state: AppState) -> Router {
         .merge(media_upload)
         .route("/media/{id}", media_entry)
         .route("/media/{id}/raw", media_raw)
+        // The file manager's own paths. `/media/files` and `/media/folders` sit beside the v0
+        // collection route rather than replacing it, so a client written against `{site_id, media}`
+        // keeps working while the browser moves to the file system.
+        .route("/media/files", media_files_route)
+        .route("/media/files/{id}", media_file)
+        .route("/media/files/{id}/restore", media_file_restore)
+        .route("/media/files/{id}/purge", media_file_purge)
+        .route("/media/folders", media_folders)
+        .route("/media/folders", media_folder_create)
+        .route("/media/folders/{id}", media_folder)
+        .route("/media/trash", media_trash)
+        .route("/media/trash/empty", media_trash_empty)
+        .route("/media/bulk", media_bulk)
         .route("/public/pages/{slug}", public_pages)
         .route("/public/media/{id}", public_media)
         .route("/workflows", workflows)

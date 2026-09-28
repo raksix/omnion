@@ -11,14 +11,31 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser;
 pub mod error;
+pub mod folder_store;
+pub mod folders;
 pub mod library;
 pub mod model;
 pub mod validation;
 
+pub use browser::{
+    FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
+    count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
+    purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+};
 pub use error::{MediaError, Result};
+pub use folder_store::{
+    count_files_in_folder, delete_empty_folder, find_folder, insert_folder, list_folders,
+    move_folder, root_folder,
+};
+pub use folders::{
+    Folder, FolderMove, MAX_FOLDER_NAME_LENGTH, MAX_FOLDER_PATH_LENGTH, NewFolder,
+    ROOT_FOLDER_NAME, child_path, sanitize_folder_name, subtree_pattern, subtree_predicate,
+    validate_folder_name,
+};
 pub use library::{delete_media, find_media, insert_media, list_media};
-pub use model::{MAX_FILENAME_LENGTH, MAX_UPLOAD_BYTES, Media, NewMedia};
+pub use model::{MAX_FILENAME_LENGTH, MAX_UPLOAD_BYTES, Media, MediaFile, NewMedia};
 pub use validation::{
     INLINE_CONTENT_TYPES, ServePlan, normalize_content_type, object_key, sanitize_filename,
     serve_plan,
