@@ -1,3 +1,78 @@
+## 2026-09-28 — REQ-010 slice 3 (four fifths) · duplicates, and the row that survives the merge
+
+- **What shipped.** **`0038_media_duplicates.sql`**, `crates/media/src/duplicates.rs`,
+  `apps/api/src/routes/media_duplicates.rs`, `apps/api/tests/media_duplicates.rs`,
+  `features/media/duplicates-view.tsx`, `/media/duplicates`, a `Duplicates` link on the media
+  browser, and `runMediaDuplicates` in the walkthrough. Five commits: `3d28b18`, `5baaa24`,
+  `6a07a68`, `c119975`, `aa6d382`, plus the harness and grammar fixes below.
+- **The shape of it.** A duplicate group is a **projection of `media` over its own checksum**, never
+  a table: a replace changes the checksum, a delete removes a row and a restore brings one back, so
+  a stored group would need a trigger on all three to stay true. `media_references` is the other new
+  table — the rows a merge repoints and the "used in" tab reads in slice 4.
+- **Seven decisions, each a shortcut that produces a plausible wrong answer.** A group of one is
+  not a duplicate, and neither is a trashed copy (it is already on its way out). Reclaimable
+  excludes the keeper: it is what a *purge* returns, not the group's size, because a merge frees
+  nothing. The report never picks the keeper and the merge **refuses** one from outside the group —
+  an automatic tie-break breaks a live page and is discovered from a 404, not from a report. A
+  merge **trashes** copies and never deletes, so a restore reverses the whole thing. The cross-site
+  mode is a different question rather than a wider default, and carries **no reclaimable column at
+  all** rather than a zero: no merge can decide which tenant keeps a file.
+- **The repoint is the interesting statement.** A page may reference two copies of the same file, so
+  a plain `update … set media_id = keeper` moves the first row and is then *refused* on the second —
+  a whole merge rolled back with a `duplicate key` message naming an index and not a cause. It is
+  written against the keeper's own rows instead, so nothing can collide afterwards by construction.
+  Proved directly against PostgreSQL 5433 rather than asserted: the plain update raises
+  `duplicate key value violates unique constraint "media_references_unique"`, the keeper-side
+  rewrite moves 1 and collapses 1, and the table then holds one live `page-1/hero` row.
+- **Four defects the router walks found, none visible to a unit test on a body builder.**
+  **(1)** The repoint's row type was `((i64, i64),)` — a composite column where the statement
+  returns two — so *every merge* answered `500: Rust type (i64,i64) (as RECORD) is not compatible
+  with INT8`. **(2)** The cross-site mode reported nothing: it read the per-site view with the site
+  filter lifted, which by construction still groups *per site*, so the two tenants each holding one
+  copy showed two empty reports to the one account allowed to ask. **(3)** The cross-site view's
+  `file_count` was the installation's, not the caller's — a checksum in nine sites reported `9` to
+  somebody who named two. It is now grouped over the named sites directly. **(4)** A share cannot
+  be created without `media.share`, which the walk's fixture had not been granted; the test now
+  proves the whole chain, because the merge closes links it did not create.
+- **Proof.** 6 walks over the real router → **0 failures**. The report ignores a lone file and a
+  trashed one; the merge keeps the **second** file (so it cannot pass by accident), moves
+  `page-1/hero` **once** rather than twice, closes a live share with its reason, and refuses an
+  outside keeper and an already-merged group with `409` — not `400`, because the request was legal
+  and the library moved on. Short checksums are `400` naming the field; a reader may read and may
+  not merge; the platform owner sees one checksum across two named sites and a tenant gets
+  `platform_only` before any row is read. The migration applies across the whole set on a fresh
+  database. `cargo test -p omnion-media --lib` → **98**, `-p omnion-api --lib` → **122**,
+  `--test media_shares` → **5** unchanged, `apps/admin` tsc clean.
+- **The browser pass, and a grammar defect only it could find.** `runMediaDuplicates` uploads the
+  same sample file twice (never a fabricated checksum), asserts the pair forms a group, asserts
+  **`Merge group` is disabled until a keeper is chosen** and enabled after, picks the *second* file
+  so a merge that quietly kept the first would fail, and checks the result. It produced:
+
+      "The 5 copies are in the trash and their bytes are is only reclaimed when the trash is purged."
+
+  The verb phrase and the `is` were carried by one branch, so the plural case got `are is`. Every
+  word was present and only the grammar was wrong — which is why neither the API walks nor the unit
+  tests saw it: they asserted on the substring `only reclaimed`, which survived. Fixed in `9bd3d58`
+  and pinned in both numbers.
+- **A cleanup script took out the quality gate it was making room for.** The first pass died with
+  `ENOENT …/clicks.jsonl` after four routes and produced **no report and no findings**: the sibling
+  commit `8fecbc4` added `scripts/qa/disk-guard.sh`, and it ran while the pass was writing,
+  deleting the artifact directory the pass had just created. Fixed in `9fa315f` — a directory
+  touched in the last hour belongs to a live walkthrough and is skipped. The second pass ran to
+  completion and produced the grammar defect above, so the fix is proved by use rather than by
+  inspection.
+- **Not mine, recorded honestly.** `media-presets` failed in the same pass with a `Failed to …` JSON
+  parse from a `page.evaluate` — a pre-existing depth pass reading a response that was not JSON —
+  and `media-file-detail` / `media-shares` reported `no file to open — the upload step did not
+  succeed`, a QA-database fixture race between passes rather than a product defect. Neither is
+  caused by this change and neither is claimed as fixed. The `media storage` pass reported a
+  `credential` leak category, which is its own standing finding (the settings screen shows a masked
+  credential); unchanged by this slice.
+- **Next.** Slice 3 closes with the CDN purge hook to REQ-011 and **EXIF** (still open from slice 2).
+  Slice 4 then brings folder and file grants with inheritance, the scanning pipeline with
+  quarantine and release, retention policies with the daily worker, and the reference-based purge
+  refusal — and with them the Usage and Activity tabs, which finally have rows to read.
+
 ## 2026-09-28 — REQ-005 slice 4a · the module switch stops being a stored intention
 
 - **What shipped.** **`0d95b2d`** (five atomic commits) — the per-organization module switch now

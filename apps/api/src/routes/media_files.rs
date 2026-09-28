@@ -84,6 +84,19 @@ pub struct FileBody {
     pub duration_ms: Option<i32>,
     /// Page count, when known.
     pub page_count: Option<i32>,
+    /// What the file's own EXIF block said, when its format carries one.
+    ///
+    /// Sent as a structured object rather than a string so the panel can render a row per field
+    /// and so a key this release does not know is carried through rather than dropped — the
+    /// alternative, a pre-formatted summary line, cannot be filtered, sorted or translated.
+    pub exif: Option<serde_json::Value>,
+    /// The size a layout should reserve, with the stored rotation applied.
+    ///
+    /// Separate from `width`/`height` on purpose: those are what the pixels are, these are what a
+    /// reader draws, and a grid that reserves the wrong box shifts every image below it.
+    pub display_width: Option<i32>,
+    /// The height on screen.
+    pub display_height: Option<i32>,
     /// Scan state.
     pub scan_status: String,
     /// How many versions the file has.
@@ -105,6 +118,10 @@ pub struct FileBody {
 impl FileBody {
     /// Describe one row for the panel.
     pub fn build(file: &MediaFile) -> Self {
+        // Read once: the record decides the swap, and parsing it twice is a chance for the two
+        // answers to disagree about the same row.
+        let exif = file.exif();
+        let display = file.display_size();
         Self {
             id: file.id,
             site_id: file.site_id,
@@ -123,6 +140,9 @@ impl FileBody {
             height: file.height,
             duration_ms: file.duration_ms,
             page_count: file.page_count,
+            exif: exif.as_ref().map(omnion_media::exif::Exif::to_value),
+            display_width: display.0,
+            display_height: display.1,
             scan_status: file.scan_status.clone(),
             version_count: file.version_count,
             raw_path: format!("/api/v1/media/{}/raw", file.id),
