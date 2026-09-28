@@ -116,6 +116,8 @@ pub struct MediaFile {
     pub version_count: i32,
     /// Whether the public renderer may read it without a session.
     pub is_public: bool,
+    /// Whether a legal hold is on the file: no retention sweep may remove it (REQ-010).
+    pub legal_hold: bool,
 }
 
 impl MediaFile {
@@ -235,6 +237,7 @@ mod tests {
             scan_engine: Some("stub".to_owned()),
             version_count: 1,
             is_public: false,
+            legal_hold: false,
         }
     }
 

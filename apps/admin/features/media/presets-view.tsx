@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { useSites } from "@/lib/sites";
 import type { MediaPreset } from "@/lib/types";
+import { MediaRetentionView } from "@/features/media/retention-view";
 import { MediaScanningView } from "@/features/media/scanning-view";
 import { MediaStorageSettingsView } from "@/features/media/storage-settings-view";
 
@@ -95,11 +96,12 @@ function toDraft(preset: MediaPreset): Draft {
  * URL somebody will bookmark and then be confused by.
  */
 export function MediaSettingsTabs() {
-  const [tab, setTab] = useState<"storage" | "presets" | "scanning">("presets");
+  const [tab, setTab] = useState<"storage" | "presets" | "scanning" | "retention">("presets");
   const tabs: [typeof tab, string][] = [
     ["presets", "Transformation"],
     ["storage", "Storage"],
     ["scanning", "Scanning"],
+    ["retention", "Retention"],
   ];
 
   return (
@@ -154,6 +156,14 @@ export function MediaSettingsTabs() {
         hidden={tab !== "scanning"}
       >
         <MediaScanningView />
+      </div>
+      <div
+        role="tabpanel"
+        id="media-settings-panel-retention"
+        aria-labelledby="media-settings-tab-retention"
+        hidden={tab !== "retention"}
+      >
+        <MediaRetentionView />
       </div>
     </div>
   );
