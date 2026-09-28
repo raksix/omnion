@@ -2137,7 +2137,10 @@ async fn the_health_and_usage_endpoints_answer_the_tabs_and_the_probe_writes_one
     assert_eq!(fresh.status, StatusCode::OK, "{:?}", fresh.body);
     assert_eq!(fresh.body["summary"]["status"], "unknown");
     assert_eq!(fresh.body["summary"]["uptime_percent"], Value::Null);
-    assert_eq!(fresh.body["window"], "7d", "the tab renders the window that was applied");
+    assert_eq!(
+        fresh.body["window"], "7d",
+        "the tab renders the window that was applied"
+    );
     assert_eq!(fresh.body["samples"].as_array().map(Vec::len), Some(0));
     assert!(
         fresh.body["windows"]
@@ -2173,13 +2176,12 @@ async fn the_health_and_usage_endpoints_answer_the_tabs_and_the_probe_writes_one
         probed.body["transition"]["to"], "degraded",
         "the first success is not yet an `ok` — the provider has no history to be healthy against"
     );
-    let sampled: (i64,) = sqlx::query_as(
-        "select count(*) from ai_provider_health where provider_id = $1::uuid",
-    )
-    .bind(&ids[0])
-    .fetch_one(harness.db.pool())
-    .await
-    .expect("the count reads");
+    let sampled: (i64,) =
+        sqlx::query_as("select count(*) from ai_provider_health where provider_id = $1::uuid")
+            .bind(&ids[0])
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the count reads");
     assert_eq!(sampled.0, 1, "one button press is one sample");
 
     // The refreshed header comes back in the probe's own answer, so the tab swaps it in without a
@@ -2214,7 +2216,10 @@ async fn the_health_and_usage_endpoints_answer_the_tabs_and_the_probe_writes_one
     assert_eq!(usage.body["summary"]["requests"], 0);
     assert_eq!(usage.body["summary"]["errors"], 0);
     assert_eq!(usage.body["window"], "24h");
-    assert_eq!(usage.body["summary"]["by_day"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        usage.body["summary"]["by_day"].as_array().map(Vec::len),
+        Some(0)
+    );
 
     // A provider that does not exist is a 404 on every one of the four, not a blank tab.
     let missing = harness
@@ -2269,4 +2274,426 @@ fn swap_database(url: &str, database: &str) -> String {
         Some(query) => format!("{prefix}/{database}?{query}"),
         None => format!("{prefix}/{database}"),
     }
+}
+
+/// Slice 3 (REQ-097): the background probe runner and the failover substitution — the two halves
+/// that closed the slice.
+///
+/// The unit tests prove the health *rules* and the failover *decision* without a database and a
+/// socket. This walk proves the two things only a real run can prove:
+///
+/// * a tick writes **exactly one sample per enabled provider**, and a provider the operator
+///   switched off is not dialled at all (the runner samples the chain, not every row);
+/// * a provider that starts failing goes `degraded` then `down`, and each transition writes the
+///   `ai.provider.health_changed` event with the `(from, to)` pair the panel and an automation
+///   both read.
+#[tokio::test]
+async fn the_probe_runner_samples_each_enabled_provider_and_announces_a_transition() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("runner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let owner_token = token_of(&owner);
+
+    // One provider the runner can reach, one it cannot. A tick that only proved the happy path
+    // would not know whether a dead endpoint ends the tick or is recorded as that provider's own
+    // health — and the answer has to be the second one.
+    let live = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Runner live",
+                "base_url": mock.base_url,
+                "priority": 10,
+                "models": ["mock-small"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(live.status, StatusCode::CREATED, "{:?}", live.body);
+    let live_id = Uuid::parse_str(live.body["id"].as_str().expect("an id")).expect("a uuid");
+
+    let dead = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Runner dead",
+                "base_url": "http://127.0.0.1:1/v1",
+                "priority": 20,
+                "models": ["mock-small"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(dead.status, StatusCode::CREATED, "{:?}", dead.body);
+    let dead_id = Uuid::parse_str(dead.body["id"].as_str().expect("an id")).expect("a uuid");
+
+    // Nothing is sampled before the runner runs: a sample nobody took is not a sample.
+    let before: (i64,) = sqlx::query_as("select count(*) from ai_provider_health")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the count reads");
+    assert_eq!(before.0, 0, "a fresh installation has no samples");
+
+    let report = omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
+    assert_eq!(report.ok, 1, "the reachable provider answered");
+    assert_eq!(
+        report.failed, 1,
+        "the dead provider is one failure, not a failed tick that skipped the other"
+    );
+
+    // One sample each — not one per step of the five-step test, and not one per provider per
+    // attempt. The count is the claim the acceptance criterion makes.
+    let per_provider: Vec<(Uuid, i64)> = sqlx::query_as(
+        "select provider_id, count(*) from ai_provider_health group by provider_id order by 1",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the counts read");
+    assert_eq!(per_provider.len(), 2, "{per_provider:?}");
+    for (provider, samples) in &per_provider {
+        assert_eq!(*samples, 1, "provider {provider} got one sample per tick");
+    }
+
+    // The live provider read `ok`; the dead one carries its own words, not a synthetic row.
+    let live_samples =
+        omnion_ai_hub::health_store::recent_samples(harness.db.pool(), live_id, 24, 50)
+            .await
+            .expect("the samples read");
+    assert_eq!(live_samples[0].status, "ok");
+    assert!(
+        live_samples[0].latency_ms > 0,
+        "a sample claiming 0 ms would make every p95 a lie"
+    );
+    let dead_samples =
+        omnion_ai_hub::health_store::recent_samples(harness.db.pool(), dead_id, 24, 50)
+            .await
+            .expect("the samples read");
+    assert_eq!(dead_samples[0].status, "down");
+    assert!(
+        dead_samples[0].error.is_some(),
+        "a failed sample keeps the endpoint's own words"
+    );
+
+    // Both transitions fired on the first tick: `unknown` → something. The event is what an
+    // automation on "a provider went down" subscribes to, and a tick must be indistinguishable
+    // from a button press.
+    let events: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "select action, metadata from audit_log where action = 'ai.provider.health_changed'",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the events read");
+    assert_eq!(events.len(), 2, "{events:?}");
+    for (_, metadata) in &events {
+        assert_eq!(metadata["source"], "runner");
+        assert!(metadata["from"].is_string(), "{metadata}");
+        assert!(metadata["to"].is_string(), "{metadata}");
+    }
+
+    // A tick that changes nothing emits nothing: the second tick sees the same verdicts.
+    let second = omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
+    assert_eq!(
+        second.transitions, 0,
+        "an unchanged status must not announce itself every minute"
+    );
+
+    // Three consecutive failures take the dead provider to `down`; the two before that are the
+    // rule the panel draws, computed from the samples the tick wrote.
+    for _ in 0..2 {
+        omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
+    }
+    let down = omnion_ai_hub::health_store::health_summary(harness.db.pool(), dead_id, 24)
+        .await
+        .expect("the summary reads");
+    assert_eq!(
+        down.status, "down",
+        "three consecutive failures read as an outage"
+    );
+
+    // A provider the operator switched off is not dialled: the tick walks the *chain*, which is
+    // the enabled set, so a switched-off provider costs no sample and no request.
+    let disabled = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/providers/{dead_id}"),
+            Some(&owner_token),
+            Some(json!({ "enabled": false })),
+        ))
+        .await;
+    assert_eq!(disabled.status, StatusCode::OK, "{:?}", disabled.body);
+
+    let before_switch: (i64,) = sqlx::query_as("select count(*) from ai_provider_health")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the count reads");
+    let after_switch = omnion_api::ai_health_runner::tick(harness.db.pool(), 30).await;
+    assert_eq!(
+        after_switch.ok, 1,
+        "only the still-enabled provider is sampled"
+    );
+    let after_samples: (i64,) = sqlx::query_as("select count(*) from ai_provider_health")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the count reads");
+    assert_eq!(
+        after_samples.0 - before_switch.0,
+        1,
+        "the switched-off provider was not dialled"
+    );
+
+    mock.task.abort();
+    harness.dispose().await;
+}
+
+/// The failover substitution, over the HTTP surface a caller actually uses.
+///
+/// A task-routed request (no `provider` prefix) whose provider is dead is answered by the next
+/// provider in the chain, the substitution is recorded as `ai.provider.failover_used`, and the
+/// answer says which provider produced it. A **pinned** request — `Provider/model` — is not
+/// rerouted at all: it fails with its own provider's error.
+#[tokio::test]
+async fn a_task_routed_chat_fails_over_and_a_pinned_one_does_not() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("failover-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let owner_token = token_of(&owner);
+
+    // The standby: reachable, and the model it serves is the one the request asked for.
+    let standby = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Standby",
+                "base_url": mock.base_url,
+                "priority": 20,
+                "models": ["mock-small"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(standby.status, StatusCode::CREATED, "{:?}", standby.body);
+    let standby_id = Uuid::parse_str(standby.body["id"].as_str().expect("an id")).expect("a uuid");
+    let standby_model_id =
+        Uuid::parse_str(standby.body["models"][0]["id"].as_str().expect("an id")).expect("a uuid");
+    assert!(
+        standby_model_id != Uuid::nil(),
+        "the standby serves a real model, so the chain has something to answer with"
+    );
+
+    // The preferred: ranked first, pointed at nothing, serving the same model key.
+    let preferred = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Preferred",
+                "base_url": "http://127.0.0.1:1/v1",
+                "priority": 10,
+                "models": ["mock-small"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(
+        preferred.status,
+        StatusCode::CREATED,
+        "{:?}",
+        preferred.body
+    );
+    let preferred_id =
+        Uuid::parse_str(preferred.body["id"].as_str().expect("an id")).expect("a uuid");
+
+    // The installation default is the model a task-routed request with no name resolves to. It
+    // has to be the **dead** provider's model, otherwise every task-routed call is already
+    // served by the standby and the failover is never exercised at all.
+    let preferred_model_id =
+        Uuid::parse_str(preferred.body["models"][0]["id"].as_str().expect("an id"))
+            .expect("a uuid");
+    let default_model = harness
+        .call(request(
+            Method::PATCH,
+            &format!("/api/v1/ai/models/{preferred_model_id}"),
+            Some(&owner_token),
+            Some(json!({ "is_default": true })),
+        ))
+        .await;
+    assert_eq!(
+        default_model.status,
+        StatusCode::OK,
+        "{:?}",
+        default_model.body
+    );
+
+    // The chain preview is the chain that will run: Preferred first, then Standby.
+    let chain = harness
+        .call(get("/api/v1/ai/failover", Some(&owner_token)))
+        .await;
+    assert_eq!(chain.status, StatusCode::OK, "{:?}", chain.body);
+    let ranks: Vec<&str> = chain.body["chain"]
+        .as_array()
+        .expect("a chain")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(ranks, vec!["Preferred", "Standby"]);
+
+    // A chat that names the standby explicitly is pinned and must reach it.
+    let pinned = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat(Some("Standby/mock-small")),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(pinned.status, StatusCode::OK, "{:?}", pinned.body);
+    let pinned_events = sse_events(&pinned.text);
+    assert_eq!(
+        pinned_events.first().map(|(event, _)| event.as_str()),
+        Some("start"),
+        "a pinned request opens a stream: {pinned_events:?}"
+    );
+
+    // A pinned request to the *dead* provider fails with that provider's own error and is not
+    // rerouted: the standby serves the same key, so a silent substitution would look identical
+    // to a success.
+    let pinned_dead = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat(Some("Preferred/mock-small")),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(pinned_dead.status, StatusCode::OK, "{:?}", pinned_dead.body);
+    let dead_events = sse_events(&pinned_dead.text);
+    let error_frame = dead_events
+        .iter()
+        .find(|(event, _)| event == "error")
+        .expect("a pinned request to a dead provider must fail");
+    let message = error_frame.1["message"].as_str().expect("a message");
+    assert!(
+        !message.is_empty(),
+        "the pinned failure carries the provider's own words, not an empty frame"
+    );
+    assert!(
+        !sse_events(&pinned_dead.text)
+            .iter()
+            .any(|(event, data)| event == "start" && data["provider"] == "Standby"),
+        "a pinned request must never be answered by another provider"
+    );
+
+    // No failover event exists yet: nothing was substituted.
+    let substitutions: (i64,) =
+        sqlx::query_as("select count(*) from audit_log where action = 'ai.provider.failover_used'")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the count reads");
+    assert_eq!(substitutions.0, 0, "a pinned request substitutes nothing");
+
+    // The usage row for a pinned failure names the provider that failed and no substitute.
+    let failed: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "select provider_id, substituted_from from ai_provider_usage where outcome <> 'ok'",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the rows read");
+    for (provider, substituted) in &failed {
+        assert_eq!(
+            *provider, preferred_id,
+            "the failure is the pinned provider's"
+        );
+        assert_eq!(*substituted, None, "a pinned request is never substituted");
+    }
+
+    // The case the request is really about: a **task-routed** request — no `provider/` prefix —
+    // that resolves to the dead provider is answered by the next one in the chain.
+    let routed = harness
+        .call(post("/api/v1/ai/chat", chat(None), Some(&owner_token)))
+        .await;
+    assert_eq!(routed.status, StatusCode::OK, "{:?}", routed.body);
+    let routed_events = sse_events(&routed.text);
+    let started_by = routed_events
+        .iter()
+        .find(|(event, _)| event == "start")
+        .map(|(_, data)| data["provider"].as_str().unwrap_or_default().to_owned());
+    assert_eq!(
+        started_by.as_deref(),
+        Some("Standby"),
+        "a task-routed request must be answered by the next provider in the chain: {routed_events:?}"
+    );
+    assert!(
+        !streamed_answer(&routed_events).is_empty(),
+        "the substituted provider's answer reaches the caller"
+    );
+
+    // The substitution is recorded, and it names both sides.
+    let events: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "select action, metadata from audit_log where action = 'ai.provider.failover_used'",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the events read");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let metadata = &events[0].1;
+    assert_eq!(metadata["requested_provider"], "Preferred");
+    assert_eq!(metadata["substitute_provider"], "Standby");
+    assert_eq!(metadata["model"], "mock-small");
+    assert_eq!(metadata["task"], "chat");
+
+    // The completed audit names the provider that actually answered — the acceptance criterion's
+    // "the caller sees the final provider", which is the standby, not the one it asked for.
+    let completed: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "select action, metadata from audit_log where action = 'ai.chat.completed' \
+         order by created_at desc limit 1",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the events read");
+    assert_eq!(
+        completed[0].1["provider"], "Standby",
+        "the answer is attributed to the provider that served it"
+    );
+    assert_eq!(completed[0].1["substitutions"], 1);
+
+    // The usage rows are per provider: the dead one carries the failure, the standby the
+    // answer, and the standby's row names the provider it took over from.
+    let served: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "select provider_id, substituted_from from ai_provider_usage where outcome = 'ok'",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the rows read");
+    assert!(
+        served
+            .iter()
+            .any(|(provider, from)| { *provider == standby_id && *from == Some(preferred_id) }),
+        "the substituted call is attributed to the standby and names its origin: {served:?}"
+    );
+
+    mock.task.abort();
+    harness.dispose().await;
 }
