@@ -217,11 +217,22 @@ pub struct NewCompany {
 /// * a **platform account that names none** falls back to the organizations it holds a live
 ///   binding in, and **only when there is exactly one**: a screen that silently opened the
 ///   wrong tenant's records is a data leak wearing the costume of a convenience, so an account
-///   with two tenants is told to say which one, and an account with none is told the same.
+///   with two tenants is told to say which one.
 ///
 /// A `global` binding is not a tenant — it is the platform-wide role an `owner` holds — so it
 /// does not count towards the fallback. An expired or revoked binding does not count either: an
 /// organization the caller can no longer act in is not a place this route may read.
+///
+/// **The one-organization installation.** The binding rule alone refused the platform owner of
+/// an installation that has exactly one organization, which is the shape of every first run: the
+/// owner holds the `global` Owner role and nothing else, so `organizations_bound_to` is empty,
+/// and the advice in the refusal — "pass organization_id" — is impossible to follow, because a
+/// caller holding no tenant binding has no organization it may name without already holding the
+/// permission that would let it. The result was that a whole module was unreachable on the one
+/// installation type where there is nothing to confuse, while a screen on that refusal reads
+/// "nothing to show" and looks like an empty list. So the `[]` arm falls back to the
+/// installation's single organization when there is exactly one, and **only then**: with two or
+/// more the answer is a choice, and a guess would hand one tenant's records to another.
 pub(crate) async fn organization_of(
     state: &AppState,
     current: &CurrentSession,
@@ -234,10 +245,7 @@ pub(crate) async fn organization_of(
     let organizations = organizations_bound_to(state, current.user.id).await;
     match organizations.as_slice() {
         [only] => Ok(*only),
-        [] => Err(ApiError::bad_request(
-            "organization_required",
-            "this account belongs to no organization; pass organization_id to name the one to read",
-        )),
+        [] => sole_organization(state).await,
         many => Err(ApiError::bad_request(
             "organization_ambiguous",
             format!(
@@ -246,6 +254,63 @@ pub(crate) async fn organization_of(
             ),
         )),
     }
+}
+
+/// The decision the `[]` arm makes, as a value.
+///
+/// Split out so the rule can be stated once and tested as one: a caller with no tenant binding
+/// takes the installation's organization only when there is exactly one, and is refused — as
+/// before — the moment there is nothing or a choice.
+fn sole_organization_outcome(installation: Vec<Uuid>) -> Result<Uuid, TenantChoice> {
+    match installation.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(TenantChoice::None),
+        many => Err(TenantChoice::Ambiguous(many.len())),
+    }
+}
+
+/// Why a platform account with no tenant binding was refused, once it is not a one-organization
+/// installation. Separate from `ApiError` so [`sole_organization_outcome`] is a pure function and
+/// the refusal is built in one place.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TenantChoice {
+    /// The installation has no organization at all: there is nothing to read, and a screen
+    /// drawing "nothing to show" is right.
+    None,
+    /// More than one organization exists and the caller holds none of them: the caller must say
+    /// which, and a guess would cross a tenant boundary.
+    Ambiguous(usize),
+}
+
+impl From<TenantChoice> for ApiError {
+    fn from(choice: TenantChoice) -> Self {
+        match choice {
+            TenantChoice::None => ApiError::bad_request(
+                "organization_required",
+                "this installation has no organization yet; create one before working in the CRM",
+            ),
+            TenantChoice::Ambiguous(count) => ApiError::bad_request(
+                "organization_ambiguous",
+                format!(
+                    "this account holds no role in any of the {} organizations here; pass \
+                     organization_id to name the one to read",
+                    count
+                ),
+            ),
+        }
+    }
+}
+
+/// Every organization in the installation, oldest first, so the tie-break is the same for
+/// everybody — the same rule `organizations_bound_to` uses for a caller's own tenants.
+async fn sole_organization(state: &AppState) -> Result<Uuid, ApiError> {
+    let organizations = sqlx::query_scalar(
+        "select id from organizations where status = 'active' order by created_at, id",
+    )
+    .fetch_all(state.db().pool())
+    .await
+    .unwrap_or_default();
+    sole_organization_outcome(organizations).map_err(ApiError::from)
 }
 
 /// The organizations an account holds a **live organization-scoped** binding in, oldest first.
@@ -931,6 +996,55 @@ mod tests {
             .await
             .expect("the error body must read");
         serde_json::from_slice(&bytes).expect("the error body is JSON")
+    }
+
+    /// A platform account holding no tenant binding reads the installation's organization when
+    /// there is exactly one — the first-run installation, where the owner holds the `global` role
+    /// and no tenant binding at all. Without this arm the whole module was unreachable there.
+    #[test]
+    fn one_organization_is_the_only_one_an_unbound_caller_may_take() {
+        let only = Uuid::new_v4();
+        assert_eq!(
+            sole_organization_outcome(vec![only]).ok(),
+            Some(only),
+            "a single organization is not a choice — refusing it locked the CRM out of a first run"
+        );
+    }
+
+    /// Two organizations and no binding is a choice, and the refusal keeps its own code so a
+    /// client can tell "pick one" from "there is nothing here".
+    #[test]
+    fn two_organizations_are_a_choice_and_stay_a_refusal() {
+        let outcome = sole_organization_outcome(vec![Uuid::new_v4(), Uuid::new_v4()])
+            .expect_err("two organizations cannot be guessed at");
+        assert_eq!(outcome, TenantChoice::Ambiguous(2));
+        assert_eq!(
+            ApiError::from(outcome).code(),
+            "organization_ambiguous",
+            "the code is what a client draws the picker from"
+        );
+    }
+
+    /// No organization at all stays `organization_required` — but the sentence changes. The old
+    /// one said "pass organization_id", which a caller holding no tenant binding cannot do: naming
+    /// a tenant requires the very permission that binding would have carried. Advice a caller
+    /// cannot follow is worse than no advice, because it sends them to look for a control that
+    /// does not exist.
+    #[tokio::test]
+    async fn no_organization_is_refused_without_impossible_advice() {
+        let outcome = sole_organization_outcome(Vec::new()).expect_err("nothing to read");
+        assert_eq!(outcome, TenantChoice::None);
+        let error = ApiError::from(outcome);
+        assert_eq!(error.code(), "organization_required");
+
+        let sentence = body_of(error).await["error"]["message"]
+            .as_str()
+            .expect("every refusal carries a sentence")
+            .to_owned();
+        assert!(
+            !sentence.contains("organization_id"),
+            "the refusal must not tell this caller to pass a parameter it has no value for: {sentence}"
+        );
     }
 
     #[tokio::test]
