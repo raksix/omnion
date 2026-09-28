@@ -9,10 +9,31 @@
 > omnion-notifications -p omnion-permissions` → 62 passed; `-p omnion-api --lib` → 159 passed;
 > `pnpm typecheck` → 2 successful. `scripts/qa/run-notifications.sh` → PASS (31 migrations
 > applied, dedupe collapses, both check constraints refuse what the crate refuses);
-> `scripts/qa/run-notifications-http.sh` → PASS, 9/9 over a real socket. **The browser pass
-> (`bash scripts/qa/run.sh`) is queued behind siblings** and slice 1 is not closed without it —
-> `runMediaUsage`-style depth pass is written and wired, so the harness that gets the slot
-> already drives it. Slices 2 (preferences + channels) and 3 (push + outbox + router) are next.
+> `scripts/qa/run-notifications-http.sh` → PASS, 9/9 over a real socket.
+>
+> **Slice 2 shipped** (c069128 rules, 11bd14d SQL, 2ffe581 fmt, 2785d7c the HTTP gate, 13ad348
+> the screen, 07e2d56 the walkthrough depth pass, 871bdb5 + eb421ba two fixes it found):
+> `preferences.rs`, `preference_store.rs`, `GET`/`PUT /api/v1/notifications/preferences`,
+> `/notifications/settings`. **The browser pass found a 400 that had been shipping since slice
+> 1**: axum 0.8's `Query` is backed by `serde_urlencoded`, which cannot put a repeated key into
+> a `Vec`, so *every* category and priority filter — legal value or not — answered
+> `invalid type: string "approval", expected a sequence` and fell through to the error state.
+> Reproduced in a four-line axum app before the fix. The read now takes `RawQuery`.
+>
+> **Slice 3 code-complete** (26d6f67 push + outbox, 9acd8ca the router + migration 0051, 0dae953
+> the `notifications.admin` key, cb7c1bb the HTTP surface, 0188172 the mounts, 12e8c88 the live
+> gate): `push.rs` (device lifecycle, outbox, channel readiness), `router.rs` (the declarative
+> router, four closed recipient shapes, a derived dedupe key),
+> `apps/api/src/routes/notifications_admin.rs` (nine endpoints), migration 0051. `cargo test -p
+> omnion-notifications` → **79 passed**; `-p omnion-permissions` → 62; `-p omnion-api --lib` →
+> **187 passed**; `scripts/qa/run-notifications-routes.sh` → **PASS** (32 migrations, the three
+> recipient/category refusals, the outbox's 13-column projection with no body, and a retry that
+> moves the failed row and leaves the delivered one alone).
+>
+> **Not yet proven by a browser:** the slice-2 screen's pass is running, and slice 3's
+> `/notifications/outbox` and the router's rules have no admin UI yet. Slices 2 and 3 are not
+> closed on tests alone — the "no untested screen" rule means the next pass must visit
+> `notifications-settings`, and slice 3's screen has to exist before it can.
 
 ## Request
 

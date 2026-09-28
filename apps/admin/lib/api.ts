@@ -47,9 +47,18 @@ import type {
   OwnerSetupResult,
   Page,
   NotificationBulkResult,
+  NotificationChannelReadiness,
+  NotificationDevice,
   NotificationFilters,
+  NotificationOutbox,
   NotificationPage,
+  NotificationPreferences,
+  NotificationPreferencesSaved,
+  NotificationPushOutcome,
+  NotificationRouteReport,
+  NotificationRouteRule,
   NotificationRow,
+  NotificationSettingsRow,
   NotificationSummary,
   Site,
   User,
@@ -4055,6 +4064,159 @@ export function emitNotification(input: {
   dedupe_key?: string;
 }): Promise<{ created: number; deduped: number }> {
   return request<{ created: number; deduped: number }>("/api/v1/notifications/emit", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The caller's own channel configuration (REQ-021, slice 2).
+ *
+ * The answer is always a **complete** matrix, so the form renders what the server sent rather
+ * than building a grid from the category and channel lists it happens to have. Two copies of
+ * the closed vocabulary in two languages is how a channel ends up in one list and not the
+ * other — and the failure is a form with a hole in it, not an error.
+ */
+export function fetchNotificationPreferences(): Promise<NotificationPreferences> {
+  return request<NotificationPreferences>("/api/v1/notifications/preferences");
+}
+
+/**
+ * Save the stated cells and the settings row.
+ *
+ * `settings` is required by the API, so this signature makes it required here too: a client
+ * that could omit it would discover at runtime that omitting it is a `400`, and the fix would
+ * be to stop sending cells.
+ *
+ * The answer carries the whole matrix back rather than a count, and the form renders from that
+ * — the count is for the toast, the matrix is for the screen.
+ */
+export function saveNotificationPreferences(input: {
+  cells: { category: string; channel: string; enabled: boolean }[];
+  settings: NotificationSettingsRow;
+}): Promise<NotificationPreferencesSaved> {
+  return request<NotificationPreferencesSaved>("/api/v1/notifications/preferences", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3: the half that leaves the panel
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's delivery log.
+ *
+ * **The filters are appended by hand, not by a query-string builder.** The server reads a
+ * repeated `status` out of `RawQuery` rather than through a `Query<T>` extractor, because
+ * `serde_urlencoded` cannot put a repeated key into a `Vec` — the bug that made every filtered
+ * inbox answer `400` until slice 2. Appending `status=` twice here is the supported way to ask
+ * for two states, and `append()` (not `+=`) is what encodes the `&` correctly.
+ */
+export function fetchNotificationOutbox(filters: {
+  statuses?: string[];
+  channel?: string;
+  limit?: number;
+} = {}): Promise<NotificationOutbox> {
+  const query = new URLSearchParams();
+  for (const status of filters.statuses ?? []) query.append("status", status);
+  if (filters.channel) query.set("channel", filters.channel);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  const suffix = query.toString();
+  return request<NotificationOutbox>(`/api/v1/notifications/outbox${suffix ? `?${suffix}` : ""}`);
+}
+
+/**
+ * Requeue one failed delivery.
+ *
+ * The answer names what happened rather than throwing on a row that cannot be retried: a
+ * `sent` row has already reached somebody, and the caller's next action is the same either
+ * way — do not press the button again. Throwing would put an error toast on a button that
+ * worked exactly as designed.
+ */
+export function retryNotificationDelivery(id: string): Promise<{ outcome: string }> {
+  return request<{ outcome: string }>(`/api/v1/notifications/outbox/${id}/retry`, {
+    method: "POST",
+  });
+}
+
+/** This person's registered browsers. The endpoint itself is never in the answer. */
+export function fetchNotificationDevices(): Promise<NotificationDevice[]> {
+  return request<NotificationDevice[]>("/api/v1/notifications/push-subscriptions");
+}
+
+/** Register (or re-point) this browser. The four outcomes are the answer, not a boolean. */
+export function registerNotificationDevice(input: {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+}): Promise<{ id: string; outcome: NotificationPushOutcome; endpoint_hint: string }> {
+  return request("/api/v1/notifications/push-subscriptions", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove one device. `404` for somebody else's, so existence does not leak. */
+export function removeNotificationDevice(id: string): Promise<void> {
+  return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
+}
+
+/** What each channel can do on this installation, and the sentence explaining it. */
+export function fetchNotificationChannels(): Promise<NotificationChannelReadiness[]> {
+  return request<NotificationChannelReadiness[]>("/api/v1/notifications/channels");
+}
+
+/** Every routing rule, enabled or not. */
+export function fetchNotificationRoutes(): Promise<NotificationRouteRule[]> {
+  return request<NotificationRouteRule[]>("/api/v1/notifications/routes");
+}
+
+/**
+ * Write one routing rule.
+ *
+ * `recipient` is one string, not a typed object, because the validation lives in the server's
+ * parse: a client that guesses `{"kind":"group"}` gets a `400` naming the four legal prefixes,
+ * which teaches it more than a schema that only admits the shapes this build knows.
+ */
+export function createNotificationRoute(input: {
+  event_name: string;
+  category: string;
+  priority: string;
+  recipient: string;
+  title_template: string;
+  url_template: string | null;
+}): Promise<NotificationRouteRule> {
+  return request<NotificationRouteRule>("/api/v1/notifications/routes", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove one rule. */
+export function deleteNotificationRoute(id: string): Promise<void> {
+  return request<void>(`/api/v1/notifications/routes/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Run one bus event through the router, now.
+ *
+ * This is the *proof* of slice 3, not a feature: the claim is that a bus fact becomes a
+ * notification with no direct call between the two modules, and the only way to show that from
+ * a browser is to hand the router the event a producer would have written. The answer's counts
+ * are the deliverable — `created: 0` alone cannot tell a rule that is ahead of its producer
+ * from a rule that resolves to nobody, which is why `unmatched_rules` and `unknown_event` are
+ * separate fields rather than one `fired` boolean.
+ */
+export function runNotificationRoute(input: {
+  event_name: string;
+  event_id?: string;
+  actor_user_id?: string;
+  organization_id?: string;
+  payload?: Record<string, unknown>;
+}): Promise<NotificationRouteReport> {
+  return request<NotificationRouteReport>("/api/v1/notifications/route", {
     method: "POST",
     body: JSON.stringify(input),
   });

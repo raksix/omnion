@@ -4128,3 +4128,117 @@ and shows that naming *another* tenant still answers 404.
 REQ-052 slice 2 — quotes end to end: the builder, totals recomputed in SQL, versioning, send, the
 public token page with accept/decline, and the expiry sweep. A QA pass is due on the tick that
 closes it, and this tick's route additions have not been through a browser pass yet.
+
+---
+
+## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
+
+**What.** The half of the notification centre that decides **how** a record reaches somebody.
+`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
+`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
+`runNotificationSettingsDepth` in the walkthrough.
+
+**Three decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
+   user per channel and would make a channel added in slice 3 a backfill instead of a
+   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
+   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
+   valid form, not an empty one.
+2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
+   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
+   guarantee, and the panel's own form is a client like any other.
+3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
+   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
+   of them is either never quiet or always quiet, and both are silent. A window that leaves no
+   waking hours is refused by name rather than stored as "e-mail is on".
+
+**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
+`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
+legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
+`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
+
+```text
+invalid type: string "approval", expected a sequence
+```
+
+for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
+priority filter on this surface had never worked, and every filtered list fell through to the
+error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
+the list read now takes `RawQuery` and parses the string itself.
+
+**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
+`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
+bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
+its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
+error element, which that call cannot affect: the assertion could only ever have passed by
+accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
+shortcut into the drawer. All three are the class of defect this harness exists to catch —
+in itself — and none of them is visible from the report, which only says `false`.
+
+**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
+gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
+takes an explicit id list, so it does not require a selection the reader never made — and rows
+carry `data-read` so the state is assertable rather than a shade of grey.
+
+**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
+**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
+Browser pass: **running**.
+
+**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
+`report.notificationSettings` to be green and **zero high findings** from this change — in
+particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
+signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
+behind `notifications.admin`, the event router turning existing bus events into notifications,
+and the per-channel delivery rows in the drawer.
+
+## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
+
+**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
+`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
+endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
+with their guards travelling with each group.
+
+**The decision the whole slice rests on: a `permission:` recipient rule resolves through
+`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
+one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
+expired grants and explicit denials, and a notification that reaches somebody who lost the key
+is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
+`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
+cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
+that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
+zero for and the crate's resolution answers one.
+
+**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
+no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
+nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
+is asserted by serialising the body and searching the JSON for the secret.
+
+**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
+`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
+button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
+list used `filter_map`, which would answer with four channels and render a settings matrix whose
+missing column is indistinguishable from one the reader switched off. And the outbox check
+constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
+
+**The live gate found three of its own assertions were wrong**, which is the more useful half:
+the role fixture expected a survivor where the honest answer is zero; the outbox projection check
+counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
+`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
+now assertions that would fail if the code regressed.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
+`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
+`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
+and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
+moves the failed row while the delivered one stays at 1 → 1.
+
+**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
+gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
+rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
+
+**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
+assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
+and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
+before running the pass again — the no-untested-screen rule applies to a screen that does not yet
+exist as much as to one that does.

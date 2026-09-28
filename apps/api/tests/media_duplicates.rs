@@ -205,10 +205,26 @@ impl Fixture {
             .expect("the owner binding must be created");
 
         let (editor_id, editor_email) = create_account(&db, Some(org)).await;
-        grant_role(&db, org, &EDITOR_PERMISSIONS, "dup-editor", editor_id, platform_id).await;
+        grant_role(
+            &db,
+            org,
+            &EDITOR_PERMISSIONS,
+            "dup-editor",
+            editor_id,
+            platform_id,
+        )
+        .await;
 
         let (reader_id, reader_email) = create_account(&db, Some(org)).await;
-        grant_role(&db, org, &READER_PERMISSIONS, "dup-reader", reader_id, platform_id).await;
+        grant_role(
+            &db,
+            org,
+            &READER_PERMISSIONS,
+            "dup-reader",
+            reader_id,
+            platform_id,
+        )
+        .await;
 
         Some(Self {
             state,
@@ -238,13 +254,7 @@ impl Fixture {
     /// Put real bytes in the library with *this* checksum, so a group is real rather than
     /// hand-written: the checksum is what the report groups by, and a fixture that lies about it
     /// would prove nothing about the grouping.
-    async fn upload_with(
-        &self,
-        site: Uuid,
-        name: &str,
-        checksum: &str,
-        size: i64,
-    ) -> Uuid {
+    async fn upload_with(&self, site: Uuid, name: &str, checksum: &str, size: i64) -> Uuid {
         let media = omnion_media::insert_media(
             self.db.pool(),
             omnion_media::NewMedia {
@@ -429,7 +439,9 @@ async fn the_report_groups_by_checksum_and_counts_only_the_waste() {
     // is about what the site is holding, not about what the trash is about to release.
     let other = Fixture::checksum_of(b"a completely different file");
     fixture.upload_with(site, "unique.txt", &other, 7).await;
-    let trashed = fixture.upload_with(site, "trashed.txt", &checksum, bytes.len() as i64).await;
+    let trashed = fixture
+        .upload_with(site, "trashed.txt", &checksum, bytes.len() as i64)
+        .await;
     sqlx::query("update media set deleted_at = now() where id = $1")
         .bind(trashed)
         .execute(fixture.db.pool())
@@ -450,7 +462,11 @@ async fn the_report_groups_by_checksum_and_counts_only_the_waste() {
     let group = &body.body["groups"][0];
     assert_eq!(group["checksum"], json!(checksum[..16].to_owned() + "…"));
     assert_eq!(group["full_checksum"], json!(checksum));
-    assert_eq!(group["file_count"], json!(2), "the trashed copy is not counted");
+    assert_eq!(
+        group["file_count"],
+        json!(2),
+        "the trashed copy is not counted"
+    );
     assert_eq!(
         group["total_bytes"],
         json!(bytes.len() as i64 * 2),
@@ -478,7 +494,11 @@ async fn the_report_groups_by_checksum_and_counts_only_the_waste() {
     // A different site sees nothing: the group is per-site, because two tenants storing the same
     // bytes is not a duplicate any of them can act on.
     let other_site = report(&fixture.state, &token, fixture.sites[1], false).await;
-    assert_eq!(other_site.body["group_count"], json!(0), "another site is clean");
+    assert_eq!(
+        other_site.body["group_count"],
+        json!(0),
+        "another site is clean"
+    );
 
     fixture.cleanup().await;
 }
@@ -554,11 +574,15 @@ async fn a_merge_keeps_the_chosen_file_and_repoints_every_reference() {
     .expect("the rows must read");
     assert_eq!(states.len(), 2);
     assert!(
-        states.iter().any(|(name, live)| name == "dupe-a.txt" && !live),
+        states
+            .iter()
+            .any(|(name, live)| name == "dupe-a.txt" && !live),
         "the copy is in the trash: {states:?}"
     );
     assert!(
-        states.iter().any(|(name, live)| name == "dupe-b.txt" && *live),
+        states
+            .iter()
+            .any(|(name, live)| name == "dupe-b.txt" && *live),
         "the keeper is live: {states:?}"
     );
 
@@ -625,7 +649,12 @@ async fn a_merge_closes_the_share_links_over_the_copies() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let bearer = created.body["token"].as_str().expect("token").to_owned();
 
     let merged = call(
@@ -691,7 +720,12 @@ async fn a_merge_refuses_what_it_must_and_names_the_field() {
         ),
     )
     .await;
-    assert_eq!(outside.status, StatusCode::CONFLICT, "body: {}", outside.body);
+    assert_eq!(
+        outside.status,
+        StatusCode::CONFLICT,
+        "body: {}",
+        outside.body
+    );
     assert_eq!(
         outside.body["error"]["code"],
         json!("duplicate_merge_refused"),
@@ -760,7 +794,12 @@ async fn a_merge_refuses_what_it_must_and_names_the_field() {
 
     // A reader may read the report and may not merge it.
     let seen = report(&fixture.state, &reader, site, false).await;
-    assert_eq!(seen.status, StatusCode::OK, "a reader may look: {}", seen.body);
+    assert_eq!(
+        seen.status,
+        StatusCode::OK,
+        "a reader may look: {}",
+        seen.body
+    );
     let refused = call(
         &fixture.state,
         request(
@@ -771,12 +810,22 @@ async fn a_merge_refuses_what_it_must_and_names_the_field() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::FORBIDDEN, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        refused.body
+    );
 
     // No session at all is refused on both halves.
     let anonymous = call(
         &fixture.state,
-        request(Method::GET, &format!("/api/v1/media/duplicates?site_id={site}"), None, None),
+        request(
+            Method::GET,
+            &format!("/api/v1/media/duplicates?site_id={site}"),
+            None,
+            None,
+        ),
     )
     .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
@@ -813,13 +862,22 @@ async fn the_cross_site_report_belongs_to_the_platform_and_nobody_else() {
         request(Method::GET, &uri, Some(&editor), None),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::FORBIDDEN, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        refused.body
+    );
     assert_eq!(refused.body["error"]["code"], json!("platform_only"));
 
     // The platform owner sees both groups, named, each with one file — which is the honest
     // answer: "this installation stores these bytes in two places", not "merge them".
     let owner = fixture.platform_token().await;
-    let seen = call(&fixture.state, request(Method::GET, &uri, Some(&owner), None)).await;
+    let seen = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&owner), None),
+    )
+    .await;
     assert_eq!(seen.status, StatusCode::OK, "body: {}", seen.body);
     assert_eq!(seen.body["cross_site"], json!(true));
     // One checksum, two sites — which is the whole point of the mode. The per-site reports above
@@ -842,7 +900,9 @@ async fn the_cross_site_report_belongs_to_the_platform_and_nobody_else() {
     assert_eq!(sites.len(), 2, "both copies are located: {sites:?}");
     for copy in sites {
         assert!(
-            copy["site_name"].as_str().is_some_and(|name| !name.is_empty()),
+            copy["site_name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()),
             "a copy names its site: {copy}"
         );
         assert_eq!(copy["file_count"], json!(1));
@@ -892,7 +952,12 @@ async fn a_reference_is_counted_once_per_record_and_the_file_says_so() {
     let site = fixture.sites[0];
     let bytes = b"a file two pages point at";
     let media_id = fixture
-        .upload_with(site, "shared.png", &Fixture::checksum_of(bytes), bytes.len() as i64)
+        .upload_with(
+            site,
+            "shared.png",
+            &Fixture::checksum_of(bytes),
+            bytes.len() as i64,
+        )
         .await;
 
     // The same record naming the same file twice is one usage, not two — a page with a hero on
