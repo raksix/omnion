@@ -3237,3 +3237,55 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
+
+## 2026-09-28 — the pass was racing four reads, and the race pointed at a picker that said nothing
+
+- **What this tick was.** The merge of `origin/main` (media REQ-010 slice 4, nine commits) and then
+  the QA pass that decides REQ-051's empty/loading/error box. The previous pass reported the
+  contacts and companies screens as having **no** error state. They have one — the list's own read
+  renders it, and the component is right there at `crm-contacts-error`. So the report was wrong,
+  and being wrong is the more interesting half.
+
+- **The pass was measuring a race.** Both screens fire four reads the moment they mount: the
+  column catalogue, the saved views, the company picker and the list. The state sweep stubbed "the
+  first CRM list read it sees" — a regex over five paths — and Playwright answered whichever
+  request the network delivered first. On those two screens that was the **company picker**, whose
+  failure the screen deliberately absorbs (the list still works, so the screen must not fall over).
+  The list then loaded, there was nothing to see, and two healthy screens were written down as
+  broken. Three more of the sweep's own steps were riding the same flaw: the retry step inherited
+  `failPath` from the loop's last iteration, so its stub was still armed on `/crm/leads` and the
+  assertion about a healthy contacts screen would have passed for free; and the "no invented id"
+  route globbed `**/api/v1/crm/contacts*`, which also answers the picker read.
+
+  The read under test is now **named per screen** (`LIST_READ`), re-armed explicitly after the
+  loop, and the anonymous-refusal route is pinned to the same path. A stub that picks which of four
+  concurrent reads to fail is not testing a screen; it is testing the network's mood.
+
+- **What the race was pointing at turned out to be real.** The contacts form read the company list
+  and, when that read failed, did `setCompanies([])` and moved on. The picker was then a `select`
+  whose only option was "No company" — a control that looks like a choice, refuses every real one,
+  and cannot be distinguished from "this contact genuinely has no company". That is precisely the
+  dead control the box forbids, and the pass found it while reporting something else. The picker
+  now holds its own state where the choice was: the sentence, the request id (printed only when
+  the **server** named one — a browser-raised fetch failure never reached a log line, and an id
+  that correlates with nothing is worse than none), and a retry on its own token so re-reading the
+  companies does not re-read the list the person is looking at. The list is untouched: losing a
+  dependency the screen survives losing must not take the screen down.
+
+- **Proof.** `pnpm turbo run typecheck --force` **2/2** (admin + web) ·
+  `bun build scripts/qa/walkthrough.cjs --target node` parses, 220 KB. Four new steps assert the
+  picker's sentence, its id, its retry, and the list surviving beside it. The walkthrough's own
+  state sweep is re-run when the box-wide QA slot frees — it is currently held by three live
+  sibling passes (w2, w3, w7), and four browsers at once is the configuration that OOM'd this
+  host, so the guard is respected rather than bypassed.
+
+- **Also closed: the build log's own merge.** `docs/BUILD-LOG.md` is append-only, so it conflicts
+  on every merge, and this branch's side was carrying a **duplicated REQ-010 block** (95 identical
+  12-line windows) left by an earlier merge — a multiset check passes anyway, because every line
+  is present twice. The copy is stripped; the merged file has zero duplicated windows and zero
+  repeated headings, and both sides' lines are accounted for.
+
+- **Next.** The state sweep decides the empty/loading/error box. What it named as still missing is
+  the two places that draw a bare paragraph instead of `EmptyState` (the board's per-column body
+  and the activities filter bar) — those are the next slice. Then the 390×844 mobile pass and the
+  keyboard sheet (`/`, `j`/`k`, `enter`, `e`, `?`), which are the last two boxes.

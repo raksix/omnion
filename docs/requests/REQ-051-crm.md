@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — the **board was unreachable on every organization created after `0022_crm.sql`**: the seed function was written there and called once, in the statement that created it, so a tenant born since owns no pipeline and `GET /crm/deals?view=board` answered `404 NotFound("pipeline")` (`4aca09e` a trigger plus a backfill, and a read that repairs the state through the same seed). The CRM suite could not see it because its fixture seeds the pipeline by hand and calls that "the same path a new tenant takes" — it was not, which is why the new test seeds nothing. The ambiguous tenant refusal also still named `organization_id`, advice a platform account cannot follow (`01d0a8a`). What is left of the empty/loading/error box is the empty state on the two places that still draw a bare paragraph instead of `EmptyState`: the board's per-column body and the activities filter bar. Then the 390×844 pass and the keyboard sheet. · `cargo test -p omnion-api --lib routes::crm` **27/27** · `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force` **2/2** · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
+> **Status:** in-progress — the **board was unreachable on every organization created after `0022_crm.sql`**: the seed function was written there and called once, in the statement that created it, so a tenant born since owns no pipeline and `GET /crm/deals?view=board` answered `404 NotFound("pipeline")` (`4aca09e` a trigger plus a backfill, and a read that repairs the state through the same seed). The CRM suite could not see it because its fixture seeds the pipeline by hand and calls that "the same path a new tenant takes" — it was not, which is why the new test seeds nothing. The ambiguous tenant refusal also still named `organization_id`, advice a platform account cannot follow (`01d0a8a`). What is left of the empty/loading/error box is the empty state on the two places that still draw a bare paragraph instead of `EmptyState`: the board's per-column body and the activities filter bar. Then the 390×844 pass and the keyboard sheet. · `cargo test -p omnion-api --lib routes::crm` **27/27** · `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force` **2/2** — slice 4: the state sweep was racing four concurrent reads, and the race pointed at a company picker that said nothing when its read failed (`fa6181c`). · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -152,6 +152,27 @@ Payloads carry ids and the changed field list only — never a rendered document
 - [x] An automation rule triggered by `crm.deal.stage_changed` runs **once**. (Proved by driving the **real** matcher — `crates/automation/src/matcher.rs` — over the **real** bus in this suite's own database, so the event the rule reads is the one the board's stage endpoint emitted rather than a hand-written row. Three walks: `a_rule_on_a_deal_stage_change_runs_exactly_once`, `a_rule_whose_condition_does_not_hold_starts_nothing` and `defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home`, all in the **42/42** run. They assert: a move to the stage a deal is **already in** starts nothing (the board's `ctrl + ←/→` posts on every key press); one move starts **one** run whose step carries *this* move's resolved values — the subject reads "A deal entered open" and the body the deal's id, amount and currency, so a retry would repeat the first attempt rather than re-reading a bus that has moved on; a second drain over the same bus is **idle**, which is what "once" means rather than a count; the match is audited as `automation.rule.matched` against the execution; a second deal starts a second run, because exactly-once is per *event* and collapsing two customers into one run would lose one; and a condition that does not hold is `skipped`, not `matched`. The rule's key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define the rule that watches them, and a rule for another organization is refused.)
 - [ ] Empty, loading and error states exist on all six screens; no dead buttons and no placeholder rows.
   *Two thirds are in, and both halves were defects rather than omissions.*
+
+  *The state sweep was itself the defect (`fa6181c`).* It reported the contacts and companies
+  screens as having **no** error state. They have one — the list's own read renders it. What had
+  happened is that both screens fire four reads at once (column catalogue, saved views, company
+  picker, list) and the pass stubbed "the first CRM list read it sees", so the refusal landed on
+  whichever the network delivered first: the company picker, whose failure is *meant* to be
+  absorbed because the list still works. A pass that fails an arbitrary one of four concurrent
+  reads is measuring a race, and it reported the race. The read under test is now named per screen
+  (`LIST_READ`), and the retry step re-arms it — the variable still held the *last* screen's path
+  after the loop, so that assertion had been running against a healthy screen.
+
+  *What the race was pointing at was real.* The company picker read its list and, on failure, set
+  it to empty and moved on: a `select` whose only option was "No company". That is a control that
+  looks like a choice, refuses every real one, and cannot be told apart from "this contact has no
+  company" — a dead control, which is what the box forbids. The picker now carries its own state
+  where the choice was: the sentence, the request id **only when the server named one**, and a
+  retry on its own token (so re-reading the companies does not re-read the list the person is
+  looking at). The list behind it is untouched — losing a dependency the screen survives losing
+  must not take the screen down. Four new steps assert it: the picker's sentence, its id, its
+  retry, and the list still being there.
+
 
   *The **tenant resolution** (`b899f7f`): a platform account that has no organization is now a
   state with a sentence and an action rather than a 400 with a code nobody can draw from.*
