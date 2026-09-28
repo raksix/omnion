@@ -2571,3 +2571,62 @@
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+## 2026-09-28 — REQ-005 slice 4, last criterion · and the duplicate migration that was faking a total regression
+
+- **What shipped.** **`9195e18`** (migration numbering) and **`e00c53c`** (the
+  platform-account criterion) plus **`cb1b839`** (the tick). Two branches had
+  independently claimed `0029`: main for per-site media storage settings
+  (`9973268`) and this branch for organization departments, which `644a129` had
+  itself moved onto `0029` to escape an earlier `0028` collision with site
+  presets. The number was free when that fix was written and is taken now. Git
+  merged both files without comment and sqlx refused to start:
+
+      migrations must apply: Migration(VersionMismatch(29))
+
+  Every walk in the tenancy suite dies in `live_state` before reaching a single
+  assertion, so the suite printed **0 passed / 29 failed** and read as a total
+  regression. It was one duplicated version number. Renumbered to `0037`-`0039`,
+  clear of main (`0036`), wave4 (`0034`) and wave3 (`0030`).
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits -- --test-threads=1`
+  → **26 passed / 3 failed**, and `a_platform_account_names_the_tenant_every_write_needs`
+  passes alone (`1 passed`). The 3 failures are **pre-existing and were not
+  interference**: each of them fails on its own with `--test-threads=1`. They had
+  been mislabelled as cross-test interference by an earlier tick, and the reason
+  that went unnoticed for so long is the migration panic — it killed all 29 walks
+  before any of them could be seen failing for its own reason. Established by
+  stashing only this tick's work on top of the migration fix: the baseline is
+  **25 passed / 3 failed**, the same three names, so nothing here regressed and
+  one walk was added. `tsc --noEmit` in `apps/admin` exits 0 (a `pnpm typecheck`
+  cache hit is not evidence — the new `tenant-picker.tsx` was untracked, so the
+  real check was run directly).
+- **The criterion, and what "naming the field" actually meant.** The sentence
+  already contained the string `organization_id`, so an assertion on the message
+  would have passed against an error no client could act on. The missing part was
+  the structured `details.field`, which is what lets a panel put a control *next
+  to the failing input*. `organization_required()` is now the single refusal every
+  scope-resolving route shares, and the two refusals a client renders differently
+  are kept apart deliberately and unit-proved: a missing tenant names a field
+  (it is the caller's problem to fix), `cross_organization` names none (a picker
+  there would only reproduce the same refusal). `TenantPicker` renders a labelled
+  organization select only for a subject with no organization of its own, and is
+  absent in `global` scope, where "no tenant" is the point.
+- **Environment, twice over.** `rustc` was missing from the box — the
+  `0-byte`/vanish class of bug again, with `/root/.rustup/toolchains/` empty and
+  `rustup toolchain install` reporting "unchanged" and doing nothing. `rustup
+  component add rustc` restored 1.98.1 (first attempt died on a download rename).
+  **A suite database persists between runs**, so renumbering migrations orphans
+  what the old numbering recorded and produces a second, phantom failure
+  (`VersionMissing(30)`) until the database is dropped.
+- **Owner action.** `/mnt/apopic` reached **100 % (215 M free)** with eight
+  sibling `qa/run.sh` processes running. The QA pass was deferred for the second
+  time in three ticks and the work was committed and pushed first. This branch
+  reclaimed only its own `target/debug/{incremental,build}` (~1.9 G). The eight
+  worktrees still hold ~25 GB of `target/` between them; writers reclaiming each
+  other's caches is not a sustainable answer.
+- **Next.** The last unticked criterion (line 222) is the whole-`cargo test
+  --workspace` + `pnpm build` + QA walkthrough gate, and the mobile pass at
+  390x844 over the member drawer, the Members card list and the
+  Settings/Modules/Billing/Audit tabs is still unproven. Both are blocked on the
+  same thing: **run the pass when `/mnt/apopic` has real headroom and few sibling
+  passes.** Then REQ-005 closes and the queue moves to REQ-011 (CDN/edge).
