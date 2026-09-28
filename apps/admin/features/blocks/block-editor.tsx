@@ -421,6 +421,16 @@ export function BlockEditor() {
           setSelected([...selected, (parent.children?.length ?? 0)]);
           return appendChild(current, selected, block);
         }
+        // A Columns block holds Column blocks and nothing else, and the API says so
+        // (`block_child_not_allowed`). Appending a heading as a direct child made a tree the
+        // server refuses, which an author can only discover by trying to publish — the editor
+        // accepted a structure the renderer cannot draw. `column` is a `structure_only` type, so
+        // it is never in the insert panel; the only honest move is to put the block after the
+        // Columns block, at the level the author is actually working on.
+        if (parent?.type === "columns") {
+          setSelected([...selected.slice(0, -1), selected[selected.length - 1] + 1]);
+          return insertAfter(current, selected, block);
+        }
         if (parent?.children && !definition.container) {
           setSelected([...selected, parent.children.length]);
           return appendChild(current, selected, block);
