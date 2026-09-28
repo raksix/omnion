@@ -203,7 +203,10 @@ export function LeadsView() {
             filed at most once, whatever reads the bus.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        {/* `w-full` before `sm:` and a `min-w-0` search: at 390 px a fixed 224 px input plus
+            two labelled buttons is wider than the screen, and the whole document scrolls
+            sideways. The buttons wrap onto their own row instead. */}
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           <input
             id="crm-leads-search"
             ref={searchRef}
@@ -211,7 +214,7 @@ export function LeadsView() {
             onChange={(event) => setSearch(event.target.value)}
             placeholder="Search a name, an address or a form"
             aria-label="Search the lead inbox"
-            className="w-56 rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent"
+            className="min-w-0 flex-1 rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent sm:w-56 sm:flex-none"
           />
           <button
             type="button"
@@ -513,7 +516,10 @@ function LeadRouting({
             </p>
           ) : null}
 
-          <div className="flex flex-wrap items-end gap-3">
+          {/* `grid` rather than a wrapping flex row: a flex row wraps but two 224 px inputs
+              side by side still ask for more than a phone has, and a wrapping flex keeps the
+              *unbreakable* items on one line. A grid cell can shrink, so nothing overflows. */}
+          <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2 lg:flex lg:flex-wrap">
             <Toggle
               id="crm-leads-create-contact"
               label="Create a contact"
@@ -536,7 +542,7 @@ function LeadRouting({
                 value={draft.stage_id}
                 onChange={(event) => setDraft((d) => ({ ...d, stage_id: event.target.value }))}
                 placeholder="First open stage"
-                className="w-56 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent"
+                className="w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent lg:w-56"
               />
             </label>
 
@@ -549,7 +555,7 @@ function LeadRouting({
                   setDraft((d) => ({ ...d, repeat_stage_id: event.target.value }))
                 }
                 placeholder="Same as a new lead"
-                className="w-56 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent"
+                className="w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent lg:w-56"
               />
             </label>
 
@@ -562,7 +568,7 @@ function LeadRouting({
                   setDraft((d) => ({ ...d, source_label: event.target.value }))
                 }
                 placeholder="form"
-                className="w-40 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent"
+                className="w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] outline-none focus:border-accent lg:w-40"
               />
             </label>
 
@@ -622,7 +628,7 @@ function Toggle({
           onChange={(event) => onChange(event.target.checked)}
           className="size-3.5 accent-[var(--accent)]"
         />
-        <span className="text-[11.5px] text-muted">{hint}</span>
+        <span className="min-w-0 text-[11.5px] text-muted">{hint}</span>
       </span>
     </label>
   );
