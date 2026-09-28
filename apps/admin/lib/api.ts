@@ -107,6 +107,105 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
+/**
+ * Download a CSV endpoint as a file.
+ *
+ * A separate function rather than a `format=csv` flag on the JSON caller, because the two cannot
+ * share a body parser: the JSON path runs every response through `readJson`, which turns a CSV
+ * into `null` and a `Blob` into a promise that never resolves. The error path *is* shared — a
+ * refusal is JSON whatever the request asked for, so the caller still gets the API's own code and
+ * message rather than a failed download.
+ */
+export async function downloadCsv(
+  path: string,
+  filename: string,
+): Promise<{ filename: string; rows: number }> {
+  let response: Response;
+  try {
+    response = await fetch(path, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const body = (await readJson(response)) as ErrorBody;
+    throw new ApiError(
+      response.status,
+      body.error?.code ?? "unknown_error",
+      body.error?.message ?? `The API answered with status ${response.status}.`,
+      body.error?.details ?? null,
+    );
+  }
+
+  const text = await response.text();
+  const url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  // Revoked on the next tick rather than immediately: Firefox cancels an in-flight download whose
+  // URL disappears in the same task, and the file then lands empty.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+
+  return {
+    filename,
+    rows: text.split("\n").filter((line) => line.trim() !== "").length - 1,
+  };
+}
+
+/** One row of the Audit tab. */
+export type OrganizationAuditEntry = {
+  id: number;
+  action: string;
+  actor_type: string;
+  actor_user_id: string | null;
+  /** Display name of the actor, resolved server-side so the feed needs no second request. */
+  actor_name: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  metadata: unknown;
+  ip_address: string | null;
+  created_at: string;
+};
+
+/** The Audit tab's payload: the rows, the filter's choices and the filtered count. */
+export type OrganizationAuditPayload = {
+  organization_id: string;
+  entries: OrganizationAuditEntry[];
+  actions: string[];
+  total: number;
+};
+
+/** The audit filters the tab offers. Empty strings mean "no filter", not "matches nothing". */
+export type OrganizationAuditFilters = {
+  action?: string;
+  actor?: string;
+  since?: string;
+};
+
+/**
+ * Read one organization's audit trail.
+ *
+ * The action list comes back with the rows on purpose: the filter then offers what this tenant
+ * has actually done, and cannot drift from the platform as actions are added.
+ */
+export async function fetchOrganizationAudit(
+  organizationId: string,
+  filters: OrganizationAuditFilters = {},
+): Promise<OrganizationAuditPayload> {
+  const params = new URLSearchParams();
+  if (filters.action) params.set("action", filters.action);
+  if (filters.actor) params.set("actor", filters.actor);
+  // The date input speaks `YYYY-MM-DD`; the API speaks RFC 3339. Converting here keeps the
+  // server's parser strict — a half-understood date is a filter that quietly matches nothing.
+  if (filters.since) params.set("since", `${filters.since}T00:00:00Z`);
+  const query = params.toString();
+
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/audit${query ? `?${query}` : ""}`,
+  );
+}
+
 /** What a password check answered: a session, or the second factor it still needs. */
 export type LoginOutcome =
   | { status: "signed-in"; user: User }
@@ -3419,6 +3518,39 @@ export async function createOrganizationInvitation(
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+/**
+ * The invitations waiting for an owner, oldest first.
+ *
+ * The `owner_approval` queue is a work list, so the panel asks for it directly instead of
+ * filtering the whole invitation history on the client — a tenant that has invited two hundred
+ * people would otherwise download two hundred rows to render the three that need a decision.
+ */
+export async function fetchQueuedOrganizationInvitations(
+  organizationId: string,
+): Promise<{ organization_id: string; invitations: OrganizationInvitation[] }> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/queue`,
+  );
+}
+
+/**
+ * Release a queued invitation and receive its single-use link — once.
+ *
+ * The link is minted by the release, not recovered from the create: a queued invitation never
+ * had a working link, so this is the only moment one exists and it is never readable again.
+ */
+export async function releaseQueuedOrganizationInvitation(
+  organizationId: string,
+  invitationId: string,
+): Promise<CreatedOrganizationInvitation> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/${encodeURIComponent(
+      invitationId,
+    )}/release`,
+    { method: "POST" },
+  );
 }
 
 /** Revoke a pending invitation. */
