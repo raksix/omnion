@@ -2855,3 +2855,69 @@ published carries the slug `qa-block-page` on the `QA Site` it was created in. T
 harness address or a site-scoping defect, and it is the only thing between REQ-063 and `done`. The
 verifying run against `17073c5` is in flight; read its `netFailures` before deciding. Do **not** run
 a full pass to check it — `--only=block-editor` answers the same question in ten minutes.
+
+
+## 2026-09-28 — REQ-063 slice 4: acceptance 17, the last number, and the defect behind it
+
+**What.** The `publicRendered` check that had been carried as "harness addressing or a site-scoping
+defect" for three ticks is closed, and the chase found one real product defect on the way.
+
+**Proof.** `--only=block-editor` against `QA_STACK=w2` (`qa-artifacts/20260928-195750-fin`):
+
+- `errors 0`, `blockCount 5`, `published true`, **`publicRendered true`**,
+  `publicHasImage true`, `publicHasSemanticFigure true`, `semanticTags ["figure","h1","h2"]`
+- `headingGotItsOwnText true`, `clearedAfterFix true`, `publishEnabledAfterFix true`
+- `columnsInserted`/`addColumnOffered`/`columnCountGrew`/`columnsStillValid` all true
+  (`columnCount 2 -> 3`), `breadcrumbReachesNested true`, `noColumnErrors true`
+- `historyCoversFifty true` (`historyDepthAfterFifty 72`), `saveKeptHistory true`,
+  `undoRestoredTree true`, `redoRestoredBlocks true`, `unwindLandedOnSavedTree true`
+- `visibilityTarget heading`, `hideOnBefore none -> hideOnAfter mobile`, `hiddenBadge true`
+  ("Not on phones"), `hiddenBadgeCleared true`
+- `revisionRows 4`, `diffEntries 1`, `changedRowNamesProp true`, `baseSwitched true`,
+  `diffRecomputed true`, `previewToastNamesRevision true`, `previewLiveUnchanged true`
+- Patterns: `inserted`/`savedAfterInsert`/`landedInEditor`/`sampleContentIntact` all true,
+  `templateBlocksOnPage 11`, all five seeded templates present
+- `BLOCK_EDITOR_MISSING=none`; `netFailures` is **1**, a `404` on the pass's deliberately fake
+  media UUID — the image block refusing to load an asset that does not exist.
+- `pnpm typecheck` → 2/2.
+
+The two remaining `false` values are the correct answer, not a gap: `addColumnDisabledAtMax false`
+because the block held 2 of 4 columns so the control was enabled and the count grew to 3, and
+`outlineWarningPublishDisabled false` because the heading-order warning is advisory — the bar read
+`errors 0, warnings 5` and Publish was never disabled by it.
+
+**What was actually wrong, none of it the renderer.** Three harness defects, each of which read
+as a product defect:
+
+1. The depth pass undid until the undo button was disabled, which walks *past* the tree the save
+   wrote onto the tree the editor was opened on — then saved and published that, so the public
+   render drew a page with no blocks. `eeaf96f`.
+2. `--only=block-editor` skips `run.sh`, and `run.sh` owns the database reset. The fixed slug
+   collided with the pass's own previous run, so the create answered `409` and the pass drove the
+   page an earlier run had left behind. `eeaf96f`.
+3. `#block-prop-text` is rendered by every text-bearing block, so it is whichever block is
+   selected — and by the time the pass filled the heading's text, the selection was on a Columns
+   block, which has no `text` prop and renders no such field. The fill reported success, the
+   heading stayed "Untitled heading", and that `block_prop_required` blocked the publish the pass
+   then reported as broken. `0e920ac`, `ce572a2`.
+
+**The one product defect.** With a Columns block selected, inserting any block appended it as a
+direct child of `columns`; the API refuses that with `block_child_not_allowed`, so the editor
+accepted a structure the renderer cannot draw and the author found out by trying to publish. A
+Columns block now puts the block *after* itself, which is the same result a person gets by clicking
+outside the container first. `e31505d`.
+
+**Also in the harness.** The column count control needs the container's own select control clicked
+(a container row holds its children, so the click lands on a nested block) `03717f9`; the column
+count is asserted on the block it describes rather than page-wide `4409692`; the visibility badge
+step names the block it sets the setting on and the product now exposes selection as a data
+attribute instead of a Tailwind class `d82b841`, `860ee6e`, `51a4593`.
+
+**Not done, deliberately.** The *full-pass* half of criterion 17 — zero high findings at 1440 px
+and 390 px — was not re-measured. `free -g` showed 3 GB available on a box five writers share and
+a full pass needs roughly 1.5 GB of browser heap plus its screenshots, so it was not started
+rather than started and killed halfway. The next tick runs it with `QA_SLOTS=0` and
+`QA_SHOT_MODE=viewport`.
+
+**Next.** REQ-064 (CMS depth pack: menus, forms, SEO toolkit, redirects, scheduled publishing,
+comments, newsletter, memberships).
