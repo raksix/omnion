@@ -795,6 +795,55 @@ pub async fn create_silence(
     .await
     .map_err(audit_error)?;
 
+    // The request lists `observability.silence.created` as emitted, and this is the only place a
+    // silence is created — so this is the only place the event can come from. A silence is the
+    // one observability event that belongs to a TENANT and names a user: it is somebody's
+    // decision about their own instance, so the fan-out reaches that organization's webhook
+    // endpoints and `actor_user_id` is the person who pressed the button.
+    //
+    // The rule's NAME travels with it so a subscriber need not query the API to make the event
+    // readable — an audit row is not a subscription payload, and the one free-text field in this
+    // payload is the operator's own reason, which the request already requires to exist.
+    let rule_name = match row.rule_id {
+        Some(rule_id) => omnion_telemetry::alerts::find_rule(state.db().pool(), rule_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|rule| rule.name),
+        None => None,
+    };
+    let silence_event = omnion_telemetry::SilenceCreated {
+        silence_id: row.id,
+        rule_id: row.rule_id,
+        rule_name,
+        reason: row.reason.clone(),
+        ends_at: row.ends_at.format(&Rfc3339).unwrap_or_default(),
+    }
+    .payload();
+    // An account with no named organization gets a platform-wide event, which fans out to
+    // nobody and is still recorded. The alternative — inventing an organization id — would put a
+    // tenant's silence on somebody else's endpoint.
+    match session.user.organization_id {
+        Some(organization_id) => {
+            omnion_telemetry::events::try_emit_for_organization(
+                state.db().pool(),
+                omnion_telemetry::events::SILENCE_CREATED,
+                organization_id,
+                session.user.id,
+                silence_event,
+            )
+            .await;
+        }
+        None => {
+            omnion_telemetry::events::try_emit(
+                state.db().pool(),
+                omnion_telemetry::events::SILENCE_CREATED,
+                silence_event,
+            )
+            .await;
+        }
+    }
+
     Ok(Json(SilenceView::from(alerts::Silence {
         id: row.id,
         rule_id: row.rule_id,
@@ -1003,6 +1052,67 @@ impl ObservabilitySettingsInput {
     }
 }
 
+/// What changed between two `log_level_overrides` objects, one entry per module.
+///
+/// A diff and not a dump, for two reasons the request names. An event per save would fire on
+/// every autosave of a form nobody edited; an event per module that moved is the one an operator
+/// can act on. And the diff is over the raw objects, so an entry the write DROPPED because its
+/// expiry passed is reported as a move to the configured default — which is the fact the
+/// acceptance line's "expires back to the configured default" is actually about.
+///
+/// A malformed entry is read leniently rather than refused: the row it came from is already
+/// stored and this is an event describing it, and an event that refuses to describe a real row
+/// is worse than one that names the level it can read. The write path validates properly, so a
+/// row like that can only exist if it was edited by hand.
+fn level_changes(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Vec<omnion_telemetry::LogLevelChanged> {
+    let read = |value: &serde_json::Value, target: &str| {
+        value
+            .get(target)
+            .and_then(|entry| entry.get("level"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut targets: Vec<&str> = before
+        .as_object()
+        .map(|map| map.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if let Some(map) = after.as_object() {
+        for key in map.keys() {
+            if !targets.contains(&key.as_str()) {
+                targets.push(key);
+            }
+        }
+    }
+    targets.sort_unstable();
+
+    targets
+        .into_iter()
+        .filter_map(|target| {
+            let previous = read(before, target);
+            let current = read(after, target);
+            // The expiry alone is not a level change: a raise whose window was extended is the
+            // same raise, and an operator extending a silence-like window should not see an
+            // event for it.
+            if previous == current {
+                return None;
+            }
+            Some(omnion_telemetry::LogLevelChanged {
+                target: target.to_owned(),
+                previous: previous.unwrap_or_else(|| "default".to_owned()),
+                current: current.unwrap_or_else(|| "default".to_owned()),
+                expires_at: after
+                    .get(target)
+                    .and_then(|entry| entry.get("expires_at"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
 /// `GET /api/v1/observability/settings`.
 pub async fn read_observability_settings(
     State(state): State<AppState>,
@@ -1195,8 +1305,56 @@ pub async fn save_observability_settings(
     // The registry and the sampler are told immediately, not at the next restart: the request's
     // reason for the screen is "debugging does not need a redeploy", and a setting that only
     // takes effect on restart is a setting that fails at the one moment it is needed.
+    //
+    // The ratio is read BEFORE the write and after it, so the event says what MOVED rather than
+    // what is now. An event carrying only the new value cannot distinguish an operator raising
+    // the ratio from the panel saving a form that never changed it — and a `sampling.changed`
+    // per autosave would be the second.
+    let previous_ratio: f64 = sqlx::query_scalar(
+        "select sampling_ratio from obs_log_settings where id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(map_error)?;
+    let previous_overrides: serde_json::Value = sqlx::query_scalar(
+        "select log_level_overrides from obs_log_settings where id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(map_error)?;
+    // Compared against the RAW previous value, not against a re-resolved copy of it: this diff
+    // exists to say what the write changed, and re-resolving the previous row would drop an
+    // entry that is still there and report the removal as nothing. The expired entries the write
+    // dropped therefore show up here as `previous` with no `current` — which is what actually
+    // happened.
+    let before_overrides = previous_overrides;
+
     omnion_telemetry::metrics::global().set_global_budget(input.cardinality_budget as usize);
     omnion_telemetry::tracing_spine::set_sampling_ratio(input.sampling_ratio);
+
+    if (previous_ratio - input.sampling_ratio).abs() > f64::EPSILON {
+        omnion_telemetry::events::try_emit(
+            pool,
+            omnion_telemetry::events::SAMPLING_CHANGED,
+            omnion_telemetry::SamplingChanged {
+                previous: previous_ratio,
+                current: input.sampling_ratio,
+            }
+            .payload(),
+        )
+        .await;
+    }
+    // One event per module whose level actually moved, and none for a module whose raise merely
+    // had its expiry edited. `previous` and `current` both come from the resolved form, so an
+    // expired override reads as "gone" rather than as a raise to a level nobody asked for.
+    for change in level_changes(&before_overrides, &stored) {
+        omnion_telemetry::events::try_emit(
+            pool,
+            omnion_telemetry::events::LOG_LEVEL_CHANGED,
+            change.payload(),
+        )
+        .await;
+    }
 
     omnion_audit::record(
         pool,

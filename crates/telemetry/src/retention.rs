@@ -44,7 +44,12 @@ use crate::{alerts, store, trace_store};
 pub const PRUNED_FAMILY: &str = "omnion_retention_pruned_rows_total";
 
 /// The event a sweep emits when it removed something.
-pub const PRUNED_EVENT: &str = "observability.retention.pruned";
+///
+/// An alias, not a second constant: `crate::events::RETENTION_PRUNED` is the one place the eight
+/// documented names live, and a copy of this string here is a name that can be changed in one
+/// file and not the other — which is how the other seven came to be documented and dead in the
+/// first place.
+pub const PRUNED_EVENT: &str = crate::events::RETENTION_PRUNED;
 
 /// The default sweep interval: once a day.
 pub const SWEEP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -340,13 +345,11 @@ fn record(pool: &PgPool, report: &PruneReport) {
 /// delete old rows because a subscriber's inbox is unreachable would be a worse outcome than a
 /// missed notification.
 pub async fn emit_pruned(pool: &PgPool, payload: serde_json::Value) -> Result<(), crate::TelemetryError> {
-    omnion_events::bus::emit(
-        pool,
-        omnion_events::NewEvent::new(PRUNED_EVENT).payload(payload),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| crate::TelemetryError::Telemetry(format!("the retention event failed: {error}")))
+    crate::events::emit(pool, crate::events::RETENTION_PRUNED, payload)
+        .await
+        .map(|report| {
+            tracing::debug!(event_id = report.event.id, "the retention event was recorded");
+        })
 }
 
 #[cfg(test)]
@@ -476,6 +479,7 @@ mod tests {
 
     #[test]
     fn the_event_name_is_the_one_the_request_documents() {
+        assert_eq!(PRUNED_EVENT, crate::events::RETENTION_PRUNED);
         assert_eq!(PRUNED_EVENT, "observability.retention.pruned");
     }
 

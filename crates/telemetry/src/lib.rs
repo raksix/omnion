@@ -35,6 +35,7 @@ pub mod alert_loop;
 pub mod alerts;
 pub mod context;
 pub mod error;
+pub mod events;
 pub mod exporter;
 pub mod exporter_flush;
 pub mod lifecycle;
@@ -59,7 +60,10 @@ pub use lifecycle::{DrainOutcome, Lifecycle, ShutdownSummary, drain_and_flush};
 pub use metric_catalog::FamilyDeclaration;
 pub use metrics::{FamilySpec, MetricKind, Registry, global as metrics_registry};
 pub use redact::{REDACTED, redact_fields, redact_text};
-pub use retention::{PRUNED_EVENT, PruneReport, Retention};
+pub use events::{
+    AlertTransition, ExporterTransition, LogLevelChanged, SilenceCreated, SamplingChanged,
+};
+pub use retention::{PruneReport, Retention};
 pub use schema::{LogEntry, LogLevel, LogSource, NewLogEntry};
 pub use trace_store::TraceFilter;
 pub use tracing_span::{
