@@ -70,6 +70,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
+pub mod ai_routing;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
@@ -631,6 +632,25 @@ pub fn router(state: AppState) -> Router {
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
 
+    // Task routing and feature overrides (REQ-098 slice 2). Reading a route map is the same
+    // knowledge as the provider list — which models exist and what they can do — so it is
+    // `ai.providers.read`. *Rewriting* it is `ai.settings.manage`, a separate power on purpose:
+    // a reader can see how traffic is routed and still not be able to redirect it.
+    //
+    // The dry run is a `read` and does nothing but read: it resolves a hypothetical request
+    // against the stored maps, so an operator can ask "what would this do today" without
+    // spending quota or changing a row.
+    let ai_routing = get(ai_routing::get_routing)
+        .layer(guards::require(&state, "ai.providers.read"))
+        .merge(put(ai_routing::put_routing).layer(guards::require(&state, "ai.settings.manage")));
+    let ai_routing_overrides = get(ai_routing::get_overrides)
+        .layer(guards::require(&state, "ai.providers.read"))
+        .merge(
+            put(ai_routing::put_override).layer(guards::require(&state, "ai.settings.manage")),
+        );
+    let ai_routing_preview =
+        post(ai_routing::preview_routing).layer(guards::require(&state, "ai.providers.read"));
+
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
     // `webhooks.manage`, and the platform's event feed is read with `events.read`. Every
@@ -1013,6 +1033,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
+        .route("/ai/routing", ai_routing)
+        .route("/ai/routing/overrides", ai_routing_overrides)
+        .route("/ai/routing/preview", ai_routing_preview)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)

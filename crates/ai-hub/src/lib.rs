@@ -25,6 +25,7 @@ pub mod model;
 pub mod protocol;
 pub mod router;
 pub mod routing;
+pub mod routing_store;
 pub mod store;
 
 pub use catalog::{
@@ -65,4 +66,8 @@ pub use store::{
     apply_discovery, create_provider, delete_provider, discovery_diff, failover_chain,
     find_default_model, find_model, find_model_by_key, find_provider, find_provider_by_name,
     list_models, list_providers, record_health, replace_models, update_model, update_provider,
+};
+pub use routing_store::{
+    CandidateInput, ScopeRoutes, TaskRouteView, clear_task_map, features, load_maps,
+    organization_of_site, read_scope, replace_task_map, requirements, set_override,
 };
