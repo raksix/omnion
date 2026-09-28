@@ -4832,9 +4832,24 @@ async function runBlockEditorDepth(page, report) {
   // The heading's text prop: `heading`'s first prop is the text, and the panel generated it
   // from the schema, so it is the field the schema names.
   // The heading was selected as it landed, so its text field is the one the schema names.
+  //
+  // `#block-prop-text` is NOT a name — every text-bearing block renders that id, so it is
+  // whichever block happens to be selected. Filling it without re-selecting the heading types
+  // into somebody else's paragraph and leaves the heading as "Untitled heading", which is
+  // `block_prop_required` and blocks the publish. That is what this pass did for two runs: the
+  // fill "succeeded", the heading stayed empty, and the publish that follows was refused by an
+  // error the pass itself had created. So the step asserts the heading's own text afterwards.
   const headingField = page.locator("#block-prop-text").first();
   await headingField.fill("QA heading from the walkthrough").catch(() => {});
   await page.waitForTimeout(900);
+  // Re-select the heading from the canvas and read its own body: the field is a claim about
+  // what was typed, the canvas is the claim about where it landed.
+  await page.locator('[data-block-canvas-block=heading]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.headingGotItsOwnText =
+    /QA heading from the walkthrough/.test(
+      (await page.locator('[data-block-canvas-block=heading]').first().innerText().catch(() => "")) || "",
+    );
   steps.inspectedValue = (await page.locator('[data-block-canvas-block=heading]').first().innerText().catch(() => "")).replace(/\s+/g, " ").trim();
   steps.outlineAfterEdit = (
     await page.locator("[data-block-outline-row]").first().innerText().catch(() => "")
@@ -5242,6 +5257,12 @@ async function runBlockEditorDepth(page, report) {
   steps.redoRestoredBlocks = blocksAfterRedo > blocksAfterUndoAll;
   steps.historyDepthAfterRedo = depthAfterRedo;
   steps.blocksAfterRedo = blocksAfterRedo;
+  // Redo replays the steps the pass just made, and one of them inserted a *second* Columns
+  // block. Nothing is wrong with that tree — an unfilled Columns is a warning, not an error —
+  // but the pass then unwinds and saves THAT, and the published page carries a layout nobody
+  // built. Recording the structure of the tree the redo left behind makes the next step's
+  // "it came back to the saved tree" a claim about the right tree.
+  steps.columnsAfterRedo = await page.locator("[data-block-columns]").count();
   await shot(page, "page-block-editor-redone");
   note("redid the history and the blocks came back");
 
