@@ -19,7 +19,16 @@ export function statusLabel(status: string): string {
   if (!status) {
     return "unknown";
   }
-  return status.charAt(0).toUpperCase() + status.slice(1);
+  // Underscores become spaces and every word is capitalised, because the API's vocabulary is
+  // `snake_case` and this is the one place that vocabulary reaches a screen. A status the panel
+  // has never seen (`awaiting_approval`) used to render as `Awaiting_approval`, which reads as a
+  // leaked token rather than a state — and the value was correct, so nothing else would have
+  // caught it. Splitting on `_` and `-` covers both, since scope and role keys use dashes too.
+  return status
+    .split(/[_-]/)
+    .filter((word) => word.length > 0)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 /** Render a byte count the way the panel shows file sizes. */
