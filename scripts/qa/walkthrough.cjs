@@ -507,7 +507,13 @@ function sampleValueFor(meta) {
 }
 
 async function fillSubtree(page, selector) {
-  return page.evaluate((sel) => {
+  // `SAMPLE_SLUG` is a Node binding. Everything inside this callback is *serialized and run in
+  // the page*, where no Node scope exists — referencing it there is a `ReferenceError` the moment
+  // a form grows an input whose key matches `/slug|key/`. The slug is therefore passed in as
+  // data, the same way `creds` is passed at line 290. It only surfaced now because the first
+  // form with a slug-ish field is the newest screen, and every earlier pass died on the crash
+  // above before reaching one.
+  return page.evaluate(({ sel, sampleSlug }) => {
     const root = document.querySelector(sel);
     if (!root) return [];
     const filled = [];
@@ -536,7 +542,7 @@ async function fillSubtree(page, selector) {
       else if (el.type === "password") value = "Sample-Passw0rd!";
       else if (el.type === "url" || /url|endpoint/.test(key)) value = "https://api.omnion.test/v1";
       else if (el.type === "number") value = "42";
-      else if (/slug|key/.test(key)) value = SAMPLE_SLUG;
+      else if (/slug|key/.test(key)) value = sampleSlug;
       else if (/title|name/.test(key)) value = "QA Sample";
       else if (el.tagName === "TEXTAREA") value = "QA sample text written by the automated walkthrough.";
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -546,7 +552,7 @@ async function fillSubtree(page, selector) {
       filled.push({ field: (el.id || el.name || el.type || "input").slice(0, 40), value });
     }
     return filled;
-  }, selector);
+  }, { sel: selector, sampleSlug: SAMPLE_SLUG });
 }
 
 async function clickPrimaryIn(page, selector) {
