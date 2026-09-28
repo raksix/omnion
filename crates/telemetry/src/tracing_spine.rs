@@ -284,6 +284,23 @@ impl TracingGuard {
         &self.record
     }
 
+    /// The record, mutable, so a caller that learns the route after the guard was built can name
+    /// the root span it started with a placeholder.
+    pub fn record_mut(&mut self) -> &mut TraceRecord {
+        &mut self.record
+    }
+
+    /// Force the trace to be sampled and record why.
+    ///
+    /// The request's sampling policy is "100 % of errors, a configurable ratio otherwise", and the
+    /// error is only known when the response is — a 5xx cannot be recognised at the edge, before
+    /// the handler has run. Without this the bias is a lie: a failing request that missed the
+    /// ratio is exactly the trace an operator needs and would not find.
+    pub fn force_sampled(&mut self, reason: SamplingDecision) {
+        self.sampled = true;
+        self.sampling = reason;
+    }
+
     /// Consume the guard and return the record, so a caller can write it itself.
     #[must_use]
     pub fn into_record(self) -> TraceRecord {

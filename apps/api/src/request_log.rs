@@ -39,7 +39,10 @@ use axum::http::{HeaderName, HeaderValue, Response};
 use axum::middleware::Next;
 use uuid::Uuid;
 
-use omnion_telemetry::{LogContext, LogLevel, LogSource, NewLogEntry, mint_trace_id, trace_id_from_header};
+use omnion_telemetry::tracing_spine::{self, TracingGuard};
+use omnion_telemetry::{
+    LogContext, LogLevel, LogSource, NewLogEntry, mint_trace_id, trace_id_from_header,
+};
 
 use crate::auth::CurrentSession;
 use crate::state::AppState;
@@ -77,9 +80,37 @@ pub async fn request_context(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
+    // The root span and the guard that will write it. Started HERE, before the context and the
+    // scope, so the trace exists for the whole request — a span started inside the scope would
+    // miss everything the middleware itself did, and the inbound `traceparent`'s sampling decision
+    // has to be made once, by the edge, so every child inherits it.
+    let inbound_parent = request
+        .headers()
+        .get(TRACEPARENT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(omnion_telemetry::TraceParent::parse);
+    // The route template is not known until the router has matched, so the span is started with a
+    // placeholder and named once it is — the name is set from `context.route` after the scope.
+    let (root_span, sampling) = tracing_spine::start_request(
+        &trace_id,
+        inbound_parent.as_ref(),
+        &method,
+        "(unmatched)",
+        request_id,
+        omnion_telemetry::tracing_spine::DEFAULT_SAMPLING_RATIO,
+    );
+    let root_span_id = root_span.span_id.clone();
+    let mut tracing_guard =
+        TracingGuard::start(root_span, request_id, sampling.is_sampled(), sampling);
+
     let mut context = LogContext::new_request(request_id)
         .with_trace(trace_id)
         .with_source("api");
+    // The root span's id goes into the task-local context, which is how a child span created
+    // deeper in the stack (a SQLx span, a queue publish) knows what to hang from. Without it
+    // `current_parent()` falls back to a fresh id and every child becomes its own trace root —
+    // which looks like a working trace in the index and is in fact a scatter of singletons.
+    context.span_id = Some(root_span_id.clone());
     context.method = Some(method.clone());
     context.host = host;
     context.version = Some(state.build().version.to_owned());
@@ -142,6 +173,21 @@ pub async fn request_context(
     context.status = Some(response.status().as_u16());
     context.duration_ms = Some(started.elapsed().as_millis() as i64);
 
+    // The route template is only known now, so the root span is renamed and the guard is told.
+    // An unmatched route is left as `(unmatched)` rather than given a plausible-looking path,
+    // which is the same rule the log line follows.
+    {
+        let record = tracing_guard.record_mut();
+        record.route = context.route.clone();
+        record.root_name = format!(
+            "HTTP {method} {}",
+            context.route.as_deref().unwrap_or("(unmatched)")
+        );
+    }
+    if let Some(route) = context.route.as_deref() {
+        tracing_guard.set_route(route);
+    }
+
     let mut response = response;
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         response
@@ -179,7 +225,10 @@ pub async fn request_context(
     // alerts on, and a family keyed by the exact code has a series per code per route per method
     // for no query anybody writes.
     {
-        let route = context.route.clone().unwrap_or_else(|| "(unmatched)".to_owned());
+        let route = context
+            .route
+            .clone()
+            .unwrap_or_else(|| "(unmatched)".to_owned());
         let status = context.status.unwrap_or(0);
         let class = if status >= 500 {
             "5xx"
@@ -206,6 +255,23 @@ pub async fn request_context(
     if let Err(error) = omnion_telemetry::store::write(&state_for_line.db().pool(), &entry).await {
         eprintln!("omnion-api: the request line could not be stored: {error}");
     }
+
+    // The trace is written LAST, after the log line, so a trace that is searchable always has its
+    // log line present too — an operator who finds a trace in the search can always see the line
+    // that explains it. A 5xx is re-decided here as an error: the sampling bias is "100 % of
+    // errors", and a request that failed has to be sampled even though the edge could not know
+    // that when it made the decision.
+    let status = response.status().as_u16();
+    if status >= 500 {
+        tracing_guard.force_sampled(omnion_telemetry::SamplingDecision::Error);
+    }
+    tracing_guard
+        .finish(
+            &state_for_line.db().pool(),
+            status,
+            context.duration_ms.unwrap_or(0),
+        )
+        .await;
 
     response
 }
