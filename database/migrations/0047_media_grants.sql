@@ -75,12 +75,32 @@ create table media_grants (
     constraint media_grants_effect_known
         check (effect in ('allow', 'deny')),
     constraint media_grants_effect_means_something
-        check (effect = 'allow' or can_read or can_write or can_delete or can_share),
-    constraint media_grants_unique_subject
-        unique (coalesce(folder_id, '00000000-0000-0000-0000-000000000000'::uuid),
-                coalesce(media_id, '00000000-0000-0000-0000-000000000000'::uuid),
-                subject_kind, subject_id)
+        check (effect = 'allow' or can_read or can_write or can_delete or can_share)
 );
+
+-- One row per (node, subject), as a **unique index** and not a table constraint.
+--
+-- The uniqueness spans `(folder_id, media_id)` where exactly one of the two is set, and
+-- that is the reason it is an index: a table-level `unique` constraint accepts *column
+-- names*, not expressions, so `unique (coalesce(...), coalesce(...), ...)` is a syntax
+-- error that takes the whole migration set down with it — the database then refuses every
+-- subsequent migration too, which reads like a total regression when it is one line.
+--
+-- The nil uuid is the sentinel: `media_grants_node_xor` guarantees one side is null, so
+-- the coalesce can never collapse a folder row onto a file row.
+--
+-- The expression here is duplicated in `crates/media/src/grants.rs` (`GRANT_CONFLICT`),
+-- because the writer's `on conflict` clause must name this exact index — a conflict target
+-- that does not match the index is a statement PostgreSQL refuses. Two files, two
+-- languages, so the drift is real; the API crate's `media_grants` suite pins the two
+-- against each other.
+create unique index if not exists media_grants_node_x_subject
+    on media_grants (
+        coalesce(folder_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        coalesce(media_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        subject_kind,
+        subject_id
+    );
 
 comment on table media_grants is
     'Folder and file access grants (REQ-010). A grant can only narrow: a `deny` refuses a '
