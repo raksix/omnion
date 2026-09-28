@@ -2509,3 +2509,103 @@ created for this run (`omnion_test_w4_t7c`), `--test-threads=1`. `cargo test -p 
 which is the last part of this slice. Then REQ-051's final three acceptance boxes: the
 empty/loading/error sweep across all six screens, the 390×844 mobile pass and the keyboard sheet.
 Only then may the status line read `done`, and that close tick runs the w4 QA browser pass.
+
+## 2026-09-28 — REQ-051 slice 4 part seven · a submitted form becomes a contact and a deal
+
+- **The merge first.** `origin/main` had moved 10 commits (the media file manager's presets and
+  transform pipeline, the QA slot holder). One conflict, in the append-only build log, resolved
+  as a union from the three merge stages rather than by hand — and verified two ways, because
+  the last merge of this file had silently dropped 112 lines on the main side: the per-side
+  `SequenceMatcher` reported a shortfall of 112, and a **multiset** comparison of every line on
+  both sides against the merged file reported **zero missing on either side**. The line count
+  checks out too: 1874 base + 572 ours + 66 theirs = 2512.
+- **What shipped.** **`modules/crm/src/leads.rs`** — the consumer, 1262 lines with 26 unit tests ·
+  **`database/migrations/0034_crm_form_leads.sql`** (0034 was free; every other wave's highest is
+  0033) · **`apps/api/src/routes/crm_leads.rs`** — three routes and two permission keys ·
+  **`apps/api/src/lead_runner.rs`** — the background drain, wired in `main.rs` behind
+  `OMNION_LEAD_RUNNER` · `CrmConfig` in the core config (`OMNION_LEAD_POLL_MS`,
+  `OMNION_LEAD_BATCH`) · the inbox screen and its API client in the admin app · ten integration
+  walks.
+- **The producer is not in this build, and that shaped everything.** The form builder is REQ-064
+  (wave 2b, another worktree). So the consumer is written against the **event contract** —
+  `form.submitted` — and not against a form table, a form crate or a form type. It does not
+  import anything from a module that may never be installed, and the day the builder lands it
+  has to emit one documented string and nothing else. The walks emit the event through
+  `omnion_events::bus::emit` — the same call REQ-064's public endpoint will make — rather than
+  inserting a row, so what is proved is the contract and not the SQL.
+- **Three decisions that are the whole feature.**
+  1. **Exactly once, by the bus identity.** `crm_form_leads.event_id` is the primary key. An
+     `exists` check followed by an insert would be the obvious way and it is wrong: there is a
+     window between the two statements in which a second API process reads the same bus and
+     creates a second contact. So the ledger row is inserted **first**, with
+     `on conflict do nothing`, and the **row count** decides who acts. One of the three walks
+     rewinds the cursor and drains the same event again to prove the claim, not just the cursor,
+     holds.
+  2. **Deliberately not in a transaction.** `create_contact` and `create_deal` take a `&PgPool`,
+     so wrapping the drain in one transaction would mean changing the module's own write
+     signatures to take an executor. Claiming first buys a different failure: a crash between the
+     claim and the write leaves a ledger row that says `rejected` and names why, which the inbox
+     shows. A rolled-back transaction shows nothing and replays forever. The `restate` call is
+     what keeps the ledger honest when the contact write itself fails.
+  3. **Routing is a row, not a constant.** `crm_lead_settings` holds two toggles, two stage ids
+     and a source label, seeded for every organization that has a pipeline and created on first
+     use for the ones that do not. A feature that only works after somebody has opened a
+     settings screen is a hidden feature; the `GET` deliberately does **not** create the row (a
+     read that writes turns a read into a change), and the drain's `load_settings` does.
+- **Four defects the unit tests found, all of them in the extractor, all of them in the *happy*
+  path of a form nobody had written yet.**
+  1. **A form with both a "Name" and a "First name" field lost the first name.** The key list
+     had `name` first, so the combined two-word value won and "Augusta King" became the first
+     name `Augusta King`. The more specific key has to be read first — a form that collects both
+     has told us which one it means.
+  2. **A 400-character "name" and a name of `---` both passed.** The explicit name fields were
+     not passed through the same `clamp_name` the guessed split used, so a hostile or broken
+     producer reached the first-name column and `create_contact` then refused the whole
+     submission with a message a person reading a form never typed. Refusing at extraction turns
+     that into an honest `rejected` row.
+  3. **A message longer than the note cap was dropped entirely** — losing exactly the person who
+     cared enough to write a lot. It is truncated at a word boundary now, as the doc promised.
+  4. **A submission with only an address produced a contact with no first name**, because the
+     contact table requires one and `validate_contact` refuses. The local part of the address is
+     the honest fallback: it is what the person typed in that field, and a human can correct it. A
+     placeholder like "Unknown" is not — it looks like data and reads as an error.
+- **The `create_deal` signature changed, and that is a decision worth naming.** It took
+  `user_id: Uuid` and used it as the owner fallback, so a submission would have been filed into
+  whoever happened to run the drain. That is a stranger's lead in a colleague's list. The
+  parameter is now `owner_fallback: Option<Uuid>` and the drain passes `None`: an unassigned deal
+  is a deal the board shows as needing an owner. The one other caller passes `Some(current.user.id)`.
+- **Ten walks, over the real router and the real bus.** A submitted form becomes a contact and a
+  deal with the deal titled in the person's own words · the same bus drained twice files nothing
+  twice, **including** after the cursor is rewound onto the same event · a repeat from a
+  differently-cased address is the same person and lands in the repeat stage while the first deal
+  stays in the first open column · a submission with nothing usable is kept, is `rejected`, and
+  **carries the sentence** · a submission with no organization is `orphaned` and is in nobody's
+  inbox · an organization that turned leads off records the submission and writes nothing · the
+  two keys are genuinely separate (a watcher may read the inbox and is refused when it tries to
+  reconfigure it), unauthenticated is `401`, and a foreign tenant's save does not touch ours · a
+  stage from another pipeline's organization is refused **by name** in `error.details.field` ·
+  a routing change is audited and announced exactly once, and the same body again is neither ·
+  and the two keys are in the catalogue and in the owner's role, and **not** handed to a CRM
+  manager by default.
+- **Proof.** `cargo test -p omnion-module-crm --lib` → **172/172** (146 before, 26 new).
+  `cargo test -p omnion-api --test crm` → **52/52** (42 before, 10 new) against a database
+  created for this run, `--test-threads=1`. `pnpm typecheck` → **2/2**. `cargo check --workspace`
+  clean. The walkthrough route list gained `/crm/leads` and a `runCrmLeadsDepth` pass.
+- **The QA browser pass, honestly.** It ran on the private `w4` stack (`:18083` / `:3103` /
+  `:3203`, database `omnion_qa_w4`, `QA_SLOTS=0`) and got through the whole route list **until the
+  Chromium tab died**: `Target page, context or browser has been closed` from the analytics routes
+  onward, so `crm-leads` and the depth passes after it were recorded as failures of the *tab*,
+  not of the screen. The box is running seven writers and three concurrent QA passes; free memory
+  was 262 MiB against 32 GiB with 17 GiB already in swap. The screen is in the route list and the
+  pass is registered, so the next run on a quieter box proves it; **this tick does not claim a QA
+  pass on the new screen**, and REQ-051 stays `in-progress` for that reason as well as for the
+  last three acceptance boxes.
+- **One more disk death, and the file it cost.** `/mnt/apopic` reached 100% mid-tick and a
+  `write_file` of `leads.rs` left it **zero bytes** while `git status` still showed it as
+  untracked. The lesson is the one from `git commit` failing the same way two ticks ago: on this
+  image a write can succeed, a truncate the file, and report nothing. The file was rewritten from
+  the content the compile errors had already corrected.
+- **Next.** REQ-051's **last three acceptance boxes**, which are the whole of what remains: the
+  empty/loading/error sweep across every screen, the 390×844 mobile pass and the keyboard sheet.
+  The inbox screen already answers `/` for the search and is in the route list, so the sweep is
+  about the six screens that predate it. The close tick runs the w4 QA pass.
