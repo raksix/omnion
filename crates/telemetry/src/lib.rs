@@ -29,18 +29,29 @@
 
 pub mod context;
 pub mod error;
+pub mod exporter;
 pub mod metric_catalog;
 pub mod metrics;
 pub mod redact;
 pub mod schema;
 pub mod store;
+pub mod trace_store;
+pub mod tracing_span;
 
 pub use context::{LogContext, mint_span_id, mint_trace_id, trace_id_from_header};
 pub use error::TelemetryError;
+pub use exporter::{
+    Batch, Collector as ExporterCollector, ExporterHealth, ExporterKind, FlushOutcome,
+};
 pub use metric_catalog::FamilyDeclaration;
 pub use metrics::{FamilySpec, MetricKind, Registry, global as metrics_registry};
 pub use redact::{REDACTED, redact_fields, redact_text};
 pub use schema::{LogEntry, LogLevel, LogSource, NewLogEntry};
+pub use trace_store::TraceFilter;
+pub use tracing_span::{
+    MAX_SPANS_PER_TRACE, Parent, SamplingDecision, Span, TraceContext, TraceParent, TraceRecord,
+    TraceSummary,
+};
 
 /// The cap on a single log line's `fields` object.
 ///
