@@ -2062,7 +2062,7 @@ left the slice-4 work uncommitted. The engine half was intact and correct; what 
 missing were the call sites a new column breaks. Recovered, finished and shipped.
 
 - **What shipped.** `rate_limit_per_hour` + `concurrency` + `last_error` on a rule
-  (`omnion_automation::limits`, migration `0029_automation_operations`), enforced in the
+  (`omnion_automation::limits`, migration `0031_automation_operations`), enforced in the
   **same transaction that starts the run** — the request's own risk note, and the reason
   `workflow_rate_windows` is created on first use and then read `for update`, so the row
   always exists and two callers serialise. The refusal names **which** bound refused

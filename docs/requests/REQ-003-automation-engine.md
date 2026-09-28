@@ -305,7 +305,7 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
      engine's next claim ends the run, so the clock and the state machine stay separate.
 4. **Operations polish** — rate limits and concurrency, endless-loop guard, templates gallery, versions/restore, audit tab, mobile and empty states, event emissions.
    *Done when:* the six templates run green on the QA database and the limit and loop guards each have a test that fails when the guard is removed.
-   *Engine + API half shipped* (`b130f0b`, `684741e`, `49f7ac2`; migration `0029_automation_operations`).
+   *Engine + API half shipped* (`b130f0b`, `684741e`, `49f7ac2`; migration `0031_automation_operations`).
    The bounds are enforced in the run-start transaction and the guard is installed beside the
    action handler. **The screen half shipped this tick** (`50902cc`): run history, the run detail
    with its step trace, the templates gallery, versions/restore and the Audit tab are built, and
@@ -313,7 +313,7 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
    five: the walkthrough has not yet walked these five screens, so "no untested screen" is not yet
    satisfied for them. The next tick extends `scripts/qa/walkthrough.cjs`'s routes and closes with
    a full `run.sh` pass — that pass is the gate, and until it runs the slice is not done.
-   Migration `0030_automation_versions`.
+   Migration `0032_automation_versions`.
 
 ### Risks / notes
 
