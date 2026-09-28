@@ -97,7 +97,9 @@ pub async fn request_context(
         &method,
         "(unmatched)",
         request_id,
-        omnion_telemetry::tracing_spine::DEFAULT_SAMPLING_RATIO,
+        // The runtime ratio, not the constant: the settings screen writes it, and a middleware
+        // pinned to the compile-time default would ignore every save the operator makes.
+        tracing_spine::sampling_ratio(),
     );
     let root_span_id = root_span.span_id.clone();
     let mut tracing_guard =

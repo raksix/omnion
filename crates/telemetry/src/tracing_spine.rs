@@ -45,6 +45,37 @@ pub const SERVICE_WORKER: &str = "worker";
 /// The default sampling ratio, matching the request's `sampling_ratio` default.
 pub const DEFAULT_SAMPLING_RATIO: f64 = 0.1;
 
+/// The process-wide sampling ratio.
+///
+/// A `OnceLock` rather than a plain `static f64` because the settings screen writes it at runtime
+/// and the request path reads it on every request: an `AtomicU64` holding the bits would be the
+/// alternative, and a bit pattern an operator can only set by converting a float to hex in a
+/// debugger is not a setting. `f64` has no interior mutability, and this is written exactly once
+/// per settings save — the cost of the write check is below the cost of the trace it guards.
+static SAMPLING_RATIO: std::sync::OnceLock<std::sync::RwLock<f64>> = std::sync::OnceLock::new();
+
+fn ratio_cell() -> &'static std::sync::RwLock<f64> {
+    SAMPLING_RATIO.get_or_init(|| std::sync::RwLock::new(DEFAULT_SAMPLING_RATIO))
+}
+
+/// The ratio the edge samples non-error traces at, clamped to `[0.0, 1.0]`.
+#[must_use]
+pub fn sampling_ratio() -> f64 {
+    *ratio_cell()
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Set the ratio. Out-of-range values are CLAMPED, not refused: this is the process-wide copy
+/// that the edge reads, and a value that cannot be stored at all would leave the edge on the old
+/// ratio with no error anywhere — the settings route is where the refusal and its field message
+/// live, and by the time a value reaches here it has already passed that.
+pub fn set_sampling_ratio(ratio: f64) {
+    *ratio_cell()
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = ratio.clamp(0.0, 1.0);
+}
+
 /// The parent linkage for a span started in the current task, if there is one.
 ///
 /// `None` outside any traced request. A caller that gets `None` must start a root — there is no
