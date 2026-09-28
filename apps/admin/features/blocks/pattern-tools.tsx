@@ -19,7 +19,7 @@ import type { BlockRegistry, ContentBlock, ContentPattern } from "@/lib/types";
 import { Library, Plus } from "lucide-react";
 
 import { ApiError, fetchPatternBlocks, fetchPatterns, savePattern } from "@/lib/api";
-import { useSession } from "@/lib/session";
+import { useContentTenant } from "@/lib/tenant";
 import { countBlocks, describeTree, keyFromName } from "./block-tree-summary";
 
 type Props = {
@@ -42,11 +42,17 @@ export function PatternTools({ registry, blocks, selectedPath, onInsert, onClose
   const [busyId, setBusyId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-    // See the pattern library: the Owner holds no primary tenant and has to name one.
-  const organizationId = useSession().user?.organization_id ?? undefined;
+    // See the pattern library: a tenant-addressed read has to name its tenant, and the platform
+    // Owner — the account every installation starts with — has none of its own.
+  const tenant = useContentTenant();
+  const organizationId = tenant.organizationId ?? undefined;
 
 const load = useCallback(() => {
     setError(null);
+    if (!organizationId) {
+      setPatterns([]);
+      return;
+    }
     fetchPatterns(undefined, organizationId)
       .then(setPatterns)
       .catch((cause: unknown) => {

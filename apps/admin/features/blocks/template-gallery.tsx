@@ -29,7 +29,8 @@ import {
 } from "@/lib/api";
 import { describeTree } from "./block-tree-summary";
 import { UseTemplateForm } from "./use-template-form";
-import { useSession } from "@/lib/session";
+import { useContentTenant } from "@/lib/tenant";
+import { TenantPicker } from "@/components/tenant-picker";
 
 /** A registry-shaped value for when the registry request failed. */
 const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
@@ -37,9 +38,11 @@ const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
 /** The template gallery. */
 export function TemplateGallery() {
   const router = useRouter();
-  // The Owner holds no primary tenant, so the gallery names one: see the pattern library for the
-  // same argument. Both screens are the ones a fresh installation opens first.
-  const organizationId = useSession().user?.organization_id ?? undefined;
+  // A tenant-addressed read has to name its tenant, and the first-run platform account has none of
+  // its own. Same argument as the pattern library; see `useContentTenant` for where the tenant
+  // comes from and why it is derived rather than typed.
+  const tenant = useContentTenant();
+  const organizationId = tenant.organizationId ?? undefined;
   const [templates, setTemplates] = useState<PageTemplateSummary[] | null>(null);
   const [registry, setRegistry] = useState<BlockRegistry | null>(null);
   const [sites, setSites] = useState<Site[]>([]);
@@ -63,6 +66,14 @@ export function TemplateGallery() {
 
   useEffect(() => {
     let cancelled = false;
+    // No tenant resolved yet means no tenant to name; asking anyway is the 400 this replaced.
+    if (!organizationId) {
+      setTemplates([]);
+      setSites([]);
+      return () => {
+        cancelled = true;
+      };
+    }
     fetchPageTemplates(organizationId)
       .then((listed) => {
         if (!cancelled) {
@@ -124,6 +135,19 @@ export function TemplateGallery() {
     return <LoadingTable columns={3} />;
   }
 
+  // The one state a member of a tenant cannot reach: a platform account that holds no tenant has
+  // no gallery to be empty. Saying "no templates yet" would describe a library never asked.
+  if (tenant.status === "unresolved") {
+    return (
+      <div className="rounded-xl border border-line bg-surface">
+        <EmptyState
+          title="No organization to read the gallery from"
+          hint="Templates belong to an organization, and this account is not in one. Open a site, or ask an owner for access to a tenant."
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-surface px-4 py-3">
@@ -134,7 +158,14 @@ export function TemplateGallery() {
             {templates.length} starting point{templates.length === 1 ? "" : "s"}
           </span>
         </div>
-        <label className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <TenantPicker
+            organizations={tenant.organizations}
+            organizationId={tenant.organizationId}
+            onSelect={tenant.selectOrganization}
+            testId="page-templates"
+          />
+          <label className="flex items-center gap-2">
           <span className="sr-only">Search the template gallery</span>
           <Search className="size-3.5 text-muted" aria-hidden />
           <input
@@ -145,7 +176,8 @@ export function TemplateGallery() {
             placeholder="Search templates…"
             className="w-52 rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/15"
           />
-        </label>
+          </label>
+        </div>
       </div>
 
       {visible.length === 0 ? (

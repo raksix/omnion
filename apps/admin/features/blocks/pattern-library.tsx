@@ -19,6 +19,7 @@ import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
+import { TenantPicker } from "@/components/tenant-picker";
 import { ApiError, deletePattern, fetchBlockRegistry, fetchPatterns } from "@/lib/api";
 import { countBlocks, describeTree, keyProblem } from "./block-tree-summary";
 
@@ -31,7 +32,7 @@ import { countBlocks, describeTree, keyProblem } from "./block-tree-summary";
  */
 const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
 import { PatternEditor } from "./pattern-editor";
-import { useSession } from "@/lib/session";
+import { useContentTenant } from "@/lib/tenant";
 
 /** One library row's local state: the editor's open/close plus a per-row error. */
 type RowState = { editing: boolean; error: string | null };
@@ -64,12 +65,19 @@ export function PatternLibrary() {
     };
   }, []);
 
-  // The Owner has no primary tenant, so the library names one explicitly. Without it this screen
-  // is the account's `400 organization_required` rather than its first screen.
-  const organizationId = useSession().user?.organization_id ?? undefined;
+  // A tenant-addressed read has to name its tenant, and the platform Owner has none of its own —
+  // the first-run account of every installation. Without this the library is the account's
+  // `400 organization_required` instead of its first content screen.
+  const tenant = useContentTenant();
+  const organizationId = tenant.organizationId ?? undefined;
 
   const load = useCallback(() => {
     setError(null);
+    // No tenant resolved yet means no tenant to name; asking anyway is the 400 this replaced.
+    if (!organizationId) {
+      setPatterns([]);
+      return;
+    }
     fetchPatterns(undefined, organizationId)
       .then((listed) => setPatterns(listed))
       .catch((cause: unknown) => {
@@ -125,6 +133,20 @@ export function PatternLibrary() {
 
   if (!patterns) {
     return <LoadingTable columns={3} />;
+  }
+
+  // A platform account that holds no tenant at all has nothing to read, and saying "no patterns
+  // yet" would be a lie about a library that was never asked. This is the one state a member of a
+  // tenant cannot reach, so it costs them nothing.
+  if (tenant.status === "unresolved") {
+    return (
+      <div className="rounded-xl border border-line bg-surface">
+        <EmptyState
+          title="No organization to read the library from"
+          hint="Patterns belong to an organization, and this account is not in one. Open a site, or ask an owner for access to a tenant."
+        />
+      </div>
+    );
   }
 
   const setRow = (id: string, next: RowState) =>
@@ -183,6 +205,12 @@ export function PatternLibrary() {
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <TenantPicker
+            organizations={tenant.organizations}
+            organizationId={tenant.organizationId}
+            onSelect={tenant.selectOrganization}
+            testId="patterns"
+          />
           {categories.length > 1 ? (
             <label className="flex items-center gap-2">
               <span className="sr-only">Filter by category</span>
