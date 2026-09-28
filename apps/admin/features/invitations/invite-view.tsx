@@ -45,13 +45,14 @@ export function InviteView({ token }: { token: string }) {
   const router = useRouter();
   const { status: sessionStatus, signOut } = useSession();
   const [preview, setPreview] = useState<{
-    organization_name: string;
-    organization_slug: string;
+    organization_name: string | null;
+    organization_slug: string | null;
     invited_by_name: string | null;
     role_name: string | null;
-    email_masked: string;
-    expires_at: string;
+    email_masked: string | null;
+    expires_at: string | null;
     usable: boolean;
+    reason: string | null;
   } | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -171,6 +172,34 @@ export function InviteView({ token }: { token: string }) {
     );
   }
 
+  // A token that was never issued is not an error any more: the preview answers `200` with
+  // `usable: false` and no organization, so the public endpoint cannot be walked to find out
+  // which organizations exist. The screen then has to say the same thing it says for a revoked
+  // link, and it must not print "invited to null" on the way — hence the separate branch rather
+  // than a fallback name in the template.
+  const isKnownInvitation = preview.usable || preview.organization_name !== null;
+
+  if (!isKnownInvitation) {
+    return (
+      <main className="flex min-h-screen items-center justify-center px-4">
+        <div className="flex max-w-md flex-col items-center gap-3 rounded-xl border border-line bg-surface px-6 py-10 text-center">
+          <h1 className="text-[15px] font-semibold">This invitation link is not valid</h1>
+          <p className="text-[13px] text-muted">
+            It has already been used, revoked or replaced — ask whoever invited you for a new
+            link.
+          </p>
+          <button
+            type="button"
+            onClick={() => router.replace("/login")}
+            className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+          >
+            Go to sign in
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="flex min-h-screen items-center justify-center px-4 py-10">
       <div className="flex w-full max-w-md flex-col gap-4 rounded-xl border border-line bg-surface p-6">
@@ -207,7 +236,7 @@ export function InviteView({ token }: { token: string }) {
                 <label className="flex flex-col gap-1.5 text-[12.5px] font-medium">
                   E-mail address
                   <input
-                    value={preview.email_masked}
+                    value={preview.email_masked ?? ""}
                     readOnly
                     className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[13px] font-normal text-muted outline-none"
                   />
@@ -265,14 +294,14 @@ export function InviteView({ token }: { token: string }) {
               )}
             </button>
             <p className="text-center text-[11.5px] text-muted">
-              The link works once and expires {formatTimestamp(preview.expires_at)}.
+              The link works once and expires {formatTimestamp(preview.expires_at ?? "")}.
             </p>
           </>
         ) : (
           <div className="flex flex-col items-center gap-3 rounded-lg border border-caution/40 bg-caution-soft px-4 py-6 text-center">
             <p className="text-[13px] text-caution">
-              This invitation has already been used, revoked or expired — it ran out{" "}
-              {formatTimestamp(preview.expires_at)}.
+              This invitation has already been used, revoked or expired
+              {preview.expires_at ? ` — it ran out ${formatTimestamp(preview.expires_at)}` : ""}.
             </p>
             <button
               type="button"

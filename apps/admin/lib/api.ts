@@ -4126,13 +4126,19 @@ export async function unbindDepartmentRole(
 
 /** The public preview of an invitation link. */
 export async function fetchInvitationPreview(token: string): Promise<{
-  organization_name: string;
-  organization_slug: string;
+  organization_name: string | null;
+  organization_slug: string | null;
   invited_by_name: string | null;
   role_name: string | null;
-  email_masked: string;
-  expires_at: string;
+  email_masked: string | null;
+  expires_at: string | null;
   usable: boolean;
+  /**
+   * Why the token cannot be used — one coarse value on purpose. `unusable` covers queued,
+   * revoked, expired and never-issued alike, so a public link cannot be walked to find out which
+   * organizations exist. The panel says "ask for a new one" rather than guessing.
+   */
+  reason: string | null;
 }> {
   return request(`/api/v1/invitations/${encodeURIComponent(token)}`);
 }
