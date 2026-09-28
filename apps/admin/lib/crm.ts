@@ -845,3 +845,147 @@ export function relativeTime(iso: string, at: Date = new Date()): string {
             : [Math.floor(magnitude / 2_629_800), "mo"];
   return seconds > 0 ? `in ${value}${unit}` : `${value}${unit} ago`;
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// The form → lead ingress (docs/requests/REQ-051 slice 4 part seven, REQ-117).
+// ---------------------------------------------------------------------------------------------
+
+/** What a submission became. The closed set the module's ledger can hold. */
+export type CrmLeadOutcome = "created" | "merged" | "rejected" | "orphaned" | "disabled";
+
+/** One submission the CRM has read, and what it did with it. */
+export type CrmLead = {
+  /** The bus identity of the submission — the inbox's own key for "the same thing". */
+  event_id: number;
+  form_id: string | null;
+  form_key: string | null;
+  outcome: CrmLeadOutcome;
+  /** The sentence shown under the outcome. */
+  detail: string | null;
+  /** The person, as the extractor read them. */
+  name: string;
+  email: string | null;
+  company_name: string | null;
+  /** The records this submission produced. */
+  contact_id: string | null;
+  deal_id: string | null;
+  company_id: string | null;
+  /** Every answer, as the form sent them. */
+  payload: Record<string, unknown>;
+  /** When the person submitted. */
+  occurred_at: string;
+  /** When the CRM read it. */
+  received_at: string;
+};
+
+/** One filter chip. */
+export type CrmLeadCount = { outcome: CrmLeadOutcome; count: number };
+
+/** The inbox payload: rows, chips and where the drain got to. */
+export type CrmLeadInbox = {
+  items: CrmLead[];
+  counts: CrmLeadCount[];
+  /** The highest bus id the drain has read. */
+  cursor: number;
+  generated_at: string;
+};
+
+/** The routing policy, plus whether the organization has a row yet. */
+export type CrmLeadSettingsView = {
+  settings: {
+    create_contact: boolean;
+    create_deal: boolean;
+    stage_id: string | null;
+    repeat_stage_id: string | null;
+    source_label: string;
+  };
+  /** `false` means "not configured yet" — the defaults apply on the first submission. */
+  configured: boolean;
+};
+
+/** The inbox's filters. */
+export type CrmLeadQuery = {
+  outcome?: CrmLeadOutcome | "";
+  search?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** What one drain did, as the button that asks for one reports it. */
+export type CrmLeadDrain = {
+  cursor: number;
+  advanced_to: number;
+  created: number;
+  merged: number;
+  rejected: number;
+  orphaned: number;
+  disabled: number;
+  failures: number;
+  idle: boolean;
+  event: string;
+};
+
+/** The five outcomes, in the order the chips show them. */
+export const CRM_LEAD_OUTCOMES: CrmLeadOutcome[] = [
+  "created",
+  "merged",
+  "rejected",
+  "orphaned",
+  "disabled",
+];
+
+/** The word each outcome is written with. */
+export const CRM_LEAD_OUTCOME_LABEL: Record<CrmLeadOutcome, string> = {
+  created: "Filed",
+  merged: "Repeat",
+  rejected: "Nothing usable",
+  orphaned: "No tenant",
+  disabled: "Not converted",
+};
+
+/** The sentence each outcome means, for the tooltip and the empty state. */
+export const CRM_LEAD_OUTCOME_HINT: Record<CrmLeadOutcome, string> = {
+  created: "A new contact and a new deal.",
+  merged: "The address was already known — the same person wrote again.",
+  rejected: "The submission carried no name and no e-mail address.",
+  orphaned: "The submission arrived without an organization to file it under.",
+  disabled: "This organization does not turn submissions into records.",
+};
+
+/** Read the ingress inbox. */
+export function fetchCrmLeads(query: CrmLeadQuery = {}): Promise<CrmLeadInbox> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+  }
+  const suffix = params.toString();
+  return crmRequest(`/api/v1/crm/leads${suffix ? `?${suffix}` : ""}`);
+}
+
+/** Read the routing policy, without creating the row. */
+export function fetchCrmLeadSettings(): Promise<CrmLeadSettingsView> {
+  return crmRequest("/api/v1/crm/leads/settings");
+}
+
+/**
+ * Save the routing policy. Every field is optional: an absent key keeps what it has, which is
+ * what a form that only sent the two toggles has to mean.
+ */
+export function saveCrmLeadSettings(input: {
+  create_contact?: boolean;
+  create_deal?: boolean;
+  stage_id?: string | null;
+  repeat_stage_id?: string | null;
+  source_label?: string;
+}): Promise<CrmLeadSettingsView> {
+  return crmRequest("/api/v1/crm/leads/settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Run one drain now, and report what it filed. */
+export function drainCrmLeads(): Promise<CrmLeadDrain> {
+  return crmRequest("/api/v1/crm/leads/drain", { method: "POST" });
+}

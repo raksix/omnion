@@ -34,6 +34,7 @@ export const CRM_NAV = [
   { href: "/crm/companies", label: "Companies", shortcut: "o" },
   { href: "/crm/deals", label: "Deals", shortcut: "d" },
   { href: "/crm/activities", label: "Activities", shortcut: "a" },
+  { href: "/crm/leads", label: "Leads", shortcut: "l" },
   { href: "/crm/settings/pipelines", label: "Settings", shortcut: "s" },
 ] as const;
 

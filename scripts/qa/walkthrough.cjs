@@ -3153,6 +3153,10 @@ async function main() {
     // The activity feed (REQ-051, slice 4) — the nav has linked this screen since slice 2, so
     // without it in the list the pass would never visit a route a person can click.
     { path: "/crm/activities", name: "crm-activities" },
+    // The lead inbox (REQ-051 slice 4 part seven, REQ-117). The nav links it, so a pass that did
+    // not visit it would leave a screen a person can click unvisited — and "no untested screen"
+    // is the rule the whole route list exists to enforce.
+    { path: "/crm/leads", name: "crm-leads" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -3263,6 +3267,12 @@ async function main() {
   // since they shipped, so this pass is what makes the feature a feature. It runs after the
   // activities pass because it needs a deal on the board, which the deals pass put there.
   await runCrmCopilotDepth(page, report);
+
+  // The form → lead inbox (REQ-051 slice 4 part seven): the routing panel opens, the toggles are
+  // real, the drain button produces a verdict, the outcome chips filter, and the empty state is a
+  // sentence rather than a blank panel. It runs after the copilot because the copilot needs the
+  // board, and the inbox needs nothing but itself.
+  await runCrmLeadsDepth(page, report);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -4658,6 +4668,131 @@ async function runCrmCopilotDepth(page, report) {
 
   report.crmCopilot = steps;
   log(`crm copilot depth: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The form → lead ingress inbox (REQ-051, slice 4 part seven · REQ-117).
+ *
+ * The screen's one promise is that **nothing is silently dropped**: a submission that became
+ * nothing still has to be visible, with the reason. So the pass checks the log and the reason
+ * paths, not the happy one — a drain that files a contact is the module's test, and what only a
+ * browser can see is whether the panel is legible when there is nothing to show.
+ *
+ * The producer is the forms module (REQ-064), which is not in this build, so the pass cannot
+ * create a submission through the UI. It drives the **button the panel actually has** — the
+ * drain — and asserts the verdict it prints, which is the honest outcome for an empty bus and
+ * is the path a person sees when nothing has arrived.
+ */
+async function runCrmLeadsDepth(page, report) {
+  const steps = {};
+
+  await page.goto(`${URL_ADMIN}/crm/leads`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#crm-leads-drain", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await shot(page, "page-crm-leads");
+
+  // The screen answered, and it answered as the lead inbox rather than as a 404 or a shell.
+  steps.screenLoaded = (await page.locator("#crm-leads-drain").count()) > 0;
+  steps.hasTheSearchBox = (await page.locator("#crm-leads-search").count()) > 0;
+  steps.namesTheContract = /at most once/i.test(
+    await page.locator("body").innerText().catch(() => ""),
+  );
+
+  // ---- the outcome chips are real filters, with counts ---------------------------------------
+  // All five outcomes have to be offered even before anything has arrived: a chip that appears
+  // only once it has rows cannot filter the submission that made it.
+  const chips = await page.locator("nav[aria-label='Outcomes'] button").count();
+  steps.offersEveryOutcome = chips >= 6; // "All" plus the five outcomes
+
+  // ---- the drain produces a verdict ---------------------------------------------------------
+  // No dead button: whatever the bus holds, the click has to end in a sentence.
+  await page.locator("#crm-leads-drain").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[role='alert'], header ~ p", { timeout: 30000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const verdict = await page.locator("body").innerText().catch(() => "");
+  steps.drainReportsAVerdict = /nothing new|filed/i.test(verdict);
+  steps.noDeadDrainButton = steps.drainReportsAVerdict;
+  await shot(page, "page-crm-leads-drained");
+
+  // ---- an unknown outcome filter shows everything, not nothing -------------------------------
+  // A stale bookmark carrying an outcome the ledger cannot hold must not render an empty panel
+  // that reads as "your submissions are gone".
+  await page.goto(`${URL_ADMIN}/crm/leads?outcome=not-a-real-outcome`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.aStaleFilterDoesNotBlankTheInbox = !/no submission matches this filter/i.test(
+    await page.locator("body").innerText().catch(() => ""),
+  );
+
+  // ---- the routing panel opens, and it says what it is for -----------------------------------
+  await page.goto(`${URL_ADMIN}/crm/leads`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#crm-leads-settings-toggle", { timeout: 15000 }).catch(() => {});
+  await page.locator("#crm-leads-settings-toggle").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("#crm-leads-save", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  steps.routingOpens = (await page.locator("#crm-leads-save").count()) > 0;
+  steps.routingHasBothToggles =
+    (await page.locator("#crm-leads-create-contact").count()) > 0 &&
+    (await page.locator("#crm-leads-create-deal").count()) > 0;
+  steps.routingExplainsTheRepeatStage =
+    (await page.locator("#crm-leads-repeat-stage").count()) > 0;
+  steps.routingHasALabel = (await page.locator("#crm-leads-source").count()) > 0;
+  steps.routingSaysWhyItExists = /repeat|submission|tenant/i.test(
+    await page.locator("section[aria-label='Form to lead routing']").innerText().catch(() => ""),
+  );
+  await shot(page, "page-crm-leads-routing");
+
+  // ---- saving the routing is a real write ----------------------------------------------------
+  // A panel whose save button does nothing is the definition of a dead feature, and this is the
+  // one control on the screen a person changes on purpose.
+  const label = `qa-${Math.floor(Date.now() / 1000) % 100000}`;
+  await page.locator("#crm-leads-source").fill(label).catch(() => {});
+  await page.locator("#crm-leads-save").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.saveProducesAVerdict = /routing was saved|could not be saved/i.test(
+    await page.locator("body").innerText().catch(() => ""),
+  );
+  steps.noDeadSaveButton = steps.saveProducesAVerdict;
+
+  // And the value survived: a settings screen that shows what it just saved is the only proof
+  // the write reached the database rather than the component's own state.
+  await page.goto(`${URL_ADMIN}/crm/leads`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.locator("#crm-leads-settings-toggle").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("#crm-leads-source", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.savePersisted = (await page.locator("#crm-leads-source").inputValue().catch(() => "")) === label;
+  await shot(page, "page-crm-leads-routing-saved");
+
+  // ---- `/` focuses the search ----------------------------------------------------------------
+  // A screen with a search box and no way to reach it from the keyboard is a screen that only
+  // works with a mouse.
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("/");
+  await page.waitForTimeout(400);
+  steps.slashFocusesSearch =
+    await page
+      .locator("#crm-leads-search")
+      .evaluate((node) => node === document.activeElement)
+      .catch(() => false);
+
+  // ---- mobile: 390×844, because a log that needs horizontal scroll is a log nobody reads -----
+  const phone = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/crm/leads`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => 0);
+  steps.noHorizontalOverflowOnAPhone = overflow <= 2;
+  steps.searchReachableOnAPhone = (await page.locator("#crm-leads-search").count()) > 0;
+  steps.drainReachableOnAPhone = (await page.locator("#crm-leads-drain").count()) > 0;
+  await shot(page, "page-crm-leads-mobile");
+  if (phone) await page.setViewportSize(phone);
+
+  report.crmLeads = steps;
+  log(`crm leads depth: ${JSON.stringify(steps)}`);
 }
 
 /**
