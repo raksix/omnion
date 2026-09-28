@@ -4626,8 +4626,11 @@ async fn a_submitted_form_becomes_a_contact_and_a_deal() {
 
     // The deal is the person's own words: the company, which is the shorter and more specific
     // phrase, not a placeholder and not the whole message.
-    let title: String = sqlx::query_scalar("select title from crm_deals where id = $1")
-        .bind(row["deal_id"].as_str().expect("a deal id"))
+    // The id is read as the column's own type: a `&str` bound into a `uuid` parameter is a
+    // type error at the database, and it reads as a missing row rather than a wrong bind.
+    let title: String =
+        sqlx::query_scalar("select title from crm_deals where id = $1::uuid")
+            .bind(row["deal_id"].as_str().expect("a deal id"))
         .fetch_one(fixture.db.pool())
         .await
         .expect("the deal must read");
@@ -4817,7 +4820,7 @@ async fn a_repeat_submission_is_the_same_person_and_lands_in_the_repeat_stage() 
     // the operator said repeats go.
     let stages_of: Vec<String> = sqlx::query_scalar(
         "select s.name from crm_deals d join crm_pipeline_stages s on s.id = d.stage_id \
-         where d.contact_id = $1 order by d.created_at",
+         where d.contact_id = $1::uuid order by d.created_at",
     )
     .bind(first_row["contact_id"].as_str().expect("a contact id"))
     .fetch_all(fixture.db.pool())
@@ -5087,7 +5090,9 @@ async fn the_ingress_keys_and_the_tenant_boundary_are_enforced() {
     .await;
     assert_eq!(settings.status, StatusCode::OK, "body: {}", settings.body);
 
-    let manager = fixture.token(&fixture.manager).await;
+    // Read the *manager* is the tenant's own: the ingress keys were granted explicitly at the
+    // top of this walk, and a caller without them is refused before the row is read at all.
+    let manager = grant_lead_powers(&fixture, &fixture.manager).await;
     let ours_settings = call(
         state,
         request(Method::GET, "/api/v1/crm/leads/settings", Some(&manager), None),
@@ -5124,7 +5129,7 @@ async fn a_stage_from_another_pipelines_organization_is_refused() {
     )
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
-    assert_eq!(refused.body["error"]["code"], json!("invalid_lead_settings.stage_id"));
+    assert_eq!(refused.body["error"]["code"], json!("invalid_crm_record"));
 
     // And the refusal left the stored row alone.
     let after = call(
@@ -5293,7 +5298,7 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
         fixture.db.pool(),
         NewRole {
             organization_id: fixture.org,
-            key: format!("crm-platform-{}-{}", "own", Uuid::new_v4().simple()),
+            key: format!("crm-p{}", Uuid::new_v4().simple()),
             name: "CRM Platform Reader".to_owned(),
             description: "The platform owner looking into one tenant".to_owned(),
             priority: 300,
@@ -5333,12 +5338,13 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
     .expect("the tenant binding must be created");
 
     // A contact to read, so the answer is a list and not merely a status.
+    let manager_token = fixture.token(&fixture.manager).await;
     let created = call(
         &fixture.state,
         request(
             Method::POST,
             "/api/v1/crm/contacts",
-            Some(&fixture.manager),
+            Some(&manager_token),
             Some(json!({ "first_name": "Tenant", "last_name": "Probe" })),
         ),
     )
@@ -5416,7 +5422,8 @@ async fn a_platform_account_bound_to_two_organizations_is_told_to_choose() {
             fixture.db.pool(),
             NewRole {
                 organization_id: organization,
-                key: format!("crm-two-{}-{}", organization, Uuid::new_v4().simple()),
+                // A role key is at most 64 characters; the unique suffix is what keeps it distinct.
+                key: format!("crm-two{}", Uuid::new_v4().simple()),
                 name: "CRM Two Tenants".to_owned(),
                 description: "A role in each of two organizations".to_owned(),
                 priority: 300,
@@ -5492,9 +5499,12 @@ async fn a_platform_account_in_no_organization_is_told_it_has_none() {
         .expect("the platform owner binding must be created");
     let _ = &fixture.owner;
 
+    // A session, not an address: `request` takes a bearer token, and an e-mail answers 401
+    // before the route is ever reached — which would pass for a working guard.
+    let token = login(&fixture.state, &email).await;
     let response = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/crm/contacts", Some(&email), None),
+        request(Method::GET, "/api/v1/crm/contacts", Some(&token), None),
     )
     .await;
 

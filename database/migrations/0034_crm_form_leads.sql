@@ -54,7 +54,11 @@ create table crm_form_leads (
     -- The bus identity of the submission. Primary key because exactly-once is the whole
     -- contract: the drain is retried on failure, and two API processes may read the same bus.
     event_id         bigint      primary key,
-    organization_id  uuid        not null references organizations (id) on delete cascade,
+    -- Nullable, and deliberately so: a submission from a public endpoint on a site with no
+    -- owning organization belongs to nobody. The column said `not null` while the file's own
+    -- header said otherwise, so the orphan path -- the one that records such a submission --
+    -- raised a not-null violation and every orphaned row came back as a drain failure.
+    organization_id  uuid        references organizations (id) on delete cascade,
     site_id          uuid,
     form_id          uuid,
     form_key         text,
