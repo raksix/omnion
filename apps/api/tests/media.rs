@@ -129,6 +129,33 @@ fn multipart_body(boundary: &str, filename: &str, content_type: &str, bytes: &[u
     body
 }
 
+/// A multipart body carrying a `note` part beside the `file` part.
+///
+/// The two parts are written out in full rather than assembled by cutting the single-part
+/// builder's output: a part appended *after* a closing boundary is not part of the body at all,
+/// which is a silent no-op rather than an error, and the note would arrive empty.
+fn multipart_body_with_note(
+    boundary: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+    note: &str,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 320);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"note\"\r\n\r\n");
+    body.extend_from_slice(note.as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
 /// Build an upload request: the multipart body plus, when given, the session cookie.
 fn upload_request(
     uri: &str,
@@ -330,13 +357,22 @@ impl Fixture {
     }
 
     /// Remove what this fixture created — objects first, then rows.
+    ///
+    /// The keys come from the *union* of the live rows and the version history. Reading only
+    /// `media.storage_key` leaves every replaced version's object in the bucket, because a
+    /// replace moves that column to the new key and the old one is named only by the history —
+    /// a cleanup that misses them turns a test run into a slow leak.
     async fn cleanup(&self) {
-        let keys: Vec<String> =
-            sqlx::query_scalar("select storage_key from media where site_id = any($1)")
-                .bind(&self.sites)
-                .fetch_all(self.db.pool())
-                .await
-                .expect("the fixture keys must read");
+        let keys: Vec<String> = sqlx::query_scalar(
+            "select storage_key from media where site_id = any($1) \
+             union \
+             select v.storage_key from media_versions v \
+               join media m on m.id = v.media_id where m.site_id = any($1)",
+        )
+        .bind(&self.sites)
+        .fetch_all(self.db.pool())
+        .await
+        .expect("the fixture keys must read");
         for key in keys {
             let _ = self.storage.delete(&key).await;
         }
@@ -955,7 +991,12 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         ),
     )
     .await;
-    assert_eq!(campaigns.status, StatusCode::CREATED, "body: {}", campaigns.body);
+    assert_eq!(
+        campaigns.status,
+        StatusCode::CREATED,
+        "body: {}",
+        campaigns.body
+    );
     assert_eq!(campaigns.body["path"], "Media/Campaigns");
     let campaigns_id = id_of(&campaigns.body);
 
@@ -1067,7 +1108,12 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         ),
     )
     .await;
-    assert_eq!(archive.status, StatusCode::CREATED, "body: {}", archive.body);
+    assert_eq!(
+        archive.status,
+        StatusCode::CREATED,
+        "body: {}",
+        archive.body
+    );
 
     let reparented = call(
         &fixture.state,
@@ -1079,7 +1125,12 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         ),
     )
     .await;
-    assert_eq!(reparented.status, StatusCode::OK, "body: {}", reparented.body);
+    assert_eq!(
+        reparented.status,
+        StatusCode::OK,
+        "body: {}",
+        reparented.body
+    );
     assert_eq!(reparented.body["path"], "Media/Archive/Campaigns");
     // The child followed its parent, which is the invariant the subtree rewrite exists to keep.
     assert_eq!(
@@ -1140,14 +1191,23 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         ),
     )
     .await;
-    assert_eq!(deep_folder.status, StatusCode::OK, "body: {}", deep_folder.body);
+    assert_eq!(
+        deep_folder.status,
+        StatusCode::OK,
+        "body: {}",
+        deep_folder.body
+    );
     let crumbs: Vec<String> = deep_folder.body["breadcrumb"]
         .as_array()
         .expect("the breadcrumb is an array")
         .iter()
         .map(|crumb| crumb["name"].as_str().unwrap_or_default().to_owned())
         .collect();
-    assert_eq!(crumbs, vec!["Media", "Archive", "Campaigns", "2026 Launch"], "{crumbs:?}");
+    assert_eq!(
+        crumbs,
+        vec!["Media", "Archive", "Campaigns", "2026 Launch"],
+        "{crumbs:?}"
+    );
 
     // The confirmation text on the screen ("a folder that still holds files or subfolders is
     // refused") and the API have to agree on BOTH sides of the rule: the refusal was proved above
@@ -1164,7 +1224,12 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         ),
     )
     .await;
-    assert_eq!(scratch.status, StatusCode::CREATED, "body: {}", scratch.body);
+    assert_eq!(
+        scratch.status,
+        StatusCode::CREATED,
+        "body: {}",
+        scratch.body
+    );
     let delete_empty = call(
         &fixture.state,
         request(
@@ -1186,7 +1251,10 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
             &fixture.state,
             request(
                 Method::GET,
-                &format!("/api/v1/media/files?site_id={site}&folder_id={}", id_of(&scratch.body)),
+                &format!(
+                    "/api/v1/media/files?site_id={site}&folder_id={}",
+                    id_of(&scratch.body)
+                ),
                 Some(&editor),
                 None,
             )
@@ -1235,11 +1303,12 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
     // reads as TEXT and fails `uuid = text`, the second as a text parameter holding a binary uuid
     // and fails "incorrect binary data format". Both look like schema bugs; both are bind bugs.
     let deep_uuid = Uuid::parse_str(&deep_id).expect("the created file id must be a uuid");
-    let key_before: String = sqlx::query_scalar::<_, String>("select storage_key from media where id = $1")
-        .bind(deep_uuid)
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("the key must read");
+    let key_before: String =
+        sqlx::query_scalar::<_, String>("select storage_key from media where id = $1")
+            .bind(deep_uuid)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the key must read");
     let moved = call(
         &fixture.state,
         request(
@@ -1376,11 +1445,7 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
             .await
             .expect("the key must read");
     assert!(
-        fixture
-            .storage
-            .get(&key_after_delete)
-            .await
-            .is_ok(),
+        fixture.storage.get(&key_after_delete).await.is_ok(),
         "a delete keeps the bytes: only a purge removes them"
     );
 
@@ -1398,10 +1463,15 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
     assert_eq!(trash.status, StatusCode::OK, "body: {}", trash.body);
     assert_eq!(trash.body["file_count"], json!(1));
     assert_eq!(trash.body["retention_days"], json!(30));
-    let entries = trash.body["entries"].as_array().expect("entries is an array");
+    let entries = trash.body["entries"]
+        .as_array()
+        .expect("entries is an array");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"], json!(first_id));
-    assert!(entries[0]["purges_at"].as_str().is_some(), "the countdown is real");
+    assert!(
+        entries[0]["purges_at"].as_str().is_some(),
+        "the countdown is real"
+    );
 
     // Restoring puts the file back where it was.
     let restored = call(
@@ -1454,7 +1524,11 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         .fetch_one(fixture.db.pool())
         .await
         .expect("the tags must read");
-    assert_eq!(tags, json!(["summer"]), "tags are trimmed, lower-cased and unique");
+    assert_eq!(
+        tags,
+        json!(["summer"]),
+        "tags are trimmed, lower-cased and unique"
+    );
 
     // An unknown action is refused by name.
     let unknown = call(
@@ -1504,7 +1578,12 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         ),
     )
     .await;
-    assert_eq!(purged.status, StatusCode::NO_CONTENT, "body: {}", purged.body);
+    assert_eq!(
+        purged.status,
+        StatusCode::NO_CONTENT,
+        "body: {}",
+        purged.body
+    );
     assert!(
         fixture.storage.get(&key_after_delete).await.is_err(),
         "a purge removes the bytes as well as the row"
@@ -1537,6 +1616,540 @@ async fn the_file_manager_walks_folders_files_and_the_trash() {
         .expect("the audit count must read");
         assert!(rows > 0, "{action} must be audited for this site");
     }
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The version history (REQ-010, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/// A PNG of the given size, built header-first — the probe only ever reads the header.
+fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    // A unique tail so two "same size, different bytes" versions really do differ.
+    bytes.extend_from_slice(b"omnion-version-walk");
+    bytes
+}
+
+/// Post a replacement to a file's version route, with a note beside the file.
+fn replace_request(
+    uri: &str,
+    token: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+    note: &str,
+) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::COOKIE, format!("omnion_session={token}"))
+        .body(Body::from(multipart_body_with_note(
+            BOUNDARY,
+            filename,
+            content_type,
+            bytes,
+            note,
+        )))
+        .expect("request must build")
+}
+
+#[tokio::test]
+async fn replacing_a_file_keeps_the_old_bytes_as_a_version() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    // A 640×360 PNG. The header is what the probe reads, so the row must come back with the
+    // dimensions filled in rather than null — the preview's aspect ratio depends on them.
+    let original = png_bytes(640, 360);
+    let uploaded = call(
+        &fixture.state,
+        upload_request(&library, Some(&editor), "hero.png", "image/png", &original),
+    )
+    .await;
+    assert_eq!(
+        uploaded.status,
+        StatusCode::CREATED,
+        "body: {}",
+        uploaded.body
+    );
+    let file_id = id_of(&uploaded.body);
+    let media_id = Uuid::parse_str(&file_id).expect("the uploaded id is a uuid");
+
+    let detail = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/files/{file_id}"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert_eq!(detail.body["width"], 640, "the header states the width");
+    assert_eq!(detail.body["height"], 360, "the header states the height");
+    assert_eq!(detail.body["version_count"], 1, "an upload is version 1");
+
+    // The upload wrote a version 1, so the history is never empty on a file that exists.
+    let history = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/versions"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(history.status, StatusCode::OK, "body: {}", history.body);
+    assert_eq!(history.body["version_total"], 1);
+    assert_eq!(history.body["versions"][0]["version"], 1);
+    assert_eq!(
+        history.body["versions"][0]["is_current"], true,
+        "the only version is the current one"
+    );
+
+    // Replace the bytes. The file keeps its name, its id and its folder.
+    let replacement = png_bytes(1920, 1080);
+    let replaced = call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{file_id}/versions"),
+            &editor,
+            "hero.png",
+            "image/png",
+            &replacement,
+            "the campaign crop",
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced.status,
+        StatusCode::CREATED,
+        "body: {}",
+        replaced.body
+    );
+    assert_eq!(
+        replaced.body["version"]["version"], 2,
+        "a replace appends the next number"
+    );
+    assert_eq!(
+        replaced.body["file"]["filename"], "hero.png",
+        "a replace never renames the file"
+    );
+    assert_eq!(replaced.body["file"]["width"], 1920);
+    assert_eq!(
+        replaced.body["version"]["note"], "the campaign crop",
+        "the note rides as its own multipart part"
+    );
+
+    // The row now points at the new bytes and says two versions.
+    let after = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/files/{file_id}"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(after.body["version_count"], 2);
+    assert_eq!(after.body["size_bytes"], replacement.len() as i64);
+
+    // Version 1 is still downloadable, and it still serves the OLD bytes. This is the whole
+    // point of the slice: if the old key had been overwritten, this read would return the
+    // 1920×1080 payload and the assertion on the size would pass by accident on a length
+    // check — so the bytes are compared, not just the status.
+    let old_bytes = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/versions/1/raw"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(old_bytes.status, StatusCode::OK, "body: {}", old_bytes.body);
+    assert_eq!(
+        old_bytes.bytes, original,
+        "version 1 must still be the bytes it was"
+    );
+
+    // The current version serves the new bytes through the panel's own read path. The path is
+    // `/media/{id}/raw` — the *file manager* list is `/media/files`, and a raw read addressed at
+    // `/media/files/{id}/raw` has no route, so it would 404 and read as an empty body here.
+    let current_bytes = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/raw"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        current_bytes.status,
+        StatusCode::OK,
+        "body: {}",
+        current_bytes.body
+    );
+    assert_eq!(current_bytes.bytes, replacement);
+
+    // Two versions, two storage keys, and the current key is the newer one.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "select storage_key from media_versions where media_id = $1 order by version",
+    )
+    .bind(media_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the version keys must read");
+    assert_eq!(keys.len(), 2, "one key per version: {keys:?}");
+    assert_ne!(
+        keys[0], keys[1],
+        "two versions may never share one object key"
+    );
+    assert!(
+        keys[1].ends_with("/v2.png"),
+        "the key carries the version number: {}",
+        keys[1]
+    );
+    let current_key: String = sqlx::query_scalar("select storage_key from media where id = $1")
+        .bind(media_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the current key must read");
+    assert_eq!(
+        current_key, keys[1],
+        "the row points at the version it serves"
+    );
+
+    // A download of an old version is an attachment named after *that* version, so two
+    // versions do not collide on one name in a download folder.
+    let downloaded = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/versions/1/download"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(downloaded.status, StatusCode::OK);
+    let disposition = downloaded
+        .content_disposition
+        .as_deref()
+        .expect("a download carries a disposition");
+    assert!(
+        disposition.contains("attachment") && disposition.contains("hero-v1.png"),
+        "the download is an attachment named for the version: {disposition}"
+    );
+    assert_eq!(downloaded.bytes, original);
+
+    // A version that does not exist is named as missing, not answered with the current bytes.
+    let missing = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/versions/9/raw"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.body["error"]["code"], "version_not_found");
+
+    // And the replace is audited.
+    assert!(
+        audit_rows(&fixture.db, "media.version_created", &file_id).await > 0,
+        "a replace leaves an audit row"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn restoring_an_old_version_appends_instead_of_rewriting() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    let first = png_bytes(800, 600);
+    let uploaded = call(
+        &fixture.state,
+        upload_request(&library, Some(&editor), "banner.png", "image/png", &first),
+    )
+    .await;
+    assert_eq!(uploaded.status, StatusCode::CREATED);
+    let file_id = id_of(&uploaded.body);
+    let media_id = Uuid::parse_str(&file_id).expect("the uploaded id is a uuid");
+
+    let second = png_bytes(1024, 768);
+    call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{file_id}/versions"),
+            &editor,
+            "banner.png",
+            "image/png",
+            &second,
+            "v2",
+        ),
+    )
+    .await;
+
+    // Restore version 1. It comes back as version 3 — a *new* version — and version 1 itself is
+    // not touched, so the history stays a straight line of appends.
+    let restored = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/media/{file_id}/versions/1/restore"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(restored.status, StatusCode::OK, "body: {}", restored.body);
+    assert_eq!(
+        restored.body["version"]["version"], 3,
+        "a restore appends; it does not renumber"
+    );
+    assert_eq!(
+        restored.body["file"]["width"], 800,
+        "the restored bytes are the old ones"
+    );
+
+    // The three rows, with their checksums: version 1 and version 3 carry the same checksum
+    // (same bytes), version 2 differs, and the numbers are 1, 2, 3 with no reuse.
+    let rows: Vec<(i32, String, String)> = sqlx::query_as(
+        "select version, checksum, storage_key from media_versions where media_id = $1 order by version",
+    )
+    .bind(media_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the versions must read");
+    assert_eq!(
+        rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "three versions, in order"
+    );
+    assert_eq!(
+        rows[0].1, rows[2].1,
+        "the restored copy is byte-identical to the version it came from"
+    );
+    assert_ne!(rows[1].1, rows[0].1, "version 2 is a different upload");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.2.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "three versions, three keys — a restore copies, it does not point at the old object"
+    );
+
+    // The current bytes are version 1's bytes again, read through the panel's own path.
+    let current = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/raw"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(current.status, StatusCode::OK, "body: {}", current.body);
+    assert_eq!(current.bytes, first);
+
+    // And version 2 — the one that was replaced — is still downloadable after the restore.
+    let second_still_there = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/versions/2/raw"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        second_still_there.bytes, second,
+        "a restore does not remove the version that was current"
+    );
+
+    // The history says three versions, with exactly one marked current.
+    let history = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/versions"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(history.body["version_total"], 3);
+    let current_flags: Vec<bool> = history.body["versions"]
+        .as_array()
+        .expect("versions is an array")
+        .iter()
+        .map(|entry| entry["is_current"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(
+        current_flags.iter().filter(|flag| **flag).count(),
+        1,
+        "exactly one version is current"
+    );
+    // The listing is newest first, so the current one is the *first* entry — a check written
+    // against an assumed oldest-first order fails on a correct response.
+    assert!(
+        current_flags[0] && !current_flags[1] && !current_flags[2],
+        "and it is the newest, which the listing puts first: {current_flags:?}"
+    );
+    let listed: Vec<i64> = history.body["versions"]
+        .as_array()
+        .expect("versions is an array")
+        .iter()
+        .filter_map(|entry| entry["version"].as_i64())
+        .collect();
+    assert_eq!(listed, vec![3, 2, 1], "the history reads newest first");
+
+    // Restoring a version that does not exist is refused by name.
+    let missing = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/media/{file_id}/versions/7/restore"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.body["error"]["code"], "version_not_found");
+
+    assert!(
+        audit_rows(&fixture.db, "media.version_restored", &file_id).await > 0,
+        "a restore leaves an audit row"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_version_routes_are_permission_gated_and_scoped() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let member = fixture.member_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    let uploaded = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "notes.txt",
+            "text/plain",
+            b"the original text",
+        ),
+    )
+    .await;
+    assert_eq!(uploaded.status, StatusCode::CREATED);
+    let file_id = id_of(&uploaded.body);
+    let history_uri = format!("/api/v1/media/{file_id}/versions");
+
+    // Without a session, the history and the bytes of a version are both closed.
+    for uri in [
+        history_uri.clone(),
+        format!("/api/v1/media/{file_id}/versions/1/raw"),
+    ] {
+        let response = call(&fixture.state, request(Method::GET, &uri, None, None)).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+
+    // A member without a media permission sees none of it either.
+    for uri in [
+        history_uri.clone(),
+        format!("/api/v1/media/{file_id}/versions/1/raw"),
+    ] {
+        let response = call(
+            &fixture.state,
+            request(Method::GET, &uri, Some(&member), None),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    // The platform Owner, whose scope crosses tenants, may read the history — the gate is the
+    // permission, not the organization, so the same route answers for a different caller.
+    let platform = fixture.platform_token().await;
+    let owner_reads = call(
+        &fixture.state,
+        request(Method::GET, &history_uri, Some(&platform), None),
+    )
+    .await;
+    assert_eq!(
+        owner_reads.status,
+        StatusCode::OK,
+        "body: {}",
+        owner_reads.body
+    );
+
+    // A file that does not exist is a 404 by id, naming what is missing — a stale deep link
+    // must not answer with somebody else's history.
+    let stale = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{}/versions", Uuid::new_v4()),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        stale.body["error"]["code"], "media_not_found",
+        "a stale id is named as a missing media row"
+    );
+
+    // An upload with no bytes is refused on the version route as well.
+    let empty = call(
+        &fixture.state,
+        replace_request(&history_uri, &editor, "x.txt", "text/plain", b"", ""),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    // The media crate answers an empty upload as a single `invalid_request`; the walk asserts
+    // the name the surface actually uses rather than one invented for the test.
+    assert_eq!(empty.body["error"]["code"], "invalid_request");
 
     fixture.cleanup().await;
 }

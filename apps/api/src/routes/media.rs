@@ -155,6 +155,19 @@ pub async fn upload_media(
         .put(&storage_key, &upload.bytes, &content_type)
         .await?;
 
+    // What the bytes say about themselves, read from their header. A format we cannot read is
+    // simply not described — the row keeps its columns empty rather than a guess that would
+    // break every layout that reads them.
+    let probe = omnion_media::probe_of(&upload.bytes, &content_type);
+
+    // `insert_media` consumes the name, the type and the checksum, and the history below needs
+    // the same three values. They are copied here, once, rather than read back out of the row —
+    // a value that has been moved cannot be re-read, and a round trip through the database to
+    // get it back would make the two paths disagree if anything changed in between.
+    let stored_size = stored.size_bytes as i64;
+    let stored_checksum = stored.checksum.clone();
+    let content_type_for_version = content_type.clone();
+
     let written = omnion_media::insert_media(
         state.db().pool(),
         NewMedia {
@@ -162,7 +175,7 @@ pub async fn upload_media(
             storage_key: storage_key.clone(),
             filename,
             content_type,
-            size_bytes: stored.size_bytes as i64,
+            size_bytes: stored_size,
             checksum: stored.checksum,
             created_by: Some(current.user.id),
         },
@@ -170,7 +183,31 @@ pub async fn upload_media(
     .await;
 
     let media = match written {
-        Ok(media) => media,
+        Ok(media) => {
+            // The history starts at the file: version 1 is this upload, not a later backfill, so
+            // the detail screen never opens on a file with an empty version list. The probe's
+            // numbers go onto the row here rather than in a second statement, which is what makes
+            // "the file says it is 1920 wide" and "the history says it is 1920 wide" the same
+            // fact read twice.
+            omnion_media::versions::fill_dimensions(state.db().pool(), media.id, probe.columns())
+                .await?;
+            omnion_media::versions::ensure_version_one(
+                state.db().pool(),
+                media.id,
+                &omnion_media::NewVersion {
+                    version: 1,
+                    storage_key: storage_key.clone(),
+                    size_bytes: stored_size,
+                    checksum: stored_checksum,
+                    content_type: content_type_for_version,
+                    probe,
+                    note: upload.note.clone(),
+                    created_by: Some(current.user.id),
+                },
+            )
+            .await?;
+            media
+        }
         Err(error) => {
             // The bytes are in the bucket but the row was refused: drop the object again so the
             // library and the store stay in step, then report the real failure.
@@ -307,21 +344,32 @@ pub async fn public_media(
 // ---------------------------------------------------------------------------------------------
 
 /// One part of an upload as it was received.
-struct Upload {
+pub struct Upload {
     /// File name the client sent (reduced before it is used).
-    filename: String,
+    pub filename: String,
     /// Content type the client declared (normalised before it is used).
-    content_type: String,
+    pub content_type: String,
     /// The bytes themselves.
-    bytes: Bytes,
+    pub bytes: Bytes,
+    /// What the uploader said about this version, reduced to one bounded line.
+    pub note: String,
 }
 
 /// Read the `file` part of a multipart upload; other parts are consumed and ignored.
-async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
+///
+/// `note` is read from a second part when the client sends one, which is how a replace says
+/// what changed about itself. Any other part is drained so the parser can reach the next field.
+pub async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
     let mut upload: Option<Upload> = None;
+    let mut note = String::new();
 
     while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
-        if field.name() == Some("file") {
+        if field.name() == Some("note") {
+            // The version note rides as its own part rather than a query parameter, so a note
+            // with a newline or a quote in it cannot corrupt the URL.
+            let raw = field.text().await.map_err(multipart_error)?;
+            note = omnion_media::normalize_note(&raw);
+        } else if field.name() == Some("file") {
             let filename = field.file_name().unwrap_or("upload").to_owned();
             let content_type = field
                 .content_type()
@@ -332,6 +380,7 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
                 filename,
                 content_type,
                 bytes,
+                note: String::new(),
             });
         } else {
             // Drain the part so the parser can reach the next one.
@@ -339,12 +388,14 @@ async fn read_upload(mut multipart: Multipart) -> Result<Upload, ApiError> {
         }
     }
 
-    upload.ok_or_else(|| {
+    let mut upload = upload.ok_or_else(|| {
         ApiError::bad_request(
             "missing_file",
             "the request carries no `file` part — send the upload as multipart/form-data",
         )
-    })
+    })?;
+    upload.note = note;
+    Ok(upload)
 }
 
 /// Map a multipart failure onto the API surface; a body over the limit is a `413`.
