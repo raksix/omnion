@@ -85,9 +85,9 @@ pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
+pub mod media_duplicates;
 pub mod media_files;
 pub mod media_grants;
-pub mod media_duplicates;
 pub mod media_retention;
 pub mod media_scan;
 mod media_settings;
@@ -511,8 +511,8 @@ pub fn router(state: AppState) -> Router {
     // permission as repointing where every file in it lives.
     let media_settings_route: MethodRouter<AppState, Infallible> =
         get(media_settings::read).layer(guards::require(&state, "media.read"));
-    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
-        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -552,18 +552,18 @@ pub fn router(state: AppState) -> Router {
     // (organise a library) nor `media.delete` (remove a file) is that power.
     let media_scan_route: MethodRouter<AppState, Infallible> =
         get(media_scan::read).layer(guards::require(&state, "media.read"));
-    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
-        .layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
         get(media_scan::list_held).layer(guards::require(&state, "media.read"));
     let media_quarantine_release: MethodRouter<AppState, Infallible> =
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -573,12 +573,12 @@ pub fn router(state: AppState) -> Router {
     // able to decide who else may read what they uploaded.
     let media_folder_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
-    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
-    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     // A grant is removed by its own id alone — the row knows the node it was written on, so
     // putting the node in the URL as well would make a two-parameter path with a one-parameter
     // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
@@ -791,11 +791,20 @@ pub fn router(state: AppState) -> Router {
         post(notifications::emit).layer(guards::require(&state, "notifications.send"));
     let notifications_entry = get(notifications::get)
         .layer(guards::require(&state, "notifications.read"))
+        .merge(delete(notifications::delete).layer(guards::require(&state, "notifications.read")));
+    let notifications_read =
+        post(notifications::set_read).layer(guards::require(&state, "notifications.read"));
+    // Slice 2's own surface: the reader's own channel configuration, which is a *different*
+    // power from reading one's own inbox. `notifications.read` is granted to every role
+    // because it grants nothing about anybody else; `notifications.manage` changes what the
+    // organization will send this person and how, so it is deliberately absent from the base
+    // role and belongs to a person who has been given it on purpose.
+    let notifications_preferences = get(notifications::get_preferences)
+        .layer(guards::require(&state, "notifications.manage"))
         .merge(
-            delete(notifications::delete).layer(guards::require(&state, "notifications.read")),
+            put(notifications::put_preferences)
+                .layer(guards::require(&state, "notifications.manage")),
         );
-    let notifications_read = post(notifications::set_read)
-        .layer(guards::require(&state, "notifications.read"));
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -914,6 +923,12 @@ pub fn router(state: AppState) -> Router {
         .route("/notifications/bulk", notifications_bulk)
         .route("/notifications/mark-all-read", notifications_mark_all)
         .route("/notifications/emit", notifications_emit)
+        // Slice 2. `preferences` is a *literal* segment and is declared before the `{id}`
+        // routes for exactly the reason `summary` is above: axum ranks a static segment ahead
+        // of a parameter one, and `PUT /notifications/preferences` would otherwise be parsed
+        // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
+        // as "the settings screen is broken".
+        .route("/notifications/preferences", notifications_preferences)
         .route("/notifications/{id}", notifications_entry)
         .route("/notifications/{id}/read", notifications_read)
         .route(
@@ -1079,7 +1094,6 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
         .route("/media/grants/{grant_id}", media_grant_delete)

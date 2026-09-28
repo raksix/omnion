@@ -2354,7 +2354,11 @@ fn the_camera_builder_produces_a_block_the_reader_accepts() {
     let exif = omnion_media::read_exif("image/jpeg", &jpeg_with_exif(6, 4000, 3000));
     assert_eq!(exif.make.as_deref(), Some("Canon"), "make");
     assert_eq!(exif.model.as_deref(), Some("Canon EOS R5"), "model");
-    assert_eq!(exif.lens.as_deref(), Some("RF 24-70mm F2.8 L IS USM"), "lens");
+    assert_eq!(
+        exif.lens.as_deref(),
+        Some("RF 24-70mm F2.8 L IS USM"),
+        "lens"
+    );
     assert_eq!(exif.iso, Some(400), "iso");
     assert_eq!(exif.exposure_ms, Some(5), "1/200 s is five milliseconds");
     assert_eq!(exif.aperture_x100, Some(180), "f/1.8 is 180 hundredths");
@@ -2458,7 +2462,9 @@ async fn a_camera_record_is_read_from_the_bytes_and_never_holds_a_coordinate() {
         .parse()
         .expect("a uuid");
     assert!(
-        media_column(&fixture.state, plain_id, "exif").await.is_none(),
+        media_column(&fixture.state, plain_id, "exif")
+            .await
+            .is_none(),
         "a text file must not grow a camera record"
     );
 

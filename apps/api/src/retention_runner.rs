@@ -70,7 +70,10 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
 /// statements open in one tick, and the remainder is picked up by the next one rather than
 /// lost. The bound is a `limit` on the site query, not a slice afterwards, so the truncation
 /// is visible in the log as a count.
-pub async fn tick(state: &AppState, max_sites: i64) -> std::result::Result<TickReport, omnion_media::MediaError> {
+pub async fn tick(
+    state: &AppState,
+    max_sites: i64,
+) -> std::result::Result<TickReport, omnion_media::MediaError> {
     let pool = state.db().pool();
 
     // First, because a reference to a page that no longer exists refuses a purge for ever.
@@ -114,7 +117,13 @@ pub async fn tick(state: &AppState, max_sites: i64) -> std::result::Result<TickR
         }
     }
 
-    Ok(TickReport { sites: batch.len(), purged, versions, repaired, failed })
+    Ok(TickReport {
+        sites: batch.len(),
+        purged,
+        versions,
+        repaired,
+        failed,
+    })
 }
 
 /// How many stale reference rows one tick removes. Bounded because the repair is a scan over
@@ -175,20 +184,41 @@ mod tests {
     /// the database — becomes the one line in a thousand that still gets looked at.
     #[test]
     fn an_empty_tick_is_idle_and_a_failing_site_is_not() {
-        let empty = TickReport { sites: 12, ..TickReport::default() };
+        let empty = TickReport {
+            sites: 12,
+            ..TickReport::default()
+        };
         assert!(empty.is_idle());
 
-        let held = TickReport { repaired: 1, ..TickReport::default() };
-        assert!(!held.is_idle(), "a repair is work, even when nothing was removed");
+        let held = TickReport {
+            repaired: 1,
+            ..TickReport::default()
+        };
+        assert!(
+            !held.is_idle(),
+            "a repair is work, even when nothing was removed"
+        );
 
-        let worked = TickReport { sites: 2, purged: 1, versions: 3, repaired: 0, failed: 0 };
+        let worked = TickReport {
+            sites: 2,
+            purged: 1,
+            versions: 3,
+            repaired: 0,
+            failed: 0,
+        };
         assert!(!worked.is_idle());
     }
 
     /// A site that failed is counted, not hidden, and it does not stop the others.
     #[test]
     fn a_failing_site_is_counted_rather_than_swallowed() {
-        let report = TickReport { sites: 3, purged: 2, versions: 0, repaired: 0, failed: 1 };
+        let report = TickReport {
+            sites: 3,
+            purged: 2,
+            versions: 0,
+            repaired: 0,
+            failed: 1,
+        };
         assert_eq!(report.sites, 3);
         assert_eq!(report.purged, 2, "the sites that worked still counted");
         assert_eq!(report.failed, 1, "and the one that did not is visible");

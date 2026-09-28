@@ -269,7 +269,11 @@ impl MergeBody {
             notice.push_str(&format!(
                 " {} {} closed, because the file behind {} no longer exists.",
                 shares,
-                if shares == 1 { "link was" } else { "links were" },
+                if shares == 1 {
+                    "link was"
+                } else {
+                    "links were"
+                },
                 if shares == 1 { "it" } else { "them" },
             ));
         }
@@ -314,7 +318,12 @@ pub async fn report(
     // Two sites is one question with a different scope, so it is a different code path rather
     // than a wider `site_id`: the platform check has to happen *before* any rows are read, not
     // after they have been counted.
-    if let Some(raw) = query.sites.as_deref().map(str::trim).filter(|raw| !raw.is_empty()) {
+    if let Some(raw) = query
+        .sites
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    {
         platform_only(&current)?;
         let site_ids = parse_sites(raw)?;
         if site_ids.is_empty() {
@@ -367,7 +376,8 @@ pub async fn merge(
         .filter(|file| file.id != input.keep)
         .collect();
     let bytes: i64 = before.iter().map(|file| file.size() as i64).sum();
-    let shares: i64 = count_live_shares(pool, &before.iter().map(|f| f.id).collect::<Vec<_>>()).await?;
+    let shares: i64 =
+        count_live_shares(pool, &before.iter().map(|f| f.id).collect::<Vec<_>>()).await?;
 
     let outcome = merge_group(pool, site.id, &checksum, input.keep, current.user.id).await?;
 
@@ -534,9 +544,8 @@ fn parse_sites(raw: &str) -> std::result::Result<Vec<Uuid>, ApiError> {
         if part.is_empty() {
             continue;
         }
-        let id = Uuid::parse_str(part).map_err(|_| {
-            ApiError::bad_request("sites", format!("`{part}` is not a site id"))
-        })?;
+        let id = Uuid::parse_str(part)
+            .map_err(|_| ApiError::bad_request("sites", format!("`{part}` is not a site id")))?;
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -568,7 +577,10 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         assert_eq!(parse_sites(&format!("{a},{b}")).expect("ids"), vec![a, b]);
-        assert_eq!(parse_sites(&format!(" {a} , {b} ")).expect("ids"), vec![a, b]);
+        assert_eq!(
+            parse_sites(&format!(" {a} , {b} ")).expect("ids"),
+            vec![a, b]
+        );
         // A repeated id is one site, not two rows in the report.
         assert_eq!(parse_sites(&format!("{a},{a}")).expect("ids"), vec![a]);
         assert!(parse_sites("").expect("empty list").is_empty());
@@ -602,7 +614,8 @@ mod tests {
         let body = MergeBody::build(&outcome, 4096, 0);
         assert!(body.notice.contains("in the trash"), "{}", body.notice);
         assert!(
-            body.notice.contains("only reclaimed when the trash is purged"),
+            body.notice
+                .contains("only reclaimed when the trash is purged"),
             "{}",
             body.notice
         );
@@ -628,7 +641,8 @@ mod tests {
             0,
         );
         assert!(
-            one.notice.contains("is in the trash and its 1 byte is only reclaimed"),
+            one.notice
+                .contains("is in the trash and its 1 byte is only reclaimed"),
             "{}",
             one.notice
         );
@@ -645,7 +659,8 @@ mod tests {
             0,
         );
         assert!(
-            many.notice.contains("are in the trash and their 5000 bytes are only reclaimed"),
+            many.notice
+                .contains("are in the trash and their 5000 bytes are only reclaimed"),
             "{}",
             many.notice
         );
@@ -661,7 +676,15 @@ mod tests {
             references_collapsed: 0,
         };
         let body = MergeBody::build(&outcome, 0, 3);
-        assert!(body.notice.contains("3 links were closed"), "{}", body.notice);
-        assert!(body.notice.contains("2 copies are in the trash"), "{}", body.notice);
+        assert!(
+            body.notice.contains("3 links were closed"),
+            "{}",
+            body.notice
+        );
+        assert!(
+            body.notice.contains("2 copies are in the trash"),
+            "{}",
+            body.notice
+        );
     }
 }
