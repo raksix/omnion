@@ -30,8 +30,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use omnion_ai_hub::{
-    AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole,
-    MAX_PRIORITY, MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelCapability,
+    AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole, MAX_PRIORITY,
+    MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelCapability,
     ModelChanges, NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, StepStatus,
     TestReport, protocol_infos, stream_chat, test_provider,
 };
@@ -763,8 +763,7 @@ pub async fn apply_provider_discovery(
 
     let target = ProviderTarget::from_provider(&provider);
     let reported = omnion_ai_hub::list_remote_models(&target).await?;
-    let diff =
-        omnion_ai_hub::apply_discovery(state.db().pool(), &provider, &reported).await?;
+    let diff = omnion_ai_hub::apply_discovery(state.db().pool(), &provider, &reported).await?;
 
     let models = omnion_ai_hub::list_models(state.db().pool(), Some(provider.id)).await?;
 
@@ -835,7 +834,6 @@ pub async fn update_model(
     Ok(Json(ModelBody::build(&provider, &model)))
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Handlers — protocols and the connection test
 // ---------------------------------------------------------------------------------------------
@@ -894,12 +892,16 @@ pub async fn test_provider_connection(
     let error = report
         .failing_step
         .as_ref()
-        .and_then(|_| report.steps.iter().find(|step| matches!(step.status, StepStatus::Failed)))
+        .and_then(|_| {
+            report
+                .steps
+                .iter()
+                .find(|step| matches!(step.status, StepStatus::Failed))
+        })
         .and_then(|step| step.error.clone());
     // A test that failed is evidence, not noise: the verdict is stored so the list can show it,
     // and a passing test clears the previous failure instead of leaving a stale error behind.
-    let _ = omnion_ai_hub::record_health(state.db().pool(), id, status, 0, error.as_deref())
-        .await;
+    let _ = omnion_ai_hub::record_health(state.db().pool(), id, status, 0, error.as_deref()).await;
 
     if !report.ok {
         let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.test_failed")

@@ -73,7 +73,6 @@ pub async fn resolve_for(
 
 /// The resolution half of [`resolve`] and [`resolve_for`].
 async fn lookup(pool: &PgPool, requested: Option<&str>) -> Result<ResolvedModel> {
-
     match requested {
         None => default_model(pool).await,
         Some(value) => {

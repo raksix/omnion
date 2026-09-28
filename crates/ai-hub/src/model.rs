@@ -630,7 +630,10 @@ pub fn diff_discovery(stored: &[AiModel], reported: &[String]) -> Vec<DiscoveryL
     }
 
     for model in stored {
-        if !reported_keys.iter().any(|key| key.as_str() == model.model_key) {
+        if !reported_keys
+            .iter()
+            .any(|key| key.as_str() == model.model_key)
+        {
             lines.push(DiscoveryLine {
                 model_key: model.model_key.clone(),
                 action: DiscoveryAction::Removed,
@@ -804,7 +807,10 @@ pub fn validate_model_key(model_key: &str) -> Result<()> {
 /// Both are "how many tokens" and both are optional, so `None` passes. A ceiling of zero is
 /// refused rather than stored: a model that can produce no tokens cannot answer, and a row that
 /// says so would break the router at request time instead of at edit time.
-pub fn validate_token_limits(context_window: Option<i32>, max_output_tokens: Option<i32>) -> Result<()> {
+pub fn validate_token_limits(
+    context_window: Option<i32>,
+    max_output_tokens: Option<i32>,
+) -> Result<()> {
     if let Some(window) = context_window
         && window <= 0
     {
@@ -1067,12 +1073,21 @@ mod tests {
     fn the_capability_vocabulary_is_closed_and_round_trips() {
         assert_eq!(ModelCapability::ALL.len(), 10);
         for capability in ModelCapability::ALL {
-            assert_eq!(ModelCapability::parse(capability.as_str()), Some(*capability));
+            assert_eq!(
+                ModelCapability::parse(capability.as_str()),
+                Some(*capability)
+            );
             assert!(!capability.note().is_empty(), "{capability} needs a note");
         }
         assert_eq!(ModelCapability::parse("telepathy"), None);
-        assert!(!ModelCapability::Chat.is_model_flag(), "chat is true for every row");
-        assert!(!ModelCapability::ListModels.is_model_flag(), "list-models is a provider fact");
+        assert!(
+            !ModelCapability::Chat.is_model_flag(),
+            "chat is true for every row"
+        );
+        assert!(
+            !ModelCapability::ListModels.is_model_flag(),
+            "list-models is a provider fact"
+        );
         assert!(ModelCapability::Vision.is_model_flag());
     }
 
@@ -1081,7 +1096,10 @@ mod tests {
         let mut model = bare("m");
         // Chat is a fact about the row existing; list-models is a fact about the endpoint.
         assert!(model.capability(ModelCapability::Chat));
-        assert!(model.capability(ModelCapability::Streaming), "the default is on");
+        assert!(
+            model.capability(ModelCapability::Streaming),
+            "the default is on"
+        );
         assert!(!model.capability(ModelCapability::ListModels));
         assert!(!model.capability(ModelCapability::Vision));
 

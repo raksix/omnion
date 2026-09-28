@@ -203,15 +203,18 @@ pub async fn run_test(provider: &Provider, known: &[String]) -> TestReport {
             Some(models)
         }
         Err(error) => {
-            steps[0] =
-                TestStep::failed("resolve", "Host resolves", elapsed(resolve_started), &error.to_string());
+            steps[0] = TestStep::failed(
+                "resolve",
+                "Host resolves",
+                elapsed(resolve_started),
+                &error.to_string(),
+            );
             // A host that never answered proves nothing about TLS or the key, so those steps stay
             // pending. A host that *did* answer and refused tells us exactly one more thing: the
             // key (or the URL) is what it refused, and the panel needs that named.
             if answered_with_an_error(&error) {
                 steps[1] = tls_step(&target.base_url);
-                steps[2] =
-                    TestStep::failed("auth", "Key accepted", 0, &error.to_string());
+                steps[2] = TestStep::failed("auth", "Key accepted", 0, &error.to_string());
             }
             return report(provider, steps, started, models_failure_kind(&error));
         }
@@ -283,9 +286,9 @@ fn report(
 ) -> TestReport {
     // Everything after the first hard failure is `pending`: a test that stops at the auth step
     // has not learned anything about streaming, and saying so beats three green ticks.
-    let first_failure = steps.iter().position(|step| {
-        matches!(step.status, StepStatus::Failed)
-    });
+    let first_failure = steps
+        .iter()
+        .position(|step| matches!(step.status, StepStatus::Failed));
     if let Some(index) = first_failure {
         for step in steps.iter_mut().skip(index + 1) {
             if matches!(step.status, StepStatus::Pending) {
@@ -400,7 +403,9 @@ pub fn sanitize_provider_error(message: &str) -> String {
             && (trimmed.starts_with("sk-")
                 || trimmed.starts_with("sk_")
                 || trimmed.starts_with("AIza")
-                || trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                || trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
                     && trimmed.chars().any(|c| c.is_ascii_digit())
                     && trimmed.starts_with("sk"));
         if looks_like_key {
@@ -454,14 +459,21 @@ mod tests {
 
     #[test]
     fn a_metadata_endpoint_is_refused_before_a_socket_is_opened() {
-        let blocked = provider("http://169.254.169.254/latest/meta-data/", "openai_compatible");
+        let blocked = provider(
+            "http://169.254.169.254/latest/meta-data/",
+            "openai_compatible",
+        );
         let report = futures_lite_block_on(run_test(&blocked, &[]));
         assert!(!report.ok);
         assert_eq!(report.failing_step.as_deref(), Some("resolve"));
         let resolve = &report.steps[0];
         assert!(matches!(resolve.status, StepStatus::Failed));
         assert!(
-            resolve.error.as_deref().unwrap_or_default().contains("metadata endpoint"),
+            resolve
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("metadata endpoint"),
             "{:?}",
             resolve.error
         );
@@ -493,7 +505,10 @@ mod tests {
         let message = "invalid key sk-abcdefghijklmnopqrstuvwx was sent";
         let clean = sanitize_provider_error(message);
         assert!(!clean.contains("abcdefghijklmnopqrstuvwx"), "{clean}");
-        assert!(clean.contains("invalid key"), "the sentence survives: {clean}");
+        assert!(
+            clean.contains("invalid key"),
+            "the sentence survives: {clean}"
+        );
 
         // A normal word is not mistaken for a key.
         assert!(sanitize_provider_error("model not found").contains("model not found"));
@@ -504,7 +519,11 @@ mod tests {
     fn a_provider_message_is_clipped_to_a_readable_length() {
         let long = "x".repeat(MAX_ERROR_CHARS + 100);
         let clean = sanitize_provider_error(&long);
-        assert!(clean.chars().count() <= MAX_ERROR_CHARS + 1, "{}", clean.chars().count());
+        assert!(
+            clean.chars().count() <= MAX_ERROR_CHARS + 1,
+            "{}",
+            clean.chars().count()
+        );
         assert!(clean.ends_with('…'));
     }
 

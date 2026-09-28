@@ -871,7 +871,10 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/providers/{id}", ai_provider)
         .route("/ai/providers/{id}/models", ai_provider_models)
         .route("/ai/providers/{id}/discover-models", ai_provider_discover)
-        .route("/ai/providers/{id}/apply-discovery", ai_provider_apply_discovery)
+        .route(
+            "/ai/providers/{id}/apply-discovery",
+            ai_provider_apply_discovery,
+        )
         .route("/ai/protocols", ai_protocols)
         .route("/ai/providers/{id}/test", ai_provider_test)
         .route("/ai/models", ai_models)

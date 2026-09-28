@@ -514,8 +514,7 @@ pub async fn discovery_diff(
     let mut reported_keys = reported.to_vec();
     reported_keys.sort();
     reported_keys.dedup();
-    let mut stored_keys: Vec<String> =
-        stored.iter().map(|model| model.model_key.clone()).collect();
+    let mut stored_keys: Vec<String> = stored.iter().map(|model| model.model_key.clone()).collect();
     stored_keys.sort();
 
     Ok(DiscoveryDiff {
@@ -533,7 +532,11 @@ pub async fn discovery_diff(
 /// model list carries no capability metadata — the operator is who turns the rest on, and a row
 /// that claimed otherwise would be a guess the router then enforced. A row that is already
 /// stored keeps every flag it had: discovery reconciles *keys*, never capabilities.
-pub async fn apply_discovery(pool: &PgPool, provider: &Provider, reported: &[String]) -> Result<DiscoveryDiff> {
+pub async fn apply_discovery(
+    pool: &PgPool,
+    provider: &Provider,
+    reported: &[String],
+) -> Result<DiscoveryDiff> {
     let diff = discovery_diff(pool, provider, reported).await?;
 
     let additions: Vec<String> = diff

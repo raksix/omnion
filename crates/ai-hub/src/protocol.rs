@@ -326,7 +326,10 @@ impl ProtocolAdapter for AnthropicMessages {
         if let Ok(value) = reqwest::header::HeaderValue::from_str(ANTHROPIC_VERSION) {
             headers.insert("anthropic-version", value);
         }
-        headers.insert("content-type", reqwest::header::HeaderValue::from_static("application/json"));
+        headers.insert(
+            "content-type",
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
         headers
     }
 
@@ -405,12 +408,7 @@ impl ProtocolAdapter for AnthropicMessages {
         Some(
             entries
                 .iter()
-                .filter_map(|entry| {
-                    entry
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
+                .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_owned))
                 .collect(),
         )
     }
@@ -431,7 +429,9 @@ fn read_anthropic_usage(value: &Value) -> Option<ChatUsage> {
     Some(ChatUsage {
         prompt_tokens: input,
         completion_tokens: output,
-        total_tokens: input.zip(output).map(|(prompt, completion)| prompt + completion),
+        total_tokens: input
+            .zip(output)
+            .map(|(prompt, completion)| prompt + completion),
     })
 }
 
@@ -456,10 +456,16 @@ impl StreamDecoder for AnthropicStream {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| clip(data));
-            return Err(AiHubError::Upstream { status: 200, message });
+            return Err(AiHubError::Upstream {
+                status: 200,
+                message,
+            });
         }
 
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let mut piece = StreamPiece::default();
 
         match kind {
@@ -478,10 +484,7 @@ impl StreamDecoder for AnthropicStream {
                 }
             }
             "message_delta" => {
-                if let Some(reason) = value
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
-                {
+                if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     piece.finish_reason = Some(reason.to_owned());
                 }
                 if let Some(output) = value
@@ -601,10 +604,7 @@ impl ProtocolAdapter for GoogleGemini {
     }
 
     fn parse_answer(&self, value: &Value) -> Option<ChatOutcome> {
-        let candidate = value
-            .get("candidates")?
-            .as_array()?
-            .first()?;
+        let candidate = value.get("candidates")?.as_array()?.first()?;
         let content: String = candidate
             .pointer("/content/parts")
             .and_then(Value::as_array)
@@ -682,7 +682,10 @@ impl StreamDecoder for GeminiStream {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| clip(data));
-            return Err(AiHubError::Upstream { status: 200, message });
+            return Err(AiHubError::Upstream {
+                status: 200,
+                message,
+            });
         }
 
         let mut piece = StreamPiece::default();
@@ -750,10 +753,18 @@ pub fn role_name(protocol: &str, role: &ChatMessage) -> &'static str {
     let assistant = role.role == crate::client::ChatRole::Assistant;
     match protocol {
         "anthropic_messages" => {
-            if assistant { "assistant" } else { "user" }
+            if assistant {
+                "assistant"
+            } else {
+                "user"
+            }
         }
         "google_gemini" => {
-            if assistant { "model" } else { "user" }
+            if assistant {
+                "model"
+            } else {
+                "user"
+            }
         }
         _ => role.role.as_str(),
     }
@@ -787,8 +798,14 @@ mod tests {
 
     #[test]
     fn the_registry_covers_exactly_the_three_adapters() {
-        assert_eq!(adapter_for("openai_compatible").protocol(), "openai_compatible");
-        assert_eq!(adapter_for("anthropic_messages").protocol(), "anthropic_messages");
+        assert_eq!(
+            adapter_for("openai_compatible").protocol(),
+            "openai_compatible"
+        );
+        assert_eq!(
+            adapter_for("anthropic_messages").protocol(),
+            "anthropic_messages"
+        );
         assert_eq!(adapter_for("google_gemini").protocol(), "google_gemini");
         assert_eq!(
             protocol_infos()
@@ -938,9 +955,21 @@ mod tests {
         assert_eq!(gemini.usage.expect("usage").total_tokens, Some(7));
 
         // A body that carries no answer at all is `None` everywhere, not an empty string.
-        assert!(adapter_for("openai_compatible").parse_answer(&json!({})).is_none());
-        assert!(adapter_for("anthropic_messages").parse_answer(&json!({})).is_none());
-        assert!(adapter_for("google_gemini").parse_answer(&json!({})).is_none());
+        assert!(
+            adapter_for("openai_compatible")
+                .parse_answer(&json!({}))
+                .is_none()
+        );
+        assert!(
+            adapter_for("anthropic_messages")
+                .parse_answer(&json!({}))
+                .is_none()
+        );
+        assert!(
+            adapter_for("google_gemini")
+                .parse_answer(&json!({}))
+                .is_none()
+        );
     }
 
     #[test]
@@ -972,8 +1001,16 @@ mod tests {
             "the models/ prefix is stripped once, here"
         );
 
-        assert!(adapter_for("openai_compatible").parse_model_list(&json!({})).is_none());
-        assert!(adapter_for("google_gemini").parse_model_list(&json!({})).is_none());
+        assert!(
+            adapter_for("openai_compatible")
+                .parse_model_list(&json!({}))
+                .is_none()
+        );
+        assert!(
+            adapter_for("google_gemini")
+                .parse_model_list(&json!({}))
+                .is_none()
+        );
     }
 
     #[test]
@@ -998,10 +1035,12 @@ mod tests {
         // Messages: text deltas, a stop reason and the output count in the delta event, the end
         // sentinel in its own event.
         let mut anthropic = adapter_for("anthropic_messages").decoder();
-        assert!(anthropic
-            .decode(r#"{"type":"message_start","message":{"usage":{"input_tokens":7}}}"#)
-            .expect("a piece")
-            .is_empty());
+        assert!(
+            anthropic
+                .decode(r#"{"type":"message_start","message":{"usage":{"input_tokens":7}}}"#)
+                .expect("a piece")
+                .is_empty()
+        );
         let text = anthropic
             .decode(r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel"}}"#)
             .expect("a piece");
@@ -1011,7 +1050,11 @@ mod tests {
             .expect("a piece");
         assert_eq!(stop.finish_reason.as_deref(), Some("end_turn"));
         let usage = stop.usage.expect("both counts");
-        assert_eq!(usage.prompt_tokens, Some(7), "the input count survives from message_start");
+        assert_eq!(
+            usage.prompt_tokens,
+            Some(7),
+            "the input count survives from message_start"
+        );
         assert_eq!(usage.completion_tokens, Some(4));
         assert_eq!(usage.total_tokens, Some(11));
         assert!(
@@ -1046,7 +1089,10 @@ mod tests {
             };
             let mut decoder = adapter_for(protocol).decoder();
             let error = decoder.decode(payload).expect_err("a provider error");
-            assert!(matches!(error, AiHubError::Upstream { status: 200, .. }), "{protocol}");
+            assert!(
+                matches!(error, AiHubError::Upstream { status: 200, .. }),
+                "{protocol}"
+            );
             let text = error.to_string();
             assert!(
                 ["no such model", "overloaded", "quota"]
