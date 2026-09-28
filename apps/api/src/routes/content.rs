@@ -389,7 +389,16 @@ pub async fn update_page(
     // A block save is a structural change, and the platform's own bus is where downstream
     // listeners learn about those. The payload carries the count, never the tree: the events
     // surface is read by integrations that must not be handed a page's whole body.
-    if let Some(draft) = &body.draft {
+    //
+    // The event is gated on the request actually carrying a block tree, not merely on a draft
+    // existing. A rename PATCH appends a draft revision like any other content change, so gating
+    // on the draft made every title edit announce "blocks updated" with a count of zero — and an
+    // integration subscribed to it would rebuild a page's media, re-run a diff and re-publish a
+    // CDN cache for a page whose blocks never moved. The audit entry below still records the
+    // rename, so nothing is lost; it simply stops being reported as a structural change.
+    if changes.blocks.is_some()
+        && let Some(draft) = &body.draft
+    {
         let block_count = omnion_content::validate(&draft.blocks).block_count;
         let _report = bus::emit(
             state.db().pool(),
