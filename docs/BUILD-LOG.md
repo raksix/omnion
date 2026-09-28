@@ -3975,3 +3975,56 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+## 2026-09-28 · tick 19 · REQ-051 · the merge took the workspace down twice, and the second fix is the one that holds
+
+**What.** No CRM code changed. `origin/main` had moved five commits (REQ-021
+notifications), so the tick opened by merging it — the right moment, because the tree was clean
+and the QA pass was still queued. The merge produced four conflicts, and resolving them wrongly
+broke the build **twice** in ways that looked nothing like a merge problem.
+
+**Conflict 1 — `Cargo.lock`, and the rule that is now written down.** Both sides had touched it,
+so the union resolver ran on a file that is **generated**. It appended two lines that were in
+neither stage — a bare dependency entry and a duplicate `name =` — and cargo then refused to
+parse the manifest at all, taking the entire workspace down rather than one crate. *Cargo.lock is
+never hand-merged: take the other side and let cargo regenerate it.* Union is for append-only
+prose and for lists a human curates, never for anything a tool owns. (`bc3dcc5`)
+
+**Conflict 2 — the one that matters, and the reason the first fix was not enough.** `seed.rs` and
+`app-shell.tsx` are genuine both-changed files: each writer added elements to *the same array
+literal*. The lines missing from the merge are therefore not whole statements — they are array
+elements whose surrounding structure both sides already agreed on — so "append the lines that
+disappeared" writes a bare string literal **after the file's closing brace**:
+
+```
+error: expected item, found `"crm.contacts.read"`      seed.rs:565
+components/app-shell.tsx(216,46): error TS1005: ';' expected.
+```
+
+The BUILD-LOG union went through the same code path and *passed its own multiset check* while
+silently dropping 1,308 lines of wave4 history, because the check ran on the wrong intermediate.
+**Line counts are not verification; the multiset is.** That one is now asserted (`missing ours: 0,
+missing theirs: 0`) and the append-only splice is anchored to the base, not to a side. (`3f8230c`)
+
+The two code files are now merged **list-aware**: walk the other side's diff, carry over only
+lines that are genuinely new array elements (a bare key string, or a nav object with an `href`),
+then assert the file's invariants — every key both writers introduced is present, braces balance,
+the file still ends on the component's closing brace. That assertion is the durable part: it is
+what catches the next one, and the line union is what caused this. Restoring main's edit to the
+same lucide import line also dropped `Users`, which the CRM nav row needs; it is back. (`56464c4`)
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `cargo test -p omnion-api --lib
+routes::crm` **27/27** · `pnpm turbo run typecheck --force` **2/2** · `cargo build -p
+omnion-permissions` clean · `cargo metadata` parses the restored lock. `3f8230c`/`bc3dcc5`/`56464c4`
+pushed to `origin/wave4`, tree clean.
+
+**QA pass.** Started with `QA_SLOT_WAIT=7200` on the w4 stack (18083/3103/3203). The tick-18 pass
+was still queued at 21:00 and would have **barged in without a place at 21:17:12** — its 3600 s
+wait expired one minute before this tick, and the box had 2 GB free with w6 mid-pass. Killed it
+rather than run two Chromium passes; the new wrapper waits for a real place. w6 held the only
+place and is walking. **No new report yet, so the last two boxes stay unticked.**
+
+**Next.** Read `crmStates` and `crmKeyboardMobile` from the first w4 report written *after*
+`56464c4`; only then tick the empty/loading/error and keyboard boxes and set REQ-051 to `done`.
+Then REQ-052 (sales & quotes), which has no code yet: `modules/sales`, migration **0051** (0050
+was taken by main's notifications in this very merge), and a walkthrough route list.
