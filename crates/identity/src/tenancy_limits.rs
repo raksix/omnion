@@ -606,6 +606,109 @@ pub async fn set_module_enabled(
     })
 }
 
+/// Which installed module a screen belongs to, and where that screen lives.
+///
+/// This is the one mapping the enforcement path and the panel's navigation both read, and it
+/// lives here rather than in either of them for the same reason the storage rule lives here: a
+/// list written twice is a list that will be written twice *differently*. The moment the API
+/// hides a screen the panel still shows — or the panel hides one the API still serves — the
+/// switch stops meaning anything, and a per-organization module toggle that only decorates the
+/// Modules tab is a lie told with a working-looking switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleRoute {
+    /// The module key, matching [`installed_modules`].
+    pub module: &'static str,
+    /// The path the panel uses for that module, and the prefix a request path is matched on.
+    pub path_prefix: &'static str,
+}
+
+/// Every module's surface in the panel, in the order the sidebar lists them.
+///
+/// The prefixes are matched against the request path *inside* `/api/v1` as well, so the same
+/// table can answer "which module owns this endpoint" without a second list written in the
+/// router — see [`route_module`] for the normalization that makes the two line up.
+#[must_use]
+pub fn module_routes() -> &'static [ModuleRoute] {
+    &[
+        ModuleRoute {
+            module: "ai-hub",
+            path_prefix: "/ai",
+        },
+        ModuleRoute {
+            module: "automation",
+            path_prefix: "/automations",
+        },
+        ModuleRoute {
+            module: "media",
+            path_prefix: "/media",
+        },
+        ModuleRoute {
+            module: "analytics",
+            path_prefix: "/analytics",
+        },
+        ModuleRoute {
+            module: "webhooks",
+            path_prefix: "/webhooks",
+        },
+    ]
+}
+
+/// The module that owns a request path, if the installation ships one.
+///
+/// `None` for everything the platform itself owns (tenancy, identity, content pages, search,
+/// health) — those are the core, and a core that a tenant switch could remove is not a core.
+///
+/// The match is on a *segment* boundary, not on the string: `starts_with("media")` also matches
+/// `/media-centre`, and a refusal on a path that belongs to no module is a 403 the operator
+/// cannot act on — worse than the bug it was written to prevent. So a prefix matches only when
+/// the path continues with `/` or ends there.
+///
+/// **Both shapes are accepted.** A path inside the router is `/media/{id}/raw`; the same request
+/// seen from outside the `/api/v1` nest is `/api/v1/media/{id}/raw`. The guard prefers the route's
+/// own matched path, but that extension is not present on every request (a layer that runs
+/// before routing has not seen it yet, and a request that matched nothing never gets one), and a
+/// lookup that silently answers "no module" for a prefixed path fails *open* — the switch appears
+/// to do nothing on exactly the requests that never carried a `MatchedPath`. Stripping the
+/// mount prefix makes the two shapes one question with one answer.
+#[must_use]
+pub fn route_module(request_path: &str) -> Option<&'static str> {
+    let path = request_path
+        .trim_start_matches('/')
+        .strip_prefix(API_PREFIX)
+        .unwrap_or_else(|| request_path.trim_start_matches('/'));
+    // `/public/*` is a site's own surface: a published page's script reads media and posts
+    // analytics beacons. It is matched before the module list so switching a module off does
+    // not break a live site that was published while the module was on.
+    if path.starts_with("public/") {
+        return None;
+    }
+    module_routes()
+        .iter()
+        .find(|route| owns(route.path_prefix, path))
+        .map(|route| route.module)
+}
+
+/// The mount every versioned route sits behind, without its slashes.
+const API_PREFIX: &str = "api/v1/";
+
+/// `true` when `path` is the route's own path or a path below it.
+fn owns(path_prefix: &str, path: &str) -> bool {
+    let prefix = path_prefix.trim_start_matches('/');
+    path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The panel's navigation with one module's entries removed.
+///
+/// Returns `None` for a key the installation does not ship, so a caller cannot accidentally
+/// filter on nothing and render the full list as if it had been filtered.
+#[must_use]
+pub fn navigation_without<'a>(
+    routes: &'a [ModuleRoute],
+    module: &str,
+) -> Option<Vec<&'a ModuleRoute>> {
+    Some(routes.iter().filter(|route| route.module != module).collect())
+}
+
 /// Drop an organization's decision about a module, returning it to the platform default.
 ///
 /// The Modules tab needs this: a switch that has never been touched is "on by default", and the
@@ -991,5 +1094,124 @@ mod tests {
             "the message names the number: {message}"
         );
         assert!(message.contains("members"), "and the resource: {message}");
+    }
+
+    #[test]
+    fn a_path_resolves_to_the_module_that_owns_it() {
+        assert_eq!(route_module("/media"), Some("media"));
+        assert_eq!(route_module("/media/files"), Some("media"));
+        assert_eq!(route_module("/media/{id}/raw"), Some("media"));
+        assert_eq!(route_module("/analytics/overview"), Some("analytics"));
+        assert_eq!(route_module("/ai/providers"), Some("ai-hub"));
+        assert_eq!(route_module("/automations/catalogue"), Some("automation"));
+        assert_eq!(route_module("/webhooks"), Some("webhooks"));
+    }
+
+    #[test]
+    fn a_mounted_path_answers_the_same_as_the_route_behind_it() {
+        // The failure this guards is silent and one-sided: the guard asks about the *request's*
+        // path, and a lookup that does not understand the `/api/v1` mount answers "no module"
+        // — which is a module switch that appears to do nothing. Same question, both shapes, one
+        // answer.
+        for path in [
+            "/media",
+            "/media/files",
+            "/media/{id}/raw",
+            "/analytics/overview",
+            "/ai/providers",
+            "/webhooks",
+        ] {
+            assert_eq!(
+                route_module(&format!("/api/v1{path}")),
+                route_module(path),
+                "{path} resolves differently through the mount"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mount_stripping_does_not_eat_a_route_that_merely_starts_like_it() {
+        // `strip_prefix` is the tool that fixes the above and the tool that could over-apply:
+        // a route named `api/v1/...` of its own would be read as the mounted one. Asserting
+        // `None` here says the strip only removes a *mount*, never a first path segment.
+        assert_eq!(route_module("/api/v2/media"), None);
+        assert_eq!(route_module("/api/v1"), None);
+    }
+
+    #[test]
+    fn the_core_is_never_a_module() {
+        // The core is what a tenant cannot switch off: tenancy, identity, content, search and
+        // health all keep working, because an organization whose tenants can be deleted by an
+        // ordinary toggle is not a platform.
+        for path in [
+            "/organizations",
+            "/organizations/{id}/members",
+            "/iam/roles",
+            "/pages",
+            "/pages/{id}/publish",
+            "/search",
+            "/me/organizations",
+            "/healthz",
+            "/readyz",
+            "/onboarding",
+        ] {
+            assert_eq!(route_module(path), None, "{path} is the core, not a module");
+        }
+    }
+
+    #[test]
+    fn a_published_page_survives_its_tenants_modules_being_switched_off() {
+        // `/public/*` is the *site's* surface, not the panel's: a page published while media was
+        // on keeps rendering its images and keeps posting its analytics beacons afterwards. The
+        // special case is matched before the module list, and this is the assertion for it —
+        // without it the prefix match below would swallow `/public/media/...` and a switch would
+        // quietly break live sites.
+        assert_eq!(route_module("/public/pages/home"), None);
+        assert_eq!(route_module("/public/media/{id}"), None);
+        assert_eq!(route_module("/public/analytics/collect"), None);
+    }
+
+    #[test]
+    fn a_prefix_is_not_matched_in_the_middle_of_a_word() {
+        // `/media-centre` must not read as the media module: a refusal on a path that belongs to
+        // nobody is a 403 for a reason the operator cannot act on.
+        assert_eq!(route_module("/media-centre"), None);
+        assert_eq!(route_module("/automations-x"), None);
+        // The one genuine exception: a *segment* boundary is a match, not a prefix of a word.
+        assert_eq!(route_module("/media-manifest"), None);
+        assert_eq!(route_module("/media-stats"), None);
+        assert_eq!(route_module("/media-foo/asset"), None);
+    }
+
+    #[test]
+    fn an_installed_module_with_no_route_would_have_a_dead_switch() {
+        // The Modules tab lists `installed_modules()` and the guard reads `module_routes()`. A
+        // module in the first list and not the second is a switch that changes a row and nothing
+        // else, which is exactly the failure the REQ's unticked acceptance line was about.
+        for module in installed_modules() {
+            assert!(
+                module_routes().iter().any(|route| route.module == module.key),
+                "{} is on the Modules tab but owns no route, so switching it off changes \
+                 nothing anybody can observe",
+                module.key
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_module_from_the_navigation_removes_exactly_its_entry() {
+        let routes = module_routes();
+        let remaining = navigation_without(routes, "media").expect("a shipped module");
+
+        assert!(!remaining.is_empty(), "the core keeps its own entries");
+        assert!(
+            !remaining.iter().any(|route| route.module == "media"),
+            "the media entry is gone"
+        );
+        assert_eq!(
+            remaining.len(),
+            routes.len() - 1,
+            "and nothing else was taken with it"
+        );
     }
 }
