@@ -2406,3 +2406,50 @@ Slice 2 — preview, metadata, versions. The version table already exists; the v
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+## 2026-09-28 — REQ-003 slice 4, the close tick: four defects the browser found and the unit tests could not
+
+- **What.** Merged `origin/main` (14 commits) at the top of the tick and found that the merge
+  had produced two defects before a line of new code was written. Then ran the w3 QA pass for
+  the first time against slice 4's five screens, and fixed every product defect it reported.
+- **Proof.**
+  - `cargo test -p omnion-automation --lib` → **115 passed, 0 failed**.
+  - `pnpm typecheck` (apps/admin) → clean.
+  - `bash scripts/qa/run.sh` (QA_STACK=w3, 18082/3102/3202) → **78 high → 65 high**, every
+    high attributable to a *media* screen now removed from this branch's scope; the automations
+    findings went to **zero** for run history, the trace, Retry and the gallery install.
+  - The operations pass, verbatim from `clicks.jsonl`: `run-history rows 1`, `trace steps 1`,
+    `attempts "1 of 1 attempts · 11 ms"`, `showsAttempts true`, `namesTheFailure true`,
+    `retry offered true accepted true`, `templates cards 6 installed true`, `cleanup removed`.
+- **Defects fixed.**
+  1. `aaac3c0` — **two writers took migration 0029**. main shipped
+     `0029_media_storage_settings.sql` in the same merge that already had
+     `0029_automation_operations.sql` on this branch. sqlx keys its ledger on the *number*, so
+     the API answered `migration 29 was previously applied but has been modified` and refused to
+     boot. Renumbered to 0031/0032, banners and the one doc comment included.
+  2. `7e878b9` — **a merge conflict kept both sides of a fix**. The media footer read had been
+     repaired on both branches the same day; splicing both produced
+     `SyntaxError: Identifier 'footer' has already been declared` and the pass never started.
+     One fix kept, with the reason recorded.
+  3. `5e9264a` — **a shared disk deleted the pass's artifacts mid-run**. Another writer reclaimed
+     space; `record()`'s `appendFileSync` threw ENOENT and unwound `main()`, so a 22-minute pass
+     ended with no summary. The write is now best-effort — the evidence is already in memory.
+  4. `8aede17`, `881b8b4` — **two controls on the new screens could not work**. The gallery's
+     install sent no tenant for a platform account (a 400 on every card's button), and the button
+     was pressable during the round trip in which the tenant is still unknown. Run now started a
+     real run and left the open Runs tab showing "this rule has not run yet": the panel read its
+     list on mount and nothing told it to look again.
+  5. `1f29ad6` — **the pass reported two phantoms**. Five places saved, returned to the list and
+     clicked the rule's row without waiting for it; the click found nothing, the `.catch()`
+     swallowed it, and the pass went on to report "the Versions tab lists nothing" for a rule it
+     had never opened. `openRuleByName` waits for the row and for the editor to prove it opened.
+- **Environment.** Two QA slots were held by pids that no longer existed, and `qa-slot.sh` only
+  reaps a dead place once it is also older than `WAIT + 900`; three passes queued behind a leak
+  for minutes before the dead places were cleared. `/mnt/apopic` fell to 100 % mid-pass again and
+  the artifact directory went with it. The last pass also crawled on `/analytics` for nine
+  minutes with 30 Chromium processes and 1 GiB free — **not** a code problem.
+- **Next.** Slice 4 closes on the next tick once a clean pass confirms the Versions and Audit
+  tabs with `openRuleByName` in place (the trace, retry and gallery are already green). Then
+  **REQ-004**, the visual workflow builder. Carried over from earlier slices and still open:
+  the "welcome e-mail on signup" walk, the inbound-hook run walk, the "paused rule does not
+  replay" walk, and the loop guard's test shown to fail with the guard removed.

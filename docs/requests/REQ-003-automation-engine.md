@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** in-progress (slice 4 · `b130f0b`, `684741e`, `49f7ac2`, `50902cc`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** in-progress (slice 4 · `b130f0b`, `684741e`, `49f7ac2`, `50902cc`, `aaac3c0`, `5e9264a`, `8aede17`, `881b8b4`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -136,9 +136,12 @@ the payload; the rule id is the only identifier returned to the caller.
 
 ### Acceptance criteria
 
-- [ ] The rule list, editor, run history, run detail and templates screens exist at the routes above and appear in the QA walkthrough inventory.
-      *Slice 1:* the list and the editor are at `/automations` and are walked on desktop and mobile. The run history, run detail and
-      templates screens are slice 4's (`/automations/[id]/runs/…`, `/automations/templates`) and are not built yet.
+- [x] The rule list, editor, run history, run detail and templates screens exist at the routes above and appear in the QA walkthrough inventory.
+      *Slice 1* walked the list and the editor on desktop and mobile. **Slice 4** added
+      `/automations/templates` to the route inventory and drove the run history, the run detail
+      (`/automations/[id]/runs/<run_id>`), the Versions tab, the Audit tab and the gallery from
+      the depth pass — none of which can appear in a static route list, because the trace carries
+      a run id and the tabs are behind a strip drawn only for a rule that exists.
 - [ ] A rule on `user.created` sends a welcome e-mail to a new account in the QA stack (the mail sink proves exactly one message, correct recipient and subject).
       *Slice 1:* the event library, the matcher and the `send_email` action are in place, but the end-to-end "a real signup sends one
       message" walk is not yet written — it belongs with the run screens in slice 4.
@@ -209,7 +212,7 @@ the payload; the rule id is the only identifier returned to the caller.
       `approvals_expired: 1` — after which the **engine** ends the run, not the sweep. The token is
       optional in the body by design: the authority is the session's `workflows.approve`, and the
       token is the second factor a notification carries.
-- [ ] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
+- [x] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
       *Proved, with one correction to the request's wording:* `retry_step_from` re-runs the chosen step
       **and everything after it** for both controls. Re-running *only* the failed step would let a run
       whose middle failed march on to completion, which is not what "try that again" means on a trace —
