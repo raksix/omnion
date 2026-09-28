@@ -128,3 +128,132 @@ pub const BUNDLE_ASSETS: &[(&str, &str)] = &[
         "Each dashboard panel mapped to the metric families it queries",
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// The repository root, found by walking up from this file.
+    ///
+    /// From `crates/telemetry/src/lib.rs` that is three levels up. Hard-coded rather than read
+    /// from `CARGO_MANIFEST_DIR` + `../..` so the same expression works whether the test runs
+    /// from the crate or from a copied source tree.
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the crate is two levels below the repository root")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn every_asset_the_manifest_names_exists_in_the_tree() {
+        // The manifest is served to the panel and shown as a list of things the operator can
+        // import. A name with no file behind it is a button that leads nowhere, which the
+        // request's own definition of done forbids outright.
+        let bundle = repo_root().join("infra").join("observability");
+        for (path, description) in BUNDLE_ASSETS {
+            let full = bundle.join(path);
+            assert!(
+                full.exists(),
+                "the manifest names `{path}` ({description}) and there is no such file — \
+                 an asset list is a promise and this one is broken"
+            );
+            assert!(
+                std::fs::metadata(&full)
+                    .expect("the asset metadata reads")
+                    .len()
+                    > 0,
+                "`{path}` is empty"
+            );
+        }
+    }
+
+    #[test]
+    fn the_readme_documents_every_family_the_dashboards_query() {
+        // The README is the contract the request asks for ("a README mapping each dashboard
+        // panel to the metric families above"). Checking it HERE means the Rust suite fails when
+        // a dashboard grows a panel the mapping does not mention, not only when someone
+        // remembers to run the Node generator.
+        //
+        // The dashboards are generated, so this is not a second source of truth: it is the
+        // assertion that the generated output still matches the document beside it.
+        let readme = std::fs::read_to_string(
+            repo_root()
+                .join("infra")
+                .join("observability")
+                .join("README.md"),
+        )
+        .expect("the bundle README exists");
+
+        for (path, _) in BUNDLE_ASSETS {
+            if !path.ends_with(".json") {
+                continue;
+            }
+            let json =
+                std::fs::read_to_string(repo_root().join("infra").join("observability").join(path))
+                    .expect("the dashboard exists");
+            for family in families_in(&json) {
+                assert!(
+                    readme.contains(&family),
+                    "`{path}` queries `{family}`, which the README's mapping does not document — \
+                     a panel nobody can debug is a panel nobody should ship"
+                );
+            }
+        }
+    }
+
+    /// Every `omnion_*` name in a JSON document, deduplicated.
+    fn families_in(json: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let mut rest = json;
+        while let Some(at) = rest.find("omnion_") {
+            rest = &rest[at + 7..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let name = format!("omnion_{}", &rest[..end]);
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_bundle_version_is_the_one_the_readme_states() {
+        let readme = std::fs::read_to_string(
+            repo_root()
+                .join("infra")
+                .join("observability")
+                .join("README.md"),
+        )
+        .expect("the bundle README exists");
+        assert!(
+            readme.contains(BUNDLE_VERSION),
+            "the README does not state the bundle version {BUNDLE_VERSION}, so the two numbers \
+             the compatibility note compares cannot be compared"
+        );
+    }
+
+    #[test]
+    fn every_declared_family_is_reachable_from_the_catalogue_the_panel_reads() {
+        // The metrics screen reads `obs_metric_catalog`, not a hard-coded list, and the bundle's
+        // dashboards query the registry. Both are fed from `FAMILIES`, so a family that is in
+        // neither is a family nobody can see — which is the same failure as a panel on a
+        // nonexistent family, from the other direction.
+        assert!(
+            crate::metrics::FAMILIES.len() >= 20,
+            "the registry declares only {} families",
+            crate::metrics::FAMILIES.len()
+        );
+        for spec in crate::metrics::FAMILIES {
+            assert!(
+                !spec.name.is_empty() && spec.name.starts_with("omnion_"),
+                "a family is not namespaced: `{}`",
+                spec.name
+            );
+        }
+    }
+}

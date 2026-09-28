@@ -41,9 +41,16 @@ backend and import what is here.
 ## Every panel, and the families it queries
 
 This mapping is the point of the bundle: a panel whose query names a family that does not exist is
-a panel that shows an empty graph and looks like a quiet system.
+a panel that shows an empty graph and looks like a quiet system. The mapping is checked against
+the dashboards by the crate's own test suite, so a panel that grows a family the table does not
+mention fails a build rather than shipping.
 
 ### `omnion-overview.json` — API overview
+
+The `instance` template variable on every dashboard is filled from `omnion_build_info`, which
+carries the version and commit. That is the family to filter by when a spike arrived with a
+deploy — the two numbers are the release it arrived in, and the commit is `unknown` when the
+build did not set it, because a made-up sha is worse than an honest one.
 
 | Panel | Query | Families |
 |---|---|---|
@@ -63,6 +70,7 @@ budget in the settings screen exists to prevent.
 |---|---|---|
 | Pool states | `omnion_db_pool_connections` | `omnion_db_pool_connections` |
 | Query latency | `histogram_quantile(0.95, sum(rate(omnion_db_query_duration_seconds_bucket[5m])) by (le, statement))` | `omnion_db_query_duration_seconds` |
+| Query rate | `sum by (statement) (rate(omnion_db_query_duration_seconds_count[5m]))` | `omnion_db_query_duration_seconds` |
 
 `statement` is a **statement name**, never a parameter value. A label carrying query arguments is
 a label carrying user data.
@@ -105,6 +113,7 @@ raise the budget, not as a model.
 | Dropped telemetry | `sum by (exporter) (rate(omnion_exporter_dropped_total[5m]))` | `omnion_exporter_dropped_total` |
 | Cardinality losses | `omnion_registry_budget_exceeded` | `omnion_registry_budget_exceeded` |
 | Alert transitions | `sum by (state) (increase(omnion_alert_transitions_total[1h]))` | `omnion_alert_transitions_total` |
+| Alert evaluations | `sum(increase(omnion_alert_evaluations_total[15m]))` | `omnion_alert_evaluations_total` |
 | Shutdowns | `sum by (outcome) (increase(omnion_shutdowns_total[24h]))` | `omnion_shutdowns_total` |
 
 ## The two families that are about Omnion rather than about your traffic

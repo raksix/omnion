@@ -1,0 +1,98 @@
+# OpenTelemetry collector example for Omnion (REQ-126, slice 4).
+#
+# This is a WORKING example, not a sketch: it receives OTLP over HTTP from an Omnion exporter
+# row, batches, and forwards to whatever backend you run. Two edits make it yours — the two
+# `exporters:` endpoints at the bottom.
+#
+# ## How the two paths connect to the API
+#
+# The exporter form's endpoint is the collector's address, and Omnion appends `/v1/logs` for an
+# `otlp` kind. So the receiver below is at `0.0.0.0:4318` and the endpoint you type into the
+# exporter screen is:
+#
+#     http://omnion-collector:4318
+#
+# The `prometheus_remote_write` kind posts the same JSON body to the endpoint verbatim, so it is
+# for a receiver that speaks the remote-write path rather than OTLP — point it at a Prometheus
+# that has `--web.enable-remote-write-receiver`, not at this collector.
+#
+# ## Memory, and why the batch sizes are what they are
+#
+# A collector with a memory limit and no `memory_limiter` is a collector that is OOM-killed the
+# first time a backend is slow. That is why the FIRST processor here is `memory_limiter`: it
+# refuses data (spilling nothing, just shedding load) long before the container limit, and it is
+# above `batch` so the shedding happens before the memory is allocated.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      # gRPC is commented out rather than left on by default: it opens a second port for a
+      # transport Omnion does not use yet, and an open unused port is an attack surface, not a
+      # feature. Uncomment both lines when the exporter's OTLP/gRPC transport lands.
+      # grpc:
+      #   endpoint: 0.0.0.0:4317
+
+processors:
+  # FIRST, always. Everything below it can be allowed to use memory.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Omnion already batches on its side (`batch_ms` on the exporter row). This is the second
+  # stage, and it exists so a slow backend is paid for once per batch rather than once per batch
+  # times the number of exporters.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  # Drop the attributes Omnion never populates, so a backend's index does not carry empty
+  # columns. Omnion's own redaction has already run before any of this sees the data.
+  attributes/redact:
+    actions:
+      - key: user.email
+        action: delete
+      - key: http.request.header.authorization
+        action: delete
+
+exporters:
+  # ── pick ONE of the two below and point it at your backend ──
+  #
+  # Tempo / Jaeger (OTLP):
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Loki, for the LOGS this collector receives. Omnion sends its log lines as the `logs` array
+  # of a batch; a Loki exporter wants a log stream per resource, which is what the batch is.
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+  # Prometheus, for the metrics. Omnion's own `/metrics` scrape does NOT go through the
+  # collector — a pull scrape is simpler and is what the bundle's README describes. This is here
+  # for an installation that already pushes everything through one path.
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch]
+      # Only ONE exporter per signal, or every span is stored twice. Omnion sends logs and
+      # spans; traces are what a backend like Tempo exists for, and the other two are commented
+      # above so enabling one is a deliberate act.
+      exporters: [otlp/tempo]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch]
+      exporters: [loki]
+
+  telemetry:
+    logs:
+      level: info
