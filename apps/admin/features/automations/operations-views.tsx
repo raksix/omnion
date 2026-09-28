@@ -29,6 +29,7 @@ import Link from "next/link";
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { StatusBadge } from "@/components/status-badge";
+import { useSession } from "@/lib/session";
 import {
   ApiError,
   cancelAutomationRun,
@@ -710,6 +711,12 @@ export function RunsPanel({ automationId }: { automationId: string }) {
  * audited and rate-bounded like any other rule. Nothing here is a preview.
  */
 export function AutomationTemplatesView() {
+  // The tenant is resolved *here* rather than passed in. The route is a server component
+  // that has no session, and the install is the one control on this screen that writes — so
+  // the screen that reads the session is the screen that must send it. A prop would push the
+  // question one level up to a caller that has no better answer.
+  const { user } = useSession();
+  const organizationId = user?.organization_id ?? null;
   const [templates, setTemplates] = useState<AutomationTemplate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [using, setUsing] = useState<string | null>(null);
@@ -733,19 +740,22 @@ export function AutomationTemplatesView() {
     };
   }, []);
 
-  const install = useCallback(async (key: string) => {
-    setUsing(key);
-    setError(null);
-    setNotice(null);
-    try {
-      const created = await installTemplate(key);
-      setNotice(`"${created}" is created and paused. Open it to fill in what it needs, then arm it.`);
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : "That template could not be installed.");
-    } finally {
-      setUsing(null);
-    }
-  }, []);
+  const install = useCallback(
+    async (key: string) => {
+      setUsing(key);
+      setError(null);
+      setNotice(null);
+      try {
+        const created = await installTemplate(key, organizationId);
+        setNotice(`"${created}" is created and paused. Open it to fill in what it needs, then arm it.`);
+      } catch (cause) {
+        setError(cause instanceof ApiError ? cause.message : "That template could not be installed.");
+      } finally {
+        setUsing(null);
+      }
+    },
+    [organizationId],
+  );
 
   const grouped = useMemo(() => {
     const byCategory = new Map<string, typeof templates>();
@@ -868,13 +878,21 @@ export function AutomationTemplatesView() {
  * The gallery's *own* read decides what to write rather than trusting a body the button was
  * handed: the card is a pointer, not a payload. The create is an ordinary one, so the
  * installed rule is validated, audited and rate-bounded like any rule the author typed.
+ *
+ * `organizationId` is not decoration. A starter's body carries no tenant — it is a *shape* —
+ * so without it the create is refused for any account that is not already bound to one, and
+ * the gallery's one real control fails on exactly the installation where a starter is most
+ * wanted. The same value the editor sends is the one this sends.
  */
-async function installTemplate(key: string): Promise<string> {
+async function installTemplate(key: string, organizationId?: string | null): Promise<string> {
   const answer = await fetchAutomationTemplates();
   const template = answer.templates.find((row) => row.key === key);
   if (!template) {
     throw new ApiError(404, "template_not_found", "That template is no longer offered.");
   }
-  const created = await createAutomation(template.body as AutomationInput);
+  const created = await createAutomation({
+    ...(template.body as AutomationInput),
+    organization_id: organizationId ?? null,
+  });
   return created.name;
 }

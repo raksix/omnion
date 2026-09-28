@@ -4586,19 +4586,28 @@ async function runAutomationsOperationsDepth(page, report) {
   await shot(page, "page-automations-operations-editor");
 
   // ---- Run it, and read the run history ---------------------------------------------------
+  // Save *closes* the editor and returns to the list, so the rule is opened again by name —
+  // and a "Run now" writes a row the Runs tab then reads, which means waiting for the row
+  // rather than for a fixed pause. A pass that reads the tab 1.6s after the run reports an
+  // empty history and looks like a broken screen rather than a read that was too early.
   await page
     .locator("[data-automation-row] a", { hasText: ruleName })
     .first()
     .click({ timeout: 8000 })
     .catch(() => {});
-  await page.waitForTimeout(1500);
+  await page.locator("[data-automation-run-now]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
   if (runNowVisible) {
     await page.locator("[data-automation-run-now]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    await page.waitForSelector("[data-automation-notice]", { timeout: 15000 }).catch(() => {});
   }
-  await page.locator("[data-automation-tab='runs']").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1600);
+  await page.locator("[data-automation-tab='runs']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  // The row is the evidence; poll for it instead of guessing how long the queue takes.
+  for (let wait = 0; wait < 12 && (await page.locator("[data-automation-run-row]").count()) === 0; wait += 1) {
+    await page.waitForTimeout(1000);
+    await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(600);
+  }
   const runRows = await page.locator("[data-automation-run-row]").count();
   const runStatus = await page
     .locator("[data-automation-run-row]")
@@ -4615,8 +4624,18 @@ async function runAutomationsOperationsDepth(page, report) {
   await shot(page, "page-automations-operations-runs");
 
   // ---- The run's own route: the trace ----------------------------------------------------
+  await page
+    .locator("[data-automation-run-open]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
   await page.locator("[data-automation-run-open]").first().click({ timeout: 6000 }).catch(() => {});
-  await page.waitForTimeout(1800);
+  await page
+    .locator("[data-automation-trace-steps]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(800);
   const traceUrl = page.url();
   const traceSteps = await page.locator("[data-automation-trace-step]").count();
   const attemptsText = (await page.locator("[data-automation-trace-attempts]").first().innerText().catch(() => ""))
@@ -4675,17 +4694,39 @@ async function runAutomationsOperationsDepth(page, report) {
     .first()
     .click({ timeout: 8000 })
     .catch(() => {});
-  await page.waitForTimeout(1500);
+  await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1800);
+  await page
+    .locator("[data-automation-versions], [role=alert]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(800);
   const versionRows = await page.locator("[data-automation-version-row]").count();
   // The rule has one write so far. A second one gives the restore something to restore.
+  await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+  await page.locator("[data-automation-description]").first().waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
   await page.locator("[data-automation-description]").first().fill("Edited by the walkthrough").catch(() => {});
   await page.waitForTimeout(300);
   await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
-  await page.waitForTimeout(2200);
+  await page.waitForSelector("[data-automation-notice]", { timeout: 15000 }).catch(() => {});
+  // Save closes the editor, so the rule is opened again and the tab asked for a second time.
+  await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .click({ timeout: 8000 })
+    .catch(() => {});
+  await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1800);
+  // The edit's version is a write the panel issues *after* the save, so the row is polled for
+  // rather than assumed: reading one beat early sees the pre-edit history and reports a
+  // restore that had nothing to restore.
+  for (let wait = 0; wait < 10 && (await page.locator("[data-automation-version-row]").count()) <= versionRows; wait += 1) {
+    await page.waitForTimeout(1000);
+    await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-automation-tab='versions']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
   const versionsAfterEdit = await page.locator("[data-automation-version-row]").count();
   const restoreButtons = await page.locator("[data-automation-version-restore]").count();
   let restoreNotice = "";
@@ -4713,7 +4754,8 @@ async function runAutomationsOperationsDepth(page, report) {
 
   // ---- The Audit tab: the create, the edit and the restore are all listed -------------------
   await page.locator("[data-automation-tab='audit']").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1800);
+  await page.locator("[data-automation-audit], [role=alert]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
   const auditRows = await page.locator("[data-automation-audit-row]").count();
   const auditActions = await page
     .locator("[data-automation-audit-row]")
