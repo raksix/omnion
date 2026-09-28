@@ -88,6 +88,7 @@ pub mod media;
 pub mod media_files;
 pub mod media_grants;
 pub mod media_duplicates;
+pub mod media_retention;
 pub mod media_scan;
 mod media_settings;
 pub mod media_shares;
@@ -588,6 +589,29 @@ pub fn router(state: AppState) -> Router {
     let media_grant_effective: MethodRouter<AppState, Infallible> =
         get(media_grants::effective).layer(guards::require(&state, "media.read"));
 
+    // Retention (REQ-010, slice 4). Reading a policy, the run log and the trash's own numbers
+    // is `media.read` — a person who cannot change a window must still be able to ask what the
+    // site promises to keep, because "my file was deleted by a policy" is exactly that
+    // question. Writing a policy, running a sweep, setting a hold and repairing references are
+    // `media.settings.manage`, the key slice 3 already gave the storage screen: retention is
+    // the destructive half of the same screen, so it is the same key.
+    let media_retention: MethodRouter<AppState, Infallible> =
+        get(media_retention::read).layer(guards::require(&state, "media.read"));
+    let media_retention_create: MethodRouter<AppState, Infallible> =
+        post(media_retention::create).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_update: MethodRouter<AppState, Infallible> =
+        put(media_retention::update).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_delete: MethodRouter<AppState, Infallible> =
+        delete(media_retention::delete).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_run: MethodRouter<AppState, Infallible> =
+        post(media_retention::run_now).layer(guards::require(&state, "media.settings.manage"));
+    let media_retention_runs: MethodRouter<AppState, Infallible> =
+        get(media_retention::runs).layer(guards::require(&state, "media.read"));
+    let media_retention_repair: MethodRouter<AppState, Infallible> =
+        post(media_retention::repair).layer(guards::require(&state, "media.settings.manage"));
+    let media_file_hold: MethodRouter<AppState, Infallible> =
+        put(media_retention::set_file_hold).layer(guards::require(&state, "media.settings.manage"));
+
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
     let public_pages = get(public::get_published_page);
@@ -1009,6 +1033,18 @@ pub fn router(state: AppState) -> Router {
         .route("/media/grants/{grant_id}", media_grant_delete)
         .route("/media/grant-subjects", media_subjects)
         .route("/media/{id}/grant-effective", media_grant_effective)
+        // Retention. `retention`, `retention/runs` and `retention/repair` are *static*
+        // segments declared here, so axum ranks them ahead of `/media/{id}/…` — the same
+        // reason `/media/scan-settings` is spelled as a literal rather than a parameter.
+        .route("/media/retention", media_retention)
+        .route("/media/retention", media_retention_create)
+        .route("/media/retention/runs", media_retention_runs)
+        .route("/media/retention/run", media_retention_run)
+        .route("/media/retention/repair", media_retention_repair)
+        .route("/media/retention/{id}", media_retention_update)
+        .route("/media/retention/{id}", media_retention_delete)
+        // The hold is on a *file*, so it lives under the file rather than under the policy.
+        .route("/media/files/{id}/hold", media_file_hold)
         .route("/media/transformation-presets", media_preset_create)
         .route("/media/transformation-presets/{id}", media_preset)
         .route(
