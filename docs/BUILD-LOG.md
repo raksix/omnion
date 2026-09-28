@@ -1821,3 +1821,53 @@
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
+
+- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  filtered listing against a real database — the walk that asserts the audit rows for
+  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  made the walk real and then fixed what it found.
+- **Six defects, none of them visible to the layer that owned them.**
+  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+     only exist where the value beside it was pushed.
+  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+     trash summary answered 500. Cast back to `bigint`.
+  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+     row against the pre-update snapshot, so no ordering is needed.
+  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+     new path, so `parent_id` became the folder itself on every move, and the first move of a
+     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+     *parent's* path.
+  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+  and a move to where a folder already is is a no-op.
+- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+  session and to an account with no media permission, a site created after the migration still
+  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  a file moves between folders without its storage key changing, a filter narrows the listing and
+  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  no new warning.
+- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  `target/debug/incremental` in this worktree returned 2.9 GB.
+- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+  history, the preview pipeline and the file detail screen do not.
