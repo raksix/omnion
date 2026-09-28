@@ -4033,6 +4033,51 @@ async function runObservabilityTracesDepth(page, report) {
   const none = await page.locator("[data-trace-open]").count();
   const clearStillThere = await page.locator("[data-trace-clear]").count();
   note({ check: "impossible-filter", rows: none, clearFilterKept: clearStillThere });
+
+  // (4a) a value the API would refuse must be caught BY THE SCREEN, with a field-level message and
+  //      NO request sent. The first run of this pass typed "12x" and the screen forwarded
+  //      `min_duration_ms=NaN`, which the API rightly answered with a 400 that the screen then
+  //      rendered as "the trace index could not be read" — a server failure caused by a keystroke.
+  //      The request count is the assertion, because the message alone could come from a request
+  //      that was sent and refused.
+  //
+  // The request count is measured by COUNTING the network, because the alternative — reading a
+  // screen's own error banner — would pass on a request that was sent and refused. The
+  // performance entries are the only place a request this pass caused is visible.
+  const traceRequests = async () =>
+    page.evaluate(() =>
+      performance
+        .getEntriesByType("resource")
+        .filter((e) => e.name.includes("/api/v1/observability/traces"))
+        .length,
+    );
+
+  const beforeInvalid = await traceRequests();
+  await page.locator("[data-trace-min-input]").fill("12x");
+  await page.waitForTimeout(1400);
+  const minMessage = (await page.locator("[data-trace-min-error]").innerText().catch(() => "")) || "";
+  note({
+    check: "min-duration-refused-locally",
+    shown: minMessage.length > 0,
+    requestsSent: (await traceRequests()) - beforeInvalid,
+    message: minMessage.slice(0, 90),
+  });
+
+  // (4b) the same for a request id that is not a uuid — the QA harness pastes words into every
+  //      text box it finds, and a bad paste is an operator's paste too.
+  await page.locator("[data-trace-min-input]").fill("");
+  const beforeId = await traceRequests();
+  await page.locator("[data-trace-request-input]").fill("QA sample");
+  await page.waitForTimeout(1400);
+  const idMessage = (await page.locator("[data-trace-request-id-error]").innerText().catch(() => "")) || "";
+  note({
+    check: "request-id-refused-locally",
+    shown: idMessage.length > 0,
+    requestsSent: (await traceRequests()) - beforeId,
+    message: idMessage.slice(0, 90),
+  });
+  await shot(page, "page-observability-traces-invalid-filter");
+
   await page.locator("[data-trace-clear]").click().catch(() => {});
   await page.waitForTimeout(1200);
 

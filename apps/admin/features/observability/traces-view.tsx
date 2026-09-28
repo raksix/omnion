@@ -65,7 +65,10 @@ const SAMPLING_LABEL: Record<string, { label: string; tone: string; hint: string
   },
   ratio: {
     label: "ratio",
-    tone: "bg-accent-soft text-accent",
+    // `accent-strong` on `accent-soft`, not `accent`: the plain accent on its own soft background
+    // measures 4.18:1, under the 4.5 the palette's own header comment promises. The QA vision
+    // pass found it as 50 low-contrast text nodes on this screen — one per row chip.
+    tone: "bg-accent-soft text-accent-strong",
     hint: "Drawn by the sampling ratio. Most requests are not here, and that is the policy working.",
   },
   always: {
@@ -224,16 +227,49 @@ export function TracesView() {
   const requestInput = useRef<HTMLInputElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
 
+  /**
+   * The request-id box, validated as a uuid.
+   *
+   * The API answers a non-uuid `request_id` with a `400`, correctly — and the screen would then
+   * render "the trace index could not be read", which is a server failure caused by a bad paste.
+   * A request id is 36 characters with four hyphens in fixed positions, so the check is cheap and
+   * the message names what was expected.
+   */
+  const requestIdFilter = useMemo(() => {
+    const raw = requestId.trim();
+    if (!raw) return { value: undefined as string | undefined, invalid: false };
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuid.test(raw)) return { value: undefined, invalid: true };
+    return { value: raw, invalid: false };
+  }, [requestId]);
+
+  /**
+   * The min-duration box, parsed.
+   *
+   * `Number("…")` is the trap: it yields `NaN` for anything non-numeric, and `URLSearchParams`
+   * stringifies that into the literal query `min_duration_ms=NaN`, which the API rightly refuses
+   * with a `400` the screen then renders as "the trace index could not be read" — a server
+   * error caused by a keystroke. A partial number (`12x`) is a number being typed, not a wrong
+   * value, so it simply sends nothing and the filter is inert until it is complete.
+   */
+  const durationFilter = useMemo(() => {
+    const raw = minDuration.trim();
+    if (!raw) return { value: undefined as number | undefined, invalid: false };
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) return { value: undefined, invalid: true };
+    return { value: parsed, invalid: false };
+  }, [minDuration]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       setData(
         await fetchTraces({
-          request_id: requestId.trim() || undefined,
+          request_id: requestIdFilter.value,
           route: route.trim() || undefined,
           status: status || undefined,
-          min_duration_ms: minDuration ? Number(minDuration) : undefined,
+          min_duration_ms: durationFilter.value,
           window_minutes: windowMinutes,
           limit: 50,
         }),
@@ -247,7 +283,7 @@ export function TracesView() {
     } finally {
       setLoading(false);
     }
-  }, [requestId, route, status, minDuration, windowMinutes]);
+  }, [requestIdFilter.value, route, status, durationFilter.value, windowMinutes]);
 
   useEffect(() => {
     void load();
@@ -387,9 +423,24 @@ export function TracesView() {
                 onChange={(event) => setRequestId(event.target.value)}
                 data-trace-request-input
                 placeholder="the id from an error banner or a log row"
-                className="h-9 w-full rounded-lg border border-line bg-surface pl-7 pr-2 font-mono text-[12px] outline-none focus:border-accent"
+                aria-invalid={requestIdFilter.invalid}
+                aria-describedby={requestIdFilter.invalid ? "trace-request-id-error" : undefined}
+                className={`h-9 w-full rounded-lg border bg-surface pl-7 pr-2 font-mono text-[12px] outline-none focus:border-accent ${
+                  requestIdFilter.invalid ? "border-danger" : "border-line"
+                }`}
               />
             </div>
+            {requestIdFilter.invalid ? (
+              <p
+                id="trace-request-id-error"
+                role="alert"
+                data-trace-request-id-error
+                className="mt-1 text-[11.5px] text-danger"
+              >
+                A request id is a uuid — 36 characters. Copy it from the log row or the error
+                banner rather than typing it.
+              </p>
+            ) : null}
           </div>
           <div>
             <label className="text-[12px] text-muted" htmlFor="trace-route">
@@ -431,8 +482,22 @@ export function TracesView() {
               data-trace-min-input
               inputMode="numeric"
               placeholder="0"
-              className="mt-1 h-9 w-full rounded-lg border border-line bg-surface px-2.5 text-[12px] outline-none focus:border-accent"
+              aria-invalid={durationFilter.invalid}
+              aria-describedby={durationFilter.invalid ? "trace-min-duration-error" : undefined}
+              className={`mt-1 h-9 w-full rounded-lg border bg-surface px-2.5 text-[12px] outline-none focus:border-accent ${
+                durationFilter.invalid ? "border-danger" : "border-line"
+              }`}
             />
+            {durationFilter.invalid ? (
+              <p
+                id="trace-min-duration-error"
+                role="alert"
+                data-trace-min-error
+                className="mt-1 text-[11.5px] text-danger"
+              >
+                A duration is a whole number of milliseconds. Leave it empty for no floor.
+              </p>
+            ) : null}
           </div>
           <div>
             <label className="text-[12px] text-muted" htmlFor="trace-window">
