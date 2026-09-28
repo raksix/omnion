@@ -171,7 +171,9 @@ impl Retention {
     #[must_use]
     pub fn clamped(self) -> Self {
         Self {
-            logs_days: self.logs_days.clamp(MIN_RETENTION_DAYS, store::MAX_WINDOW_DAYS),
+            logs_days: self
+                .logs_days
+                .clamp(MIN_RETENTION_DAYS, store::MAX_WINDOW_DAYS),
             traces_days: self
                 .traces_days
                 .clamp(MIN_RETENTION_DAYS, trace_store::MAX_TRACE_RETENTION_DAYS),
@@ -274,7 +276,10 @@ pub async fn prune_from_settings(pool: &PgPool) -> Result<PruneReport, crate::Te
 /// values is not.
 #[must_use]
 pub fn run(pool: PgPool) -> tokio::task::JoinHandle<()> {
-    tracing::info!(interval_ms = SWEEP_INTERVAL_MS, "the retention sweep started");
+    tracing::info!(
+        interval_ms = SWEEP_INTERVAL_MS,
+        "the retention sweep started"
+    );
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(StdDuration::from_millis(SWEEP_INTERVAL_MS));
         // A sweep that overran its interval must not become a burst of catch-up sweeps; the rows
@@ -301,7 +306,9 @@ pub fn run(pool: PgPool) -> tokio::task::JoinHandle<()> {
                         );
                     }
                 }
-                Err(error) => tracing::warn!(error = %error, "the retention sweep could not read its settings"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "the retention sweep could not read its settings")
+                }
             }
         }
     })
@@ -344,11 +351,17 @@ fn record(pool: &PgPool, report: &PruneReport) {
 /// A failure is logged and the sweep stands: retention is a housekeeping duty and refusing to
 /// delete old rows because a subscriber's inbox is unreachable would be a worse outcome than a
 /// missed notification.
-pub async fn emit_pruned(pool: &PgPool, payload: serde_json::Value) -> Result<(), crate::TelemetryError> {
+pub async fn emit_pruned(
+    pool: &PgPool,
+    payload: serde_json::Value,
+) -> Result<(), crate::TelemetryError> {
     crate::events::emit(pool, crate::events::RETENTION_PRUNED, payload)
         .await
         .map(|report| {
-            tracing::debug!(event_id = report.event.id, "the retention event was recorded");
+            tracing::debug!(
+                event_id = report.event.id,
+                "the retention event was recorded"
+            );
         })
 }
 
@@ -362,7 +375,10 @@ mod tests {
         // default is the migration's literal and the trace store's is its own constant; this
         // pins the sweep's copy to both.
         let defaults = Retention::defaults();
-        assert_eq!(defaults.logs_days, 14, "the request's log default is 14 days");
+        assert_eq!(
+            defaults.logs_days, 14,
+            "the request's log default is 14 days"
+        );
         assert_eq!(
             defaults.traces_days,
             trace_store::DEFAULT_TRACE_RETENTION_DAYS,
@@ -459,7 +475,12 @@ mod tests {
         // The payload is what a webhook subscriber receives. A field carrying a log line, a
         // request id or a message would put operator data in somebody's inbox, so the check is
         // on the KEYS rather than on a string that a fixture would have to invent.
-        let keys: Vec<&str> = payload.as_object().expect("an object").keys().map(String::as_str).collect();
+        let keys: Vec<&str> = payload
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
         for forbidden in ["message", "msg", "line", "rows", "request_id", "fields"] {
             assert!(
                 !keys.contains(&forbidden),
