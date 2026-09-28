@@ -3389,3 +3389,56 @@ gate fixed and running-but-waiting rather than with a new screen.
 
 **Next.** Re-run the w4 pass and read the four sweep steps; then the 390×844 mobile pass and the
 keyboard sheet, written only from bindings the six screens actually implement.
+
+## 2026-09-28 · wave4 tick 16 — the two open boxes, and what pressing the keys found
+
+REQ-051's last two acceptance boxes — the 390×844 pass and the keyboard sheet — both had their
+behaviour in the code and neither had ever been *exercised*. Those are different states, and the
+difference only shows when a pass presses the keys. Writing one found three defects the code could
+not report on itself.
+
+**The sheet was a list of claims the screen could not keep.** `LIST_SHORTCUTS` advertised `c` and
+`o` as navigation. There is no listener for either key anywhere in the module — `grep` for
+`key === "c"` across `apps/admin/features/crm/` returns nothing. The sheet is opened *by* a key, so
+a row promising a binding nobody listens for is a dead list inside the screen whose whole job is to
+report the screen truthfully, and the box explicitly forbids it. It is now a `g` prefix built from
+`CRM_NAV` itself (`GO_DESTINATIONS`), so the sheet and the tab bar cannot drift, and the arm expires
+after 1200ms so an abandoned prefix cannot swallow the next keystroke.
+
+**`j`/`k` moved a cursor nobody could see.** `selectedIndex` was in the frame's state and in the
+context value, and **no screen read it**. Pressing `j` changed which row `Enter` would open while
+nothing on the page said so — a shortcut indistinguishable from a broken one, with the person
+pressing it guessing. `CrmRow` is a component rather than a helper on purpose: a screen builds its
+rows as `children` *outside* the provider, so `selectedIndex` is not readable where the row is
+written however the markup is shaped. It draws the cursor, moves it on click (pressing `j` and
+clicking are the same act, and a click that leaves the cursor elsewhere makes them disagree) and
+the frame scrolls it into view with `block: "nearest"` so the page does not jump under a reader.
+
+**The board rendered at 390px.** The box asks that a phone get the list and that the board scroll
+horizontally with sticky stage headers; the board was the default at every width, so a phone had to
+scroll sideways to see which stage a card was in — the one number that decides what to do next. A
+phone now defaults to the list below `md`, the board stays one tap away rather than being taken
+away, the stage header sticks inside the horizontal scroller, and the page itself no longer scrolls
+sideways. The defaulting happens in an effect, deliberately: reading the viewport during render
+makes server and client disagree about the first frame, and a hydration mismatch is worse than a
+one-frame flash.
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force`
+**2/2 successful, 0 errors** · `node --check scripts/qa/walkthrough.cjs` parses.
+
+**A harness rule, from the shape of the last two ticks.** A step that comes back `false` and is
+only written into the JSON report is a defect nobody is told about — tick 15's whole subject was a
+pass that "ran" while a defect sat unread in the report. A `false` in the new pass is now a **high
+finding**, and an unset step is a medium one. The guarded steps (the cursor, `e`) stay *unset* on an
+empty list rather than `false`: "the shortcut moved nothing" and "there was nothing to move" are
+different claims, and a fresh database must not be reported as a broken screen.
+
+**Queue state.** The pass is **queued, and alive** — holder 2664123 confirmed running, its log still
+growing at 58 minutes. That is the tick-15 fix working: the place is held by a live holder, so the
+w4 pass waits rather than barging into the one QA stack this box can afford (four browsers is the
+configuration that OOM'd it). `kill -0` on the holder, not on the pid in the lock filename, is what
+distinguishes this from tick 14's silent death.
+
+**Next.** Read `crmKeyboardMobile` when the pass runs: `theSheetOnlyPromisesLiveKeys`,
+`jMovesTheVisibleCursor`, `thePhoneDefaultsToTheList`, `theStageHeaderSticks`,
+`theFormIsSingleColumn`. Any `false` is a high finding and REQ-051 does not close until it is read.
