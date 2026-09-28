@@ -622,6 +622,14 @@ export function AiView() {
       // state after the write rather than the request that caused it.
       const after = await discoverAiProviderModels(provider.id);
       setDiscovery((current) => ({ ...current, [provider.id]: after }));
+      // The **model list** has to be re-read too, not only the diff. Discovery writes rows the
+      // registry table renders, and until that list is refetched the panel announces "applied 2
+      // added" over an empty table — the write succeeded and the screen says nothing happened.
+      // The walk found it by applying a diff and then looking for the model row the notice had
+      // just promised: `data-capability-editor` was 0 because the rows it hangs off do not exist
+      // in the list, not because the editor is broken.
+      const models = await fetchAiModels();
+      setModels(models);
       setNotice(
         applied.up_to_date
           ? `${provider.name} was already up to date.`
