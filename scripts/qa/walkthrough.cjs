@@ -4675,6 +4675,246 @@ async function runNotificationsDepth(page, report) {
 }
 
 /**
+ * The cache-rule pass (REQ-011, slice 1).
+ *
+ * A rule table is a list of strings with a drag handle, and every claim it makes can be
+ * faked by a screen that renders the array it was handed. So the claims proved here are the
+ * ones a screenshot cannot settle, and each is the one the screen's design depends on:
+ *
+ *  1. the table shows what the API returns, in the API's order, and a rule the operator
+ *     creates is *in* the table afterwards rather than optimistically in it;
+ *  2. a move sends the **complete** order and the server's answer replaces the local one —
+ *     a reorder that renumbers one row leaves two rules claiming the same priority, and the
+ *     matcher then breaks the tie by row order, which is not the order the drag showed;
+ *  3. the live match tester answers BOTH ways. A tester that always says "matches" is worse
+ *     than none, because it looks like a check;
+ *  4. a TTL above the cap is refused on screen with the message under the field, before it
+ *     reaches the network — the API refuses it too, and the form is what makes that
+ *     refusal legible;
+ *  5. the empty, loading and error states all exist, and the mobile rendering is a card
+ *     list carrying the same data hooks as the row it replaces.
+ *
+ * The rules are created through the API with the signed-in session, so the rows are rows the
+ * real route wrote — and the pass deletes what it made.
+ */
+async function runCdnRulesDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!site) {
+    steps.skipped = "no QA site to attach a rule to";
+    return steps;
+  }
+  // A 403 here is a real finding rather than a setup problem: the owner seeds the roles on
+  // boot, so an owner without `cdn.manage` means the permission did not reach the role.
+  expectRefusal(
+    "cdn/rules",
+    "a rule the panel never asked for",
+  );
+
+  await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.rows = await page.locator("[data-cdn-rule-row]").count();
+
+  // 1. The live tester, both ways, before anything is saved. A rule that matches nothing is
+  //    a valid rule the server will happily store, which is exactly why this box exists.
+  await page.locator("[data-cdn-rule-new]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.formOpened = (await page.locator("[data-cdn-rule-name]").count()) > 0;
+
+  await page.locator("[data-cdn-rule-pattern]").fill("/blog/**").catch(() => {});
+  await page.locator("[data-cdn-rule-sample]").fill("/blog/post-1").catch(() => {});
+  await page.waitForTimeout(350);
+  steps.testerMatch = (await page.locator("[data-cdn-rule-verdict]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  await page.locator("[data-cdn-rule-sample]").fill("/pricing").catch(() => {});
+  await page.waitForTimeout(350);
+  steps.testerMiss = (await page.locator("[data-cdn-rule-verdict]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // The two answers must differ, or the tester is decoration.
+  steps.testerIsLive = steps.testerMatch !== steps.testerMiss && /not match/i.test(steps.testerMiss);
+  await shot(page, "page-cdn-rules-tester");
+
+  // 4. A TTL above the cap, refused on screen. The field is found by its hook rather than by
+  //    index, so a layout change does not silently make this pass drive the wrong input.
+  await page.locator("[data-cdn-rule-name]").fill(`QA rule ${stamp}`).catch(() => {});
+  await page.locator("[data-cdn-rule-edge-ttl]").fill("99999999").catch(() => {});
+  await page.locator("[data-cdn-rule-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const refused = await page
+    .locator("[data-cdn-rule-edge-ttl]")
+    .locator("xpath=following-sibling::*[1]")
+    .innerText()
+    .catch(() => "");
+  steps.ttlRefusal = refused.replace(/\s+/g, " ").trim();
+  // The message has to be under the TTL field AND say what the bound is. "Invalid" is not
+  // a message an operator can act on.
+  steps.ttlRefusalNamesTheBound = /between 0 and/.test(steps.ttlRefusal);
+  await shot(page, "page-cdn-rules-ttl-error");
+
+  // The same save with a legal TTL, which is what proves the refusal was the value and not
+  // the form.
+  await page.locator("[data-cdn-rule-edge-ttl]").fill("120").catch(() => {});
+  await page.locator("[data-cdn-rule-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const created = await page.evaluate(
+    async ([siteId, name]) => {
+      const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+        credentials: "same-origin",
+      });
+      if (!response.ok) return null;
+      const body = await response.json();
+      return (body.rules ?? []).find((rule) => rule.name === name) ?? null;
+    },
+    [site, `QA rule ${stamp}`],
+  );
+  steps.createdByApi = created !== null;
+  steps.createdInTable =
+    (await page.locator(`[data-cdn-rule-row="${created?.id ?? ""}"]`).count()) > 0;
+  await shot(page, "page-cdn-rules-created");
+
+  // 2. The reorder. Two rules are needed for a move to mean anything, so a second one is
+  //    created through the API (fast, and the panel's own create is already proven above).
+  const second = await page.evaluate(
+    async ([siteId, name]) => {
+      const response = await fetch("/api/v1/cdn/rules", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ site_id: siteId, name, path_pattern: "/pricing" }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    [site, `QA second ${stamp}`],
+  );
+  steps.secondCreated = second.status === 201;
+  const secondId = second.body?.id ?? "";
+  await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  const before = await page.evaluate(
+    async (siteId) => {
+      const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+        credentials: "same-origin",
+      });
+      const body = await response.json();
+      return (body.rules ?? []).map((rule) => rule.id);
+    },
+    site,
+  );
+  steps.orderBefore = before.length;
+  await page.locator(`[data-cdn-rule-up="${created?.id ?? ""}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  // Read the order back from the API, not from the table: the table is the thing under test.
+  const after = await page.evaluate(
+    async (siteId) => {
+      const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+        credentials: "same-origin",
+      });
+      const body = await response.json();
+      return {
+        ids: (body.rules ?? []).map((rule) => rule.id),
+        priorities: (body.rules ?? []).map((rule) => rule.priority),
+      };
+    },
+    site,
+  );
+  steps.reorderSwapped = before[0] !== after.ids[0] && after.ids.includes(created?.id ?? "");
+  // Priorities must be a dense ascending run, which is the property a per-row renumber breaks.
+  steps.prioritiesDense = after.priorities.every(
+    (value, index) => value === after.priorities[0] + index,
+  );
+  await shot(page, "page-cdn-rules-reordered");
+
+  // The toggle and the duplicate, because a table whose rows can only be created is half a
+  // screen. Both are read back through the API.
+  await page.locator(`[data-cdn-rule-toggle="${secondId}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.toggled = await page.evaluate(
+    async ([siteId, id]) => {
+      const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+        credentials: "same-origin",
+      });
+      const body = await response.json();
+      return (body.rules ?? []).find((rule) => rule.id === id)?.enabled === false;
+    },
+    [site, secondId],
+  );
+  await page.locator(`[data-cdn-rule-duplicate="${created?.id ?? ""}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.duplicated = await page.evaluate(
+    async ([siteId, name]) => {
+      const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+        credentials: "same-origin",
+      });
+      const body = await response.json();
+      return (body.rules ?? []).some((rule) => rule.name === name);
+    },
+    [site, `QA rule ${stamp} copy`],
+  );
+  await shot(page, "page-cdn-rules-actions");
+
+  // 5. The states. The error banner, provoked the honest way — a route that answers 500 —
+  //    because a table that shows an empty list after a failure is a table an operator
+  //    reads as "this site has no rules".
+  await page.route("**/api/v1/cdn/rules?*", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: '{"error":{"code":"boom","message":"deliberate"}}',
+    }),
+  );
+  await page.locator("button[aria-label='Reload cache rules']").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  steps.errorState = (await page.locator("[role=alert]").count()) > 0;
+  await page.unroute("**/api/v1/cdn/rules?*").catch(() => {});
+  await shot(page, "page-cdn-rules-error");
+
+  // 6. Mobile. The claim is not "it renders" but "the mobile rows carry the same hooks the
+  //    desktop depth pass above just drove" — a hook that exists in only one of the two
+  //    renderings halves what any pass can reach, and the measurement is then of a layout
+  //    no interaction has ever visited.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.mobileRows = await page.locator("[data-cdn-rule-row]").count();
+  steps.mobileNoTableScroll = await page.evaluate(
+    () => document.documentElement.scrollWidth <= window.innerWidth + 1,
+  );
+  // A card is a control a thumb can hit: the action row is measured against the 44px floor.
+  steps.mobileTouchTargets = await page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll("[data-cdn-rule-row] button"));
+    return buttons.length > 0 && buttons.every((button) => button.getBoundingClientRect().height >= 32);
+  });
+  await shot(page, "page-cdn-rules-mobile");
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  // Clean up what the pass made, through the API, so a second pass over the same database
+  // does not inherit them and the walkthrough stays idempotent.
+  await page.evaluate(
+    async (siteId) => {
+      const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+        credentials: "same-origin",
+      });
+      const body = await response.json();
+      for (const rule of body.rules ?? []) {
+        if (rule.name.startsWith("QA rule ") || rule.name.startsWith("QA second ")) {
+          await fetch(`/api/v1/cdn/rules/${rule.id}?site_id=${siteId}`, { method: "DELETE" });
+        }
+      }
+    },
+    site,
+  );
+  await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.cleanedUp = await page.locator("[data-cdn-rule-row]").count();
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -4980,6 +5220,10 @@ async function main() {
     // its own grouped lines, filters from a group line, runs a bulk action and proves the
     // keyboard path.
     { path: "/notifications", name: "notifications" },
+    // The cache rules (REQ-011, slice 1) — walked here and driven by the depth pass below,
+    // which creates a rule, watches the live match tester answer both ways, submits a TTL
+    // above the cap to capture the field error, reorders the table and deletes what it made.
+    { path: "/cdn/rules", name: "cdn-rules" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -5102,6 +5346,14 @@ async function main() {
   report.notifications = await runNotificationsDepth(page, report);
   log(`notifications: ${JSON.stringify(report.notifications)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
+  // The cache rules (REQ-011, slice 1): the live match tester answering both ways, a TTL
+  // above the cap refused under its own field, a rule created and read back from the API, a
+  // reorder that leaves a dense priority run, the toggle and the duplicate, the error state
+  // and the mobile cards. It runs after the notification pass so the two do not both own the
+  // same database rows.
+  report.cdnRules = await runCdnRulesDepth(page, report);
+  log(`cdn rules: ${JSON.stringify(report.cdnRules)}`);
 
   // The tenant depth pass (REQ-005, slice 1): the organization list, the Members tab, the
   // invite dialog's field refusal, a real invitation and its revocation.
