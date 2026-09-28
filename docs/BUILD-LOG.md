@@ -2780,3 +2780,43 @@ result. Part 2 is that walk plus the browser pass.
 **Next.** Land the API check, run `iam_attribute_map.rs` against the development database, extend
 `runIamAuthenticationDepth` to open the mapping editor and paste a sample, then the
 `QA_STACK=w9` pass — and only then close the slice.
+
+---
+
+## 2026-09-28 · omnion-w9 · REQ-065 slice 2, part 2 — the map, proven end to end
+
+**What.** Part 1 shipped the map; this tick proves it and fixes the two things the proof found.
+`runIamAuthenticationDepth` in the walkthrough now opens the mapping editor, saves two rows, pastes a
+claims payload, reads the *transformed* values back and then previews a payload with no email. The
+product fixes are in `attributes.rs` (an empty map is valid again) and in the route's tenant check.
+
+**The bug the walkthrough found, which no unit test had.** `AttributeMap::validate()` required an
+email mapping unconditionally — so the server refused the write that clears the map. Every new
+provider starts with an empty map, which means the one operation that returned a provider to
+"not configured yet" was the one operation the server forbade. The map was a one-way door, and the
+symptom would have appeared weeks later as an operator who could not undo a mapping mistake. The
+rule now reads: *a map somebody has filled in must map an email*, which is the case that actually
+provisions nobody. Covered both ways by a new unit test.
+
+**The compile error that had been hiding since part 1.** The route read `current.organization_id`.
+There is no such field: it is `current.user.organization_id`, and that is an `Option<Uuid>`, not a
+`Uuid` — so the crate had been red for a whole slice, and the walk had simply never been run. Two
+errors, both in one field access. `cargo check -p omnion-api --tests` is 30 seconds of work that
+would have caught it before part 1 was called done.
+
+**Two mistakes that were mine, in the test rather than the product.** The `lowercase` projection of
+`  Furkan@Example.COM  ` is `furkan@example.com`, and an error message lives at
+`body["error"]["message"]` — reading `body["message"]` asserts against `Null`, which is a passing
+assertion about nothing. Both are recorded in the code so the next reader does not repeat them.
+
+**Proof.** `cargo test -p omnion-identity --lib` → **147 passed** (was 146). `cargo test -p omnion-api
+--test iam_attribute_map` → **1 passed** against `omnion_w9_iso` — an *isolated* database, because
+the shared development one is polluted by other writers and answers `VersionMissing(19)`, which
+looks like a migration bug and is not one. `pnpm --filter @omnion/admin typecheck` → clean.
+
+**Not claimed.** The browser pass is queued behind another writer's; it will report separately.
+Slice 2's remaining work is the live OIDC start→callback round trip with PKCE, discovery and the
+JIT account creation that consumes this map.
+
+**Next.** Run the `QA_STACK=w9` pass and read the `attribute-map-preview` steps; then the start and
+callback routes, which is where this map finally gets used by a real sign-in.
