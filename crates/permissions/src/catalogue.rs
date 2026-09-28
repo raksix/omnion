@@ -142,6 +142,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "workflows",
         description: "Start and cancel workflow runs",
     },
+    // Credentials (REQ-087 slice 2). Reading a credential list and changing one are separate
+    // keys for the same reason workflows.read and workflows.manage are: knowing which
+    // integrations an installation has is not the same permission as being able to replace a
+    // secret, and a role that may build a workflow should not thereby gain every credential in
+    // the organization.
+    PermissionDef {
+        key: "workflows.credentials.read",
+        category: "workflows",
+        description: "Read credentials and their usage, masked",
+    },
+    PermissionDef {
+        key: "workflows.credentials.manage",
+        category: "workflows",
+        description: "Create, edit, test and remove credentials",
+    },
     // Users.
     PermissionDef {
         key: "users.read",
@@ -613,7 +628,15 @@ mod tests {
     fn the_workflow_family_is_catalogued() {
         // P09: the automation surface is guarded by three keys — read, manage and run — so a
         // role can be trusted to trigger a workflow without letting it rewrite definitions.
-        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
+        // REQ-087 slice 2 adds two more for credentials, and the split matters: a role that
+        // may build a workflow should not thereby gain every secret in the organization.
+        for key in [
+            "workflows.read",
+            "workflows.manage",
+            "workflows.run",
+            "workflows.credentials.read",
+            "workflows.credentials.manage",
+        ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
                 Some("workflows"),

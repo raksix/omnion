@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod commands;
 pub mod content;
+pub mod credentials;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -678,6 +679,53 @@ pub fn router(state: AppState) -> Router {
     let credential_type =
         get(node_types::get_credential_type).layer(guards::require(&state, "workflows.read"));
 
+    // Credential *instances* (REQ-087, slice 2). Two powers, not one: reading which
+    // integrations an installation has is not the same permission as being able to replace a
+    // secret, and a role that may build a workflow should not thereby gain every credential
+    // in the organization. The sub-resources are separate routers for the same reason — a
+    // test writes health, and a usage read is a read.
+    let credentials_list = get(credentials::list_credentials)
+        .layer(guards::require(&state, "workflows.credentials.read"))
+        .merge(
+            post(credentials::create_credential)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+    let credential_item = get(credentials::get_credential)
+        .layer(guards::require(&state, "workflows.credentials.read"))
+        .merge(
+            patch(credentials::update_credential)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        )
+        .merge(
+            delete(credentials::delete_credential)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+    let credential_usage =
+        get(credentials::credential_usage).layer(guards::require(&state, "workflows.credentials.read"));
+    let credential_test =
+        post(credentials::test_credential).layer(guards::require(&state, "workflows.credentials.manage"));
+    // The replace-secret path: manage, and audited. It is a distinct route rather than a
+    // branch of the PATCH so the audit entry can say "a secret was replaced" instead of
+    // "a credential changed".
+    let credential_secret = post(credentials::replace_secret)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+
+    // The node-package ledger (REQ-087 slices 2 and 4). The list is a read of a table that
+    // holds no secrets, so it carries the credential *read* power; installing one changes what
+    // the canvas can place, so it carries the credential *manage* power.
+    let node_packages = get(credentials::list_node_packages)
+        .layer(guards::require(&state, "workflows.credentials.read"))
+        .merge(
+            post(credentials::install_node_package)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+    let node_package_item = patch(credentials::update_node_package)
+        .layer(guards::require(&state, "workflows.credentials.manage"))
+        .merge(
+            delete(credentials::remove_node_package)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+
     // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
     // who may act, and it must be reachable before any account, role or binding exists.
     let onboarding_owner = post(onboarding::create_owner);
@@ -1146,6 +1194,20 @@ pub fn router(state: AppState) -> Router {
         .route("/port-kinds", port_kinds)
         .route("/credential-types", credential_types)
         .route("/credential-types/{key}", credential_type)
+        // Credential *instances* (REQ-087 slice 2). Read and manage are separate routes, not
+        // one method-guarded handler, because a role that may see which integrations exist is
+        // not a role that may replace a secret. The sub-resources are declared before the
+        // `{id}` parameter so `/credentials/{id}/test` is a test and not an id.
+        .route("/credentials/{id}/usage", credential_usage)
+        .route("/credentials/{id}/test", credential_test)
+        .route("/credentials/{id}/secret", credential_secret)
+        .route("/credentials", credentials_list)
+        .route("/credentials/{id}", credential_item)
+        // The node-package ledger (REQ-087 slice 2/4). The static `installed` screen is a
+        // read of the ledger, so it carries the workflow read power and not the credential
+        // power: an installer ledger holds no secrets.
+        .route("/node-packages", node_packages)
+        .route("/node-packages/{key}", node_package_item)
         .route("/onboarding", get(onboarding::status))
         .route("/onboarding/owner", onboarding_owner)
         .route("/onboarding/organization", onboarding_organization)

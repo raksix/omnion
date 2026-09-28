@@ -813,6 +813,37 @@ impl From<WorkflowError> for ApiError {
             ),
             WorkflowError::Audit(err) => err.into(),
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
+            // The credential taxonomy (REQ-087 slice 2). The statuses are the ones the routes
+            // use too, kept here so a `?` conversion and a `.map_err(map_store)` cannot answer
+            // the same failure two different ways: `credential_in_use` is a `409` because the
+            // resource exists and the conflict is real, and the rest are the caller's `400`.
+            WorkflowError::CredentialInUse { key, workflows } => Self::new(
+                StatusCode::CONFLICT,
+                "credential_in_use",
+                format!("{key:?} is still named by {workflows} workflow(s)"),
+            ),
+            WorkflowError::CredentialSecretWriteOnly { field } => Self::bad_request(
+                "credential_secret_write_only",
+                format!(
+                    "{field:?} is write-only — a secret is accepted once, on the replace-secret \
+                     path, and is never returned"
+                ),
+            ),
+            WorkflowError::CredentialFieldRequired { field } => Self::bad_request(
+                "credential_field_required",
+                format!("{field:?} is required by this credential type"),
+            ),
+            WorkflowError::CredentialTypeUnknown(key) => Self::bad_request(
+                "credential_type_unknown",
+                format!("{key:?} is not a credential type"),
+            ),
+            WorkflowError::CredentialScopeDenied { field, value, allowed } => Self::bad_request(
+                "credential_scope_denied",
+                format!("{field} {value:?} is not one of {}", allowed.join(", ")),
+            ),
+            WorkflowError::CredentialInvalid(message) => {
+                Self::bad_request("credential_invalid", message)
+            }
         }
     }
 }
