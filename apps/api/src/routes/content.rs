@@ -112,6 +112,14 @@ pub struct PageBody {
 
 impl PageBody {
     /// Assemble a page with the states the store reports.
+    pub fn from_store(
+        page: &Page,
+        draft: Option<&PageRevision>,
+        published: Option<&PageRevision>,
+    ) -> Self {
+        Self::build(page, draft, published)
+    }
+
     fn build(page: &Page, draft: Option<&PageRevision>, published: Option<&PageRevision>) -> Self {
         Self {
             id: page.id,

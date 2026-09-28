@@ -30,6 +30,15 @@ pub enum ContentError {
     /// A page type key is not usable.
     #[error("invalid page type: {0}")]
     InvalidPageType(String),
+    /// A pattern or template key is not usable (REQ-063 slice 3).
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
+    /// A pattern or template name is blank or too long (REQ-063 slice 3).
+    #[error("invalid name: {0}")]
+    InvalidName(String),
+    /// A free-text field is too long (REQ-063 slice 3).
+    #[error("invalid text: {0}")]
+    InvalidText(String),
     /// A lifecycle state is not one of the documented values.
     #[error("invalid status: {0}")]
     InvalidStatus(String),
@@ -51,6 +60,21 @@ pub enum ContentError {
     /// The site already carries a page with this slug.
     #[error("this site already has a page with this slug")]
     SlugTaken,
+    /// No pattern carries this identifier (REQ-063 slice 3).
+    #[error("no such pattern")]
+    PatternNotFound,
+    /// The organization already has a pattern with this key.
+    #[error("this organization already has a pattern with this key")]
+    PatternKeyTaken(String),
+    /// No page template carries this identifier (REQ-063 slice 3).
+    #[error("no such page template")]
+    TemplateNotFound,
+    /// The organization already has a page template with this key.
+    #[error("this organization already has a page template with this key")]
+    TemplateKeyTaken(String),
+    /// A template the platform ships with cannot be deleted.
+    #[error("this template ships with the platform and cannot be deleted")]
+    TemplateIsSystem,
     /// Publication was requested but the page holds no draft revision.
     #[error("this page has no draft revision to publish")]
     NoDraftRevision,
@@ -72,6 +96,9 @@ impl ContentError {
             Self::InvalidSummary(_) => "invalid_summary",
             Self::InvalidBlock(_) => "invalid_block",
             Self::InvalidPageType(_) => "invalid_page_type",
+            Self::InvalidKey(_) => "invalid_key",
+            Self::InvalidName(_) => "invalid_name",
+            Self::InvalidText(_) => "invalid_text",
             Self::InvalidStatus(_) => "invalid_status",
             Self::InvalidLanguage(_) => "invalid_language",
             Self::InvalidField(_) => "invalid_field",
@@ -79,6 +106,11 @@ impl ContentError {
             Self::PageNotFound => "page_not_found",
             Self::RevisionNotFound => "revision_not_found",
             Self::SlugTaken => "slug_taken",
+            Self::PatternNotFound => "pattern_not_found",
+            Self::PatternKeyTaken(_) => "pattern_key_taken",
+            Self::TemplateNotFound => "template_not_found",
+            Self::TemplateKeyTaken(_) => "template_key_taken",
+            Self::TemplateIsSystem => "template_is_system",
             Self::NoDraftRevision => "no_draft_revision",
         }
     }

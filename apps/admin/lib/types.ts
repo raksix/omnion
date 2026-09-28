@@ -68,6 +68,11 @@ export type {
   BlockRegistry,
   BlockValidationResult,
   ContentBlock,
+  ContentPattern,
+  PageTemplateSummary,
+  PatternBlocksResponse,
+  PatternListResponse,
+  TemplateListResponse,
 } from "@omnion/types";
 
 /**

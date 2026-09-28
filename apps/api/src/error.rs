@@ -349,6 +349,32 @@ impl From<ContentError> for ApiError {
             // A block tree the store cannot accept is a bad request, and it is not generic: the
             // message names the first failing block so the editor can put the cursor on it.
             ContentError::InvalidBlock(message) => Self::bad_request("invalid_blocks", message),
+            // Patterns and page templates (REQ-063 slice 3) follow the same shape as pages: a
+            // missing row is a 404, a key an organization already uses is a 409 — not a 400,
+            // because nothing about the request is malformed, the name is simply taken.
+            ContentError::PatternNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "pattern_not_found", "no such pattern")
+            }
+            ContentError::PatternKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "pattern_key_taken",
+                format!("this organization already has a pattern with the key {key:?}"),
+            ),
+            ContentError::TemplateNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "template_not_found",
+                "no such page template",
+            ),
+            ContentError::TemplateKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "template_key_taken",
+                format!("this organization already has a page template with the key {key:?}"),
+            ),
+            ContentError::TemplateIsSystem => Self::new(
+                StatusCode::CONFLICT,
+                "template_is_system",
+                "this template ships with the platform and cannot be deleted",
+            ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

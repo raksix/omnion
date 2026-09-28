@@ -7,6 +7,12 @@
 import type {
   BlockRegistry,
   BlockValidationResult,
+  ContentBlock,
+  ContentPattern,
+  PageTemplateSummary,
+  PatternBlocksResponse,
+  PatternListResponse,
+  TemplateListResponse,
   Media,
   MediaBulkResult,
   MediaFile,
@@ -308,6 +314,112 @@ export function updatePage(
   return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
+  });
+}
+
+// -- Patterns and page templates (REQ-063, slice 3) --------------------------------------------------
+
+/** The pattern library, optionally narrowed to one category. */
+export async function fetchPatterns(category?: string): Promise<ContentPattern[]> {
+  const query = category ? `?category=${encodeURIComponent(category)}` : "";
+  const body = await request<PatternListResponse>(`/api/v1/patterns${query}`);
+  return body.patterns;
+}
+
+/** One pattern, with its block group. */
+export function fetchPattern(patternId: string): Promise<ContentPattern> {
+  return request<ContentPattern>(`/api/v1/patterns/${encodeURIComponent(patternId)}`);
+}
+
+/**
+ * The blocks a pattern contributes to a page, with ids minted server-side.
+ *
+ * Deliberately a server call rather than a client-side rename of the pattern's own payload: the
+ * ids that matter are the ones the page will *store*, and a browser that re-mints them has a
+ * second implementation of "copy this pattern" which will disagree with the server's the first
+ * time either one learns a rule the other does not have.
+ */
+export function fetchPatternBlocks(patternId: string): Promise<PatternBlocksResponse> {
+  return request<PatternBlocksResponse>(
+    `/api/v1/patterns/${encodeURIComponent(patternId)}/blocks`,
+  );
+}
+
+/**
+ * Save a pattern. The key is its identity, so a `POST` with an existing key replaces that
+ * pattern — which is why the library's "save my changes" and "create a new one" are one call.
+ */
+export function savePattern(input: {
+  key: string;
+  name: string;
+  category?: string;
+  description?: string;
+  blocks: ContentBlock[];
+  organizationId?: string;
+}): Promise<ContentPattern> {
+  const body: Record<string, unknown> = {
+    key: input.key,
+    name: input.name,
+    blocks: input.blocks,
+  };
+  if (input.category !== undefined) body.category = input.category;
+  if (input.description !== undefined) body.description = input.description;
+  if (input.organizationId !== undefined) body.organization_id = input.organizationId;
+  return request<ContentPattern>("/api/v1/patterns", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Edit a pattern's name, category, description or block group. */
+export function updatePattern(
+  patternId: string,
+  changes: {
+    name?: string;
+    category?: string;
+    description?: string;
+    blocks?: ContentBlock[];
+  },
+): Promise<ContentPattern> {
+  const body: Record<string, unknown> = {};
+  if (changes.name !== undefined) body.name = changes.name;
+  if (changes.category !== undefined) body.category = changes.category;
+  if (changes.description !== undefined) body.description = changes.description;
+  if (changes.blocks !== undefined) body.blocks = changes.blocks;
+  return request<ContentPattern>(`/api/v1/patterns/${encodeURIComponent(patternId)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Remove a pattern from the library. */
+export function deletePattern(patternId: string): Promise<void> {
+  return request<void>(`/api/v1/patterns/${encodeURIComponent(patternId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** The page template gallery, with the platform's own starting points. */
+export async function fetchPageTemplates(): Promise<PageTemplateSummary[]> {
+  const body = await request<TemplateListResponse>("/api/v1/page-templates");
+  return body.templates;
+}
+
+/** Create a page from a template: a real draft page whose blocks match the template's. */
+export function createPageFromTemplate(input: {
+  siteId: string;
+  templateId: string;
+  slug: string;
+  title: string;
+}): Promise<Page> {
+  return request<Page>("/api/v1/pages/from-template", {
+    method: "POST",
+    body: JSON.stringify({
+      site_id: input.siteId,
+      template_id: input.templateId,
+      slug: input.slug,
+      title: input.title,
+    }),
   });
 }
 

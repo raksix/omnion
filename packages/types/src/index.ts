@@ -177,6 +177,74 @@ export interface BlockValidationResult {
   can_publish: boolean;
 }
 
+// -- Patterns and page templates (REQ-063, slice 3) -----------------------------------------------------
+
+/** One reusable block group in the pattern library. */
+export interface ContentPattern {
+  /** Pattern id. */
+  id: string;
+  /** Organization the pattern belongs to. */
+  organization_id: string;
+  /** Stable key, unique inside the organization. */
+  key: string;
+  /** Name the card shows. */
+  name: string;
+  /** Grouping the library filters by. */
+  category: string;
+  /** One line describing the group. */
+  description: string | null;
+  /** Blocks in the group, nested included. */
+  block_count: number;
+  /** The block group itself. */
+  blocks: ContentBlock[];
+  /** Last change, ISO 8601. */
+  updated_at: string;
+}
+
+/** One page template in the gallery. */
+export interface PageTemplateSummary {
+  /** Template id. */
+  id: string;
+  /** Stable key. */
+  key: string;
+  /** Name the card shows. */
+  name: string;
+  /** Content type a page created from it gets. */
+  page_type: string;
+  /** One line describing it. */
+  description: string | null;
+  /** Blocks in the template, nested included. */
+  block_count: number;
+  /** `true` when the platform ships this template and it cannot be deleted. */
+  is_system: boolean;
+  /** The page's blocks, for the gallery's preview. */
+  blocks: ContentBlock[];
+}
+
+/** Response of `GET /api/v1/patterns`. */
+export interface PatternListResponse {
+  /** Organization the patterns belong to. */
+  organization_id: string;
+  /** Patterns, newest first. */
+  patterns: ContentPattern[];
+}
+
+/** Response of `GET /api/v1/page-templates`. */
+export interface TemplateListResponse {
+  /** Templates, gallery order. */
+  templates: PageTemplateSummary[];
+}
+
+/** Response of `GET /api/v1/patterns/{id}/blocks` — the blocks a page will store. */
+export interface PatternBlocksResponse {
+  /** The pattern the blocks came from. */
+  pattern_id: string;
+  /** The blocks, with ids minted fresh for the page they are going into. */
+  blocks: ContentBlock[];
+  /** Blocks in the pattern, nested included. */
+  block_count: number;
+}
+
 /** Response of `GET /api/v1/public/pages/{slug}` — one renderable page. */
 export interface PublishedPage {
   /** Site the page belongs to. */

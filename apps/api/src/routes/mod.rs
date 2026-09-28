@@ -88,6 +88,7 @@ pub mod me;
 pub mod media;
 pub mod media_files;
 pub mod onboarding;
+pub mod patterns;
 pub mod public;
 pub mod readyz;
 pub mod scim;
@@ -390,6 +391,41 @@ pub fn router(state: AppState) -> Router {
         get(blocks::list_blocks).layer(guards::require(&state, "content.blocks.read"));
     let blocks_validate =
         post(blocks::validate_blocks).layer(guards::require(&state, "content.blocks.read"));
+
+    // Patterns and page templates (REQ-063, slice 3). Both libraries read with the block read
+    // key — what an author may build is not a privilege — but writing is a separate key from
+    // editing a page, because a pattern outlives the page it was cut from and is reused across
+    // every site of the organization. Building from a template is the other direction: it needs
+    // `content.pages.create` (it creates a page) and no curation power at all.
+    let patterns_list =
+        get(patterns::list_patterns).layer(guards::require(&state, "content.blocks.read"));
+    let patterns_save =
+        post(patterns::save_pattern).layer(guards::require(&state, "content.patterns.manage"));
+    let templates_list =
+        get(patterns::list_templates).layer(guards::require(&state, "content.blocks.read"));
+    let templates_save =
+        post(patterns::save_template).layer(guards::require(&state, "content.templates.manage"));
+    let page_from_template = post(patterns::create_page_from_template)
+        .layer(guards::require(&state, "content.pages.create"));
+
+    let pattern = get(patterns::get_pattern)
+        .layer(guards::require(&state, "content.blocks.read"))
+        .merge(
+            put(patterns::update_pattern)
+                .layer(guards::require(&state, "content.patterns.manage")),
+        )
+        .merge(
+            delete(patterns::delete_pattern)
+                .layer(guards::require(&state, "content.patterns.manage")),
+        );
+
+    // The insert path reads a pattern's blocks with ids already fresh for the page they are
+    // going into, so it carries the read key — inserting is authoring, not curation.
+    let pattern_blocks =
+        get(patterns::get_pattern_blocks).layer(guards::require(&state, "content.blocks.read"));
+
+    let template = delete(patterns::delete_template)
+        .layer(guards::require(&state, "content.templates.manage"));
 
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
@@ -831,6 +867,14 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
         .route("/blocks", blocks_registry)
         .route("/blocks/validate", blocks_validate)
+        .route("/patterns", patterns_list)
+        .route("/patterns", patterns_save)
+        .route("/patterns/{id}", pattern)
+        .route("/patterns/{id}/blocks", pattern_blocks)
+        .route("/page-templates", templates_list)
+        .route("/page-templates", templates_save)
+        .route("/page-templates/{id}", template)
+        .route("/pages/from-template", page_from_template)
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)

@@ -14,7 +14,9 @@ pub mod comments;
 pub mod error;
 pub mod model;
 pub mod pages;
+pub mod patterns;
 pub mod sanitize;
+pub mod templates;
 pub mod translations;
 pub mod validation;
 
@@ -30,6 +32,13 @@ pub use comments::{
     COMMENT_COLUMNS, CommentSource, MAX_COMMENT_BODY, NewRevisionComment, RevisionComment,
 };
 pub use error::{ContentError, Result};
+pub use patterns::{
+    MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate, PageTemplate,
+    Pattern, PatternChanges, delete_pattern, delete_template, find_pattern, find_pattern_by_key,
+    find_template, find_template_by_key, instance_blocks, list_patterns, list_templates,
+    save_pattern, save_template, update_pattern,
+};
+pub use templates::{ABOUT, BLOG_POST, CONTACT, LANDING, PRICING, SYSTEM_TEMPLATES, SystemTemplate};
 pub use model::{
     DEFAULT_PAGE_TYPE, NewPage, NewRevisionTranslation, Page, PageChanges, PageRevision,
     REVISION_RESOURCE, Translation,
