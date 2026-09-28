@@ -2657,3 +2657,68 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+## REQ-065 slice 1 — the provider registry learns to be directory-aware
+
+**What.** LDAP and Active Directory become first-class provider kinds, and everything the
+registry screen needs to manage one honestly lands with them: a configuration language with
+field-level validation, a connection test that is a **ladder of steps** rather than a boolean,
+a stored test result, a four-state status chip, and an enable gate that refuses anything whose
+last test has not passed.
+
+The migration is `0051` rather than the REQ's `0116`/`0117` — the released high-water mark was
+0050, and the mapping, role-rule and sync-run tables take their own numbers in their own
+slices rather than landing as a set of tables nothing reads yet.
+
+**Why the design is shaped this way.** A directory is not a protocol provider. OIDC and SAML
+*hand you* an identity; a directory answers queries over a connection somebody else operates.
+Three consequences run through the whole slice:
+
+1. **A test is a list of steps.** DNS → TCP → TLS → bind → search → attributes, each with its
+   own verdict and its own sentence. A directory fails at exactly one of them, and an operator
+   told "connection failed" has nothing to act on. A plaintext directory gets no TLS step at
+   all, because a greyed-out step forever reads as an unresolved problem.
+2. **A sound form is not a passing test.** `TestOutcome::status` is three-valued — `ok` /
+   `incomplete` / `failed` — and `passed()` additionally requires that the server was actually
+   reached. Slice 1 does not open a socket, so a clean configuration is honestly `incomplete`.
+   Collapsing that into `ok` is how a registry grows a "Last test" column that is a lie, and an
+   enable gate built on that lie switches on a directory nobody has ever reached.
+3. **No secret can reach a row.** The bind password is named by `bind_secret_ref` and resolved
+   from the environment; a lowercase name is refused with a message saying it is a pasted
+   password, because a pasted password otherwise surfaces three steps later as "the bind step
+   failed". `DirectoryConfig` has no field that *could* hold one, which a test proves by
+   round-tripping it and refusing any password-shaped key.
+
+**Two things the tests caught in my own first draft, both quiet.** The escape in the user filter
+was correct and my *test expectation* was wrong — which is the good kind of failure, and it
+taught the test to check the rendered filter rather than a remembered string. The real one was
+`status: "ok"` for a configuration nobody had connected to: a clean form reported as a passing
+test would have let the enable gate be satisfied by an empty wizard. That is why `incomplete`
+exists.
+
+And two compile errors turned out to be the compiler finding real holes rather than refusing
+syntax. `flow_of` had no directory arm, and `routes/sso.rs` had no answer for a directory on
+the sign-in path — a directory is a bind and a search, not a redirect, so it now answers `501`
+with a sentence saying so rather than inventing an authorization endpoint that does not exist.
+
+**Proof.** `cargo test -p omnion-identity --lib` → **131 passed**; `-p omnion-api --lib` →
+**165 passed**; `pnpm --filter @omnion/admin typecheck` → clean, no new warnings.
+`scripts/qa/run-iam-directory.sh` → **PASS 6/6**.
+
+The migration gate is the interesting one. It applies `0051` to a **populated**
+`auth_providers` table, because every migration test until now has been an empty-database test
+and that proves nothing about the `drop constraint` — a migration that only works when no
+provider has ever been created breaks the first real install. It also reads the surviving
+constraint's *definition* and asserts it is the wide one, because two checks on one column means
+the stricter silently wins and a directory would still be refused by a constraint nobody can see.
+
+**Not claimed.** The live OIDC/AD round trip (slice 2), the attribute map, the role rules and
+the dry run (slice 3), SCIM and the sync runner (slice 4). The **browser pass has not run**:
+`qa-slot.sh` held the box at load 31 with seven sibling writers, so `run.sh` was not started.
+`runIamAuthenticationDepth` has a written, unrun directory half — connect an AD provider, read
+the ladder, prove the client-secret field is absent, prove the enable button is locked, break
+the user filter and read the field-level problem by name. Slice 1 is not closed until it reports
+zero high findings from those steps.
+
+**Next.** Run the QA pass, then REQ-065 slice 2: the start/callback round trip, discovery, JIT
+provisioning and the attribute mapping editor.

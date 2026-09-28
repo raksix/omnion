@@ -1,6 +1,11 @@
 # REQ-065 — Identity Providers & SSO
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** core (`crates/identity`, `crates/auth`) + admin
+> **Status:** in-progress (slice 1 code complete and gated: `a546d01` the directory
+> configuration language and its step ladder, `f94f5d8` the panel, `e0ac90a` the enable gate
+> and the HTTP surface, `245951e` the live-database gate. The **browser pass has not run** —
+> `qa-slot.sh` held the box at load 31 with seven sibling writers, so `run.sh` was not started;
+> the walkthrough's directory half is written in `runIamAuthenticationDepth` and is unrun) ·
+> **Captured:** 2026-09-26 · **Layer:** core (`crates/identity`, `crates/auth`) + admin
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -106,8 +111,8 @@ Consumed: `iam.role_permissions_changed` (mapping previews and cached rule resul
 
 ### Acceptance criteria
 
-- [ ] `0116`/`0117` apply on a fresh and on a populated database; constraints and indexes land as specified; `cargo test --workspace` is green.
-- [ ] An OIDC provider is created against the test identity provider fixture, `Test connection` passes step by step, and the provider can only be enabled after a passing test.
+- [x] `0116`/`0117` apply on a fresh and on a populated database; constraints and indexes land as specified; `cargo test --workspace` is green. *(Slice 1 takes `0051` instead — the REQ's own reserved band; the released high-water mark was 0050 and the mapping/rule/sync-run tables land with their own slices. `scripts/qa/run-iam-directory.sh` → **PASS 6/6**: 32 migrations applied in filename order, both directory kinds accepted, the surviving `kind` check asserted to be the *wide* one, an unknown kind still refused, the test state round-tripping through all three values, negative and over-long sync intervals refused, six registry columns + the partial index confirmed present, and **0051 applied to a populated `auth_providers` table** — 2 pre-existing rows survived, still enabled, still `never tested`. `cargo test -p omnion-identity --lib` → **131 passed**, `-p omnion-api --lib` → **165 passed**.)*
+- [ ] An OIDC provider is created against the test identity provider fixture, `Test connection` passes step by step, and the provider can only be enabled after a passing test. *(Slice 1 ships the **enable gate** — `providers::enable_gate` refuses an untested provider and a failed one alike, `POST /{id}/enable` and `/disable` are separate verbs so the safe direction is never gated, and the generic PATCH asks the same question so the edit form and the Enable button are two doors with one lock. The live OIDC round trip against the stub IdP is slice 2's job and is not claimed here.)*
 - [ ] An LDAP/AD provider binds with a service account, searches the configured base and resolves nested groups to the depth cap; a wrong bind DN produces a field-level error naming the bind step.
 - [ ] Discovery or metadata validation refuses a wrong issuer or an invalid certificate naming the failed check, then succeeds against the fixture.
 - [ ] A start → callback round trip signs in a user that exists in the fixture; the failure page for an unknown user is indistinguishable from a wrong-password failure.
