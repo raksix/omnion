@@ -802,8 +802,14 @@ fn read_attributes(element: &Element) -> serde_json::Map<String, serde_json::Val
     map
 }
 
+/// The module's own tests, reachable from the rest of the crate's test build.
+///
+/// `pub(crate)` because the SAML half of the protocol ladder needs a *real* certificate rather
+/// than a paste that only looks like one: a hand-written fixture the parser rejects would make
+/// that ladder's first step fail for the wrong reason, and a second copy of the DER wrapper is a
+/// second thing to keep in step with the first.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::SigningKey;
     use rsa::signature::{SignatureEncoding, Signer};
@@ -812,7 +818,7 @@ mod tests {
     use super::*;
 
     /// A 2048-bit key and a PEM wrapping its public half as a `SubjectPublicKeyInfo`.
-    fn test_key() -> (RsaPrivateKey, String) {
+    pub(crate) fn test_key() -> (RsaPrivateKey, String) {
         let mut rng = rand::rngs::OsRng;
         let private = RsaPrivateKey::new(&mut rng, 2048).expect("entropy");
         (private.clone(), der_certificate(&private))

@@ -29,6 +29,7 @@ pub mod claims;
 pub mod directory;
 pub mod mappings;
 pub mod oidc;
+pub mod protocol_steps;
 pub mod providers;
 pub mod provisioning;
 pub mod saml;
