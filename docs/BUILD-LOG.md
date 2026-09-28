@@ -2820,3 +2820,50 @@ JIT account creation that consumes this map.
 
 **Next.** Run the `QA_STACK=w9` pass and read the `attribute-map-preview` steps; then the start and
 callback routes, which is where this map finally gets used by a real sign-in.
+
+---
+
+## 2026-09-28 · omnion-w9 · REQ-065 slice 2, part 3 — the map reaches the sign-in
+
+**What.** `finish_sign_in` now calls `project_through_map` before anything looks at the identity,
+so the account key, the JIT account and the audit line all use the address the map produced. Until
+now the map was a panel setting and a preview, and nothing in the sign-in path read it — an operator
+could map their provider, watch a correct preview, and still be signed in as whatever claim the
+reduction happened to find. That is exactly the wrong answer for every provider that names its
+fields its own way, and it is wrong *silently*.
+
+**Two boundaries, both deliberate.** A provider with **no** map is untouched, because "not
+configured yet" must not mean "nobody can sign in" — that is the local-sign-in invariant in
+provider shape, and a stricter reading would have locked out every provider the moment somebody
+created it. And the subject, the group list and the raw attributes are left alone: the map maps
+*fields*, and an operator who maps a display name must not find that doing so silently broke the
+role rules, which read their own claim.
+
+**The walk that can only pass if the code is right.** `sso_attribute_map.rs` drives the real router
+against the real stub identity provider. The mapped row points the email at `name` while the stub
+asserts `email`, so the address on the account can only be the map's if the callback read it. Then
+the map is pointed at `upn`, which the stub does not send, and the sign-in is refused — and the
+account list is asserted *unchanged*, because a refused projection that has already written a person
+is the failure this whole design exists to prevent.
+
+**Two walks that were already red, and were not mine.** `sso_live.rs` and `sso.rs` both failed
+before this tick and failed identically with my sign-in change stashed — slice 1 shipped the
+enablement gate and left them switching providers on *before* testing them, so they were asserting
+against a gate they had not satisfied. Verified with `git stash` rather than assumed, because a
+failing test you did not break and a failing test you did look the same from the summary line. They
+are now better tests of the same thing: the gate is asserted in its own right, the `kinds`
+catalogue is asserted by contents rather than by count (a count silently rots the next time a kind is
+added, and the entries turned out to be *objects* — which the count never had to notice), and the
+unreachable-discovery step stopped tolerating either outcome.
+
+**Proof.** `sso_attribute_map` **1 passed**, `sso` **1**, `sso_live` **2**,
+`iam_attribute_map` **1**, `omnion-api --lib` **165**, `omnion-identity --lib` **147**. All against
+`omnion_w9_iso`, an *isolated* database — the shared development one answers `VersionMissing(19)`
+because other writers have migrated it, and that reads exactly like a migration bug.
+
+**Not claimed.** The browser pass is still queued behind another writer's pass and will report
+separately. The local-*password* half of the sign-in invariant is not claimed either; what is proven
+is the provider-shaped half.
+
+**Next.** Read the `attribute-map-preview` steps from the pass, then slice 2's last piece: SAML
+assertion validation against a posted document and the discovery-refusal acceptance line.
