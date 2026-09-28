@@ -47,7 +47,7 @@ import {
   updateMediaFile,
 } from "@/lib/api";
 import { formatBytes, formatTimestamp } from "@/lib/format";
-import type { MediaFile, MediaVersion, MediaVersionList } from "@/lib/types";
+import type { MediaExif, MediaFile, MediaVersion, MediaVersionList } from "@/lib/types";
 
 /** Which tab of the right-hand panel is on screen. */
 type Tab = "metadata" | "versions" | "shares";
@@ -469,7 +469,11 @@ function MetadataTab({
         <Fact label="Size" value={formatBytes(file.size_bytes)} />
         <Fact
           label="Dimensions"
-          value={file.width && file.height ? `${file.width} × ${file.height}` : "—"}
+          value={
+            file.display_width && file.display_height
+              ? `${file.display_width} × ${file.display_height}`
+              : "—"
+          }
         />
         <Fact
           label="Duration"
@@ -510,6 +514,8 @@ function MetadataTab({
           </dd>
         </div>
       </dl>
+
+      <CameraBlock exif={file.exif} />
 
       <div className="space-y-3 border-t border-line pt-3">
         <Field
@@ -662,6 +668,99 @@ function Fact({ label, value }: { label: string; value: string }) {
       <dd className="mt-0.5 truncate text-ink">{value}</dd>
     </div>
   );
+}
+
+/**
+ * What the camera said about its own picture (REQ-010, slice 3).
+ *
+ * A block rather than three more rows in the facts list above, because a photograph either has a
+ * camera record or has none: a screenshot and a text file both produce the empty state, and a
+ * list that always shows six empty cells reads as a file with nothing in it.
+ *
+ * The GPS line is the one that has to say more than a value. The record carries `gps: true` and
+ * no coordinates — the platform files the *fact* that a photograph carries a location and keeps
+ * the position in the bytes the uploader chose to send — so the line states the omission rather
+ * than leaving an editor wondering where the map pin went.
+ */
+function CameraBlock({ exif }: { exif?: MediaExif | null }) {
+  if (!exif || Object.keys(exif).length === 0) {
+    return (
+      <section aria-labelledby="media-camera-heading" data-testid="media-camera-empty">
+        <h3 id="media-camera-heading" className="text-[12px] text-muted">
+          Camera
+        </h3>
+        <p className="mt-1 text-[12px] text-muted">
+          This file carries no camera data. Photographs taken on a phone or a camera record it
+          automatically; exports, screenshots and text files do not.
+        </p>
+      </section>
+    );
+  }
+
+  const body = [exif.make, exif.model].filter(Boolean).join(" ");
+  const rows: { label: string; value: string }[] = [];
+  if (body) rows.push({ label: "Camera", value: body });
+  if (exif.lens) rows.push({ label: "Lens", value: exif.lens });
+  if (typeof exif.iso === "number") rows.push({ label: "ISO", value: String(exif.iso) });
+  const exposure = formatExposure(exif.exposure_ms);
+  if (exposure) rows.push({ label: "Exposure", value: exposure });
+  if (typeof exif.aperture_x100 === "number")
+    rows.push({ label: "Aperture", value: `f/${(exif.aperture_x100 / 100).toFixed(1)}` });
+  if (typeof exif.focal_length_mm === "number")
+    rows.push({ label: "Focal length", value: `${exif.focal_length_mm} mm` });
+  if (exif.software) rows.push({ label: "Software", value: exif.software });
+  if (exif.captured_at)
+    rows.push({ label: "Captured", value: formatTimestamp(exif.captured_at) });
+  if (typeof exif.orientation === "number" && exif.orientation > 1)
+    rows.push({ label: "Rotation", value: rotationLabel(exif.orientation) });
+
+  return (
+    <section aria-labelledby="media-camera-heading" data-testid="media-camera-block">
+      <h3 id="media-camera-heading" className="text-[12px] text-muted">
+        Camera
+      </h3>
+      <dl className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-2 text-[12px]">
+        {rows.map((row) => (
+          <Fact key={row.label} label={row.label} value={row.value} />
+        ))}
+        {exif.gps ? (
+          <div className="col-span-2" data-testid="media-camera-gps">
+            <dt className="text-muted">Location</dt>
+            <dd className="mt-0.5 text-ink">
+              This picture carries a location. Omnion records that it does and does not store the
+              coordinates.
+            </dd>
+          </div>
+        ) : null}
+      </dl>
+    </section>
+  );
+}
+
+/**
+ * A shutter time the way a camera prints it.
+ *
+ * `1/200 s` rather than `0.005 s` for the fast speeds, and a decimal for the slow ones — the
+ * fraction is what somebody comparing two frames recognises, and `0.005 s` is not.
+ */
+function formatExposure(millis?: number): string | null {
+  if (typeof millis !== "number" || millis <= 0) return null;
+  if (millis >= 1000) return `${(millis / 1000).toFixed(1)} s`;
+  return `1/${Math.max(1, Math.round(1000 / millis))} s`;
+}
+
+/** What an EXIF orientation value means in words, for the fields that are not upright. */
+function rotationLabel(orientation: number): string {
+  const labels: Record<number, string> = {
+    2: "Mirrored horizontally",
+    3: "Rotated 180°",
+    4: "Mirrored vertically",
+    5: "Mirrored, then rotated 90°",
+    6: "Rotated 90°",
+    7: "Mirrored, then rotated 270°",
+    8: "Rotated 270°",
+  };
+  return labels[orientation] ?? `Orientation ${orientation}`;
 }
 
 /** One labelled field of the metadata form. */

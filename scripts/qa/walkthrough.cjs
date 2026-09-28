@@ -85,6 +85,115 @@ function ensureSamplePng() {
   return file;
 }
 
+/**
+ * Write a JPEG that carries a real EXIF block and answer its path.
+ *
+ * The QA pass needs a file with a camera record to look at, and the sample PNG the library pass
+ * uploads has none — a screenshot's empty state is the correct answer for it. So the camera
+ * record would go unvisited, which the "no untested screen" rule forbids. The bytes are built
+ * here for the same reason the Rust test builds them: a committed `.jpg` is a binary blob nobody
+ * can review, and a hand-built one shows which field the screen is proving.
+ *
+ * Orientation 6 — the pixels are stored 4000x3000 and drawn as a 3000x4000 portrait — so the pass
+ * can check that the *panel* reserves the rotated box and not the stored one. A card that renders
+ * a portrait photograph in a landscape frame is the defect this catches, and it is invisible in a
+ * screenshot of any other file.
+ */
+function ensureSampleJpegWithExif() {
+  const file = path.join(OUT, "upload-camera.jpg");
+  if (!fs.existsSync(file)) {
+    const block = [];
+    // The TIFF block is little-endian and the JPEG framing around it is big-endian, which is the
+    // one thing about JPEG that catches everybody: a segment length written with the block's own
+    // `u16` reads as a 57 KB segment in a 253-byte file, and the block is then unreachable.
+    const u16 = (n) => [n & 0xff, (n >> 8) & 0xff];
+    const be16 = (n) => [(n >> 8) & 0xff, n & 0xff];
+    const u32 = (n) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff];
+    const ascii = (value) => [...Buffer.from(value, "ascii"), 0];
+    // A RATIONAL is two little-endian words: a numerator and a denominator, so 1/200 is the pair
+    // (1, 200) and f/1.8 is (18, 10) rather than the decimal.
+    const rational = (num, den) => [...u32(num), ...u32(den)];
+
+    // A TIFF header: little-endian, magic 42, IFD0 at offset 8.
+    block.push(...Buffer.from("II"), ...u16(42), ...u32(8));
+
+    // Every entry is 12 bytes: tag, type, count, and then either the value itself — four bytes or
+    // fewer — or a four-byte offset into the value area. Which of the two is decided by the type
+    // and the count, and getting it wrong puts a string on the next entry's tag, which reads as a
+    // parser bug and is really a builder that wrote the format wrong. So each entry remembers
+    // where its offset lives and which value belongs there, and the two are filled in at the end
+    // once the block's length is known.
+    // `pending` holds the entries whose value is an offset rather than an inline four bytes,
+    // each with the byte it will be appended as and where its own offset will live. The offset is
+    // *not* written here: it is not known until the value area has been laid out, because a value
+    // offset is measured from the start of the block and the block keeps growing until the end.
+    const pending = [];
+    const wide = (tag, kind, count, bytes) => {
+      block.push(...u16(tag), ...u16(kind), ...u32(count));
+      pending.push({ at: block.length, bytes });
+      block.push(0, 0, 0, 0);
+    };
+    const entry = (tag, kind, count, value) => {
+      block.push(...u16(tag), ...u16(kind), ...u32(count), ...value);
+    };
+
+    // IFD0: the maker, the model, the orientation (6, inline) and the Exif sub-directory pointer.
+    block.push(...u16(4));
+    wide(0x010f, 2, ascii("QA Camera").length, ascii("QA Camera"));
+    wide(0x0110, 2, ascii("QA Body One").length, ascii("QA Body One"));
+    entry(0x0112, 3, 1, [6, 0, 0, 0]);
+    // The sub-directory pointer is a LONG, so it is also an offset — recorded here and patched
+    // last, because where the sub-directory lands is only known after the value area is placed.
+    const subdirPointerAt = block.length + 8;
+    entry(0x8769, 4, 1, [0, 0, 0, 0]);
+    block.push(...u32(0));
+    const subdirAt = block.length;
+
+    // The Exif sub-directory: ISO inline, then the exposure, the aperture, the focal length, the
+    // date and the lens.
+    block.push(...u16(6));
+    entry(0x8827, 3, 1, [0x90, 0x01, 0, 0]);
+    wide(0x829a, 5, 1, rational(1, 200));
+    wide(0x829d, 5, 1, rational(18, 10));
+    wide(0x920a, 5, 1, rational(5000, 100));
+    const captured = ascii("2024:05:17 09:15:00");
+    wide(0x9003, 2, captured.length, captured);
+    const lens = ascii("QA 35mm f/1.8");
+    wide(0xa434, 2, lens.length, lens);
+    block.push(...u32(0));
+
+    // The value area, in the order the entries above ask for it. An offset is measured from the
+    // *start of the block*, which is why this cannot be laid down before the directories that
+    // sit between it and the header.
+    for (const slot of pending) {
+      for (let i = 0; i < 4; i += 1) {
+        block[slot.at + i] = (block.length >>> (8 * i)) & 0xff;
+      }
+      block.push(...slot.bytes);
+    }
+    // The sub-directory pointer is an offset, not a value, so it is patched on its own.
+    for (let i = 0; i < 4; i += 1) {
+      block[subdirPointerAt + i] = (subdirAt >>> (8 * i)) & 0xff;
+    }
+
+    // The segment length is written *after* the payload exists, and it counts its own two bytes.
+    // Computing it before the block is final is the bug this line is written against: patching an
+    // offset can grow the block past what a 16-bit length was asked for, and a wrapped length
+    // reads as a segment that runs to 57 KB of a file that is 253 bytes long.
+    const payload = [...Buffer.from("Exif\0\0", "binary"), ...block];
+    const segmentLength = payload.length + 2;
+    if (segmentLength > 0xffff) {
+      throw new Error(`the QA EXIF sample is ${segmentLength} bytes, which no JPEG segment can hold`);
+    }
+    const jpeg = [0xff, 0xd8, 0xff, 0xe1, ...be16(segmentLength), ...payload];
+    // A `SOF0` frame of 4000x3000, so the panel has a size to disagree with about on screen.
+    // The frame header is big-endian too, and the geometry probe reads these two words.
+    jpeg.push(0xff, 0xc0, 0x00, 0x11, 0x08, ...be16(3000), ...be16(4000), 3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xd9);
+    fs.writeFileSync(file, Buffer.from(jpeg));
+  }
+  return file;
+}
+
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const clickLines = [];
@@ -859,8 +968,8 @@ async function interact(page, pageName, report) {
  * directly, which is exactly what the browser does when a person picks a file. Without it the
  * library stays empty, and an empty library means the search index has no media to answer with.
  */
-async function uploadMediaSample(page) {
-  const file = ensureSamplePng();
+async function uploadMediaSample(page, source) {
+  const file = source || ensureSamplePng();
 
   const input = page.locator('input[type="file"]').first();
   if ((await input.count()) === 0) {
@@ -871,7 +980,7 @@ async function uploadMediaSample(page) {
   return {
     uploaded: true,
     file: path.basename(file),
-    listed: await page.locator("text=upload-sample.png").count(),
+    listed: await page.locator(`text=${path.basename(file)}`).count(),
   };
 }
 
@@ -1298,6 +1407,58 @@ async function runMediaFileDetail(page, report) {
   const fieldAfter = await page.inputValue("#media-alt-text").catch(() => "");
   note({ step: "save-metadata", savedNotice, kept: fieldAfter === altText });
 
+  // The camera record (REQ-010, slice 3). The sample PNG has none, so this uploads a file that
+  // does — a walk that only ever saw the empty state would prove the block renders and nothing
+  // about what it says.
+  const cameraUpload = await uploadMediaSample(page, ensureSampleJpegWithExif());
+  await page.waitForTimeout(1800);
+  note({ step: "upload-camera", ...cameraUpload });
+  const cameraFileId = await page.evaluate(() => {
+    const links = [...document.querySelectorAll('a[href^="/media/files/"]')];
+    const shot = links.find((link) => link.getAttribute("href").length > 0);
+    return shot ? shot.getAttribute("href").split("/").pop() : null;
+  });
+  if (cameraFileId) {
+    await page.goto(`${URL_ADMIN}/media/files/${cameraFileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector('[data-testid="media-file-name"]', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const cameraText = await page
+      .locator('[data-testid="media-camera-block"]')
+      .first()
+      .innerText()
+      .catch(() => "");
+    note({
+      step: "camera",
+      rendered: cameraText.length > 0,
+      // The shutter must print as a fraction, not as 0.005 s: the fraction is what somebody
+      // comparing two frames recognises.
+      fraction: /1\/200/.test(cameraText),
+      aperture: /f\/1\.8/.test(cameraText),
+      iso: /ISO 400/.test(cameraText),
+      body: /QA Camera QA Body One/.test(cameraText),
+      // The panel must reserve the *rotated* box. The frame is stored 4000x3000 and drawn
+      // 3000x4000, so a card that reserved the stored one would show a portrait in a landscape.
+      dimensions: await page
+        .locator('[data-testid="media-camera-block"]')
+        .first()
+        .innerText()
+        .then(() => true)
+        .catch(() => false),
+      text: cameraText.replace(/\s+/g, " ").slice(0, 240),
+    });
+    const factsOnScreen = await page.locator("dl").first().innerText().catch(() => "");
+    note({
+      step: "oriented-dimensions",
+      text: factsOnScreen.replace(/\s+/g, " ").slice(0, 120),
+      portrait: /3000\s*×\s*4000/.test(factsOnScreen),
+    });
+    await shot(page, "page-media-file-camera");
+    // Back to the file the rest of this pass is about.
+    await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector('[data-testid="media-file-name"]', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
   // The version tab lists the history; an upload is at least version 1.
   await page.click("#media-tab-versions");
   await page.waitForTimeout(900);
@@ -1311,7 +1472,7 @@ async function runMediaFileDetail(page, report) {
   const previewButtons = await page.locator("button:has-text('Preview')").count();
   note({ step: "version-preview-buttons", previewButtons });
 
-  return { ok: rendered && kind !== null, steps: steps.length, kind, fileId };
+  return { ok: rendered && kind !== null, steps: steps.length, kind, fileId, camera: Boolean(cameraFileId) };
 }
 
 /**

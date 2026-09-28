@@ -291,6 +291,32 @@ export type MediaStorageProbe = {
   elapsed_ms: number;
 };
 
+/**
+ * One camera record, as the platform stored it.
+ *
+ * Every field is optional because the camera said what it said: a phone writes no aperture, a
+ * studio body writes no software, and a screenshot writes nothing at all. A missing key means
+ * "not recorded" and the panel says so rather than printing a zero.
+ */
+export type MediaExif = {
+  make?: string;
+  model?: string;
+  lens?: string;
+  software?: string;
+  /** RFC 3339 without a zone — the EXIF format carries no offset. */
+  captured_at?: string;
+  iso?: number;
+  /** Shutter time in milliseconds, so `1/200 s` is 5. */
+  exposure_ms?: number;
+  /** Aperture in hundredths of an f-stop, so f/1.8 is 180. */
+  aperture_x100?: number;
+  focal_length_mm?: number;
+  /** 1–8. Values 5–8 mean the pixels are stored sideways. */
+  orientation?: number;
+  /** The file carried a location. The coordinates are deliberately not kept. */
+  gps?: boolean;
+};
+
 /** One file as the browser reads it (`GET /api/v1/media/files`). */
 export type MediaFile = Media & {
   folder_id: string | null;
@@ -304,6 +330,18 @@ export type MediaFile = Media & {
   height: number | null;
   duration_ms: number | null;
   page_count: number | null;
+  /**
+   * What the file's own EXIF block said, when its format carries one (REQ-010, slice 3).
+   *
+   * A structured object rather than a pre-formatted line, so the panel renders a row per field
+   * and so a key this release does not know is carried through instead of dropped. A GPS fix is
+   * `gps: true` and nothing more — the platform never stores the coordinates.
+   */
+  exif?: MediaExif | null;
+  /** The size to reserve on screen, with the stored rotation applied. */
+  display_width: number | null;
+  /** The height on screen. */
+  display_height: number | null;
   scan_status: string;
   version_count: number;
   uploaded_by: string | null;
