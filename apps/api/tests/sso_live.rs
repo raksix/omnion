@@ -35,7 +35,27 @@ use uuid::Uuid;
 use support::stub_idp::{CLIENT_ID, CLIENT_SECRET, SAML_AUDIENCE, SAML_ISSUER, StubIdp};
 
 const PASSWORD: &str = "correct horse battery";
-const HOST: &str = "sso-live.omnion.test";
+
+/// Serializes this file's two tests against each other.
+///
+/// Each fixture clears every row carrying the `sso-live-%` prefix before it inserts its own, so
+/// a blanket cleanup in one test deletes the organization the other inserted microseconds
+/// earlier. The failure then surfaces as a foreign-key violation on an unrelated statement,
+/// which is exactly the sort of thing that sends the next reader looking in the wrong file.
+/// The two tests are not independent enough to run in parallel; this says so in one line rather
+/// than leaving `--test-threads=1` in a runbook.
+static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A host that is unique per fixture.
+///
+/// The public sign-in surface resolves its organization from the `Host` header, so every fixture
+/// has to register a domain — and `site_domains.host` is globally unique. A shared constant made
+/// the two tests in this file race: the first to insert won, and the loser died on a unique
+/// violation in a line that has nothing to do with what it was testing. A per-fixture host makes
+/// the two independent, which is the only reason to run them in parallel at all.
+fn fixture_host() -> String {
+    format!("sso-live-{}.omnion.test", Uuid::new_v4().simple())
+}
 
 /// The name of the environment variable the provider's client secret lives under.
 const SECRET_REF: &str = "OMNION_SSO_LIVE_STUB_SECRET";
@@ -204,6 +224,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
+        // Held for the whole test, not just the setup: the cleanup runs at both ends. A tokio
+        // mutex rather than `std::sync::Mutex`, because this guard lives across `.await` points
+        // and a blocking lock there would pin a runtime worker for the length of the test.
+        let _guard = FIXTURE_LOCK.lock().await;
         let config = Config::from_env().expect("environment must be valid");
         let db = match Db::connect(&config.database).await {
             Ok(db) => db,
@@ -241,7 +265,11 @@ impl Fixture {
         // a test that only passes in a particular harness is a test that lies.
         // The walk marks everything it owns with a prefix and clears only what carries it, so a
         // sibling suite in the same database is never touched.
-        const OWNED: &str = "sso-live-";
+        let owned = "sso-live-%";
+        // The order is the foreign keys' order, not a preference: a user references its
+        // organization, a site references its organization, a domain references its site, and
+        // every provider row references the organization. Deleting the organization first fails
+        // on whichever of those three happens to have a row left.
         for statement in [
             "delete from sessions where user_id in \
              (select id from users where email like $1)",
@@ -253,40 +281,20 @@ impl Fixture {
              (select id from organizations where slug like $1)",
             "delete from auth_providers where organization_id in \
              (select id from organizations where slug like $1)",
+            "delete from site_domains where site_id in \
+             (select id from sites where organization_id in \
+              (select id from organizations where slug like $1))",
+            "delete from sites where organization_id in \
+             (select id from organizations where slug like $1)",
+            "delete from users where email like $1",
+            "delete from organizations where slug like $1",
         ] {
             sqlx::query(statement)
-                .bind(format!("{OWNED}%"))
+                .bind(&owned)
                 .execute(db.pool())
                 .await
                 .expect("a leftover row from a previous run must be clearable");
         }
-        sqlx::query("delete from users where email like $1")
-            .bind(format!("{OWNED}%"))
-            .execute(db.pool())
-            .await
-            .expect("a leftover account from a previous run must be clearable");
-        sqlx::query(
-            "delete from site_domains where site_id in \
-             (select id from sites where organization_id in \
-              (select id from organizations where slug like $1))",
-        )
-        .bind(format!("{OWNED}%"))
-        .execute(db.pool())
-        .await
-        .expect("a leftover domain from a previous run must be clearable");
-        sqlx::query(
-            "delete from sites where organization_id in \
-             (select id from organizations where slug like $1)",
-        )
-        .bind(format!("{OWNED}%"))
-        .execute(db.pool())
-        .await
-        .expect("a leftover site from a previous run must be clearable");
-        sqlx::query("delete from organizations where slug like $1")
-            .bind(format!("{OWNED}%"))
-            .execute(db.pool())
-            .await
-            .expect("a leftover organization from a previous run must be clearable");
 
         let organization_id: Uuid = sqlx::query_scalar(
             "insert into organizations (name, slug) values ($1, $2) returning id",
@@ -324,14 +332,11 @@ impl Fixture {
         .fetch_one(db.pool())
         .await
         .expect("the test site must be created");
-        sqlx::query("delete from site_domains where host = $1")
-            .bind(HOST)
-            .execute(db.pool())
-            .await
-            .expect("the stale domain must be cleared");
+        // Its own host, so a parallel run cannot collide on the globally unique `host` column.
+        let host = fixture_host();
         sqlx::query("insert into site_domains (site_id, host, is_primary) values ($1, $2, true)")
             .bind(site_id)
-            .bind(HOST)
+            .bind(&host)
             .execute(db.pool())
             .await
             .expect("the test domain must be created");
@@ -340,7 +345,7 @@ impl Fixture {
             state,
             db,
             organization_id,
-            host: HOST.to_owned(),
+            host,
         })
     }
 
