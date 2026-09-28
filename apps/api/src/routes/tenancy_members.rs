@@ -171,6 +171,18 @@ pub struct MyOrganizationsResponse {
     pub current_organization_id: Option<Uuid>,
     /// Every organization the caller belongs to, primary first.
     pub organizations: Vec<AccountOrganizationBody>,
+    /// The modules the current tenant has switched off, by key.
+    ///
+    /// The panel's sidebar is built from a static list (a menu that changes shape per tenant
+    /// cannot be reasoned about), and the API refuses a switched-off module's routes with
+    /// `403 organization.module.disabled` (REQ-005, slice 4). Those two facts only agree if the
+    /// sidebar is told which entries to drop, and this is that answer — on the response the shell
+    /// already fetches for the switcher, so hiding an entry costs no extra request.
+    ///
+    /// Empty for a platform account: it belongs to no tenant and has no module decisions, and
+    /// hiding the whole menu from the person who administers the modules would lock them out of
+    /// the switch that has to turn them back on.
+    pub disabled_modules: Vec<String>,
 }
 
 /// Response body of `POST /api/v1/me/organization`.
@@ -1022,10 +1034,37 @@ pub async fn my_organizations(
         })
         .collect();
 
+    // The sidebar is filtered from this, so the modules the *current* tenant switched off are
+    // measured here — for that tenant only. Reporting every membership's decisions would make a
+    // switcher row ("media off") render a sidebar that does not match the tenant it names.
+    let disabled_modules = match current.user.organization_id {
+        Some(organization_id) => disabled_modules_of(state.db().pool(), organization_id).await?,
+        None => Vec::new(),
+    };
+
     Ok(Json(MyOrganizationsResponse {
         current_organization_id: current.user.organization_id,
         organizations,
+        disabled_modules,
     }))
+}
+
+/// The keys of the modules this organization switched off.
+///
+/// Only *installed* modules appear: a row naming a module this build does not ship is dropped by
+/// the same rule the Modules tab uses, because a sidebar entry for a feature that cannot be
+/// reached is a dead link — and a dead link is worse than a missing one, since it looks like a
+/// bug rather than a decision.
+async fn disabled_modules_of(
+    pool: &sqlx::PgPool,
+    organization_id: Uuid,
+) -> Result<Vec<String>, ApiError> {
+    let states = omnion_identity::tenancy_limits::load_module_states(pool, organization_id).await?;
+    Ok(states
+        .into_iter()
+        .filter(|state| !state.enabled)
+        .map(|state| state.key)
+        .collect())
 }
 
 /// Switch the session's organization.
