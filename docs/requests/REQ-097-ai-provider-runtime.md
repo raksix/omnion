@@ -159,14 +159,22 @@ Providers are installation-level, so these events carry `organization_id = null`
   real** — a 500 on the provider list, a 500 on the model registry, then a dropped connection —
   and raises a high finding when a skeleton is still on screen while an error is claimed, which is
   the original bug asserted rather than described.*
-  *The walk itself is written and committed but its **closing pass has not completed**: two runs on
-  2026-09-28 died before the AI depth passes. The first lost its artifact directory mid-run to a
-  sibling writer's disk reclaim (`ENOENT … clicks.jsonl`), and the second ran 45 minutes under
-  `load 16` with 319 MB free and lost its browser context (`Target page, context or browser has been
-  closed`) at `runAiProviderDepth`. Both are the shared box, not a screen — the pass reached
-  `iam-roles` and `analytics-settings`, and every page walked before that reported clean. Until a
-  run finishes end to end this box stays **open**, and the states criterion is ticked on the code and
-  the assertions, not on a pass that does not exist yet.*
+  *The walk itself is written and committed but its **closing pass had not completed** when this
+  slice started: two runs on 2026-09-28 died before the AI depth passes. The first lost its
+  artifact directory mid-run to a sibling's disk reclaim (`ENOENT … clicks.jsonl`), and the second
+  ran 45 minutes under `load 16` with 319 MB free and lost its browser context (`Target page,
+  context or browser has been closed`) at `runAiProviderDepth`. Both are the shared box, not a
+  screen — the pass reached `iam-roles` and `analytics-settings`, and every page walked before
+  that reported clean. Neither failure was a defect to hunt, and neither could be prevented by
+  writing a better screen: the request was being closed on a pass that spends forty of its forty-five
+  minutes on screens this request never touched. So the pass grew a **scope** (`--only=ai`,
+  `acb73eb`): the same wizard, sign-in, roll-up and refusal gate, with the routes and depth passes
+  of one area. A scoped pass is a real report, not a lighter one, and the vision review is skipped
+  on it because a verdict over a fraction of the screens describes a product state that does not
+  exist. The scope is proven by `scripts/qa/probe-pass-scope.cjs` (7/7), which reads the route list
+  and the guards **out of `walkthrough.cjs`** — a typo in a scope would otherwise report a clean
+  sheet of zeros for a pass that walked nothing, and a depth pass nobody tagged falls out of every
+  scope with nobody noticing.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan

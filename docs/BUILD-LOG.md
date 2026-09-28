@@ -2500,3 +2500,53 @@
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+## 2026-09-28 · wave 7 · tick 8 · a scoped pass, and the closing walk at last
+
+- **What.** `acb73eb` — `--only=<area>` on the QA walkthrough, plus `scripts/qa/probe-pass-scope.cjs`.
+  REQ-097 is unchanged in substance and still `in-progress`; what shipped is the tool that lets it
+  be closed honestly on the box as it actually is.
+
+- **The request was not blocked, the pass was too long.** Two consecutive closing passes for
+  REQ-097 died *before* the AI depth passes: one lost its artifact directory to a sibling's disk
+  reclaim, the other lost its browser context under `load 16` with 319 MB free — at
+  `runAiProviderDepth`, the first AI pass, which starts around minute forty. Both runs spent
+  forty of forty-five minutes on IAM and analytics screens this request never touched. Nothing
+  about that is a defect to hunt, and no amount of writing better screens fixes it: the pass
+  simply could not reach the screens the request is about. A request that cannot be closed stays
+  open, which is the same as shipping nothing.
+
+- **The scope is narrowing, not a second pass.** `--only=ai` keeps the wizard, the sign-in, the
+  route walk, the roll-up and the refusal gate, and gates the routes and depth passes by area.
+  Every route now carries an `area` tag and every depth pass sits inside an `if (inScope(…))`, so
+  a scoped report comes from the same code and means the same thing as a full one. The vision
+  review is **skipped** on a scoped pass: its verdicts describe a shot set that is a fraction of
+  the product, and a partial verdict about screens that were never walked is worse than none.
+
+- **Two ways this fails silently, so the probe is written against the walkthrough, not beside it.**
+  A typo in the scope matches nothing, and the pass reports a clean sheet of zeros — "0 high
+  findings" for a pass that walked nothing at all. A depth pass nobody tags drops out of every
+  scope with no signal. `probe-pass-scope.cjs` therefore *reads the route list, the guards and the
+  mobile loop out of `walkthrough.cjs`* rather than restating them: a copy of a list in a test is
+  worthless the day it drifts. 7/7, including the check that the `/ai` route is tagged, that both
+  desktop and mobile name the same areas for shared paths, and that a skipped renderer cannot be
+  filed as a high finding against a scoped pass.
+
+- **The append-only merge, verified the right way this time.** The `BUILD-LOG.md` conflict is a
+  UNION and `SequenceMatcher` applies each side's *insert* opcodes onto the real merge-base
+  (`ee82e6a`) in position order. The first attempt compared multisets of *both full sides against
+  the merge* — which counts the 2 029 shared base lines twice and therefore reports 1 913
+  "missing" for a merge that was in fact complete. The honest check is: ours survives as a
+  contiguous prefix, the base survives in order as a subsequence, and every insert block from both
+  sides is present verbatim. All three hold, 0 conflict markers, `1bf18e1`.
+
+- **Proof.** `cargo test -p omnion-ai-hub -- --test-threads=1` → **86 passed, 0 failed**.
+  `pnpm typecheck` → **2/2 packages** (admin executed, web cached). `probe-pass-scope.cjs` →
+  **7/7 PASS**. `probe-refusal-gate.cjs` → **9/9 PASS** (unchanged, still a high finding for an
+  unregistered 500). QA: the scoped pass runs on the private stack `QA_STACK=w7` (ports
+  18086/3106/3206, database `omnion_qa_w7`) and reached the AI depth passes in ~2 minutes instead
+  of ~40.
+
+- **Next.** Read the scoped pass's report. If it is clean, REQ-097 closes and REQ-098 slice 1 (the
+  model catalog) starts. If it found something, that something is a defect in the panels this
+  request shipped, and it is fixed here rather than explained away.
