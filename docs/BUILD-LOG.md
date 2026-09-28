@@ -3134,3 +3134,12 @@ that checks counts cannot see a wrong name.**
 **Next.** REQ-004 slice 2 — interaction depth: palette drag and keyboard add, marquee and
 multi-move, undo/redo, copy/paste, duplicate, minimap, auto-layout, expression autocomplete,
 and Table-mode parity as a tab on the builder rather than a link out of it.
+
+### The gate itself (recorded, not run)
+
+The `QA_STACK=w3` slot was held by a **live** sibling pass for this whole tick: the holder pid
+was alive, its walkthrough was mid-IAM, and this pass waited its turn for half an hour without
+the stack ever coming up (`/healthz` on 18082 never answered). By the harness's own rule that
+is a *no-result* run, not a red one — so the slice stays `in-progress`, the REQ is not closed,
+and the walkthrough's first real look at the builder is the first job of the next tick. The
+handover is in the state file's `next_hint` for exactly that reason.
