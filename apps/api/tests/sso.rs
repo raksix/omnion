@@ -385,10 +385,37 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         Some(0),
         "a fresh organization has no provider"
     );
-    assert_eq!(
-        empty.body["kinds"].as_array().map(Vec::len),
-        Some(3),
-        "the form offers exactly the three protocols the platform speaks"
+    // The catalogue grew when directory support landed: `0051` widened the `kind` check from
+    // three protocols to five kinds, because a directory is not a protocol and refusing one here
+    // would have made the whole LDAP/AD half unreachable. The assertion is on the *contents*,
+    // not a count — a count is a thing that silently rots the next time a kind is added, which
+    // is the opposite of what a test is for. Each entry is an object (`value`, `label`, `family`),
+    // so the assertion reads `value`: the panel's picker keys off that and nothing else.
+    let kinds: Vec<&str> = empty.body["kinds"]
+        .as_array()
+        .expect("the form is told which kinds exist")
+        .iter()
+        .filter_map(|kind| kind["value"].as_str())
+        .collect();
+    for expected in ["ldap", "active_directory", "oidc", "oauth2", "saml"] {
+        assert!(
+            kinds.contains(&expected),
+            "`{expected}` is a kind this platform speaks and the form must offer it: {kinds:?}"
+        );
+    }
+    // And the families are the reason the panel groups its form: a directory is a live
+    // connection with a service account, not a redirect, so it must not sit under "protocol".
+    let directory_family: Vec<&str> = empty.body["kinds"]
+        .as_array()
+        .expect("kinds")
+        .iter()
+        .filter(|kind| matches!(kind["value"].as_str(), Some("ldap" | "active_directory")))
+        .filter_map(|kind| kind["family"].as_str())
+        .collect();
+    assert!(
+        directory_family.iter().all(|family| *family == "directory"),
+        "the directory kinds are grouped as directories, so the wizard never offers them an \
+         OAuth scope: {directory_family:?}"
     );
 
     // ---- 2. Connect a provider; it is created switched off, and JIT off ---------------------
@@ -858,7 +885,11 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
             }),
         )
         .await;
-    call(
+    // The reconnection is switched on the way a working installation would: tested first. The
+    // gate refuses an untested provider — including one whose issuer is an `.invalid` host that
+    // cannot answer — so this walk asserts the gate rather than routing around it, and the
+    // discovery failure below is then reached through a *marked* row rather than a live one.
+    let enable = call(
         &fixture.state,
         request(
             Method::PATCH,
@@ -868,7 +899,54 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         ),
     )
     .await;
+    assert_eq!(
+        enable.status, StatusCode::BAD_REQUEST,
+        "an untested provider cannot be switched on, and the refusal names the reason: {}",
+        enable.body
+    );
+    assert_eq!(enable.body["error"]["code"], json!("provider_not_ready"));
 
+    // A test against an unreachable issuer is `incomplete`, not `ok` — a sound configuration with
+    // a host that does not resolve is a configuration that has not been proven, and reporting it
+    // as a pass is exactly what would let the gate be satisfied by a form nobody filled in.
+    let untested = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/providers/{reconnected}/test"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(untested.status, StatusCode::OK, "test: {}", untested.body);
+    assert_ne!(
+        untested.body["status"],
+        json!("ok"),
+        "discovery against an unresolvable issuer must never report a pass: {}",
+        untested.body
+    );
+
+    // And the gate still holds after a test that did not pass: a `partial` result is not a pass.
+    let still_off = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/iam/providers/{reconnected}"),
+            Some(&cookie),
+            Some(json!({ "enabled": true })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        still_off.status, StatusCode::BAD_REQUEST,
+        "a test that did not pass leaves the provider off: {}", still_off.body
+    );
+    assert_eq!(still_off.body["error"]["code"], json!("provider_not_ready"));
+
+    // The start route is therefore asked about a provider that is *off*. It answers `404` with
+    // the same code as an unknown provider: the sign-in surface must not let somebody discover
+    // which provider slugs exist by watching which ones say "switched off".
     let redirect = call(
         &fixture.state,
         public_request(
@@ -879,28 +957,21 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         ),
     )
     .await;
-    assert!(
-        matches!(redirect.status, StatusCode::FOUND | StatusCode::BAD_GATEWAY),
-        "a provider that cannot be discovered answers a refusal, never a redirect to nowhere: {}",
+    assert_eq!(
+        redirect.status, StatusCode::NOT_FOUND,
+        "an unreachable, unproven provider is refused at the start route: {}",
         redirect.body
     );
-    if let Some(location) = redirect.location.as_deref() {
-        // Only reached when the discovery document *was* readable (a local stub in a future
-        // extension of this walk); then the URL must carry our own parameters.
-        assert!(
-            location.contains("client_id=omnion-workspace"),
-            "{location}"
-        );
-        assert!(
-            location.contains("state="),
-            "the challenge must ride the URL: {location}"
-        );
-        assert!(
-            location.contains("code_challenge="),
-            "PKCE must ride it too: {location}"
-        );
-    }
-
+    assert_eq!(
+        redirect.body["error"]["code"], json!("provider_disabled"),
+        "and the refusal names the cause for the operator while the status stays indistinguishable \
+         from an unknown provider"
+    );
+    assert!(
+        redirect.location.is_none(),
+        "and it never redirects: a redirect into a discovery that cannot answer is how a sign-in \
+         ends on a provider's own error page"
+    );
     // A `return_to` outside the known panel paths is dropped rather than followed: the callback
     // must not be able to become an open redirect.
     let foreign = call(

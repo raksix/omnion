@@ -518,6 +518,11 @@ async fn connect(fixture: &Fixture, cookie: &str, body: Value) -> (Uuid, Uuid) {
 }
 
 /// Turn a provider on, as an administrator does once the wiring is right.
+///
+/// The order matters and used to be the other way round: the enablement gate refuses a provider
+/// whose connection test has never passed, so a walk that published first was testing a gate it
+/// had not yet satisfied — and the refusal it got back was the gate working, not a broken test.
+/// Publishing is now *after* the test below, which is also the order the wizard uses.
 async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
     let response = call(
         &fixture.state,
@@ -534,6 +539,31 @@ async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
         StatusCode::OK,
         "publish: {}",
         response.body
+    );
+}
+
+/// The gate, on its own: a provider that has never passed a test stays off.
+async fn assert_untested_providers_stay_off(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
+    let response = call(
+        &fixture.state,
+        session_request(
+            Method::PATCH,
+            &format!("/api/v1/iam/providers/{provider_id}"),
+            Some(cookie),
+            Some(json!({ "enabled": true })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "a provider that has never passed a connection test cannot be switched on: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["error"]["code"],
+        json!("provider_not_ready"),
+        "and the refusal says which precondition is unmet, rather than failing generically"
     );
 }
 
@@ -631,7 +661,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
          the value ever leaving the process"
     );
 
-    publish(&fixture, &cookie, provider_id).await;
+    assert_untested_providers_stay_off(&fixture, &cookie, provider_id).await;
 
     let tested = call(
         &fixture.state,
@@ -655,6 +685,8 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
             .as_str()
             .is_some_and(|uri| uri.ends_with("/jwks"))
     );
+
+    publish(&fixture, &cookie, provider_id).await;
 
     // ---- 2. The browser is sent to the provider, and comes back with a session ---------------
     let start = call(
