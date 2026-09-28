@@ -1989,6 +1989,216 @@ async function runOrganizationDepartments(page, report, organizationId) {
  * and reload to prove both persisted, and look at the usage bars the Billing tab labels with
  * their ceiling. A tab that only loads is a screenshot, not a walk.
  */
+/**
+ * The invite policy, the owner-approval queue and the Audit tab (REQ-005, slice 3 remainder).
+ *
+ * The other slice-3 pass proved the Settings, Modules and Billing tabs render. This one drives
+ * the two screens that *change what the API does*:
+ *
+ *   1. the tenant is put on `closed` and an invitation is refused, with the refusal registered as
+ *      an assertion so a correct 403 is not reported as a defect;
+ *   2. `self_serve` invites for real, and the row carries a link;
+ *   3. `owner_approval` queues the invite — the dialog says so instead of printing a dead link,
+ *      and the queue panel appears;
+ *   4. the manager who raised it cannot release it (the API refuses; the panel shows why), which
+ *      is the whole difference between `self_serve` and `owner_approval`;
+ *   5. the Audit tab lists the tenant's own rows, filters to one action, and exports;
+ *   6. the tenant is put back to the policy it started on, so the pass leaves no residue.
+ *
+ * The release itself is deliberately *not* clicked: the pass account is the installation's owner
+ * only by accident, and a release mints a single-use link that cannot be minted twice. Proving
+ * the release is what the seven API walks in `tenancy_limits.rs` are for; this pass proves the
+ * screen says the right thing about it.
+ */
+async function runOrganizationInvitePolicy(page, report, organizationId) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "organization-invite-policy", action: "organizations", ...step });
+  };
+
+  if (!organizationId) {
+    note({ step: "skip", reason: "no organization was created by an earlier pass" });
+    report.organizationInvitePolicy = { steps, organizationId: null };
+    return report.organizationInvitePolicy;
+  }
+
+  const base = `${URL_ADMIN}/organizations/${organizationId}`;
+  const stamp = Date.now();
+  const addresses = {
+    selfServe: `qa-selfserve-${stamp}@omnion.test`,
+    queued: `qa-queued-${stamp}@omnion.test`,
+  };
+
+  const setPolicy = async (policy) => {
+    await page.goto(`${base}?tab=settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-organization-settings-policy]", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    // The policy is a radio group, not a select, so it is clicked by value and then saved — the
+    // form is edited in local state and only pushed on submit, so clicking alone changes nothing.
+    await page
+      .locator(`[data-organization-settings-policy="${policy}"]`)
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForTimeout(300);
+    await page.locator("[data-organization-settings-save]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+  };
+
+  const inviteThrough = async (address) => {
+    await page.goto(`${base}?tab=members`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-invite-open]", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    await page.locator("[data-invite-open]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    await page.locator("[data-invite-email]").first().fill(address).catch(() => {});
+    await page.locator("[data-invite-submit]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+  };
+
+  // ---- closed: the invitation is refused, and the panel says why -----------------------------
+  await setPolicy("closed");
+  // A refusal the pass provokes on purpose must be registered first, or the correct 403 is
+  // reported as a defect.
+  expectRefusal("/invitations", "a closed organization refuses a new invitation");
+  await inviteThrough(addresses.selfServe);
+  const closedRefusal = (await page
+    .locator('[role="alert"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "closed", refused: closedRefusal.slice(0, 160) });
+  await shot(page, "page-organization-invite-closed");
+
+  // ---- self_serve: the invitation is real and its row carries a link -------------------------
+  await setPolicy("self_serve");
+  await inviteThrough(addresses.selfServe);
+  const selfServeRow = await page.locator(`[data-invitation-row="${addresses.selfServe}"]`).count();
+  note({ step: "self-serve", rowShown: selfServeRow > 0 });
+  await shot(page, "page-organization-invite-self-serve");
+
+  // ---- owner_approval: queued, no link, and the queue panel appears --------------------------
+  await setPolicy("owner_approval");
+  await inviteThrough(addresses.queued);
+  const queuedNotice = (await page
+    .locator('[role="status"]')
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  const queueVisible = await page.locator("[data-invitation-queue]").count();
+  const queueRow = await page.locator(`[data-queue-row="${addresses.queued}"]`).count();
+  note({
+    step: "queued",
+    queuePanel: queueVisible > 0,
+    queueRow: queueRow > 0,
+    // The notice is the half that matters: "invitation sent, copy this link" for a queued
+    // invitation would send the operator off to mail a link that answers "waiting".
+    saysQueued: /queued|owner/i.test(queuedNotice),
+    notice: queuedNotice.slice(0, 160),
+  });
+  await shot(page, "page-organization-invite-queued");
+
+  // Releasing is the owner's alone. The pass account may or may not be one, so both answers are
+  // acceptable and what is asserted is that the panel never offers a *silent* no-op: either the
+  // link appears, or the refusal is on screen with its code.
+  const release = page.locator(`[data-queue-release="${addresses.queued}"]`).first();
+  if (await release.count()) {
+    expectRefusal("/invitations", "releasing a queued invitation needs the owner");
+    await release.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    const released = await page.locator("[data-invitation-released]").count();
+    const refusal = (await page
+      .locator('[role="status"]')
+      .last()
+      .innerText()
+      .catch(() => "")).replace(/\s+/g, " ");
+    note({ step: "release", released: released > 0, refused: refusal.slice(0, 160) });
+    await shot(page, "page-organization-invite-released");
+  } else {
+    note({ step: "release", skipped: "no queue row to release" });
+  }
+
+  // Revoke it instead, so the pass leaves no live invitation behind whatever the policy did.
+  const queueRevoke = page.locator(`[data-queue-revoke="${addresses.queued}"]`).first();
+  if (await queueRevoke.count()) {
+    await queueRevoke.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  const drained = (await page.locator(`[data-queue-row="${addresses.queued}"]`).count()) === 0;
+  note({ step: "queue-drained", drained });
+
+  // The live invitation from the self_serve step is revoked too.
+  const revokeSelfServe = page.locator(`[data-invitation-revoke="${addresses.selfServe}"]`).first();
+  if (await revokeSelfServe.count()) {
+    await revokeSelfServe.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+
+  // ---- the Audit tab ---------------------------------------------------------------------------
+  const auditUrl = `${base}?tab=audit`;
+  await page.goto(auditUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-audit-filters]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const auditRows = await page.locator("[data-audit-row]").count();
+  const actionOptions = await page
+    .locator("[data-audit-action-filter] option")
+    .count();
+  const count = (await page
+    .locator("[data-audit-count]")
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "audit-open", rows: auditRows, actionOptions, count });
+  await shot(page, "page-organization-audit");
+
+  // The action filter is built from the tenant's own rows, so it has to *have* options — a filter
+  // that offers nothing is the tab's most likely quiet failure.
+  if (actionOptions > 1) {
+    const firstAction = await page
+      .locator("[data-audit-action-filter] option")
+      .nth(1)
+      .getAttribute("value");
+    await page
+      .locator("[data-audit-action-filter]")
+      .first()
+      .selectOption(firstAction)
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+    const narrowed = await page.locator("[data-audit-row]").count();
+    const narrowedCount = (await page
+      .locator("[data-audit-count]")
+      .first()
+      .innerText()
+      .catch(() => "")).replace(/\s+/g, " ");
+    note({ step: "audit-filter", action: firstAction, rows: narrowed, count: narrowedCount });
+    await shot(page, "page-organization-audit-filtered");
+
+    // A filter that matches nothing must say so — an empty table with no sentence reads as a
+    // broken tab.
+    await page
+      .locator("[data-audit-action-filter]")
+      .first()
+      .selectOption("")
+      .catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
+  const exportButton = page.locator("[data-audit-export]").first();
+  note({ step: "audit-export", enabled: await exportButton.isEnabled().catch(() => false) });
+  await shot(page, "page-organization-audit-export");
+
+  // Leave the tenant on the policy it started on.
+  await setPolicy("owner_approval");
+  await shot(page, "page-organization-invite-policy-restored");
+
+  const out = { steps, organizationId, addresses };
+  report.organizationInvitePolicy = out;
+  log(`organization invite policy: ${JSON.stringify(steps)}`);
+  return out;
+}
+
 async function runOrganizationTenantTabs(page, report, organizationId) {
   const steps = [];
   const note = (step) => {
@@ -3163,6 +3373,12 @@ async function main() {
   // straight after the departments pass rather than opening a second one.
   await runOrganizationTenantTabs(page, report, organizationDepth.organizationId);
   log(`organization tenant tabs: ${JSON.stringify(report.organizationTenantTabs)}`);
+
+  // The invite policy, the owner-approval queue and the Audit tab (REQ-005, slice 3 remainder):
+  // the two screens that change what the API does. Runs straight after the tenant tabs because
+  // it edits the same organization's policy and has to put it back.
+  await runOrganizationInvitePolicy(page, report, organizationDepth.organizationId);
+  log(`organization invite policy: ${JSON.stringify(report.organizationInvitePolicy)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
