@@ -4076,3 +4076,55 @@ test asserting a number it had itself got wrong, which is the only reason it was
 in `apps/api/src/routes/sales.rs`, and the catalog screens. Then REQ-051's two boxes the moment a
 pass reports — read `crmStates` and `crmKeyboardMobile` from the first w4 report written after
 `56464c4` and only then tick them.
+
+
+## 2026-09-28 — tick 20 · REQ-052 slice 1 · the catalog API, the dates it could not have carried, and the screens
+
+Slice 1 of REQ-052 closed end to end: the migration, the module, the routes, the five screens and
+the walkthrough that drives them. The interesting part was not the CRUD — it was the two defects
+the walks found, both of which are the kind that read as "working" until a person is on the screen.
+
+**What**
+
+- `0455658` the catalog API: product and price-list CRUD behind `sales.products.*` /
+  `sales.pricelists.*`, organization-scoped, every mutation writing an audit row and an event —
+  plus `modules/sales/src/dates.rs`, which is the fix described below.
+- `634c453` the tenant fix: the single-record routes resolve the organization from the path row
+  alone, so a platform Owner could see the list and then be refused the row it linked to.
+- `ac3b297` the five screens, the section frame and the depth pass.
+
+**The date bug is the one worth remembering.** `time`'s serde support is opt-in per field and a
+field that forgets the attribute does not fall back to something readable. `archived_at` went out
+as `[2026,271,22,43,23,295199000,0,0,0]`, and a bare `time::Date` on the price-list window was
+**refused on the way in** — so the editor's date fields could not be filled at all. CRM had already
+solved this in its own `dates` module for exactly this reason, and the rule is now written down in
+`sales/dates.rs`: a day is `YYYY-MM-DD`, a stamp is RFC 3339, a zone-less time is read as UTC, and
+every refusal names the format rather than saying "expected a Date" at a form field.
+
+The second half of it is the trap: naming a `with` path **replaces the field's deserializer**, so a
+field-level `#[serde(default)]` is silently dropped and a blank "valid from" becomes a 422. The
+`default` has to move to the container. That is CRM's comment, and now it is this crate's.
+
+**The tenant bug is the second kind.** The lists carried `organization_id` and the records did not.
+The API's own refusal says "pass organization_id", and a platform account that holds no role in any
+organization has no organization it may name without the permission it is being refused — so a
+screen's own list was unreachable by its own links. Every read and write that resolves a tenant
+from a path id now takes the same parameter, and the walk names it, shows the refusal without it,
+and shows that naming *another* tenant still answers 404.
+
+**Proof**
+
+- `cargo test -p omnion-module-sales --lib` → 87/87.
+- `cargo test -p omnion-api --test sales -- --test-threads=1` → 17/17 walks.
+- `pnpm --filter @omnion/admin typecheck` → clean.
+- `cargo clippy -p omnion-module-sales --all-targets` → 0 warnings. (The 42 on the wider `-p omnion-api`
+  run are other writers' crates — `crates/media`, `modules/crm`, `media_grants` — and were not
+  touched. One `useless_format` in my own test file is fixed.)
+- `bun -e` parse of `walkthrough.cjs` → SYNTAX_OK. (`bun build` cannot resolve `playwright-core`
+  outside the QA stack's node_modules; that is the module resolution, not the file.)
+
+**Next**
+
+REQ-052 slice 2 — quotes end to end: the builder, totals recomputed in SQL, versioning, send, the
+public token page with accept/decline, and the expiry sweep. A QA pass is due on the tick that
+closes it, and this tick's route additions have not been through a browser pass yet.
