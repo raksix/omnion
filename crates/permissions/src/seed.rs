@@ -111,6 +111,14 @@ const BASE_ROLES: &[BaseRole] = &[
             "analytics.export",
             "analytics.goals.manage",
             "analytics.settings.manage",
+            // Your own inbox is not a privilege: every account has one, and the reads are
+            // owner-scoped in the store, so this key grants nothing about anybody else. It is
+            // listed explicitly rather than folded into a family because the panel shows the
+            // bell on every route — a role entry that lacked it would be a person with a
+            // screen they cannot open.
+            "notifications.read",
+            "notifications.send",
+            "notifications.manage",
         ]),
     },
     BaseRole {
@@ -134,6 +142,11 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            // The bell is on every route, so every role that can open the panel needs to read
+            // its own inbox. `notifications.manage` is deliberately NOT here: it is the
+            // channel-configuration power slice 2 introduces, and a role that may read an
+            // inbox is not thereby the role that decides how it is delivered.
+            "notifications.read",
         ]),
     },
     BaseRole {
@@ -155,6 +168,8 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            // The bell is on every route. See the note in the manager role.
+            "notifications.read",
         ]),
     },
     BaseRole {
@@ -162,7 +177,17 @@ const BASE_ROLES: &[BaseRole] = &[
         name: "Member",
         priority: 100,
         description: "Reads content and media.",
-        permissions: BasePermissions::List(&["content.pages.read", "media.read", "search.read"]),
+        permissions: BasePermissions::List(&[
+            "content.pages.read",
+            "media.read",
+            "search.read",
+            // The member is the smallest role that can open the panel at all, and the bell sits
+            // in the header of every screen — so this row decides whether a member sees a badge
+            // they cannot click, or a header with a hole in it. Read only, never manage: the
+            // test below asserts the member holds no management permission at all, and a key
+            // added to the catalogue for slice 2 is the first thing that would quietly break it.
+            "notifications.read",
+        ]),
     },
 ];
 
@@ -492,14 +517,34 @@ mod tests {
         let keys = member.permissions.keys();
         assert_eq!(
             keys,
-            vec!["content.pages.read", "media.read", "search.read"],
-            "the member reads content, media and the search box"
+            vec![
+                "content.pages.read",
+                "media.read",
+                "search.read",
+                "notifications.read"
+            ],
+            "the member reads content, media, the search box and its own inbox"
         );
         assert!(!keys.contains(&"iam.roles.manage"));
         assert!(!keys.contains(&"users.delete"));
         assert!(
             !keys.contains(&"search.manage"),
             "running the index is not a member's power"
+        );
+        // The member reads its own inbox — the bell is in the header of every screen, so a
+        // member without the key is a member with a badge they cannot open — and that is the
+        // whole of it. Reading an inbox is not deciding how it is delivered, so neither
+        // `notifications.manage` nor `notifications.send` belongs here: the second is the
+        // power to write into *other* people's inboxes, and a member holding it could notify
+        // the entire organization.
+        assert!(keys.contains(&"notifications.read"));
+        assert!(
+            !keys.contains(&"notifications.manage"),
+            "configuring your own channels is not a member's power"
+        );
+        assert!(
+            !keys.contains(&"notifications.send"),
+            "notifying other people is not a member's power"
         );
 
         let editor = BASE_ROLES
