@@ -188,22 +188,114 @@ const fn path_defaults_on() -> bool {
 ///
 /// Deliberately not `http::Request`: this type is built from a request at the
 /// edge and from literals in a test, and the second is the point.
+///
+/// The scalar fields borrow — they are slices of a URI, which outlives the match —
+/// but the two name *lists* are owned. They are the only part a caller has to
+/// allocate, and a borrowed list would have to be built by the caller and kept
+/// alive by a struct this one cannot name, which is the self-referential shape a
+/// handler cannot satisfy: it parses a `HeaderMap` into a local, and the local dies
+/// at the `await` the decision needs. Owning them costs two small allocations per
+/// public request and removes a lifetime that could not be satisfied.
 #[derive(Debug, Clone)]
-pub struct RequestShape<'a> {
+pub struct RequestShape {
     /// Request path, without the query string.
-    pub path: &'a str,
+    pub path: String,
     /// Request host, if host-keyed entries are wanted.
-    pub host: Option<&'a str>,
+    pub host: Option<String>,
     /// Raw query string without the leading `?`.
-    pub query: Option<&'a str>,
+    pub query: Option<String>,
     /// Value of the language cookie, if present.
-    pub language: Option<&'a str>,
-    /// Names of the cookies the request carried.
-    pub cookies: &'a [&'a str],
+    pub language: Option<String>,
+    /// Names of the cookies the request carried. Values are deliberately absent: a
+    /// cache key built from a cookie value is a cache key built from a secret.
+    pub cookies: Vec<String>,
     /// Names of the request headers that were present.
-    pub headers: &'a [&'a str],
+    pub headers: Vec<String>,
     /// Request method, upper-case.
-    pub method: &'a str,
+    pub method: String,
+}
+
+impl RequestShape {
+    /// A request with nothing but a path and `GET`.
+    ///
+    /// The starting point every caller builds on: a rule that keys on nothing but the path
+    /// is the common case, and a test that wants to prove a decision does not care about
+    /// cookies or headers should not have to name empty lists to say so.
+    #[must_use]
+    pub fn bare(path: &str) -> Self {
+        RequestShape {
+            path: path.to_string(),
+            host: None,
+            query: None,
+            language: None,
+            cookies: Vec::new(),
+            headers: Vec::new(),
+            method: "GET".to_string(),
+        }
+    }
+
+    /// Set the host.
+    #[must_use]
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_string());
+        self
+    }
+
+    /// Set the query string, without the leading `?`.
+    ///
+    /// An empty value sets *nothing* rather than `Some("")`. The two key identically
+    /// everywhere a rule can look, but they do not read identically in a log line, and a
+    /// shape that says "this request had a query string" when it did not is the kind of
+    /// small lie that gets copied into a decision three layers down.
+    #[must_use]
+    pub fn with_query(mut self, query: &str) -> Self {
+        if !query.is_empty() {
+            self.query = Some(query.to_string());
+        }
+        self
+    }
+
+    /// Set the language cookie value. An empty value sets nothing, for the same reason
+    /// [`RequestShape::with_query`] does.
+    #[must_use]
+    pub fn with_language(mut self, language: &str) -> Self {
+        if !language.is_empty() {
+            self.language = Some(language.to_string());
+        }
+        self
+    }
+
+    /// Set the request method.
+    #[must_use]
+    pub fn with_method(mut self, method: &str) -> Self {
+        self.method = method.to_string();
+        self
+    }
+
+    /// Set the cookie names the request carried.
+    ///
+    /// Takes names, not `name=value` pairs, because that is all a rule may match on: the
+    /// value is what a cache must never key on.
+    #[must_use]
+    pub fn with_cookies<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cookies = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the header names the request carried.
+    #[must_use]
+    pub fn with_headers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.headers = names.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 impl CacheKey {
@@ -214,20 +306,20 @@ impl CacheKey {
     /// emitted as `name=value` pairs rather than concatenated values, so two
     /// different requests can never collide by running their parts together.
     #[must_use]
-    pub fn derive(&self, request: &RequestShape<'_>) -> String {
+    pub fn derive(&self, request: &RequestShape) -> String {
         let mut key = String::with_capacity(128);
         if self.host {
-            key.push_str(request.host.unwrap_or(""));
+            key.push_str(request.host.as_deref().unwrap_or(""));
         }
         key.push('|');
         if self.path {
-            key.push_str(request.path);
+            key.push_str(request.path.as_str());
         }
         // Only allow-listed parameters take part, and they are emitted in the
         // order the rule lists them: a rule that names `page` before `limit`
         // keys identically regardless of the order the client sent them in.
         if !self.query_allow.is_empty() {
-            let query = request.query.unwrap_or("");
+            let query = request.query.as_deref().unwrap_or("");
             for name in &self.query_allow {
                 key.push('|');
                 key.push_str(name);
@@ -239,7 +331,7 @@ impl CacheKey {
         }
         if self.language_cookie {
             key.push_str("|lang=");
-            key.push_str(request.language.unwrap_or(""));
+            key.push_str(request.language.as_deref().unwrap_or(""));
         }
         key
     }
@@ -261,16 +353,8 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
 
-    fn shape<'a>(path: &'a str) -> RequestShape<'a> {
-        RequestShape {
-            path,
-            host: None,
-            query: None,
-            language: None,
-            cookies: &[],
-            headers: &[],
-            method: "GET",
-        }
+    fn shape(path: &str) -> RequestShape {
+        RequestShape::bare(path)
     }
 
     fn keyed(query_allow: Vec<&str>, language_cookie: bool) -> CacheKey {
@@ -337,30 +421,24 @@ mod tests {
     #[test]
     fn the_cache_key_ignores_query_parameters_that_are_not_allow_listed() {
         let key = keyed(vec!["page"], false);
-        let mut first = shape("/search");
-        first.query = Some("page=2&limit=10");
-        let mut second = shape("/search");
-        second.query = Some("page=2&limit=99");
+        let first = shape("/search").with_query("page=2&limit=10");
+        let second = shape("/search").with_query("page=2&limit=99");
         assert_eq!(key.derive(&first), key.derive(&second));
     }
 
     #[test]
     fn the_cache_key_separates_two_different_allow_listed_values() {
         let key = keyed(vec!["page"], false);
-        let mut first = shape("/search");
-        first.query = Some("page=2");
-        let mut second = shape("/search");
-        second.query = Some("page=3");
+        let first = shape("/search").with_query("page=2");
+        let second = shape("/search").with_query("page=3");
         assert_ne!(key.derive(&first), key.derive(&second));
     }
 
     #[test]
     fn the_order_the_rule_lists_parameters_does_not_depend_on_the_client() {
         let key = keyed(vec!["page", "limit"], false);
-        let mut first = shape("/search");
-        first.query = Some("page=2&limit=10");
-        let mut second = shape("/search");
-        second.query = Some("limit=10&page=2");
+        let first = shape("/search").with_query("page=2&limit=10");
+        let second = shape("/search").with_query("limit=10&page=2");
         assert_eq!(key.derive(&first), key.derive(&second));
     }
 
@@ -372,8 +450,7 @@ mod tests {
 
     #[test]
     fn the_language_cookie_takes_part_in_the_key_only_when_asked_for() {
-        let mut request = shape("/");
-        request.language = Some("de");
+        let request = shape("/").with_language("de");
         let without = CacheKey::default();
         assert_ne!(
             without.derive(&request),
@@ -383,14 +460,12 @@ mod tests {
 
     #[test]
     fn the_host_separates_two_domains_sharing_one_edge() {
-        let mut request = shape("/blog");
-        request.host = Some("a.test");
+        let request = shape("/blog").with_host("a.test");
         let keyed = CacheKey {
             host: true,
             ..CacheKey::default()
         };
-        let mut other = shape("/blog");
-        other.host = Some("b.test");
+        let other = shape("/blog").with_host("b.test");
         assert_ne!(keyed.derive(&request), keyed.derive(&other));
     }
 }

@@ -80,7 +80,7 @@ impl Bypass {
     /// response would serve it to the next anonymous visitor, so the one condition
     /// that is never optional is applied unconditionally.
     #[must_use]
-    pub fn applies(&self, request: &RequestShape<'_>) -> bool {
+    pub fn applies(&self, request: &RequestShape) -> bool {
         if request
             .headers
             .iter()
@@ -88,7 +88,7 @@ impl Bypass {
         {
             return true;
         }
-        let query = request.query.unwrap_or("");
+        let query = request.query.as_deref().unwrap_or("");
         self.query_params.iter().any(|name| {
             query
                 .split('&')
@@ -187,13 +187,13 @@ impl CacheRule {
 
     /// Whether this rule matches a request at all.
     #[must_use]
-    pub fn matches(&self, request: &RequestShape<'_>) -> bool {
+    pub fn matches(&self, request: &RequestShape) -> bool {
         self.enabled
             && self
                 .methods
                 .iter()
-                .any(|method| method.eq_ignore_ascii_case(request.method))
-            && self.pattern.matches(request.path)
+                .any(|method| method.eq_ignore_ascii_case(&request.method))
+            && self.pattern.matches(request.path.as_str())
     }
 }
 
@@ -230,7 +230,7 @@ pub enum Decision {
 /// `rules` must be in priority order (lowest number first); the caller loads them
 /// that way so the same ordering drives the panel table and this decision.
 #[must_use]
-pub fn decide(rules: &[CacheRule], request: &RequestShape<'_>) -> Decision {
+pub fn decide(rules: &[CacheRule], request: &RequestShape) -> Decision {
     for rule in rules {
         if !rule.matches(request) {
             continue;
@@ -255,16 +255,8 @@ pub fn decide(rules: &[CacheRule], request: &RequestShape<'_>) -> Decision {
 mod tests {
     use super::*;
 
-    fn shape<'a>(path: &'a str, method: &'a str) -> RequestShape<'a> {
-        RequestShape {
-            path,
-            host: Some("site.test"),
-            query: None,
-            language: None,
-            cookies: &[],
-            headers: &[],
-            method,
-        }
+    fn shape(path: &str, method: &str) -> RequestShape {
+        RequestShape::bare(path).with_method(method).with_host("site.test")
     }
 
     fn rule(name: &str, pattern: &str, edge: i32) -> CacheRule {
