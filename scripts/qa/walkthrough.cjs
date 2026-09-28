@@ -5487,7 +5487,15 @@ async function openRuleByName(page, ruleName, timeout = 15000) {
   // the pass went on to read Versions and Audit **on the list page**, reported both as empty,
   // and the two screenshots came out byte-identical because they were literally the same
   // page. So the answer is what is on screen now, and a false here is a no-result run.
-  log(`openRuleByName: the editor did not open for "${ruleName}" (still on ${page.url()})`);
+  // What the form actually held is the difference between "the rule is not there" and "the
+  // rule is there under another name" — and the second is a real product finding (a save that
+  // renamed the rule) while the first is a navigation problem. Report both.
+  const seenName = await page.locator("[data-automation-name]").first().inputValue().catch(() => null);
+  const seenRows = await page.locator("[data-automation-row]").count();
+  log(
+    `openRuleByName: the editor did not open for "${ruleName}" ` +
+      `(url ${page.url()}, form name ${JSON.stringify(seenName)}, list rows ${seenRows})`,
+  );
   return false;
 }
 
