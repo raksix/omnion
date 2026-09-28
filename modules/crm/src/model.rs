@@ -13,6 +13,14 @@ pub const STATUSES: [&str; 4] = ["lead", "customer", "partner", "churned"];
 /// The kinds of activity a record's timeline can hold.
 pub const ACTIVITY_KINDS: [&str; 4] = ["call", "meeting", "note", "task"];
 
+/// What a form submission became (`modules::crm::leads`).
+///
+/// The list is the whole vocabulary of the ingress ledger: the drain writes one of these, the
+/// inbox filters on one of these, and the check constraint in the migration agrees. A fourth
+/// value needs all three changed, which is the point — a lead's fate is a closed set, not a
+/// free-text note somebody invents in a script.
+pub const OUTCOMES: [&str; 5] = ["created", "merged", "rejected", "orphaned", "disabled"];
+
 /// Tags a record may carry.
 pub const MAX_TAGS: usize = 10;
 

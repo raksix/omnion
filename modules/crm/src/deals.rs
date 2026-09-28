@@ -1094,7 +1094,7 @@ pub fn add_money(left: &str, right: &str) -> String {
 pub async fn create_deal(
     pool: &PgPool,
     organization_id: Uuid,
-    user_id: Uuid,
+    owner_fallback: Option<Uuid>,
     changes: &DealChanges,
 ) -> Result<Deal> {
     let normalised = validate_deal(changes)?;
@@ -1134,7 +1134,7 @@ pub async fn create_deal(
     .bind(&normalised.title)
     .bind(changes.company_id)
     .bind(changes.contact_id)
-    .bind(changes.owner_user_id.or(Some(user_id)))
+    .bind(changes.owner_user_id.or(owner_fallback))
     .bind(&normalised.amount)
     .bind(&normalised.currency)
     .bind(probability)

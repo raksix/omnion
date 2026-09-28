@@ -27,6 +27,7 @@ pub mod csv;
 pub mod dates;
 pub mod deals;
 pub mod error;
+pub mod leads;
 pub mod model;
 pub mod query;
 pub mod views;

@@ -317,7 +317,9 @@ pub async fn create_deal(
         lost_reason: body.lost_reason,
     };
 
-    let after = deals::create_deal(state.db().pool(), organization_id, current.user.id, &changes).await?;
+    let after =
+        deals::create_deal(state.db().pool(), organization_id, Some(current.user.id), &changes)
+            .await?;
 
     record(
         &state,
