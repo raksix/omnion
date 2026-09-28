@@ -775,6 +775,12 @@ async function interact(page, pageName, report) {
     // the pass from reporting its own test as a broken screen, and the vocabulary is 4xx only so
     // a 500 in the same window — the API crashing on input it just refused — is still a finding.
     const submitsAForm = meta.tag === "button" && meta.type === "submit";
+    // …and the window opens **here**, before the click, not after it. Playwright's click resolves
+    // as soon as the browser dispatches it, and this panel's POST is refused in ~50 ms — often
+    // before the click promise resolves at all. A window opened after the click is a window that
+    // has already missed the failure it was opened for, which is why the registration claimed
+    // nothing and the report kept filing the pass's own 400 as a defect.
+    const netAtOpen = submitsAForm ? netFailures.length : -1;
     if (submitsAForm) {
       expectRefusal(
         "/api/v1/",
@@ -863,7 +869,6 @@ async function interact(page, pageName, report) {
     // panel, the refusal lands at ~230 ms; the wait is generous because the box is shared and a
     // slow dev server answering a small POST is normal, not a defect.
     if (submitsAForm) {
-      const netAtOpen = netFailures.length;
       await page.waitForTimeout(2500);
       endRefusalWindow("/api/v1/");
       // Record what the window actually covered. A registration that opens and closes over

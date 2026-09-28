@@ -116,5 +116,35 @@ test("the discovery assertion is what a dead endpoint would have broken", () => 
   assert.ok(discovery < editor && discovery < toggle, "discovery must run before the checks that read models");
 });
 
+test("the window opens before the click, because the click can outrun it", () => {
+  // Playwright resolves `click()` as soon as the browser dispatches it, and this panel's refused
+  // POST lands in ~50 ms — measured, not assumed. A window opened *after* the click has already
+  // missed the failure it was opened for, so it claims nothing and the report files the pass's own
+  // 400 as a defect. This is the one ordering that reads like a product bug and is not one.
+  const i = source.indexOf("const submitsAForm = meta.tag === \"button\"");
+  assert.notEqual(i, -1, "the submit branch is gone from the interactor");
+  const reg = source.indexOf("expectRefusal(", i);
+  const click = source.indexOf('await page.locator(`[data-qa-idx="${i}"]`).click', i);
+  assert.notEqual(reg, -1 && reg > i, "the inline submit is never registered");
+  assert.notEqual(click, -1, "the click is gone from the interactor");
+  assert.ok(reg < click, `the window opens at ${reg} and the click is at ${click} — it misses the failure`);
+  // …and it has to be closed after the response arrives, not straight after the click.
+  const close = source.indexOf("endRefusalWindow(", i);
+  assert.ok(close > click, "the window closes before the click, so nothing is ever covered");
+});
+
+test("a narrowed registration is a 4xx vocabulary, and the filler uses it", () => {
+  // The filler submits sample values into a real form: a 4xx is the product refusing it, a 5xx is
+  // the API crashing on input it should have rejected. Registering the whole vocabulary would let
+  // the crash through.
+  const i = source.indexOf("interact(${pageName}): a sample-filled form is submitted on purpose");
+  assert.notEqual(i, -1, "the inline submit registration reason is gone");
+  const window = source.slice(source.lastIndexOf("expectRefusal(", i), i + 200);
+  assert.ok(
+    /\[400, 401, 403, 422\]/.test(window),
+    "the inline submit must register 4xx only, so a 500 in the window stays a finding",
+  );
+});
+
 console.log(`\n${pass}/${pass + fail} PASS${fail ? "" : ""}`);
 process.exitCode = fail ? 1 : 0;
