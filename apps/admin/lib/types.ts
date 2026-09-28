@@ -109,6 +109,23 @@ export type MediaFolderTree = {
   folders: MediaFolder[];
 };
 
+/** One transformation preset (`GET /api/v1/media/transformation-presets`). */
+export type MediaPreset = {
+  id: string;
+  name: string;
+  width: number | null;
+  height: number | null;
+  /** `cover` | `contain` | `fill`. */
+  fit: string;
+  /** `webp` | `jpeg` | `png`. */
+  format: string;
+  quality: number;
+  /** What the settings screen reads: `1200 x 630 · cover · WebP q80`. */
+  summary: string;
+  /** The query a page appends, e.g. `?preset=card`. */
+  example_query: string;
+};
+
 /** One file as the browser reads it (`GET /api/v1/media/files`). */
 export type MediaFile = Media & {
   folder_id: string | null;

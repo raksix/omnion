@@ -1015,6 +1015,95 @@ async function runMediaFileManager(page, report) {
  * A screen that only ever renders its 404 state passes a route walk, so the id is taken from a
  * real row: the point is to test the screen, not the router that guards it.
  */
+/**
+ * Drive the transformation presets the way an operator does (REQ-010, slice 3).
+ *
+ * The interesting claims are not "the table renders" — they are the ones a screenshot cannot
+ * settle: a preset that refuses a bad quality with a message *under the field*, and a preset URL
+ * that answers with real transformed bytes rather than the original. Both are checked here.
+ */
+async function runMediaPresets(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-presets", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/media/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  const listed = await page.locator("text=Transformation presets").count();
+  note({ step: "load", listed });
+  if (listed === 0) {
+    return { ok: false, reason: "the presets screen did not render" };
+  }
+
+  // The seeded preset must be there: a site with no `standard` would silently serve full-size
+  // originals to every page that asks for it.
+  const seeded = await page.locator("text=standard").count();
+  note({ step: "seeded", seeded });
+
+  await page.getByRole("button", { name: /New preset/i }).click().catch(() => {});
+  await page.waitForTimeout(600);
+  const editor = await page.locator("text=New preset").count();
+  note({ step: "editor-open", editor });
+  if (editor === 0) {
+    return { ok: false, reason: "the preset editor did not open" };
+  }
+
+  // An out-of-range quality must be refused *by the form*, naming the field, before it reaches
+  // the API. A screen that posts and then shows a banner has already sent the request.
+  await page.locator('input[placeholder="card"]').fill("qa-card").catch(() => {});
+  await page.locator('input[placeholder="1200"]').fill("640").catch(() => {});
+  await page.locator('input[placeholder="630"]').fill("360").catch(() => {});
+  await page.locator('input[inputmode="numeric"]').last().fill("9000").catch(() => {});
+  await page.getByRole("button", { name: /Create preset/i }).click().catch(() => {});
+  await page.waitForTimeout(800);
+
+  const fieldError = await page.locator('[role="alert"]').allTextContents();
+  note({ step: "quality-refused", fieldError });
+  const qualityNamed = fieldError.some((text) => /quality/i.test(text));
+
+  // Now a good one, so the table is proved with a row this pass created.
+  await page.locator('input[inputmode="numeric"]').last().fill("75").catch(() => {});
+  await page.getByRole("button", { name: /Create preset/i }).click().catch(() => {});
+  await page.waitForTimeout(1500);
+  const created = await page.locator("text=qa-card").count();
+  note({ step: "created", created });
+  await shot(page, "media-presets-created");
+
+  // The preset URL must answer with transformed bytes. This runs in the page, against the
+  // session cookie, so the check is against the real API rather than a fixture.
+  const served = await page.evaluate(async () => {
+    const link = document.querySelector('a[href^="/api/v1/media/"]');
+    if (!link) return { ok: false, reason: "no preset example URL on the screen" };
+    const url = link.getAttribute("href").replace("<file-id>", "");
+    const response = await fetch(url, { credentials: "same-origin" });
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    return {
+      ok: response.ok,
+      status: response.status,
+      type: response.headers.get("content-type"),
+      cache: response.headers.get("cache-control"),
+      bytes: buffer.length,
+      magic: Array.from(buffer.slice(0, 12))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    };
+  });
+  note({ step: "preset-url", ...served });
+
+  await shot(page, "media-presets-table");
+  return {
+    ok: created > 0 && qualityNamed,
+    steps: steps.length,
+    seeded,
+    qualityNamed,
+    created,
+    served,
+  };
+}
+
 async function runMediaFileDetail(page, report) {
   const steps = [];
   const note = (step) => {
@@ -2796,6 +2885,10 @@ async function main() {
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
     { path: "/media/trash", name: "media-trash" },
+    // The transformation presets (REQ-010, slice 3) — walked here and driven by the depth pass
+    // below, which creates a preset, submits an out-of-range quality to see the field error, and
+    // asks for the preset URL to answer with real transformed bytes.
+    { path: "/media/settings", name: "media-settings" },
     // The file detail screen (REQ-010, slice 2) is NOT in this list on purpose: its path
     // carries a file id, and a route walked with a placeholder id only proves that the 404
     // state renders. `runMediaFileDetail` below opens a *real* file's screen instead. Listing
@@ -2890,6 +2983,9 @@ async function main() {
     runMediaFileDetail(page, report),
   );
   log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
+
+  report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
+  log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
