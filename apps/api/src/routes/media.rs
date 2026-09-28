@@ -159,6 +159,9 @@ pub async fn upload_media(
     // simply not described — the row keeps its columns empty rather than a guess that would
     // break every layout that reads them.
     let probe = omnion_media::probe_of(&upload.bytes, &content_type);
+    // What the camera wrote about its own picture, read from the same prefix as the geometry.
+    // Read here rather than after the insert so the row is written once, described once.
+    let exif = omnion_media::read_exif(&content_type, &upload.bytes);
 
     // `insert_media` consumes the name, the type and the checksum, and the history below needs
     // the same three values. They are copied here, once, rather than read back out of the row —
@@ -189,8 +192,15 @@ pub async fn upload_media(
             // numbers go onto the row here rather than in a second statement, which is what makes
             // "the file says it is 1920 wide" and "the history says it is 1920 wide" the same
             // fact read twice.
-            omnion_media::versions::fill_dimensions(state.db().pool(), media.id, probe.columns())
-                .await?;
+            // One statement writes the record and the geometry it rotates, so a row can never
+            // hold the orientation from one call and the dimensions from another.
+            omnion_media::versions::fill_exif(
+                state.db().pool(),
+                media.id,
+                &exif,
+                (probe.width, probe.height),
+            )
+            .await?;
             omnion_media::versions::ensure_version_one(
                 state.db().pool(),
                 media.id,

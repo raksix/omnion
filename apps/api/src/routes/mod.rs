@@ -88,7 +88,9 @@ pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod media_files;
+pub mod media_duplicates;
 pub mod media_settings;
+pub mod media_shares;
 pub mod media_transform;
 pub mod media_versions;
 pub mod onboarding;
@@ -508,6 +510,33 @@ pub fn router(state: AppState) -> Router {
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
+
+    // Share links (REQ-010, slice 3). Creating and revoking a link is `media.share`, which is
+    // deliberately *not* `media.manage`: handing a file to somebody outside the platform is a
+    // different power from organising the library, and a team that may move files around has no
+    // business handing them to a client. Reading the list is `media.read` — the file-detail
+    // screen shows a file's links to anyone who can open the file.
+    let media_shares_route: MethodRouter<AppState, Infallible> =
+        get(media_shares::list).layer(guards::require(&state, "media.read"));
+    let media_share_create: MethodRouter<AppState, Infallible> =
+        post(media_shares::create).layer(guards::require(&state, "media.share"));
+    let media_share_revoke: MethodRouter<AppState, Infallible> =
+        delete(media_shares::revoke).layer(guards::require(&state, "media.share"));
+    let media_share_revoke_all: MethodRouter<AppState, Infallible> =
+        post(media_shares::revoke_all).layer(guards::require(&state, "media.share"));
+
+    // The public token route carries no guard and no session, because the token *is* the
+    // credential — that is what a share link is. Everything it checks is about the token.
+    let public_media_shared = get(media_shares::public_shared);
+
+    // Duplicate detection and merge (REQ-010, slice 3). Reading the report is `media.read` —
+    // knowing what a site stores twice costs nothing and helps everybody. Merging is
+    // `media.manage`: it rewrites which row a published page resolves to, which is a different
+    // power from being able to organise the library.
+    let media_duplicates_route: MethodRouter<AppState, Infallible> =
+        get(media_duplicates::report).layer(guards::require(&state, "media.read"));
+    let media_duplicates_merge: MethodRouter<AppState, Infallible> =
+        post(media_duplicates::merge).layer(guards::require(&state, "media.manage"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -956,7 +985,19 @@ pub fn router(state: AppState) -> Router {
             media_version_restore,
         )
         .route("/media/{id}/versions/{version}/raw", media_version_raw)
+        // Share links (REQ-010, slice 3). `/media/{id}/shares` is a collection and
+        // `/media/{id}/shares/{share_id}` one link, so a revoke addresses a link without
+        // touching the rest of the file's links.
+        .route("/media/{id}/shares", media_shares_route)
+        .route("/media/{id}/shares", media_share_create)
+        .route("/media/{id}/shares/revoke-all", media_share_revoke_all)
+        .route("/media/{id}/shares/{share_id}", media_share_revoke)
         .route("/media/transformation-presets", media_presets)
+        // The duplicate report and its merge. `duplicates` is a static segment declared before
+        // `/media/{id}/…`, so axum ranks it ahead of the parameter route — same rule the
+        // settings row below relies on, and the reason it is a literal here.
+        .route("/media/duplicates", media_duplicates_route)
+        .route("/media/duplicates/merge", media_duplicates_merge)
         // `/media/settings` is a *static* segment and `/media/{id}/…` is a parameter one.
         // Axum ranks the static match first, so the settings row is never read as a media
         // id — which is why the literal is declared here and not spelled as `{id}`.
@@ -971,6 +1012,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/public/pages/{slug}", public_pages)
         .route("/public/media/{id}", public_media)
+        // The share token route: unauthenticated by nature, because the token is the
+        // credential. It is a *static* `shared` segment, so it never collides with the
+        // `{id}` parameter above it.
+        .route("/public/media/shared/{token}", public_media_shared)
         .route("/workflows", workflows)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)

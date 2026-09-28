@@ -27,10 +27,14 @@ use crate::folders::Folder;
 use crate::model::MediaFile;
 
 /// Every column of a media row, in the order [`MediaFile`] reads them.
-const FILE_COLUMNS: &str = "id, site_id, storage_key, filename, content_type, size_bytes, \
+///
+/// `pub(crate)` rather than a second copy: the duplicate report and the merge both read whole
+/// file rows, and a second column list that can drift from this one is a query that compiles and
+/// then decodes a `MediaFile` whose `metadata` came from the `tags` column.
+pub(crate) const FILE_COLUMNS: &str = "id, site_id, storage_key, filename, content_type, size_bytes, \
                            checksum, created_by, created_at, folder_id, updated_at, deleted_at, \
                            deleted_by, purged_at, alt_text, caption, description, metadata, tags, \
-                           width, height, duration_ms, page_count, scan_status, scan_detail, \
+                           width, height, duration_ms, page_count, exif, scan_status, scan_detail, \
                            version_count, is_public";
 
 /// The same column list, prefixed with `alias.` — for a select that nests the row in an object.
