@@ -93,7 +93,21 @@ function log(...a) {
 }
 function record(entry) {
   clickLines.push(entry);
-  fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  // Every writer shares one disk, and a pass that frees space does it by removing build
+  // directories and artifact runs it does not own. The first write after that lands an
+  // ENOENT out of appendFileSync, and because `record` is called from the pass itself the
+  // throw unwinds the whole walkthrough — an hour of screens, on a screen with nothing
+  // wrong with it. The evidence of what the pass saw stays in `clickLines` either way, so
+  // a write that fails is reported once and the walk continues.
+  try {
+    fs.mkdirSync(OUT, { recursive: true });
+    fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  } catch (err) {
+    if (!record.warned) {
+      record.warned = true;
+      console.log("[walk] artifact directory is gone (" + err.code + "), recording in memory only");
+    }
+  }
 }
 
 // ---------------------------------------------------------------- browser
