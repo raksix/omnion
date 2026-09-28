@@ -70,6 +70,15 @@ export type {
   ContentBlock,
 } from "@omnion/types";
 
+/**
+ * `BlockIssue` again, as a *binding* rather than a re-export.
+ *
+ * `export type { X } from "…"` places nothing in this module's scope, so a type that is also
+ * used inside a declaration here has to be imported in its own right. Two lines, one import —
+ * and the compiler says so the moment one of them goes missing.
+ */
+import type { BlockIssue } from "@omnion/types";
+
 /** One prop-level difference inside a `changed` block row (REQ-063). */
 export type PropChange = {
   /** Prop name (`text`, `alt`) or `meta.<setting>` for a per-block setting. */
@@ -152,6 +161,34 @@ export type Page = {
 export function pageTitle(page: Page): string {
   return page.draft?.title ?? page.published?.title ?? page.slug;
 }
+
+/**
+ * The renderer-frame payload of a page's working draft
+ * (`GET /api/v1/pages/{id}/preview?viewport=`).
+ *
+ * It carries BOTH trees. `blocks` is what is stored; `visible_blocks` is what the requested
+ * viewport actually renders, after the server dropped the blocks the author hid from that
+ * screen. A frame that only received the filtered tree could not tell a hidden block from a
+ * deleted one — and "where did my block go" is the first question an author asks a phone
+ * preview.
+ */
+export type PagePreview = {
+  page_id: string;
+  slug: string;
+  title: string;
+  viewport: "desktop" | "mobile";
+  blocks: unknown[];
+  visible_blocks: unknown[];
+  block_count: number;
+  visible_count: number;
+  body: string;
+  revision_id: string;
+  revision_no: number;
+  /** The revision visitors see, when there is one. */
+  published_revision_no: number | null;
+  can_publish: boolean;
+  issues: BlockIssue[];
+};
 
 /** One file in a site's media library (`GET /api/v1/media`). */
 export type Media = {

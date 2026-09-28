@@ -35,6 +35,16 @@ type CanvasProps = {
   onSelect?: (path: number[]) => void;
   /** The path prefix the block sits under, for selection bookkeeping. */
   basePath?: number[];
+  /**
+   * Which prop each block id writes into, for the preview frame's inline editing.
+   *
+   * `undefined` is the editor, where the inspector is the way to change a prop. The frame
+   * passes it, and only then does a block grow a `contenteditable` region: an editor that
+   * accepted typing into the canvas would put two ways to edit the same field on one screen.
+   */
+  editable?: Map<string, string>;
+  /** An inline edit: the block's id and the text the author typed. */
+  onInlineEdit?: (blockId: string, value: string) => void;
 };
 
 /** Issues of one block, in the order the API reports them. */
@@ -62,6 +72,8 @@ export function BlockCanvas({
   issues,
   onSelect,
   basePath = [],
+  editable,
+  onInlineEdit,
 }: CanvasProps) {
   if (blocks.length === 0) {
     return mode === "edit" ? (
@@ -83,6 +95,8 @@ export function BlockCanvas({
           selected={selected}
           issues={issues}
           onSelect={onSelect}
+          editable={editable}
+          onInlineEdit={onInlineEdit}
         />
       ))}
     </div>
@@ -97,6 +111,8 @@ type CanvasBlockProps = {
   selected?: number[] | null;
   issues?: Map<string, BlockIssue[]>;
   onSelect?: (path: number[]) => void;
+  editable?: Map<string, string>;
+  onInlineEdit?: (blockId: string, value: string) => void;
 };
 
 function CanvasBlock({
@@ -107,6 +123,8 @@ function CanvasBlock({
   selected,
   issues,
   onSelect,
+  editable,
+  onInlineEdit,
 }: CanvasBlockProps) {
   const definition = definitionFor(registry, block.type);
   const blockIssues = issuesFor(issues, block);
@@ -190,6 +208,8 @@ function CanvasBlock({
                     selected={selected}
                     issues={issues}
                     onSelect={onSelect}
+                    editable={editable}
+                    onInlineEdit={onInlineEdit}
                   />
                 ))}
               </div>
@@ -222,6 +242,8 @@ function CanvasBlock({
             selected={selected}
             issues={issues}
             onSelect={onSelect}
+            editable={editable}
+            onInlineEdit={onInlineEdit}
           />
         ))}
       </div>
@@ -236,24 +258,75 @@ function CanvasBlock({
     );
   }
 
+  // The preview frame's inline editing: the block's own text becomes a `contenteditable`
+  // region, so the author types where the text is rather than in a field three panes away.
+  //
+  // `suppressContentEditableWarning` is deliberate. React's warning is about a *controlled*
+  // contenteditable being mutated by the browser, and here the browser IS the input: the value
+  // is read back on blur and pushed up, so the DOM is the source of truth between the keystrokes.
+  // `plaintext-only` is the other half — `true` would let a pasted <script> land in the tree and
+  // then be saved, so the browser is asked for text and the server still sanitises on write.
+  const inlineKey = editable?.get(block.id);
+  const inline = inlineKey ? (
+    <span
+      data-block-inline-field={block.id}
+      data-block-inline-prop={inlineKey}
+      contentEditable
+      suppressContentEditableWarning
+      role="textbox"
+      aria-label={`Edit the text of this ${definition?.label ?? block.type} block`}
+      tabIndex={0}
+      onInput={(event) => onInlineEdit?.(block.id, event.currentTarget.textContent ?? "")}
+      onBlur={(event) => onInlineEdit?.(block.id, event.currentTarget.textContent ?? "")}
+      className="-mx-1 block cursor-text rounded px-1 whitespace-pre-line outline-none ring-accent/40 focus:ring-2"
+    >
+      {String(block.props[inlineKey] ?? "")}
+    </span>
+  ) : null;
+
   return (
     <div
       data-block-canvas-block={block.type}
       data-block-has-error={blocking ? "true" : "false"}
+      data-block-inline-editable={inline ? "true" : "false"}
       className={`relative rounded-lg border transition ${
         active ? "border-accent ring-2 ring-accent/15" : "border-line hover:border-accent/40"
       } ${blocking ? "border-accent-strong" : ""}`}
     >
-      <button
-        type="button"
-        onClick={() => onSelect?.(path)}
-        aria-pressed={active}
-        aria-label={`Select ${definition?.label ?? block.type} block`}
-        className="block w-full cursor-pointer rounded-lg px-3 py-2.5 text-left"
-      >
-        {heading}
-        <span className="block">{body}</span>
-      </button>
+      {/*
+        The block's body is a BUTTON only when it is not being edited in place. A
+        `contenteditable` region nested inside a `<button>` is invalid HTML — the button owns its
+        content, so a caret inside it is a click on the button, and an author cannot place the
+        cursor in the middle of a paragraph. With inline editing on, the header row stays the
+        selecting button and the text itself is the editable region beside it.
+      */}
+      {inline ? (
+        <>
+          <button
+            type="button"
+            onClick={() => onSelect?.(path)}
+            aria-pressed={active}
+            aria-label={`Select ${definition?.label ?? block.type} block`}
+            className="block w-full cursor-pointer rounded-lg px-3 pt-2.5 text-left"
+          >
+            {heading}
+          </button>
+          <div className="px-3 pb-2.5">
+            <p className="text-[13px] leading-relaxed">{inline}</p>
+          </div>
+        </>
+      ) : (
+        <button
+          type="button"
+          onClick={() => onSelect?.(path)}
+          aria-pressed={active}
+          aria-label={`Select ${definition?.label ?? block.type} block`}
+          className="block w-full cursor-pointer rounded-lg px-3 py-2.5 text-left"
+        >
+          {heading}
+          <span className="block">{body}</span>
+        </button>
+      )}
       {frame}
     </div>
   );

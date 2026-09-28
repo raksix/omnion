@@ -21,6 +21,7 @@ import {
   ArrowDown,
   ArrowUp,
   Copy,
+  Eye,
   Layers,
   Pencil,
   Plus,
@@ -406,6 +407,14 @@ export function BlockEditor() {
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <Link
+            href={`/pages/${pageId}/preview`}
+            data-block-preview-link
+            className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+          >
+            <Eye className="size-3.5" aria-hidden />
+            Preview
+          </Link>
           <Link
             href="/pages"
             className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"

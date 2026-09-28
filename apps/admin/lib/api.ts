@@ -19,6 +19,7 @@ import type {
   Organization,
   OwnerSetupResult,
   Page,
+  PagePreview,
   Revision,
   RevisionDiff,
   Site,
@@ -342,6 +343,24 @@ export function fetchRevisionDiff(
     : "";
   return request<RevisionDiff>(
     `/api/v1/pages/${encodeURIComponent(pageId)}/revisions/${encodeURIComponent(revisionId)}/diff${query}`,
+  );
+}
+
+/**
+ * The renderer-frame payload of a page's working draft (REQ-063, slice 2).
+ *
+ * `viewport` picks the screen: the server filters the tree for it, so a phone frame does not
+ * carry a desktop block in the DOM wearing a `display: none`. The screen switch has to be a
+ * round trip on purpose — the filter lives in the same place the public renderer's filter lives,
+ * and a client-side copy is exactly how a preview starts disagreeing with the site.
+ */
+export function fetchPagePreview(
+  pageId: string,
+  viewport: "desktop" | "mobile" = "desktop",
+): Promise<PagePreview> {
+  const query = viewport === "mobile" ? "?viewport=mobile" : "";
+  return request<PagePreview>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/preview${query}`,
   );
 }
 
