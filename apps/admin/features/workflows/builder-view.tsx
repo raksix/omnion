@@ -36,6 +36,7 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type DragEvent as ReactDragEvent,
 } from "react";
 
 import {
@@ -373,9 +374,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const { canUndo, canRedo } = capabilities(historyRef.current);
 
   const addNode = useCallback(
-    (nodeType: GraphNodeType) => {
+    (nodeType: GraphNodeType, at?: { x: number; y: number }) => {
       const before = currentSnapshot();
-      const position = viewportCentre(canvasRef.current, viewport);
+      // A drop carries the exact spot the card was released, so the node lands under the
+      // pointer. Without one — a click, or a keyboard add — it lands at the viewport centre,
+      // which is the only position a pointer-less gesture can honestly claim.
+      const position = at ?? viewportCentre(canvasRef.current, viewport);
       const node: GraphNode = {
         id: uniqueId(nodeType.key, nodes),
         type: nodeType.key,
@@ -652,6 +656,44 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       commit("edge-remove", before, graphRef.current.nodes, nextEdges);
     },
     [commit],
+  );
+
+  /**
+   * Drag a node from the palette onto the canvas.
+   *
+   * HTML5 drag rather than pointer events: a palette item is a button, and a button that
+   * answers a pointer-drag has to suppress the click that a plain click fires, which is how
+   * "drag" ends up breaking "click". The drag carries only the node type key, and the drop
+   * position is converted from screen to graph coordinates here — the drop handler receives
+   * client coordinates, and a node placed at `clientX` would land wherever the viewport
+   * happened to be scrolled.
+   */
+  const onPaletteDragStart = useCallback((event: ReactDragEvent<HTMLButtonElement>, key: string) => {
+    event.dataTransfer.setData("application/x-omnion-node-type", key);
+    event.dataTransfer.effectAllowed = "copy";
+  }, []);
+
+  const onCanvasDrop = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>) => {
+      const key = event.dataTransfer.getData("application/x-omnion-node-type");
+      const nodeType = key ? nodeTypes.get(key) : undefined;
+      if (!nodeType) {
+        return;
+      }
+      event.preventDefault();
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) {
+        return;
+      }
+      addNode(nodeType, {
+        // Centred on the pointer, the same way `viewportCentre` centres a click-add: the
+        // card's *top-left* is not what the eye places, and a node that appears down and to
+        // the right of where it was dropped reads as a drop that did not land where it aimed.
+        x: (event.clientX - rect.left - viewport.x) / viewport.zoom - CARD_W / 2,
+        y: (event.clientY - rect.top - viewport.y) / viewport.zoom - CARD_H / 2,
+      });
+    },
+    [addNode, nodeTypes, viewport],
   );
 
   // ---- canvas interaction -----------------------------------------------------------------
@@ -1325,6 +1367,8 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                       <li key={nodeType.key}>
                         <button
                           type="button"
+                          draggable
+                          onDragStart={(event) => onPaletteDragStart(event, nodeType.key)}
                           onClick={() => addNode(nodeType)}
                           onKeyDown={(event) => onPaletteKeyDown(event, nodeType.key)}
                           className="w-full rounded-md border border-line bg-canvas px-2 py-1.5 text-left hover:border-accent"
@@ -1357,6 +1401,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerLeave={onPointerUp}
+          onDragOver={(event) => {
+            // Without this the browser refuses the drop outright and the gesture ends with
+            // nothing happening, which is indistinguishable from a broken drop handler.
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }}
+          onDrop={onCanvasDrop}
           onKeyDown={onCanvasKeyDown}
           tabIndex={0}
           role="application"

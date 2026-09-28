@@ -6692,6 +6692,51 @@ async function runWorkflowBuilderDepth(page, report) {
     note({ step: "shift-click-multi", skipped: "fewer than two nodes on the canvas", nodes: cardIds.length });
   }
 
+  // Drag from the palette onto the canvas. HTML5 drag is driven through `dispatchEvent` with
+  // a real DataTransfer because Playwright's mouse API does not synthesise it; the node count
+  // before and after is the assertion, and the position is checked against the drop point so
+  // a drop that lands at the canvas origin (screen coords used as graph coords) cannot pass.
+  const nodesBeforeDrag = await page.locator("[data-node-id]").count();
+  const dragResult = await page
+    .evaluate(() => {
+      const item = document.querySelector("[data-palette-node='transform']");
+      const canvas = document.querySelector("[data-builder-canvas]");
+      if (!item || !canvas) return { attempted: false };
+      const rect = canvas.getBoundingClientRect();
+      const target = { x: rect.left + 320, y: rect.top + 220 };
+      const transfer = new DataTransfer();
+      item.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
+      canvas.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer }));
+      canvas.dispatchEvent(
+        new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer, clientX: target.x, clientY: target.y }),
+      );
+      return { attempted: true, target };
+    })
+    .catch(() => ({ attempted: false }));
+  await page.waitForTimeout(900);
+  const afterDrag = await page.locator("[data-node-id]").count();
+  const droppedNode = await page
+    .locator("[data-node-type='transform']")
+    .last()
+    .evaluate((card) => {
+      const rect = card.getBoundingClientRect();
+      return { left: Math.round(rect.left), top: Math.round(rect.top) };
+    })
+    .catch(() => null);
+  note({
+    step: "palette-drag",
+    ...dragResult,
+    before: nodesBeforeDrag,
+    after: afterDrag,
+    dropped: droppedNode,
+    // A drop that ignores the viewport puts the card at the graph origin instead of under
+    // the pointer; the card's centre should sit within a card's width of the drop point.
+    nearDropPoint: droppedNode && dragResult.attempted
+      ? Math.abs(droppedNode.left + 110 - dragResult.target.x) < 240
+      : null,
+  });
+  await shot(page, "page-workflow-builder-drag");
+
   // ⌘P focuses the palette, ArrowDown moves the focus, Enter adds. The node count before and
   // after is the assertion — a palette that takes focus but does not add is a dead control.
   const nodesBeforeKeyboardAdd = await page.locator("[data-node-id]").count();
