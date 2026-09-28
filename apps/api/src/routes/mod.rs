@@ -283,6 +283,15 @@ pub fn router(state: AppState) -> Router {
     let iam_provider_test =
         post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage"));
 
+    // Enable and disable are their own verbs rather than a PATCH with a boolean, because the
+    // difference is the *gate*: switching on is refused until a test has passed, switching off
+    // never is. Folding them into the generic update would mean either bypassing the gate or
+    // blocking the safe direction as well (REQ-065).
+    let iam_provider_enable =
+        post(iam_providers::enable_provider).layer(guards::require(&state, "iam.providers.manage"));
+    let iam_provider_disable =
+        post(iam_providers::disable_provider).layer(guards::require(&state, "iam.providers.manage"));
+
     let iam_provider_events = get(iam_providers::list_provider_events)
         .layer(guards::require(&state, "iam.providers.read"));
 
@@ -970,6 +979,8 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers", iam_providers)
         .route("/iam/providers/{id}", iam_provider)
         .route("/iam/providers/{id}/test", iam_provider_test)
+        .route("/iam/providers/{id}/enable", iam_provider_enable)
+        .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
         .route("/scim/v2/ServiceProviderConfig", scim_config)
         .route("/scim/v2/Schemas", scim_schemas)

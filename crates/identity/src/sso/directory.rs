@@ -21,9 +21,8 @@
 //!   looks like, what the depth cap is, and what the steps mean.
 
 use serde_json::{Value, json};
-use uuid::Uuid;
 
-use crate::error::{IdentityError, Result};
+use crate::error::Result;
 
 /// A directory provider, as configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]

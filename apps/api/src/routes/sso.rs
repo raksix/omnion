@@ -243,6 +243,17 @@ pub async fn start(
             tracing::info!(provider = %provider.slug, "sign-in started");
             Ok(redirect(url.as_str()))
         }
+        // A directory is not a redirect. There is no authorization endpoint to send a browser
+        // to and no callback to come back through — the sign-in is a bind and a search, which
+        // is slice 4's business. Answering it as anything else would mean inventing a redirect
+        // to a URL that does not exist, and a 404 from the sign-in screen is a far better
+        // failure than a plausible-looking loop.
+        ProviderKind::Ldap | ProviderKind::ActiveDirectory => Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "directory_signin_not_available",
+            "signing in through a directory is not available yet — connect it in Settings → IAM \
+             → Authentication, and it will appear on the sign-in screen once it can be reached",
+        )),
     }
 }
 
@@ -1422,6 +1433,12 @@ mod tests {
     /// A provider row that names its group claim, so the group mapping is actually exercised.
     fn provider(kind: ProviderKind) -> AuthProvider {
         AuthProvider {
+            last_test_at: None,
+            last_test_ok: None,
+            sync_interval_minutes: 60,
+            last_sync_at: None,
+            last_sync_status: None,
+            plugin_key: None,
             id: Uuid::new_v4(),
             organization_id: Uuid::new_v4(),
             slug: "okta".into(),
