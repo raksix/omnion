@@ -15,7 +15,7 @@
  *   company, not by editing the company, and this screen says so rather than offering a field
  *   that would be a lie.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Download, Plus, Upload, X } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -259,6 +259,23 @@ export function CompaniesView() {
     },
     [rows],
   );
+
+  // `/crm/companies?focus=<id>` — a search hit (or a shared link) opens that company's editor.
+  // The applied id is remembered, so closing the form or reloading the list never reopens it, and
+  // an id that is not on the loaded page is simply not applied: the record exists (the search
+  // index is a reindex behind at worst) but this page has not fetched it.
+  const focusParam = searchParams.get("focus");
+  const appliedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusParam || !rows || appliedFocus.current === focusParam) {
+      return;
+    }
+    if (!rows.some((row) => row.id === focusParam)) {
+      return;
+    }
+    appliedFocus.current = focusParam;
+    openEdit(focusParam);
+  }, [focusParam, rows, openEdit]);
 
   const saveForm = useCallback(async () => {
     if (!form) {

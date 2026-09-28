@@ -199,6 +199,11 @@ struct Fixture {
     db: Db,
     org: Uuid,
     other_org: Uuid,
+    /// The platform Owner (no primary organization). Held because the global search's
+    /// **reindex** is `search.manage`, a platform-level key a CRM manager does not hold — the
+    /// CRM suite builds the index the way the owner's settings screen does, not through a role
+    /// that could not press the button.
+    owner: String,
     manager: String,
     reader: String,
     sensitive: String,
@@ -218,7 +223,7 @@ impl Fixture {
         let org = create_organization_row(&db, "a").await;
         let other_org = create_organization_row(&db, "b").await;
 
-        let (owner_id, _) = create_account(&db, None, "CRM Owner").await;
+        let (owner_id, owner) = create_account(&db, None, "CRM Owner").await;
         seed::bind_owner(db.pool(), owner_id)
             .await
             .expect("the owner binding must be created");
@@ -255,6 +260,7 @@ impl Fixture {
             db,
             org,
             other_org,
+            owner,
             manager,
             reader,
             sensitive,
@@ -3764,6 +3770,286 @@ async fn the_copilot_is_guarded_scoped_and_audited() {
     assert!(
         after.body.get("summary").is_none() && after.body.get("next_action").is_none(),
         "the deal must carry no stored copilot output: {}",
+        after.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The CRM in the global search (REQ-002 · docs/requests/REQ-051, slice 4 part four)
+// ---------------------------------------------------------------------------------------------
+
+/// Look a fixture account's id up by its address.
+///
+/// The search box is its own surface and its own key: `search.read` is "may I use the palette",
+/// which is a different decision from "may I read a contact". A CRM reader who was never granted
+/// it is refused by `/api/v1/search` with a `403` before any provider is considered — so a walk
+/// that wants to prove the **provider** split has to hand it over explicitly, or it proves the
+/// box is closed instead.
+async fn account_id(db: &Db, email: &str) -> Uuid {
+    sqlx::query_scalar("select id from users where email = $1")
+        .bind(email)
+        .fetch_one(db.pool())
+        .await
+        .expect("the fixture account must exist")
+}
+
+/// Rebuild the whole search index as the platform Owner, who holds `search.manage`.
+///
+/// The CRM suite is not a search suite, so it borrows the indexer's own two entry points rather
+/// than a private copy: `reindex_all` is what the owner's "reindex" button and the scheduled pass
+/// both call, and `drain` is the background runner's tick. Calling the **same** functions is what
+/// makes the walk prove the wiring rather than a re-implementation of it.
+async fn rebuild_index(state: &AppState, token: &str) {
+    let response = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/search/reindex",
+            Some(token),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the reindex must run: {}",
+        response.body
+    );
+}
+
+/// The provider keys an answer's hits come from.
+fn hit_providers(body: &Value) -> Vec<String> {
+    body["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hits must be an array in {body}"))
+        .iter()
+        .filter_map(|hit| hit["provider"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// One hit of a provider, by its title.
+fn hit_of(body: &Value, provider: &str, title: &str) -> Value {
+    body["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("hits must be an array in {body}"))
+        .iter()
+        .find(|hit| hit["provider"] == provider && hit["title"] == title)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "a {provider} hit titled {title:?} must be in the answer: {body}"
+            )
+        })
+}
+
+/// The CRM joins the palette: a contact, a company and a deal each become one document, each hit
+/// carries the deep link that opens that record, and the search key narrows to one of them.
+#[tokio::test]
+async fn the_crm_answers_the_palette_with_a_deep_link_into_the_record() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    grant(
+        &fixture.db,
+        fixture.org,
+        account_id(&fixture.db, &fixture.manager).await,
+        owner_id,
+        &["search.read"],
+    )
+    .await;
+    let manager = fixture.token(&fixture.manager).await;
+    let owner = fixture.token(&fixture.owner).await;
+    let marker = Uuid::new_v4().simple().to_string();
+
+    let (company_id, contact_id, deal_id, _) = crm_trio(&fixture, &manager, &marker).await;
+    rebuild_index(state, &owner).await;
+
+    let body = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search?q={marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(body.status, StatusCode::OK, "search: {}", body.body);
+    let providers = hit_providers(&body.body);
+    for expected in ["contacts", "companies", "deals"] {
+        assert!(
+            providers.iter().any(|key| key == expected),
+            "the answer must carry a {expected} hit: {providers:?}"
+        );
+    }
+
+    // The deep link is the whole point of a hit: it opens the record, not the list. The contact's
+    // title is its display name (`Walk <marker>`), the company's is its name, the deal's its title.
+    let contact_hit = hit_of(&body.body, "contacts", &format!("Walk {marker}"));
+    assert_eq!(
+        contact_hit["url"],
+        json!(format!("/crm/contacts?focus={contact_id}")),
+        "a contact hit must open that contact"
+    );
+    let company_hit = hit_of(&body.body, "companies", &format!("Walk Co {marker}"));
+    assert_eq!(
+        company_hit["url"],
+        json!(format!("/crm/companies?focus={company_id}")),
+        "a company hit must open that company"
+    );
+    let deal_hit = hit_of(&body.body, "deals", &format!("Walk deal {marker}"));
+    assert_eq!(
+        deal_hit["url"],
+        json!(format!("/crm/deals?focus={deal_id}")),
+        "a deal hit must open that deal's card"
+    );
+
+    // The scoped syntax narrows to a single register, so a person can ask for the people and not
+    // the pipeline: `type:contacts <marker>` returns contact rows only.
+    let narrowed = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search?q=type%3Acontacts%20{marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(narrowed.status, StatusCode::OK, "search: {}", narrowed.body);
+    let narrowed_providers = hit_providers(&narrowed.body);
+    assert!(
+        narrowed_providers.iter().all(|key| key == "contacts"),
+        "type:contacts must answer with contact rows only: {narrowed_providers:?}"
+    );
+}
+
+/// The two CRM read keys are separate, so the palette is too: a caller who may know who a
+/// customer is does not thereby get to see what they are negotiating.
+#[tokio::test]
+async fn the_palette_hides_the_pipeline_from_a_contact_only_reader() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    for account in [&fixture.manager, &fixture.reader] {
+        grant(
+            &fixture.db,
+            fixture.org,
+            account_id(&fixture.db, account).await,
+            owner_id,
+            &["search.read"],
+        )
+        .await;
+    }
+    let reader = fixture.token(&fixture.reader).await;
+    let manager = fixture.token(&fixture.manager).await;
+    let owner = fixture.token(&fixture.owner).await;
+    let marker = Uuid::new_v4().simple().to_string();
+
+    // Written by the manager (the reader may not write), indexed by the owner.
+    let (_company_id, _contact_id, _deal_id, _) = crm_trio(&fixture, &manager, &marker).await;
+    rebuild_index(state, &owner).await;
+
+    // The reader holds `crm.contacts.read` and no `crm.deals.read`, so the contact is findable…
+    let as_reader = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search?q={marker}"),
+            Some(&reader),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(as_reader.status, StatusCode::OK, "search: {}", as_reader.body);
+    let reader_providers = hit_providers(&as_reader.body);
+    assert!(
+        reader_providers.iter().any(|key| key == "contacts"),
+        "a contact reader must find the contact: {reader_providers:?}"
+    );
+    // …and the deal is **not** in the answer, exactly as `/api/v1/crm/deals` refuses the same
+    // caller with a `403`. A search that answered with the pipeline would be the wider door.
+    assert!(
+        !reader_providers.iter().any(|key| key == "deals"),
+        "a contact reader must get no deal rows: {reader_providers:?}"
+    );
+}
+
+/// Archiving a record takes it out of the index. The CRM lists hide archived rows by default, so a
+/// document that outlived the archive would answer with a record the panel will not show.
+#[tokio::test]
+async fn archiving_a_crm_record_removes_it_from_the_palette() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let owner_id = account_id(&fixture.db, &fixture.owner).await;
+    grant(
+        &fixture.db,
+        fixture.org,
+        account_id(&fixture.db, &fixture.manager).await,
+        owner_id,
+        &["search.read"],
+    )
+    .await;
+    let manager = fixture.token(&fixture.manager).await;
+    let owner = fixture.token(&fixture.owner).await;
+    let marker = Uuid::new_v4().simple().to_string();
+
+    let (company_id, _contact_id, _deal_id, _) = crm_trio(&fixture, &manager, &marker).await;
+    rebuild_index(state, &owner).await;
+
+    let before = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search?q={marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        hit_providers(&before.body).iter().any(|key| key == "companies"),
+        "the company must be indexed to begin with: {}",
+        before.body
+    );
+
+    // Archive it through the API, so the event the indexer drains is the one the real screen
+    // emits — not a hand-written row.
+    let archived = call(
+        state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/crm/companies/{company_id}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(archived.status, StatusCode::OK, "{}", archived.body);
+    // The archive's `crm.company.archived` event removes the document on the next drain; a
+    // reindex proves the same thing through the other door (the prune arm), so both are run.
+    rebuild_index(state, &owner).await;
+
+    let after = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/search?q={marker}"),
+            Some(&manager),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        !hit_providers(&after.body).iter().any(|key| key == "companies"),
+        "an archived company must leave the index: {}",
         after.body
     );
 }

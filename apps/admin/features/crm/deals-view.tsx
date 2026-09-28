@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AlertTriangle, ArrowLeftRight, LayoutGrid, List, Plus, X } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { ApiError } from "@/lib/api";
@@ -107,6 +108,7 @@ function age(days: number): string {
 
 /** The deals screen: the board, the list toggle and the form. */
 export function DealsView() {
+  const searchParams = useSearchParams();
   const [board, setBoard] = useState<CrmBoard | null>(null);
   const [list, setList] = useState<CrmDeal[] | null>(null);
   const [pipelines, setPipelines] = useState<CrmPipeline[]>([]);
@@ -262,6 +264,25 @@ export function DealsView() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [board, focusedCard, requestMove, stages]);
+
+  // `/crm/deals?focus=<id>` — a search hit (or a shared link) marks that card and brings it into
+  // view. The board is the one CRM screen where opening a *form* would be wrong: the card itself
+  // is the record, and marking it is what the board's own keyboard path acts on. The applied id
+  // is remembered, so the next render does not steal focus back from whoever clicked a card.
+  const focusParam = searchParams.get("focus");
+  const appliedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusParam || !board || appliedFocus.current === focusParam) {
+      return;
+    }
+    if (!board.deals.some((deal) => deal.id === focusParam)) {
+      return;
+    }
+    appliedFocus.current = focusParam;
+    setFocusedCard(focusParam);
+    const card = document.querySelector<HTMLElement>(`[data-qa-card="${focusParam}"]`);
+    card?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [focusParam, board]);
 
   const openCreate = useCallback(() => {
     setForm({ ...EMPTY_FORM, stage_id: stages[0]?.id ?? "" });

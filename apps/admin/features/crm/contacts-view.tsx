@@ -335,6 +335,23 @@ export function ContactsView() {
     [rows],
   );
 
+  // `/crm/contacts?focus=<id>` — a search hit (or a shared link) opens that contact's editor, the
+  // same deep-link contract the pages screen uses. The applied id is remembered, so dismissing
+  // the form does not bring it back on the next render, and an id that is not on the loaded page
+  // is left alone rather than erroring: the search index is a reindex behind at worst.
+  const focusParam = searchParams.get("focus");
+  const appliedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusParam || !rows || appliedFocus.current === focusParam) {
+      return;
+    }
+    if (!rows.some((row) => row.id === focusParam)) {
+      return;
+    }
+    appliedFocus.current = focusParam;
+    openEdit(focusParam);
+  }, [focusParam, rows, openEdit]);
+
   const saveForm = useCallback(async () => {
     if (!form) {
       return;
