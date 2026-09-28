@@ -90,6 +90,7 @@ pub mod media_settings;
 pub mod media_transform;
 pub mod media_versions;
 pub mod observability;
+pub mod observability_traces;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -506,8 +507,8 @@ pub fn router(state: AppState) -> Router {
     // permission as repointing where every file in it lives.
     let media_settings_route: MethodRouter<AppState, Infallible> =
         get(media_settings::read).layer(guards::require(&state, "media.read"));
-    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
-        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -878,6 +879,21 @@ pub fn router(state: AppState) -> Router {
             "/observability/metrics/query",
             get(observability::read_metric_query),
         )
+        // The trace search and its detail (REQ-126, slice 3). Both are reads of telemetry, so
+        // both are `observability.read` — a caller who may see what happened may see how long it
+        // took and which span failed.
+        .route(
+            "/observability/traces",
+            get(observability_traces::read_traces),
+        )
+        .route(
+            "/observability/traces/{trace_id}",
+            get(observability_traces::read_trace),
+        )
+        .route(
+            "/observability/exporters",
+            get(observability_traces::read_exporters),
+        )
         .route_layer(guards::require(&state, "observability.read"));
 
     let observability_write = Router::new()
@@ -890,6 +906,23 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/observability/metrics/sync",
             post(observability::sync_catalog),
+        )
+        // Exporter management (REQ-126, slice 3). An exporter row is a standing instruction to
+        // send this instance's telemetry somewhere, so it takes `observability.manage` — a
+        // different power from `observability.read` on purpose, and every mutation writes an
+        // audit row.
+        .route(
+            "/observability/exporters",
+            post(observability_traces::create_exporter),
+        )
+        .route(
+            "/observability/exporters/{id}",
+            put(observability_traces::update_exporter)
+                .delete(observability_traces::delete_exporter),
+        )
+        .route(
+            "/observability/exporters/{id}/test",
+            post(observability_traces::test_exporter),
         );
 
     let secrets_lease_redeem = Router::new().route(
