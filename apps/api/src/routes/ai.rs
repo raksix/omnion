@@ -1437,8 +1437,16 @@ pub async fn chat(
                         // caller gets the first provider's complaint with the later ones
                         // appended, because the first is the provider they asked for.
                         let final_error = omnion_ai_hub::final_error(&attempts).unwrap_or(error);
-                        record_usage(&pool, &attempts, &served_by, "error", started.elapsed())
-                            .await;
+                        record_usage(
+                            &pool,
+                            &attempts,
+                            &served_by,
+                            &model_key,
+                            None,
+                            "error",
+                            started.elapsed(),
+                        )
+                        .await;
                         let _ = frames
                             .send(Frame::Failed {
                                 code: final_error.code(),
@@ -1467,6 +1475,8 @@ pub async fn chat(
                         &pool,
                         &attempts,
                         &attempt.provider_id,
+                        &model_key,
+                        None,
                         "error",
                         started.elapsed(),
                     )
@@ -1499,7 +1509,18 @@ pub async fn chat(
         }
 
         let answer = outcome.expect("an answer or an early return above");
-        record_usage(&pool, &attempts, &served_by, "ok", started.elapsed()).await;
+        // The counts the provider reported ride on the row that served the call, and nowhere
+        // else: a failed attempt produced no answer and therefore spent no tokens.
+        record_usage(
+            &pool,
+            &attempts,
+            &served_by,
+            &model_key,
+            answer.usage.as_ref(),
+            "ok",
+            started.elapsed(),
+        )
+        .await;
 
         // `current` is the provider that actually answered, which after a substitution is *not*
         // the one the request was routed to. The caller is told the final provider, because "the
@@ -1549,10 +1570,18 @@ pub async fn chat(
 /// provider, and a substitution is two provider-level facts — the one that failed and the one
 /// that answered. A single row would make the failed provider look like it never served anything
 /// and the substitute look like it served a request nobody made.
+///
+/// `reported` is the usage the answering provider actually sent. It rides on the **successful**
+/// row only: the tokens belong to the answer, and a failed attempt produced none. Passing it here
+/// is the whole difference between a Usage tab with numbers on it and a tab where every call
+/// reads "unknown" — the counts arrive on the `done` frame, so dropping them here threw away the
+/// only place they existed.
 async fn record_usage(
     pool: &sqlx::PgPool,
     attempts: &[omnion_ai_hub::Attempt],
     served_by: &uuid::Uuid,
+    model_key: &str,
+    reported: Option<&omnion_ai_hub::ChatUsage>,
     outcome: &str,
     elapsed: std::time::Duration,
 ) {
@@ -1565,22 +1594,34 @@ async fn record_usage(
         } else {
             None
         };
+        let served = outcome == "ok";
         let row = omnion_ai_hub::health_store::NewUsage {
-            provider_id: if outcome == "ok" {
+            provider_id: if served {
                 *served_by
             } else {
                 attempt.provider_id
             },
-            model_key: None,
+            model_key: (!model_key.is_empty()).then(|| model_key.to_owned()),
             task: "chat".to_owned(),
-            outcome: if attempt.error.is_some() && outcome != "ok" {
+            outcome: if attempt.error.is_some() && !served {
                 "error".to_owned()
             } else {
                 outcome.to_owned()
             },
             http_status: None,
-            prompt_tokens: None,
-            completion_tokens: None,
+            // Counts belong to the answer, so they land on the row that served it and nowhere
+            // else. A stream that reported none stays `None`, and `missing_usage` counts it —
+            // which is the difference between "unknown" and a real zero.
+            prompt_tokens: if served {
+                reported.and_then(|usage| token_count(usage.prompt_tokens))
+            } else {
+                None
+            },
+            completion_tokens: if served {
+                reported.and_then(|usage| token_count(usage.completion_tokens))
+            } else {
+                None
+            },
             latency_ms,
             substituted_from,
             first_byte_at: None,
@@ -1589,6 +1630,16 @@ async fn record_usage(
             tracing::warn!(%error, "a provider usage row could not be written");
         }
     }
+}
+
+/// A reported token count as the `int` the column stores.
+///
+/// A provider's count arrives as `u64` and a column that cannot hold it must not turn a
+/// five-billion-token run into a negative number, so the value saturates: a count beyond what
+/// the column can hold is stored as the largest count it can hold, which is visibly wrong and
+/// far better than a wrapped one.
+fn token_count(tokens: Option<u64>) -> Option<i32> {
+    tokens.map(|count| i32::try_from(count).unwrap_or(i32::MAX))
 }
 
 /// Announce a substitution: the requested provider, the one that took over, and why.
