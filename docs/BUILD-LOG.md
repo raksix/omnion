@@ -2771,3 +2771,61 @@ assertions that `eb421ba` claimed to have fixed — if they are still false, the
 and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
 before running the pass again — the no-untested-screen rule applies to a screen that does not yet
 exist as much as to one that does.
+
+## Tick 48 — the pass that had been running for an hour, and what it actually said
+
+**What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
+question the last tick left open. `report.notifications` is **green on the bell, the badge, the
+grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
+`false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
+answered with status 400."*
+
+**The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
+push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
+swallowing the static segments, which is exactly what the comment above the mount says it
+prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is from **20:39**;
+slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
+filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
+disposable by design, so the lesson is to read the binary's mtime before reading the router.
+
+**What this tick fixed instead.** Two real defects, both found by hand against the live stack
+because no existing gate could reach them:
+
+1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
+   `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
+   itself: a `500` whose body quotes `violates foreign key constraint
+   "notifications_user_id_fkey"`. Four good recipients lost to one stale one, and a constraint
+   name shipped to whoever held the response. `0707141` checks recipients before the loop
+   through a new `store::existing_users` and refuses in a sentence that names *which* id is wrong.
+2. `Escape` was documented in the file header, the REQ's QA plan and the walkthrough, and it was
+   **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
+   exactly when the list had content — and the open drawer held the focus, which is why `e`,
+   `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
+
+**And the gate that had been lying.** `run-notifications-http.sh` decided its build by
+`cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
+status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
+crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
+twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
+compiler's exit status and only reads the log when that status says something went wrong.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
+`-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
+`node --check scripts/qa/walkthrough.cjs` → clean.
+`scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
+*a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
+with one bad id writes none of the good ones*.
+
+**Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
+typechecked, but no pass has run against them — the pass that found them ran against the 20:39
+binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
+this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
+**in-progress**.
+
+**Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
+newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
+and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
+`slashFocusedFilter` to recover behind them, `report.notificationSettings.loaded` to be true, and
+`report.notificationOutbox` to be **present** — that last one is the first pass that can close
+slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
+after that.
