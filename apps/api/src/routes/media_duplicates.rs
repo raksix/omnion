@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn a_site_list_refuses_what_is_not_a_site_id() {
         let err = parse_sites("not-a-uuid").expect_err("must refuse");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(err.code(), "sites");
     }
 
