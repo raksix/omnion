@@ -3828,3 +3828,44 @@ distinguishes this from tick 14's silent death.
 **Next.** Read `crmKeyboardMobile` when the pass runs: `theSheetOnlyPromisesLiveKeys`,
 `jMovesTheVisibleCursor`, `thePhoneDefaultsToTheList`, `theStageHeaderSticks`,
 `theFormIsSingleColumn`. Any `false` is a high finding and REQ-051 does not close until it is read.
+
+## 2026-09-28 · wave4 tick 17 · REQ-051 · the sixth screen, and the report nobody read
+
+**What.** Merged `origin/main` (7 commits) into `wave4` — `docs/BUILD-LOG.md` and
+`scripts/qa/qa-slot.sh` conflicted; the log is append-only so both sides were unioned
+(`difflib` over the three stages, multiset-verified: 0 lines missing from either side) and the
+slot script took main's, which is a superset. Then took REQ-051's last open box — *empty, loading
+and error states exist on all six screens*.
+
+**Two defects, both found by reading the last report against HEAD.**
+
+1. **The box says six screens; the pass visited five.** `runCrmStateSweep` had grown one screen
+   at a time and `/crm/settings/pipelines` was never added, so the box was being ticked on five.
+   Worse, that screen was the last of the six still ungated on its own read: it rendered
+   "This pipeline has no stages — add the first one" from a `rows` array that starts empty, so a
+   503 answered with a **confident claim about the tenant's data plus a button that writes a
+   stage into it**. The same array also showed that empty state during every load, on the first
+   paint. One value (`rows.length === 0`) was carrying two facts — "empty" and "not loaded yet" —
+   and the empty state was the one that lost. Fixed the way `fed62b5` fixed the board: `loadError`
+   separate from `error` (a save refused leaves the editor as you left it, so it stays a strip; a
+   read refused leaves nothing, so it replaces the body), plus a skeleton while `pipelines === null`.
+2. **`crmStates` was written to `summary.json` and never read back** — the exact trap tick 16
+   fixed for the keyboard steps. The previous report held **twelve `false` claims** in that object,
+   including `contacts/companies/deals_hasAState = false` — three screens with no error state at
+   all — while the pass headline read "high 59" with not one of those 59 about the box the sweep
+   exists to check. Both objects are now scanned: `false` is a high finding, unset is a medium.
+
+The sweep also gained `<label>_doesNotClaimToBeEmpty` for all six screens, because the defect is
+the *claim*, not the button: a screen may show an empty state once it knows the answer is empty,
+and only then.
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `cargo test -p omnion-api --lib
+routes::crm` **27/27** · `pnpm turbo run typecheck --force` **2/2** · `node --check
+scripts/qa/walkthrough.cjs` parses. Commit `69a7643`, pushed to `origin/wave4`. **The QA pass
+carrying the new steps has not run yet** — it is queued behind another writer's live pass
+(`QA_SLOTS=1` is box-wide), and the next tick reads `crmStates` from the newest report rather than
+assuming any of it.
+
+**Next.** Read `crmStates` (the six `*_doesNotClaimToBeEmpty` keys and `stages_*`) and
+`crmKeyboardMobile` in the newest w4 report; only then tick the two remaining boxes and set
+REQ-051 to `done`. After that, REQ-052 (sales & quotes).
