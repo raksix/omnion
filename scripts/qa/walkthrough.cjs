@@ -963,21 +963,13 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "image");
   await page.waitForTimeout(1200);
   const imageRows = await page.locator("tbody tr").count();
-  // Every other read on this screen is best-effort, and this one was not: an unguarded
-  // `textContent()` waits the full 30s for a footer that a build under load renders late
-  // or not at all, and the timeout escapes as a **fatal** that kills the whole pass — an
-  // hour of other writers' screens thrown away by a counting that was a nicety, not a
-  // criterion. A pass that dies takes every screen after it unvisited, so a read here is
-  // a number when the footer is there and a note when it is not.
-  const footer = await page
-    .locator("text=/Showing \\d+ of \\d+/")
-    .first()
-    .textContent({ timeout: 4000 })
-    .catch(() => null);
-  // The footer is a *report*, not a precondition: a listing that renders no rows has no footer
-  // to read, and waiting 30 s for one throws away the rest of the pass — the depth passes below
-  // this line never run and the whole QA run dies on a screen that is behaving correctly. A
-  // missing footer is recorded as absent and the pass continues.
+  // The footer is a *report*, not a precondition: a listing that renders no rows has no
+  // footer to read, and waiting the full 30 s for one throws the rest of the pass away —
+  // every depth pass below this line goes unrun and the whole QA run dies on a screen that
+  // is behaving correctly. Two writers fixed this independently (one by bounding the read,
+  // one by asking whether the element exists first), and both fixes are the same
+  // guarantee: a number when the footer is there, absent when it is not. Kept as the
+  // count-then-read form, because a bare `textContent()` on a zero-match locator waits.
   const footerLocator = page.locator("text=/Showing \\d+ of \\d+/").first();
   const footer =
     (await footerLocator.count()) > 0
