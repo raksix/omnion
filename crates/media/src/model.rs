@@ -97,6 +97,13 @@ pub struct MediaFile {
     pub duration_ms: Option<i32>,
     /// Page count, for documents.
     pub page_count: Option<i32>,
+    /// What the file's own EXIF block said, when its format carries one.
+    ///
+    /// Held as the stored json rather than as an [`Exif`](crate::exif::Exif) so sqlx decodes the
+    /// column natively: a row written by a future release, or by a hand-edited jsonb column, must
+    /// not make a whole file listing fail to decode. [`MediaFile::exif`] parses it, and an
+    /// unrecognised key in there is ignored rather than refused.
+    pub exif: Option<serde_json::Value>,
     /// Scan state: `pending`, `clean`, `flagged`, `skipped` or `error`.
     pub scan_status: String,
     /// What the scanner reported.
@@ -108,6 +115,28 @@ pub struct MediaFile {
 }
 
 impl MediaFile {
+    /// The camera record, parsed, or `None` when the file carries none.
+    ///
+    /// A column that is present but unreadable is `None` as well: a row written by a future
+    /// release with a key this one does not know is not a file whose metadata tab should refuse
+    /// to open.
+    #[must_use]
+    pub fn exif(&self) -> Option<crate::exif::Exif> {
+        let value = self.exif.as_ref()?;
+        let parsed = crate::exif::Exif::from_json(value);
+        (!parsed.is_empty()).then_some(parsed)
+    }
+
+    /// The dimensions a layout should reserve, with the stored rotation applied.
+    #[must_use]
+    pub fn display_size(&self) -> (Option<i32>, Option<i32>) {
+        crate::exif::oriented_size(
+            self.width,
+            self.height,
+            self.exif().and_then(|e| e.orientation),
+        )
+    }
+
     /// Size in bytes as an unsigned number.
     #[must_use]
     pub fn size(&self) -> u64 {
@@ -124,9 +153,13 @@ impl MediaFile {
     }
 
     /// A compact description for a `description` list — the two lines a list row shows.
+    ///
+    /// The size a reader sees, not the size the pixels are stored at: a portrait photograph
+    /// stored sideways is `3000×4000` on screen, and a list that prints `4000×3000` sends an
+    /// editor looking for a landscape crop of a picture that has none.
     #[must_use]
     pub fn dimensions(&self) -> Option<String> {
-        match (self.width, self.height) {
+        match self.display_size() {
             (Some(width), Some(height)) => Some(format!("{width}×{height}")),
             _ => None,
         }

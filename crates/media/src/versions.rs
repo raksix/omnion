@@ -193,6 +193,7 @@ pub async fn append_version(
     media_id: Uuid,
     version: &NewVersion,
     columns: (Option<i32>, Option<i32>, Option<i32>, Option<i32>),
+    exif: &crate::exif::Exif,
 ) -> Result<MediaVersion> {
     let (width, height, duration_ms, page_count) = columns;
     let row: MediaVersion = sqlx::query_as(
@@ -217,10 +218,19 @@ pub async fn append_version(
 
     // The current pointer moves to the new bytes in the same transaction the caller runs in, so
     // the panel read path follows the newest version while the old keys stay downloadable.
+    //
+    // The geometry is written *oriented* (`swap` decides) and the record is written with it, for
+    // the reason [`fill_exif`] gives: a row holding the orientation from one statement and the
+    // dimensions from another is a picture half-rotated. The version row itself keeps what the
+    // header said, so a version list shows the file as the camera stored it while the panel shows
+    // it as the browser draws it — one fact, two honest readings.
+    let swap = matches!(exif.orientation, Some(5..=8));
     sqlx::query(
         "update media set storage_key = $2, size_bytes = $3, checksum = $4, content_type = $5, \
-           width = coalesce($6, width), height = coalesce($7, height), \
+           width = case when $11 then coalesce($7, $6) else coalesce($6, width) end, \
+           height = case when $11 then coalesce($6, $7) else coalesce($7, height) end, \
            duration_ms = coalesce($8, duration_ms), page_count = coalesce($9, page_count), \
+           exif = $12, \
            version_count = $10, updated_at = now() \
          where id = $1",
     )
@@ -234,6 +244,12 @@ pub async fn append_version(
     .bind(duration_ms)
     .bind(page_count)
     .bind(version.version)
+    .bind(swap)
+    .bind(if exif.is_empty() {
+        None::<serde_json::Value>
+    } else {
+        Some(exif.to_value())
+    })
     .execute(&mut *connection)
     .await?;
 
@@ -265,6 +281,59 @@ pub async fn fill_dimensions(
     .bind(height)
     .bind(duration_ms)
     .bind(page_count)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Write the camera record and the *oriented* geometry onto the file's own row.
+///
+/// One statement, because the two are a single fact: the geometry of a stored photograph and the
+/// record describing it are read together by every layout that reserves a box, and a row holding
+/// the orientation from one call and the dimensions from another is a picture half-rotated.
+///
+/// Three decisions the statement is built around:
+///
+///  * **The record is replaced, not merged.** A replacement's bytes are a different photograph;
+///    leaving the previous body's lens on a file that has been re-shot is a wrong fact, not a
+///    stale cache. A file whose format carries no EXIF clears the column rather than inheriting
+///    the previous version's — a screenshot uploaded over a camera original must not keep
+///    claiming to have been shot on a body it was never near.
+///  * **The geometry written is the geometry on screen.** A picture stored sideways
+///    (`orientation` 5–8) is a portrait photograph as every browser will draw it, so the columns
+///    a grid reserves have to be the ones a reader sees — and the transformation route compares a
+///    preset's size against these columns to decide whether it would enlarge the source, which
+///    would be the wrong answer for a file the panel displays rotated. The raw orientation stays
+///    in the record, so a downloader that applies it does not rotate a second time.
+///  * **A file with no record is not a file with an empty one.** The column is null, so "we never
+///    read a camera block" and "the camera said nothing" stay two different rows in a report
+///    rather than collapsing into the same `{}`.
+pub async fn fill_exif(
+    pool: &sqlx::PgPool,
+    media_id: Uuid,
+    exif: &crate::exif::Exif,
+    dimensions: (Option<i32>, Option<i32>),
+) -> Result<()> {
+    // The swap is expressed in SQL rather than here, because `coalesce` has to see the *stored*
+    // columns to fall back on them: a rotation cannot be computed in Rust from values the row
+    // only holds, and recomputing it there would mean reading the row first.
+    let rotated = matches!(exif.orientation, Some(5..=8));
+    sqlx::query(
+        "update media set \
+           exif = $2, \
+           width = case when $5 then coalesce($4, $3) else coalesce($3, width) end, \
+           height = case when $5 then coalesce($3, $4) else coalesce($4, height) end \
+         where id = $1",
+    )
+    .bind(media_id)
+    .bind(if exif.is_empty() {
+        None::<serde_json::Value>
+    } else {
+        Some(exif.to_value())
+    })
+    .bind(dimensions.0)
+    .bind(dimensions.1)
+    .bind(rotated)
     .execute(pool)
     .await?;
     Ok(())
