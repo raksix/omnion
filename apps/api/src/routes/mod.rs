@@ -74,6 +74,7 @@ pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod cdn;
+pub mod cdn_cache;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -875,12 +876,17 @@ pub fn router(state: AppState) -> Router {
     // themselves are slice 2; only the rules and settings ship here.
     let cdn_rules = get(cdn::list_rules)
         .layer(guards::require(&state, "cdn.read"))
-        .merge(post(cdn::create_rule).layer(guards::require(&state, "cdn.manage")))
-        .merge(post(cdn::reorder_rules).layer(guards::require(&state, "cdn.manage")));
+        .merge(post(cdn::create_rule).layer(guards::require(&state, "cdn.manage")));
     let cdn_rule = get(cdn::get_rule)
         .layer(guards::require(&state, "cdn.read"))
         .merge(put(cdn::update_rule).layer(guards::require(&state, "cdn.manage")))
         .merge(delete(cdn::delete_rule).layer(guards::require(&state, "cdn.manage")));
+    // Reorder is its own path, not a second `POST` merged onto `/cdn/rules`. Two handlers
+    // for the same method on one path is not an ambiguous route to axum — it is a panic
+    // while the router is *built*, which takes down every route in the application, not
+    // just this one. It read as a working feature because the API tests had never been
+    // run against this router.
+    let cdn_rule_reorder = post(cdn::reorder_rules).layer(guards::require(&state, "cdn.manage"));
     let cdn_rule_toggle = post(cdn::toggle_rule).layer(guards::require(&state, "cdn.manage"));
 
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
@@ -1292,6 +1298,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
         .route("/cdn/rules", cdn_rules)
+        .route("/cdn/rules/reorder", cdn_rule_reorder)
         .route("/cdn/rules/{id}", cdn_rule)
         .route("/cdn/rules/{id}/toggle", cdn_rule_toggle)
         .route("/webhooks", webhooks)
