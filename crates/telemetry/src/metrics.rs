@@ -382,6 +382,19 @@ pub const FAMILIES: &[FamilySpec] = &[
         max_series: 4,
         bounded_labels: true,
     },
+    // What the retention sweep removed. A sweep that deleted 40 000 lines and left no number is
+    // a sweep whose only record is "the table got smaller", which is the same provable-but-
+    // unreachable shape the prune functions had before this loop existed.
+    FamilySpec {
+        name: "omnion_retention_pruned_rows_total",
+        kind: MetricKind::Counter,
+        unit: "1",
+        description: "Rows the retention sweep removed, counted by signal.",
+        labels: &["signal"],
+        source: "core",
+        max_series: 4,
+        bounded_labels: true,
+    },
     FamilySpec {
         name: "omnion_registry_budget_exceeded",
         kind: MetricKind::Counter,

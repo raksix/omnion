@@ -176,6 +176,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the alert evaluator is disabled (OMNION_ALERTS_EVALUATOR=false)");
     }
 
+    // The retention sweep (REQ-126, slice 4). Without it the three prune functions are reachable
+    // only from their own tests: an instance left up for a year keeps a year of log lines and
+    // trace rows while the settings screen shows a window nothing honours. This is the caller that
+    // makes "retention prunes log rows and trace-index rows past the window" a property of the
+    // process rather than a property of a test suite.
+    if state.config().telemetry.retention_sweep_enabled {
+        let _retention = omnion_telemetry::retention::run(state.db().pool().clone());
+    } else {
+        tracing::info!("the retention sweep is disabled (OMNION_RETENTION_SWEEP=false)");
+    }
+
     let app = routes::router(state.clone());
     // The graceful shutdown sequence (REQ-126, slice 4). The order is the contract and it lives
     // in `omnion_telemetry::lifecycle`:

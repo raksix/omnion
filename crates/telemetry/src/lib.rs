@@ -41,6 +41,7 @@ pub mod lifecycle;
 pub mod metric_catalog;
 pub mod metrics;
 pub mod redact;
+pub mod retention;
 pub mod schema;
 pub mod store;
 pub mod trace_store;
@@ -58,6 +59,7 @@ pub use lifecycle::{DrainOutcome, Lifecycle, ShutdownSummary, drain_and_flush};
 pub use metric_catalog::FamilyDeclaration;
 pub use metrics::{FamilySpec, MetricKind, Registry, global as metrics_registry};
 pub use redact::{REDACTED, redact_fields, redact_text};
+pub use retention::{PRUNED_EVENT, PruneReport, Retention};
 pub use schema::{LogEntry, LogLevel, LogSource, NewLogEntry};
 pub use trace_store::TraceFilter;
 pub use tracing_span::{

@@ -453,6 +453,14 @@ pub struct TelemetryConfig {
     /// both is how an operator gets two pages for one incident, and the flag is the documented way
     /// to avoid that rather than deleting the bundled rules.
     pub alerts_evaluator_enabled: bool,
+    /// Whether this process prunes telemetry past its retention window
+    /// (`OMNION_RETENTION_SWEEP`).
+    ///
+    /// The switch an operator uses when they would rather run the same deletion from their own
+    /// cron. Two jobs deleting the same rows is harmless — every prune is `delete where ts <
+    /// cutoff` — but two jobs holding *different* retention values is not, and the flag is the
+    /// documented way to make that impossible rather than a comment asking people to remember.
+    pub retention_sweep_enabled: bool,
     /// How long a drain waits for in-flight requests, in milliseconds
     /// (`OMNION_DRAIN_TIMEOUT_MS`).
     ///
@@ -467,6 +475,7 @@ impl Default for TelemetryConfig {
         Self {
             exporter_flush_enabled: true,
             alerts_evaluator_enabled: true,
+            retention_sweep_enabled: true,
             drain_timeout_ms: 10_000,
         }
     }
@@ -772,6 +781,7 @@ impl Config {
         let telemetry = TelemetryConfig {
             exporter_flush_enabled: read_flag(&read, "OMNION_EXPORTER_FLUSH", true)?,
             alerts_evaluator_enabled: read_flag(&read, "OMNION_ALERTS_EVALUATOR", true)?,
+            retention_sweep_enabled: read_flag(&read, "OMNION_RETENTION_SWEEP", true)?,
             // Clamped rather than refused: a drain timeout of zero would skip every in-flight
             // request, and a hand-typed negative would be a `u64` parse error at boot — neither is
             // a useful way to learn the setting exists. The floor is one second, which is the
