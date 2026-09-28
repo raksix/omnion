@@ -4544,11 +4544,7 @@ async function runAutomationsActionsDepth(page, report) {
     : "";
   const saved = !saveBlocked && (await page.locator("[data-automation-notice]").count()) > 0;
 
-  await page
-    .locator("[data-automation-row] a", { hasText: ruleName })
-    .first()
-    .click({ timeout: 8000 })
-    .catch(() => {});
+  await openRuleByName(page, ruleName);
   await page.waitForTimeout(1500);
   const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
   let ranNotice = null;
@@ -4750,11 +4746,7 @@ async function runAutomationsApprovalsDepth(page, report) {
     : "";
   const saved = !saveBlocked && (await page.locator("[data-automation-notice]").count()) > 0;
 
-  await page
-    .locator("[data-automation-row] a", { hasText: ruleName })
-    .first()
-    .click({ timeout: 8000 })
-    .catch(() => {});
+  await openRuleByName(page, ruleName);
   await page.waitForTimeout(1500);
   // The round trip is the assertion: a whole-rule write that dropped the gate's parameters
   // would save a rule the engine cannot run, and only a save-and-reopen catches it.
@@ -4823,6 +4815,30 @@ async function runAutomationsApprovalsDepth(page, report) {
  * The rule is deleted at the end, so a pass that died half way leaves a name the next pass's
  * sweep removes.
  */
+/**
+ * Open a rule by its name from the list, waiting for the row to exist first.
+ *
+ * Save closes the editor and returns to the list, so every step that edits and re-opens has to
+ * click through a list that is re-reading at the time. A click issued during that read finds
+ * no row, the `.catch()` swallows it, and the pass carries on in whatever screen it happened
+ * to land in — which is how "the Versions tab showed nothing" turns out to be a pass that
+ * never opened the rule at all. Waiting for the row is the difference between a finding and
+ * a phantom.
+ */
+async function openRuleByName(page, ruleName, timeout = 15000) {
+  const row = page.locator("[data-automation-row] a", { hasText: ruleName }).first();
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if ((await row.count()) > 0) {
+      await row.click({ timeout: 5000 }).catch(() => {});
+      await page.locator("[data-automation-run-now]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+      return true;
+    }
+    await page.waitForTimeout(500);
+  }
+  return false;
+}
+
 async function runAutomationsOperationsDepth(page, report) {
   const steps = [];
   const note = (entry) => {
@@ -4874,12 +4890,7 @@ async function runAutomationsOperationsDepth(page, report) {
   // and a "Run now" writes a row the Runs tab then reads, which means waiting for the row
   // rather than for a fixed pause. A pass that reads the tab 1.6s after the run reports an
   // empty history and looks like a broken screen rather than a read that was too early.
-  await page
-    .locator("[data-automation-row] a", { hasText: ruleName })
-    .first()
-    .click({ timeout: 8000 })
-    .catch(() => {});
-  await page.locator("[data-automation-run-now]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  await openRuleByName(page, ruleName);
   const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
   if (runNowVisible) {
     await page.locator("[data-automation-run-now]").first().click({ timeout: 6000 }).catch(() => {});
@@ -4976,11 +4987,7 @@ async function runAutomationsOperationsDepth(page, report) {
   // ---- The Versions tab: a restore appends, it does not rewind ----------------------------
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1000);
-  await page
-    .locator("[data-automation-row] a", { hasText: ruleName })
-    .first()
-    .click({ timeout: 8000 })
-    .catch(() => {});
+  await openRuleByName(page, ruleName);
   await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
   await page
@@ -4998,11 +5005,7 @@ async function runAutomationsOperationsDepth(page, report) {
   await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForSelector("[data-automation-notice]", { timeout: 15000 }).catch(() => {});
   // Save closes the editor, so the rule is opened again and the tab asked for a second time.
-  await page
-    .locator("[data-automation-row] a", { hasText: ruleName })
-    .first()
-    .click({ timeout: 8000 })
-    .catch(() => {});
+  await openRuleByName(page, ruleName);
   await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
   // The edit's version is a write the panel issues *after* the save, so the row is polled for
