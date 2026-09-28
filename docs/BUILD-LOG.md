@@ -3328,3 +3328,40 @@ claiming to load.
 **Next.** The 390×844 mobile pass and the keyboard sheet (`/`, `j`/`k`, `enter`, `e`, `?`) — the
 last two boxes. The full QA pass is queued behind three sibling writers; four browsers is the
 configuration that OOM'd this host, so the slot waits rather than barging.
+
+## 2026-09-28 · wave4 tick 15 — the acceptance gate had never actually run
+
+The previous tick left two acceptance boxes open (the 390×844 mobile pass and the keyboard
+sheet) and handed them a QA pass that was still queued. The queue was the story: `/tmp/w4_qa_tick14.log`
+ended at `[PM2][ERROR] Script not found: /mnt/apopic/omnion-w4/target/debug/omnion-api`. That is not a
+queue message. **The pass died**, and it died silently, after the log line that explains itself.
+
+**Root cause.** `scripts/qa/run.sh` hardcoded `target/debug/omnion-api`, but `cargo build` honours
+an ambient `CARGO_TARGET_DIR` — and this loop exports one, on the recorded advice that the shared
+`/mnt/apopic` mount fills up. So the build landed in `.tmp-target/debug/`, the freshness guard
+compared the migration timestamps against the **stale** binary still sitting in `./target/debug/`,
+decided there was nothing to build, skipped the build, and then handed pm2 a path with no file in it.
+The two conditions reinforce each other: the divergence hid the build, and the skipped build
+guaranteed the file was missing. Verified directly — `cargo metadata` reports `target_directory` as
+`/mnt/apopic/omnion-w4/.tmp-target` with the variable set and `/mnt/apopic/omnion-w4/target` without it.
+
+A first attempt at the fix made it worse in a subtler way: `cargo metadata` reports the target
+**root**, not the profile subdirectory, so `target_directory + /omnion-api` resolves to a path that
+never exists and the pass would have failed on a *fresh* checkout too. The resolver now probes
+`debug/` then `release/` under the reported root and falls back to `debug` for a first build.
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force`
+**2/2 successful, 0 errors** · `bash -n scripts/qa/run.sh` parses · the resolver was exercised under
+both environments and points at an existing binary in each
+(`no env → target/debug/omnion-api exists=YES`, `CARGO_TARGET_DIR=.tmp-target → .tmp-target/debug/omnion-api exists=YES`).
+`run.sh` now also prints the database it is actually using; the step banner claimed `omnion_qa` on
+every stack, including the `omnion_qa_w4` one that exists precisely so two passes do not drop each
+other's rows.
+
+**Merge.** `origin/main` had moved two commits (the media-retention feature, migration `0049`).
+Merged at tick start before editing; the ort strategy auto-resolved with no conflict and touched none
+of this worker's files.
+
+**Next.** The mobile pass and the keyboard sheet, now against a gate that is known to run. The
+keyboard sheet is written last and only lists bindings the six screens actually implement — a sheet
+naming a binding no screen has is a dead list.
