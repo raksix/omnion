@@ -3493,7 +3493,10 @@ async function runObservabilityMetricsDepth(page, report) {
 
   const copy = page.getByRole("button", { name: /Copy as PromQL/i });
   if (await copy.count()) {
-    await context.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
+    // No clipboard permission is granted here: the export takes `(page, report)` and reaching
+    // for `context` would make this function depend on a binding it does not own — which is how
+    // the first draft died with `context is not defined` after the harness had already signed in.
+    // A headless Chromium allows `navigator.clipboard.writeText` on a user gesture regardless.
     await copy.first().click();
     await page.waitForTimeout(500);
     const notice = (await page.getByText(/PromQL copied/i).count()) > 0;

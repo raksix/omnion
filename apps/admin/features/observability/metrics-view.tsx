@@ -387,6 +387,12 @@ export function MetricsView() {
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.key === "/") {
         event.preventDefault();
+        // The panel's global search binds `/` on `window` as well, and it registers first, so
+        // without this the shell's handler focuses ITS box a moment after this one focuses the
+        // filter's — the screen's shortcut silently did nothing while the depth pass reported a
+        // focus on "Search Omnion". Claiming the event is the fix; two screens both listening to
+        // a window-level key is the situation that produced the bug.
+        event.stopPropagation();
         searchRef.current?.focus();
       } else if (event.key === "r") {
         event.preventDefault();
