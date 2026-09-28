@@ -346,6 +346,20 @@ export function BlockEditor() {
   const selectedBlock = selected ? blockAt(blocks, selected) : undefined;
   const selectedIssues = selectedBlock ? (issueMap.get(selectedBlock.id) ?? []) : [];
   const blocking = issues.filter((issue) => issue.severity === "error");
+  // A warning never blocks a publish, and that is exactly why it needs its own way into the
+  // block carrying it: nothing in the flow forces the author toward a block that is merely
+  // worth a look. Counted apart from `blocking` so the bar can say which kind it is reporting
+  // without the reader having to subtract one from the other.
+  const warnings = issues.filter((issue) => issue.severity !== "error");
+  // The same "way into the problem" the blocking branch has, for the same reason.
+  const firstWarningPath = (() => {
+    const first = warnings[0];
+    if (!first) {
+      return null;
+    }
+    const entry = walk(blocks).find(({ block }) => block.id === first.block_id);
+    return entry ? entry.path : null;
+  })();
   // The path of the first block that needs attention, so the summary in the bottom bar is a
   // way *into* the problem rather than a number the author has to go hunting for. Before this,
   // a blocking issue on a block that is not selected was counted in the bar and visible
@@ -962,7 +976,7 @@ export function BlockEditor() {
         data-block-status
         data-block-count={blockCount}
         data-block-errors={blocking.length}
-        data-block-warnings={issues.length - blocking.length}
+        data-block-warnings={warnings.length}
         data-block-undo-depth={history.past.length}
         data-block-redo-depth={history.future.length}
         data-block-dirty={dirty ? "true" : "false"}
@@ -983,10 +997,23 @@ export function BlockEditor() {
             {blocking.length} block{blocking.length === 1 ? "" : "s"} need attention
             {firstBlockingPath ? " — show me" : ""}
           </button>
-        ) : issues.length > 0 ? (
-          <span className="text-caution">
-            {issues.length} warning{issues.length === 1 ? "" : "s"}
-          </span>
+        ) : warnings.length > 0 ? (
+          /* A warning is advisory, so it never blocks a publish — which used to make it
+             unreachable as well. The issue list itself lives in the inspector, so a warning on a
+             block the author is not looking at was counted in this bar and visible nowhere else,
+             and the one thing the author could not do was read it. The blocking branch above
+             solved exactly this with a "show me"; a warning is the same dead end with a softer
+             voice, so it gets the same way in. */
+          <button
+            type="button"
+            data-block-first-warning
+            onClick={() => setSelected(firstWarningPath ?? selected)}
+            title={firstWarningPath ? "Go to the first block with a warning" : undefined}
+            className="text-caution underline decoration-caution/40 underline-offset-2 transition hover:decoration-caution"
+          >
+            {warnings.length} warning{warnings.length === 1 ? "" : "s"}
+            {firstWarningPath ? " — show me" : ""}
+          </button>
         ) : (
           <span className="text-positive">Ready to publish</span>
         )}
