@@ -1376,6 +1376,7 @@ dependencies = [
  "omnion-search",
  "omnion-secrets",
  "omnion-storage",
+ "omnion-telemetry",
  "omnion-workflows",
  "p256",
  "rand 0.8.8",
@@ -1618,6 +1619,23 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "omnion-telemetry"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "omnion-secrets",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
