@@ -1275,6 +1275,8 @@ dependencies = [
  "omnion-workflows",
  "p256",
  "rand 0.8.8",
+ "reqwest",
+ "rsa",
  "serde",
  "serde_json",
  "sha2",
@@ -1284,6 +1286,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -1401,9 +1404,11 @@ dependencies = [
 name = "omnion-media"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sqlx",
  "thiserror",
  "time",
+ "tracing",
  "uuid",
 ]
 

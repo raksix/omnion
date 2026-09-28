@@ -401,14 +401,14 @@ async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> 
 }
 
 /// Load a site or answer `404 site_not_found`.
-async fn site_of(state: &AppState, site_id: Uuid) -> Result<Site, ApiError> {
+pub(crate) async fn site_of(state: &AppState, site_id: Uuid) -> Result<Site, ApiError> {
     sites::find_site(state.db().pool(), site_id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "site_not_found", "no such site"))
 }
 
 /// Load a site and refuse it when it lives outside the caller's organization.
-async fn site_in_scope(
+pub(crate) async fn site_in_scope(
     state: &AppState,
     current: &CurrentSession,
     site_id: Uuid,

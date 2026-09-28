@@ -86,6 +86,103 @@ export type Media = {
   created_at: string;
 };
 
+/** One folder of the media tree (`GET /api/v1/media/folders`). */
+export type MediaFolder = {
+  id: string;
+  parent_id: string | null;
+  name: string;
+  /** Materialised path from the library root, e.g. `Media/Campaigns/2026`. */
+  path: string;
+  /** `true` for the library root, which cannot be renamed, moved or deleted. */
+  is_root: boolean;
+  /** Depth below the root; the root itself is 0. */
+  depth: number;
+  /** How many live files sit directly in this folder. */
+  file_count: number;
+  created_at: string;
+};
+
+/** The folder tree of one site. */
+export type MediaFolderTree = {
+  site_id: string;
+  root: MediaFolder;
+  folders: MediaFolder[];
+};
+
+/** One file as the browser reads it (`GET /api/v1/media/files`). */
+export type MediaFile = Media & {
+  folder_id: string | null;
+  kind: string;
+  alt_text: string;
+  caption: string;
+  description: string;
+  metadata: Record<string, unknown>;
+  tags: string[];
+  width: number | null;
+  height: number | null;
+  duration_ms: number | null;
+  page_count: number | null;
+  scan_status: string;
+  version_count: number;
+  uploaded_by: string | null;
+  updated_at: string | null;
+};
+
+/** One step of the breadcrumb above a folder. */
+export type MediaCrumb = { id: string; name: string };
+
+/** One page of the browser listing. */
+export type MediaFilePage = {
+  site_id: string;
+  folder_id: string | null;
+  breadcrumb: MediaCrumb[];
+  files: MediaFile[];
+  /** How many rows the filters match in total, not just on this page. */
+  total: number;
+  has_more: boolean;
+};
+
+/** The filters the browser listing understands; every one is optional. */
+export type MediaFilters = {
+  folder_id?: string | null;
+  recursive?: boolean;
+  search?: string;
+  kind?: string;
+  min_bytes?: number;
+  max_bytes?: number;
+  uploaded_by?: string;
+  tag?: string;
+  scan_status?: string;
+  has_versions?: boolean;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** One trashed file. */
+export type MediaTrashEntry = MediaFile & {
+  deleted_at: string;
+  deleted_by: string | null;
+  /** When the retention window purges it, if a policy applies. */
+  purges_at: string | null;
+};
+
+/** The trash of one site. */
+export type MediaTrash = {
+  site_id: string;
+  retention_days: number;
+  file_count: number;
+  total_bytes: number;
+  entries: MediaTrashEntry[];
+};
+
+/** The answer to a bulk action: what changed and what did not. */
+export type MediaBulkResult = {
+  requested: number;
+  changed: number;
+  failures: { id: string; message: string }[];
+};
+
 /** One theme this installation bundles (`GET /api/v1/onboarding`). */
 export type BundledTheme = {
   key: string;

@@ -35,4 +35,36 @@ pub enum MediaError {
     /// The row is already there (two uploads raced for the same object key).
     #[error("this storage key is already in the media library")]
     KeyTaken,
+    /// No folder row with that id.
+    #[error("no media folder with this id")]
+    FolderNotFound,
+    /// The folder name cannot be used.
+    #[error("{0}")]
+    InvalidFolderName(String),
+    /// A sibling folder of that name already exists.
+    #[error("a folder with this name already exists here")]
+    FolderNameTaken,
+    /// The move would put a folder inside its own subtree.
+    #[error("a folder cannot be moved inside itself (target path `{path}`)")]
+    FolderCycle {
+        /// The path the move tried to create.
+        path: String,
+    },
+    /// The folder still holds something.
+    #[error("the folder still holds {count} {what}")]
+    FolderNotEmpty {
+        /// What is in the way (`folders` or `files`).
+        what: &'static str,
+        /// How many.
+        count: i64,
+    },
+    /// The library root is structural: it cannot be renamed, moved or removed.
+    #[error("the library root cannot be renamed, moved or deleted")]
+    RootFolderProtected,
+    /// A file cannot be moved into a folder of another site.
+    #[error("the folder belongs to another site")]
+    FolderSiteMismatch,
+    /// The file is in the trash and the action needs it live (or the other way round).
+    #[error("the file is in the trash")]
+    FileTrashed,
 }

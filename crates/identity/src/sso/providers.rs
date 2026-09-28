@@ -188,14 +188,12 @@ pub async fn list_providers(pool: &PgPool, organization_id: Uuid) -> Result<Vec<
 
 /// Read a provider by its id.
 pub async fn find_provider(pool: &PgPool, id: Uuid) -> Result<Option<AuthProvider>> {
-    Ok(
-        sqlx::query_as::<_, AuthProvider>(&format!(
-            "select {COLUMNS} from auth_providers where id = $1"
-        ))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?,
-    )
+    Ok(sqlx::query_as::<_, AuthProvider>(&format!(
+        "select {COLUMNS} from auth_providers where id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// Read a provider by the slug the sign-in URL carries.
@@ -204,15 +202,13 @@ pub async fn find_provider_by_slug(
     organization_id: Uuid,
     slug: &str,
 ) -> Result<Option<AuthProvider>> {
-    Ok(
-        sqlx::query_as::<_, AuthProvider>(&format!(
-            "select {COLUMNS} from auth_providers where organization_id = $1 and slug = $2"
-        ))
-        .bind(organization_id)
-        .bind(slug)
-        .fetch_optional(pool)
-        .await?,
-    )
+    Ok(sqlx::query_as::<_, AuthProvider>(&format!(
+        "select {COLUMNS} from auth_providers where organization_id = $1 and slug = $2"
+    ))
+    .bind(organization_id)
+    .bind(slug)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// Every enabled provider of an organization — the list the sign-in screen renders.
@@ -262,16 +258,19 @@ pub async fn create_provider(pool: &PgPool, new: NewProvider) -> Result<AuthProv
     .bind(&new.config)
     .bind(new.secret_ref.as_deref().map(str::trim))
     .bind(&new.scopes)
-    .bind(new.group_claim.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    .bind(
+        new.group_claim
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )
     .bind(new.default_role_id)
     .bind(new.jit_enabled)
     .bind(new.enabled)
     .fetch_optional(pool)
     .await?;
 
-    row.ok_or_else(|| {
-        IdentityError::InvalidProvider("the provider could not be created".into())
-    })
+    row.ok_or_else(|| IdentityError::InvalidProvider("the provider could not be created".into()))
 }
 
 /// Update the mutable fields of a provider.

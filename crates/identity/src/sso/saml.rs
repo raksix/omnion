@@ -85,8 +85,121 @@ pub struct SamlConfig {
     pub display_name_attribute: Option<String>,
 }
 
+/// Whether a configured certificate can be read as the RSA key a signature needs.
+///
+/// The management API's `test` action needs to answer one question about a SAML provider: *can
+/// this platform verify an assertion this directory signs?* — and the answer has to come from the
+/// same parser, not from a second implementation of it that could drift. So this is that parser's
+/// certificate step, exposed on its own.
+///
+/// The full [`verify_response`] cannot answer it: it refuses at the first thing that is missing,
+/// and a probe document is missing its signature long before it reaches the key. Exposing the one
+/// step keeps the test honest — a certificate copied with its `BEGIN` line missing, or a base64
+/// blob that lost its wrapping, is reported here rather than at the first real sign-in.
+pub fn certificate_is_readable(pem: &str) -> Result<()> {
+    certificate_key(pem).map(|_| ())
+}
+
+/// A complete, unsigned assertion carrying every attribute a configuration names.
+///
+/// The `test` action needs to prove the *attribute wiring* too — a typo in `email_attribute` is
+/// invisible until a real assertion arrives with no address the reader recognises. This is the
+/// document that probe runs, built from the same code the reader runs on, so a name that does not
+/// survive the round trip is reported at configuration time rather than at the first sign-in.
+///
+/// The window is deliberately far in the future: a probe is a *shape* check, and a document that
+/// expired would be refused for the wrong reason.
+#[must_use]
+pub fn probe_document(
+    issuer: &str,
+    audience: &str,
+    email_attribute: &str,
+    group_attribute: Option<&str>,
+    display_name_attribute: Option<&str>,
+) -> String {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut attributes = vec![
+        (email_attribute.to_owned(), "probe@omnion.test".to_owned()),
+        (
+            display_name_attribute.unwrap_or("displayName").to_owned(),
+            "Probe User".to_owned(),
+        ),
+    ];
+    if let Some(group) = group_attribute {
+        attributes.push((group.to_owned(), "probe-group".to_owned()));
+        // `read_attributes` takes the *first* value of a repeated name as a string and the rest
+        // as a list, so a group attribute is written twice — otherwise the probe would only ever
+        // prove the single-value path, and a configuration whose directory sends a list would look
+        // fine here and lose every group at the first real sign-in.
+        attributes.push((group.to_owned(), "probe-group-two".to_owned()));
+    }
+
+    let attributes_xml = attributes
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                r#"<saml:Attribute Name="{name}"><saml:AttributeValue>{value}</saml:AttributeValue></saml:Attribute>"#
+            )
+        })
+        .collect::<String>();
+
+    // Escaped because both halves come from a provider row an operator typed.
+    //
+    // The `xmlns:saml` declaration is repeated **on the assertion**, not only on the response,
+    // and that is not decoration: the reader parses the assertion element on its own, so a prefix
+    // it uses has to be declared where it is used. Relying on an ancestor's declaration parses in
+    // a browser and fails in the only reader that matters.
+    format!(
+        r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" Version="2.0" ID="probe-response"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Version="2.0" ID="probe-assertion"><saml:Issuer>{issuer}</saml:Issuer><saml:Subject><saml:NameID>probe-subject</saml:NameID></saml:Subject><saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{not_after}"><saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement>{attributes_xml}</saml:AttributeStatement></saml:Assertion></samlp:Response>"#,
+        issuer = xml_escape(issuer),
+        audience = xml_escape(audience),
+        attributes_xml = attributes_xml,
+        not_before = now - 600,
+        not_after = now + 600,
+    )
+}
+
+/// Run the claim half of the reader over a probe document, stopping before the signature.
+///
+/// Everything an operator can mistype in a SAML configuration — the entity id, the audience, the
+/// attribute names, the window — is checked here, and the certificate is checked separately by
+/// [`certificate_is_readable`]. What is left is the one thing no configuration can be wrong about,
+/// because it is the provider's own signature.
+pub fn probe_claims(document: &str, config: &SamlConfig) -> Result<SamlAssertion> {
+    verify_response_unverified(document, config)
+}
+
+/// Escape the five characters that change the meaning of XML text or an attribute value.
+fn xml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Parse and verify a posted SAML response.
 pub fn verify_response(document: &str, config: &SamlConfig) -> Result<SamlAssertion> {
+    let (element, raw) = checked_document(document)?;
+
+    // The signature must be inside the assertion: signing the response and not the assertion would
+    // leave the claims themselves unsigned.
+    let signature = find_signature(&element)
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion is not signed".into()))?;
+    verify_signature(signature, &raw, &element, config)?;
+
+    read_claims(&element, config)
+}
+
+/// The shape checks every document gets before anything is read out of it.
+fn checked_document(document: &str) -> Result<(Element, String)> {
     if document.len() > MAX_ASSERTION_BYTES {
         return Err(IdentityError::InvalidProvider(
             "the assertion is implausibly large".into(),
@@ -98,41 +211,44 @@ pub fn verify_response(document: &str, config: &SamlConfig) -> Result<SamlAssert
             "the assertion carries an entity declaration".into(),
         ));
     }
+    find_assertion(document)
+        .ok_or_else(|| IdentityError::InvalidProvider("the response carries no assertion".into()))
+}
 
-    let (element, raw) = find_assertion(document)
-        .ok_or_else(|| IdentityError::InvalidProvider("the response carries no assertion".into()))?;
+/// The claim half of [`verify_response`], split out so a configuration probe can run it.
+///
+/// Everything here is a comparison between what a document says and what a provider row claims —
+/// issuer, audience, window, attribute names. None of it depends on the signature, which is why
+/// the probe can check the whole of it while the signature is left to the real thing.
+pub fn verify_response_unverified(document: &str, config: &SamlConfig) -> Result<SamlAssertion> {
+    let (element, _raw) = checked_document(document)?;
+    read_claims(&element, config)
+}
 
-    // The signature must be inside the assertion: signing the response and not the assertion would
-    // leave the claims themselves unsigned.
-    let signature = find_signature(&element)
-        .ok_or_else(|| IdentityError::InvalidProvider("the assertion is not signed".into()))?;
-    verify_signature(signature, &raw, &element, config)?;
-
-    let issuer = child_text(&element, "Issuer").ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion names no issuer".into())
-    })?;
+/// Read a verified assertion's claims, refusing anything that contradicts the configuration.
+fn read_claims(element: &Element, config: &SamlConfig) -> Result<SamlAssertion> {
+    let issuer = child_text(element, "Issuer")
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion names no issuer".into()))?;
     if issuer.trim() != config.issuer.trim() {
         return Err(IdentityError::InvalidProvider(
             "the assertion comes from a different issuer".into(),
         ));
     }
 
-    let audience = read_audience(&element).ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion names no audience".into())
-    })?;
+    let audience = read_audience(element)
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion names no audience".into()))?;
     if audience.trim() != config.audience.trim() {
         return Err(IdentityError::InvalidProvider(
             "the assertion is not for this application".into(),
         ));
     }
 
-    check_timestamps(&element)?;
+    check_timestamps(element)?;
 
-    let subject = read_subject_id(&element).ok_or_else(|| {
-        IdentityError::InvalidProvider("the assertion names no subject".into())
-    })?;
+    let subject = read_subject_id(element)
+        .ok_or_else(|| IdentityError::InvalidProvider("the assertion names no subject".into()))?;
 
-    let attributes = read_attributes(&element);
+    let attributes = read_attributes(element);
     let email = attributes
         .get(&config.email_attribute)
         .or_else(|| attributes.get("email"))
@@ -254,8 +370,9 @@ fn find_signature(element: &Element) -> Option<SignatureBlock<'_>> {
     let node = find_child(element, "Signature")?;
     // `<ds:SignatureMethod Algorithm="…"/>` is an empty element: the algorithm is its attribute,
     // never its text. Reading it as text is the classic SAML mis-parse.
-    let method = find_child(node, "SignatureMethod")
-        .or_else(|| find_child(node, "SignedInfo").and_then(|info| find_child(info, "SignatureMethod")))?;
+    let method = find_child(node, "SignatureMethod").or_else(|| {
+        find_child(node, "SignedInfo").and_then(|info| find_child(info, "SignatureMethod"))
+    })?;
     let algorithm = attr(method, "Algorithm")?.to_owned();
     if !ALLOWED_ALGORITHMS.contains(&algorithm.as_str()) {
         return None;
@@ -290,11 +407,9 @@ fn enveloped_bytes(raw: &str) -> Result<Vec<u8>> {
 
     // The qualified name, then the end of the opening tag.
     let name_end = open_at
-        + raw[open_at..]
-            .find([' ', '>', '/'])
-            .ok_or_else(|| {
-                IdentityError::InvalidProvider("the signature element is malformed".into())
-            })?;
+        + raw[open_at..].find([' ', '>', '/']).ok_or_else(|| {
+            IdentityError::InvalidProvider("the signature element is malformed".into())
+        })?;
     let name = raw[open_at..name_end].trim_start_matches('<');
     let body_start = raw[open_at..]
         .find('>')
@@ -330,8 +445,8 @@ fn signed_info_bytes(raw: &str) -> Option<Vec<u8>> {
 
 /// The `URI` of the reference the signature covers.
 fn signed_info_reference(signature: &Element) -> Option<String> {
-    let reference = find_child(signature, "SignedInfo")
-        .and_then(|info| find_child(info, "Reference"))?;
+    let reference =
+        find_child(signature, "SignedInfo").and_then(|info| find_child(info, "Reference"))?;
     Some(attr(reference, "URI")?.to_owned())
 }
 
@@ -341,8 +456,8 @@ fn signed_info_reference(signature: &Element) -> Option<String> {
 /// on its own is not well-formed XML (it uses the `ds:` prefix without declaring it), so parsing
 /// the fragment would fail on a perfectly valid assertion.
 fn signed_info_digest(signature: &Element) -> Option<Vec<u8>> {
-    let reference = find_child(signature, "SignedInfo")
-        .and_then(|info| find_child(info, "Reference"))?;
+    let reference =
+        find_child(signature, "SignedInfo").and_then(|info| find_child(info, "Reference"))?;
     let value = find_child(reference, "DigestValue")?;
     b64().decode(value.get_text()?.trim().as_bytes()).ok()
 }
@@ -352,8 +467,7 @@ fn signed_info_digest(signature: &Element) -> Option<Vec<u8>> {
 /// Read off the parsed opening tag rather than by scanning the raw text: the attribute map is
 /// already separated, so a value that merely contains `ID=` cannot be mistaken for the attribute.
 fn assertion_id(element: &Element) -> Option<String> {
-    attr(element, "ID")
-        .map(|value| value.trim_start_matches('#').to_owned())
+    attr(element, "ID").map(|value| value.trim_start_matches('#').to_owned())
 }
 
 /// Verify a posted assertion's signature — both halves of the binding.
@@ -363,9 +477,9 @@ fn verify_signature(
     element: &Element,
     config: &SamlConfig,
 ) -> Result<()> {
-    let signature = b64().decode(block.signature.as_bytes()).map_err(|_| {
-        IdentityError::InvalidProvider("the signature value is not base64".into())
-    })?;
+    let signature = b64()
+        .decode(block.signature.as_bytes())
+        .map_err(|_| IdentityError::InvalidProvider("the signature value is not base64".into()))?;
     let public_key = certificate_key(&config.certificate_pem)?;
 
     let padding = if block.algorithm == ALLOWED_ALGORITHMS[1] {
@@ -376,9 +490,8 @@ fn verify_signature(
 
     // The reference must name this assertion (or the whole document). A reference to some other
     // element would make the digest check meaningless.
-    let reference = signed_info_reference(block.node).ok_or_else(|| {
-        IdentityError::InvalidProvider("the signature references nothing".into())
-    })?;
+    let reference = signed_info_reference(block.node)
+        .ok_or_else(|| IdentityError::InvalidProvider("the signature references nothing".into()))?;
     if !(reference.is_empty()
         || assertion_id(element) == Some(reference.trim_start_matches('#').to_owned()))
     {
@@ -389,9 +502,8 @@ fn verify_signature(
 
     // 1. The declared digest must match the referenced element — this is what makes a changed
     //    claim fail.
-    let declared = signed_info_digest(block.node).ok_or_else(|| {
-        IdentityError::InvalidProvider("the signature declares no digest".into())
-    })?;
+    let declared = signed_info_digest(block.node)
+        .ok_or_else(|| IdentityError::InvalidProvider("the signature declares no digest".into()))?;
     let computed = digest_for(&block.algorithm, &enveloped_bytes(raw)?);
     if !bool::from(computed.ct_eq(&declared)) {
         return Err(IdentityError::InvalidProvider(
@@ -429,11 +541,9 @@ fn certificate_key(pem: &str) -> Result<RsaPublicKey> {
         .flat_map(|line| line.chars())
         .filter(|character| !character.is_whitespace())
         .collect();
-    let der = b64()
-        .decode(cleaned.as_bytes())
-        .map_err(|_| {
-            IdentityError::InvalidProvider("the signing certificate is not valid base64".into())
-        })?;
+    let der = b64().decode(cleaned.as_bytes()).map_err(|_| {
+        IdentityError::InvalidProvider("the signing certificate is not valid base64".into())
+    })?;
 
     // `der`/`spki` are not needed here: the reader below walks the fixed RFC 5280 shape directly,
     // and refusing anything that does not match is safer than a lenient parser.
@@ -598,17 +708,21 @@ fn check_timestamps(element: &Element) -> Result<()> {
     };
 
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    if let Some(not_before) = attr(conditions, "NotBefore").and_then(|value| value.parse::<i64>().ok())
+    if let Some(not_before) =
+        attr(conditions, "NotBefore").and_then(|value| value.parse::<i64>().ok())
         && not_before - CLOCK_SKEW_SECONDS > now
     {
         return Err(IdentityError::InvalidProvider(
             "the assertion is not valid yet".into(),
         ));
     }
-    if let Some(until) = attr(conditions, "NotOnOrAfter").and_then(|value| value.parse::<i64>().ok())
+    if let Some(until) =
+        attr(conditions, "NotOnOrAfter").and_then(|value| value.parse::<i64>().ok())
         && until + CLOCK_SKEW_SECONDS < now
     {
-        return Err(IdentityError::InvalidProvider("the assertion has expired".into()));
+        return Err(IdentityError::InvalidProvider(
+            "the assertion has expired".into(),
+        ));
     }
 
     if attr(conditions, "NotOnOrAfter").is_none() && attr(conditions, "NotBefore").is_none() {
@@ -845,6 +959,93 @@ mod tests {
     }
 
     #[test]
+    fn a_configuration_probe_reads_back_as_an_identity() {
+        // The probe is what the panel's `test` button runs, so it has to survive the *real* reader
+        // — an attribute name that the configuration names must come back readable, or an
+        // operator has no way to find a typo before the first sign-in.
+        let config = SamlConfig {
+            issuer: "https://idp.example/saml".into(),
+            audience: "https://omnion.example".into(),
+            certificate_pem: "unused".into(),
+            email_attribute: "email".into(),
+            group_attribute: Some("groups".into()),
+            display_name_attribute: Some("displayName".into()),
+        };
+        let probe = probe_document(
+            &config.issuer,
+            &config.audience,
+            &config.email_attribute,
+            config.group_attribute.as_deref(),
+            config.display_name_attribute.as_deref(),
+        );
+        let verified = verify_response_unverified(&probe, &config)
+            .expect("a probe built from this configuration must read back");
+        assert_eq!(verified.email, "probe@omnion.test");
+        assert_eq!(verified.subject_id, "probe-subject");
+        assert_eq!(verified.display_name.as_deref(), Some("Probe User"));
+        assert_eq!(
+            verified.groups,
+            vec!["probe-group", "probe-group-two"],
+            "a repeated attribute is a list, and the probe writes it twice to prove it"
+        );
+    }
+
+    #[test]
+    fn a_probe_survives_a_configuration_that_does_not_match() {
+        // The point of the probe: a mismatched entity id or audience is refused *here*, at
+        // configuration time, rather than at the first real assertion.
+        let probe = probe_document(
+            "https://idp.example/saml",
+            "https://omnion.example",
+            "email",
+            None,
+            None,
+        );
+        let wrong_audience = SamlConfig {
+            issuer: "https://idp.example/saml".into(),
+            audience: "https://other.example".into(),
+            certificate_pem: "unused".into(),
+            email_attribute: "email".into(),
+            group_attribute: None,
+            display_name_attribute: None,
+        };
+        let error = verify_response_unverified(&probe, &wrong_audience)
+            .expect_err("a different audience is a configuration error");
+        assert!(
+            error.to_string().contains("not for this application"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_certificate_is_readable_only_when_it_is_a_key() {
+        assert!(
+            certificate_is_readable(&der_certificate(
+                &rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("entropy")
+            ))
+            .is_ok()
+        );
+        for broken in [
+            "",
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n",
+        ] {
+            assert!(
+                certificate_is_readable(broken).is_err(),
+                "a certificate an operator can mis-paste must be reported: {broken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaping_covers_what_changes_the_meaning_of_xml() {
+        assert_eq!(
+            xml_escape(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+    }
+
+    #[test]
     fn a_signed_assertion_becomes_an_identity() {
         let (private, certificate) = test_key();
         let document = assertion(
@@ -860,7 +1061,8 @@ mod tests {
             ],
         );
 
-        let verified = verify_response(&document, &config(&certificate)).expect("a valid assertion");
+        let verified =
+            verify_response(&document, &config(&certificate)).expect("a valid assertion");
         assert_eq!(verified.subject_id, "alice-subject");
         assert_eq!(verified.email, "alice@example.com");
         assert_eq!(verified.display_name.as_deref(), Some("Alice Nguyen"));
@@ -932,7 +1134,8 @@ mod tests {
         let unsigned = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Version="2.0" ID="id-1"><saml:Issuer>https://idp.example/saml</saml:Issuer></saml:Assertion></samlp:Response>"#;
         assert!(verify_response(unsigned, &config(&certificate)).is_err());
 
-        let bomb = r#"<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;">]><samlp:Response/>"#;
+        let bomb =
+            r#"<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;">]><samlp:Response/>"#;
         assert!(verify_response(bomb, &config(&certificate)).is_err());
     }
 
@@ -970,11 +1173,16 @@ mod tests {
     #[test]
     fn an_element_name_is_read_before_its_prefix_is_dropped() {
         assert_eq!(
-            local_name_of(r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="1">"#),
+            local_name_of(
+                r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="1">"#
+            ),
             "Assertion",
             "a colon inside an attribute value is not a namespace separator"
         );
         assert_eq!(local_name_of("<Assertion>"), "Assertion");
-        assert_eq!(local_name_of(r#"<ds:SignatureMethod Algorithm="x"/>"#), "SignatureMethod");
+        assert_eq!(
+            local_name_of(r#"<ds:SignatureMethod Algorithm="x"/>"#),
+            "SignatureMethod"
+        );
     }
 }

@@ -348,14 +348,13 @@ async fn a_passkey_enrols_and_signs_in_end_to_end() {
     };
 
     let slug = format!("webauthn-{}", Uuid::new_v4().simple());
-    let organization_id: Uuid = sqlx::query_scalar(
-        "insert into organizations (name, slug) values ($1, $2) returning id",
-    )
-    .bind("WebAuthn Test Organization")
-    .bind(&slug)
-    .fetch_one(db.pool())
-    .await
-    .expect("the test organization must be created");
+    let organization_id: Uuid =
+        sqlx::query_scalar("insert into organizations (name, slug) values ($1, $2) returning id")
+            .bind("WebAuthn Test Organization")
+            .bind(&slug)
+            .fetch_one(db.pool())
+            .await
+            .expect("the test organization must be created");
     let (user_id, email) = create_account(&db, Some(organization_id)).await;
 
     let session = login(&state, &email).await;
@@ -518,7 +517,12 @@ async fn a_passkey_enrols_and_signs_in_end_to_end() {
 
     let passkeys = call(
         &state,
-        request(Method::GET, "/api/v1/auth/webauthn/passkeys", Some(&token), None),
+        request(
+            Method::GET,
+            "/api/v1/auth/webauthn/passkeys",
+            Some(&token),
+            None,
+        ),
     )
     .await;
     assert_eq!(passkeys.status, StatusCode::OK, "{}", passkeys.body);
@@ -553,7 +557,12 @@ async fn a_passkey_enrols_and_signs_in_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(assertion_options.status, StatusCode::OK, "{}", assertion_options.body);
+    assert_eq!(
+        assertion_options.status,
+        StatusCode::OK,
+        "{}",
+        assertion_options.body
+    );
     let ceremony_challenge = assertion_options.body["challenge"]
         .as_str()
         .expect("ceremony challenge")
