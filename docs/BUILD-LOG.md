@@ -2875,3 +2875,65 @@
     The two remaining known-pre-existing items are named here so the next tick does not
     rediscover them: the media depth passes report "no file to open" although the upload step
     reports success, and the IAM sessions screen answers 401 for a scoped read.
+
+
+## Wave 5 · REQ-005 slice 4 — the switcher's phone sheet, and a gate that could not run
+
+- **What.** The last high finding of the previous pass was a `position: fixed` bottom sheet whose
+  bottom edge measured **738px above the floor of a 390×844 phone**. A `fixed` box resolves against
+  its nearest containing block, and an ancestor with a `filter` — `backdrop-filter` included, which
+  `getComputedStyle` reports as `filter` — or a transform *becomes* that block. The panel's own
+  header is `sticky` with `backdrop-blur`, so the sheet rendered beside its own trigger was
+  anchored to the header's box. The class list was correct and said nothing about any of this; only
+  a measurement of the rendered box caught it. The sheet is now portalled to `<body>` on a phone,
+  where no ancestor establishes a containing block, and it stays `absolute` beside its trigger from
+  `sm` up. The click-outside handler tests the sheet separately, because a portalled sheet is no
+  longer inside the trigger's ref and the first click inside it would otherwise close the control
+  under the finger.
+- **Proof, measured, not asserted.** `node scripts/qa/probe-tenant-mobile.cjs` → **5 passed, 0
+  failed**: `gapToBottom 0` (was 738), `position fixed`, `blockers []` — the walk up from the sheet
+  names every ancestor that would capture it, and there are none. The walkthrough now also accepts
+  the redirect an organization account gets from `/organizations` and starts the tenant depth pass
+  from there, instead of concluding there is no organization to open; both entry points share one
+  body so they cannot drift.
+- **Every fast gate is green and the numbers are real.** `cargo test --workspace` → **979 passed /
+  0 failed** (exit 0, isolated database, `--test-threads=1`). `pnpm build` → 2/2 tasks, 44 admin
+  routes. `pnpm typecheck` clean. `cargo test -p omnion-identity --lib` → 144.
+- **Two walks were asking the wrong question, and one was born broken.**
+  - `tenancy::only_the_platform_opens_tenants_and_reads_across_them` bundled a rename and a freeze
+    into one PATCH and asserted `organization.updated` — true only before slice 3 made a status
+    move its own lifecycle action. It had been failing since. Split into the two claims it was
+    really making, and the freeze is now proved to be a real freeze (a rename of a frozen tenant is
+    refused with `organization_not_writable`) before the walk thaws the tenant and carries on.
+  - `onboarding::the_first_run_walks_a_fresh_database_to_a_signed_in_owner` read
+    `body["organization"]["id"]` from an endpoint that answers a `StatusBody` and has never carried
+    the created row — the admin client types the reply `Promise<OnboardingStatus>` and never looks
+    for an id either. The assertion came from `b347de6` and failed the first time it ever ran. The
+    walk reads the id from the database, which is what it actually wanted. **Adding a field to the
+    API to satisfy a test would have been changing the contract to fit the assertion.**
+- **The pass itself could not run, and twice, for reasons that are the box and the harness.**
+  - `run.sh` hardcoded `target/debug/omnion-api` in three places while the standing practice on
+    this box is `CARGO_TARGET_DIR=/dev/shm/<writer>-target` (seven writers, one 60G mount). A writer
+    who followed that practice could not start a pass at all: the build wrote 332MB of good binary
+    into `/dev/shm`, the gate concluded there was none, and the pass died at `wait_http` reporting
+    nothing about the code under test. Fixed, and the gate now prints the path it is about to
+    start. The second half of the same bug: once a pass registers the API from tmpfs, the pm2
+    entry's script path *is* the tmpfs copy, and a later pass that builds elsewhere inherits an
+    entry that can only fail — so the gate compares the registered path with the one it just
+    built and re-registers when they differ. (Extracting that path from `pm2 describe` is its own
+    small trap: the table uses a box character followed by a **non-breaking** space, so a sed
+    pattern matching an ordinary space extracts nothing and the comparison silently never fires.)
+  - The next attempt reached **620 clicks** and then the shared pm2 daemon restarted and wiped
+    `omnion-qa-*-w5` mid-run. No `summary.json` was written. A missing summary is not a product
+    result, and a `chrome-error://chromewebdata` navigation in the click log is the tell.
+- **13 "failures" that were never failures.** `cargo test --workspace` with no
+  `OMNION_DATABASE_URL` runs against the **shared default database**, where a sibling branch's
+  `0019_cms_blocks` is already applied while this branch's `0019_organization_memberships` is a
+  different migration at the same number. Isolated, the analytics suite is **13/13 green**. This
+  is the second time this branch has lost a gate to a shared migration number; the fix is a
+  writer-owned database and `--test-threads=1`, never a code change.
+- **Next.** The one unticked box is the walkthrough with zero high findings, and it is **not
+  ticked**: three passes on this box ended in a harness bug, a daemon restart and a 100% disk, and
+  a REQ is never closed on a partial run. Gate the numbers first — `df -h /mnt/apopic` with real
+  headroom, `pgrep -cf 'qa/run.sh'` at 1, `free -g` MemAvailable over 8 — and defer rather than
+  report a pass that measured a box under pressure. Then the queue moves to **REQ-011 (CDN/edge)**.
