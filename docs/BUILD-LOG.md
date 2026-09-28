@@ -2177,5 +2177,77 @@ clicked, and close with a full `run.sh` pass once the box has memory for one.
 - **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
   so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
   `target/debug/incremental` in this worktree returned 2.9 GB.
-- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+- **Next.**
+
+Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
+
+## 2026-09-28 — REQ-003 slice 4, screen half: the trace that finally closed the loop guard
+
+- **What this tick was.** The engine and API half of slice 4 shipped last tick. The **screen half**
+  was unbuilt — run history, the run detail with its step trace, the templates gallery,
+  versions/restore and the Audit tab — and two acceptance criteria could not close without a
+  trace to look at. This tick built them, and the trace immediately earned its cost by exposing a
+  defect three layers of tests had missed.
+
+- **A guard that stopped the run and said nothing.** The engine consults the run guard *after*
+  `complete_step` has already written `status = 'succeeded'`, then called `store::fail_step`, whose
+  guard clause is `and status = 'running'`. The update matched **zero rows**. So the run stopped,
+  the steps after the repeat were closed, the trace showed the repeat — and the single sentence
+  saying *why* was discarded. That sentence is the entire reason the guard's message is long: a
+  trace with three steps and no explanation is indistinguishable from a guard that was never
+  installed, which is the exact failure the slice exists to rule out. Nothing above the integration
+  walk could have caught it, because the unit tests assert the *verdict* and the walk asserted the
+  *run*, and the reason lived on neither.
+  `store::fail_step_after_success` targets the state the guard actually observes, and the engine
+  logs an error when the write still changes nothing — a state machine that reports success for a
+  write that changed nothing is the defect this replaces.
+
+- **A second, unreachable stop.** `loopguard::stop_repeated` wrote the run to `failed` and
+  cancelled the later steps — the same transition the engine performs through `fail_step` and
+  `end_run_after_branch`. **Nothing called it.** It was a second implementation of a state
+  transition asserting a *different* location for the message than the real path uses, and a test
+  written against it read an empty run error and concluded the guard was mute. Deleted, with the
+  doc explaining the trap: a guard that stops a run cannot decide how the run is recorded.
+
+- **Two more product bugs, both found by walks rather than by reading.** `workflows.version`
+  defaulted to `1` while `record` claims a number by *incrementing*, so a brand-new rule's create
+  wrote version **2** and version 1 named no write at all — the history began at 2 for a reason no
+  person could explain. And a restore of a version the rule already runs was **accepted**, because
+  the no-op check compared version *numbers*; the definition is what the user asked about, so it
+  is a diff now, and a refused restore provably does not bump the counter.
+
+- **Two test defects that were hiding the product ones.** `versions[1]` was read as "version 1" in
+  four places; the list is newest first, so the index holds only while the history is two rows
+  long — the audit walk's own restore made it three, and the walk silently restored the wrong row
+  and then failed on a *product* message that was correct all along. And the harness's `Drop`
+  spawned its database cleanup, which a current-thread runtime discards when the test body
+  returns: every walk **leaked** its database. Thirty-eight had piled up and the server's
+  connections ran out mid-suite, which surfaces as `PoolTimedOut` and reads like a slow database.
+  `Harness::close` drops it while the runtime can still do the work.
+
+- **Proof.** `cargo check -p omnion-api -p omnion-automation -p omnion-workflows --all-targets`
+  clean. `cargo test -p omnion-automation -p omnion-workflows -p omnion-api --lib` → **291 tests,
+  0 failures** (115 / 62 / 114). `cargo test -p omnion-api --test automation_operations` →
+  **6 walks, 0 failures** against a real database: the history is written on the create and on
+  every edit with the diff in words; a restore puts the definition back **and appends** (1, 2, 3),
+  is refused when the definition is already loaded, and is refused to a reader; the audit tab
+  lists the create, the edit and the restore with both version numbers; the gallery's six starters
+  each install as a real rule through the ordinary create; and the guard walk drives the engine
+  twice — `LoopGuard` settles `failed` at step 2 with step 3 cancelled and the reason on the
+  repeat, `NoRunGuard` runs all three to `completed`. `pnpm typecheck --force` green.
+
+- **Environment note.** `/mnt/apopic` sat at **100%** twice during this tick and a link died with
+  `No space left on device` — the reclaim that worked was checking `readlink /proc/<pid>/cwd` for
+  a live cargo per worktree and deleting only my own `target/debug/incremental`. **w4 and w7 were
+  mid-build** while w2 and w5 sat with live servers and a walkthrough in progress, so the two idle
+  worktrees were neither of the two a first look suggests. The ledger's rule holds a second time:
+  check first, delete second.
+
+- **Where the tick stopped.** Slice 4's screens are built and the API and integration gates are
+  green, but the **browser gate has not run against them**. `walkthrough.cjs` does not yet visit
+  `/automations/templates`, `/automations/[id]/runs/[run_id]`, or the Versions and Audit tabs, so
+  "no untested screen" is not satisfied and the slice stays **open**. **Next:** extend the
+  walkthrough's routes so each of the five is visited and clicked, then close with a full
+  `QA_STACK=w3 … bash scripts/qa/run.sh` pass — that pass is the gate, and until it runs this slice
+  is not done.

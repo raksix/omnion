@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** in-progress (slice 3 · `8ecfba0`, `0cb9920`, `59cc837`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** in-progress (slice 4 · `b130f0b`, `684741e`, `49f7ac2`, `50902cc`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -307,11 +307,13 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
    *Done when:* the six templates run green on the QA database and the limit and loop guards each have a test that fails when the guard is removed.
    *Engine + API half shipped* (`b130f0b`, `684741e`, `49f7ac2`; migration `0029_automation_operations`).
    The bounds are enforced in the run-start transaction and the guard is installed beside the
-   action handler. **The screen half is not built**: run history, the run detail with its step
-   trace, the templates gallery, versions/restore and the Audit tab all remain, and the two
-   criteria that need a trace to close (attempts used against attempts allowed, and the
-   loop-guard message shown in a run) cannot be proved without them. Slice 4 stays **open** —
-   what is above is not enough to close it.
+   action handler. **The screen half shipped this tick** (`50902cc`): run history, the run detail
+   with its step trace, the templates gallery, versions/restore and the Audit tab are built, and
+   both criteria that needed a trace now close. Slice 4 stays **open**, on one item rather than
+   five: the walkthrough has not yet walked these five screens, so "no untested screen" is not yet
+   satisfied for them. The next tick extends `scripts/qa/walkthrough.cjs`'s routes and closes with
+   a full `run.sh` pass — that pass is the gate, and until it runs the slice is not done.
+   Migration `0030_automation_versions`.
 
 ### Risks / notes
 
