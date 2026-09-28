@@ -67,8 +67,24 @@ step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
+# A gate that only builds on a missing binary silently exercises the last binary that happened
+# to be there: the stack restarts fine, every request answers, and the route or column added this
+# tick is simply not there — which reads as a broken screen rather than as a stale build. That is
+# not hypothetical: this file's `if [ ! -x … ]` once made a REQ-close pass report "green" against
+# a binary that predated the migration under test. A newer mtime is the only signal available
+# without asking cargo, and it is exactly the one that matters (source or migration edited ->
+# rebuild). The migration directory belongs in the list because sqlx embeds the SQL at COMPILE
+# time: an edited migration with an older binary replays the old statement, and the failure
+# ("column does not exist") reads like a missing `alter` rather than like a stale build.
+NEEDS_BUILD=0
 if [ ! -x target/debug/omnion-api ]; then
-  step "building the API (first pass only)"
+  NEEDS_BUILD=1
+  step "building the API (no binary yet)"
+elif [ -n "$(find apps/api crates database/migrations Cargo.toml -newer target/debug/omnion-api -print -quit 2>/dev/null)" ]; then
+  NEEDS_BUILD=1
+  step "building the API (sources or migrations are newer than the binary)"
+fi
+if [ "$NEEDS_BUILD" = "1" ]; then
   cargo build -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
