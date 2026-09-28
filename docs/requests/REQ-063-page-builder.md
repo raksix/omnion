@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 3 built: patterns + templates, 9 integration tests and 107 content tests green; browser pass running) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
+> **Status:** in-progress (slice 4 built: undo/redo at 7cce71e, 107 content tests and typecheck green; the browser proof of the three passes run for it is outstanding — see BUILD-LOG) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -119,9 +119,9 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [x] Duplicate clones a block with a new id and keeps the original untouched; delete removes only the selected block or subtree after the confirm.
 - [x] A `columns` container accepts 2–4 child columns, each accepting child blocks, and the editor's breadcrumb selects a nested block directly.
 - [x] Required-prop validation blocks publish (`block_alt_missing`, `block_prop_required`) but still allows saving a draft, and the offending block is highlighted.
-- [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering.
+- [ ] Heading order linting warns when an `h2` block precedes the page's `h1`, and the warning disappears after reordering. **Server rule and its tests are green (`heading_order_warns_but_never_blocks`, `a_sequential_heading_run_is_silent_and_the_warning_clears_on_reorder`, `an_h1_after_another_heading_warns_and_the_warning_clears_on_reorder`); the browser half — the walkthrough's `outlineWarningShown` / `outlineWarningCleared` keys — has not been read out of a finished pass, so the box stays open.**
 - [x] `raw_html` is sanitized on save; a script tag is stripped, the sanitiser report lists what changed, and the stored payload no longer contains it.
-- [ ] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft.
+- [ ] Undo/redo covers at least 50 steps including nesting changes, and `⌘Z` after a save restores the pre-save state in the draft. **Built and unit-gated; the browser proof is still outstanding (see the slice 4 entry in BUILD-LOG).**
 - [x] A pattern inserted into a page reproduces the block tree exactly; creating a pattern from a selection works and the new pattern appears in the library.
 - [x] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
 - [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.

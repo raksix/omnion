@@ -2236,3 +2236,61 @@ different ways, both of which had been silently green in the plan.
 
 - **Next.** The browser pass over `/patterns`, `/page-templates` and the editor's pattern panel
   is what closes this slice, and the undo/redo stack and the remaining slice-2 boxes follow.
+
+## Wave 2 · REQ-063 slice 4 — undo/redo (acceptance 9)
+
+- **What.** The editor's undo/redo stack. `apps/admin/features/blocks/block-history.ts` is the
+  stack itself — a pure list of tree snapshots, `HISTORY_LIMIT 100` — and the editor gained one
+  `apply()` that is the only writer of the working tree. Toolbar *Undo* / *Redo* with
+  `data-block-undo` / `data-block-redo`, a status bar that reports undo depth, redo depth and
+  dirty-ness, and `⌘Z` / `⇧⌘Z` on the canvas.
+
+- **The decision the whole thing follows from.** "⌘Z after a save restores the pre-save state"
+  forces an answer to *what a save is*, and both obvious answers are wrong. Clearing the
+  history on save satisfies "undo the last edit" for exactly one press and then loses the
+  session. Recording the save **as a step** is just as wrong: the tree at the moment of the
+  save is the tree already on screen, so the first undo restores an identical tree and looks
+  like a dead button. A save is neither — it is the boundary between what the server holds and
+  what the author is doing. The saved tree is kept as a baseline, which is also what makes
+  *dirty* a pointer comparison (`next !== savedTreeRef.current`) rather than a deep-equal of
+  400 blocks per keystroke, and what lets undoing back to the saved state report *clean*
+  honestly instead of permanently reading as unsaved work.
+
+- **Three more things the criterion decided.**
+  - The stack holds **trees, not diffs**. Every helper in `block-tree.ts` is pure and returns
+    a new array, so a snapshot is a value that cannot be mutated later and undoing is an
+    assignment rather than an inverse operation that would need to know what "inverse" means
+    for each of the nine helpers.
+  - A run of **typing is one step**, keyed by *block id* rather than by label: "Edit Heading"
+    and "Edit Text" merge under a label key, and taking back a heading would silently take
+    back a paragraph.
+  - `⌘Z` works with **nothing selected** — an author who has just deleted the block they were
+    looking at has no selection, and `⌘Z` is exactly what they press. Inside a text field the
+    browser's own undo is the better one and is left alone.
+
+- **Gates.** `cargo test -p omnion-content --quiet` → **107 passed, 0 failed**.
+  `pnpm typecheck` → **2/2 successful**.
+
+- **NOT PROVEN YET: the browser pass.** Three attempts, three different causes, none of them
+  the screen. Recording it here because the next tick must not mistake a crashed pass for a
+  failing one:
+  - **06:19** — the walkthrough and the undo/redo depth pass both completed, and then a bare
+    `locator().getAttribute()` on the preview frame threw a 30 s `TimeoutError` that nothing
+    caught. `summary.json` was written holding *only* `{"fatal": …}`: no counts, no findings,
+    no block-editor steps. Every screen that passed was lost with it.
+  - **07:16** — the same death on a *different* unguarded read (the inline-editing toggle),
+    because the first fix had been found by a same-line regex and this read spans two lines.
+  - **08:17** — OOM-killed at `analytics-realtime`. The box reached **0 bytes free RAM** at
+    load 90 while another writer's pass (`omnion-w6`) ran concurrently. Not a screen problem.
+  - The guard class is now swept and closed (`a88656c`, `b009097`): every `page.locator()` chain
+    ending in an auto-waiting call is `.catch()`-guarded with an explicit timeout, and
+    `count()` / `evaluateAll()` are deliberately excluded because neither waits — a zero there
+    is a fact, not a thirty-second hang.
+  - **The next tick checks `free -g` before starting a pass.** A pass costs ~1.5 G of browser
+    heap on a 32 G box that four writers share.
+
+- **Next.** Run the pass on a box with room and read the undo keys out of `summary.json`:
+  `historyDepthAfterSave`, `saveKeptHistory`, `historyCoversFifty`, `undoEmptiesHistory`,
+  `undoRestoredTree`, `redoRestoredBlocks`, `dirtyAfterUndo`. Then slice 4's remaining two
+  boxes: the five events with a verified delivery (acceptance 16 — server-side, so a test) and
+  the mobile read-only notice (acceptance 17 — a UI guard).
