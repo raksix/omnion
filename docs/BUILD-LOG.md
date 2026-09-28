@@ -2006,3 +2006,60 @@
   `target/debug/incremental` in this worktree returned 2.9 GB.
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
+### Wave 5 · REQ-005 slice 3 remainder — the invite policy gets teeth, and the Audit tab (`337c5bc`)
+
+- **What shipped.** The invite policy was a stored, validated, *offered* value that bounded
+  nothing; this tick makes all three modes real, and adds the tenant-scoped audit feed the REQ's
+  last tab asks for. Migration `0031_invitation_approval_queue.sql` adds one status
+  (`awaiting_approval`) and two decision columns. The queue is a **state of an existing live
+  invitation, not a second table** — the unique index on `(organization_id, lower(email))` then
+  keeps refusing a duplicate for a queued address, and a queued and a released invitation cannot
+  both exist for one person.
+- **The queue hands out no link at the create.** A queued create answers `202` with an **empty
+  token**, so the manager who cannot release it has nothing to forward. The release **mints** the
+  link, because the stored value is a one-way hash and a token that was never shown is a token
+  that cannot be recovered. The alternative — hand the link out at create time and trust the
+  queue-holder — makes the feature work by trust instead of by construction. A *second* release is
+  refused `invitation_not_queued` rather than minting a different link and silently orphaning the
+  first, and the panel shows the released link in a `role="status"` region rather than a toast,
+  because a toast takes the only copy with it.
+- **The owner check asks whether the binding *reaches this tenant*.** The seed binds `owner` at
+  platform scope (`roles.organization_id is null`), so asking only "does an owner binding exist"
+  would let tenant A's owner release tenant B's queue. `global` and this-organization's
+  `organization` scope qualify; a `site` scope deliberately does not, because a site lead is not
+  the owner of the whole tenant. `self_serve` needs no new check at all — the route's existing
+  `organizations.manage` guard already *is* that rule, which is the cheapest correct
+  implementation and the one that cannot drift.
+- **The Audit tab is guarded by `audit.read`, not `organizations.read`.** A trail names every
+  privileged act in the tenant; "can see the member list" is not a reason to see it. The walk
+  asserts the refusal *first*, because a tab that worked for everyone would leave the split
+  untested and still look green. The action filter is a picker built from the tenant's own rows
+  (it cannot offer a filter that matches nothing, and cannot drift as actions are added), the
+  count is the *filtered* count from the same statement as the rows, and a typo'd actor is
+  refused `invalid_actor_filter` rather than answered as an empty history.
+- **Proof.** `cargo test -p omnion-api --test tenancy_limits` → **19 walks, 0 failures**
+  (7 new). `cargo test -p omnion-identity -p omnion-audit` → **136 unit tests, 0 failures**.
+  `tenancy` (5), `tenancy_members` (7) and `tenancy_departments` (7) all green against the same
+  per-writer database. `tsc --noEmit` in `apps/admin` → clean. A new QA pass
+  (`runOrganizationInvitePolicy`) walks all three policies, the queue panel and the Audit tab.
+- **A defect the QA stack's own start-up found, not my code.** The walkthrough read `/` after a
+  fixed 900ms to decide whether setup was needed. But a fresh installation does not answer `/`
+  with the wizard: the request gate sends an anonymous visitor to `/login`, and *that* screen asks
+  the API and replaces itself with `/setup` — a client-side redirect. So the pass decided "an
+  installation already exists" about an **empty database**, and then failed to sign in to the
+  account it never created. `c83af9b` waits for one of the two URLs to be true instead. The
+  general rule: a URL read after a sleep is a guess about a *redirect chain*, and the client-side
+  half of that chain is not observable from the server.
+- **Environment note.** `/mnt/apopic` was at 100% twice mid-tick and a `rustc` link died with
+  "No space left on device" — the known shared-volume failure with seven writers. Reclaimed what
+  is mine and regenerable (`.rcgu.o`, the stale test binaries, `~/.npm/_cacache`, the cargo
+  registry cache) and four **dangling** docker volumes nobody references (2.4G, checked with
+  `docker volume ls -f dangling=true` — Omnion's own volumes are named and were untouched).
+  `CARGO_PROFILE_DEV_DEBUG=0` cut the linker's peak disk use enough to finish the suite on a
+  volume this contended.
+- **Next.** The last of slice 3: the **suspend/archive behaviour**. The `organizations.status`
+  column and the list's Suspend/Reactivate/Archive controls exist, but suspending a tenant does not
+  yet *block writes with the reason* — the acceptance line wants a suspended tenant to keep reads
+  available and refuse every write by name, and reactivating to restore them. That is one guard
+  applied across the tenancy write paths plus the banner, which the panel already renders.
+

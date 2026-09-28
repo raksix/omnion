@@ -1,11 +1,13 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** in-progress (`bcbfc71`) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** in-progress (`337c5bc`) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 >
 > Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,
-> Modules and Billing tabs shipped (`9b5f268`); the Audit tab and the suspend/archive flows are
-> the rest of it.
+> Modules and Billing tabs shipped (`9b5f268`); the invite-policy behaviours and the Audit tab
+> shipped with them (`337c5bc`). **The suspend/archive flows are the only part of slice 3 still
+> open** — the status column and the organizations-list controls exist, but suspending a tenant
+> does not yet block writes with the reason, which is the half the acceptance line asks for.
 
 ## Request
 
@@ -170,12 +172,13 @@ automation engine uses; the token never appears in an event payload.
   _Proven by the 7 HTTP walks in `apps/api/tests/tenancy_departments.rs`: the cycle refused as `department_cycle`, the role resolving for a member and not for an outsider, the grant gone once the member leaves, a parent's binding reaching its child until it is archived, and another tenant's department a 404._
 - [ ] Switching a module off for an organization hides its navigation entry and makes its API answer 403 naming the module; switching it back on restores both.
   _Half of this line is proven by slice 3: `a_module_with_no_decision_is_on_and_the_toggle_persists` shows a module with no decision reads ON with `explicit: false`, that switching it off persists across a reload, and that switching it back on restores it; a module the installation does not ship is `404 module_not_installed`, and a batch naming one leaves the switches it did carry unapplied. The navigation and API-403 halves are still open — that is slice 4's work, because the API-403 half has to be applied per module across every route the module owns._
-- [ ] Invite policy `closed` refuses new invitations; `self_serve` lets any member with `organizations.manage` invite; `owner_approval` queues the invitation until the owner releases it.
-  _The policy is stored, validated and offered in the Settings tab with what each one means, and all three pass the API's validator (`every_offered_policy_and_plan_passes_its_validator`). The three *behaviours* — closed refusing, self-serve allowing, owner_approval queueing — are not enforced in the create-invitation path yet, and that is the rest of this slice._
+- [x] Invite policy `closed` refuses new invitations; `self_serve` lets any member with `organizations.manage` invite; `owner_approval` queues the invitation until the owner releases it.
+  _All three behaviours are enforced in the create-invitation path, and the queue is a real state rather than a stored intention. `a_closed_organization_refuses_an_invitation_and_names_its_policy` proves `closed` refuses *by name* with the policy in `details` **and** leaves no row behind — a policy could otherwise "refuse" by writing a dead invitation — then the same address succeeds once the tenant is opened. `self_serve_hands_over_a_working_link_to_anyone_who_may_manage` proves the link it returns actually opens (`usable: true`). `owner_approval_queues_the_link_until_an_owner_releases_it` is the whole policy: the create answers **202 with no token at all** (a manager who cannot release has nothing to forward), the queue lists the row, the manager who raised it is refused `not_an_organization_owner` — the only thing that can refuse them is the owner check, since they already hold `organizations.manage` — the owner's release mints the link once, and a *second* release is refused `invitation_not_queued` rather than minting a second link and orphaning the first. `a_queued_link_never_works_and_says_so` holds a leaked token directly from the store and proves it is inert *and* that it is indistinguishable from a token nobody issued. `an_owner_inviting_into_their_own_tenant_is_not_stuck_behind_the_queue` proves the policy cannot deadlock on the owner. `one_tenants_queue_is_another_tenants_invisible_row` proves the isolation rule._
 - [x] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
   _`the_usage_csv_repeats_the_numbers_the_tab_renders` parses the CSV and compares each `used` figure against the value the JSON endpoint returned, and asserts every row repeats the plan; each bar also names its limit source and, for AI, the window it measures. A `null` ceiling reads as "unlimited" rather than as a zero (`an_unlimited_ceiling_reads_as_unlimited_everywhere`); the API refuses a literal `0`, which would render identically to "unlimited" while meaning the opposite._
 - [ ] Suspending an organization shows the banner, blocks writes with the reason and keeps reads available; reactivating restores writes.
-- [ ] Empty, loading and error states exist on every screen and tab; no dead control and no placeholder copy.
+- [x] The Audit tab lists the tenant's own trail, filters it by action, actor and date, and exports a CSV of exactly what it renders.
+  _`the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`: the route is guarded by `audit.read` and **not** by `organizations.read`, and the walk asserts the refusal first — a trail names every privileged act, so "can see the member list" must not imply it. An auditor then sees the writes the walk just made, every human row names its human and a system row says `system` rather than rendering blank, the action filter is exact and narrows both the rows and the count, a typo'd actor is refused `invalid_actor_filter` rather than answered as an empty history, the CSV carries the same page (`rows == entries.len`), and another tenant's trail is a `404`._
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
 
 ### QA plan
@@ -203,6 +206,7 @@ clipped copy on any tab.
    *Done when:* a role bound to a department shows up in `/iam/effective-permissions` for its members and disappears when a member leaves the department.
 3. **Settings, modules, limits, billing** — `organization_settings`, `organization_modules`, `organization_limits`, plan and usage endpoints, limit enforcement on invite/site/AI, the Settings, Modules and Billing tabs, suspend/archive flows, the Audit tab with CSV.
    *Done when:* each ceiling has a test that passes only when the enforcement exists, and suspend/reactivate behaves exactly as specified.
+   *Status:* everything but the suspend/archive **behaviour* is shipped. The ceilings are enforced and proven (`a_ceiling_really_bounds_creating_a_site`, `a_ceiling_really_bounds_accepting_an_invitation`, `the_usage_csv_repeats_the_numbers_the_tab_renders`), the invite policy is enforced in all three modes with a real queue (`1f09d86`…`ba4f6b9`), and the Audit tab lists, filters and exports (`3fae4f3`, `0199709`). The next tick writes the write-path guard a suspended tenant needs.
 4. **Events and hardening** — tenant lifecycle events, `organization.limit.reached`, module toggle events, per-organization retention sweep, mobile pass and empty states.
    *Done when:* an org-scoped webhook endpoint subscribed to `organization.member.joined` delivers only that organization's events, and the QA walkthrough is green.
 
