@@ -61,19 +61,37 @@ fn ratio_cell() -> &'static std::sync::RwLock<f64> {
 /// The ratio the edge samples non-error traces at, clamped to `[0.0, 1.0]`.
 #[must_use]
 pub fn sampling_ratio() -> f64 {
-    *ratio_cell()
+    let raw = *ratio_cell()
         .read()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(|error| error.into_inner());
+    // A `NaN` can only be here if something wrote one, and the reader still has to be safe: `NaN`
+    // fails every comparison, so a sampler fed `NaN` drops EVERY trace — including the failing
+    // ones the policy is built to keep. Reading through a guard is what makes a bad write
+    // degrade to the default instead of silently disabling the one guarantee.
+    if raw.is_finite() {
+        raw.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_SAMPLING_RATIO
+    }
 }
 
 /// Set the ratio. Out-of-range values are CLAMPED, not refused: this is the process-wide copy
 /// that the edge reads, and a value that cannot be stored at all would leave the edge on the old
 /// ratio with no error anywhere — the settings route is where the refusal and its field message
 /// live, and by the time a value reaches here it has already passed that.
+///
+/// A non-finite value is the exception: it is not clamped, it is REPLACED with the default.
+/// `f64::clamp` passes `NaN` straight through, so clamping alone would store the one value that
+/// makes every comparison false and no error trace ever sampled.
 pub fn set_sampling_ratio(ratio: f64) {
+    let safe = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_SAMPLING_RATIO
+    };
     *ratio_cell()
         .write()
-        .unwrap_or_else(|error| error.into_inner()) = ratio.clamp(0.0, 1.0);
+        .unwrap_or_else(|error| error.into_inner()) = safe;
 }
 
 /// The parent linkage for a span started in the current task, if there is one.

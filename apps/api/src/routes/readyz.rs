@@ -61,7 +61,45 @@ impl Check {
 }
 
 /// Readiness probe: `200` when every dependency answers, `503` otherwise.
+///
+/// ## The drain check comes FIRST, and it is not the same question
+///
+/// A load balancer asks this every couple of seconds. During a shutdown the honest answer to
+/// *that* question — "are your dependencies reachable?" — is still yes, the database is right
+/// there. What the orchestrator needs to know is a different fact: **stop sending me traffic**,
+/// which is about this process's intent rather than about Postgres.
+///
+/// So the flag is read before anything is pinged, and a `503` is returned without a round trip
+/// at all. Order matters for a second reason: pinging during a drain is work the process is
+/// trying to stop doing, and a probe that has to wait on a database to learn it should stop
+/// accepting traffic delays the very thing the drain is waiting for.
+///
+/// `/healthz` deliberately does NOT consult this flag — a liveness probe that fails during a
+/// drain restarts a process that is behaving perfectly. The asymmetry is the contract
+/// (`omnion_telemetry::lifecycle`).
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let lifecycle = omnion_telemetry::lifecycle::global();
+    if lifecycle.is_draining() {
+        let build = state.build();
+        let mut checks = BTreeMap::new();
+        checks.insert(
+            "process",
+            Check {
+                status: "draining",
+                error: None,
+            },
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyResponse {
+                ok: false,
+                service: build.service,
+                version: build.version,
+                checks,
+            }),
+        );
+    }
+
     let (database, redis) = tokio::join!(state.db().ping(), state.redis().ping());
     let expose_details = state.config().env.is_development();
 

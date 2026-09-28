@@ -157,15 +157,75 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the exporter flush loop is disabled (OMNION_EXPORTER_FLUSH=false)");
     }
 
-    let app = routes::router(state);
-    axum::serve(
+    // The alert evaluator (REQ-126, slice 4). It moves rules through pending → firing → resolved
+    // and claims each newly-firing event exactly once, so "notifies once" is a property of the
+    // UPDATE rather than of the caller. The same rules ship as `infra/observability/alerts.yml`,
+    // so an operator who runs them in Prometheus turns this loop off rather than receiving two
+    // notifications per incident.
+    if state.config().telemetry.alerts_evaluator_enabled {
+        if let Err(error) =
+            omnion_telemetry::alert_loop::seed_bundled_rules(state.db().pool()).await
+        {
+            // A failed seed is logged and the process continues: an instance with no bundled rules
+            // still evaluates the custom ones, and an API that refuses to start because a
+            // monitoring table was briefly unreachable is strictly worse.
+            tracing::warn!(error = %error, "the bundled alert rules were not seeded");
+        }
+        let _evaluator = omnion_telemetry::alert_loop::run(state.db().pool().clone());
+    } else {
+        tracing::info!("the alert evaluator is disabled (OMNION_ALERTS_EVALUATOR=false)");
+    }
+
+    let app = routes::router(state.clone());
+    // The graceful shutdown sequence (REQ-126, slice 4). The order is the contract and it lives
+    // in `omnion_telemetry::lifecycle`:
+    //
+    //   1. SIGTERM arrives → `lifecycle::begin_drain` flips the flag, so `/readyz` answers `503`
+    //      from this instant and a load balancer stops sending. `/healthz` stays `200`.
+    //   2. axum's own graceful shutdown stops the listener and waits for in-flight connections;
+    //      our guard in `request_log` is what the drain counts down.
+    //   3. `drain_and_flush` waits for that count to reach zero, to a deadline, then does ONE
+    //      final telemetry sweep so the lines the requests just wrote are not lost to a process
+    //      that exits before the next interval tick.
+    //   4. One summary line, and the pools close as the runtime unwinds.
+    //
+    // Steps 1 and 2 race by design: axum stops the listener the moment the future resolves, and
+    // the flag has to be set BEFORE that, not after, or a balancer polling in the gap keeps
+    // sending into a socket that is about to close.
+    let lifecycle = omnion_telemetry::lifecycle::global();
+    // The `Arc` is cloned into the shutdown future and kept here: both need it, and cloning an
+    // `Arc` for a future that runs once at the end of the process is far cheaper than the
+    // borrow-checker gymnastics of sharing one.
+    let on_signal = std::sync::Arc::clone(&lifecycle);
+    let shutdown = async move {
+        shutdown_signal().await;
+        on_signal.begin_drain();
+    };
+
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown);
+    let server_result = server.await;
 
-    tracing::info!("shutdown complete");
+    // The drain, the flush and the summary. `state.db().pool()` is passed so the final sweep
+    // can fold the drop counter and the health chip back into their rows — the same sweep the
+    // loop runs, not a second one that could drift from it.
+    let summary = omnion_telemetry::lifecycle::drain_and_flush(
+        &lifecycle,
+        Some(state.db().pool()),
+        std::time::Duration::from_millis(
+            // From the config, not the constant: the drain has to fit inside the deployment's
+            // termination grace period, and only the operator knows what that is set to.
+            state.config().telemetry.drain_timeout_ms,
+        ),
+    )
+    .await;
+
+    server_result?;
+
+    tracing::info!(summary = %summary.to_line(), "shutdown sequence finished");
     telemetry.shutdown();
     Ok(())
 }
@@ -194,7 +254,11 @@ async fn seed_metric_catalog(db: &Db) -> Result<(), Box<dyn std::error::Error + 
     let version = env!("CARGO_PKG_VERSION").to_owned();
     let commit = option_env!("OMNION_COMMIT").unwrap_or("unknown").to_owned();
     let registry = omnion_telemetry::metrics::global();
-    registry.gauge_set("omnion_build_info", &[version.as_str(), commit.as_str()], 1.0);
+    registry.gauge_set(
+        "omnion_build_info",
+        &[version.as_str(), commit.as_str()],
+        1.0,
+    );
 
     // The families that were recorded before the first boot finished are marked as seen, so the
     // screen's "never recorded" column stays meaningful instead of being zero for everything the

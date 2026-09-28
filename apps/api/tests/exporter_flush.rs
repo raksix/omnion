@@ -78,13 +78,14 @@ impl MockCollector {
                 served += 1;
                 async move {
                     let refused = stop_after.is_some_and(|limit| served > limit);
-                    if !refused
-                        && let Ok(value) = serde_json::from_str::<Value>(&body)
-                    {
+                    if !refused && let Ok(value) = serde_json::from_str::<Value>(&body) {
                         sink.lock().expect("the sink is not poisoned").push(value);
                     }
                     if refused {
-                        (StatusCode::SERVICE_UNAVAILABLE, "the collector is shedding load")
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "the collector is shedding load",
+                        )
                     } else {
                         (StatusCode::OK, "accepted")
                     }
@@ -168,9 +169,7 @@ async fn state_or_skip() -> Option<AppState> {
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!(
-                "[exporter flush] skipping: the environment is not configured ({error})"
-            );
+            eprintln!("[exporter flush] skipping: the environment is not configured ({error})");
             return None;
         }
     };
@@ -347,7 +346,11 @@ async fn a_request_s_line_reaches_a_configured_backend() {
 
     // The payload shape: a batch, with log lines in it, and the batch names the exporter.
     let first = &batches[0];
-    assert_eq!(first["exporter"], json!(name), "the batch did not name its exporter");
+    assert_eq!(
+        first["exporter"],
+        json!(name),
+        "the batch did not name its exporter"
+    );
     let logs = first["logs"]
         .as_array()
         .expect("the batch carries a logs array");
@@ -357,7 +360,11 @@ async fn a_request_s_line_reaches_a_configured_backend() {
     // id it minted. A hand-written payload would carry neither.
     let exported: Vec<&Value> = logs
         .iter()
-        .filter(|line| line["route"].as_str().is_some_and(|r| r.contains("/api/v1/observability")))
+        .filter(|line| {
+            line["route"]
+                .as_str()
+                .is_some_and(|r| r.contains("/api/v1/observability"))
+        })
         .collect();
     assert!(
         !exported.is_empty(),
@@ -384,8 +391,16 @@ async fn a_request_s_line_reaches_a_configured_backend() {
         .iter()
         .find(|row| row["name"] == json!(name))
         .expect("the configured exporter is listed");
-    assert_eq!(row["health"], json!("ok"), "an accepted batch left the chip unknown: {row}");
-    assert_eq!(row["buffered"], json!(0), "the buffer was not drained: {row}");
+    assert_eq!(
+        row["health"],
+        json!("ok"),
+        "an accepted batch left the chip unknown: {row}"
+    );
+    assert_eq!(
+        row["buffered"],
+        json!(0),
+        "the buffer was not drained: {row}"
+    );
 
     // And the flush was counted in the registry, because a counter that lives only in a struct is
     // not something an operator can see on /metrics.
@@ -399,9 +414,16 @@ async fn a_request_s_line_reaches_a_configured_backend() {
     )
     .await;
     assert!(
-        scrape.text.contains("omnion_exporter_batches_flushed_total"),
+        scrape
+            .text
+            .contains("omnion_exporter_batches_flushed_total"),
         "the flush family is absent from /metrics:\n{}",
-        scrape.text.lines().filter(|l| l.contains("exporter")).collect::<Vec<_>>().join("\n")
+        scrape
+            .text
+            .lines()
+            .filter(|l| l.contains("exporter"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
     remove_exporter(&state, &token, id).await;
@@ -431,10 +453,14 @@ async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
     }
     let status = exporter::global().status(&name).expect("registered");
     assert_eq!(
-        status.buffered, exporter::DEFAULT_BUFFER_CAPACITY,
+        status.buffered,
+        exporter::DEFAULT_BUFFER_CAPACITY,
         "the buffer grew past its cap"
     );
-    assert!(status.dropped_total >= 25, "the loss was not counted: {status:?}");
+    assert!(
+        status.dropped_total >= 25,
+        "the loss was not counted: {status:?}"
+    );
 
     let _ = exporter_flush::sweep(state.db().pool(), exporter::global())
         .await
@@ -466,7 +492,10 @@ async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
 
     // One refused batch is `degraded`, not `down` — slice 3's deliberate rule, and this is where
     // the loop's persistence is checked: the chip on the ROW, not only in memory.
-    assert_eq!(row.0, "degraded", "the refused batch did not degrade the chip: {row:?}");
+    assert_eq!(
+        row.0, "degraded",
+        "the refused batch did not degrade the chip: {row:?}"
+    );
     assert!(
         !row.1.is_empty(),
         "the refused batch recorded no reason: {row:?}"
@@ -522,12 +551,11 @@ async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
         exporter::global().status(&name).is_some(),
         "the sweep did not register a stored row"
     );
-    let health: String =
-        sqlx::query_scalar("select health from obs_exporters where name = $1")
-            .bind(&name)
-            .fetch_one(state.db().pool())
-            .await
-            .expect("the row is readable");
+    let health: String = sqlx::query_scalar("select health from obs_exporters where name = $1")
+        .bind(&name)
+        .fetch_one(state.db().pool())
+        .await
+        .expect("the row is readable");
     assert_eq!(
         health, "ok",
         "an empty buffer left the row's chip as something a screen would render as a problem"
@@ -561,7 +589,10 @@ async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
         let _ = exporter_flush::fan_out(exporter::global(), json!({ "n": index }));
     }
     assert_eq!(
-        exporter::global().status(&name).expect("registered").buffered,
+        exporter::global()
+            .status(&name)
+            .expect("registered")
+            .buffered,
         5,
         "the fan-out did not buffer"
     );
@@ -641,7 +672,11 @@ async fn a_batch_interval_is_respected_between_flushes() {
         "the second sweep sent before the interval elapsed"
     );
     assert!(
-        exporter::global().status(&name).expect("registered").buffered > 0,
+        exporter::global()
+            .status(&name)
+            .expect("registered")
+            .buffered
+            > 0,
         "the paced sweep discarded the line it was not ready to send"
     );
 

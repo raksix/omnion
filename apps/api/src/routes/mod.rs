@@ -85,13 +85,14 @@ pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
-pub mod media_files;
 pub mod media_duplicates;
+pub mod media_files;
 pub mod media_settings;
 pub mod media_shares;
 pub mod media_transform;
 pub mod media_versions;
 pub mod observability;
+pub mod observability_alerts;
 pub mod observability_traces;
 pub mod onboarding;
 pub mod public;
@@ -923,6 +924,33 @@ pub fn router(state: AppState) -> Router {
             "/observability/exporters",
             get(observability_traces::read_exporters),
         )
+        // The alert surface and the settings screen (REQ-126, slice 4). Reading a rule is
+        // `observability.read` for the same reason reading an exporter is: what the instance is
+        // configured to watch is as readable as what it recorded.
+        .route(
+            "/observability/alert-rules",
+            get(observability_alerts::read_alert_rules),
+        )
+        .route(
+            "/observability/alerts",
+            get(observability_alerts::read_alerts),
+        )
+        .route(
+            "/observability/settings",
+            get(observability_alerts::read_observability_settings),
+        )
+        // The bundle manifest and the lifecycle contract. Both are reads of static, build-time
+        // facts — which bundle this instance ships, and what its probes do during a drain — and
+        // REQ-128 (deployment tooling) and the deployment centre need them as data rather than
+        // each keeping a hard-coded copy of a contract the process has to honour.
+        .route(
+            "/observability/bundle",
+            get(observability_alerts::read_bundle),
+        )
+        .route(
+            "/observability/lifecycle",
+            get(observability_alerts::read_lifecycle),
+        )
         .route_layer(guards::require(&state, "observability.read"));
 
     let observability_write = Router::new()
@@ -952,6 +980,36 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/observability/exporters/{id}/test",
             post(observability_traces::test_exporter),
+        )
+        // Alert rules, silences and the settings row (REQ-126, slice 4). All three change what
+        // the instance tells an operator and when it interrupts them, so all three take
+        // `observability.manage` and all three write an audit row. The preview is a POST
+        // because it evaluates a caller-supplied expression — a GET would be replayed by every
+        // cache in the path.
+        .route(
+            "/observability/alert-rules",
+            post(observability_alerts::create_alert_rule),
+        )
+        .route(
+            "/observability/alert-rules/preview",
+            post(observability_alerts::preview_alert_rule),
+        )
+        .route(
+            "/observability/alert-rules/{id}",
+            axum::routing::patch(observability_alerts::update_alert_rule)
+                .delete(observability_alerts::delete_alert_rule),
+        )
+        .route(
+            "/observability/silences",
+            post(observability_alerts::create_silence),
+        )
+        .route(
+            "/observability/silences/{id}",
+            axum::routing::delete(observability_alerts::delete_silence),
+        )
+        .route(
+            "/observability/settings",
+            put(observability_alerts::save_observability_settings),
         );
 
     let secrets_lease_redeem = Router::new().route(
@@ -1208,6 +1266,10 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(health::healthz))
+        // `/livez` is the same handler under the name some platforms expect (REQ-126, slice 4).
+        // An alias implemented separately from the endpoint it aliases is a probe that checks
+        // something the deployment does not, so this is one handler at two paths.
+        .route("/livez", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         // The Prometheus exposition (REQ-126, slice 2). Unversioned and unauthenticated, beside
         // the probes and for the same reason: a scraper has no session, and a versioned

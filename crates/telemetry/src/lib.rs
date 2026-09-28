@@ -31,6 +31,7 @@
 //! propagation, the redaction pass and the store. Two implementations of any of those drift, and
 //! drift in this area is a leak.
 
+pub mod alert_loop;
 pub mod alerts;
 pub mod context;
 pub mod error;
@@ -73,3 +74,57 @@ pub const MAX_FIELD_COUNT: usize = 32;
 
 /// The cap on one field's rendered length, in characters.
 pub const MAX_FIELD_CHARS: usize = 512;
+
+/// The version of the shipped observability bundle (`infra/observability/`).
+///
+/// Compiled in rather than read from disk, because the panel has to say which bundle THIS
+/// instance was built to import and the directory it was built from may not have been deployed.
+/// The bundle carries its own version file; a mismatch between the two is what the compatibility
+/// note in the manifest exists to explain.
+pub const BUNDLE_VERSION: &str = "1.0.0";
+
+/// What the bundle ships, as `(path, what it is)` pairs.
+///
+/// The list is the request's own enumeration — "Grafana dashboard JSON, Prometheus alert rules,
+/// an OpenTelemetry collector example configuration, and a README mapping each dashboard panel to
+/// the metric families" — and each entry names a file that exists in the tree. A test asserts
+/// that, because an asset list is a promise and a promise with no file behind it is how a bundle
+/// quietly becomes a README describing assets that were never written.
+pub const BUNDLE_ASSETS: &[(&str, &str)] = &[
+    (
+        "grafana/omnion-overview.json",
+        "API overview: request rate, error ratio, p95 latency",
+    ),
+    (
+        "grafana/omnion-database.json",
+        "Pool states and query latency by statement name",
+    ),
+    (
+        "grafana/omnion-queue-workers.json",
+        "Queue depth, job duration, failures, worker heartbeat",
+    ),
+    (
+        "grafana/omnion-workflows.json",
+        "Workflow step outcomes and queue interaction",
+    ),
+    (
+        "grafana/omnion-ai-usage.json",
+        "AI requests, tokens and spend per provider and model",
+    ),
+    (
+        "grafana/omnion-outbound-reliability.json",
+        "Webhook results, outbound retries, circuit state, exporter health",
+    ),
+    (
+        "alerts.yml",
+        "Prometheus alert rules for the usual suspects, seeded into obs_alert_rules",
+    ),
+    (
+        "otel-collector.yaml",
+        "OpenTelemetry collector example configuration",
+    ),
+    (
+        "README.md",
+        "Each dashboard panel mapped to the metric families it queries",
+    ),
+];

@@ -361,9 +361,23 @@ pub const FAMILIES: &[FamilySpec] = &[
         name: "omnion_alert_transitions_total",
         kind: MetricKind::Counter,
         unit: "1",
-        description: "Alert rule state transitions by the state they moved to: `pending`, \
+        description: "Alert rule state transitions by the state they moved to: `pending`, \\
                         `firing` or `resolved`.",
         labels: &["state"],
+        source: "core",
+        max_series: 4,
+        bounded_labels: true,
+    },
+    // The evaluator's own liveness. Without it, a loop disabled by config or wedged on a
+    // database is indistinguishable from a healthy system: no alert fires, the panel is quiet,
+    // and the only symptom is that the outage nobody was paged about. Its own unit test caught
+    // this family being recorded before it was declared.
+    FamilySpec {
+        name: "omnion_alert_evaluations_total",
+        kind: MetricKind::Counter,
+        unit: "1",
+        description: "Alert rule evaluations this process has run, counted per pass.",
+        labels: &["phase"],
         source: "core",
         max_series: 4,
         bounded_labels: true,

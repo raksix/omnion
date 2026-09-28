@@ -78,6 +78,22 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
+    /// `404` — the addressed row does not exist, named in the message.
+    ///
+    /// The `what` and the `id` are both in the message on purpose. A `404` with the body
+    /// `{"code":"not_found"}` tells a form nothing about which of its rows vanished, and the
+    /// one case worth naming is a double-submit: the row was deleted, the second write answers
+    /// `404`, and the operator needs to know that is what happened rather than that the
+    /// identifier was malformed.
+    #[must_use]
+    pub fn not_found(what: &'static str, id: impl std::fmt::Display) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no {what} with the id {id}"),
+        )
+    }
+
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an
@@ -704,8 +720,10 @@ impl From<MediaError> for ApiError {
             }
             MediaError::TooManySites { limit, requested } => Self::bad_request(
                 "too_many_sites",
-                format!("a cross-site report may cover at most {limit} sites; {requested} were \
-                         named"),
+                format!(
+                    "a cross-site report may cover at most {limit} sites; {requested} were \
+                         named"
+                ),
             ),
             // Every storage field error names the field that caused it, and carries it as a
             // detail — the settings form puts the message under that input, and a *save* and a

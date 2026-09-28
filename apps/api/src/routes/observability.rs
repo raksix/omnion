@@ -419,10 +419,7 @@ pub async fn metrics_exposition() -> impl IntoResponse {
     tracing::debug!(bytes = text.len(), "metrics exposition rendered");
     (
         [
-            (
-                axum::http::header::CONTENT_TYPE,
-                EXPOSITION_CONTENT_TYPE,
-            ),
+            (axum::http::header::CONTENT_TYPE, EXPOSITION_CONTENT_TYPE),
             // A scrape must never be answered from a cache: a stale `/metrics` is a monitoring
             // system reporting numbers that stopped happening.
             (axum::http::header::CACHE_CONTROL, "no-store"),
@@ -594,7 +591,11 @@ pub async fn read_metric_query(
     let window = window.min(MAX_POINTS as i64) as usize;
 
     let series = metrics::global().series_of(spec.name, window);
-    let labels: Vec<String> = spec.labels.iter().map(|label| (*label).to_owned()).collect();
+    let labels: Vec<String> = spec
+        .labels
+        .iter()
+        .map(|label| (*label).to_owned())
+        .collect();
     // The PromQL is built from the first *real* series, never from the overflow bucket. The
     // overflow series is sorted into the list like any other, and an operator who clicks "copy as
     // PromQL" and pastes `omnion_circuit_state{provider="other"}` into a dashboard has been handed
@@ -604,7 +605,10 @@ pub async fn read_metric_query(
         .iter()
         .find(|snapshot| !snapshot.labels.iter().all(|value| value == "other"))
         .or_else(|| series.first());
-    let promql = promql_for(spec, &representative.map(|s| s.labels.clone()).unwrap_or_default());
+    let promql = promql_for(
+        spec,
+        &representative.map(|s| s.labels.clone()).unwrap_or_default(),
+    );
 
     Ok(Json(MetricQueryResponse {
         metric: spec.name.to_owned(),
@@ -713,13 +717,15 @@ fn parse_levels(values: &[String]) -> Result<Vec<LogLevel>, ApiError> {
 fn parse_instant(text: Option<&str>, field: &str) -> Result<Option<OffsetDateTime>, ApiError> {
     match text {
         None => Ok(None),
-        Some(text) => OffsetDateTime::parse(text, &Rfc3339).map(Some).map_err(|_| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_instant",
-                format!("`{field}` must be an RFC 3339 instant, e.g. 2026-09-28T09:00:00Z"),
-            )
-        }),
+        Some(text) => OffsetDateTime::parse(text, &Rfc3339)
+            .map(Some)
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_instant",
+                    format!("`{field}` must be an RFC 3339 instant, e.g. 2026-09-28T09:00:00Z"),
+                )
+            }),
     }
 }
 
@@ -730,9 +736,11 @@ fn map_error(error: TelemetryError) -> ApiError {
             "window_too_wide",
             error.to_string(),
         ),
-        TelemetryError::Telemetry(message) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "log_store_failed", message)
-        }
+        TelemetryError::Telemetry(message) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "log_store_failed",
+            message,
+        ),
     }
 }
 
@@ -755,12 +763,8 @@ mod tests {
 
     #[test]
     fn the_level_filter_accepts_the_documented_names() {
-        let levels = parse_levels(&[
-            "info".to_owned(),
-            "WARN".to_owned(),
-            " error ".to_owned(),
-        ])
-        .expect("the documented names must parse");
+        let levels = parse_levels(&["info".to_owned(), "WARN".to_owned(), " error ".to_owned()])
+            .expect("the documented names must parse");
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[1], LogLevel::Warn);
     }
@@ -770,21 +774,17 @@ mod tests {
         let since = (OffsetDateTime::now_utc() - time::Duration::days(400))
             .format(&Rfc3339)
             .unwrap();
-        store::validate_window(
-            parse_instant(Some(&since), "since").unwrap(),
-            None,
-        )
-        .expect_err("a 400-day window must be refused");
+        store::validate_window(parse_instant(Some(&since), "since").unwrap(), None)
+            .expect_err("a 400-day window must be refused");
         let error = map_error(
-            store::validate_window(
-                parse_instant(Some(&since), "since").unwrap(),
-                None,
-            )
-            .expect_err("a 400-day window must be refused"),
+            store::validate_window(parse_instant(Some(&since), "since").unwrap(), None)
+                .expect_err("a 400-day window must be refused"),
         );
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
         assert!(
-            error.message().contains(&store::MAX_WINDOW_DAYS.to_string()),
+            error
+                .message()
+                .contains(&store::MAX_WINDOW_DAYS.to_string()),
             "the refusal must name the cap: {}",
             error.message()
         );

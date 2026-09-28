@@ -110,7 +110,9 @@ async fn state_or_skip() -> Option<AppState> {
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("[observability metrics] skipping: the environment is not configured ({error})");
+            eprintln!(
+                "[observability metrics] skipping: the environment is not configured ({error})"
+            );
             return None;
         }
     };
@@ -242,13 +244,19 @@ async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_sta
     }
     // A request that genuinely 500s is not something this test fabricates; a 4xx is enough to
     // prove the class label is computed rather than hard-coded to 2xx.
-    let refused = call(&state, get("/api/v1/observability/metrics/query?metric=nope")).await;
+    let refused = call(
+        &state,
+        get("/api/v1/observability/metrics/query?metric=nope"),
+    )
+    .await;
     assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
 
     let scrape = call(&state, get("/metrics")).await;
     assert_eq!(scrape.status, StatusCode::OK);
     assert!(
-        scrape.text.contains("# TYPE omnion_http_requests_total counter"),
+        scrape
+            .text
+            .contains("# TYPE omnion_http_requests_total counter"),
         "the family header is missing: {}",
         scrape.text
     );
@@ -283,11 +291,13 @@ async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_sta
     // And the status is a CLASS. A per-code label is the cardinality failure the request names,
     // and `2xx`/`4xx`/`5xx` is what the panel's ratio is computed from.
     assert!(
-        template_series[0].contains("status=\"4xx\"") || template_series[0].contains("status=\"2xx\""),
+        template_series[0].contains("status=\"4xx\"")
+            || template_series[0].contains("status=\"2xx\""),
         "the status label is not a class: {template_series:?}"
     );
     assert!(
-        !template_series[0].contains("status=\"404\"") && !template_series[0].contains("status=\"200\""),
+        !template_series[0].contains("status=\"404\"")
+            && !template_series[0].contains("status=\"200\""),
         "the status label is a code, not a class: {template_series:?}"
     );
     assert!(
@@ -296,7 +306,9 @@ async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_sta
         scrape.text
     );
     assert!(
-        scrape.text.contains("omnion_http_request_duration_seconds_count"),
+        scrape
+            .text
+            .contains("omnion_http_request_duration_seconds_count"),
         "the duration histogram is missing: {}",
         scrape.text
     );
@@ -324,11 +336,7 @@ async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_sta
 
     let catalog = call(
         &state,
-        authed(
-            Method::GET,
-            "/api/v1/observability/metrics/catalog",
-            &token,
-        ),
+        authed(Method::GET, "/api/v1/observability/metrics/catalog", &token),
     )
     .await;
     assert_eq!(catalog.status, StatusCode::OK, "{}", catalog.text);
@@ -360,7 +368,8 @@ async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_sta
                 .find(|row| row["name"] == *name)
                 .expect("the row is in the list it came from");
             assert_eq!(
-                row["live"], json!(false),
+                row["live"],
+                json!(false),
                 "{name} is not declared by this build and must be marked as not live"
             );
             assert_eq!(row["source"], "module", "{name} came from a module");
@@ -425,7 +434,11 @@ async fn a_query_names_the_family_when_the_selector_is_unknown_and_clamps_an_ove
         wide.body["max_points"].as_i64(),
         Some(metrics::MAX_POINTS as i64)
     );
-    assert!(wide.body["promql"].as_str().is_some_and(|q| q.contains("omnion_cache_hits_total")));
+    assert!(
+        wide.body["promql"]
+            .as_str()
+            .is_some_and(|q| q.contains("omnion_cache_hits_total"))
+    );
 
     let zero = call(
         &state,
@@ -483,7 +496,9 @@ async fn a_family_past_its_budget_is_folded_and_the_fold_is_reported_three_ways(
         scrape.text
     );
     assert!(
-        !scrape.text.contains(&format!("provider=\"probe{}\"", fold_at - 1)),
+        !scrape
+            .text
+            .contains(&format!("provider=\"probe{}\"", fold_at - 1)),
         "a value past the bound is still present verbatim: {}",
         scrape.text
     );
@@ -499,11 +514,7 @@ async fn a_family_past_its_budget_is_folded_and_the_fold_is_reported_three_ways(
     // (3) the catalogue names the family as over budget.
     let catalog = call(
         &state,
-        authed(
-            Method::GET,
-            "/api/v1/observability/metrics/catalog",
-            &token,
-        ),
+        authed(Method::GET, "/api/v1/observability/metrics/catalog", &token),
     )
     .await;
     assert_eq!(catalog.status, StatusCode::OK, "{}", catalog.text);
@@ -551,7 +562,9 @@ async fn the_catalogue_is_seeded_from_the_registry_and_a_resync_is_audited() {
     // prove a resync does not delete it) and a previous run's row is still in the database. An
     // exact equality here fails on the SECOND run for a reason that has nothing to do with the
     // seeding — the "landmine for whoever runs the suite second" rule again, this time on a count.
-    let total = metric_catalog::count(state.db().pool()).await.expect("countable");
+    let total = metric_catalog::count(state.db().pool())
+        .await
+        .expect("countable");
     assert!(
         total >= FAMILIES.len() as i64,
         "the catalogue holds {total} rows and does not contain every declared family"
@@ -594,7 +607,11 @@ async fn the_catalogue_is_seeded_from_the_registry_and_a_resync_is_audited() {
     )
     .await;
     assert_eq!(response.status, StatusCode::OK, "{}", response.text);
-    assert!(response.body["families"].as_array().is_some_and(|f| !f.is_empty()));
+    assert!(
+        response.body["families"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty())
+    );
 
     let audit: i64 = sqlx::query_scalar(
         "select count(*)::int8 from audit_log \
@@ -616,10 +633,19 @@ async fn observability_read_does_not_grant_the_catalogue_resync() {
     // point of the split between `observability.read` and `observability.manage`.
     let response = call(
         &state,
-        authed(Method::POST, "/api/v1/observability/metrics/sync", "not-a-real-token"),
+        authed(
+            Method::POST,
+            "/api/v1/observability/metrics/sync",
+            "not-a-real-token",
+        ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{}", response.text);
+    assert_eq!(
+        response.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        response.text
+    );
 
     let read = call(
         &state,
@@ -662,7 +688,10 @@ async fn the_exposition_is_not_cached_and_carries_the_canonical_content_type() {
         .get(header::CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    assert_eq!(cache, "no-store", "a stale /metrics reports numbers that stopped happening");
+    assert_eq!(
+        cache, "no-store",
+        "a stale /metrics reports numbers that stopped happening"
+    );
 }
 
 /// A uuid-shaped path segment. Not `Uuid::new_v4()` inlined, because the two requests in the
@@ -677,8 +706,7 @@ fn uuid_like() -> String {
 /// suite. This one asserts the sharing is real rather than leaving it to whoever runs second.
 #[test]
 fn the_registry_is_process_wide_and_a_tester_reaches_what_a_production_layer_recorded() {
-    metrics::global()
-        .counter_add("omnion_cache_hits_total", &["suite-probe"], 1.0);
+    metrics::global().counter_add("omnion_cache_hits_total", &["suite-probe"], 1.0);
     assert_eq!(
         metrics::global().value_of("omnion_cache_hits_total", &["suite-probe"]),
         Some(1.0),
@@ -778,8 +806,7 @@ async fn the_promql_names_a_real_series_and_not_the_overflow_bucket() {
     // of the pick, so the comment names it.
     for index in 0..(metrics::BOUNDED_SET_CAP + 4) {
         let scope = format!("pq{index}");
-        metrics::global()
-            .counter_add("omnion_rate_limit_refusals_total", &[scope.as_str()], 1.0);
+        metrics::global().counter_add("omnion_rate_limit_refusals_total", &[scope.as_str()], 1.0);
     }
 
     let response = call(

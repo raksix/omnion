@@ -34,7 +34,7 @@ use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::store::{self, LogFilter, LogSettings};
-use omnion_telemetry::{LogContext, LogLevel, LogSource, NewLogEntry, MAX_FIELD_COUNT};
+use omnion_telemetry::{LogContext, LogLevel, LogSource, MAX_FIELD_COUNT, NewLogEntry};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use time::OffsetDateTime;
@@ -165,7 +165,11 @@ async fn login(state: &AppState, email: &str) -> String {
         )
         .await
         .expect("router must answer");
-    assert_eq!(response.status(), StatusCode::OK, "the account must sign in");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the account must sign in"
+    );
     response
         .headers()
         .get(header::SET_COOKIE)
@@ -186,7 +190,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
             "OMNION_DATABASE_URL",
             std::env::var("OMNION_TEST_DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://omnion:omnion@127.0.0.1:5433/omnion_w6_dev".into()),
-    );
+        );
     }
     let Some((state, db)) = live_state().await else {
         eprintln!("skipping: no test database");
@@ -293,19 +297,27 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
     let trace_id = mine.trace_id.clone().expect("the request line has a trace");
     let producer_request = Uuid::new_v4();
     let worker_context = LogContext::new_request(producer_request).with_trace(&trace_id);
-    let worker_line = NewLogEntry::new(LogLevel::Info, "omnion_secrets_runner", "the re-wrap batch applied")
-        .with_field("rewrapped", 4i64)
-        .source(LogSource::Worker)
-        .build_with(&worker_context);
+    let worker_line = NewLogEntry::new(
+        LogLevel::Info,
+        "omnion_secrets_runner",
+        "the re-wrap batch applied",
+    )
+    .with_field("rewrapped", 4i64)
+    .source(LogSource::Worker)
+    .build_with(&worker_context);
     store::write(db.pool(), &worker_line)
         .await
         .expect("the worker line must be stored");
 
     // …and a second line from the same worker, so the ordering assertion has something to order.
-    let follow_up = NewLogEntry::new(LogLevel::Warn, "omnion_secrets_runner", "the batch slowed to 3.2s")
-        .with_field("rewrapped", 0i64)
-        .source(LogSource::Worker)
-        .build_with(&worker_context);
+    let follow_up = NewLogEntry::new(
+        LogLevel::Warn,
+        "omnion_secrets_runner",
+        "the batch slowed to 3.2s",
+    )
+    .with_field("rewrapped", 0i64)
+    .source(LogSource::Worker)
+    .build_with(&worker_context);
     store::write(db.pool(), &follow_up)
         .await
         .expect("the follow-up line must be stored");
@@ -333,7 +345,8 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
     assert_eq!(entries[0]["message"], "the re-wrap batch applied");
     assert_eq!(entries[1]["message"], "the batch slowed to 3.2s");
     assert_eq!(
-        entries[0]["trace_id"], trace_id.as_str(),
+        entries[0]["trace_id"],
+        trace_id.as_str(),
         "the worker line must carry the trace of the request that enqueued the job"
     );
     assert_eq!(entries[0]["source"], "worker");
@@ -353,7 +366,8 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
     )
     .await;
     assert_eq!(
-        refused.status, StatusCode::BAD_REQUEST,
+        refused.status,
+        StatusCode::BAD_REQUEST,
         "a window past the cap is the caller's error, not a 500"
     );
     assert_eq!(refused.body["error"]["code"], "window_too_wide");
@@ -391,7 +405,8 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
     )
     .await;
     assert_eq!(
-        single.status, StatusCode::OK,
+        single.status,
+        StatusCode::OK,
         "a filter only its own client can satisfy is not a filter: {}",
         single.body
     );
@@ -535,7 +550,7 @@ async fn the_stored_line_never_carries_a_secret_or_an_address() {
             "OMNION_DATABASE_URL",
             std::env::var("OMNION_TEST_DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://omnion:omnion@127.0.0.1:5433/omnion_w6_dev".into()),
-    );
+        );
     }
     let Some((state, db)) = live_state().await else {
         eprintln!("skipping: no test database");
@@ -555,7 +570,10 @@ async fn the_stored_line_never_carries_a_secret_or_an_address() {
     )
     .with_field("detail", FIXTURE_SECRET)
     .with_field("api_key", FIXTURE_SECRET)
-    .with_field("request", json!({ "headers": { "authorization": FIXTURE_SECRET } }))
+    .with_field(
+        "request",
+        json!({ "headers": { "authorization": FIXTURE_SECRET } }),
+    )
     .build_with(&context);
 
     let id = store::write(db.pool(), &entry)
@@ -601,7 +619,7 @@ async fn a_wide_field_object_is_truncated_visibly_and_prune_only_removes_old_lin
             "OMNION_DATABASE_URL",
             std::env::var("OMNION_TEST_DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://omnion:omnion@127.0.0.1:5433/omnion_w6_dev".into()),
-    );
+        );
     }
     let Some((_state, db)) = live_state().await else {
         eprintln!("skipping: no test database");
@@ -632,7 +650,11 @@ async fn a_wide_field_object_is_truncated_visibly_and_prune_only_removes_old_lin
     .await
     .expect("the row must read back");
     assert!(
-        (row.fields.as_object().map(serde_json::Map::len).unwrap_or(0)) <= MAX_FIELD_COUNT + 1,
+        (row.fields
+            .as_object()
+            .map(serde_json::Map::len)
+            .unwrap_or(0))
+            <= MAX_FIELD_COUNT + 1,
         "the stored field object must be bounded"
     );
 
@@ -659,7 +681,9 @@ async fn a_wide_field_object_is_truncated_visibly_and_prune_only_removes_old_lin
     .await
     .expect("the current line must be inserted");
 
-    let removed = store::prune(db.pool(), 14).await.expect("the prune must run");
+    let removed = store::prune(db.pool(), 14)
+        .await
+        .expect("the prune must run");
     assert!(
         removed >= 1,
         "the prune must remove the line past the retention window"
@@ -678,11 +702,12 @@ async fn a_wide_field_object_is_truncated_visibly_and_prune_only_removes_old_lin
     assert_eq!(fresh_left, 1, "a line inside the window must survive");
 
     // The audit trail is not the log store, and the prune must not have touched it.
-    let audit_left: i64 =
-        sqlx::query_scalar("select count(*) from audit_log where created_at < now() - interval '1 day'")
-            .fetch_one(db.pool())
-            .await
-            .expect("the audit count must read");
+    let audit_left: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where created_at < now() - interval '1 day'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("the audit count must read");
     assert!(
         audit_left >= 0,
         "the prune must not delete from the audit trail"

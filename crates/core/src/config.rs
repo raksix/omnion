@@ -446,12 +446,28 @@ const DEFAULT_SECRETS_REWRAP_BATCH: usize = 25;
 pub struct TelemetryConfig {
     /// Whether this process drains exporter buffers (`OMNION_EXPORTER_FLUSH`).
     pub exporter_flush_enabled: bool,
+    /// Whether this process evaluates the alert rules (`OMNION_ALERTS_EVALUATOR`).
+    ///
+    /// The switch an operator uses when the same rules run in Prometheus — the bundle ships them
+    /// as `alerts.yml` so Alertmanager's routing and silences can own the notification. Running
+    /// both is how an operator gets two pages for one incident, and the flag is the documented way
+    /// to avoid that rather than deleting the bundled rules.
+    pub alerts_evaluator_enabled: bool,
+    /// How long a drain waits for in-flight requests, in milliseconds
+    /// (`OMNION_DRAIN_TIMEOUT_MS`).
+    ///
+    /// It has to fit inside the deployment's termination grace period with room for the telemetry
+    /// flush that follows, which is why it is configuration rather than a constant: the number
+    /// that is right for a 30-second Kubernetes grace period is wrong for a 5-second one.
+    pub drain_timeout_ms: u64,
 }
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             exporter_flush_enabled: true,
+            alerts_evaluator_enabled: true,
+            drain_timeout_ms: 10_000,
         }
     }
 }
@@ -755,6 +771,12 @@ impl Config {
 
         let telemetry = TelemetryConfig {
             exporter_flush_enabled: read_flag(&read, "OMNION_EXPORTER_FLUSH", true)?,
+            alerts_evaluator_enabled: read_flag(&read, "OMNION_ALERTS_EVALUATOR", true)?,
+            // Clamped rather than refused: a drain timeout of zero would skip every in-flight
+            // request, and a hand-typed negative would be a `u64` parse error at boot — neither is
+            // a useful way to learn the setting exists. The floor is one second, which is the
+            // smallest wait that can drain a real request.
+            drain_timeout_ms: read_positive(&read, "OMNION_DRAIN_TIMEOUT_MS", 10_000)?.max(1_000),
         };
 
         let analytics = AnalyticsConfig {

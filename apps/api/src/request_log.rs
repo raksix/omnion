@@ -65,6 +65,12 @@ pub async fn request_context(
     let request_id = Uuid::new_v4();
     let started = Instant::now();
 
+    // The drain's in-flight count (REQ-126, slice 4). Taken HERE, before anything else, and held
+    // for the whole request by the guard's Drop — so a request that is refused, that panics or
+    // that is cancelled still releases it. Counting "requests that reached a handler" instead
+    // would leave the drain waiting for a request that ended at the router.
+    let _in_flight = omnion_telemetry::lifecycle::global().track();
+
     // An inbound trace is honoured; a malformed one is ignored. Accepting a header that is not
     // the shape W3C defines produces a trace id no collector will ever join to.
     let inbound_trace = request
