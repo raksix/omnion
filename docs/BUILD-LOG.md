@@ -2786,3 +2786,72 @@ on a box four writers share: check `free -g` first, and budget 1500s+.
   quarantine and release, retention policies with the daily worker, and reference-based purge
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
+
+
+## 2026-09-28 · REQ-063 slice 4 — a pass that can survive this box, and five copies of one rule
+
+**What.** Merged `origin/main` (two commits, one conflict: the append-only `docs/BUILD-LOG.md`,
+resolved with `git merge-file --union` and gated on a **multiset** of content lines — every line of
+both sides present, zero unexpected duplicates, rather than a line count that would hide a
+duplicated block). Then attacked the last open box, acceptance 17.
+
+**The first thing this tick had to establish was that the last tick's note was false.** It said
+"the pass is running against the fix". No process was running, `qa-artifacts/20260928-151001` had
+a `clicks.jsonl` and no `summary.json`, and the box had rebooted 6 minutes before this session
+started. A REQ note describing work in flight reads exactly like work finished, and the cost of
+believing it is a whole tick.
+
+**The pass cannot be trusted to run to the end on this box, so it was made smaller.** It takes
+~45 minutes and three things kill it: a reboot (today), seven writers sharing one box, and
+**another writer's `pm2 resurrect` pruning the shared daemon** — the API shut down cleanly at 17:28,
+all three `omnion-qa-*-w2` processes vanished, and `omnion-qa-*-main` went with them. The
+signature is unmistakable once you know it: every depth pass reports `blocked`, the fills carry
+`chrome-error://chromewebdata/`, and the `block-editor-page-form` screenshot is Chrome's
+`ERR_CONNECTION_REFUSED`. That reads exactly like a product defect and is not one. `--only=block-editor`
+runs this wave's depth passes and exits — minutes instead of an hour, and nothing another stack does
+can take it down.
+
+**What the re-run found, by counting findings by route instead of by eye** (which is what the
+previous tick's reading got wrong): the 241 gallery highs are gone, and four `404`s from the dead
+server went with them. Two real defects remained, and they are not the same bug.
+
+`publish_page` promotes the draft row to `published` **in place** rather than copying it. So a page
+that was published and not edited since — the ordinary state of a live site — has **no draft row at
+all**, and `GET /pages/{id}/preview` answered `404 no_draft_revision`. The preview of a published,
+working page was a dead screen, and it is why `publicRendered` had read false on a page that had
+in fact published. The frame now falls back to the revision visitors are seeing: with no newer work,
+the live copy is the answer. `8a3e237`, with `the_preview_frame_survives_a_publish_and_falls_back_to_the_live_revision`
+verified **red without the fix** (404 against the assertion's 200) and green with it.
+
+The other one is the same rule in five places. `useContentTenant` exists precisely so the rule is
+written once, and `9226e21` used it for the pattern library's list and the template gallery — then
+fixed the *reads* and stopped. The library listed fine and **New pattern** answered `400`: the
+create form is a separate component and never got the value. Re-run, the editor's **save as pattern**
+— a *different* component again, 200 lines down — was the next 400. Re-run again, **Insert pattern**
+was the next, because `fetchPatternBlocks` sends its tenant on the query string and sent none.
+`236a443`, `094c890`, `17073c5`.
+
+**Proof.**
+- `cargo test -p omnion-api --test content_blocks` → **20 passed, 0 failed** (`--test-threads=1`;
+  this crate creates and drops a database per test, so parallel runs contend and produce
+  `PoolTimedOut` that is not a defect).
+- The new preview test: red with the route change reverted, green with it restored.
+- `pnpm typecheck` → **2/2**.
+- `--only=block-editor` against `QA_STACK=w2`: `created true`, `reordered/duplicated/deleted/saved/
+  published true`, `historyCoversFifty true` (depth 70), `outlineWarningShown`/`Cleared true`,
+  `columnsInserted`/`breadcrumbReachesNested true`, `landedInEditor` + `templateBlocksOnPage 11` +
+  `sampleContentIntact` for the template gallery, and the preview frame reporting `draft v6 /
+  visitors see v6` where it used to 404.
+- `netFailures` on the last run: 3 — two `409` on `POST /pages` and `POST /pages/from-template`, which
+  are the pass re-using a slug on a database it did not reset (the API refusing correctly), and one
+  `400` on the pattern blocks read, which is the defect fixed in `17073c5` above.
+
+**Commits.** `8a3e237` (the preview fallback + its test), `236a443` (the pattern create's tenant, and
+`--only=block-editor`), `094c890` (save-as-pattern's tenant), `17073c5` (the blocks read's tenant).
+
+**Next.** Acceptance 17 is still open on one number: `publicRendered` reads false because the public
+renderer answers `404` for the QA page's slug — the pass navigates `?site=main`, and the page it
+published carries the slug `qa-block-page` on the `QA Site` it was created in. That is either a
+harness address or a site-scoping defect, and it is the only thing between REQ-063 and `done`. The
+verifying run against `17073c5` is in flight; read its `netFailures` before deciding. Do **not** run
+a full pass to check it — `--only=block-editor` answers the same question in ten minutes.
