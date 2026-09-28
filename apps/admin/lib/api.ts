@@ -3879,3 +3879,153 @@ export function fetchDeploymentKeyUses(
 ): Promise<{ key_id: string; uses: DeploymentKeyUse[] }> {
   return request(`/api/v1/deployment-keys/${encodeURIComponent(id)}/uses?limit=${limit}`);
 }
+
+/* ── the secrets audit trail (REQ-125, slice 4) ─────────────────────────────────────────────────
+ *
+ * Nothing in this block can return a credential value, and the type shapes are the reason: there
+ * is no field on `SecretAuditEntry` that could hold one. The API answers with an explicit field
+ * allowlist rather than redacting a whole row, so a column added to the trail later cannot appear
+ * in the feed unasked.
+ */
+
+/** One row of the access trail. Metadata only. */
+export type SecretAuditEntry = {
+  id: number;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  actor_user_id: string | null;
+  /** `user`, `agent`, `service` or `system` — the chip that separates a person from a pipeline. */
+  actor_type: string;
+  ip_address: string | null;
+  /** The id the caller was handed in its error banner, so a refusal joins to the row. */
+  request_id: string | null;
+  lease_id: string | null;
+  deployment_key_id: string | null;
+  pipeline: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+/** The detector thresholds, plus the sentence that explains them. */
+export type SecretAuditDetectors = {
+  business_hours_start: number;
+  business_hours_end: number;
+  reveal_burst_per_hour: number;
+  detect_new_network: boolean;
+  /** Always `false` in this build, and rendered as such rather than hidden. */
+  hard_rule_enforced: boolean;
+  explanation: string;
+};
+
+/** One advisory flag. Never a gate: acknowledging it is the only write the screen can make. */
+export type SecretAnomaly = {
+  id: number;
+  pattern: string;
+  severity: string;
+  secret_id: string | null;
+  secret_name: string | null;
+  actor_user_id: string | null;
+  address: string | null;
+  detail: Record<string, unknown>;
+  request_id: string | null;
+  created_at: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+};
+
+/** The audit screen in one read: the trail, the open-flag count and the thresholds. */
+export type SecretAuditResponse = {
+  entries: SecretAuditEntry[];
+  open_anomalies: number;
+  /** The action names the filter offers, generated server-side from what is actually written. */
+  filters: string[];
+  detectors: SecretAuditDetectors;
+  /** The installation's local hour, which is what "off hours" is measured against. */
+  local_hour: number;
+};
+
+/** The filters the trail can be narrowed by. Every field is optional; empty means "no narrowing". */
+export type SecretAuditFilter = {
+  actions?: string[];
+  secretId?: string;
+  actorUserId?: string;
+  address?: string;
+  requestId?: string;
+  since?: string;
+  limit?: number;
+};
+
+/**
+ * Build the query string.
+ *
+ * `action` repeats rather than joining: a collector reading the request line can see each
+ * selected action, and a single comma-joined value would have to be re-split with a guess about
+ * whether a name could contain a comma.
+ */
+function auditQuery(filter: SecretAuditFilter = {}): string {
+  const query = new URLSearchParams();
+  for (const action of filter.actions ?? []) query.append("action", action);
+  if (filter.secretId) query.set("secret_id", filter.secretId);
+  if (filter.actorUserId) query.set("actor_user_id", filter.actorUserId);
+  if (filter.address) query.set("address", filter.address);
+  if (filter.requestId) query.set("request_id", filter.requestId);
+  if (filter.since) query.set("since", filter.since);
+  if (filter.limit) query.set("limit", String(filter.limit));
+  const text = query.toString();
+  return text ? `?${text}` : "";
+}
+
+/** Read the access trail. The filters the screen offers come back in `filters`. */
+export function fetchSecretAudit(
+  filter: SecretAuditFilter = {},
+): Promise<SecretAuditResponse> {
+  return request<SecretAuditResponse>(`/api/v1/secrets/audit${auditQuery(filter)}`);
+}
+
+/** Read the flags on their own, for the popover on the header count. */
+export function fetchSecretAnomalies(): Promise<{ anomalies: SecretAnomaly[] }> {
+  return request<{ anomalies: SecretAnomaly[] }>("/api/v1/secrets/audit/anomalies");
+}
+
+/**
+ * Clear one flag.
+ *
+ * The API answers `already_acknowledged` rather than a change that did not happen, because a
+ * second click on a row is a normal thing for a panel to do.
+ */
+export function acknowledgeSecretAnomaly(
+  id: number,
+): Promise<{ state: "acknowledged" | "already_acknowledged"; id: number }> {
+  return request(`/api/v1/secrets/audit/anomalies/${id}/acknowledge`, {
+    method: "PATCH",
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * The SIEM feed, as newline-delimited JSON.
+ *
+ * This one does not go through `request`: that helper insists on a JSON answer and would have
+ * needed a second shape for the identical bytes. The endpoint is a plain download and the browser
+ * gets it as one — which is also why the trail it writes about the export is worth having.
+ */
+export async function downloadSecretAuditExport(filter: SecretAuditFilter = {}): Promise<string> {
+  const response = await fetch(`/api/v1/secrets/audit/export${auditQuery(filter)}`, {
+    credentials: "same-origin",
+    headers: { accept: "application/x-ndjson" },
+  });
+  if (!response.ok) {
+    // Parsed with the same helper so an export refusal renders the same error card as a listing
+    // refusal, request id and all, rather than as a blank download.
+    const body = await response.json().catch(() => null);
+    throw new ApiError(
+      response.status,
+      (body as { error?: { code?: string; message?: string } } | null)?.error?.code ??
+        "export_failed",
+      (body as { error?: { code?: string; message?: string } } | null)?.error?.message ??
+        "The audit export could not be produced.",
+    );
+  }
+  return response.text();
+}

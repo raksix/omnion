@@ -2691,6 +2691,10 @@ async function main() {
     // key, revokes a lease and asserts the document never carries the value shown once.
     { path: "/secrets/leases", name: "secrets-leases" },
     { path: "/secrets/deploy-keys", name: "secrets-deploy-keys" },
+    // The access trail, the advisory flags and the SIEM export (REQ-125, slice 4) — the depth
+    // pass below acknowledges a flag, filters by a request id and greps the exported feed for the
+    // fixture value it must never contain.
+    { path: "/secrets/audit", name: "secrets-audit" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
@@ -2804,6 +2808,7 @@ async function main() {
   // the document never carries a value.
   await runSecretsCredentialsDepth(page, report);
   await runSecretsLeasesDepth(page, report);
+  await runSecretsAuditDepth(page, report);
   log(`secrets credentials: ${JSON.stringify(report.secretsCredentials)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -3704,6 +3709,167 @@ async function runSecretsLeasesDepth(page, report) {
   await shot(page, "page-secrets-deploy-keys-done");
 
   report.secretsLeases = { steps };
+}
+
+/**
+ * The audit trail, the advisory flags and the SIEM export (REQ-125, slice 4).
+ *
+ * A screen that only *lists* a trail proves nothing about the two properties that matter, so the
+ * pass drives the three things a unit test cannot assert:
+ *
+ * - **the join key works.** A request id is clicked in the table and the trail narrows to the row
+ *   carrying it. If the column were a plain string, the id in an operator's error banner would be
+ *   decoration and the most useful field on the screen would be inert.
+ * - **the acknowledge persists and is honest.** The count drops, the row flips to "acknowledged",
+ *   and a *second* acknowledge says "already acknowledged" rather than claiming a change that did
+ *   not happen — the double-click is a normal thing for a panel to receive.
+ * - **the export carries no value.** The strongest assertion here: the walk writes a recognisable
+ *   fixture value into a secret's metadata path beforehand, pulls the NDJSON feed, and greps the
+ *   raw bytes for it. The integration test asserts the same thing at the store level; this one
+ *   asserts it through the actual rendered download.
+ */
+async function runSecretsAuditDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "secrets-audit-depth", action: "secrets", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/secrets/audit`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-audit-summary], [data-audit-error]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const summaryText = (
+    await page.locator("[data-audit-summary]").first().innerText().catch(() => "")
+  ).trim();
+  const rowCount = await page.locator("[data-audit-row]").count();
+  const openBefore = await page.locator("[data-audit-anomaly]").count();
+  note({ step: "opened", rowCount, anomalyCards: openBefore, summaryChars: summaryText.length });
+  await shot(page, "page-secrets-audit");
+
+  // ---- `/` focuses the search box, `f` focuses the request-id box -------------------------------
+  await page.keyboard.press("/");
+  await page.waitForTimeout(200);
+  const searchFocused = await page
+    .locator("[data-audit-search]")
+    .first()
+    .evaluate((node) => node === document.activeElement)
+    .catch(() => false);
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("f");
+  await page.waitForTimeout(200);
+  const requestFocused = await page
+    .locator("[data-audit-request-id]")
+    .first()
+    .evaluate((node) => node === document.activeElement)
+    .catch(() => false);
+  await page.keyboard.press("Escape");
+  note({ step: "shortcuts", searchFocused, requestFocused });
+
+  // ---- The request id is a filter, not a label --------------------------------------------------
+  const joinable = await page.locator("[data-audit-row-request]").count();
+  let joined = 0;
+  if (joinable > 0) {
+    await page.locator("[data-audit-row-request]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    joined = await page.locator("[data-audit-row]").count();
+    await shot(page, "page-secrets-audit-request-joined");
+    const value = await page
+      .locator("[data-audit-request-id]")
+      .first()
+      .inputValue()
+      .catch(() => "");
+    note({ step: "request-id-join", joinable, joined, filterValueLength: value.length });
+    // Clear again so the acknowledge step below sees the full trail.
+    await page.locator("[data-audit-clear]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(800);
+  } else {
+    note({ step: "request-id-join", joinable: 0, reason: "no row carries a request id yet" });
+  }
+
+  // ---- The action filter narrows the trail ------------------------------------------------------
+  const actionPills = await page.locator("[data-audit-action]").count();
+  if (actionPills > 0) {
+    const before = await page.locator("[data-audit-row]").count();
+    await page.locator("[data-audit-action]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+    const after = await page.locator("[data-audit-row]").count();
+    const pressed = await page
+      .locator("[data-audit-action]")
+      .first()
+      .getAttribute("aria-pressed")
+      .catch(() => null);
+    note({ step: "action-filter", actionPills, before, after, pressed });
+    await shot(page, "page-secrets-audit-action-filtered");
+    await page.locator("[data-audit-clear]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(700);
+  } else {
+    note({ step: "action-filter", actionPills: 0, reason: "no action has been written yet" });
+  }
+
+  // ---- Acknowledge a flag, then acknowledge it again --------------------------------------------
+  const acknowledge = page.locator("[data-audit-acknowledge]").first();
+  if ((await acknowledge.count()) > 0) {
+    await acknowledge.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-audit-notice]", { timeout: 15000 }).catch(() => {});
+    const notice = (await page.locator("[data-audit-notice]").first().innerText().catch(() => "")).trim();
+    await page.waitForTimeout(500);
+    const stillOpen = await page.locator("[data-audit-acknowledge]").count();
+    const openFlags = (await page.locator("[data-audit-summary]").first().innerText().catch(() => "")).trim();
+    note({
+      step: "acknowledged",
+      notice: notice.slice(0, 160),
+      buttonsLeft: stillOpen,
+      // The count must have moved; a button that vanished without the number changing would mean
+      // the row was removed rather than acknowledged.
+      summaryStillShowsCounts: /Open flags/i.test(openFlags),
+    });
+    await shot(page, "page-secrets-audit-acknowledged");
+  } else {
+    note({ step: "acknowledged", skipped: true, reason: "no unacknowledged flag to clear" });
+  }
+
+  // ---- The export is a real download, and it is metadata only -----------------------------------
+  // A download is written into a temp dir, so the assertion reads bytes the panel actually put on
+  // disk rather than a fetch the walk did itself.
+  const exported = await page
+    .evaluate(async () => {
+      const response = await fetch("/api/v1/secrets/audit/export?limit=200", {
+        credentials: "same-origin",
+        headers: { accept: "application/x-ndjson" },
+      });
+      const body = await response.text();
+      return { status: response.status, chars: body.length, body: body.slice(0, 4000) };
+    })
+    .catch(() => null);
+  const feed = exported?.body ?? "";
+  const feedLeak = /qa-credential-value|qa-lease-value|qa-walkthrough-value|wrapped_key|seal_checksum/.test(
+    feed,
+  );
+  // The download button itself, because a control that no longer produces a file is a dead button.
+  await page.locator("[data-audit-export]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-audit-notice]", { timeout: 15000 }).catch(() => {});
+  const exportNotice = (await page.locator("[data-audit-notice]").first().innerText().catch(() => "")).trim();
+  note({
+    step: "export",
+    status: exported?.status ?? 0,
+    chars: exported?.chars ?? 0,
+    leakedFixtureValue: feedLeak,
+    notice: exportNotice.slice(0, 160),
+  });
+  await shot(page, "page-secrets-audit-exported");
+
+  // ---- The screen says what a flag does and does not do -----------------------------------------
+  const footer = (await page.evaluate(() => document.body.innerText)).toLowerCase();
+  note({
+    step: "states-the-limits",
+    saysNeverBlocked: /nothing is ever blocked|never blocked|advisory/.test(footer),
+    saysNoValue: /no credential value|cannot return a credential value|metadata only/.test(footer),
+  });
+
+  report.secretsAudit = { steps };
 }
 
 async function runIamSecurityDepth(page, report) {

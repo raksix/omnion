@@ -40,6 +40,7 @@ const NAV = [
   { href: "/secrets/slots", label: "Credential slots", icon: Network },
   { href: "/secrets/leases", label: "Leases", icon: Timer },
   { href: "/secrets/deploy-keys", label: "Deployment keys", icon: KeyRound },
+  { href: "/secrets/audit", label: "Audit & flags", icon: ShieldCheck },
 ] as const;
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
