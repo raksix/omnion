@@ -2903,3 +2903,39 @@ the REQ was resting on it.
 **Next.** The re-run decides whether REQ-051's error box closes, or whether the state sweep finds
 that a screen with a working error state still has a broken *load* state. Then the 390×844 pass and
 the keyboard sheet, which are the two boxes after it.
+
+## 2026-09-28 — REQ-051, the CRM was unreachable on a first-run installation
+
+**What.** The scoped pass (`--only=crm`, added this tick) found that after the tenant fix every
+CRM read *and* write answers `organization_required`: no contact, company, deal or activity could
+be created or listed by the account the panel is used with. `organization_of` resolves a caller
+that cannot name an organization from the **tenant bindings** it holds, and the platform owner of
+a first-run installation holds the `global` Owner role and nothing else — the owner role is a
+`global` binding by construction, so the tenant list is empty. The refusal's own advice,
+"pass organization_id", is impossible to follow: naming a tenant requires the very permission that
+binding would have carried. The `[]` arm now falls back to the installation's organization when
+there is **exactly one**, and only then; two or more is still `organization_ambiguous`.
+
+**Proof.**
+- `cargo test -p omnion-api --lib routes::crm` — **27/27** (three new: the one-organization
+  fallback, the two-organization refusal, and the no-organization sentence no longer naming a
+  parameter the caller cannot supply).
+- `cargo test -p omnion-module-crm --lib` — **172/172**.
+- `pnpm turbo run typecheck --force` — **2/2**.
+- Live, before the fix: `GET /api/v1/crm/contacts` and `/api/v1/crm/contacts/export` as the QA owner
+  both answered `400 organization_required` with a `request_id`, and the database held **one**
+  organization and **zero** CRM rows — the empty state the pass reported was the refusal wearing an
+  empty list's clothes.
+- Scoped pass `20260928-155321-crm` (7 routes, `--only=crm`): `contactsEmptyState: true` against a
+  screen that had never loaded — the false green this tick exists to end.
+
+**Commits.** `a8e3f53` the scoped pass · `e7ba429` the one-organization fallback.
+
+**Next.** Restart the w4 QA API onto the rebuilt binary and re-run `--only=crm`: the depth passes
+that never got to run (deals, activities, copilot, leads, the state sweep) are what decide whether
+REQ-051's empty/loading/error box closes. The 390x844 and keyboard boxes are still open after it.
+
+**Environment.** `/mnt/apopic` hit 100% mid-build and the box-wide disk guard deleted this
+worktree's whole `target/`, so the build is now on `CARGO_TARGET_DIR=.tmp-target` (the repo's own
+convention, and it is the same tree the guard spares). Load sat at ~316 for ten minutes: seven
+writers compile at once, so a build can sit at 0% CPU for minutes before it is scheduled at all.
