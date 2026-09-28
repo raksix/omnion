@@ -43,9 +43,10 @@ pub use library::{delete_media, find_media, insert_media, list_media};
 pub use model::{MAX_FILENAME_LENGTH, MAX_UPLOAD_BYTES, Media, MediaFile, NewMedia};
 pub use pixels::{Box2, Transformed, apply, decode, target_box, transform_bytes};
 pub use preset_store::{
-    NewDerivative, Served, clear_derivatives, create_preset, delete_preset, derivative_filename,
-    derivative_keys, derivative_totals, find_derivative, find_preset, find_preset_by_name,
-    insert_derivative, list_derivatives, list_presets, require_preset, served_for, update_preset,
+    NewDerivative, STANDARD_PRESET, Served, clear_derivatives, create_preset, delete_preset,
+    derivative_filename, derivative_keys, derivative_totals, ensure_default_presets,
+    find_derivative, find_preset, find_preset_by_name, insert_derivative, list_derivatives,
+    list_presets, require_preset, require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
 pub use transform::{
