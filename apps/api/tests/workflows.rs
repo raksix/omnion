@@ -1321,8 +1321,17 @@ async fn unusable_definitions_are_refused_with_the_engine_codes() {
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
-            "unknown action",
+            // `http_request` IS a known action, so the refusal here is about its *parameters*,
+            // not about the name: the case used to name it as "unknown" and stopped being true
+            // in slice 2, when the action library landed. An action the engine really does not
+            // know is covered by the case below.
+            "known action without its required parameter",
             json!([{ "name": "prepare", "kind": "task", "action": "http_request" }]),
+            "invalid_step_params",
+        ),
+        (
+            "an action the engine does not know",
+            json!([{ "name": "prepare", "kind": "task", "action": "not_an_action" }]),
             "invalid_step_action",
         ),
         (
