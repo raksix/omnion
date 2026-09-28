@@ -320,6 +320,22 @@ pub struct AiModel {
     pub supports_json_mode: bool,
     /// Largest answer the model advertises, when it says.
     pub max_output_tokens: Option<i32>,
+    /// Micros of a currency per million input tokens, when known (REQ-098).
+    ///
+    /// Stored in micros and per **million** so a whole-cent price never rounds away and so the
+    /// number can be compared with a vendor's own price page. The panel renders it per 1K; the
+    /// column does not change when the panel does.
+    pub input_cost_micros_per_mtok: Option<i64>,
+    /// Micros of a currency per million output tokens, when known (REQ-098).
+    pub output_cost_micros_per_mtok: Option<i64>,
+    /// Where the price came from: `manual`, `discovery` or `probe` (REQ-098).
+    pub price_source: String,
+    /// When the price was last written down (REQ-098).
+    pub price_updated_at: Option<OffsetDateTime>,
+    /// Where the capability flags came from: `manual`, `discovery` or `probe` (REQ-098).
+    pub capabilities_source: String,
+    /// When the capability flags were last confirmed against something (REQ-098).
+    pub capabilities_verified_at: Option<OffsetDateTime>,
     /// `false` when the operator switched the model off.
     pub enabled: bool,
     /// `true` for the installation's default model.
@@ -372,6 +388,25 @@ impl AiModel {
             .copied()
             .filter(|capability| self.capability(*capability))
             .collect()
+    }
+
+    /// What this model costs, as the catalog reads it.
+    ///
+    /// One accessor so the table, the detail screen, the CSV export and the cost estimator all
+    /// read the *same* two columns — a screen that built its own `PriceView` from the raw fields
+    /// would be one refactor away from rounding differently from the screen beside it.
+    #[must_use]
+    pub fn price(&self) -> crate::catalog::ModelPrice {
+        crate::catalog::ModelPrice {
+            input_micros_per_mtok: self.input_cost_micros_per_mtok,
+            output_micros_per_mtok: self.output_cost_micros_per_mtok,
+            // An unrecognised source string in the database must not read as `Manual` — that
+            // would file a discovery-reported price as an operator's estimate. The fallback is
+            // the honest middle: it *is* a price somebody found, and the panel will say so.
+            source: crate::catalog::PriceSource::parse(&self.price_source)
+                .unwrap_or(crate::catalog::PriceSource::Manual),
+            updated_at: self.price_updated_at,
+        }
     }
 }
 
@@ -495,6 +530,20 @@ pub struct ModelChanges {
     pub supports_json_mode: Option<bool>,
     /// New answer ceiling.
     pub max_output_tokens: Option<Option<i32>>,
+    /// New input price in micros per million tokens; `Some(None)` clears it.
+    ///
+    /// Double-`Option` for the same reason `max_output_tokens` is: `None` means "the caller said
+    /// nothing" and `Some(None)` means "erase the price". A single `Option<i64>` cannot say
+    /// "remove this" and would make a price impossible to clear.
+    pub input_cost_micros_per_mtok: Option<Option<i64>>,
+    /// New output price in micros per million tokens; `Some(None)` clears it.
+    pub output_cost_micros_per_mtok: Option<Option<i64>>,
+    /// New price source (`manual`, `discovery` or `probe`).
+    pub price_source: Option<String>,
+    /// When the capability flags were last confirmed against something.
+    pub capabilities_verified_at: Option<OffsetDateTime>,
+    /// New capability source (`manual`, `discovery` or `probe`).
+    pub capabilities_source: Option<String>,
 }
 
 impl ModelChanges {
@@ -995,6 +1044,12 @@ mod tests {
             supports_transcription: false,
             supports_json_mode: false,
             max_output_tokens: None,
+            input_cost_micros_per_mtok: None,
+            output_cost_micros_per_mtok: None,
+            price_source: "manual".to_owned(),
+            price_updated_at: None,
+            capabilities_source: "manual".to_owned(),
+            capabilities_verified_at: None,
             enabled: true,
             is_default: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1062,6 +1117,12 @@ mod tests {
             supports_transcription: false,
             supports_json_mode: false,
             max_output_tokens: None,
+            input_cost_micros_per_mtok: None,
+            output_cost_micros_per_mtok: None,
+            price_source: "manual".to_owned(),
+            price_updated_at: None,
+            capabilities_source: "manual".to_owned(),
+            capabilities_verified_at: None,
             enabled: true,
             is_default: false,
             created_at: OffsetDateTime::UNIX_EPOCH,

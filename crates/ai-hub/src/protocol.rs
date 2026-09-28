@@ -886,7 +886,8 @@ mod tests {
 
         // The other two protocols spell it their own way and must stay untouched by this.
         for protocol in ["anthropic_messages", "google_gemini"] {
-            let body = adapter_for(protocol).build_chat(&request(vec![ChatMessage::user("hi")]), true);
+            let body =
+                adapter_for(protocol).build_chat(&request(vec![ChatMessage::user("hi")]), true);
             assert!(
                 body.get("stream_options").is_none(),
                 "{protocol}: this field is an OpenAI-compatible one"

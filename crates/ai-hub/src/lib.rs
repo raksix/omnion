@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod client;
 pub mod connection_test;
 pub mod error;
@@ -25,6 +26,15 @@ pub mod protocol;
 pub mod router;
 pub mod store;
 
+pub use catalog::{
+    CapabilityFilter, CatalogEntry, CatalogQuery, CatalogSort, LONG_CONTEXT_TOKENS,
+    MICROS_CEILING_PER_MTOK, MICROS_FLOOR_PER_MTOK, MODEL_FEATURES, ModelFeatures, ModelPrice,
+    ModelUsage, PRICE_STALE_DAYS, PriceHalf, PriceSource, PriceView, ROUTE_REQUIREMENTS,
+    ROUTING_TASKS, TOKENS_PER_MTOK, can_serve_task, catalog_entry, cmp_price,
+    feature_description, long_context_minimum, model_features, price_age_days, price_is_stale,
+    requirement_capability, requirement_refusal_reason, routing_tasks, task_description,
+    task_refusal_reason, validate_feature, validate_price, validate_requirement, validate_task,
+};
 pub use client::{
     ChatEvent, ChatMessage, ChatOutcome, ChatRequest, ChatRole, ChatUsage, ProviderTarget, chat,
     list_remote_models, stream_chat, validate_request,

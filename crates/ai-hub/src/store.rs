@@ -12,6 +12,7 @@
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::catalog;
 use crate::error::{AiHubError, Result};
 use crate::model::{
     AiModel, ApiKeyChange, DiscoveryAction, DiscoveryDiff, MAX_DISPLAY_NAME_LEN, ModelChanges,
@@ -33,7 +34,10 @@ const PROVIDER_COLUMNS: &str = "id, name, protocol, kind, base_url, api_key, tim
 const MODEL_COLUMNS: &str = "id, provider_id, model_key, display_name, context_window, \
      supports_tools, supports_vision, supports_streaming, supports_embeddings, \
      supports_image_generation, supports_audio_generation, supports_transcription, \
-     supports_json_mode, max_output_tokens, enabled, is_default, created_at, updated_at";
+     supports_json_mode, max_output_tokens, input_cost_micros_per_mtok, \
+     output_cost_micros_per_mtok, price_source, price_updated_at, \
+     capabilities_source, capabilities_verified_at, \
+     enabled, is_default, created_at, updated_at";
 
 // ---------------------------------------------------------------------------------------------
 // Providers
@@ -457,6 +461,48 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
         .unwrap_or(current.max_output_tokens);
     validate_token_limits(context_window, max_output_tokens)?;
 
+    // The price is validated **before** anything is written, and both halves are named in one
+    // message. Validating after the update would leave a row whose input price landed and whose
+    // output price did not — a half-applied price is worse than a refused one, because the next
+    // cost estimate would read the new input rate against the old output rate and neither is
+    // what the operator typed.
+    let input_cost = changes
+        .input_cost_micros_per_mtok
+        .unwrap_or(current.input_cost_micros_per_mtok);
+    let output_cost = changes
+        .output_cost_micros_per_mtok
+        .unwrap_or(current.output_cost_micros_per_mtok);
+    catalog::validate_price(input_cost, output_cost)?;
+
+    let price_source = match changes.price_source.as_deref() {
+        None => current.price_source.clone(),
+        Some(source) => {
+            catalog::PriceSource::parse(source).ok_or_else(|| {
+                AiHubError::InvalidModel(format!(
+                    "price source \"{source}\" is not one of ({})",
+                    catalog::PriceSource::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+            source.to_owned()
+        }
+    };
+
+    let capabilities_source = match changes.capabilities_source.as_deref() {
+        None => current.capabilities_source.clone(),
+        Some(source) => {
+            catalog::PriceSource::parse(source).ok_or_else(|| {
+                AiHubError::InvalidModel(format!(
+                    "capabilities source \"{source}\" is not one of (manual, discovery, probe)"
+                ))
+            })?;
+            source.to_owned()
+        }
+    };
+
     let display_name = changes.display_name.as_deref().map(str::trim);
     if let Some(name) = display_name
         && name.chars().count() > MAX_DISPLAY_NAME_LEN
@@ -479,10 +525,33 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
          supports_transcription = coalesce($11, supports_transcription), \
          supports_json_mode = coalesce($12, supports_json_mode), \
          max_output_tokens = case when $13 then $14 else max_output_tokens end, \
+         input_cost_micros_per_mtok = case when $16 then $17 else input_cost_micros_per_mtok end, \
+         output_cost_micros_per_mtok = case when $18 then $19 else output_cost_micros_per_mtok end, \
+         price_source = $20, \
+         -- `price_updated_at` is stamped whenever *any* half of the price was written, including
+         -- a write that cleared it. A cleared price has no age -- the column goes back to null
+         -- with the halves -- so the panel reads 'no price' rather than a price from 2024.
+         price_updated_at = case \
+           when $16 or $18 then case when $17 is null and $19 is null then null else now() end \
+           else price_updated_at end, \
+         capabilities_source = $21, \
+         capabilities_verified_at = $22, \
          enabled = $2, is_default = $15, updated_at = now() \
          where id = $1 returning {MODEL_COLUMNS}"
     );
     let (set_ceiling, ceiling) = match changes.max_output_tokens {
+        None => (false, None),
+        Some(value) => (true, value),
+    };
+    // The two `case when` arms need a boolean *and* a value because a bare `coalesce` cannot
+    // express "set this to null": `coalesce(null, column)` returns the column, so clearing a
+    // price with a coalesce would silently keep the old number. The boolean is the intent flag
+    // and the value is what to write — the same shape `max_output_tokens` above already uses.
+    let (set_input_price, input_price) = match changes.input_cost_micros_per_mtok {
+        None => (false, None),
+        Some(value) => (true, value),
+    };
+    let (set_output_price, output_price) = match changes.output_cost_micros_per_mtok {
         None => (false, None),
         Some(value) => (true, value),
     };
@@ -502,6 +571,13 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
         .bind(set_ceiling)
         .bind(ceiling)
         .bind(is_default)
+        .bind(set_input_price)
+        .bind(input_price)
+        .bind(set_output_price)
+        .bind(output_price)
+        .bind(price_source)
+        .bind(capabilities_source)
+        .bind(changes.capabilities_verified_at)
         .fetch_one(&mut *tx)
         .await?;
 
