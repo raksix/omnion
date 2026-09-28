@@ -25,6 +25,7 @@ pub mod engine;
 pub mod error;
 pub mod handler;
 pub mod model;
+pub mod registry;
 pub mod store;
 
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
@@ -34,4 +35,10 @@ pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
 pub use model::{
     ExecutionStatus, NewWorkflow, StepKind, StepStatus, TriggerKind, Workflow, WorkflowExecution,
     WorkflowStep,
+};
+pub use registry::{
+    Capability, CredentialDefinition, CredentialField, CredentialKind, FieldType, LintFinding,
+    NodeCategory, NodeDefinition, OAuthConfig, ParamHint, ParamSpec, Port, PortKind, Sandbox,
+    credential_type_keys, credential_types, find_credential_type, find_node, lint, node_keys,
+    nodes,
 };
