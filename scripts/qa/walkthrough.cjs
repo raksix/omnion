@@ -5129,16 +5129,22 @@ async function runBlockEditorDepth(page, report) {
   // The visibility control lives in the inspector's Visibility section, and its effect on the
   // canvas is a badge — a setting that changes nothing on screen is a setting nobody can check.
   //
-  // The badge is asserted on the SELECTED block, not on the page. `hide_on` belongs to one
-  // block's `meta`, the control is the selected block's, and the badge is drawn by that block
-  // row — so a page-wide count answers "does any block have this badge" and the pass sets it on
-  // one. A different block that was already hidden makes that true on a run where the step
-  // failed, which is the same class of error as a page-wide counter read as an item's own state.
+  // The heading is selected FIRST, explicitly. The control is the selected block's control and
+  // the badge is drawn by that block's row, so "set it and see the badge" is only meaningful on
+  // a known block. By this point the selection is whatever the last nesting step left, so the
+  // step is asserting about a block it never chose — and the page-wide count it used to read
+  // could be satisfied by some other block entirely. Proven by hand on the same stack: with
+  // the heading selected, `hide_on` reads `none` → `mobile` and the badge reads "Not on phones".
+  await page.locator('[data-block-canvas-block=heading] button[aria-label^="Select"]').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const selectedRow = page.locator('[data-block-canvas-block][data-block-selected=true]').first();
+  steps.visibilityTarget = await selectedRow.getAttribute("data-block-canvas-block").catch(() => null);
   const hideOn = page.locator("[data-block-hide-on]").first();
   steps.visibilityControlPresent = (await hideOn.count()) > 0;
+  steps.hideOnBefore = await hideOn.inputValue().catch(() => null);
   await hideOn.selectOption("mobile").catch(() => {});
-  await page.waitForTimeout(1200);
-  const selectedRow = page.locator('[data-block-canvas-block][data-block-selected=true]').first();
+  await page.waitForTimeout(1400);
+  steps.hideOnAfter = await hideOn.inputValue().catch(() => null);
   const badgeRow = (await selectedRow.count()) > 0 ? selectedRow : page.locator('[data-block-canvas-block=heading]').first();
   steps.hiddenBadge = (await badgeRow.locator("[data-block-hidden-on=mobile]").count()) > 0;
   steps.hiddenBadgeText = (
