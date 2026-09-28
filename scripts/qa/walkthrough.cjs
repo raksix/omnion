@@ -4228,6 +4228,101 @@ async function runBlockEditorDepth(page, report) {
     note("compared two revisions of the QA page");
   }
 
+  // ---- The inline-editing preview frame (REQ-063 slice 2) ---------------------------------
+  // "Inline editing saves one draft revision per save, shows the revision number in the toast,
+  // and never publishes." Three claims, and only the last one is about a *rule* rather than a
+  // control — the other two are observable, so a pass that only counted revisions would miss an
+  // implementation that published on every save.
+  if (pageId) {
+    await page
+      .goto(`${URL_ADMIN}/pages/${pageId}/preview`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForSelector("[data-block-preview]", { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+
+    // The banner is the screen's contract with the author: this is a draft and it says which.
+    steps.previewBanner = (await page.locator("[data-block-preview-banner]").innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    const draftNo = await page
+      .locator("[data-block-preview-banner]")
+      .getAttribute("data-block-preview-draft")
+      .catch(() => null);
+    const liveNo = await page
+      .locator("[data-block-preview-banner]")
+      .getAttribute("data-block-preview-live")
+      .catch(() => null);
+    steps.previewDraftNo = draftNo;
+    steps.previewLiveNo = liveNo;
+    steps.previewSaysDraft = /draft/i.test(steps.previewBanner);
+    // There is no publish control on this screen at all — not a disabled one, not a hidden one.
+    steps.previewHasNoPublish = (await page.locator("[data-block-preview] [data-block-publish]").count()) === 0;
+    steps.previewDrawnBlocks = await page.locator("[data-block-preview-frame] [data-block-canvas-block]").count();
+    await shot(page, "page-block-preview");
+
+    // The screen switch is a server round trip, and the two payloads genuinely differ: a block
+    // the author hid from phones is ABSENT, not invisible.
+    await page.locator("[data-block-preview-viewport=mobile]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    steps.previewPhoneActive =
+      (await page.locator("[data-block-preview-frame]").getAttribute("data-block-preview-viewport-active")) === "mobile";
+    steps.previewPhoneBlocks = await page.locator("[data-block-preview-frame] [data-block-canvas-block]").count();
+    steps.previewPhoneNarrower = await page
+      .locator("[data-block-preview-frame]")
+      .evaluate((node) => node.getBoundingClientRect().width);
+    steps.previewCounts = {
+      block: await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-block-count"),
+      visible: await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-visible-count"),
+    };
+    await shot(page, "page-block-preview-phone");
+    await page.locator("[data-block-preview-viewport=desktop]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    note("switched the frame between screens");
+
+    // Inline editing: the toggle makes the page's own text editable, a keystroke marks the page
+    // dirty, and the save names the revision the server actually wrote.
+    await page.locator("[data-block-preview-toggle-edit]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    steps.previewEditingOn =
+      (await page.locator("[data-block-preview-toggle-edit]").getAttribute("aria-pressed")) === "true";
+    const field = page.locator("[data-block-inline-field]").first();
+    steps.previewInlineFields = await page.locator("[data-block-inline-field]").count();
+    if ((await field.count()) > 0) {
+      await field.click({ timeout: 5000 }).catch(() => {});
+      await page.keyboard.press("End").catch(() => {});
+      await page.keyboard.type(" Typed in the QA frame.").catch(() => {});
+      await page.waitForTimeout(700);
+    }
+    steps.previewDirtyAfterTyping =
+      (await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-dirty")) === "true";
+    steps.previewSaveEnabled = !(await page.locator("[data-block-preview-save]").isDisabled());
+    await shot(page, "page-block-preview-editing");
+
+    // The save. The number in the toast is the assertion: it must name a revision HIGHER than
+    // the frame's own draft, and the live number must not move.
+    const beforeSaveNo = Number(draftNo || 0);
+    await page.locator("[data-block-preview-save]").first().click({ timeout: 10000 }).catch(() => {});
+    await page.waitForSelector("[data-block-preview-toast]", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.previewToast = (
+      await page.locator("[data-block-preview-toast]").innerText().catch(() => "")
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+    steps.previewToastNamesRevision = /revision\s*\d+/i.test(steps.previewToast);
+    const afterSaveNo = await page
+      .locator("[data-block-preview-banner]")
+      .getAttribute("data-block-preview-draft")
+      .catch(() => null);
+    steps.previewRevisionAdvanced = Number(afterSaveNo) > beforeSaveNo;
+    steps.previewLiveUnchanged =
+      (await page.locator("[data-block-preview-banner]").getAttribute("data-block-preview-live")) === liveNo;
+    steps.previewCleanAfterSave =
+      (await page.locator("[data-block-preview-status]").getAttribute("data-block-preview-dirty")) === "false";
+    await shot(page, "page-block-preview-saved");
+    note("typed in the frame and saved a draft revision");
+  }
+
   report.blockEditor = steps;
   return steps;
 }
