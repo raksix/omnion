@@ -1763,3 +1763,46 @@
 - **Next.** REQ-097 slice 2 — the capability flags on `ai_models` (image generation, audio
   generation, transcription, JSON mode, `max_output_tokens`), the Models tab, discovery as a
   reviewable diff with an explicit apply, and router enforcement of each flag.
+
+## 2026-09-27 — REQ-097 slice 2 · Capability flags and the discovery diff
+
+- **What.** The model registry stops being four boolean columns and becomes a closed vocabulary of
+  ten capabilities (`ModelCapability`), read through one accessor so the panel and the router
+  cannot disagree. Migration `0026_ai_model_capabilities.sql` adds image generation, audio
+  generation, transcription, JSON mode and `max_output_tokens` beside 0008's four flags, all
+  defaulting to what the existing rows already claimed. `require_capability` and the new
+  `resolve_for` refuse a request a model cannot serve **before any call leaves the process**: the
+  chat route asks for streaming, so switching it off on the default model answers `400
+  capability_unsupported` with the model's key in the message instead of opening a stream that
+  can only end in an error frame.
+- **Discovery is a diff now.** `POST /ai/providers/{id}/discover-models` reads the endpoint and
+  returns what *applying* it would do — `added` / `changed` / `removed` lines with counts — and
+  writes nothing. `POST /ai/providers/{id}/apply-discovery` is the separate confirming call. The
+  apply reconciles **keys only**: a row that survives keeps every flag the operator gave it, a
+  discovered model claims nothing it was not told (streaming on, the rest off), and a second
+  discovery run over the same endpoint reports `up_to_date: true` with zero lines. A row the
+  endpoint still serves but the operator switched off is reported as `changed` rather than
+  silently re-enabled — the apply leaves that flag alone.
+- **Proof (Rust).** `cargo test -p omnion-ai-hub` → **57 units** (48 before, 9 new: the closed
+  vocabulary round-trips, `chat` is true for every row and `list_models` is a provider fact, a
+  refused capability names both, the token limits refuse a ceiling that cannot fit its context, a
+  diff of the same endpoint twice is empty, a duplicate report is one model, a switched-off served
+  model is reported not reset). `cargo test -p omnion-api --test ai_hub` → **7/7 green** against
+  `omnion_test_w7`, on top of the 6 slice-1 walks. The new walk proves the whole slice against the
+  live mock: the ten-entry catalog travels with the row, streaming off is refused by the router
+  with `mock-small`/`streaming` in the message, `max_output_tokens: 0` and a ceiling over its
+  context are both `400 invalid_model` at edit time, a discovery read leaves the model count at
+  one, the apply adds exactly the diff's one model while the survivor keeps `vision: true` and
+  `max_output_tokens: 2048`, a second discovery is empty, and a planted `retired-model` is
+  reported as one `removed` line.
+- **Proof (web).** `pnpm typecheck` clean, `pnpm --filter @omnion/admin build` green.
+- **One test the change broke, caught by the suite.** The slice-1 walk asserted the discovery
+  response's old `models` array. Two shapes of the same idea now exist — the endpoint's list
+  under `reported` and the diff under the counts — and the assertion moved to the diff, where the
+  question "does the registry already match?" belongs.
+- **Proof (QA).** The private `w7` stack pass (ports 18086/3106/3206, database `omnion_qa_w7`)
+  now opens the model rows' flag editor and reads the catalog it renders, switches `vision` off
+  and back on and reads the notice each time, then runs Discover twice — once for a diff, applies
+  it, and once more for the empty diff that proves the first apply did what it said.
+- **Next.** REQ-097 slice 3 — the health table, the probe runner with pruning, the status
+  computation, the Health and Usage tabs, the failover order UI and the substitution logic.
