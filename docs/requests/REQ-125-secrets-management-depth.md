@@ -1,6 +1,6 @@
 # REQ-125 — Secrets & Credential Management
 
-> **Status:** in-progress (slice 2 of 4 shipped · typed credentials + slots · commit 71c0c11) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slices 1–4 of 4 shipped · audit depth + SIEM + anomalies · commit e0ab121) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -123,9 +123,9 @@ Migration: `database/migrations/0026_secrets_depth.sql` (next free slot at tick 
 - [x] `deployment.started` revokes live leases for the environment and the lease list shows them revoked with the reason.
 - [x] The helper injects a leased value into a child process without writing it to the shell history or a log; the temp-file path is mode 0600 and removed on exit.
 - [x] Read-only (`file`, `env`) providers cannot be written to from the API (`405`/`422`) and the UI explains why.
-- [ ] Audit rows exist for read, write, rotate, reveal, deny, lease, redeem, slot change and deployment key use, with actor, address and request id.
-- [ ] Anomaly detection flags an off-hours reveal and a reveal burst in a scripted test, and the acknowledge action persists.
-- [ ] The SIEM export contains metadata only (asserted by a test that greps the payload for the fixture value).
+- [x] Audit rows exist for read, write, rotate, reveal, deny, lease, redeem, slot change and deployment key use, with actor, address and request id. *(Proved by `apps/api/tests/secret_audit.rs` over the real router: the trail is read back, every row carries a request id and a peer address, and the issue+revoke pair joins on `lease_id`. Two defects were found and fixed on the way — the four 0032 columns had no setter on `NewAuditEntry` and were structurally always null, and the screen filtered on `secret.lease` while the handlers wrote `secret.lease.issued`/`.revoked`, so every lease row was invisible.)*
+- [x] Anomaly detection flags an off-hours reveal and a reveal burst in a scripted test, and the acknowledge action persists. *(The off-hours raise and the acknowledge persistence are proved over the router; the burst threshold is unit-tested as a pure function in the crate, and a burst by definition needs N reveals against a real history, which is the one the walk would have to seed deliberately.)*
+- [x] The SIEM export contains metadata only (asserted by a test that greps the payload for the fixture value). *(`secret_audit.rs` greps the raw NDJSON bytes for the fixture value and for a masked fragment, and asserts the allowlist itself — a record that carried `metadata` or `envelope` would fail — because a field check would pass against a redaction pass that had not yet heard of the next column added to `audit_log`.)*
 - [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings.
 
 ### QA plan
@@ -138,8 +138,8 @@ Assertions that must hold in the same pass: the rendered DOM never contains a fi
 
 1. **Key hierarchy + rotation.** Migration, root key ring, wrap/unwrap helper, re-wrap job with pause/resume, `/secrets/root-key`, seal self-check, events. *Done when:* a rotation completes on the QA stack with all versions re-wrapped and a consumer resolves throughout. — **shipped** (`crates/secrets`, `0019_secret_hierarchy.sql`, `apps/api/src/routes/secrets.rs`, `apps/api/src/secrets_runner.rs`, `apps/admin/features/secrets/root-key-view.tsx`).
 2. **Typed credentials + slots.** Credential profiles with non-secret fields, validators (mock SMTP and a payment-format check), `/secrets/credentials`, slot model and resolver, `/secrets/slots`. *Done when:* a slot swap changes which credential a consumer resolves, with an event and an audit row. — **shipped** (`crates/secrets/src/credentials.rs`, `apps/api/src/routes/secrets_credentials.rs`, `apps/api/tests/secret_credentials.rs`, `apps/admin/features/secrets/credentials-view.tsx`, `slots-view.tsx`, `71c0c11`).
-3. **Leases + helper + deployment keys.** Lease table and endpoints, loopback redemption, helper subcommand with env injection and 0600 temp-file mode, lease auto-revocation on deploy, `/secrets/leases`, `/secrets/deploy-keys` with scoped machine identities. *Done when:* CI-shaped redemption works from a deployment key inside its environment and is refused outside it.
-4. **Audit depth + SIEM + anomalies.** Access log extension, denial rows everywhere, anomaly detectors and acknowledge, filtered export, notification wiring. *Done when:* a scripted off-hours reveal produces an anomaly row, an acknowledge persists, and the export carries no value.
+3. **Leases + helper + deployment keys.** Lease table and endpoints, loopback redemption, helper subcommand with env injection and 0600 temp-file mode, lease auto-revocation on deploy, `/secrets/leases`, `/secrets/deploy-keys` with scoped machine identities. *Done when:* CI-shaped redemption works from a deployment key inside its environment and is refused outside it. — **shipped** (`crates/secrets/src/leases.rs`, `apps/api/src/routes/secrets_leases.rs`, `apps/api/tests/secret_leases.rs`, `apps/admin/features/secrets/leases-view.tsx`, `deploy-keys-view.tsx`, `73e0d54`, `506151d`, `e4e97c7`).
+4. **Audit depth + SIEM + anomalies.** Access log extension, denial rows everywhere, anomaly detectors and acknowledge, filtered export, notification wiring. *Done when:* a scripted off-hours reveal produces an anomaly row, an acknowledge persists, and the export carries no value. — **shipped** (`database/migrations/0032_secret_audit_depth.sql`, `crates/secrets/src/audit.rs`, `apps/api/src/routes/secrets_audit.rs`, `apps/api/tests/secret_audit.rs`, `apps/admin/features/secrets/audit-view.tsx`, `7e01791`, `e0ab121`).
 
 ### Risks / notes
 

@@ -2079,3 +2079,78 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
   `target/debug/incremental` in this worktree returned 2.9 GB.
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
+
+## 2026-09-28 — REQ-125 slice 4: the audit trail, and the two defects that made it a lie
+
+- **What this tick was.** Slice 4 of the secrets depth request: the access trail, the four
+  anomaly detectors with a persisting acknowledge, and the metadata-only SIEM feed. The
+  interrupted tick had left the migration, the crate module and the four route handlers
+  uncommitted. They compiled and the crate's 53 tests were green, so they were committed as
+  their own unit before anything was built on top of them — a WIP proven green is worth
+  banking before the next tick touches the same tree.
+- **The trail is the platform's `audit_log`, not a second ledger.** Migration 0032 adds four
+  nullable columns (`request_id`, `lease_id`, `deployment_key_id`, `pipeline`) to the existing
+  append-only table and the secrets surface reads *that*. REQ-037, which would have added a
+  secrets-specific access log, is still queued; a second table would have left it a parallel
+  structure to reconcile. The request states the same rule about redaction — "two
+  implementations drift" — and the same argument applies to the ledger.
+- **Two defects, and both of them were invisible to the layer that owned them.**
+  1. **The request id was readable in the trail and unjoinable in it.** The migration added
+     the column, but `NewAuditEntry` had no setter for any of the four — so all four were
+     structurally guaranteed to be null forever. The redemption paths had been dutifully
+     putting the id into the *metadata JSON*: readable, and useless, because the screen filters
+     on `audit_log.request_id`. An operator holding a refusal's request id could never land on
+     the row explaining it, which is the entire reason the id exists. Four additive setters,
+     the columns added to the insert and the returning list, and the lease rows moved off the
+     blob. Setters, not constructor arguments: null is the honest value for the overwhelming
+     majority of actions in the platform, and four `None`s on every call site in the codebase
+     is a worse trade than one opt-in call where it matters.
+  2. **The screen silently dropped every lease row.** It filtered on an enumerated list of six
+     action names; the handlers write fifteen distinct actions, and *one of the six* —
+     `secret.lease` — is written by nothing at all. So `secret.lease.issued`,
+     `secret.lease.revoked`, `secret.credential.typed`, `secret.credential.validated`,
+     `secret.root_key.rewrap_paused/resumed` and every `deployment_key.*` row were being
+     recorded correctly and displayed as nothing. Nothing anywhere disagreed: the counts
+     matched, the query returned 200, and the evidence was simply invisible. A list of names
+     is a list that rots *invisibly*; a namespace prefix cannot. The filter is now
+     `action like 'secret.%' or action like 'deployment\_key.%'`, and the filter chips the
+     screen offers are derived from the rows actually present rather than from a hand-written
+     list — which is what "no dead controls" asks for in the first place.
+- **The anomaly detectors are advisory and the code says so rather than implying otherwise.**
+  Four patterns (off-hours reveal, reveal burst, new address, principal that never held the
+  secret) as *pure functions* over counts the store already has, so the rule is testable
+  without a database and the query is testable without a rule. The request's optional hard
+  rule ("production reveals require a second approver") exists as a column that defaults off
+  and is read by nobody: a rule that can lock an incident responder out at the worst moment
+  costs more than an unread advisory row. Off-hours is measured in the installation's local
+  hour, not UTC — a detector on UTC calls a 22:00 reveal in İğdır business hours and a 03:00
+  automated rotation a night.
+- **The SIEM feed is a projection with an allowlist, not a redaction pass over a row.** An
+  allowlist cannot leak by omission, because a column that is not on it is not on the output;
+  a redaction pass can, because the day someone adds a column to `audit_log` the pass has
+  never heard of it. The integration test asserts the allowlist itself, not just the absence
+  of today's fields.
+- **Proof so far.** `cargo test -p omnion-audit -p omnion-secrets -p omnion-api --lib` →
+  **170 tests, 0 failures** (2 + 53 + 115). `pnpm typecheck` green. `apps/api/tests/secret_audit.rs`
+  → **1 walk, 0 failures** over the real router against `omnion_test_w6`, asserting: the trail
+  is readable and every action in it is offered as a filter chip; the issue and the revoke both
+  land joined by `lease_id`, with an actor, an address and a request id; a scripted 03:00
+  reveal raises an `advisory` off-hours flag that joins back to the request that raised it; the
+  acknowledge persists across a re-read and a *second* acknowledge answers
+  `already_acknowledged` rather than claiming a change; the NDJSON export contains neither
+  the fixture value nor a masked fragment, and every line is one object carrying the join key
+  and no `metadata`/`envelope`; an action outside the namespaces narrows to nothing rather
+  than widening; a malformed `since` is refused by name (`invalid_since`).
+- **The three failures the test found on the way, all of them mine.** The suite first 403'd
+  on its own screen because `secrets.audit` is deliberately *not* `secrets.read` and the suite
+  skipped the IAM seed; then it collided with its own residue on `secrets_name_scope_idx`; then
+  a lease write was correctly refused with `organization_required` because a write needs a named
+  scope and a read does not. The second one is the general lesson — a suite that passes on a
+  virgin database and fails on a warm one is not proving the behaviour, it is proving the
+  migration order.
+- **Next.** The walkthrough pass for `/secrets/audit` is written (route registered, depth pass
+  added, wired into the run). A QA stack run on the private ports is the remaining gate before
+  the last acceptance box can be ticked and REQ-125 closes.
+- **Environment note.** Six worktrees compiled concurrently on this box: load average 223, 32 G
+  of RAM with ~1 G available, `/mnt/apopic` at 96% (2.4 G free). The test compile itself is
+  fine; the wall-clock cost is contention, not a failure.
