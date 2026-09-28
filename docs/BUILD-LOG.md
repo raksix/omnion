@@ -2838,3 +2838,27 @@ work uncommitted from the previous run.
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+- **What.** REQ-098 **slice 3** — the route decision log (`7ec57bd` migration + store, `2741cea`
+  endpoints + the pruner, `7e4a33c` ten API walks, `f8e68c4` the screen, `227ca7f` the acceptance
+  boxes, `ebf6a18` a routing fix the pass found). The table is
+  `database/migrations/0047_ai_route_decisions.sql`; the store is
+  `crates/ai-hub/src/decision_store.rs`; the endpoints are `apps/api/src/routes/ai_decisions.rs`;
+  the screen is `apps/admin/features/ai/ai-decision-log.tsx`; the pruner is
+  `apps/api/src/ai_log_runner.rs` behind its own `OMNION_AI_LOG_RUNNER` switch.
+- **Proof.** `cargo test -p omnion-ai-hub` 151 (6 new) · `-p omnion-core` 36 · `-p omnion-api
+  --test ai_decisions` 10/10, none skipped (the tenancy and guard walks print a skip line and the
+  log has none) · `npx turbo run typecheck --force` 2/2 · `QA_STACK=w7 … bash scripts/qa/run.sh`
+  — 975 clicks, 1032 screenshots, the log's own report `docs/qa/QA-LATEST-w7.md` with the decision
+  log `present: true`, its empty state correct on a fresh install, all four filters and the export
+  present, the CSV export answering ("Exported 0 rows"), and no overflow at 390 px.
+- **Two design points worth carrying.** The decision row is written **before** the provider is
+  dialled, so a request that times out is still in the log; and `fallback_index` is 0-based while
+  the resolver's `position` is 1-based, which is a total-but-silent bug (every primary badges as a
+  fallback) — the conversion lives in one function and the API walk asserts the badge.
+- **The `ai_usage.decision_id` column is conditional.** REQ-001 owns `ai_usage` and it is not on
+  this branch, so the migration guards the `alter` with `to_regclass` and adds the column the day
+  that table appears. The pruner test says so out loud rather than passing vacuously.
+- **Next.** REQ-098 has one slice left to close it: wiring `record` into the *live call* path and
+  emitting `ai.route.unresolved` there, which is the one acceptance box left unticked and the
+  reason the request is still `in-progress`. Then REQ-099 (agent runtime).
