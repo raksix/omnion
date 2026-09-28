@@ -5854,7 +5854,13 @@ async function runCrmKeyboardAndMobile(page, report) {
   const rowCount = await rows.count();
   steps.theListHasRows = rowCount > 0;
   const cursorRow = () => page.locator('[data-qa-crm-cursor="true"]');
-  steps.theCursorIsVisibleOnAPhone = (await cursorRow().count()) > 0;
+
+  // Every step below needs a row to stand on. A list with no rows leaves them **unset** rather
+  // than `false`: "the shortcut did not move a cursor" and "there was no cursor to move" are
+  // different claims, and a fresh database must not be reported as a broken screen.
+  if (rowCount > 0) {
+    steps.theCursorIsVisible = (await cursorRow().count()) > 0;
+  }
 
   if (rowCount > 1) {
     const firstText = (await cursorRow().first().innerText().catch(() => "")).slice(0, 60);
@@ -5872,12 +5878,16 @@ async function runCrmKeyboardAndMobile(page, report) {
   }
 
   // ---- `e` opens the editor for the row under the cursor ---------------------------------------
-  await page.keyboard.press("e");
-  await page.waitForTimeout(900);
-  steps.eEditsTheSelectedRow = (await page.locator("#crm-first-name").count()) > 0;
-  await shot(page, "page-crm-keyboard-edit");
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(400);
+  // Guarded by the same rule as the cursor: with no row there is nothing for `e` to edit, and a
+  // step that reports `false` there would be reporting an empty database as a broken screen.
+  if (rowCount > 0) {
+    await page.keyboard.press("e");
+    await page.waitForTimeout(900);
+    steps.eEditsTheSelectedRow = (await page.locator("#crm-first-name").count()) > 0;
+    await shot(page, "page-crm-keyboard-edit");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+  }
 
   // ---- `n` opens the create form --------------------------------------------------------------
   await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
