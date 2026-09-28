@@ -4818,23 +4818,55 @@ async function runBlockEditorDepth(page, report) {
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
-  // A heading-order warning must never stop a publish: it is advisory by construction.
-  steps.outlineWarningIsNotBlocking =
-    (await page.locator("[data-block-status]").getAttribute("data-block-errors")) === "0" &&
-    !(await page
-      .locator("[data-block-publish]")
-      .first()
-      .isDisabled({ timeout: 5000 })
-      .catch(() => true));
+  // A heading-order warning must never stop a publish: it is advisory by construction. Asserted
+  // where the claim actually lives — the warning is REPORTED as a warning, and the bar's error
+  // count does not include it. The old check read the page's whole error count, so an unrelated
+  // missing `src` on a different block reported "the heading warning blocks publishing", which
+  // is not what the sentence says and which no fix to the heading could ever clear.
+  const barWithWarning = await page
+    .locator("[data-block-status]")
+    .first()
+    .evaluate((el) => ({
+      errors: el.getAttribute("data-block-errors"),
+      warnings: el.getAttribute("data-block-warnings"),
+    }))
+    .catch(() => null);
+  steps.outlineWarningIsAdvisory = (barWithWarning?.warnings ?? "0") !== "0";
+  steps.outlineWarningIsNotBlocking = (barWithWarning?.errors ?? "0") === "0";
+  steps.outlineWarningPublishDisabled = await page
+    .locator("[data-block-publish]")
+    .first()
+    .isDisabled({ timeout: 5000 })
+    .catch(() => null);
+  steps.outlineWarningBar = barWithWarning;
   await shot(page, "page-block-editor-heading-order");
   note("provoked a heading-order warning");
 
   // Fixing it is the second half of the criterion, and it must be a reorder rather than an edit.
+  // The assertion is about THIS warning, not the page's warning total. The bar counts every
+  // advisory on the page, and this pass deliberately left an unrelated `block_column_empty` on
+  // screen — a Columns block with an empty second column is a warning the criterion never
+  // mentions, and it does not go away when the heading is fixed. Reading `data-block-warnings`
+  // as "the heading warning is gone" therefore reports a failure that is really the page being
+  // honest about something else, and no amount of fixing the heading clears it.
   await page.locator("#block-prop-level").first().selectOption("h2").catch(() => {});
   await page.waitForTimeout(1200);
-  steps.outlineWarningCleared = (
-    (await page.locator("[data-block-status]").getAttribute("data-block-warnings").catch(() => "0")) || "0"
-  ) === "0";
+  const stillOutlined = (
+    await page.locator("[data-block-issues] li").allInnerTexts().catch(() => [])
+  )
+    .join(" ")
+    .toLowerCase();
+  steps.outlineWarningCleared = !/heading order|h1 comes after|follows an h/.test(stillOutlined);
+  steps.remainingWarningText = stillOutlined.replace(/\s+/g, " ").trim().slice(0, 200);
+  // A warning that stays on the page must be a way INTO its block, or it is a dead end with a
+  // soft voice: it cannot block a publish, so nothing else in the flow leads the author to it.
+  const warnJump = page.locator("[data-block-first-warning]").first();
+  steps.warningJumpOffered = (await warnJump.count()) > 0;
+  if (steps.warningJumpOffered) {
+    await warnJump.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    steps.warningReachable = (await page.locator("[data-block-issues] li").count()) > 0;
+  }
   note("cleared the heading-order warning");
 
   // The visibility control lives in the inspector's Visibility section, and its effect on the
