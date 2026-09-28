@@ -524,6 +524,24 @@ function sampleValueFor(meta) {
   return "QA sample";
 }
 
+/**
+ * The credentials the pass signs in with, when the form on screen is the *sign-in* form.
+ *
+ * This exists because `sampleValueFor` is the right answer for a settings field and a
+ * catastrophic one for a login. A sample address is a real failed sign-in, and the platform
+ * answers ten of them from one address by blocking that address — at which point every
+ * *later* page renders the sign-in screen again and the pass measures three elements instead
+ * of thirty, with no error anywhere to say why. The failure is silent because the sign-out is
+ * deferred and the session is renewed: the run looks healthy right up until it does not.
+ *
+ * So the sign-in form is filled with the account that actually exists. A form whose email
+ * field is *not* the sign-in one keeps the sample, because a person's own address in a
+ * stranger's invite form is exactly the thing a walkthrough must never submit.
+ */
+function signInValueFor(meta) {
+  return meta.type === "email" ? CREDS.email : CREDS.password;
+}
+
 async function fillSubtree(page, selector) {
   return page.evaluate((sel) => {
     const root = document.querySelector(sel);
@@ -725,7 +743,13 @@ async function interact(page, pageName, report) {
       continue;
     }
     if (["input", "textarea"].includes(meta.tag) && meta.type !== "file") {
-      const value = sampleValueFor(meta);
+      // The sign-in form is the one place a sample value is a real failed attempt against a
+      // real account-lockout policy, so it is filled with credentials that exist. Detected by
+      // the page's own path rather than by the field's label: a "someone else's address" field
+      // is still an `email` input, and this must not turn into submitting the QA owner into a
+      // stranger's invite form.
+      const onSignIn = new URL(baseUrl || page.url()).pathname === "/login";
+      const value = onSignIn ? signInValueFor(meta) : sampleValueFor(meta);
       let filled = await control
         .fill(value, { timeout: 4000 })
         .then(() => true)
