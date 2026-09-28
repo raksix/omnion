@@ -129,6 +129,21 @@ const BASE_ROLES: &[BaseRole] = &[
             "crm.copilot.use",
             "crm.leads.read",
             "crm.leads.manage",
+            // Sales (REQ-052), the full seller loop except the two releases. A manager
+            // prepares and reviews; who may *send* a quote to a customer and *confirm* an
+            // order that reserves stock is granted separately in the installation's own roles,
+            // because in most organizations the person who may discount is not the person who
+            // may commit the stock.
+            "sales.products.read",
+            "sales.products.manage",
+            "sales.pricelists.read",
+            "sales.pricelists.manage",
+            "sales.quotes.read",
+            "sales.quotes.create",
+            "sales.quotes.update",
+            "sales.orders.read",
+            "sales.orders.create",
+            "sales.reports.read",
             // Your own inbox is not a privilege: every account has one, and the reads are
             // owner-scoped in the store, so this key grants nothing about anybody else. It is
             // listed explicitly rather than folded into a family because the panel shows the

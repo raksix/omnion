@@ -504,7 +504,7 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "crm.views.manage",
         category: "crm",
         description: "Create and delete saved CRM views (a view is shared with its organization)",
-        },
+    },
     PermissionDef {
         key: "crm.contacts.import",
         category: "crm",
@@ -578,6 +578,78 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "crm.leads.manage",
         category: "crm",
         description: "Configure form → lead routing and run the ingress drain",
+    },
+    // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
+    // does — read, create, edit, archive — and adds the two powers that are genuinely different
+    // acts rather than a stricter version of editing:
+    //
+    // * **`sales.quotes.send`** exists because sending is the moment a document stops being the
+    //   organization's and becomes the customer's. From that point the lines are frozen, the
+    //   number is immutable and a public link exists that anyone holding it can open. A role
+    //   that may write a quote but not send it can prepare work a manager reviews, which is the
+    //   normal shape of a sales desk.
+    // * **`sales.orders.confirm`** is the stock decision. Confirming reserves inventory, so it
+    //   moves physical goods; cancelling releases them. It is separated from `.update` because
+    //   the damage of a wrong confirmation is not a wrong label on a row.
+    PermissionDef {
+        key: "sales.products.read",
+        category: "sales",
+        description: "Read the sales product catalog and its price lists",
+    },
+    PermissionDef {
+        key: "sales.products.manage",
+        category: "sales",
+        description: "Create and edit products and their price lists",
+    },
+    PermissionDef {
+        key: "sales.pricelists.read",
+        category: "sales",
+        description: "Read price lists and the prices they assign",
+    },
+    PermissionDef {
+        key: "sales.pricelists.manage",
+        category: "sales",
+        description: "Create price lists and replace their price rows",
+    },
+    PermissionDef {
+        key: "sales.quotes.read",
+        category: "sales",
+        description: "Read quotes, their versions and the public link state",
+    },
+    PermissionDef {
+        key: "sales.quotes.create",
+        category: "sales",
+        description: "Create quotes and duplicate an existing one",
+    },
+    PermissionDef {
+        key: "sales.quotes.update",
+        category: "sales",
+        description: "Edit a draft quote and cancel it",
+    },
+    PermissionDef {
+        key: "sales.quotes.send",
+        category: "sales",
+        description: "Send a quote to the customer, mint its public link and request approval",
+    },
+    PermissionDef {
+        key: "sales.orders.read",
+        category: "sales",
+        description: "Read sales orders and their stock reservation state",
+    },
+    PermissionDef {
+        key: "sales.orders.create",
+        category: "sales",
+        description: "Create sales orders from an accepted quote or by hand",
+    },
+    PermissionDef {
+        key: "sales.orders.confirm",
+        category: "sales",
+        description: "Confirm an order (reserving stock), cancel it and create its invoice draft",
+    },
+    PermissionDef {
+        key: "sales.reports.read",
+        category: "sales",
+        description: "Read the sales reports and export them as CSV",
     },
 ];
 
@@ -802,6 +874,33 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("crm"),
                 "{key} belongs to the crm category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sales_family_is_catalogued() {
+        // REQ-052: the catalog, the price lists and the documents are read, written and
+        // *released* separately, because sending a quote and confirming an order are the two
+        // acts a role must be able to withhold from a seller who may otherwise prepare anything.
+        for key in [
+            "sales.products.read",
+            "sales.products.manage",
+            "sales.pricelists.read",
+            "sales.pricelists.manage",
+            "sales.quotes.read",
+            "sales.quotes.create",
+            "sales.quotes.update",
+            "sales.quotes.send",
+            "sales.orders.read",
+            "sales.orders.create",
+            "sales.orders.confirm",
+            "sales.reports.read",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("sales"),
+                "{key} belongs to the sales category"
             );
         }
     }
