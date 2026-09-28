@@ -70,6 +70,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
+pub mod ai_decisions;
 pub mod ai_routing;
 pub mod analytics;
 pub mod auth;
@@ -651,6 +652,25 @@ pub fn router(state: AppState) -> Router {
     let ai_routing_preview =
         post(ai_routing::preview_routing).layer(guards::require(&state, "ai.providers.read"));
 
+    // The decision log (REQ-098 slice 3). `ai.usage.read`, deliberately not `ai.providers.read`:
+    // the log is the accounting trail of what the platform asked of its providers, so a reader
+    // of "which models are connected" has no business reading an organization's per-request
+    // history. One key, shared with the cost manager (REQ-104), rather than two spellings.
+    let ai_decisions = get(ai_decisions::list_decisions)
+        .layer(guards::require(&state, "ai.usage.read"));
+    let ai_decision = get(ai_decisions::get_decision)
+        .layer(guards::require(&state, "ai.usage.read"));
+    let ai_decisions_csv = get(ai_decisions::export_decisions)
+        .layer(guards::require(&state, "ai.usage.read"));
+    // "What cannot resolve" is a routing question, not a usage one: it answers from the log but
+    // belongs to the routing screen's warning banner, which a provider reader must be able to
+    // see — otherwise the only people who can tell that a task is broken are the ones who
+    // already cannot fix it.
+    let ai_unresolved = get(ai_decisions::get_unresolved)
+        .layer(guards::require(&state, "ai.providers.read"));
+    let ai_last_resolved = get(ai_decisions::last_resolved)
+        .layer(guards::require(&state, "ai.providers.read"));
+
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
     // `webhooks.manage`, and the platform's event feed is read with `events.read`. Every
@@ -1036,6 +1056,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/routing", ai_routing)
         .route("/ai/routing/overrides", ai_routing_overrides)
         .route("/ai/routing/preview", ai_routing_preview)
+        .route("/ai/logs/decisions", ai_decisions)
+        .route("/ai/logs/decisions.csv", ai_decisions_csv)
+        .route("/ai/logs/decisions/{id}", ai_decision)
+        .route("/ai/routing/unresolved", ai_unresolved)
+        .route("/ai/routing/last-resolved", ai_last_resolved)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)

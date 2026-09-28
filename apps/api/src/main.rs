@@ -10,8 +10,8 @@ use std::process::ExitCode;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    ai_health_runner, analytics_runner, automation_runner, event_runner, search_runner,
-    workflow_runner,
+    ai_health_runner, ai_log_runner, analytics_runner, automation_runner, event_runner,
+    search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -132,6 +132,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _probes = ai_health_runner::spawn(state.clone());
     } else {
         tracing::info!("the AI health probe runner is disabled (OMNION_AI_HEALTH_RUNNER=false)");
+    }
+
+    // The route decision pruner (REQ-098, slice 3) drops decisions past the 90-day window once
+    // a day. It is behind its own switch (`OMNION_AI_LOG_RUNNER`) because it has nothing to do
+    // with the health probe: one dials providers, the other issues a bulk delete, and an
+    // installation that disables one almost never wants to disable the other.
+    if state.config().ai_hub.log_runner_enabled {
+        let _pruner = ai_log_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the AI decision pruner is disabled (OMNION_AI_LOG_RUNNER=false)");
     }
 
     let app = routes::router(state);

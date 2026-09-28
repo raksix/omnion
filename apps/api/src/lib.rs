@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ai_health_runner;
+pub mod ai_log_runner;
 pub mod analytics_runner;
 pub mod auth;
 pub mod automation_runner;

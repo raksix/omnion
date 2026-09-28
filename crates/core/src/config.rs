@@ -529,6 +529,16 @@ pub struct AiHubConfig {
     /// Unsigned on purpose: a negative retention is not a shorter history, it is a `make_interval`
     /// that deletes everything, and the reader refuses it rather than trusting the spelling.
     pub retention_days: u64,
+    /// Whether this process prunes the route decision log (`OMNION_AI_LOG_RUNNER`).
+    ///
+    /// A **separate** switch from `runner_enabled`, not a second reading of the same one: the
+    /// health probe dials providers on the network, and the decision pruner only issues a bulk
+    /// delete. An installation that wants to stop outbound probes (a locked-down network, a
+    /// cost policy) still wants its log pruned, and an installation that manages retention
+    /// with an external job does not want a second one deleting rows underneath it. One env
+    /// var for "do not touch my providers" and another for "do not touch my log" is the only
+    /// split that serves both.
+    pub log_runner_enabled: bool,
 }
 
 impl Default for AiHubConfig {
@@ -537,6 +547,7 @@ impl Default for AiHubConfig {
             runner_enabled: true,
             poll_ms: DEFAULT_AI_HEALTH_POLL_MS,
             retention_days: 30,
+            log_runner_enabled: true,
         }
     }
 }
@@ -738,6 +749,7 @@ impl Config {
                 "OMNION_AI_HEALTH_RETENTION_DAYS",
                 AiHubConfig::default().retention_days,
             )?,
+            log_runner_enabled: read_flag(&read, "OMNION_AI_LOG_RUNNER", true)?,
         };
 
         let mail = MailConfig {
@@ -1161,6 +1173,17 @@ mod tests {
         ])
         .expect("the AI Hub settings are valid");
         assert!(!tuned.ai_hub.runner_enabled);
+        // The decision pruner is a second switch on purpose: disabling the health probe must
+        // not silently disable the log retention (or the reverse), which is the mistake a
+        // shared env var guarantees somebody will eventually make.
+        assert!(config.ai_hub.log_runner_enabled);
+        let pruner_off = config_from(&[("OMNION_AI_LOG_RUNNER", "false")])
+            .expect("the pruner flag is a boolean");
+        assert!(!pruner_off.ai_hub.log_runner_enabled);
+        assert!(
+            pruner_off.ai_hub.runner_enabled,
+            "the health probe keeps its own switch"
+        );
         assert_eq!(tuned.ai_hub.poll_ms, 5_000);
         assert_eq!(tuned.ai_hub.retention_days, 7);
     }

@@ -874,6 +874,13 @@ impl From<AiHubError> for ApiError {
                 "provider_not_found",
                 "no such AI provider",
             ),
+            // A decision id is a bookmark, and a stale one is a 404 rather than an error: the
+            // detail view opens by id and a pruned row is the expected cause.
+            AiHubError::DecisionNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "decision_not_found",
+                "no route decision with that id",
+            ),
             AiHubError::ModelNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "model_not_found",
