@@ -70,6 +70,18 @@ pub enum MediaError {
     /// A transformation preset is not usable as written.
     #[error("{0}")]
     InvalidPreset(String),
+    /// A storage setting is not usable as written.
+    ///
+    /// The `field` is the wire name of the setting, and the settings screen renders the message
+    /// under exactly that field. A bare check-constraint refusal arrives as a 500 whose only
+    /// clue is a column name, which is a message under nothing.
+    #[error("{field}: {message}")]
+    InvalidStorageSetting {
+        /// Which setting was refused.
+        field: String,
+        /// What a correct value looks like.
+        message: String,
+    },
     /// No preset with that name (or that id) on this site.
     #[error("no transformation preset named `{name}` on this site")]
     PresetNotFound {
@@ -99,5 +111,24 @@ pub enum MediaError {
     TransformFailed {
         /// What the encoder said.
         reason: String,
+    },
+    /// A duplicate merge cannot be performed, and says why.
+    ///
+    /// A `409` at the wire, not a `400`: the request was well-formed and every value in it was
+    /// legal — the library simply does not have the group the caller believes it has. Reporting
+    /// it as a bad request would tell an operator their form was wrong when their click raced a
+    /// colleague.
+    #[error("the duplicate group cannot be merged: {reason}")]
+    MergeRefused {
+        /// What is wrong, in a sentence the report screen can show.
+        reason: String,
+    },
+    /// A cross-site report named more sites than one pass may walk.
+    #[error("a cross-site report may cover at most {limit} sites; {requested} were named")]
+    TooManySites {
+        /// The bound.
+        limit: usize,
+        /// What the caller asked for.
+        requested: usize,
     },
 }

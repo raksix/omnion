@@ -2638,3 +2638,226 @@ Only then may the status line read `done`, and that close tick runs the w4 QA br
 - **Next.** REQ-051's **last three acceptance boxes**: the empty/loading/error sweep across the
   six screens, the 390×844 mobile pass and the keyboard sheet. The close tick runs the w4 QA
   pass and requires 0 high findings before the status becomes `done`.
+- **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
+  replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
+  one back *as a new version* rather than by rewriting history.
+- **The migration the plan assumed already existed.** The last tick's handover note said
+  "the `media_versions` table exists". It did not — `0025` created folders, browser columns and
+  the trash, and nothing had ever written a version row. So slice 2 ships `0026`, which creates
+  the table and backfills version 1 for every existing file, **copying `created_at`** rather than
+  stamping `now()`. A history that starts at the migration date is a lie about when the file
+  arrived, and it is exactly the kind of lie that is invisible for a year.
+- **Three rules, each a place a shortcut produces a plausible wrong answer.**
+  1. **A version is append-only.** A restore *copies* the old bytes to a new key and appends the
+     copy. Rewriting a row would make "what did this file look like on day 3" depend on whether
+     anybody took a shortcut in between.
+  2. **The number comes from the database.** `next_version` reads `max(version)` under
+     `for update` on the `media` row — a *scalar subquery*, because `FOR UPDATE` on an aggregate
+     is a no-op in PostgreSQL. Reading the max in Rust would open a window between two reads and
+     let two concurrent replaces both claim 4, which surfaces as a "duplicate key" error that
+     names the index and not the cause.
+  3. **A number is never reused.** A pruned version leaves a hole.
+- **The transaction is opened by the crate, not the route.** This was fought out with the
+  compiler: a route-held `sqlx::Transaction` surfaces `sqlx::Error` where everything else in
+  `omnion_media` is a `MediaError`, and `ApiError` has `From` for the latter but deliberately
+  **not** for the former. `omnion_media::begin_version` / `commit_version` hand back only
+  `MediaError`, which is the honest boundary: the library owns the transaction because the
+  guarantee rule 2 exists for spans it.
+- **The header probe reads 64 KB, not the file.** `crates/media/probe.rs` pulls dimensions,
+  duration and page count out of the *header* for PNG, GIF, JPEG, BMP, TIFF, WebP (all three
+  containers), MP4/QuickTime, WebM, WAV, MP3, Ogg and PDF. A 4 GB video upload must not cost a
+  full read to learn it is 12 minutes long. Every extractor answers "I do not know" rather than
+  guessing — a wrong dimension breaks every layout that reads it and is not obviously wrong once
+  it is stored. Two findings the unit tests forced out: a WebP canvas stored as `0` is a corrupt
+  header, **not** a one-pixel image (reading `0 + 1` would put a 1×1 box on screen for a file
+  that has no size), and one blanket 30-byte minimum across the three WebP containers refuses a
+  short-but-complete `VP8L` header.
+- **The walk corrected a test that had been asserting a route which never existed.** The walk
+  read the current bytes from `/api/v1/media/files/{id}/raw` and got an empty body: the file
+  manager's *listing* is `/media/files`, the read is `/media/{id}/raw`, and no route was ever
+  registered at the address the test used. Three more corrections came out of the same run — the
+  404 is `media_not_found` (not `file_not_found`), an empty upload answers `invalid_request`
+  (not `file_empty`), and the history reads **newest first**, so a check written against an
+  assumed oldest-first order fails on a correct response.
+- **The fixture leaked objects until it read the union.** Cleanup read `media.storage_key`, but a
+  replace *moves* that column to the new key — the old one is named only by the history, so every
+  replaced version's object stayed in the bucket. A test cleanup that misses them is a slow leak
+  that nobody notices for a month.
+- **Proof.** `cargo test -p omnion-media --lib` → **46 tests, 0 failures** (24 new, mostly header
+  probes and the version key rules). `cargo test -p omnion-api --lib` → **109 tests, 0 failures**.
+  `cargo test -p omnion-api --test media` against `omnion_test_main` → **11 walks, 0 failures**,
+  over the real router: a replace leaves version 1 downloadable and **byte-identical** (compared
+  as bytes, not as a length — a length check would pass by accident on an overwrite), the row
+  points at the version it serves, the three versions own three keys, a download of an old
+  version is an attachment named `hero-v1.png`, a restore appends version 3 with version 1's
+  checksum while version 2 is untouched, and the routes refuse without a session, without
+  `media.read`, and name a missing version by number. `pnpm --filter @omnion/admin typecheck`
+  green. The QA pass ran on the default stack.
+- **Environment note.** `/mnt/apopic` was at 99 % (610 MB free) when the tests finished; this
+  worktree's `target/debug/incremental` returned 1.2 GB and the unclaimed `omnion-w5`/`omnion-w6`
+  worktrees' `target/` returned a further 2.7 GB. **Owner action:** those worktrees hold build
+  artefacts for waves nobody has started; they will fill the image again.
+- **Next.** Slice 3 — transformation presets with a content-addressed cache, per-site storage
+  settings with a connection test, the CDN purge hook, share links and duplicate detection with
+  merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
+  serve path, and EXIF extraction.
+
+## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
+
+- **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
+  gave it *derivatives*: a page asks for `?preset=card` and gets the same pixels every time,
+  built on the first request and addressed by a hash of its inputs.
+- **The dependency the plan did not mention.** A preset has to *produce* pixels, which means
+  decoding, resampling and re-encoding. The workspace had no image crate, so this tick adds
+  `image` (png/jpeg/webp only — the three codecs a preset can emit). Shelling out to a binary
+  was the alternative and was rejected: it makes the API's correctness depend on what happens to
+  be installed on the host, and the test suite would skip itself on a machine without it.
+- **Two fits are not one fit.** `cover` crops and `contain` letterboxes, and the first version
+  gave both the same resampler. It produced a correctly-sized *crop*: it passes a square-crop
+  assertion and is wrong on every non-square source, which is most of them. A `contain` result is
+  now pasted onto a canvas of the box's size, so a thumbnail is a stable 320×320 rather than a
+  320×180 that shifts the layout every time a differently-shaped image is uploaded.
+- **A request never enlarges.** A 2400px request against a 1200px source is refused with an
+  explanation instead of being answered with a blurry upscale that is *larger* than the original.
+  The check is `>`, not `>=`: asking for exactly the source's own size is the identity, and a
+  template that names the same number twice is not a mistake. The unit test forced this — the
+  first version refused the identity too, which would have broken the seeded `standard` preset on
+  a 1200×630 hero.
+- **The cache key is a hash of the definition, not of (file, preset).** A pair lookup would serve
+  stale pixels after an edit, because the pair is unchanged while the definition moved. With a
+  key lookup, an edit produces a key nobody has seen, so the old entry becomes *unreachable*
+  rather than *wrong* — and the response may honestly say `max-age=31536000, immutable`.
+  Quality is in the key, and that is the field people forget.
+- **Three defects the real router found that a unit test on `transform_bytes` could not.**
+  1. The derivative header carried the **object key** where the identity belongs. The two are
+     different strings that both appear in the module, and the response builder took one
+     parameter where it needed two — so a caller that read the header and looked it up in
+     `media_derivatives.cache_key` found nothing. A header that looks like an identifier and is
+     not one is worse than none. Both are now fields of a struct, because three positional
+     `&str`s is the shape that produced the bug.
+  2. **A site created after the migration got no `standard` preset.** The `0027` seed covers the
+     sites that existed when it ran, so a page already asking for `?preset=standard` would
+     silently fall back to full-size originals — on new sites only, which is exactly where nobody
+     is looking. It cannot be fixed in the migration, because the gap is between "the migration
+     ran" and "somebody creates a site", and it cannot be fixed in the create path either:
+     onboarding, the tenancy API and a future import all insert the row themselves. It is a
+     trigger (`0028`), which is the only place guaranteed to see every site.
+  3. A test asserting **"the first call builds" passes once and fails for ever after.** The row
+     is keyed by the source bytes, and a re-run reproduces them exactly, so the second run is a
+     cache hit. The assertion now checks the answer is correct either way and that the key is
+     stable — the property that actually matters.
+- **Proof.** `cargo test -p omnion-media --lib` → **78 tests, 0 failures** (32 new). Five walks
+  over the real router in `--test media_transform` → **0 failures**: the bytes are compared *as
+  bytes* and decoded again (a length check passes by accident on an overwrite), the second
+  request is byte-identical to the first, the object is read back out of the store and compared
+  against what was served, the old row survives an edit, a delete cascades the cache away, an
+  unknown preset returns the original *byte for byte* with no derivative key, an SVG answers
+  `not_transformable` naming its type, and every preset field error names the field that caused
+  it. The pre-existing `--test media` → **11 walks, 0 failures**, unchanged, against the raw route
+  that now takes a query parameter. `cargo test -p omnion-permissions --lib` → 62 pass.
+  `pnpm --filter @omnion/admin typecheck` green.
+- **The QA pass (`bash scripts/qa/run.sh`, default stack) — clean for this slice.** 954 clicks,
+  988 screenshots, the new `/media/settings` route walked and clicked (28 elements), and the depth
+  pass drove it: created a preset, submitted an out-of-range quality and **the field error named
+  it**. Vision review returned **0 high / 0 medium / 0 low**. The page's own diagnostics read
+  *overflow: no · offscreen: 0 · broken images: 0 · low contrast: 0 · unlabeled inputs: 0 ·
+  duplicate ids: 0 · h1: 1*. The four high findings the run reports are the walkthrough's **own
+  deliberate error-state probes** — `/media?folder=nonexistent-folder` and the 400/404 they
+  produce — none of them from this slice.
+- **Two things the pass taught about this slice's own screen.** The seeded `standard` preset *is*
+  present on a QA site (checked directly in `omnion_qa`, and the trigger in `0028` fires for a
+  site created afterwards), so the walkthrough's `seeded: 0` was its own text match, not a gap —
+  which is why the number was checked against the database rather than believed. And the preset
+  example URL is a `<code>`, not an anchor: the first depth pass looked for `a[href^="/api/v1/
+  media/"]`, found none, and reported "no preset example URL" for a screen that had one on it. An
+  `<a>` pointing at a placeholder id would only have proven a 404 — the same mistake the route
+  inventory already made once with `/media/files`. The pass now reads the query the screen
+  actually renders and builds a real URL with a real file id.
+- **A compiler lesson, fought out over a long wrong turn.** Every guarded route in this codebase
+  is written `get(handler).layer(guards::require(...))`, and the new routes refused to compile
+  with a bare `type annotations needed for MethodRouter<AppState, _>`. The guard's service impl
+  requires the inner service's `Error = Infallible`, and inference cannot pick `Infallible` out of
+  the several `From<Infallible>` impls in scope. Every existing route gets away with it because
+  the *later* `.merge()`/`.route()` calls in the same chain pin the type. The fix is a
+  `MethodRouter<AppState, Infallible>` annotation on the three new bindings — the same fix the
+  compiler suggested and that reading the guard's own bound would have given in one minute.
+- **Environment.** `/` was at 99 % and `/mnt/apopic` at 100 % during the run — MinIO refused
+  writes with `XMinioStorageFull` and three walks failed on a storage error that had nothing to do
+  with the code. Reclaiming `omnion-live/target` and `omnion-w5/target` (worktrees for waves
+  nobody has started) plus this one's stale `deps` binaries returned ~4 GB. **Owner action:** the
+  eight worktrees under `/mnt/apopic` hold ~30 GB of `target/`, and this is the second tick in a
+  row that has had to delete another loop's build cache to finish its own tests.
+- **Next.** Slice 3 continues — per-site storage settings with a connection test and public base
+  URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
+  with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
+  Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
+
+- **What.** The third third of slice 3: `0036_media_shares.sql`,
+  `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
+  `apps/api/tests/media_shares.rs`, `features/media/shares-tab.tsx` (a **Share** tab on
+  `/media/files/{id}`), the client methods and the `MediaShare`/`CreatedMediaShare` types, and a
+  walkthrough depth pass. Six design decisions, each a shortcut that produces a plausible wrong
+  answer:
+  1. **The token is stored hashed and nowhere else.** The row holds `sha256(token)` under a
+     unique index, so a backup, a replica log or a support engineer with read access comes away
+     with a list of *dead* tokens, and the lookup is still one probe. The round trip runs one way
+     only, and the row type has no field the plaintext could occupy.
+  2. **A share reaches a file; it does not bypass what the file is.** Servability is decided at
+     *serve* time, not at creation — a link made yesterday must not keep serving a file the
+     scanner has since flagged.
+  3. **`revoked` and `expired` are the same answer (410), `password_required` is 403.** Telling
+     the two dead states apart would hand a token prober a free oracle; answering "type the
+     password" with 410 would send the owner a pointless request.
+  4. **The counter counts bytes that were served**, in its own statement, so a failure after the
+     bytes went out cannot roll it back.
+  5. **Revocation is a write, not a delete** — the row is kept with its reason forever, because
+     that is the only thing that makes a leaked link investigable.
+  6. **The screen has no `Copy` on an existing row, and cannot.** The token is returned once;
+     a copy button there would silently copy nothing.
+- **Proof.** Five walks over the real router in `--test media_shares` → **0 failures**. The
+  stored value is read **out of the database** rather than inferred from a response that hid the
+  token; the list is scanned over its raw bytes for the token and for a field named `token`; the
+  served bytes are compared as bytes and `no-store`/`nosniff`/`attachment` are each checked; the
+  counter moves once and survives the revocation; the revoked row keeps its reason and instant; a
+  reader may read the list and may neither create nor revoke; anonymous is refused on both; a
+  share id on another file is a 404, not a 403. `cargo test -p omnion-media --lib` → **98**,
+  `cargo test -p omnion-api --lib` → **116**, and `--test media` (11), `--test media_settings`
+  (2), `--test media_transform` (5) are unchanged and green. `pnpm --filter @omnion/admin
+  typecheck` green.
+- **Three defects the walks found, none of which a unit test on `servable` could see.**
+  `find_media` returns the *base* `Media`, which has no `deleted_at` and no `scan_status` — the
+  two columns the whole "a share does not bypass the file" rule depends on, so the first draft
+  asked the wrong struct and the compiler found the fields missing. `POST /shares` with no body
+  answered **415**, because the handler demanded a JSON body for the most ordinary call anybody
+  makes ("give me a link until I revoke it"); the same for the `DELETE`. And `rand` is a
+  *dev*-dependency of `apps/api`, so token minting moved into the crate, which is where the
+  width and the source belong anyway.
+- **A test that reaches for a state the platform forbids.** The expiry walk set
+  `expires_at = now() - 1s` and the `media_shares_expiry_sane` check refused it — a link whose
+  expiry precedes its own creation is nonsense. The walk now ages the row by moving `created_at`
+  back instead, which is the only way to reach the same state and the reason the check is there.
+- **Environment.** `/mnt/apopic` hit **100 %** (89 MB free) mid-tick and MinIO refused every
+  object write with `XMinioStorageFull`, which reads as a storage bug and was none. The cause is
+  this worktree's own `target/`: **8.3 GB of rebuildable test binaries** plus 874 MB of `.tmp`
+  leftovers from interrupted linkers. Reclaiming *only this worktree's* artifacts returned 8.5 GB
+  (86 %). **Owner action:** the seven worktrees under `/mnt/apopic` hold ~30 GB of `target/`; a
+  shared `CARGO_TARGET_DIR` is the structural fix, and this is the third tick to have had to
+  delete its own build cache before it could run a test.
+- **Next.** Slice 3 closes with duplicate detection and the merge (checksum groups, reclaimable
+  size, `Keep this one` + `Merge group`, references repointed and the copies trashed), then the
+  CDN purge hook to REQ-011. Still open: EXIF (slice 2), HTTP range requests on the serve path,
+  and the Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+- **The QA pass did not complete this tick — and not because of this slice.** The pass got its
+  QA slot after ~30 minutes of waiting behind sibling stacks, walked 434 clicks through
+  `/media` (40 elements), `/media/trash` (26), `/media/settings` (30) and the IAM screens, and
+  then stopped advancing at `iam-service-accounts` with the walkthrough process at 0 % CPU. The
+  cause is the machine, not the code: **seven QA stacks are running at once** — 40 Chromium
+  processes, load average **36**, and **127 MB free of 33 GB**. The walkthrough outlived the
+  browser context, which is the "tab died under parallel passes" case already documented for
+  this box, so no findings were produced and none are claimed. The share walk added this tick
+  (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
+  next tick runs it. The storage walk from the previous tick was committed for the same reason
+  and the API-level proof for both is the Rust suite, which is green.

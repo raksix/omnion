@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod browser;
+pub mod duplicates;
 pub mod error;
 pub mod folder_store;
 pub mod folders;
@@ -20,6 +21,8 @@ pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod shares;
+pub mod storage_settings;
 pub mod transform;
 pub mod validation;
 pub mod versions;
@@ -28,6 +31,12 @@ pub use browser::{
     FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
     purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+};
+pub use duplicates::{
+    CrossSiteCopy, CrossSiteGroup, DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES,
+    MergeOutcome, NewReference, Reference, SiteLabel, clear_references, count_live_shares,
+    count_references, duplicate_groups, duplicate_groups_across, group_members, list_references,
+    merge_group, reclaimable_total, record_reference, repoint_references, site_labels,
 };
 pub use error::{MediaError, Result};
 pub use folder_store::{
@@ -49,6 +58,17 @@ pub use preset_store::{
     list_presets, require_preset, require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
+pub use shares::{
+    CreatedShare, MAX_EXPIRY_DAYS, MIN_EXPIRY_MINUTES, NewShare, Share, ShareRefusal, TOKEN_BYTES,
+    count_download, create_share, find_by_token, find_share, hash_token, is_password_protected,
+    list_shares, mint_token, revoke_for_media, revoke_share, servable,
+};
+pub use storage_settings::{
+    ConnectionProbe, MAX_SIGNED_URL_TTL, MAX_UPLOAD_MB, MIN_SIGNED_URL_TTL, MIN_UPLOAD_MB,
+    NewSiteStorage, SiteStorage, describe_public_base, describe_target,
+    effective_max_upload_bytes, probe_key, read_storage_settings, validate_new as validate_storage,
+    write_storage_settings,
+};
 pub use transform::{
     Derivative, Fit, ImageFormat, MAX_PRESET_DIMENSION, MAX_PRESET_NAME_LENGTH, NewPreset, Preset,
     Recipe, derivative_prefix, validate_dimensions, validate_new, validate_preset_name,

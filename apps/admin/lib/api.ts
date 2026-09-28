@@ -5,14 +5,22 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  CreatedMediaShare,
   Media,
   MediaBulkResult,
+  MediaCrossSiteReport,
+  MediaDuplicateReport,
   MediaFile,
   MediaFilePage,
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
+  MediaMergeResult,
   MediaPreset,
+  MediaShare,
+  MediaStorageProbe,
+  MediaStorageSettings,
+  MediaStorageSettingsInput,
   MediaReplaceResult,
   MediaTrash,
   MediaVersionList,
@@ -514,6 +522,113 @@ export function restoreMediaVersion(
 /** Panel read path of one version's bytes. */
 export function mediaVersionRawUrl(mediaId: string, version: number): string {
   return `/api/v1/media/${encodeURIComponent(mediaId)}/versions/${version}/raw`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Share links (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** Every share over one file, newest first, including revoked ones. */
+export function fetchMediaShares(mediaId: string): Promise<MediaShare[]> {
+  return request<MediaShare[]>(`/api/v1/media/${encodeURIComponent(mediaId)}/shares`);
+}
+
+/**
+ * Create a share link.
+ *
+ * `expiresInDays` omitted means "until revoked" and sends **no body at all** — the API accepts
+ * an empty POST, and sending `{}` would only be a workaround for a rule that does not exist.
+ */
+export function createMediaShare(
+  mediaId: string,
+  options: { expiresInDays?: number; password?: string } = {},
+): Promise<CreatedMediaShare> {
+  const hasChoices = options.expiresInDays !== undefined || options.password !== undefined;
+  return request<CreatedMediaShare>(`/api/v1/media/${encodeURIComponent(mediaId)}/shares`, {
+    method: "POST",
+    ...(hasChoices
+      ? {
+          body: JSON.stringify({
+            ...(options.expiresInDays !== undefined
+              ? { expires_in_days: options.expiresInDays }
+              : {}),
+            ...(options.password !== undefined ? { password: options.password } : {}),
+          }),
+        }
+      : {}),
+  });
+}
+
+/** Revoke one link. Immediate: the next request against the token is refused. */
+export function revokeMediaShare(mediaId: string, shareId: string, reason = ""): Promise<void> {
+  return request<void>(
+    `/api/v1/media/${encodeURIComponent(mediaId)}/shares/${encodeURIComponent(shareId)}`,
+    { method: "DELETE", ...(reason ? { body: JSON.stringify({ reason }) } : {}) },
+  );
+}
+
+/** Revoke every live link over a file — for when the file itself stops being servable. */
+export function revokeAllMediaShares(mediaId: string): Promise<{ revoked: number }> {
+  return request<{ revoked: number }>(
+    `/api/v1/media/${encodeURIComponent(mediaId)}/shares/revoke-all`,
+    { method: "POST" },
+  );
+}
+
+// --------------------------------------------------------------------------------------------
+// Duplicate detection and merge (docs/requests/REQ-010, slice 3)
+// --------------------------------------------------------------------------------------------
+
+/**
+ * The duplicate report of one site.
+ *
+ * `expand` asks for each group's members. It is off by default because a library with four
+ * hundred duplicate pairs would otherwise answer a report nobody scrolls with four thousand rows.
+ */
+export function fetchMediaDuplicates(
+  siteId: string,
+  options: { expand?: boolean } = {},
+): Promise<MediaDuplicateReport> {
+  const params = new URLSearchParams({ site_id: siteId });
+  if (options.expand) {
+    params.set("expand", "1");
+  }
+  return request<MediaDuplicateReport>(`/api/v1/media/duplicates?${params}`);
+}
+
+/**
+ * The installation-wide report, for a platform account.
+ *
+ * A *separate* function rather than an option on the above: the two reports have different
+ * shapes and different affordances, and a caller that got one when it asked for the other would
+ * find a `Merge group` button on a row that cannot be merged.
+ */
+export function fetchCrossSiteDuplicates(siteIds: string[]): Promise<MediaCrossSiteReport> {
+  const params = new URLSearchParams({ sites: siteIds.join(",") });
+  return request<MediaCrossSiteReport>(`/api/v1/media/duplicates?${params}`);
+}
+
+/**
+ * Merge a duplicate group down to one file.
+ *
+ * `keep` is required and comes from the operator's own choice. There is no default and no
+ * "suggested" value, because a merge that picked for itself breaks a live page and the operator
+ * finds out from a 404 rather than from this report.
+ */
+export function mergeMediaDuplicates(input: {
+  siteId: string;
+  /** The **full** checksum from the report. */
+  checksum: string;
+  keep: string;
+}): Promise<MediaMergeResult> {
+  return request<MediaMergeResult>("/api/v1/media/duplicates/merge", {
+    method: "POST",
+    body: JSON.stringify({
+      site_id: input.siteId,
+      checksum: input.checksum,
+      keep: input.keep,
+    }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3529,10 +3644,53 @@ export function updateMediaPreset(
   );
 }
 
-/** Remove one preset, and with it every derivative built from it. */
+/** Remove a preset, and with it every derivative built from it. */
 export function deleteMediaPreset(siteId: string, id: string): Promise<null> {
   return request<null>(
     `/api/v1/media/transformation-presets/${encodeURIComponent(id)}?${mediaQuery(siteId)}`,
     { method: "DELETE" },
   );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage settings (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** A site's storage settings. */
+export function fetchMediaStorageSettings(siteId: string): Promise<MediaStorageSettings> {
+  return request<MediaStorageSettings>(`/api/v1/media/settings?${mediaQuery(siteId)}`);
+}
+
+/**
+ * Save a site's storage settings.
+ *
+ * A `PUT` whose body is folded onto the row field by field: a form that sends six of ten fields
+ * does not reset the other four to a platform default, which is how a settings screen "saves"
+ * and loses the bucket.
+ */
+export function saveMediaStorageSettings(
+  siteId: string,
+  input: MediaStorageSettingsInput,
+): Promise<MediaStorageSettings> {
+  return request<MediaStorageSettings>(`/api/v1/media/settings?${mediaQuery(siteId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Prove that a configuration reaches a bucket — by writing, not by reading.
+ *
+ * The candidate is the body as sent, so the answer describes the form on screen rather than the
+ * row that happens to be saved. A refused value answers with the same field a save would have
+ * refused, so a person is never sent to fix a field on one path that the other accepted.
+ */
+export function testMediaStorageConnection(
+  siteId: string,
+  input: MediaStorageSettingsInput,
+): Promise<MediaStorageProbe> {
+  return request<MediaStorageProbe>(`/api/v1/media/settings/test-connection?${mediaQuery(siteId)}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
