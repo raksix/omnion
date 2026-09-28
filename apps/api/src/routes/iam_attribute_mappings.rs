@@ -271,11 +271,14 @@ async fn load(
         .await
         .map_err(internal)?
         .ok_or_else(|| not_found())?;
-    if provider.organization_id != current.organization_id {
-        // A provider in another organization is reported as *absent* rather than forbidden: the
-        // difference between "you may not see this" and "this does not exist" is an enumeration
-        // oracle, and an id is not a secret.
-        return Err(not_found());
+    // An account *with* a home organization may only read its own providers; one without (an
+    // owner who belongs to several) is allowed, which is the same rule `resolve_organization`
+    // applies everywhere else. The refusal is `not_found` rather than `forbidden` on purpose:
+    // the difference between "you may not see this" and "this does not exist" is an
+    // enumeration oracle, and a provider id is not a secret.
+    match (current.user.organization_id, provider.organization_id) {
+        (Some(own), theirs) if own != theirs => return Err(not_found()),
+        _ => {}
     }
     Ok(provider)
 }

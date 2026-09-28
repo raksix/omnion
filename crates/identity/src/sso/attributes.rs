@@ -487,10 +487,16 @@ impl AttributeMap {
             }
         }
 
-        if !self
-            .rows
-            .iter()
-            .any(|row| row.target_field == TargetField::Email)
+        // An **empty** map is "not configured yet" — the state every new provider starts in, and
+        // a state an operator has to be able to return to. The email rule is therefore about a
+        // map somebody has filled in: a map with rows that map no email provisions nobody, and
+        // that is worth a refusal. Without the emptiness check, deleting the last row would be
+        // the one write the server forbids, which turns the map into a one-way door.
+        if !self.rows.is_empty()
+            && !self
+                .rows
+                .iter()
+                .any(|row| row.target_field == TargetField::Email)
         {
             problems.push(MapProblem::new(
                 "target_field",
@@ -689,6 +695,29 @@ mod tests {
             "employeeNumber": 4812,
             "groups": ["platform-team", "qa"]
         })
+    }
+
+    #[test]
+    fn an_empty_map_is_valid_but_a_map_without_an_email_is_not() {
+        // "Not configured yet" is the state every new provider starts in, so it must validate —
+        // otherwise the server refuses the one write that returns a provider to it, and the map
+        // becomes a door you cannot walk back through.
+        let empty = AttributeMap::new(vec![]);
+        assert!(
+            empty.validate().is_empty(),
+            "an empty map is not a broken map: {:?}",
+            empty.validate()
+        );
+
+        // A map somebody filled in that maps no email provisions nobody, and that IS a refusal.
+        let no_email = AttributeMap::new(vec![row("givenName", TargetField::DisplayName)]);
+        let problems = no_email.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("email")),
+            "{problems:?}"
+        );
     }
 
     #[test]

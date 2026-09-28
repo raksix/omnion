@@ -5272,6 +5272,88 @@ async function runIamAuthenticationDepth(page, report) {
   note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
   await shot(page, "page-iam-authentication-log");
 
+  // ---- The attribute map: a real editor, and a preview that runs the real projection --------
+  // The mapping is the wizard's third step and it is the part that is invisible until somebody
+  // cannot sign in, so the walkthrough edits it and rehearses a pasted claims payload. The
+  // rehearsal matters more than the editing: a preview that echoed its own input would agree
+  // with this screen and disagree with every sign-in.
+  await page.locator(`[data-provider-edit="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-attribute-map]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const mapEmpty = await page.locator("[data-attribute-map-empty]").count();
+  note({
+    step: "attribute-map-empty",
+    visible: mapEmpty > 0,
+    // The empty state has to say what breaks: no mapped email is not a cosmetic gap.
+    namesTheConsequence: /email/i.test(
+      (await page.locator("[data-attribute-map-empty]").first().innerText().catch(() => "")),
+    ),
+  });
+
+  await page.locator("[data-attribute-map-add]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-attribute-source=0]").first().fill("mail").catch(() => {});
+  // The email row arrives required and cannot be made optional: the server refuses a map with no
+  // email, and a form that let you save one would teach people to hit that refusal.
+  const requiredLocked = await page.locator("[data-attribute-required=0]").first().isDisabled().catch(() => false);
+  await page.locator("[data-attribute-map-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const savedChip = await page.locator("[data-attribute-map-saved]").count();
+  note({ step: "attribute-map-saved", savedIndicator: savedChip > 0, emailRequiredLocked: requiredLocked });
+
+  await page.locator("[data-attribute-map-add]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-attribute-source=1]").first().fill("given_name").catch(() => {});
+  await page.locator("[data-attribute-target=1]").first().selectOption("display_name").catch(() => {});
+  await page.locator("[data-attribute-transform=1]").first().selectOption("trim").catch(() => {});
+  await page.locator("[data-attribute-map-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  await page.locator("[data-attribute-sample]").first().fill(
+    JSON.stringify({ sub: "2481", mail: "  QA.Walker@Example.COM ", given_name: "  QA Walker  " }, null, 2),
+  ).catch(() => {});
+  await page.locator("[data-attribute-preview]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-attribute-preview-result]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const previewVerdict = await page
+    .locator("[data-attribute-preview-result]")
+    .first()
+    .getAttribute("data-attribute-preview-result")
+    .catch(() => null);
+  const previewRows = await page
+    .locator("[data-attribute-preview-result] [data-attribute-preview-row]")
+    .evaluateAll((nodes) =>
+      nodes.map((n) => `${n.getAttribute("data-attribute-preview-row")}=${n.lastElementChild?.textContent?.trim() ?? ""}`),
+    )
+    .catch(() => []);
+  note({
+    step: "attribute-map-preview",
+    verdict: previewVerdict,
+    rows: previewRows,
+    // The transform has to have *run*: raw claim in, transformed value out. An echoed input
+    // would pass a row-count check and prove nothing about the map.
+    emailTransformed: previewRows.some((row) => row === "email=qa.walker@example.com"),
+    nameTrimmed: previewRows.some((row) => row === "display_name=QA Walker"),
+  });
+  await shot(page, "page-iam-attribute-map");
+
+  // ---- A payload with no email is refused BY NAME, not with a cheerful partial table ---------
+  await page.locator("[data-attribute-sample]").first().fill(JSON.stringify({ sub: "2481", given_name: "Nobody" })).catch(() => {});
+  await page.locator("[data-attribute-preview]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-attribute-preview-result=refused]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const refusalText = (await page.locator("[data-attribute-preview-result]").first().innerText().catch(() => "")).trim();
+  const refusalRows = await page.locator("[data-attribute-preview-result] [data-attribute-preview-row]").count();
+  note({
+    step: "attribute-map-refusal",
+    namesTheField: /email/i.test(refusalText),
+    // Withholding the values is the point: a half account is what a partial table would create.
+    withholdsValues: refusalRows === 0,
+  });
+
+  await page.locator("[data-provider-drawer-close]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
   // ---- A directory provider: its own fields, its own ladder, its own gate -------------------
   // The protocol half above cannot prove the directory half. A directory needs a service
   // account, has no client secret at all, and its test is a *ladder* — so connecting one and

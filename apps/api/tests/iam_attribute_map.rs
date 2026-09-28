@@ -429,7 +429,11 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
             )
         })
         .collect();
-    assert!(values.contains(&("email".to_owned(), "ferkan@example.com".to_owned())), "{values:?}");
+    // The claim is `  Furkan@Example.COM  ` and the transform is `lowercase`, so the projected
+    // value is all-lowercase. An assertion written with a capital F tests the author's memory
+    // of the sample rather than the projection, and it fails for a reason that looks like a
+    // product bug while being entirely the test's.
+    assert!(values.contains(&("email".to_owned(), "furkan@example.com".to_owned())), "{values:?}");
     assert!(values.contains(&("display_name".to_owned(), "Furkan".to_owned())), "{values:?}");
     // A multi-valued attribute reads its first usable member, and a number is a valid id.
     assert!(values.contains(&("department".to_owned(), "Platform".to_owned())), "{values:?}");
@@ -470,8 +474,12 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
         )
         .await;
     assert_eq!(no_email.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", no_email.body);
+    // The refusal names the missing field. Errors arrive in the `{error:{code,message}}`
+    // envelope every other walk reads, so the message is two levels down — reading
+    // `body["message"]` here would have tested `Null`, which is a passing assertion about
+    // nothing.
     assert!(
-        no_email.body["message"]
+        no_email.body["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("email"),
@@ -492,7 +500,7 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
         .await;
     assert_eq!(duplicate.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", duplicate.body);
     assert!(
-        duplicate.body["message"]
+        duplicate.body["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("already mapped"),
