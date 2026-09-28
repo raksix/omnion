@@ -2111,3 +2111,58 @@
 - **Next.** The local-endpoint walk (an Ollama-, vLLM- and llama.cpp-shaped base URL each passing
   Test, Discover and a streamed chat), the refusal to remove the installation's default provider,
   and the mid-stream vendor-error frame.
+
+## 2026-09-28 · wave 7 · tick 4 · REQ-097 slice 3 — the default-provider guard, and two walks that had been lying
+
+- **What.** The refusal to remove the installation's default AI provider
+  (`AiHubError::ProviderIsDefault` in the store, `409 provider_is_default` at the edge, the
+  panel's Remove disabled with the reason under it), plus the walk that proves it. Then the
+  slice-3 test run turned up two walks that had been reported green and were not, and one
+  product defect behind one of them.
+
+- **Proof.**
+  - `cargo test -p omnion-ai-hub` → **85 passed** (one new: a 2 ms probe with no baseline is
+    not a regression).
+  - `cargo test -p omnion-api --test ai_hub` against `omnion_test_w7`, `--test-threads=1` →
+    **12 passed**, including the new `the_default_provider_cannot_be_removed_and_a_removable_one_takes_its_rows_with_it`.
+  - `pnpm typecheck` → green (admin rebuilt, web cached).
+
+- **The guard is the store's, not the route's.** `delete_provider` takes the row `for update`
+  and refuses *inside the same transaction* as the delete. A route-level check would be one
+  more thing to remember at every new call site, and `select … for update` is what makes two
+  operators racing to remove two providers safe: the second one sees the first's commit.
+
+- **Two walks were claiming evidence they did not have, and both had been reported green.**
+  The failover walk read `POST /ai/providers` for a `models` array — that response carries
+  `model_count` and no models, so it panicked on a `Null` and **never reached the assertion it
+  existed for**. It now reads `GET /ai/models`, *after* both providers exist, because a
+  snapshot taken before `Preferred` was connected cannot contain Preferred's model. The runner
+  walk asserted the second tick announces nothing; `ok` needs two consecutive clean samples,
+  so tick 2 legitimately carries the live provider `degraded → ok`. It now asserts the whole
+  ladder (tick 2 promotes, tick 3 takes the dead one to `down`, tick 4 is silent), which pins
+  the recovery rule instead of a number that happened to be zero. **A walk that passes because
+  it stops before the interesting part is worse than one that fails** — at least the failure
+  is visible.
+
+- **And a real defect behind the runner walk.** Its flakiness was not the walk: the latency
+  baseline was `percentile_cont(0.5)` over *whatever samples the window held*, so on a
+  twice-probed loopback provider the median **was** the first sample, and the next probe at
+  2 ms against a 1 ms baseline read as a 1.5× regression. The provider flapped `ok`/`degraded`
+  on timing jitter and the runner announced a transition every tick. `MIN_BASELINE_SAMPLES = 5`
+  (`0a25f3e`): below that there is no baseline and the consecutive-run rules decide alone.
+
+- **Test isolation note.** `--test-threads` > 1 makes this suite fail on `PoolTimedOut` and
+  `UnexpectedEof` while dropping the temporary database: the tests create and drop a database
+  each, and in parallel they fight over the maintenance connection. The failures move around
+  between runs, which is the signature of contention rather than a defect — run it with
+  `--test-threads=1` and a failure means something.
+
+- **Disk.** `/mnt/apopic` hit 100% mid-tick and killed a `rustc` link with
+  `IO failure on output stream: No space left on device`. Seven writers each keep a `target/`,
+  and this one is 3.4 GB. Reclaimed **only this worktree's** `target/debug/incremental` (520 MB)
+  and four superseded `libsqlx*` rlibs from earlier builds; a shared `CARGO_TARGET_DIR` is
+  the durable answer and belongs to the owner, not to a writer.
+
+- **Next.** The local-endpoint walk (an Ollama-, vLLM- and llama.cpp-shaped base URL each
+  passing Test, Discover and a streamed chat), the mid-stream vendor-error frame, and the
+  every-screen-states sweep.
