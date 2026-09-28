@@ -55,7 +55,9 @@ const MAX_BATCH: i64 = 500;
 /// "Name" field and a dedicated given name has told us which one it means, and the more specific
 /// key is the one to read — the other way round a person who typed "Ada" and "Lovelace" into two
 /// boxes would get "Ada Lovelace" in the first-name column.
-const NAME_KEYS: [&str; 5] = ["first_name", "given_name", "name", "full_name", "fullname"];
+/// The *given* name alone. `"name"` is deliberately absent: on a form it holds both parts,
+/// and it is handled by [`split_full_name`] as a guess rather than read as a first name.
+const GIVEN_KEYS: [&str; 2] = ["first_name", "given_name"];
 const LAST_KEYS: [&str; 4] = ["last_name", "surname", "family_name", "lastname"];
 const EMAIL_KEYS: [&str; 5] = ["email", "e_mail", "email_address", "work_email", "contact_email"];
 const PHONE_KEYS: [&str; 4] = ["phone", "phone_number", "telephone", "mobile"];
@@ -281,14 +283,23 @@ pub fn extract(payload: &Value) -> Submission {
 
     // A `name` that holds "Ada Lovelace" splits on the first space; a form with explicit name
     // fields does not need the guess, and the explicit fields win when both are present.
-    let (guessed_first, guessed_last) = split_full_name(text_field(answers, &["name"]).as_deref());
+    // Every *combined* key is a guess, never a given name: `name`, `full_name` and
+    // `fullname` all hold both parts on a form.
+    let combined = text_field(answers, &["name", "full_name", "fullname"]);
+    let (guessed_first, guessed_last) = split_full_name(combined.as_deref());
     // `and_then(clamp_name)` is not optional here: without it a 400-character "name" or a row of
     // dashes is read as a name, and `create_contact` then refuses the whole submission with a
     // message a person reading a form submission never typed. Refusing at extraction turns that
     // into an honest `rejected` row in the inbox.
-    let mut first_name = text_field(answers, &NAME_KEYS)
+    // The *explicit given name* wins; a bare `name` is the combined one and is only ever a
+    // guess. Reading `"Ada Lovelace"` out of `NAME_KEYS` and then appending the surname the
+    // same string supplied produced `Ada Lovelace Lovelace` — the extractor contradicting
+    // itself in a way no validator catches, because each half is individually a valid name.
+    let explicit_first = text_field(answers, &GIVEN_KEYS)
         .as_deref()
         .and_then(clamp_name)
+        .filter(|name| !name.is_empty());
+    let mut first_name = explicit_first
         .or(guessed_first)
         .unwrap_or_default();
     let last_name = text_field(answers, &LAST_KEYS)

@@ -5351,6 +5351,10 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
     .await;
     assert_eq!(created.status, StatusCode::CREATED, "the fixture's contact must be created");
 
+    // The token is minted after the binding on purpose: a session's powers are read at
+    // login, so a token taken earlier answers 403 on the very route under test.
+    let owner_token = fixture.token(&fixture.owner).await;
+
     // The route with **no** organization named: the shape the panel sends.
     for uri in [
         "/api/v1/crm/contacts",
@@ -5361,7 +5365,7 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
     ] {
         let response = call(
             &fixture.state,
-            request(Method::GET, uri, Some(&fixture.owner), None),
+            request(Method::GET, uri, Some(&owner_token)),
         )
         .await;
         assert_eq!(
@@ -5446,9 +5450,12 @@ async fn a_platform_account_bound_to_two_organizations_is_told_to_choose() {
         .expect("the binding must be created");
     }
 
+    // A bearer token, not the address: `request` takes a token, and an e-mail answers 401
+    // before the route under test is ever reached.
+    let token = fixture.token(&fixture.owner).await;
     let response = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/crm/contacts", Some(&fixture.owner), None),
+        request(Method::GET, "/api/v1/crm/contacts", Some(&token), None),
     )
     .await;
 
