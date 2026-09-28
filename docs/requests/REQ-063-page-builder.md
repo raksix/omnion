@@ -248,8 +248,8 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
      Only plain-text props are editable in place (`heading.text`, `text.text`, `testimonial.quote`,
      `cta.body`, `raw_html.html`): a gallery is a list of media ids and a pricing table is
      `|`-joined rows, neither of which a paragraph of typing can express.
-3. **Patterns and templates.** ✅ Migration `0026_content_patterns.sql` (0111 was taken by
-   another wave; 0026 is the next free number and the ledger is append-only); pattern library with
+3. **Patterns and templates.** ✅ Migration `0038_content_patterns.sql` — it shipped as
+   `0026_content_patterns.sql` and was renumbered, see the renumbering note below; pattern library with
    insert/create-from-selection/edit/duplicate, page templates with sample content,
    `/pages/from-template`, and the initial template set (landing, about, pricing, blog post,
    contact). Proven: acceptance 10 and 11 — 9 integration tests against a real database, plus
@@ -303,6 +303,34 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    - A tree walker that descended only into `children` found no ids in a flat page, so the "two
      insertions never collide" assertion was comparing nothing and reading as a pass.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
+
+   **The migration ledger needs one reservation, not one convention.** This slice renumbered
+   `0026_content_patterns.sql` → `0038_content_patterns.sql`, and the reason is worth keeping:
+   slice 3 took `0026` because it was free *on this branch*, and while that slice was in flight
+   another writer took `0026` on `main` for `0026_media_versions.sql`. Both were correct at the
+   time they were written, the merge brought both in, and every database then refused to start —
+   `duplicate key value violates unique constraint "_sqlx_migrations_pkey" · Key (version)=(26)
+   already exists`. The number was never contested, so nothing in the merge said conflict; the
+   clash was invisible until a test connected.
+
+   Three rules, and the third is the one that would have saved this:
+
+   - **A migration number is claimed by landing, not by being free locally.** Reading
+     `ls database/migrations` before picking a number only proves the number is free on *your*
+     branch, which is exactly the check that passed here.
+   - **main keeps the contested number.** Renumbering the trunk's migration would change the
+     checksum a deployed database already recorded; renumbering the branch's cannot, because a
+     branch migration has by definition not been applied anywhere. The tie was broken toward
+     whichever side is on the trunk, and that is not a coincidence.
+   - **Before taking NNNN, check every branch that is not yours**: `git ls-tree` over each
+     `origin/*`, union the numbers, and take the first gap above the highest any of them claims.
+     The union here ran to `0037` (wave6), so `0038` was the first genuinely free number — three
+     of the four numbers I would have picked by looking locally were already spoken for on
+     branches I never look at.
+
+   `SELECT max(version) FROM _sqlx_migrations` is the other half of the check and it is what
+   decides whether a renumber is legal at all: it proved nothing had applied my `0026` anywhere,
+   so no checksum had to be rewritten and no `repair` migration was owed to anyone.
 
 ### Risks / notes
 
