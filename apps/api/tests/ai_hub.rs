@@ -49,6 +49,10 @@ struct MockProvider {
     base_url: String,
     /// A second prefix of the same mock, serving Gemini's own model-list shape.
     gemini_base_url: String,
+    /// The Ollama-, vLLM- and llama.cpp-shaped prefixes, each with the quirks that runtime has.
+    ollama_base_url: String,
+    vllm_base_url: String,
+    llamacpp_base_url: String,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -68,7 +72,16 @@ impl MockProvider {
             .route("/v1/messages", route_post(mock_messages))
             // axum allows one parameter per path segment, so the mock takes the whole
             // `{model}:generateContent` tail — the platform sends exactly that.
-            .route("/v1/models/{op}", route_post(mock_generate));
+            .route("/v1/models/{op}", route_post(mock_generate))
+            // The three local shapes, each under its own prefix on this one mock. The
+            // differences are the point of the walk, so they are reproduced rather than
+            // smoothed: see `mock_ollama_chat`, `mock_vllm_chat` and `mock_llamacpp_chat`.
+            .route("/ollama/v1/models", route_get(mock_ollama_models))
+            .route("/ollama/v1/chat/completions", route_post(mock_ollama_chat))
+            .route("/vllm/v1/models", route_get(mock_models))
+            .route("/vllm/v1/chat/completions", route_post(mock_vllm_chat))
+            .route("/llamacpp/v1/models", route_get(mock_llamacpp_models))
+            .route("/llamacpp/v1/chat/completions", route_post(mock_llamacpp_chat));
 
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -77,6 +90,9 @@ impl MockProvider {
         Self {
             base_url: format!("http://{address}/v1"),
             gemini_base_url: format!("http://{address}/gemini/v1"),
+            ollama_base_url: format!("http://{address}/ollama/v1"),
+            vllm_base_url: format!("http://{address}/vllm/v1"),
+            llamacpp_base_url: format!("http://{address}/llamacpp/v1"),
             task,
         }
     }
@@ -214,10 +230,225 @@ async fn mock_gemini_models() -> Json<Value> {
     }))
 }
 
+// ---------------------------------------------------------------------------------------------
+// The three local runtimes
+//
+// A local endpoint is not "OpenAI-compatible, cloud-shaped" with the key left off — each runtime
+// differs in a way that breaks a naive call, and those differences are exactly what the
+// acceptance criterion asks the walk to prove. They are reproduced here rather than smoothed:
+// an adapter that only ever sees a hosted provider's shape is an adapter that has not met one.
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /v1/models` on Ollama's OpenAI-compatible layer.
+///
+/// Ollama publishes its models with a **tag** — `llama3.2:latest` — and the tag is part of the
+/// identifier the endpoint answers to. That matters twice over: the connection test asks the
+/// *first* model the endpoint reports, so a bare `llama3.2` would 404 where `llama3.2:latest`
+/// works, and the registry stores exactly what was reported so the router addresses the endpoint
+/// in its own vocabulary rather than a guessed one.
+async fn mock_ollama_models() -> Json<Value> {
+    Json(json!({
+        "object": "list",
+        "data": [
+            { "id": "llama3.2:latest", "object": "model", "owned_by": "library" },
+            { "id": "qwen2.5-coder:7b", "object": "model", "owned_by": "library" },
+        ]
+    }))
+}
+
+/// `POST /v1/chat/completions` on Ollama's OpenAI-compatible layer.
+///
+/// Two real facts: the model must be named **with its tag** (a bare `llama3.2` 404s with
+/// "try pulling it first"), and a streamed answer reports its usage only when
+/// `stream_options.include_usage` was asked for. Ollama also lets a model key carry a slash
+/// (`library/mistral`), which is the case that collides with the router's `provider/model`
+/// address — the walk registers one and proves it is not read as a provider prefix.
+async fn mock_ollama_chat(Json(body): Json<Value>) -> Response {
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    if !matches!(model.as_str(), "llama3.2:latest" | "qwen2.5-coder:7b") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": { "message": format!("model \"{model}\" not found, try pulling it first") } })),
+        )
+            .into_response();
+    }
+
+    let stream = body["stream"].as_bool().unwrap_or(false);
+    let answer = "Hello from Ollama.";
+
+    if stream {
+        let wants_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+        let mut sse = String::new();
+        // Ollama splits the answer the same way, word by word, and always ends with `[DONE]`.
+        for word in answer.split_inclusive(' ') {
+            sse.push_str(&format!(
+                "data: {}\n\n",
+                json!({ "choices": [{ "delta": { "content": word } }] })
+            ));
+        }
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] })
+        ));
+        if wants_usage {
+            sse.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9 }
+                })
+            ));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .expect("the mock stream must build");
+    }
+
+    Json(json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": answer },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9 }
+    }))
+    .into_response()
+}
+
+/// `POST /v1/chat/completions` on a vLLM server — OpenAI's shape, and nothing else.
+///
+/// The two vLLM-specific facts: it serves the standard `/v1/models` list, and a streamed answer
+/// carries a usage frame **only** under `stream_options.include_usage` — the field is not
+/// optional there, it is the whole mechanism. A walk that does not assert the usage arrives is
+/// a walk that would pass on a runtime reporting no tokens at all.
+async fn mock_vllm_chat(Json(body): Json<Value>) -> Response {
+    // A vLLM server serves whatever it was started with and refuses nothing about the name: the
+    // walk's point about this runtime is the usage frame, not the key.
+    let stream = body["stream"].as_bool().unwrap_or(false);
+    let answer = "Hello from vLLM.";
+
+    if stream {
+        let wants_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+        let mut sse = String::new();
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": { "content": answer } }] })
+        ));
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": {}, "finish_reason": "length" }] })
+        ));
+        if wants_usage {
+            sse.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18 }
+                })
+            ));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .expect("the mock stream must build");
+    }
+
+    Json(json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": answer },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18 }
+    }))
+    .into_response()
+}
+
+/// `GET /v1/models` on a llama.cpp server.
+///
+/// llama.cpp's list carries OpenAI's own `{"data":[{"id":…}]}` shape, so the shape is not the
+/// interesting part. The interesting part is the **id**: a llama.cpp server is started with a
+/// gguf file on the command line and serves that one model under the file's own path, so the id
+/// is typically `models/llama-3.1-8b-instruct.Q4_K_M.gguf` — a key with a **slash** in it. That
+/// collides head-on with the router's `provider/model` address, and it is the single most common
+/// reason a local provider "does not exist" for someone who typed the key the endpoint printed.
+async fn mock_llamacpp_models() -> Json<Value> {
+    Json(json!({
+        "object": "list",
+        "data": [
+            {
+                "id": "models/llama-3.1-8b-instruct.Q4_K_M.gguf",
+                "object": "model",
+                "owned_by": "llamacpp",
+            }
+        ]
+    }))
+}
+
+/// `POST /v1/chat/completions` on a llama.cpp server.
+///
+/// Two real facts, both observed rather than invented. A llama.cpp server started without
+/// `stream_options` support reports **no** usage frame in a stream, so the platform has to record
+/// the answer with `null` tokens rather than invent a zero — the "unknown" the Usage tab already
+/// knows how to count. And it refuses a model it was not started with, naming the file it was
+/// started with, which is the error an operator needs to see verbatim.
+async fn mock_llamacpp_chat(Json(body): Json<Value>) -> Response {
+    const STARTED_WITH: &str = "models/llama-3.1-8b-instruct.Q4_K_M.gguf";
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    if model != STARTED_WITH {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": { "message": format!("model '{model}' not found; this server was started with {STARTED_WITH}") }
+            })),
+        )
+            .into_response();
+    }
+
+    let answer = "Hello from llama.cpp.";
+    if body["stream"].as_bool().unwrap_or(false) {
+        let mut sse = String::new();
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": { "content": answer } }] })
+        ));
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] })
+        ));
+        // No usage frame: this build reports none. The stream ends on `[DONE]`, and the platform
+        // must show the tokens as unknown rather than as a real zero.
+        sse.push_str("data: [DONE]\n\n");
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .expect("the mock stream must build");
+    }
+
+    Json(json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": answer },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }
+    }))
+    .into_response()
+}
+
 /// `POST /v1/chat/completions` — a fixed answer, streamed or in one piece.
 ///
-/// The model `broken-model` makes the mock refuse the way a real provider refuses a request it
-/// cannot serve, so the suite can prove the platform reports it instead of hiding it.
+/// Two models make the mock refuse or break the way a real provider does, so the suite can prove
+/// the platform reports it instead of hiding it:
+///
+/// * `broken-model` refuses **before** the stream opens, with a `500`.
+/// * `flaky-model` answers `200`, streams two words, and then puts an `{"error":…}` frame inside
+///   the stream — the vendor failure the request calls "mid-stream". It arrives *after* the caller
+///   has already seen text, which is the whole difficulty: the answer is half-shown, the failure
+///   is real, and the platform has to say which of the two it is.
 async fn mock_chat(Json(body): Json<Value>) -> Response {
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     if model == "broken-model" {
@@ -230,6 +461,32 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
 
     let stream = body["stream"].as_bool().unwrap_or(false);
     let answer = format!("Hello from the mock ({model}).");
+
+    if model == "flaky-model" && stream {
+        let mut sse = String::new();
+        // Half an answer first: the caller has these bytes before the failure arrives, which is
+        // exactly the state in which a naive retry would produce a second, different answer.
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": { "content": "The model " } }] })
+        ));
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": { "content": "started " } }] })
+        ));
+        // …and then the vendor's own error frame, in the middle of an otherwise 200 stream. It
+        // is followed by `[DONE]`, because a real runtime that fails mid-stream still closes.
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "error": { "message": "the upstream runner went away mid-answer", "code": "internal_error" } })
+        ));
+        sse.push_str("data: [DONE]\n\n");
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(sse))
+            .expect("the mock stream must build");
+    }
 
     if stream {
         let mut sse = String::new();
@@ -2925,5 +3182,460 @@ async fn the_default_provider_cannot_be_removed_and_a_removable_one_takes_its_ro
         .await;
     assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{:?}", unknown.body);
 
+    harness.dispose().await;
+}
+
+/// A local endpoint is not a cloud provider with the key left off, and the acceptance criterion
+/// says so by name: an Ollama-shaped, a vLLM-shaped and a llama.cpp-shaped base URL each pass
+/// Test, Discover and a streamed chat.
+///
+/// Each of the three gets its own prefix on the mock, reproducing the quirk that runtime really
+/// has, so a walk that passes here could not pass against one smoothed shape:
+///
+/// * **Ollama** publishes its models with a **tag** (`llama3.2:latest`). The tag is part of the
+///   identifier the endpoint answers to, so the connection test — which asks the *first* model
+///   the endpoint reports — only works because discovery and the registry store the key in the
+///   endpoint's own vocabulary rather than a stripped one.
+/// * **vLLM** reports a stream's token counts **only** under `stream_options.include_usage`. That
+///   field is not optional there, it is the whole mechanism, so the Usage tab would read
+///   "unknown" for every local endpoint without it.
+/// * **llama.cpp** publishes the **gguf file path** it was started with
+///   (`models/….gguf`) — a model key with a slash in it, which is the one case where the router's
+///   `provider/model` address and the model's own key collide. Its stream also reports no usage at
+///   all, which must become `null` tokens rather than a zero.
+#[tokio::test]
+async fn the_three_local_runtimes_pass_test_discover_and_a_streamed_chat() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("local-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let token = token_of(&owner);
+
+    // (label, base URL, the model the endpoint reports first, how many models the endpoint
+    // serves, the answer it streams, and the total tokens the `done` frame must carry — `None`
+    // where the runtime reports no usage). The count is per runtime on purpose: Ollama and vLLM
+    // serve the mock's two-model list, llama.cpp serves the **one** model it was started with,
+    // which is what a real single-gguf server does.
+    let runtimes = [
+        ("Ollama", mock.ollama_base_url.as_str(), "llama3.2:latest", 2, "Hello from Ollama.", Some(9)),
+        ("vLLM", mock.vllm_base_url.as_str(), "mock-small", 2, "Hello from vLLM.", Some(18)),
+        (
+            "llama.cpp",
+            mock.llamacpp_base_url.as_str(),
+            "models/llama-3.1-8b-instruct.Q4_K_M.gguf",
+            1,
+            "Hello from llama.cpp.",
+            None,
+        ),
+    ];
+    let mut provider_ids: Vec<String> = Vec::new();
+    // How many models the registry should hold after each provider's apply, so the walk can prove
+    // a discovery *read* wrote nothing without hard-coding one number.
+    let mut applied_so_far: usize = 0;
+
+    for (label, base_url, first_model, served_models, answer, expected_total) in runtimes {
+        // **No key.** A local endpoint on the operator's own machine authenticates nothing, and
+        // the walk says so by not sending one: a run that only ever worked with a key would prove
+        // nothing about the case the criterion names.
+        let created = harness
+            .call(post(
+                "/api/v1/ai/providers",
+                json!({
+                    "name": format!("Local {label}"),
+                    "kind": "local",
+                    "base_url": base_url,
+                    "timeout_ms": 20000,
+                }),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{label}: {:?}",
+            created.body
+        );
+        assert_eq!(created.body["kind"], "local", "{label}");
+        assert_eq!(
+            created.body["has_api_key"], false,
+            "{label}: a local endpoint is connected without a key"
+        );
+        let provider_id = created.body["id"].as_str().expect("an id").to_owned();
+
+        // **Test.** Five steps against a live endpoint, no key involved. The TLS step is `skipped`
+        // because a local server is plain http, and it says so instead of ticking itself green —
+        // a step that reports a pass it did not perform is a step nobody can trust.
+        let tested = harness
+            .call(post(
+                &format!("/api/v1/ai/providers/{provider_id}/test"),
+                json!({}),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(tested.status, StatusCode::OK, "{label}: {}", tested.text);
+        assert_eq!(tested.body["ok"], true, "{label}: {}", tested.text);
+        assert_eq!(
+            tested.body["steps"].as_array().map(Vec::len),
+            Some(5),
+            "{label}: all five steps are always reported"
+        );
+        for step in tested.body["steps"].as_array().expect("the five steps") {
+            if step["step"] == "tls" {
+                assert_eq!(step["status"], "skipped", "{label}: {step}");
+                assert_eq!(step["note"], "the endpoint is plain http", "{label}");
+                continue;
+            }
+            assert_eq!(step["status"], "ok", "{label}: {step}");
+        }
+        // The test asks the endpoint, so it reports what the endpoint **serves** — not what the
+        // registry holds, which is still empty at this point in the walk.
+        assert_eq!(
+            tested.body["model_count"], served_models,
+            "{label}: the test reports the endpoint's own list"
+        );
+
+        // **Discover.** A diff against a registry that holds nothing yet: everything the endpoint
+        // reports is new. Discovery writes nothing, and the model count is read back to prove it.
+        let discovered = harness
+            .call(post(
+                &format!("/api/v1/ai/providers/{provider_id}/discover-models"),
+                json!({}),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(
+            discovered.status,
+            StatusCode::OK,
+            "{label}: {}",
+            discovered.text
+        );
+        assert_eq!(discovered.body["stored_count"], 0, "{label}: nothing yet");
+        assert_eq!(
+            discovered.body["reported_count"], served_models,
+            "{label}: discovery reports the endpoint's own count"
+        );
+        let reported: Vec<&str> = discovered.body["reported"]
+            .as_array()
+            .expect("the reported keys")
+            .iter()
+            .filter_map(|key| key.as_str())
+            .collect();
+        assert!(
+            reported.contains(&first_model),
+            "{label}: the endpoint's own key is reported verbatim, tag and path included: {reported:?}"
+        );
+        let models_after_read = harness
+            .call(get("/api/v1/ai/models", Some(&token)))
+            .await;
+        let model_total = models_after_read.body["models"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(
+            model_total,
+            applied_so_far,
+            "{label}: a discovery read must never write"
+        );
+        applied_so_far += served_models;
+
+        let applied = harness
+            .call(post(
+                &format!("/api/v1/ai/providers/{provider_id}/apply-discovery"),
+                json!({}),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(
+            applied.status,
+            StatusCode::OK,
+            "{label}: {:?}",
+            applied.body
+        );
+        assert_eq!(
+            applied.body["added"], served_models,
+            "{label}: the apply adds exactly what the diff named"
+        );
+
+        // A second run finds nothing to do — the case that makes the first apply trustworthy.
+        let again = harness
+            .call(post(
+                &format!("/api/v1/ai/providers/{provider_id}/discover-models"),
+                json!({}),
+                Some(&token),
+            ))
+            .await;
+        assert_eq!(again.body["up_to_date"], true, "{label}: {:?}", again.body);
+
+        // **Stream.** The chat is addressed the way the panel addresses it — `provider/model` —
+        // and the model key is exactly what the endpoint published, so for llama.cpp the address
+        // itself carries a second slash. A router that split on the first `/` and treated the
+        // prefix as a provider name would read `models/…` as a provider called `models` and answer
+        // "no such model"; the walk asserts it did not.
+        let addressed = format!("Local {label}/{first_model}");
+        let streamed = harness
+            .call(post("/api/v1/ai/chat", chat(Some(&addressed)), Some(&token)))
+            .await;
+        assert_eq!(
+            streamed.status,
+            StatusCode::OK,
+            "{label}: a model key with a slash must still resolve: {}",
+            streamed.text
+        );
+        let events = sse_events(&streamed.text);
+        assert_eq!(events[0].0, "start", "{label}: {events:?}");
+        assert_eq!(
+            events[0].1["provider"],
+            format!("Local {label}"),
+            "{label}: the start frame names the local provider, not a prefix of the key"
+        );
+        assert_eq!(events[0].1["protocol"], "openai_compatible", "{label}");
+        assert_eq!(
+            streamed_answer(&events),
+            answer,
+            "{label}: the answer came through the adapter, unchanged"
+        );
+        assert!(
+            !events.iter().any(|(name, _)| name == "error"),
+            "{label}: a local answer that arrived has no error frame: {events:?}"
+        );
+
+        // The `done` frame carries the usage **or an honest null** — never an invented zero. For
+        // Ollama and vLLM the numbers are only there because the adapter asked for them; for
+        // llama.cpp the frame must be null and the Usage tab must count the call as
+        // `missing_usage` rather than as a free one.
+        let done = events
+            .iter()
+            .find(|(name, _)| name == "done")
+            .unwrap_or_else(|| panic!("{label}: no done frame in {events:?}"));
+        match expected_total {
+            Some(total) => {
+                assert_eq!(
+                    done.1["usage"]["total_tokens"], total,
+                    "{label}: a stream asked for its usage must report it"
+                );
+                assert!(
+                    done.1["usage"]["prompt_tokens"].is_number()
+                        && done.1["usage"]["completion_tokens"].is_number(),
+                    "{label}: both counts arrive, not just the total: {}",
+                    done.1
+                );
+            }
+            None => assert!(
+                done.1["usage"].is_null(),
+                "{label}: a stream that reports no usage carries null, not a zero: {}",
+                done.1
+            ),
+        }
+
+        provider_ids.push(provider_id);
+    }
+
+    // The Usage tab reads the calls that were just made. llama.cpp's one call is counted as a
+    // request whose tokens are **unknown** — a total is never quietly wrong because a stream
+    // ended without a usage frame.
+    let llamacpp = provider_ids.last().expect("the last provider");
+    let usage = harness
+        .call(
+            get(
+                &format!("/api/v1/ai/providers/{llamacpp}/usage?window=24h"),
+                Some(&token),
+            ),
+        )
+        .await;
+    assert_eq!(usage.status, StatusCode::OK, "{:?}", usage.body);
+    assert_eq!(usage.body["provider_name"], "Local llama.cpp");
+    assert_eq!(
+        usage.body["summary"]["requests"], 1,
+        "the call the walk just made is the one the tab reads: {:?}",
+        usage.body
+    );
+    assert_eq!(
+        usage.body["summary"]["missing_usage"], 1,
+        "a call that reported no tokens is counted as unknown, not as a real zero: {:?}",
+        usage.body
+    );
+    assert_eq!(
+        usage.body["summary"]["errors"], 0,
+        "an unknown token count is not an error: {:?}",
+        usage.body
+    );
+
+    // And the two that did report numbers are not counted as missing.
+    let ollama = &provider_ids[0];
+    let ollama_usage = harness
+        .call(
+            get(
+                &format!("/api/v1/ai/providers/{ollama}/usage?window=24h"),
+                Some(&token),
+            ),
+        )
+        .await;
+    assert_eq!(
+        ollama_usage.body["summary"]["missing_usage"], 0,
+        "Ollama reported its usage because the adapter asked for it: {:?}",
+        ollama_usage.body
+    );
+    assert_eq!(ollama_usage.body["summary"]["prompt_tokens"], 5);
+    assert_eq!(ollama_usage.body["summary"]["completion_tokens"], 4);
+
+    mock.task.abort();
+    harness.dispose().await;
+}
+
+/// A vendor that fails **inside** an otherwise-`200` stream: the caller has already received
+/// part of the answer, and the platform has to say so rather than close the stream as if it had
+/// finished. The criterion names the shape of the answer — one `error` event plus a failed usage
+/// row — so the walk asserts both, and the deltas that did arrive are kept.
+#[tokio::test]
+async fn a_mid_stream_vendor_error_is_one_error_frame_and_a_failed_usage_row() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start().await;
+
+    let owner = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Owner",
+                "email": format!("midstream-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    let token = token_of(&owner);
+
+    // Two providers serving the same key, so a reroute would be *possible* — which is what makes
+    // "it was not retried" a claim rather than an accident of there being nowhere to go.
+    let broken = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Flaky",
+                "base_url": mock.base_url,
+                "priority": 10,
+                "models": ["flaky-model", "mock-small"],
+            }),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(broken.status, StatusCode::CREATED, "{:?}", broken.body);
+    let flaky_id = Uuid::parse_str(broken.body["id"].as_str().expect("an id")).expect("a uuid");
+
+    let healthy = harness
+        .call(post(
+            "/api/v1/ai/providers",
+            json!({
+                "name": "Steady",
+                "base_url": mock.base_url,
+                "priority": 20,
+                "models": ["mock-small"],
+            }),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(healthy.status, StatusCode::CREATED, "{:?}", healthy.body);
+
+    // A **pinned** request to the flaky model, so the walk tests the mid-stream case without the
+    // failover rules on top of it: the criterion for failover is a separate walk.
+    let answered = harness
+        .call(
+            post(
+                "/api/v1/ai/chat",
+                chat(Some("Flaky/flaky-model")),
+                Some(&token),
+            ),
+        )
+        .await;
+    assert_eq!(answered.status, StatusCode::OK, "{:?}", answered.body);
+    let events = sse_events(&answered.text);
+
+    // The deltas that arrived before the failure are kept: the caller saw them, and hiding them
+    // would make the error look like it happened before anything was said.
+    assert_eq!(
+        streamed_answer(&events),
+        "The model started ",
+        "the answer in hand is what the caller was shown: {events:?}"
+    );
+
+    // Exactly one `error` frame, and no `done` after it — a stream that broke has no finish reason
+    // and no usage, and reporting either would be a claim about an answer that never completed.
+    let errors: Vec<&(String, Value)> = events
+        .iter()
+        .filter(|(name, _)| name == "error")
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "a mid-stream failure is one error, not one per frame after it: {events:?}"
+    );
+    assert_eq!(
+        errors[0].1["code"], "provider_error",
+        "the code names the provider, not a generic failure: {}",
+        errors[0].1
+    );
+    let message = errors[0].1["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("went away mid-answer"),
+        "the provider's own words survive to the caller: {message}"
+    );
+    assert!(
+        !events.iter().any(|(name, _)| name == "done"),
+        "a broken stream has no done frame: {events:?}"
+    );
+
+    // The failed exchange is a **failed usage row**, on the provider that broke — not a success
+    // with a missing answer, and not on the provider that was never asked.
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "select provider_id, outcome from ai_provider_usage where task = 'chat' order by created_at",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the usage rows read");
+    assert_eq!(rows.len(), 1, "one attempt, one row: {rows:?}");
+    assert_eq!(rows[0].0, flaky_id, "the failure is the asked provider's");
+    assert_eq!(rows[0].1, "error");
+
+    // And the audit says the same thing: a failed chat, named with the provider's own words.
+    let failures: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "select action, metadata from audit_log where action = 'ai.chat.failed'",
+    )
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the audit rows read");
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].1["provider"], "Flaky");
+    assert_eq!(failures[0].1["model"], "flaky-model");
+    assert!(
+        failures[0].1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("went away mid-answer"),
+        "{:?}",
+        failures[0].1
+    );
+
+    // No completed row: a half-answer is not a completed exchange.
+    let completed: (i64,) =
+        sqlx::query_as("select count(*) from audit_log where action = 'ai.chat.completed'")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the count reads");
+    assert_eq!(completed.0, 0, "a broken stream is never audited as completed");
+
+    mock.task.abort();
     harness.dispose().await;
 }
