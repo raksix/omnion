@@ -26,6 +26,12 @@ pub enum AiHubError {
     /// The installation has no (enabled) default model to route to.
     #[error("no default AI model is configured")]
     NoDefaultModel,
+    /// No route decision carries that id.
+    ///
+    /// A 404 rather than an empty answer: the log screen opens a decision by id, and a row that
+    /// is not there is a stale bookmark, not an installation whose log happens to be empty.
+    #[error("no route decision with that id")]
+    DecisionNotFound,
     /// The resolved provider is switched off.
     #[error("the AI provider \"{0}\" is disabled")]
     ProviderDisabled(String),
@@ -101,6 +107,7 @@ impl AiHubError {
             Self::ProviderNameTaken(_) => "provider_name_taken",
             Self::ModelNotFound => "model_not_found",
             Self::NoDefaultModel => "no_default_model",
+            Self::DecisionNotFound => "decision_not_found",
             Self::ProviderDisabled(_) => "provider_disabled",
             Self::ProviderIsDefault(_) => "provider_is_default",
             Self::InvalidProvider(_) => "invalid_provider",

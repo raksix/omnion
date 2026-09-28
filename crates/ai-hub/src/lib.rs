@@ -17,6 +17,7 @@
 pub mod catalog;
 pub mod client;
 pub mod connection_test;
+pub mod decision_store;
 pub mod error;
 pub mod failover;
 pub mod health;
@@ -70,4 +71,9 @@ pub use store::{
 pub use routing_store::{
     CandidateInput, ScopeRoutes, TaskRouteView, clear_task_map, features, load_maps,
     organization_of_site, read_scope, replace_task_map, requirements, set_override,
+};
+pub use decision_store::{
+    Answer, DecisionContext, DecisionFilter, DecisionPage, DecisionRow, NewDecision,
+    RouteDecision, answer_position, decision_id_of, export_rows, last_per_task, list, prune,
+    read_one, record,
 };
