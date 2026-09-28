@@ -2664,3 +2664,116 @@ give it a contract to import against.
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
+## 2026-09-28 — REQ-126 slice 3b · the flush loop, and the two screens slice 3 said it did not have
+
+**What shipped.** `866daed`, `df41082`, `2ff4a57`. Slice 3 ended with a sentence in its own
+request file: *"the flush LOOP that drains the buffers on `batch_ms`"*, and beside it, the two
+admin screens. Both are now shipped, and the loop turned out to be the more interesting half.
+
+**The bug the loop found, which slice 3's own tests could not see.** Nothing in the tree ever
+called `Collector::push`. The bounded ring, the drop-oldest rule, the health chip and the `Test`
+probe were all correct — and all provable, because every one of slice 3's tests pushed into the
+collector itself. That is a pipeline that is complete in every unit and empty in production: a
+configured exporter would have buffered nothing, forever, and reported `unknown` health, which is
+precisely the "exporter configured but nothing arrives" state the route module's own doc comment
+says an operator cannot diagnose. So `exporter_flush` ships both halves — `fan_out`, called from
+the request log after the row is written, and `run`/`sweep`, the loop.
+
+The `after the row is written` half is deliberate. A payload the local store rejected would still
+reach a backend, and then the exporter's copy and the explorer's copy disagree about which lines
+exist. And the fan-out pushes the *serialised* payload, not a typed record, because the redaction
+pass runs when a `LogEntry` and a `Span` are BUILT — a `Value` that reaches a buffer has been
+through it and cannot be un-redacted on the way out.
+
+**Proof.**
+- `cargo test -p omnion-telemetry` → **103 passed, 0 failed** (12 new): the fan-out reaches every
+  enabled exporter and skips a disabled one, a full buffer still drops oldest and counts it across
+  a fan-out, an interval is measured from the last flush, an unparseable stamp is treated as
+  never-flushed, and the body a flush posts is asserted to carry no fixture secret and no fixture
+  e-mail.
+- `cargo test -p omnion-api --test exporter_flush` → **5 passed, 0 failed** against
+  `omnion_w6_dev`: a real request's line reaches a mock collector on a real port, matched by the
+  request id the middleware minted; a backend that refuses everything still leaves the request at
+  `200` while the row degrades and the drop counter is persisted; a row this process never
+  registered is registered by the sweep; switching an exporter off drains and counts its backlog
+  rather than holding it; and a `batch_ms` of an hour is respected between flushes.
+- `cargo test -p omnion-core` → **35 passed** including the new `OMNION_EXPORTER_FLUSH` switch.
+- `pnpm typecheck` → 2/2.
+
+**Three test bugs, each of which would have taught the next reader to distrust the assertion.**
+The interval test asserted that a 100 ms batch is due "instantly" — but the flush stamp is written
+with the well-known RFC 3339 format, which carries **no subsecond component**, so "now" is always
+truncated to the second and the assertion was only ever true by luck. It now uses stamps that
+straddle the truncation. The config test used `"yes"` as its invalid-boolean fixture, and this
+platform's reader accepts `yes` — the test was asserting the opposite of what its name claimed. And
+the first redaction test hand-wrote a `Span` struct literal, which stopped compiling the moment the
+struct grew a field; it now uses `Span::root(..).attribute(..)`, which is the path a caller
+actually takes and the one that runs the redaction pass.
+
+**One dead-code decision worth recording.** A `Transport` struct and a `record_fan_out` helper were
+written for tests that turned out to be better expressed against the real `Batch`. Both are gone
+rather than kept as scaffolding; what replaced the first is `batch_body`, because the cheapest
+honest way to assert "the payload is redacted" is to render the body that leaves the process.
+
+**New family.** `omnion_exporter_batches_flushed_total{kind}`. A drop counter with no flush counter
+cannot answer whether the exporter is broken or the drain is, and those two present with the same
+empty buffer.
+
+**The two screens.** `/observability/traces` answers the jump (a request id from an error banner
+finds that request's trace) and the judgement (the index is a SAMPLE): every row carries *why* it
+was sampled — `error`, `ratio`, `upstream` — because "why do I have this trace but not the one next
+to it" is the question an operator arrives with and a boolean cannot answer it. A trace over the
+inline cap renders a short waterfall that looks complete, so the `span_count` / `spans_kept`
+disagreement is a banner, and "no tracing backend configured" is a configuration answer rather than
+an empty region. `/observability/exporters` makes the trade-off the request asks to be stated
+legible: the buffer as a bar against its cap, the drop counter, the last flush, and `unknown`
+deliberately NOT green — a saved row this process has never flushed is a real state, and colouring
+it `ok` would be the screen lying on the operator's behalf. `Test` posts a fixed synthetic document
+and renders a refusal as a degraded report, never an error page.
+
+**The QA pass, and the three defects it found on these screens.** The full pass (42 pages, 1497
+screenshots) put both new screens in the inventory and clicked them; the scoped depth pass then
+reported **0 console errors and 24/24 steps**. The run's 119 high findings are media, secrets and
+IAM — other writers' files, untouched here. Three findings were mine, and all three had the same
+shape: a value the screen should have caught, reaching the API and coming back as a 400 the screen
+then rendered as a generic failure.
+
+1. **`min_duration_ms=NaN` on the wire.** `Number("12x")` is `NaN`, and `URLSearchParams`
+   stringifies that into the literal query. The API was right to refuse it. The screen was wrong to
+   present the refusal as "the trace index could not be read" — which is the single worst thing a
+   debug screen can say to the person debugging it, because it says the instance is down.
+2. **A request id that is not a uuid.** The QA harness pastes words into every text box it finds,
+   which is also what an operator does when they paste the wrong column. Same 400, same misleading
+   banner. Both fields are now validated in the component and carry a field-level message.
+3. **Fifty low-contrast text nodes, one per row chip.** `text-accent` on `bg-accent-soft` measures
+   4.18:1, under the 4.5 that `globals.css`'s own header comment promises for every text pair in
+   the palette. The chip is `accent-strong` now — the pairing the palette header already names.
+
+**A test assertion that was wrong in a way that made the product look broken.** The first version of
+the fix's walkthrough check counted requests to prove the invalid filter was not sent. The count
+came back 1, which reads as a leak. It is not one: clearing an invalid filter *is* a different
+query ("no floor" rather than "floor 999999"), so one more request is correct behaviour and a count
+cannot distinguish a legitimate re-read from a leaked one. The assertion now reads the URLs out of
+the performance entries and checks the property directly — the literal `NaN` is not on the wire —
+because a proxy for a property is only as good as the reasoning behind it, and this one's reasoning
+was wrong.
+
+**A depth driver that was measuring the wrong build.** `walkthrough.cjs` reads its base URL from its
+own `--url` CLI flag, not from the environment, so `QA_ADMIN_PORT=3105` changed nothing. The first
+run of the trace driver signed in successfully against the default `:3100` — the main writer's
+admin panel, which invariant 2 forbids — and then timed out on a selector that does not exist
+there. That failure looks exactly like a broken screen, and the next person to see it would have
+started debugging the screen. Both drivers now push `--url` from their own ADMIN before the
+require, and the default is this wave's private 3105 rather than 3100.
+
+**One housekeeping note for the box.** `/mnt/apopic` hit 100% during this tick and a `patch` write
+failed with `No space left on device` mid-edit — the failure mode this box has before. It was
+cleared by deleting this worktree's own `qa-artifacts/**/shots/click-*.png` (1297 files, 156 MB of
+"a link was clicked" churn that the next pass regenerates) and keeping the `page-observability-*`
+evidence. **Never another writer's `target/` or artifacts to make room.**
+
+**Next.** REQ-126 slice 4 — the graceful-shutdown sequence and the probe contract, the alert-rule
+evaluator with silences and notifications, the settings screen, and the `infra/observability/`
+bundle (Grafana dashboards, Prometheus rules, the collector example) whose mapping the now-fixed
+metric families give it a contract to import against.
