@@ -71,8 +71,8 @@ impl StubKey {
     pub fn generate() -> Self {
         use rsa::traits::PublicKeyParts;
 
-        let private =
-            rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("the platform has entropy");
+        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)
+            .expect("the platform has entropy");
         let modulus = private.n().to_bytes_be();
         let exponent = private.e().to_bytes_be();
 
@@ -220,7 +220,12 @@ fn der_certificate(private: &rsa::RsaPrivateKey) -> String {
     // rsaEncryption OID.
     let algorithm = der_wrap(
         0x30,
-        &[&[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01], &[]],
+        &[
+            &[
+                0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+            ],
+            &[],
+        ],
     );
     let bit_string = der_wrap(0x03, &[&[0x00], &rsa_key]);
     let spki = der_wrap(0x30, &[&algorithm, &bit_string]);
@@ -292,7 +297,9 @@ impl StubIdp {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port is available");
-        let addr = listener.local_addr().expect("a bound socket has an address");
+        let addr = listener
+            .local_addr()
+            .expect("a bound socket has an address");
 
         let server_state = Arc::clone(&state);
         let server_key = Arc::clone(&key);
@@ -406,7 +413,11 @@ impl Request {
 
     /// One form field of the body.
     fn field(&self, key: &str) -> Option<String> {
-        if !self.headers.get("content-type").is_some_and(|value| value.contains("form-urlencoded")) {
+        if !self
+            .headers
+            .get("content-type")
+            .is_some_and(|value| value.contains("form-urlencoded"))
+        {
             return None;
         }
         for pair in self.body.split('&') {
@@ -549,8 +560,10 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         path: path.to_owned(),
         query: query.to_owned(),
         headers,
-        body: String::from_utf8_lossy(&buffer[body_start..(body_start + content_length).min(buffer.len())])
-            .into_owned(),
+        body: String::from_utf8_lossy(
+            &buffer[body_start..(body_start + content_length).min(buffer.len())],
+        )
+        .into_owned(),
     })
 }
 
@@ -562,11 +575,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Answer one request.
-async fn route(
-    request: &Request,
-    key: &Arc<StubKey>,
-    state: &Arc<Mutex<StubState>>,
-) -> Answer {
+async fn route(request: &Request, key: &Arc<StubKey>, state: &Arc<Mutex<StubState>>) -> Answer {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/.well-known/openid-configuration") => {
             // A real provider derives its issuer from its own host; so does this one, so the
@@ -611,23 +620,24 @@ async fn route(
                 .push(challenge.clone());
 
             if client_id != CLIENT_ID {
-                return Answer::json(
-                    400,
-                    json!({ "error": "unauthorized_client" }).to_string(),
-                );
+                return Answer::json(400, json!({ "error": "unauthorized_client" }).to_string());
             }
 
             let code = make_code(&request_issuer(request), &state_value);
-            state.lock().expect("the stub state is not poisoned").codes.insert(
-                code.clone(),
-                IssuedCode {
-                    challenge,
-                    subject,
-                    email,
-                    display_name,
-                    groups,
-                },
-            );
+            state
+                .lock()
+                .expect("the stub state is not poisoned")
+                .codes
+                .insert(
+                    code.clone(),
+                    IssuedCode {
+                        challenge,
+                        subject,
+                        email,
+                        display_name,
+                        groups,
+                    },
+                );
 
             // A real authorization endpoint redirects the *browser*; the walk reads the
             // `Location` and calls the callback itself, which is exactly what a browser does.
@@ -648,12 +658,17 @@ async fn route(
 fn request_issuer(request: &Request) -> String {
     format!(
         "http://{}",
-        request.headers.get("host").map_or("localhost", String::as_str)
+        request
+            .headers
+            .get("host")
+            .map_or("localhost", String::as_str)
     )
 }
 
 /// The identity the next authorization should assert, consumed on read.
-fn request_identity(state: &Arc<Mutex<StubState>>) -> Option<(String, String, String, Vec<String>)> {
+fn request_identity(
+    state: &Arc<Mutex<StubState>>,
+) -> Option<(String, String, String, Vec<String>)> {
     let mut guard = state.lock().expect("the stub state is not poisoned");
     let identity = guard.next_subject.take();
     guard.next_challenge = None;
@@ -661,11 +676,7 @@ fn request_identity(state: &Arc<Mutex<StubState>>) -> Option<(String, String, St
 }
 
 /// The token endpoint: PKCE is checked here, and the code is spent exactly once.
-fn token(
-    request: &Request,
-    key: &Arc<StubKey>,
-    state: &Arc<Mutex<StubState>>,
-) -> Answer {
+fn token(request: &Request, key: &Arc<StubKey>, state: &Arc<Mutex<StubState>>) -> Answer {
     let code = request.field("code").unwrap_or_default();
     let verifier = request.field("code_verifier").unwrap_or_default();
     let client_id = request.field("client_id").unwrap_or_default();
@@ -772,7 +783,13 @@ fn saml_assertion(key: &Arc<StubKey>, state: &Arc<Mutex<StubState>>) -> Answer {
         .chain(std::iter::once(("displayName", display_name.as_str())))
         .collect::<Vec<_>>();
 
-    let document = key.sign_saml("stub-assertion-1", &subject, &attributes, now - 60, now + 300);
+    let document = key.sign_saml(
+        "stub-assertion-1",
+        &subject,
+        &attributes,
+        now - 60,
+        now + 300,
+    );
     Answer::json(
         200,
         json!({ "SAMLResponse": b64(document.as_bytes()) }).to_string(),
