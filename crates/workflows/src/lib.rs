@@ -25,6 +25,7 @@ pub mod cron;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod graph;
 pub mod guard;
 pub mod handler;
 pub mod model;
@@ -34,6 +35,10 @@ pub use approval::{APPROVAL_PERMISSION, ApprovalParams, Decision as ApprovalDeci
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
 pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};
+pub use graph::{
+    Edge, Finding, Graph, Node, NodeType, Port, Severity, find_cycle, find_node_type, project,
+    reachable_from, validate,
+};
 pub use guard::{GuardStep, GuardVerdict, NoRunGuard, RunGuard};
 pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
 pub use model::{
