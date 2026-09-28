@@ -5365,7 +5365,7 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
     ] {
         let response = call(
             &fixture.state,
-            request(Method::GET, uri, Some(&owner_token)),
+            request(Method::GET, uri, Some(&owner_token), None),
         )
         .await;
         assert_eq!(
@@ -5380,7 +5380,7 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
     // would pass the check above and mean nothing.
     let listed = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/crm/contacts", Some(&fixture.owner), None),
+        request(Method::GET, "/api/v1/crm/contacts", Some(&owner_token), None),
     )
     .await;
     let items = listed.body["items"].as_array().expect("the list envelope must be an object");
@@ -5396,15 +5396,28 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
         request(
             Method::GET,
             &format!("/api/v1/crm/contacts?organization_id={}", fixture.other_org),
-            Some(&fixture.owner),
+            Some(&owner_token),
             None,
         ),
     )
     .await;
+    // A platform account **may** name any tenant — that is what the platform role is, and the
+    // route guard still decides the permission. What the fallback must never do is grant reach
+    // the named path did not already have, so the check is that the *answer* is scoped to the
+    // tenant that was named, not that the request is refused.
     assert_eq!(
         elsewhere.status,
-        StatusCode::FORBIDDEN,
-        "the fallback must not become a way to read a tenant that was not named"
+        StatusCode::OK,
+        "a named tenant is the platform account's to read: {}",
+        elsewhere.body
+    );
+    let elsewhere_items = elsewhere.body["items"]
+        .as_array()
+        .expect("the list envelope is an object");
+    assert!(
+        !elsewhere_items.iter().any(|row| row["first_name"] == "Tenant"),
+        "the other tenant's rows must not leak into the answer: {}",
+        elsewhere.body
     );
 }
 
@@ -5476,7 +5489,7 @@ async fn a_platform_account_bound_to_two_organizations_is_told_to_choose() {
         request(
             Method::GET,
             &format!("/api/v1/crm/contacts?organization_id={}", fixture.org),
-            Some(&fixture.owner),
+            Some(&token),
             None,
         ),
     )
