@@ -1,4 +1,4 @@
--- Omnion · 0026 · content: reusable patterns and page templates
+-- Omnion · 0039 · content: reusable patterns and page templates (REQ-063, slice 3)
 --
 -- REQ-063 slice 3. A pattern is a named block group an author can drop into any page; a page
 -- template is a whole page's worth of blocks with sample content. Both store exactly what a
