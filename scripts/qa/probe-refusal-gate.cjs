@@ -15,8 +15,8 @@ const expectedRefusals = [];
 const netFailures = [];
 const consoleLog = [];
 
-function expectRefusal(match, reason) {
-  expectedRefusals.push({ match, reason, consoleFrom: consoleLog.length, netFrom: netFailures.length, closed: false, claimed: 0 });
+function expectRefusal(match, reason, statuses) {
+  expectedRefusals.push({ match, reason, statuses, consoleFrom: consoleLog.length, netFrom: netFailures.length, closed: false, claimed: 0 });
 }
 function endRefusalWindow(match) {
   // The window is bounded by *position*, not by the moment the roll-up happens to read it. A
@@ -45,7 +45,7 @@ function netRollup() {
         index >= entry.netFrom &&
         (entry.netTo === undefined || index < entry.netTo) &&
         String(n.url || "").includes(entry.match) &&
-        allowedStatus(n),
+        (entry.statuses ? entry.statuses.includes(n.status) : allowedStatus(n)),
     );
     if (deliberate) { deliberate.claimed += 1; out.push("refused"); return; }
     out.push("finding");
@@ -56,9 +56,13 @@ function consoleRollup() {
   const out = [];
   for (const entry of expectedRefusals) entry.claimed = 0;
   consoleLog.forEach((f, index) => {
+    const lineStatus = Number((f.text.match(/status of (\d{3})/) || [])[1] || 0);
     const deliberate = /status of (40[013]|5\d\d)|ERR_CONNECTION_REFUSED|ERR_NETWORK/.test(f.text)
       ? expectedRefusals.find(
-          (entry) => index >= entry.consoleFrom && (entry.consoleTo === undefined || index < entry.consoleTo),
+          (entry) =>
+            index >= entry.consoleFrom &&
+            (entry.consoleTo === undefined || index < entry.consoleTo) &&
+            (entry.statuses ? entry.statuses.includes(lineStatus) : true),
         )
       : null;
     if (deliberate) { deliberate.claimed += 1; out.push("refused"); return; }
@@ -133,4 +137,39 @@ netFailures.length = 0;
 netFailures.push({ url: "/api/v1/ai/providers", status: 500 });
 assert.deepEqual(netRollup(), ["finding"], "with no registration, a 500 is a finding");
 
-console.log("qa-refusal-gate: 9/9 PASS");
+// 10. a narrowed registration excuses only what it named. The generic form filler types
+// placeholders and submits, so its POST is refused with a 400 — and a 500 in that same window is
+// the API crashing on input it should have rejected, which is a defect the report must keep.
+expectedRefusals.length = 0;
+netFailures.length = 0;
+expectRefusal("/api/v1/", "a placeholder form is refused", [400, 401, 403, 422]);
+netFailures.push({ url: "/api/v1/ai/providers", status: 400 });
+assert.deepEqual(netRollup(), ["refused"], "the 400 the filler provoked is excused");
+netFailures.push({ url: "/api/v1/ai/providers", status: 500 });
+assert.deepEqual(
+  netRollup(),
+  ["refused", "finding"],
+  "a 500 inside a 4xx-only window is still a finding — narrowing must not become a rubber stamp",
+);
+
+// 11. and the same narrowing applies to the console line, not only to the request
+expectedRefusals.length = 0;
+netFailures.length = 0;
+consoleLog.length = 0;
+expectRefusal("/api/v1/", "a placeholder form is refused", [400, 401, 403, 422]);
+consoleLog.push({ text: "Failed to load resource: the server responded with a status of 400 (Bad Request)" });
+consoleLog.push({ text: "Failed to load resource: the server responded with a status of 500 (Internal Server Error)" });
+assert.deepEqual(
+  consoleRollup(),
+  ["refused", "finding"],
+  "the console side honours the same narrowed vocabulary",
+);
+
+// 12. a default registration is unchanged by the narrowing: a 5xx provocation still excuses a 500
+expectedRefusals.length = 0;
+netFailures.length = 0;
+expectRefusal("/ai/providers", "provoked");
+netFailures.push({ url: "/api/v1/ai/providers", status: 500 });
+assert.deepEqual(netRollup(), ["refused"], "a registration with no vocabulary still excuses a 500");
+
+console.log("qa-refusal-gate: 12/12 PASS");

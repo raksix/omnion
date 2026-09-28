@@ -166,11 +166,21 @@ const aiStateFindings = [];
  *  The window is bounded by *position*, not by the moment the roll-up reads it. The pass closes it
  *  with `endRefusalWindow`, which records how far it reached; a boolean "closed" flag would retract
  *  the allowance from entries the pass had already provoked, and the provocation really did happen.
+ *
+ *  `statuses` narrows what the allowance may excuse. It defaults to the gate's full vocabulary
+ *  because most provocations (a step-up, a server-error state) genuinely are 5xx. A caller that
+ *  expects only a *client* refusal says so, and a 500 inside its window is then still a high
+ *  finding — a form filled with placeholders should be rejected, not crash the API.
  */
-function expectRefusal(match, reason) {
+/** The statuses a default (unscoped) registration may excuse: a refusal, or the server-error state. */
+function allowedStatus(n) {
+  return n.status === 0 || !n.status || [400, 401, 403].includes(n.status) || (n.status >= 500 && n.status < 600);
+}
+function expectRefusal(match, reason, statuses) {
   expectedRefusals.push({
     match,
     reason,
+    statuses,
     consoleFrom: consoleLog.length,
     netFrom: netFailures.length,
     claimed: 0,
@@ -880,9 +890,24 @@ async function interact(page, pageName, report) {
       }, dialogSel)
       .catch(() => false);
     if (hasForm) {
+      // This filler types placeholder values into every field and submits, so the POST is *expected*
+      // to be refused: a required name, a base URL that is not a URL, a value under its minimum.
+      // The refusal is the point — a form that accepted "e.g. Office AI" as a provider would be
+      // worse than one that rejects it — but an unregistered 4xx is filed as a high finding, which
+      // made every screen with a form report a defect the pass had caused itself. Registering the
+      // window is the honest form: the pass says "everything up to here is mine", and an
+      // unregistered failure in the same window is still a finding.
+      expectRefusal(
+        "/api/v1/",
+        `interact(${pageName}): a placeholder-filled form is submitted on purpose and refused`,
+        [400, 401, 403, 422],
+      );
       const filled = await fillSubtree(page, dialogSel);
       const submitted = await clickPrimaryIn(page, dialogSel);
       await page.waitForTimeout(700);
+      // Close the window here rather than at the end of the pass: a later, real failure on the
+      // same screen must not inherit the allowance from a dialog submitted twenty clicks ago.
+      endRefusalWindow("/api/v1/");
       await shot(page, `form-${pageName}-${index}`);
       record({
         page: pageName,
@@ -4286,9 +4311,16 @@ async function main() {
     // permission refusal, 400 for a field the pass deliberately submits wrong, and 5xx for the
     // server-error states a pass has to reach to prove the screen survives one. The registration
     // is what makes this safe — an unregistered 500 is still a high finding.
+    const statusInLine = f.text.match(/status of (\d{3})/);
+    const lineStatus = statusInLine ? Number(statusInLine[1]) : 0;
     const deliberate = /status of (40[013]|5\d\d)|ERR_CONNECTION_REFUSED|ERR_NETWORK/.test(f.text)
       ? expectedRefusals.find(
-          (entry) => index >= entry.consoleFrom && (entry.consoleTo === undefined || index < entry.consoleTo),
+          (entry) =>
+            index >= entry.consoleFrom &&
+            (entry.consoleTo === undefined || index < entry.consoleTo) &&
+            // Same narrowing as the request gate: a registration that only expects 4xx does not
+            // excuse a 500 console line, so the API crashing is still reported as a crash.
+            (entry.statuses ? entry.statuses.includes(lineStatus) : true),
         )
       : null;
     if (deliberate) {
@@ -4315,10 +4347,10 @@ async function main() {
         index >= entry.netFrom &&
         (entry.netTo === undefined || index < entry.netTo) &&
         String(n.url || "").includes(entry.match) &&
-        (n.status === 0 ||
-          !n.status ||
-          [400, 401, 403].includes(n.status) ||
-          (n.status >= 500 && n.status < 600)),
+        // A registration may narrow its own vocabulary. A form filled with placeholders is refused
+        // with a 4xx, so it registers 4xx only: a 500 in that window is the API crashing on input
+        // it should have rejected, and it stays a high finding.
+        (entry.statuses ? entry.statuses.includes(n.status) : allowedStatus(n)),
     );
     if (deliberate) {
       deliberate.claimed += 1;
