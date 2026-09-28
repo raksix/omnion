@@ -1,0 +1,19 @@
+[package]
+name = "omnion-module-crm-intake"
+description = "Omnion CRM intake: the sources that bind a form or a keyed endpoint to a lead, the mapping that fills it, and the dedupe verdict (docs/requests/REQ-117)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
