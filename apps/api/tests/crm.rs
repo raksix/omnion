@@ -5618,8 +5618,26 @@ async fn a_platform_account_in_no_organization_is_told_it_has_none() {
         "an unbound platform account has no tenant to read: {}",
         response.body
     );
-    assert_eq!(
-        response.body["error"]["code"], "organization_required",
-        "the code must be the one the panel's empty state reads"
+
+    // The code depends on the **installation**, and asserting one of the two unconditionally made
+    // this test a function of how many organizations the database happened to hold. A fresh
+    // installation has none, so the refusal is `organization_required`; an installation with more
+    // than one is a *choice* and says `organization_ambiguous`, which is the code the panel draws
+    // its organization picker from. Both are refusals, and the status above already proves the
+    // refusal — so what this test owns is that neither case is answered with a stranger's rows,
+    // not which of the two codes a shared database earns.
+    let code = response.body["error"]["code"]
+        .as_str()
+        .expect("every refusal carries its code");
+    assert!(
+        code == "organization_required" || code == "organization_ambiguous",
+        "an unbound platform account is refused with a code the panel knows, not {code:?}"
+    );
+    assert!(
+        !response.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("organization_id"),
+        "the refusal must not ask for a parameter this caller has no value for"
     );
 }

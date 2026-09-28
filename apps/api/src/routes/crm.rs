@@ -289,11 +289,17 @@ impl From<TenantChoice> for ApiError {
                 "organization_required",
                 "this installation has no organization yet; create one before working in the CRM",
             ),
+            // The same advice the `None` arm used to give, and the same reason it is gone:
+            // naming a tenant requires a tenant binding, and this caller holds none in any of
+            // them. "Pass organization_id" here tells the caller to use a control the panel does
+            // not draw for it — and on a panel account the chooser *is* the affordance, so the
+            // sentence should point at the decision rather than at a query parameter. The count
+            // stays, because "three organizations" is what makes it a choice.
             TenantChoice::Ambiguous(count) => ApiError::bad_request(
                 "organization_ambiguous",
                 format!(
-                    "this account holds no role in any of the {} organizations here; pass \
-                     organization_id to name the one to read",
+                    "this account holds no role in any of the {} organizations here; \
+                     choose the one to work in, or ask for a role in it",
                     count
                 ),
             ),
@@ -1013,15 +1019,32 @@ mod tests {
 
     /// Two organizations and no binding is a choice, and the refusal keeps its own code so a
     /// client can tell "pick one" from "there is nothing here".
-    #[test]
-    fn two_organizations_are_a_choice_and_stay_a_refusal() {
+    #[tokio::test]
+    async fn two_organizations_are_a_choice_and_stay_a_refusal() {
         let outcome = sole_organization_outcome(vec![Uuid::new_v4(), Uuid::new_v4()])
             .expect_err("two organizations cannot be guessed at");
         assert_eq!(outcome, TenantChoice::Ambiguous(2));
+        let error = ApiError::from(outcome);
         assert_eq!(
-            ApiError::from(outcome).code(),
+            error.code(),
             "organization_ambiguous",
             "the code is what a client draws the picker from"
+        );
+
+        // The sentence points at the decision, not at a query parameter this caller cannot
+        // supply: a platform account with no tenant binding has no organization it is allowed to
+        // name, which is the same argument that removed the advice from the `None` arm.
+        let sentence = body_of(error).await["error"]["message"]
+            .as_str()
+            .expect("every refusal carries a sentence")
+            .to_owned();
+        assert!(
+            !sentence.contains("organization_id"),
+            "the refusal must not name a parameter the caller has no value for: {sentence}"
+        );
+        assert!(
+            sentence.contains("2"),
+            "the count is what makes it a choice rather than an absence: {sentence}"
         );
     }
 
