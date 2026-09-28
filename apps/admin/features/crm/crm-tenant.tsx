@@ -21,6 +21,13 @@
  * 3. **Otherwise, one organization is taken automatically; two or more are a decision.** A picker
  *    is drawn and the screens stay in a state that says *choose* rather than in a half-loaded one.
  *
+ * Rule 3 is the API's rule, not a panel-side invention: `organization_of` in
+ * `apps/api/src/routes/crm.rs` falls back to the caller's single binding and refuses with
+ * `organization_ambiguous` when there are two. The two halves used to disagree — the panel drew a
+ * chooser for an account the API would have answered, so the screen never reached a list at all,
+ * and the walkthrough's whole CRM suite measured that chooser. A panel that is stricter than its
+ * API does not protect anything: it just makes the feature unreachable.
+ *
  * A platform account with **no** organization is not an error state to apologise for — it is a
  * correct account that has nothing to show yet, and the copy says so in one line with the action
  * that would change it.
@@ -104,7 +111,18 @@ export function CrmTenantProvider({ children }: { children: ReactNode }) {
   }, [organizations, platformAccount]);
 
   const value = useMemo<CrmTenant>(() => {
-    const organizationId = fromUrl || user?.organization_id || null;
+    // The panel's rule and the API's rule have to be the same rule, or one of the two is
+    // unreachable. `organization_of` in `apps/api/src/routes/crm.rs` falls back to the caller's
+    // single binding when a platform account names no organization and refuses with
+    // `organization_ambiguous` when there are two or more — so a platform account in exactly one
+    // organization gets that organization, and only a real choice draws a chooser.
+    //
+    // The panel used to require an explicit choice even with one organization to choose from, so
+    // it never reached a list the API would have answered. The chooser is not a safety feature:
+    // the API already refuses the ambiguous case, and this screen is the place that refusal is
+    // turned into a sentence.
+    const single = organizations?.length === 1 ? organizations[0].id : null;
+    const organizationId = fromUrl || user?.organization_id || single || null;
     return {
       organizationId,
       platformAccount,
