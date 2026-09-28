@@ -1810,6 +1810,62 @@
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
 
+## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
+
+- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
+  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
+  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
+  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
+  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
+  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
+  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
+  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
+  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
+  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
+  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
+  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
+  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
+  three unclaimed worktrees have already collided on 0019.
+- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
+  this part). The cryptography is tested against *real* cryptography, not against itself: the
+  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
+  the genuine signature and reject a tampered one.
+- **The SAML signature check is two checks, and the second one is the one that matters.** XML
+  Signature binds a document to a key in two independent steps, and my first implementation only
+  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
+  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
+  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
+  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
+  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
+  rewrite a claim, the signature alone signs the algorithm but not the document.
+- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
+  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
+  multi-valued attribute as several elements lost half a group membership and under-granted a
+  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
+  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
+  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
+  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
+  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
+  as text fails silently three frames deep.
+- **The disk is a blocker, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
+  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
+  "No space left on device". The reclamation is deliberately conservative: only **derived**
+  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
+  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
+  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
+  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
+  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
+  `node_modules` each) should be pruned — no wave owns them yet.
+- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
+  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
+  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
+  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
+  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
+  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.
+
 ## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
 
 - **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
@@ -2096,3 +2152,68 @@
   available and refuse every write by name, and reactivating to restore them. That is one guard
   applied across the tenancy write paths plus the banner, which the panel already renders.
 
+## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
+
+- **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
+  replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
+  one back *as a new version* rather than by rewriting history.
+- **The migration the plan assumed already existed.** The last tick's handover note said
+  "the `media_versions` table exists". It did not — `0025` created folders, browser columns and
+  the trash, and nothing had ever written a version row. So slice 2 ships `0026`, which creates
+  the table and backfills version 1 for every existing file, **copying `created_at`** rather than
+  stamping `now()`. A history that starts at the migration date is a lie about when the file
+  arrived, and it is exactly the kind of lie that is invisible for a year.
+- **Three rules, each a place a shortcut produces a plausible wrong answer.**
+  1. **A version is append-only.** A restore *copies* the old bytes to a new key and appends the
+     copy. Rewriting a row would make "what did this file look like on day 3" depend on whether
+     anybody took a shortcut in between.
+  2. **The number comes from the database.** `next_version` reads `max(version)` under
+     `for update` on the `media` row — a *scalar subquery*, because `FOR UPDATE` on an aggregate
+     is a no-op in PostgreSQL. Reading the max in Rust would open a window between two reads and
+     let two concurrent replaces both claim 4, which surfaces as a "duplicate key" error that
+     names the index and not the cause.
+  3. **A number is never reused.** A pruned version leaves a hole.
+- **The transaction is opened by the crate, not the route.** This was fought out with the
+  compiler: a route-held `sqlx::Transaction` surfaces `sqlx::Error` where everything else in
+  `omnion_media` is a `MediaError`, and `ApiError` has `From` for the latter but deliberately
+  **not** for the former. `omnion_media::begin_version` / `commit_version` hand back only
+  `MediaError`, which is the honest boundary: the library owns the transaction because the
+  guarantee rule 2 exists for spans it.
+- **The header probe reads 64 KB, not the file.** `crates/media/probe.rs` pulls dimensions,
+  duration and page count out of the *header* for PNG, GIF, JPEG, BMP, TIFF, WebP (all three
+  containers), MP4/QuickTime, WebM, WAV, MP3, Ogg and PDF. A 4 GB video upload must not cost a
+  full read to learn it is 12 minutes long. Every extractor answers "I do not know" rather than
+  guessing — a wrong dimension breaks every layout that reads it and is not obviously wrong once
+  it is stored. Two findings the unit tests forced out: a WebP canvas stored as `0` is a corrupt
+  header, **not** a one-pixel image (reading `0 + 1` would put a 1×1 box on screen for a file
+  that has no size), and one blanket 30-byte minimum across the three WebP containers refuses a
+  short-but-complete `VP8L` header.
+- **The walk corrected a test that had been asserting a route which never existed.** The walk
+  read the current bytes from `/api/v1/media/files/{id}/raw` and got an empty body: the file
+  manager's *listing* is `/media/files`, the read is `/media/{id}/raw`, and no route was ever
+  registered at the address the test used. Three more corrections came out of the same run — the
+  404 is `media_not_found` (not `file_not_found`), an empty upload answers `invalid_request`
+  (not `file_empty`), and the history reads **newest first**, so a check written against an
+  assumed oldest-first order fails on a correct response.
+- **The fixture leaked objects until it read the union.** Cleanup read `media.storage_key`, but a
+  replace *moves* that column to the new key — the old one is named only by the history, so every
+  replaced version's object stayed in the bucket. A test cleanup that misses them is a slow leak
+  that nobody notices for a month.
+- **Proof.** `cargo test -p omnion-media --lib` → **46 tests, 0 failures** (24 new, mostly header
+  probes and the version key rules). `cargo test -p omnion-api --lib` → **109 tests, 0 failures**.
+  `cargo test -p omnion-api --test media` against `omnion_test_main` → **11 walks, 0 failures**,
+  over the real router: a replace leaves version 1 downloadable and **byte-identical** (compared
+  as bytes, not as a length — a length check would pass by accident on an overwrite), the row
+  points at the version it serves, the three versions own three keys, a download of an old
+  version is an attachment named `hero-v1.png`, a restore appends version 3 with version 1's
+  checksum while version 2 is untouched, and the routes refuse without a session, without
+  `media.read`, and name a missing version by number. `pnpm --filter @omnion/admin typecheck`
+  green. The QA pass ran on the default stack.
+- **Environment note.** `/mnt/apopic` was at 99 % (610 MB free) when the tests finished; this
+  worktree's `target/debug/incremental` returned 1.2 GB and the unclaimed `omnion-w5`/`omnion-w6`
+  worktrees' `target/` returned a further 2.7 GB. **Owner action:** those worktrees hold build
+  artefacts for waves nobody has started; they will fill the image again.
+- **Next.** Slice 3 — transformation presets with a content-addressed cache, per-site storage
+  settings with a connection test, the CDN purge hook, share links and duplicate detection with
+  merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
+  serve path, and EXIF extraction.

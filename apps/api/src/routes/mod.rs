@@ -86,6 +86,7 @@ pub mod iam_subjects;
 pub mod me;
 pub mod media;
 pub mod media_files;
+pub mod media_versions;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -605,6 +606,19 @@ pub fn router(state: AppState) -> Router {
     let media_trash_empty =
         post(media_files::empty_trash).layer(guards::require(&state, "media.manage"));
     let media_bulk = post(media_files::bulk_action).layer(guards::require(&state, "media.manage"));
+    // The version history (REQ-010, slice 2). Reading a version is `media.read`; replacing the
+    // bytes and restoring an old one are `media.upload` / `media.update`, the same power an
+    // ordinary upload carries — a restore *is* an upload of bytes that already exist.
+    let media_versions =
+        get(media_versions::list_versions).layer(guards::require(&state, "media.read"));
+    let media_version_create =
+        post(media_versions::create_version).layer(guards::require(&state, "media.upload"));
+    let media_version_restore =
+        post(media_versions::restore_version).layer(guards::require(&state, "media.update"));
+    let media_version_raw =
+        get(media_versions::raw_version).layer(guards::require(&state, "media.read"));
+    let media_version_download =
+        get(media_versions::download_version).layer(guards::require(&state, "media.read"));
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
@@ -1034,6 +1048,17 @@ pub fn router(state: AppState) -> Router {
         .route("/media/trash", media_trash)
         .route("/media/trash/empty", media_trash_empty)
         .route("/media/bulk", media_bulk)
+        .route("/media/{id}/versions", media_versions)
+        .route("/media/{id}/versions", media_version_create)
+        .route(
+            "/media/{id}/versions/{version}/restore",
+            media_version_restore,
+        )
+        .route("/media/{id}/versions/{version}/raw", media_version_raw)
+        .route(
+            "/media/{id}/versions/{version}/download",
+            media_version_download,
+        )
         .route("/public/pages/{slug}", public_pages)
         .route("/public/media/{id}", public_media)
         .route("/workflows", workflows)
