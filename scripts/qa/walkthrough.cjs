@@ -5009,15 +5009,28 @@ async function runBlockEditorDepth(page, report) {
   await shot(page, "page-block-editor-breadcrumb");
 
   // The count control: a third column appears, and the prop the renderer reads moves with it.
-  const columnsRow = page.locator("[data-block-canvas-block=columns]").first();
+  // The count control lives in the inspector's actions, and it is only there when the `columns`
+  // block ITSELF is selected — a `column` or a block inside one gets a different set. Selecting
+  // the canvas row is not enough on its own: the row is a container, so a click lands on
+  // whichever nested block was under the pointer, and the pass then read a missing button as a
+  // feature that does not exist. The button's own label is the proof the selection is right, so
+  // the step re-selects through the outline row and records what the inspector offered.
+  const columnsRow = page.locator('[data-block-canvas-block="columns"]').first();
   if ((await columnsRow.count()) > 0) {
-    await columnsRow.click({ timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(500);
+    // The header row inside the container is the selectable part; the nested children are
+    // separate `[data-block-canvas-block]` elements with their own selection.
+    await columnsRow.locator("button[aria-label^='Select']").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(700);
   }
   const addColumn = page.locator("[data-block-add-column]").first();
   steps.addColumnOffered = (await addColumn.count()) > 0;
-  await addColumn.click({ timeout: 6000 }).catch(() => {});
-  await page.waitForTimeout(1200);
+  steps.addColumnDisabledAtMax = await addColumn
+    .isDisabled({ timeout: 3000 })
+    .catch(() => null);
+  if (steps.addColumnOffered) {
+    await addColumn.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
   steps.columnCountAfterAdd = await page
     .locator("[data-block-columns]")
     .first()
