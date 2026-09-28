@@ -109,6 +109,12 @@ pub const DEGRADED_WINDOW_HOURS: i64 = 24;
 pub const BASELINE_DAYS: i64 = 7;
 /// A latency this far above the provider's own median is a symptom, not weather.
 pub const SLOW_FACTOR: f64 = 1.5;
+/// How many samples the latency baseline needs before it is allowed to judge anything.
+///
+/// A median of one sample is that sample. A local endpoint answers in a millisecond, so a
+/// single-sample baseline makes ordinary jitter look like a regression and the verdict flaps.
+/// Below this many samples the baseline is `None` and the consecutive-run rules decide alone.
+pub const MIN_BASELINE_SAMPLES: i32 = 5;
 
 /// The status of one provider from its samples, newest first.
 ///
@@ -304,6 +310,20 @@ mod tests {
             Sample::success(102, at - Duration::minutes(2)),
         ];
         assert_eq!(health_status(&list, Some(100)), HealthStatus::Ok);
+    }
+
+    #[test]
+    fn without_a_baseline_a_two_second_answer_is_not_a_regression() {
+        // The loopback case, and the reason `MIN_BASELINE_SAMPLES` exists. A local endpoint
+        // answers in ~1 ms; against a baseline of that one sample the next probe at 2 ms is
+        // "half again slower" and the provider degrades. With no baseline the run rules decide
+        // alone, so two clean samples read as healthy — which is the truth.
+        let at = now();
+        let list = vec![
+            Sample::success(2, at - Duration::minutes(1)),
+            Sample::success(1, at - Duration::minutes(2)),
+        ];
+        assert_eq!(health_status(&list, None), HealthStatus::Ok);
     }
 
     #[test]

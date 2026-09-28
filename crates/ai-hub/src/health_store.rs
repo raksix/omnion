@@ -260,12 +260,20 @@ async fn recent_samples_in(
 ///
 /// The median in SQL (`percentile_cont`) rather than an average, because one 30-second outlier
 /// in a week's samples should not become the number every future sample is judged against.
+///
+/// The window needs [`MIN_BASELINE_SAMPLES`] samples before it counts for anything. A median of
+/// **one** sample is that sample, and a provider on a loopback answers in under a millisecond —
+/// so a 2 ms probe against a 1 ms baseline reads as "half again slower than usual" and the
+/// provider flaps between `ok` and `degraded` on nothing but timing jitter. That is a verdict
+/// nobody can act on and an event per tick nobody can read, so until there is a real sample to
+/// take the median of, there is no baseline and the run rules decide alone.
 async fn baseline_latency(
     executor: impl sqlx::PgExecutor<'_>,
     provider_id: Uuid,
 ) -> Result<Option<i32>> {
-    let row: Option<(Option<f64>,)> = sqlx::query_as(
-        "select percentile_cont(0.5) within group (order by latency_ms) from ai_provider_health \
+    let row: Option<(Option<f64>, i64)> = sqlx::query_as(
+        "select percentile_cont(0.5) within group (order by latency_ms), count(*) \
+         from ai_provider_health \
          where provider_id = $1 and status <> 'down' \
          and checked_at >= now() - make_interval(days => $2::int)",
     )
@@ -274,7 +282,12 @@ async fn baseline_latency(
     .fetch_optional(executor)
     .await?;
 
-    Ok(row.and_then(|(median,)| median.map(|m| m.round() as i32)))
+    Ok(row.and_then(|(median, count)| {
+        if count < i64::from(crate::health::MIN_BASELINE_SAMPLES) {
+            return None;
+        }
+        median.map(|m| m.round() as i32)
+    }))
 }
 
 /// The provider's own health header: the computed status, uptime and p95 over a window.
