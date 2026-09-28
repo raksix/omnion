@@ -67,12 +67,24 @@ step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
+# The binary lives in `$CARGO_TARGET_DIR` when the caller sets one, and this box has seven
+# writers sharing one 60G mount — so building into the worktree's own `target/` is how that
+# mount reaches 100% and how `cargo build` starts failing with "No space left on device". The
+# established answer is `CARGO_TARGET_DIR=/dev/shm/<writer>-target`, which this script ignored
+# twice over: it looked for the binary at the hardcoded `target/debug/omnion-api` and it told
+# pm2 to start that same path. The pass then died at `wait_http` with the API never listening,
+# reporting nothing about the code under test — the binary was in `/dev/shm` the whole time and
+# perfectly good. Honour the variable at both places, and say where the binary is so a failed
+# pass names a path instead of a symptom.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+API_BIN="$TARGET_DIR/debug/omnion-api"
+step "API binary: $API_BIN"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-if [ ! -x target/debug/omnion-api ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+if [ ! -x "$API_BIN" ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
   cargo build -p omnion-api
 fi
@@ -83,7 +95,7 @@ else
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
-    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+    pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
