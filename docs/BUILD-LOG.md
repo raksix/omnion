@@ -2594,3 +2594,66 @@ consecutive ticks and remains unrun.
 alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
 first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
 slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
+
+## Tick 45 — REQ-021 slice 1: the in-app inbox
+
+**What.** The platform's fourth feedback loop, and the only one that says *you*. The event bus
+records facts, the audit trail records privileged work, the search index records documents —
+and this one reaches a person. `omnion-notifications` (the record, the vocabulary, the store),
+migration 0050 (six tables: the record, the preference matrix, the digest settings, the
+delivery queue, the push devices and the channel config), the owner-scoped HTTP surface, the
+bell in the header of every route, `/notifications`, and the walkthrough pass that drives both.
+
+**Four decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **Owner-scoped always.** No store function takes a user id the caller chooses — every one
+   takes the owning id. "List somebody else's notifications" is not a parameter a handler can
+   get wrong; it is a function that does not exist.
+2. **Another person's notification is a `404`, never a `403`.** A `403` is the difference
+   between "that is not yours" and "that is not real", and this surface is the one a curious
+   panel is most tempted to poke at.
+3. **The badge and the grouped lines are one query.** A bell that says 12 above four lines
+   adding up to 9 is a screen nobody believes afterwards, and the fix is not a UI change: it is
+   that both come from `store::summary`, which is the only place the unread count is computed.
+4. **The vocabulary is compile-time, and the SQL duplication is a test.** SQL cannot import a
+   Rust constant, so the category/priority/channel lists are written twice. The test
+   `the_migration_agrees_with_the_lists` reads the migration file itself, because a category
+   added to Rust and not to SQL passes every unit test in the crate and then the database
+   refuses the row in production — which reads as "nothing happened".
+
+**Two bugs the tests caught in the first draft, both quiet.** `include_read: false` together
+with `unread: Some(false)` pushed both `read_at is null` and `read_at is not null` — a query
+that is *always* empty, on exactly the path the panel's "show read" filter takes, so it would
+have reported that nobody had ever read anything. And `priority_rank`'s doc said "lower is
+more urgent" while the list it indexes is written the other way round; the doc was wrong, and
+it is now explicit about which way and why.
+
+**Proof.** `cargo test -p omnion-notifications -p omnion-permissions` → **62 passed**;
+`-p omnion-api --lib` → **159 passed**; `pnpm typecheck` → 2 successful, 0 errors.
+`scripts/qa/run-notifications.sh` → **PASS**: 31 migrations applied in order, 6 tables, a
+repeated `dedupe_key` collapses to one row, and both `notifications_category_check` and
+`notification_deliveries_channel_check` refuse exactly the values the crate refuses.
+`scripts/qa/run-notifications-http.sh` → **PASS, 9/9** over a real socket with two real
+sessions.
+
+**The HTTP gate found three ways a gate can lie, which is worth more than the nine passes.**
+It built into `$CARGO_TARGET_DIR` and ran a hard-coded `./target/debug` binary — so it started
+a build that predated the feature and read *its* answers under this build's name. A failed run
+left the API holding the port, and the next run's instance exited on `EADDRINUSE` while the
+gate went on reading the orphan. And pre-applying the migrations let the API double-apply
+them, which kills it at boot — the same orphan one step earlier. All three are fixed at the
+root and the reason is in the file, because "the gate passed" is worth nothing while it is
+reading someone else's process.
+
+**And one assertion that was itself wrong.** The gate expected a `404` from the member and
+got a `403` — correctly, because an account with no role never reaches the handler. A `404`
+from a forbidden caller proves nothing about scoping, and conflating "you may not" with "it is
+not yours" is exactly how a real leak survives a review. It now proves both, and binds the
+member to the base role before making the scoping claims.
+
+**Gate.** `bash scripts/qa/run.sh` is **running** — the QA slot cleared after ~55 minutes of
+queueing behind the w6 pass, so the browser pass is in flight rather than merely queued.
+Slice 1 is not closed until it reports zero high findings from `runNotificationsDepth`.
+
+**Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
+hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
