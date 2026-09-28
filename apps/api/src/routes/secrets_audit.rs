@@ -43,9 +43,9 @@ use super::secrets::map_error;
 
 /// The query string of the audit screen.
 ///
-/// `action` is a list because the screen's filter is a multi-select, and every value goes
-/// through [`tracked_actions`] before it reaches SQL — an unknown name is dropped rather than
-/// forwarded, so a typo narrows the result instead of widening it.
+/// `action` is a list because the screen's filter is a multi-select, and every value is checked
+/// against [`omnion_secrets::audit::is_tracked`] before it reaches SQL — an unknown name is dropped
+/// rather than forwarded, so a typo narrows the result instead of widening it.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct AuditQuery {
     /// Only these actions.
@@ -177,9 +177,8 @@ pub struct AuditResponse {
     pub entries: Vec<AuditView>,
     /// The unacknowledged flag count for the header strip.
     pub open_anomalies: i64,
-    /// The action names the filter offers. Generated from the crate's own list, so the screen
-    /// cannot offer an action nothing ever writes.
-    pub filters: Vec<&'static str>,
+    /// The action names the filter offers, read from the rows that exist.
+    pub filters: Vec<String>,
     /// The detector thresholds, so the panel can explain *why* a flag fired.
     pub detectors: DetectorSettingsView,
     /// The local hour at the installation, which is what "off hours" is measured against.
@@ -243,6 +242,7 @@ pub async fn read_audit(
     };
     let rows = audit::list_audit(pool, &filter).await.map_err(map_error)?;
 
+    let filters = audit::distinct_actions(pool).await.map_err(map_error)?;
     let anomalies = audit::list_anomalies(pool, organization_id, true, 500)
         .await
         .map_err(map_error)?;
@@ -251,7 +251,10 @@ pub async fn read_audit(
     Ok(Json(AuditResponse {
         open_anomalies: anomalies.len() as i64,
         entries: rows.into_iter().map(AuditView::from).collect(),
-        filters: tracked_actions().to_vec(),
+        // From the rows, not from a hand-written list: a filter chip for an action nothing has
+        // written yet is a dead control, and a missing chip for one that HAS been written hides
+        // evidence from the person reading the screen.
+        filters,
         detectors: DetectorSettingsView {
             business_hours_start: settings.business_hours_start,
             business_hours_end: settings.business_hours_end,
@@ -394,7 +397,7 @@ pub async fn export_audit(
         NewAuditEntry::by_user(session.user.id, "secret.audit.exported")
             .organization(session.user.organization_id)
             .target("audit", "secrets")
-            .metadata(json!({ "rows": rows.len(), "actions": tracked_actions() }))
+            .metadata(json!({ "rows": rows.len(), "namespaces": omnion_secrets::audit::TRACKED_NAMESPACES }))
             .ip_address(address.as_text()),
     )
     .await;
@@ -452,10 +455,10 @@ async fn audit_entry(state: &AppState, entry: NewAuditEntry) {
     }
 }
 
-/// The actions the export and the screen agree on, re-exported so a future route file does not
-/// have to reach into the crate's internals to name one.
+/// The headline action names, re-exported so a future route file does not have to reach into the
+/// crate's internals to name one.
 #[must_use]
-pub fn action_names() -> [&'static str; 6] {
+pub fn action_names() -> [&'static str; 8] {
     tracked_actions()
 }
 
@@ -473,11 +476,49 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_list_is_the_crate_list() {
-        // A screen that offers an action nothing writes is a dead control, which the request
-        // forbids outright; the list is generated, so this is the check that keeps it generated.
+    fn every_headline_action_belongs_to_the_surface() {
         assert_eq!(action_names(), tracked_actions());
         assert!(action_names().contains(&actions::DENIED));
         assert!(action_names().contains(&actions::DEPLOY_KEY_USE));
+        for action in action_names() {
+            assert!(
+                omnion_secrets::audit::is_tracked(action),
+                "{action} is named as tracked but matches no namespace, so the screen would drop it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_outside_the_namespaces_is_not_this_surface() {
+        // The narrowing property: a crafted `?action=` must not widen the read to another
+        // feature's rows through a secrets permission.
+        for foreign in ["iam.role.created", "billing.invoice.paid", "secret", ""] {
+            assert!(
+                !omnion_secrets::audit::is_tracked(foreign),
+                "{foreign} must not be readable through the secrets audit surface"
+            );
+        }
+        // And every name the handlers actually write is inside the namespaces -- the property
+        // whose absence made lease rows invisible on the screen.
+        for owned in [
+            "secret.lease.issued",
+            "secret.lease.revoked",
+            "secret.lease.redeemed",
+            "secret.credential.typed",
+            "secret.credential.validated",
+            "secret.root_key.rewrap_paused",
+            "secret.root_key.rewrap_resumed",
+            "secret.slot_changed",
+            "secret.access.denied",
+            "secret.audit.exported",
+            "deployment_key.created",
+            "deployment_key.revoked",
+            "deployment_key.deleted",
+        ] {
+            assert!(
+                omnion_secrets::audit::is_tracked(owned),
+                "{owned} is written by a handler and must be visible on the audit screen"
+            );
+        }
     }
 }

@@ -35,11 +35,27 @@ use uuid::Uuid;
 
 use crate::error::Result;
 
-/// The audit actions this crate writes.
+/// The action *namespaces* this surface owns.
 ///
-/// The request lists them as an enumeration on the access log's `action`; they are `&'static str`
-/// constants rather than an enum so a row written by an older build stays readable by a newer one
-/// instead of failing to deserialize.
+/// This started as a list of six exact action names and that was wrong in a way no unit test
+/// could see: the handlers went on to write `secret.lease.issued`, `secret.lease.revoked`,
+/// `secret.credential.typed`, `secret.credential.validated`, `secret.root_key.rewrap_paused`,
+/// `secret.root_key.rewrap_resumed` and `deployment_key.*` — none of which matched the list. The
+/// screen silently dropped them. A list of names is a list that rots, and it rots invisibly: the
+/// rows still existed, an operator just could not see them, and no count anywhere disagreed.
+///
+/// A namespace prefix cannot rot that way. A new handler that writes `secret.whatever` is visible
+/// the moment it ships, and the *filter list the screen offers* is derived from the rows actually
+/// present (see [`distinct_actions`]) rather than from a list written by hand — which is what the
+/// "a control that offers something that does not exist is a dead control" rule asks for.
+///
+/// The names are still specific: `secret.` and `deployment_key.` belong to this crate, so a
+/// crafted `?action=` cannot widen the read to another feature's audit rows.
+pub const TRACKED_NAMESPACES: [&str; 2] = ["secret.", "deployment_key."];
+
+/// The exact actions this module knows about, kept for the tests that assert the two agree on the
+/// headline names. A row written by an older build stays readable rather than failing to
+/// deserialize, which is why these are `&'static str` and not an enum.
 pub mod actions {
     /// A value was read out of an envelope.
     pub const REVEALED: &str = "secret.revealed";
@@ -52,7 +68,11 @@ pub mod actions {
     /// A deployment key was used by a pipeline.
     pub const DEPLOY_KEY_USE: &str = "secret.deploy_key_use";
     /// A lease was issued, redeemed or revoked.
-    pub const LEASE: &str = "secret.lease";
+    pub const LEASE_ISSUED: &str = "secret.lease.issued";
+    /// A lease was redeemed by a machine identity.
+    pub const LEASE_REDEEMED: &str = "secret.lease.redeemed";
+    /// A lease was revoked.
+    pub const LEASE_REVOKED: &str = "secret.lease.revoked";
 }
 
 /// The four patterns the detectors raise.
@@ -308,20 +328,22 @@ pub struct RevealCounts {
     pub prior_reveals_by_actor: i64,
 }
 
-/// The secrets operations this crate writes, as a list the audit screen can filter on.
+/// The headline actions this crate writes, kept for tests and for the crate's own vocabulary.
 ///
-/// Reading the constants from a single place is what keeps the screen's filter list and the
-/// rows the routes actually write from drifting — a filter that offers an action nothing ever
-/// writes is a dead control, which the request forbids outright.
+/// This is **not** what the screen filters on — that is [`TRACKED_NAMESPACES`], so a handler that
+/// adds a name is visible without editing a list. It exists so the constants have one home and so
+/// a test can assert they all belong to the surface.
 #[must_use]
-pub fn tracked_actions() -> [&'static str; 6] {
+pub fn tracked_actions() -> [&'static str; 8] {
     [
         actions::REVEALED,
         actions::DENIED,
         actions::ROOT_ROTATED,
         actions::SLOT_CHANGED,
         actions::DEPLOY_KEY_USE,
-        actions::LEASE,
+        actions::LEASE_ISSUED,
+        actions::LEASE_REDEEMED,
+        actions::LEASE_REVOKED,
     ]
 }
 
@@ -375,51 +397,104 @@ pub struct AuditFilter {
     pub limit: Option<i64>,
 }
 
+/// Whether an action name belongs to this surface.
+///
+/// A prefix test, so a handler that starts writing `secret.something_new` is visible the moment
+/// it ships. The alternative -- an enumerated list -- silently drops every name added after the
+/// list was written, which is precisely how lease rows went missing from this screen.
+#[must_use]
+pub fn is_tracked(action: &str) -> bool {
+    TRACKED_NAMESPACES
+        .iter()
+        .any(|namespace| action.starts_with(namespace))
+}
+
 /// Read the audit trail, filtered, newest first.
 ///
-/// Only the actions in [`tracked_actions`] are ever returned. That is not a convenience: the
+/// Only actions in [`TRACKED_NAMESPACES`] are ever returned. That is not a convenience: the
 /// screen is the secrets surface, and a general audit log read through it would be a way to read
-/// every other feature's audit rows through a `secrets.read` permission.
+/// every other feature's audit rows through a `secrets.audit` permission.
 pub async fn list_audit(pool: &PgPool, filter: &AuditFilter) -> Result<Vec<AuditRow>> {
-    let actions: Vec<String> = if filter.actions.is_empty() {
-        tracked_actions().iter().map(|a| (*a).to_owned()).collect()
-    } else {
-        filter.actions.clone()
-    };
-    // Only names this module knows are accepted, so a crafted `?action=` cannot widen the read
-    // to another feature's rows.
-    let actions: Vec<String> = actions
-        .into_iter()
-        .filter(|a| tracked_actions().contains(&a.as_str()))
+    // A crafted `?action=` cannot widen the read: anything outside the namespaces is dropped, and
+    // a filter that ends up with nothing recognised narrows to an empty result rather than
+    // falling back to "everything".
+    let requested: Vec<String> = filter
+        .actions
+        .iter()
+        .filter(|action| is_tracked(action))
+        .cloned()
         .collect();
-    if actions.is_empty() {
-        return Ok(Vec::new());
-    }
 
-    let rows = sqlx::query_as::<_, AuditRow>(
-        "select id, action, target_type, target_id, actor_user_id, actor_type, \
-                ip_address::text as ip_address, metadata, request_id, lease_id, \
-                deployment_key_id, pipeline, created_at \
-         from audit_log \
-         where action = any($1) \
-           and ($2::uuid is null or target_id = $2::text) \
-           and ($3::uuid is null or actor_user_id = $3) \
-           and ($4::text is null or ip_address::text = $4) \
-           and ($5::uuid is null or request_id = $5) \
-           and ($6::timestamptz is null or created_at >= $6) \
-         order by created_at desc, id desc \
-         limit coalesce($7, 200)",
+    let rows = if requested.is_empty() {
+        if !filter.actions.is_empty() {
+            return Ok(Vec::new());
+        }
+        // No filter: match the namespaces with `like`, which the action index can serve because
+        // every value compared is a literal prefix -- no `any($1)` array and no per-name round trip.
+        sqlx::query_as::<_, AuditRow>(
+            "select id, action, target_type, target_id, actor_user_id, actor_type, \
+                    ip_address::text as ip_address, metadata, request_id, lease_id, \
+                    deployment_key_id, pipeline, created_at \
+             from audit_log \
+             where (action like 'secret.%' or action like 'deployment\\_key.%') \
+               and ($1::uuid is null or target_id = $1::text) \
+               and ($2::uuid is null or actor_user_id = $2) \
+               and ($3::text is null or ip_address::text = $3) \
+               and ($4::uuid is null or request_id = $4) \
+               and ($5::timestamptz is null or created_at >= $5) \
+             order by created_at desc, id desc \
+             limit coalesce($6, 200)",
+        )
+        .bind(filter.secret_id)
+        .bind(filter.actor_user_id)
+        .bind(filter.address.as_deref())
+        .bind(filter.request_id)
+        .bind(filter.since)
+        .bind(filter.limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, AuditRow>(
+            "select id, action, target_type, target_id, actor_user_id, actor_type, \
+                    ip_address::text as ip_address, metadata, request_id, lease_id, \
+                    deployment_key_id, pipeline, created_at \
+             from audit_log \
+             where action = any($1) \
+               and ($2::uuid is null or target_id = $2::text) \
+               and ($3::uuid is null or actor_user_id = $3) \
+               and ($4::text is null or ip_address::text = $4) \
+               and ($5::uuid is null or request_id = $5) \
+               and ($6::timestamptz is null or created_at >= $6) \
+             order by created_at desc, id desc \
+             limit coalesce($7, 200)",
+        )
+        .bind(&requested)
+        .bind(filter.secret_id)
+        .bind(filter.actor_user_id)
+        .bind(filter.address.as_deref())
+        .bind(filter.request_id)
+        .bind(filter.since)
+        .bind(filter.limit)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
+}
+
+/// The action names actually present in the trail, for the screen's filter control.
+///
+/// Derived from the rows rather than from a hand-written list, because a filter that offers an
+/// action nothing writes is a dead control -- and, worse, a filter that *omits* an action that is
+/// written hides evidence from the person reading the screen.
+pub async fn distinct_actions(pool: &PgPool) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "select distinct action from audit_log \
+         where action like 'secret.%' or action like 'deployment\\_key.%' \
+         order by action",
     )
-    .bind(&actions)
-    .bind(filter.secret_id)
-    .bind(filter.actor_user_id)
-    .bind(filter.address.as_deref())
-    .bind(filter.request_id)
-    .bind(filter.since)
-    .bind(filter.limit)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(rows.into_iter().map(|(action,)| action).collect())
 }
 
 /// Count the reveals of one secret by one actor in a window. The burst detector's input.

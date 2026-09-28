@@ -35,6 +35,7 @@ use omnion_api::state::AppState;
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
+use omnion_permissions::seed;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -146,7 +147,7 @@ async fn live_state() -> Option<(AppState, Db)> {
 }
 
 /// Create an account and sign it in.
-async fn create_account(db: &Db) -> (Uuid, String) {
+async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
     let email = format!("audit-{}@example.test", Uuid::new_v4().simple());
     let user = users::create_user(
         db.pool(),
@@ -154,7 +155,7 @@ async fn create_account(db: &Db) -> (Uuid, String) {
             email: email.clone(),
             password: PASSWORD.to_owned(),
             display_name: "Audit Test".to_owned(),
-            organization_id: None,
+            organization_id,
         },
     )
     .await
@@ -193,12 +194,13 @@ async fn login(state: &AppState, email: &str) -> String {
 }
 
 /// Create a local secret and seal one version of `FIXTURE_VALUE` under it.
-async fn sealed_secret(db: &Db, name: &str) -> Uuid {
+async fn sealed_secret(db: &Db, organization_id: Uuid, name: &str) -> Uuid {
     let secret_id: Uuid = sqlx::query_scalar(
-        "insert into secrets (name, scope_type, description) \
-         values ($1, 'organization', 'Sealed by the REQ-125 slice-4 suite') returning id",
+        "insert into secrets (name, scope_type, organization_id, description) \
+         values ($1, 'organization', $2, 'Sealed by the REQ-125 slice-4 suite') returning id",
     )
     .bind(name)
+    .bind(organization_id)
     .fetch_one(db.pool())
     .await
     .expect("the secret must be created");
@@ -283,9 +285,42 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
     let Some((state, db)) = live_state().await else {
         return;
     };
-    let (_user_id, email) = create_account(&db).await;
+    // The IAM seed, then an owner binding. `secrets.audit` is deliberately NOT `secrets.read` --
+    // reading which secrets an account has touched, from where, under which request id is a
+    // bigger question than reading the list of secrets, and one operator should be able to hold
+    // the first without the second -- so a suite that skipped this would 403 on its own screen
+    // and prove nothing.
+    seed::ensure(db.pool())
+        .await
+        .expect("the IAM seed must run");
+
+    // An organization, because a lease is a *write* and a write needs a named scope. A read does
+    // not -- which is the same asymmetry the routes follow, and the reason an audit-only operator
+    // can be a platform account with no organization at all.
+    let slug = format!("audit-{}", Uuid::new_v4().simple());
+    let organization_id: Uuid =
+        sqlx::query_scalar("insert into organizations (name, slug) values ($1, $2) returning id")
+            .bind("Audit Suite Organization")
+            .bind(&slug)
+            .fetch_one(db.pool())
+            .await
+            .expect("the organization must be created");
+
+    let (user_id, email) = create_account(&db, Some(organization_id)).await;
+    seed::bind_owner(db.pool(), user_id)
+        .await
+        .expect("the owner binding must be created");
     let token = login(&state, &email).await;
-    let secret_id = sealed_secret(&db, "audit-slice-4-fixture").await;
+    // A unique name per run: `secrets_name_scope_idx` is on (name, organization), and a suite that
+    // re-ran against a database it did not create would otherwise fail on its own residue before
+    // reaching a single assertion. Suites that pass on a virgin database and fail on a warm one
+    // are not proving the behaviour; they are proving the migration order.
+    let secret_id = sealed_secret(
+        &db,
+        organization_id,
+        &format!("audit-slice-4-{}", Uuid::new_v4().simple()),
+    )
+    .await;
 
     // ── claim 1: the operations land a row, and the trail is readable ────────────────────────────
     let trail = call(&state, get("/api/v1/secrets/audit?limit=200", &token)).await;
@@ -295,14 +330,28 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
         "the trail must be readable: {}",
         trail.raw
     );
-    let filters = trail.body["filters"]
+    // The filter list is derived from the rows, so what is asserted is the property that
+    // matters: every action the trail actually holds is offered as a chip. A chip missing here is
+    // how a whole class of evidence went missing from this screen once already.
+    let filters: Vec<&str> = trail.body["filters"]
         .as_array()
-        .expect("the screen's filter list must be an array");
-    assert!(
-        filters.iter().any(|value| value == "secret.revealed")
-            && filters.iter().any(|value| value == "secret.access.denied"),
-        "the trail must offer the actions the crate writes: {filters:?}"
-    );
+        .expect("the screen's filter list must be an array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    let actions_present: Vec<&str> = trail.body["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|row| row["action"].as_str())
+        .collect();
+    for action in &actions_present {
+        assert!(
+            filters.contains(action),
+            "{action} is in the trail but missing from the filter list, so an operator could not \
+             filter to it: {filters:?}"
+        );
+    }
     assert!(
         !trail.raw.contains(FIXTURE_VALUE),
         "the trail must never carry a value: {}",
@@ -353,14 +402,26 @@ async fn the_trail_joins_by_request_id_flags_off_hours_and_the_export_carries_no
     let rows = after_denial.body["entries"]
         .as_array()
         .expect("entries must be an array");
-    let lease_row = rows
+    // Both lease operations, and both of them named by what they did. This assertion is the one
+    // that failed first and found the real defect: the route wrote `secret.lease.issued` while
+    // the screen filtered on `secret.lease`, so every lease row was invisible.
+    let lease_rows: Vec<&Value> = rows
         .iter()
-        .find(|row| row["lease_id"] == lease_id.to_string())
-        .expect("the lease operation must be in the trail");
-    assert_eq!(
-        lease_row["action"], "secret.lease",
-        "a lease operation must name its action"
+        .filter(|row| row["lease_id"] == lease_id.to_string())
+        .collect();
+    assert!(
+        lease_rows.len() >= 2,
+        "the issue and the revoke must both be in the trail, joined by lease id: {rows:?}"
     );
+    let actions_written: Vec<&str> = lease_rows
+        .iter()
+        .filter_map(|row| row["action"].as_str())
+        .collect();
+    assert!(
+        actions_written.contains(&"secret.lease.issued") && actions_written.contains(&"secret.lease.revoked"),
+        "a lease operation must name what it did, not a family: {actions_written:?}"
+    );
+    let lease_row = lease_rows[0];
     assert!(
         lease_row["request_id"].is_string(),
         "every row must carry the request id the caller was handed: {lease_row}"
