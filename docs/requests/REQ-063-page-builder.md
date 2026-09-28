@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 2 at 3/4: containers + validation + revision diff) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `crates/content`)
+> **Status:** in-progress (slice 2 at 4/4: containers + validation + revision diff + inline preview) · **Captured:** 2026-09-26 · **Layer:** platform (`apps/admin` + `apps/api` + `crates/content`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -126,7 +126,7 @@ Consumed: `media.deleted` (mark image/gallery blocks with a broken-media warning
 - [ ] `New page from template` creates a draft page whose blocks match the template, with the sample content intact.
 - [x] The public page renders block output through the active theme, and a revision without blocks (existing content) renders from `body` unchanged.
 - [x] The revision diff shows added/removed/changed blocks with prop-level detail, not a raw JSON diff.
-- [ ] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
+- [x] Inline editing saves one draft revision per save, shows the revision number in the toast, and never publishes — verified by checking the published revision number stays the same.
 - [ ] Blocks marked `hide_on: mobile` are absent from the mobile render (server-side), not merely CSS-hidden, and the semantic output check passes (headings, lists, figure/figcaption).
 - [ ] `content.blocks.updated` and `content.page.published` are delivered to a subscribed endpoint with redelivery working.
 - [ ] The editor is usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone), and the walkthrough reports zero high findings.
@@ -166,10 +166,10 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    `/pages/<id>/edit` are both in the walkthrough inventory with a depth pass on each.
 2. **Containers, validation, revision diff.** Nested `columns`, breadcrumb selection, accessibility and viewport rules (`hide_on` server-side), heading-order linting, `raw_html` sanitisation, block-level diff on the revisions screen, inline-editing frame at `/pages/<id>/preview`. *Done when:* acceptance 4, 6–8, 13–15 pass.
 
-   - **Done in this slice so far (3/4):** `raw_html` sanitisation (acceptance 8), nested columns
+   - **Done in this slice so far (4/4):** `raw_html` sanitisation (acceptance 8), nested columns
      with the breadcrumb (acceptance 4), heading-order linting and server-side `hide_on`
-     (acceptance 7 and 15, proven in the previous tick's tests), and the block-level revision
-     compare (acceptance 13). `crates/content/src/sanitize.rs` is the
+     (acceptance 7 and 15, proven in the previous tick's tests), the block-level revision
+     compare (acceptance 13) and the inline-editing preview frame (acceptance 14). `crates/content/src/sanitize.rs` is the
      sanitiser — an allow-list scanner that removes rather than escapes, reports what it
      removed, and is applied by `blocks::sanitize_tree` on the way into storage, so a stored
      payload is already safe. The `embed` host allow-list ships with it (empty by default, so no
@@ -222,6 +222,32 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
      exists. `Add column` moves the `columns` prop with the structure, since the renderer reads
      one and the validator checks the other. 73 content tests, 8 of them new for the column
      rules.
+
+     **Acceptance 14 shipped as a server-filtered frame.** `GET /api/v1/pages/{id}/preview`
+     answers with the page's **draft** and carries *both* trees: `blocks` as stored and
+     `visible_blocks` after the same `filter_for_viewport` call the public renderer makes. A
+     client-side filter would be a third implementation of "what the phone sees", and the whole
+     point of the criterion is that the frame is not a picture of the page. Carrying both trees
+     is what lets the frame answer "where did my block go" — a hidden block and a deleted one
+     are indistinguishable if the filtered payload is the only payload. An unreadable
+     `?viewport=` word falls back to the wide render rather than a 400: the query addresses a
+     display choice, and a renderer that sends a bad one must still get a working page.
+
+     The rule "never publishes" is enforced by *construction* rather than by convention, in
+     three places: the route carries only `GET`, the frame's save calls the same
+     `PATCH /pages/{id}` the editor's *Save draft* calls, and there is no publish control on the
+     screen at all — the walkthrough asserts the control's absence, not its disabled state. The
+     toast names the revision the server reported, because a local counter would claim
+     "revision 9" against a server that wrote 3.
+
+     Inline editing is a `contenteditable` region per text block, and the region is only mounted
+     when the toggle is on. In the editor the inspector is the one way to change a prop; a
+     canvas that also accepted typing would put two ways to edit one field on one screen. The
+     region's *own* button wrapper moves out of the way when it is mounted, because a
+     `contenteditable` inside a `<button>` cannot hold a caret — the button owns its content.
+     Only plain-text props are editable in place (`heading.text`, `text.text`, `testimonial.quote`,
+     `cta.body`, `raw_html.html`): a gallery is a list of media ids and a pricing table is
+     `|`-joined rows, neither of which a paragraph of typing can express.
 3. **Patterns and templates.** Migration `0111_content_patterns.sql`; pattern library with insert/create-from-selection/edit/duplicate, page templates with sample content, `/pages/from-template`, and the initial template set (landing, about, pricing, blog post, contact). *Done when:* acceptance 10–11 pass and the vision review confirms the templates render as real pages.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
 

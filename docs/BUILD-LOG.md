@@ -1,3 +1,58 @@
+## 2026-09-28 — REQ-063 slice 2 (4/4) · the inline preview frame, and why "never publishes" is a route shape
+
+- **What shipped.** The API integration run that last tick could not claim is **green**, and the
+  slice's last piece is built: `GET /api/v1/pages/{id}/preview?viewport=` (`content.rs`,
+  `routes/mod.rs`) answers with the page's **draft** and both of its trees, and
+  `apps/admin/features/blocks/block-preview.tsx` + `app/pages/[id]/preview/page.tsx` are the
+  frame itself — a screen switch, an `Edit inline` toggle, `Save draft`, `Reload`, a permanent
+  `Draft` banner, and a toast that names the revision the server reported. The editor now links
+  into it. `BlockCanvas` grew two optional props (`editable`, `onInlineEdit`) and nothing else
+  changed about how it draws.
+
+- **The frame is a server render, not a picture of one.** The payload carries `blocks` (as
+  stored) *and* `visible_blocks` (after the same `filter_for_viewport` call the public renderer
+  makes), so the phone frame is a genuinely smaller payload rather than the desktop one wearing
+  a CSS class. Carrying both trees is also the only way the frame can answer the first question an
+  author asks it: *where did my block go* — a block hidden from phones and a block deleted are
+  indistinguishable in a filtered payload alone, and the status bar prints
+  `2 of 3 blocks render on mobile · 1 hidden here` rather than a bare count.
+
+- **"Never publishes" is enforced by construction, in three places.** The route carries only
+  `GET`; the frame's save calls the same `PATCH /pages/{id}` the editor's *Save draft* calls; and
+  the screen has no publish control at all. The test asserts `405` on `POST …/preview` and reads
+  the public render afterwards to confirm the sentence the author just typed is not in it. The
+  walkthrough asserts the *absence* of the control rather than its disabled state — a greyed-out
+  button is a decision, and a decision is a thing a later change can get wrong.
+
+- **Proof.**
+  - `cargo test -p omnion-api --test content_blocks -- --test-threads=4` → **18 passed, 0
+    failed** (3 new: the frame reads the draft and filters server-side, an inline save writes one
+    draft revision and leaves the published one untouched, the frame carries the pages read key).
+  - `cargo test -p omnion-content --quiet` → **93 passed, 0 failed**.
+  - `pnpm typecheck` → **2/2 successful**, 0 errors.
+  - `node --check scripts/qa/walkthrough.cjs` → clean; the new step asserts the banner, the
+    absence of a publish control, the two screen payloads, the dirty flag after a keystroke, and
+    that the revision number **advanced** while the live number did **not**.
+
+- **The parallel run failed three tests for a reason that was not the code.** 18 tests × 1
+  connection each exhausted the dev pool (`PoolTimedOut` at fixture creation), and the three
+  casualties were whichever lost the race — including two that had passed a minute earlier.
+  `--test-threads=4` made it 18/18. The lesson worth keeping: `PoolTimedOut` in a fixture is a
+  *contention* symptom, and the test it kills is a random one, so the fix is never in the
+  assertion it happened to fail.
+
+- **A `contenteditable` cannot live inside a `<button>`, and the first version did exactly
+  that.** The block body is a button so the outline and the canvas select the same thing — which
+  means the inline region was nested in it, where the button owns its content and the caret
+  cannot be placed. With inline editing on, the block splits: the label row stays the selecting
+  button, the text is its own region beside it. A nesting bug that a screenshot would show as
+  "the field looks editable" and only a keystroke reveals.
+
+- **Next.** The QA browser pass — the walkthrough steps for the nested columns, the revision
+  compare and this frame are all written and none of the three has yet been run in a browser. Run
+  it with `QA_STACK=w2 QA_API_PORT=18081 QA_ADMIN_PORT=3101 QA_WEB_PORT=3201` and
+  `QA_OUT_ROOT=/dev/shm/omnion-qa-w2`. Slice 3 (patterns and templates, migration
+  `0111_content_patterns.sql`) starts after it.
 
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
