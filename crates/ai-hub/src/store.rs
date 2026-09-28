@@ -186,8 +186,26 @@ pub async fn update_provider(
 }
 
 /// Remove a provider and every model it serves.
+///
+/// The installation's default is refused here rather than in the route: the check belongs to the
+/// transaction, so a caller that reaches the store by another road cannot leave the platform
+/// without the provider its task-routed requests point at. The check and the delete are one
+/// transaction, so two operators racing to remove two providers cannot both see a default.
 pub async fn delete_provider(pool: &PgPool, id: Uuid) -> Result<()> {
     let mut tx = pool.begin().await?;
+
+    // `for update` closes the window between this read and the delete: a concurrent "set default"
+    // either lands before it (this sees the new default and refuses) or after it (and refuses
+    // against the row this transaction is about to drop).
+    let name: Option<String> =
+        sqlx::query_scalar("select name from ai_providers where id = $1 and is_default for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+    if let Some(name) = name {
+        return Err(AiHubError::ProviderIsDefault(name));
+    }
 
     let deleted = sqlx::query("delete from ai_providers where id = $1")
         .bind(id)

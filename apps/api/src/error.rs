@@ -817,6 +817,16 @@ impl From<AiHubError> for ApiError {
                 "provider_disabled",
                 format!("the AI provider \"{name}\" is switched off"),
             ),
+            // Removing the default is a `409` and not a `404`: the row is right there, and what
+            // the caller has to change first is the installation's default, not the id.
+            AiHubError::ProviderIsDefault(name) => Self::new(
+                StatusCode::CONFLICT,
+                "provider_is_default",
+                format!(
+                    "\"{name}\" is the installation default; make another provider the default \
+                     before removing it"
+                ),
+            ),
             AiHubError::InvalidProvider(message) => Self::bad_request("invalid_provider", message),
             AiHubError::InvalidModel(message) => Self::bad_request("invalid_model", message),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing

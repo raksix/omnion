@@ -29,6 +29,15 @@ pub enum AiHubError {
     /// The resolved provider is switched off.
     #[error("the AI provider \"{0}\" is disabled")]
     ProviderDisabled(String),
+    /// The provider the installation points at cannot be removed.
+    ///
+    /// Removing the default would leave every task-routed request with nowhere to go, and the
+    /// repair the store does afterwards promotes an arbitrary row the operator never chose. The
+    /// refusal names the provider so the message can tell them which one to move first.
+    #[error(
+        "the AI provider \"{0}\" is the installation default; set another default before removing it"
+    )]
+    ProviderIsDefault(String),
     /// The provider definition is unusable.
     #[error("invalid provider: {0}")]
     InvalidProvider(String),
@@ -93,6 +102,7 @@ impl AiHubError {
             Self::ModelNotFound => "model_not_found",
             Self::NoDefaultModel => "no_default_model",
             Self::ProviderDisabled(_) => "provider_disabled",
+            Self::ProviderIsDefault(_) => "provider_is_default",
             Self::InvalidProvider(_) => "invalid_provider",
             Self::InvalidModel(_) => "invalid_model",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
