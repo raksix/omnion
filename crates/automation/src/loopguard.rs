@@ -53,7 +53,7 @@ use std::pin::Pin;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -214,45 +214,26 @@ fn name_or(name: &str, step_no: i32) -> String {
     }
 }
 
-/// Stop a run that repeated itself, and close the steps that would have followed.
+/// Stop a run that repeated itself: the **write itself** lives in the engine.
 ///
-/// One write for the same reason the branch's `end_run_after_branch` is one write: a run
-/// that stops on this must not leave a step *claimable* behind it, or the next runner tick
-/// picks it up and the guard is defeated by a step that was already known to be a
-/// duplicate. The failed step keeps its own row and its own fingerprint in the error, so
-/// the trace shows the step that repeated *and* the one it repeated.
+/// This used to be a function here, and it was a lie the compiler could not catch: nothing
+/// called it. The engine owns the stopping — after a step succeeds it consults the guard
+/// (see [`crate::guard::check_run`]) and, on a stop verdict, calls `store::fail_step` with
+/// the reason and then `store::end_run_after_branch`, which closes every later step in the
+/// same write and lets the run settle `failed` from its own rows.
 ///
-/// The run is settled `failed` rather than `cancelled`: nothing cancelled it, and "the run
-/// was stopped here" is a failure an operator has to fix — which is the same ending the
-/// `stop` step's *success* produces, deliberately not reused here.
-pub async fn stop_repeated(
-    connection: &mut PgConnection,
-    execution_id: Uuid,
-    repeated_step_no: i32,
-    message: &str,
-) -> Result<()> {
-    sqlx::query(
-        "update workflow_steps set status = 'cancelled', finished_at = now(), \
-             error = 'the run was stopped before this step' \
-         where execution_id = $1 and step_no > $2 \
-           and status in ('pending', 'waiting', 'running')",
-    )
-    .bind(execution_id)
-    .bind(repeated_step_no)
-    .execute(&mut *connection)
-    .await?;
-
-    sqlx::query(
-        "update workflow_executions set status = 'failed', finished_at = now(), error = $2 \
-         where id = $1 and status in ('running', 'awaiting_approval')",
-    )
-    .bind(execution_id)
-    .bind(message)
-    .execute(&mut *connection)
-    .await?;
-
-    Ok(())
-}
+/// Two things follow, and both are worth stating because the duplicate version asserted the
+/// opposite:
+///
+/// * the reason lives on **the repeated step's `error`**, not on the run's. The engine writes
+///   it where the trace will render it, beside the step that repeated;
+/// * the steps *after* it carry the engine's own "the run ended before this step", so a reader
+///   (or a test) that joins every error in a stopped run and expects them all to name the
+///   loop is looking at the wrong column.
+///
+/// A second implementation of a state transition is never safer than one: it is a second
+/// place for the truth to be stale, and this one was stale enough that a test written against
+/// it read an empty run error and concluded the guard was mute.
 
 /// The `output` a repeated step's row carries, so the trace shows *why* without a second
 /// query and the panel can render it as the failure it is.
@@ -330,7 +311,10 @@ impl LoopGuard {
 }
 
 impl RunGuard for LoopGuard {
-    fn check<'a>(&'a self, step: GuardStep<'a>) -> Pin<Box<dyn Future<Output = GuardVerdict> + Send + 'a>> {
+    fn check<'a>(
+        &'a self,
+        step: GuardStep<'a>,
+    ) -> Pin<Box<dyn Future<Output = GuardVerdict> + Send + 'a>> {
         // The parameters are read into an owned value *before* the async block, because the
         // step's borrow cannot cross into a `'static`-shaped future the way a reference
         // into a row can. The value is small (a step's resolved parameters) and the
@@ -340,9 +324,16 @@ impl RunGuard for LoopGuard {
         let pool = self.pool.clone();
 
         Box::pin(async move {
-            let verdict = check(&pool, step.execution_id, step.step_no, step.kind, step.action, &params)
-                .await
-                .unwrap_or(LoopVerdict::Clear);
+            let verdict = check(
+                &pool,
+                step.execution_id,
+                step.step_no,
+                step.kind,
+                step.action,
+                &params,
+            )
+            .await
+            .unwrap_or(LoopVerdict::Clear);
 
             match verdict.reason() {
                 Some(reason) => GuardVerdict::stop(reason),
@@ -451,8 +442,16 @@ mod tests {
         // Renaming is not an escape hatch: the fingerprint is kind + action + params and
         // the name is not in it.
         assert_eq!(
-            fingerprint("task", Some("send_email"), &json!({ "to": "a@example.com" })),
-            fingerprint("task", Some("send_email"), &json!({ "to": "a@example.com" }))
+            fingerprint(
+                "task",
+                Some("send_email"),
+                &json!({ "to": "a@example.com" })
+            ),
+            fingerprint(
+                "task",
+                Some("send_email"),
+                &json!({ "to": "a@example.com" })
+            )
         );
     }
 
