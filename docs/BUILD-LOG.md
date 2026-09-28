@@ -3495,3 +3495,64 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+
+---
+
+## 2026-09-28 · wave6 · REQ-126 slice 4e — the bundle's rule file, and a check that could not see
+
+**What.** The observability bundle's `infra/observability/alerts.yml` had shipped since slice 4
+with three things going for it and none of them being a check: a `BUNDLE_ASSETS` manifest entry, a
+test that the file exists and is non-empty, and a header comment asserting that "every expression
+here uses only families the registry declares, and every one of them is asserted to parse against
+it in `crates/telemetry/src/alert_loop.rs`". Nothing read the file. The six Grafana dashboards have
+a generator that checks every family each panel names; the rule file — the artefact an operator
+imports to be paged — had nothing. That is the same shape this request has now produced four
+times (the exporter buffer with no caller, `prune` with only its own test, eight event names
+documented and dead, and now the rule file), and the consequence here is worse than a silent drop:
+a rule naming a family this build does not emit never fires, and a rule that never fires looks
+exactly like a healthy system.
+
+`crates/telemetry/src/bundle_rules.rs` parses the file — a deliberately small reader, strict in
+the one way that matters, because a parser that skipped an entry would leave the file "passing"
+with fewer rules than it appears to — and holds it to the registry: families declared, labels
+declared per family, rules complete and uniquely named, dwell stated or inherited, and every rule
+the panel runs also shipping in the file watching the same family.
+
+**Two of the check's own first-draft assertions were wrong, and the shipped file was right.**
+Demanding a `for:` on every rule failed on `ShutdownHitDeadline`, which ships `for: 0m` *on
+purpose* — it watches a counter that only moves when something has already gone wrong. And the
+cross-check was written backwards: the file is the richer set, because it is real PromQL
+(`rate()`, `histogram_quantile()`) while the panel evaluates against the in-process registry with
+a deliberately small grammar. Demanding the reverse would have meant widening the grammar or
+deleting good rules. A check written from the assumption that two artefacts should be identical
+is a check that reports a defect for a difference someone chose.
+
+**The one worth remembering.** The cross-check first compared the file against the seeder's rule
+names *scraped out of the function's source text*, because the list was a literal inside
+`seed_bundled_rules`. It passed. A mutation that removed a rule the panel seeds — the exact drift
+the check exists for — also passed. The scraper was reading one of the four rules. The seeder's
+list is now `alert_loop::BUNDLED_RULES`, a `const` the seeder and the check both read, and the
+three mutations are caught. **This is the fourth instance of the same lesson on this request, and
+the first one where I wrote the trap myself and then proved my own test wrong: a check that can
+only see its subject by parsing it will one day see nothing and still report agreement.** The
+mutation runs are the only reason to believe any of it.
+
+**The merge, and a defect it was carrying.** `origin/main` had moved, so the tick opened with an
+18-minute-old unresolved merge staged in the tree — main's notifications and media-usage work
+against my observability files. Diffing the resolution against both sides found that the conflict
+in `scripts/qa/qa-slot.sh` had left two lines of the older reaper *outside* the `if`: the
+`rm -f` and its message ran for every place in the directory, so the reaper deleted live QA slots
+on sight. Every other flagged file was a line-reordering false positive from comparing by line
+rather than by multiset.
+
+**Proof.** `cargo test -p omnion-telemetry` → **168 passed**; `-p omnion-api --lib` → **185
+passed**; `-p omnion-core --lib` → **35 passed**; `cargo build -p omnion-api` → clean (12m30s
+from an empty target — the shm target dir had been evicted). `pnpm typecheck` → 2 successful.
+Mutations: undeclared family → the family check fails; wrong label matcher → the label check
+fails; a panel-seeded rule removed from the file → the drift check fails; a file-only rule
+removed → green, by design.
+
+**Next.** The one remaining acceptance line: a shipped rule firing through a **real dependency
+outage** and resolving when the dependency returns. Then the REQ close gate — `cargo test
+--workspace`, `pnpm build`, and the private-stack walkthrough.
