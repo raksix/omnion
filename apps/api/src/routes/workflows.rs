@@ -653,7 +653,7 @@ async fn site_in_scope(
 }
 
 /// Load a workflow and refuse it when its organization is out of the caller's scope.
-async fn workflow_in_scope(
+pub async fn workflow_in_scope(
     state: &AppState,
     current: &CurrentSession,
     workflow_id: Uuid,

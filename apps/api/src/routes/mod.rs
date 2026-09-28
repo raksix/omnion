@@ -87,9 +87,9 @@ pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
 pub mod media;
+pub mod media_duplicates;
 pub mod media_files;
 pub mod media_grants;
-pub mod media_duplicates;
 pub mod media_retention;
 pub mod media_scan;
 mod media_settings;
@@ -106,6 +106,7 @@ pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
+pub mod workflow_graph;
 pub mod workflows;
 
 use axum::Router;
@@ -512,8 +513,8 @@ pub fn router(state: AppState) -> Router {
     // permission as repointing where every file in it lives.
     let media_settings_route: MethodRouter<AppState, Infallible> =
         get(media_settings::read).layer(guards::require(&state, "media.read"));
-    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
-        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -553,18 +554,18 @@ pub fn router(state: AppState) -> Router {
     // (organise a library) nor `media.delete` (remove a file) is that power.
     let media_scan_route: MethodRouter<AppState, Infallible> =
         get(media_scan::read).layer(guards::require(&state, "media.read"));
-    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
-        .layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
         get(media_scan::list_held).layer(guards::require(&state, "media.read"));
     let media_quarantine_release: MethodRouter<AppState, Infallible> =
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -574,12 +575,12 @@ pub fn router(state: AppState) -> Router {
     // able to decide who else may read what they uploaded.
     let media_folder_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
-    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
-    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     // A grant is removed by its own id alone — the row knows the node it was written on, so
     // putting the node in the URL as well would make a two-parameter path with a one-parameter
     // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
@@ -665,6 +666,24 @@ pub fn router(state: AppState) -> Router {
 
     let workflow_execution_cancel =
         post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
+
+    // The visual builder's surfaces (REQ-004 slice 1). The registry is a *static* segment,
+    // so it can never be captured by `/workflows/{id}` — the ordering is not load-bearing
+    // but the distinctness is.
+    let workflow_node_types =
+        get(workflow_graph::list_node_types).layer(guards::require(&state, "workflows.read"));
+
+    let workflow_graph_read =
+        get(workflow_graph::get_graph).layer(guards::require(&state, "workflows.read"));
+
+    let workflow_graph_write =
+        put(workflow_graph::replace_graph).layer(guards::require(&state, "workflows.manage"));
+
+    let workflow_graph_ui_state =
+        put(workflow_graph::replace_ui_state).layer(guards::require(&state, "workflows.manage"));
+
+    let workflow_graph_validate =
+        post(workflow_graph::validate_graph).layer(guards::require(&state, "workflows.manage"));
 
     // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
     // who may act, and it must be reachable before any account, role or binding exists.
@@ -1107,7 +1126,6 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
         .route("/media/grants/{grant_id}", media_grant_delete)
@@ -1138,8 +1156,15 @@ pub fn router(state: AppState) -> Router {
         // `{id}` parameter above it.
         .route("/public/media/shared/{token}", public_media_shared)
         .route("/workflows", workflows)
+        .route("/workflows/node-types", workflow_node_types)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)
+        .route(
+            "/workflows/{id}/graph",
+            workflow_graph_read.merge(workflow_graph_write),
+        )
+        .route("/workflows/{id}/graph/ui-state", workflow_graph_ui_state)
+        .route("/workflows/{id}/validate", workflow_graph_validate)
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)
         .route(
