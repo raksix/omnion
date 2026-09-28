@@ -111,6 +111,24 @@ const BASE_ROLES: &[BaseRole] = &[
             "analytics.export",
             "analytics.goals.manage",
             "analytics.settings.manage",
+            "crm.contacts.read",
+            "crm.contacts.create",
+            "crm.contacts.update",
+            "crm.contacts.delete",
+            "crm.contacts.merge",
+            "crm.fields.sensitive.read",
+            "crm.views.manage",
+            "crm.contacts.import",
+            "crm.deals.read",
+            "crm.deals.create",
+            "crm.deals.update",
+            "crm.deals.delete",
+            "crm.pipelines.manage",
+            "crm.activities.read",
+            "crm.activities.create",
+            "crm.copilot.use",
+            "crm.leads.read",
+            "crm.leads.manage",
             // Your own inbox is not a privilege: every account has one, and the reads are
             // owner-scoped in the store, so this key grants nothing about anybody else. It is
             // listed explicitly rather than folded into a family because the panel shows the
@@ -142,6 +160,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            "crm.contacts.read",
             // The bell is on every route, so every role that can open the panel needs to read
             // its own inbox. `notifications.manage` is deliberately NOT here: it is the
             // channel-configuration power slice 2 introduces, and a role that may read an
@@ -168,6 +187,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            "crm.contacts.read",
             // The bell is on every route. See the note in the manager role.
             "notifications.read",
         ]),
@@ -562,26 +582,3 @@ mod tests {
         );
     }
 }
-            "crm.contacts.read",
-            "crm.contacts.create",
-            "crm.contacts.update",
-            "crm.contacts.delete",
-            "crm.contacts.merge",
-            "crm.fields.sensitive.read",
-            "crm.views.manage",
-            "crm.contacts.import",
-            "crm.deals.read",
-            "crm.deals.create",
-            "crm.deals.update",
-            "crm.deals.delete",
-            "crm.pipelines.manage",
-            "crm.activities.read",
-            "crm.activities.create",
-            "crm.copilot.use",
-            "crm.leads.read",
-            "crm.leads.manage",
-            "crm.contacts.read",
-            "crm.contacts.read",
-        permissions: BasePermissions::List(&["content.pages.read", "media.read", "search.read"]),
-            vec!["content.pages.read", "media.read", "search.read"],
-            "the member reads content, media and the search box"
