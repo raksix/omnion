@@ -42,6 +42,11 @@ const ADMIN_PERMISSIONS: [&str; 4] = [
     "sites.create",
 ];
 
+/// What the Audit tab needs on top of that, and what a tenancy administrator deliberately does
+/// not get for free: a trail names every privileged act in the tenant, so `audit.read` is its own
+/// permission rather than a consequence of `organizations.read`.
+const AUDIT_PERMISSIONS: [&str; 1] = ["audit.read"];
+
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
@@ -290,6 +295,14 @@ impl Fixture {
         login(&self.state, &self.other_admin_email).await
     }
 
+    /// Remember an account a walk created *after* the fixture was built, so cleanup reaches it.
+    ///
+    /// The walks add owners mid-test; without this, an owner account survives the suite and the
+    /// next run's "the queue must be empty" counts their leftover rows.
+    async fn track_account(&mut self, user_id: Uuid) {
+        self.accounts.push(user_id);
+    }
+
     /// Remove exactly what this fixture created — by id, never by a pattern.
     async fn cleanup(&self) {
         sqlx::query("delete from users where id = any($1)")
@@ -349,6 +362,15 @@ async fn add_membership(db: &Db, organization_id: Uuid, user_id: Uuid) {
 
 /// Give one account the tenancy permissions of an organization.
 async fn grant_organization_admin(db: &Db, organization_id: Uuid, user_id: Uuid) {
+    grant_permissions(db, organization_id, user_id, &ADMIN_PERMISSIONS).await;
+}
+
+/// Grant one account an exact set of permissions inside one organization.
+///
+/// Parameterised rather than a second copy of `grant_organization_admin`: two copies of a
+/// fixture that *drifts* produce a walk that passes for the wrong reason — one of them quietly
+/// holding a permission the other does not, and the difference never showing up as a failure.
+async fn grant_permissions(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str]) {
     let role = role_store::create_role(
         db.pool(),
         omnion_permissions::model::NewRole {
@@ -363,7 +385,7 @@ async fn grant_organization_admin(db: &Db, organization_id: Uuid, user_id: Uuid)
     .await
     .expect("the organization role must be created");
 
-    let entries: Vec<omnion_permissions::model::RolePermissionInput> = ADMIN_PERMISSIONS
+    let entries: Vec<omnion_permissions::model::RolePermissionInput> = keys
         .iter()
         .map(|key| omnion_permissions::model::RolePermissionInput {
             key: (*key).to_owned(),
@@ -386,6 +408,73 @@ async fn grant_organization_admin(db: &Db, organization_id: Uuid, user_id: Uuid)
     )
     .await
     .expect("the binding must be granted");
+}
+
+/// Bind the platform `owner` role to one account, at this organization's scope.
+///
+/// The queue's release rule is a *per-tenant* fact, so a walk that only ever binds the suite's
+/// "organization administrator" can never prove it. This is the shape the first-run owner has:
+/// the seeded `owner` role lives at platform scope, and the binding is what makes the account
+/// this tenant's owner.
+async fn grant_organization_owner(db: &Db, organization_id: Uuid, user_id: Uuid) {
+    let role_id: Uuid = sqlx::query_scalar(
+        "select id from roles where key = 'owner' and organization_id is null limit 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("the seeded owner role must exist");
+
+    omnion_permissions::bindings::grant(
+        db.pool(),
+        omnion_permissions::model::NewBinding {
+            role_id,
+            user_id,
+            scope: omnion_permissions::Scope::Organization { organization_id },
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the owner binding must be granted");
+}
+
+/// Set one organization's invite policy, straight through the store.
+///
+/// Only the policy is sent: `SettingsChanges` is a *patch* shape where `None` means "leave it
+/// alone", so copying the rest of the row across would be a second thing to get wrong — and
+/// `Some(None)` on a nullable field is not "unchanged", it is "clear it".
+async fn set_invite_policy(db: &Db, organization_id: Uuid, policy: &str) {
+    tenancy_limits::update_settings(
+        db.pool(),
+        organization_id,
+        tenancy_limits::SettingsChanges {
+            invite_policy: Some(policy.to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the invite policy must be saved");
+}
+
+/// Invite somebody, returning the response as-is.
+///
+/// Several walks assert *how* a create ended — `201` with a link, `202` queued, `403` closed —
+/// and a helper that panicked on the wrong status would hide which one it was.
+async fn invite(
+    fixture: &Fixture,
+    token: &str,
+    email: &str,
+) -> TestResponse {
+    call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/organizations/{}/invitations", fixture.org_a),
+            Some(token),
+            Some(json!({ "email": email })),
+        ),
+    )
+    .await
 }
 
 /// Sign an account in and return the raw session token.
@@ -1551,6 +1640,605 @@ async fn the_installed_module_keys_all_survive_the_store() {
         stored.iter().all(|(_, enabled)| !enabled),
         "and all of them are off: {stored:?}"
     );
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The invite policy: three stored values, three behaviours
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_closed_organization_refuses_an_invitation_and_names_its_policy() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    set_invite_policy(&fixture.db, fixture.org_a, "closed").await;
+    let admin = fixture.admin_token().await;
+    let address = format!("closed-{}@omnion.test", Uuid::new_v4().simple());
+
+    let refused = invite(&fixture, &admin, &address).await;
+
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "a closed tenant must refuse the invitation, body: {}",
+        refused.body
+    );
+    assert_eq!(code_of(&refused.body), "invitations_closed");
+    assert_eq!(
+        refused.body["error"]["details"]["invite_policy"], "closed",
+        "the refusal names the policy that caused it: {}",
+        refused.body
+    );
+
+    // And it changed nothing: a refused invitation leaves no row behind, so opening the tenant to
+    // invitations again and inviting the same address succeeds. Without this, a policy could
+    // "refuse" by writing a dead row.
+    let stored: i64 = sqlx::query_scalar(
+        "select count(*) from organization_invitations where organization_id = $1",
+    )
+    .bind(fixture.org_a)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the count must run");
+    assert_eq!(stored, 0, "a refused invitation must not leave a row");
+
+    set_invite_policy(&fixture.db, fixture.org_a, "self_serve").await;
+    let allowed = invite(&fixture, &admin, &address).await;
+    assert_eq!(
+        allowed.status,
+        StatusCode::CREATED,
+        "the same address invites fine once the tenant is open: {}",
+        allowed.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn self_serve_hands_over_a_working_link_to_anyone_who_may_manage() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    set_invite_policy(&fixture.db, fixture.org_a, "self_serve").await;
+    let admin = fixture.admin_token().await;
+    let address = format!("selfserve-{}@omnion.test", Uuid::new_v4().simple());
+
+    let created = invite(&fixture, &admin, &address).await;
+
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let token = created.body["token"]
+        .as_str()
+        .expect("a self-serve invitation must carry its link")
+        .to_owned();
+    assert!(
+        !token.is_empty(),
+        "an empty token would be a dead link that looks alive"
+    );
+    assert_eq!(created.body["invitation"]["status"], "pending");
+
+    // …and the link really works: the public preview sees the tenant, and the address is masked in
+    // the event but named in the invitation the inviter holds.
+    let preview = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/invitations/{token}"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "body: {}", preview.body);
+    assert_eq!(preview.body["usable"], true, "the link must be usable: {}", preview.body);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn owner_approval_queues_the_link_until_an_owner_releases_it() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    set_invite_policy(&fixture.db, fixture.org_a, "owner_approval").await;
+    let admin = fixture.admin_token().await;
+    let address = format!("queued-{}@omnion.test", Uuid::new_v4().simple());
+
+    // The manager's invite: queued, and with *no* link to forward.
+    let queued = invite(&fixture, &admin, &address).await;
+    assert_eq!(
+        queued.status,
+        StatusCode::ACCEPTED,
+        "a queued invitation is accepted, not created: {}",
+        queued.body
+    );
+    assert_eq!(queued.body["invitation"]["status"], "awaiting_approval");
+    assert_eq!(
+        queued.body["token"].as_str().unwrap_or_default(),
+        "",
+        "a queued invitation must not hand out a link — the queue would be advisory"
+    );
+    let invitation_id = queued.body["invitation"]["id"]
+        .as_str()
+        .expect("the queued row has an id")
+        .to_owned();
+
+    // The queue is visible, oldest first.
+    let queue = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/organizations/{}/invitations/queue", fixture.org_a),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(queue.status, StatusCode::OK, "body: {}", queue.body);
+    let queued_rows = queue.body["invitations"].as_array().expect("an array");
+    assert!(
+        queued_rows.iter().any(|row| row["id"] == invitation_id.as_str()),
+        "the queue must list what is waiting: {}",
+        queue.body
+    );
+    assert!(
+        queued_rows
+            .iter()
+            .all(|row| row["status"] == "awaiting_approval"),
+        "the queue lists queued rows and nothing else: {}",
+        queue.body
+    );
+
+    // The manager cannot release it: the guard is `organizations.manage`, which they hold, so the
+    // only thing that can refuse them is the owner check inside the handler. That is the whole
+    // difference between `self_serve` and `owner_approval`.
+    let self_release = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!(
+                "/api/v1/organizations/{}/invitations/{invitation_id}/release",
+                fixture.org_a
+            ),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        self_release.status,
+        StatusCode::FORBIDDEN,
+        "a manager must not release their own queue entry, body: {}",
+        self_release.body
+    );
+    assert_eq!(code_of(&self_release.body), "not_an_organization_owner");
+
+    // The owner's release mints the link — the first time a working one exists.
+    let (owner_id, owner_email) = create_account(&fixture.db).await;
+    add_membership(&fixture.db, fixture.org_a, owner_id).await;
+    grant_organization_owner(&fixture.db, fixture.org_a, owner_id).await;
+    let owner = login(&fixture.state, &owner_email).await;
+    fixture.track_account(owner_id).await;
+
+    let released = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!(
+                "/api/v1/organizations/{}/invitations/{invitation_id}/release",
+                fixture.org_a
+            ),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(released.status, StatusCode::OK, "body: {}", released.body);
+    assert_eq!(released.body["invitation"]["status"], "pending");
+    let token = released.body["token"]
+        .as_str()
+        .expect("the release must hand over the link")
+        .to_owned();
+    assert!(!token.is_empty(), "the released link must not be empty");
+
+    // The queue is empty again, and the link now works.
+    let drained = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/organizations/{}/invitations/queue", fixture.org_a),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        drained.body["invitations"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .all(|row| row["id"] != invitation_id.as_str()),
+        "a released invitation must leave the queue: {}",
+        drained.body
+    );
+
+    let preview = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/invitations/{token}"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview.body["usable"], true,
+        "the released link must work: {}",
+        preview.body
+    );
+
+    // Releasing twice is refused by name rather than silently succeeding: the second release would
+    // mint a *new* link, silently orphaning the one the inviter already sent.
+    let twice = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!(
+                "/api/v1/organizations/{}/invitations/{invitation_id}/release",
+                fixture.org_a
+            ),
+            Some(&owner),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(twice.status, StatusCode::CONFLICT, "body: {}", twice.body);
+    assert_eq!(code_of(&twice.body), "invitation_not_queued");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_queued_link_never_works_and_says_so() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    set_invite_policy(&fixture.db, fixture.org_a, "owner_approval").await;
+    let admin = fixture.admin_token().await;
+    let address = format!("notyet-{}@omnion.test", Uuid::new_v4().simple());
+
+    // Created straight through the store so the test holds the raw token the API refused to
+    // return — a real deployment never shows it, but a *leaked* one must still be inert.
+    let created = memberships::create_invitation(
+        fixture.db.pool(),
+        memberships::NewInvitation {
+            organization_id: fixture.org_a,
+            email: address.clone(),
+            role_id: None,
+            invited_by: None,
+            message: String::new(),
+            expires_at: None,
+            queued: true,
+        },
+    )
+    .await
+    .expect("the queued invitation must be created");
+
+    let preview = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/invitations/{}", created.token),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview.body["usable"], false,
+        "a queued link must never be usable: {}",
+        preview.body
+    );
+
+    // And the invitee is told *why*, not "this link is not valid" — they would go back to the
+    // manager who just invited them.
+    let (invitee_id, invitee_email) = create_account(&fixture.db).await;
+    fixture.track_account(invitee_id).await;
+    let invitee = login(&fixture.state, &invitee_email).await;
+    let accepted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/invitations/{}/accept", created.token),
+            Some(&invitee),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::CONFLICT, "body: {}", accepted.body);
+    assert_eq!(
+        code_of(&accepted.body),
+        "invitation_awaiting_approval",
+        "the invitee is told the invitation is waiting, not that it is invalid: {}",
+        accepted.body
+    );
+
+    // It is still queued afterwards: a refused acceptance must not have released it.
+    let status: String = sqlx::query_scalar("select status from organization_invitations where id = $1")
+        .bind(created.invitation.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the row must still be there");
+    assert_eq!(status, "awaiting_approval");
+
+    // A token that was never issued still answers indistinguishably, so the queue is not a probe
+    // for which organizations exist.
+    let bogus = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/invitations/not-a-real-token",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        bogus.body["usable"], false,
+        "an unknown token is unusable: {}",
+        bogus.body
+    );
+    assert_eq!(
+        bogus.body["reason"], preview.body["reason"],
+        "a queued and an unknown token must be indistinguishable: {} vs {}",
+        preview.body, bogus.body
+    );
+
+    let _ = admin;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_owner_inviting_into_their_own_tenant_is_not_stuck_behind_the_queue() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    set_invite_policy(&fixture.db, fixture.org_a, "owner_approval").await;
+    let (owner_id, owner_email) = create_account(&fixture.db).await;
+    add_membership(&fixture.db, fixture.org_a, owner_id).await;
+    grant_organization_owner(&fixture.db, fixture.org_a, owner_id).await;
+    fixture.track_account(owner_id).await;
+    let owner = login(&fixture.state, &owner_email).await;
+
+    let created = invite(
+        &fixture,
+        &owner,
+        &format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+    )
+    .await;
+
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "an owner must not have to queue an invitation behind themselves: {}",
+        created.body
+    );
+    assert!(!created.body["token"].as_str().unwrap_or_default().is_empty());
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn one_tenants_queue_is_another_tenants_invisible_row() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    set_invite_policy(&fixture.db, fixture.org_a, "owner_approval").await;
+    let admin = fixture.admin_token().await;
+    let other_admin = fixture.other_admin_token().await;
+    let queued = invite(
+        &fixture,
+        &admin,
+        &format!("private-{}@omnion.test", Uuid::new_v4().simple()),
+    )
+    .await;
+    assert_eq!(queued.status, StatusCode::ACCEPTED, "body: {}", queued.body);
+    let invitation_id = queued.body["invitation"]["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+
+    // Reading organization A's queue as B is a 404 — the isolation rule every tenancy route
+    // follows, and the queue is no exception.
+    let read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/organizations/{}/invitations/queue", fixture.org_a),
+            Some(&other_admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::NOT_FOUND, "body: {}", read.body);
+    assert_eq!(code_of(&read.body), "organization_not_found");
+
+    // Releasing it is refused the same way, not `403` — a 403 would confirm the row exists.
+    let release = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!(
+                "/api/v1/organizations/{}/invitations/{invitation_id}/release",
+                fixture.org_a
+            ),
+            Some(&other_admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(release.status, StatusCode::NOT_FOUND, "body: {}", release.body);
+    assert_eq!(code_of(&release.body), "organization_not_found");
+
+    fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Audit tab
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let admin = fixture.admin_token().await;
+    let uri = format!("/api/v1/organizations/{}/audit", fixture.org_a);
+
+    // A tenancy administrator is refused: `audit.read` is not implied by `organizations.read`.
+    // Without this assertion the tab would "work" for anyone, and the split would be untested.
+    let refused = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&admin), None),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "a trail is not a member listing: {}",
+        refused.body
+    );
+
+    // An auditor sees the tenant's own trail — and the settings change the walk is about to make
+    // is already in it, because every privileged write records in the same request.
+    let (auditor_id, auditor_email) = create_account(&fixture.db).await;
+    add_membership(&fixture.db, fixture.org_a, auditor_id).await;
+    grant_permissions(
+        &fixture.db,
+        fixture.org_a,
+        auditor_id,
+        &["organizations.read", &AUDIT_PERMISSIONS[0]],
+    )
+    .await;
+    fixture.track_account(auditor_id).await;
+    let auditor = login(&fixture.state, &auditor_email).await;
+
+    set_invite_policy(&fixture.db, fixture.org_a, "self_serve").await;
+    invite(
+        &fixture,
+        &admin,
+        &format!("audited-{}@omnion.test", Uuid::new_v4().simple()),
+    )
+    .await;
+
+    let feed = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&auditor), None),
+    )
+    .await;
+    assert_eq!(feed.status, StatusCode::OK, "body: {}", feed.body);
+    let entries = feed.body["entries"].as_array().expect("an array");
+    assert!(
+        entries.iter().any(|row| row["action"] == "organization.settings.updated"),
+        "the settings change must be in this tenant's trail: {}",
+        feed.body
+    );
+    assert!(
+        entries.iter().any(|row| row["action"] == "organization.member.invited"),
+        "and so must the invitation: {}",
+        feed.body
+    );
+
+    // Every row carries a readable actor — the whole point of a feed. A system row says so rather
+    // than rendering a blank cell.
+    for row in entries {
+        assert!(row["actor_type"].is_string(), "every row names its actor type: {row}");
+        if row["actor_type"] == "user" {
+            assert!(
+                row["actor_name"].as_str().is_some_and(|name| !name.is_empty()),
+                "a human row names the human: {row}"
+            );
+        }
+    }
+
+    // The action filter is exact, chosen from the list the same response returns.
+    let actions = feed.body["actions"].as_array().expect("an array");
+    assert!(
+        actions.iter().any(|value| value == "organization.settings.updated"),
+        "the filter offers what this tenant has done: {actions:?}"
+    );
+    let filtered = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{uri}?action=organization.settings.updated"),
+            Some(&auditor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::OK, "body: {}", filtered.body);
+    let narrowed = filtered.body["entries"].as_array().expect("an array");
+    assert!(
+        !narrowed.is_empty(),
+        "the filter must match the row that exists"
+    );
+    assert!(
+        narrowed
+            .iter()
+            .all(|row| row["action"] == "organization.settings.updated"),
+        "the filter must not leak other actions: {}",
+        filtered.body
+    );
+    assert!(
+        filtered.body["total"].as_i64().unwrap_or_default() < feed.body["total"].as_i64().unwrap_or_default(),
+        "a narrowed feed counts fewer rows than the whole one: {} vs {}",
+        filtered.body["total"], feed.body["total"]
+    );
+
+    // A typo is refused rather than answered as "this tenant has no history" — the one reading an
+    // audit screen must never give by accident.
+    let nonsense = call(
+        &fixture.state,
+        request(Method::GET, &format!("{uri}?actor=not-an-id"), Some(&auditor), None),
+    )
+    .await;
+    assert_eq!(nonsense.status, StatusCode::BAD_REQUEST, "body: {}", nonsense.body);
+    assert_eq!(code_of(&nonsense.body), "invalid_actor_filter");
+
+    // The CSV repeats the rows on screen, not a different query's idea of them.
+    let csv = call(
+        &fixture.state,
+        request(Method::GET, &format!("{uri}?format=csv"), Some(&auditor), None),
+    )
+    .await;
+    assert_eq!(csv.status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&csv.raw);
+    let header = text.lines().next().expect("a header row");
+    assert!(header.starts_with("id,action,actor,"), "the header names the columns: {header}");
+    let rows = text.lines().skip(1).filter(|line| !line.trim().is_empty()).count();
+    assert_eq!(
+        rows,
+        entries.len(),
+        "the CSV must carry the page the tab rendered: {rows} vs {}",
+        entries.len()
+    );
+    assert!(
+        text.contains("organization.settings.updated"),
+        "the export carries the rows, not just the header"
+    );
+
+    // Another tenant's trail is a 404, never a 403.
+    let other_admin = fixture.other_admin_token().await;
+    let foreign = call(
+        &fixture.state,
+        request(Method::GET, &uri, Some(&other_admin), None),
+    )
+    .await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "body: {}", foreign.body);
+    assert_eq!(code_of(&foreign.body), "organization_not_found");
 
     fixture.cleanup().await;
 }

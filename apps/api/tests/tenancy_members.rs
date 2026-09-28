@@ -603,6 +603,7 @@ async fn a_used_expired_or_revoked_token_answers_with_its_own_reason() {
             invited_by: None,
             message: String::new(),
             expires_at: Some(OffsetDateTime::now_utc() - Duration::hours(1)),
+            queued: false,
         },
     )
     .await
