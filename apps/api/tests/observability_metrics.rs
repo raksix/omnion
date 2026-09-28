@@ -754,3 +754,70 @@ fn a_catalogue_timestamp_is_an_rfc3339_string_not_a_tuple() {
         "the timestamp serialised as a tuple: {value}"
     );
 }
+
+/// The PromQL the "copy as PromQL" affordance hands out must name a real series.
+///
+/// The overflow bucket is sorted into the series list like any other, so the first series is
+/// frequently `provider="other"` — and an operator who pastes that into a dashboard has been
+/// handed the aggregate of everything the cap folded, which reads exactly like a series they
+/// configured. The depth pass caught it: the copied string was literally `other`.
+#[tokio::test]
+async fn the_promql_names_a_real_series_and_not_the_overflow_bucket() {
+    let Some(state) = state_or_skip().await else {
+        return;
+    };
+    let (_user, token) = sign_in(&state).await;
+
+    // Drive a family past its label bound so the overflow series exists AND sorts into the list.
+    //
+    // The registry is a process-global singleton and a learned label set is a ONE-WAY door: the
+    // first 24 values a family ever sees are kept verbatim forever. Two tests driving the same
+    // family therefore interleave into one shared set and neither can assert a boundary, because
+    // which of them got the verbatim values depends on the test scheduler. This family is chosen
+    // precisely because no other test in this file records into it — the isolation is a property
+    // of the pick, so the comment names it.
+    for index in 0..(metrics::BOUNDED_SET_CAP + 4) {
+        let scope = format!("pq{index}");
+        metrics::global()
+            .counter_add("omnion_rate_limit_refusals_total", &[scope.as_str()], 1.0);
+    }
+
+    let response = call(
+        &state,
+        authed(
+            Method::GET,
+            "/api/v1/observability/metrics/query?metric=omnion_rate_limit_refusals_total&window_minutes=60",
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+    let promql = response.body["promql"]
+        .as_str()
+        .expect("the query answers a promql string");
+    assert!(
+        !promql.contains("=\"other\""),
+        "the copy affordance handed out the overflow bucket: {promql}"
+    );
+
+    // The registry is a process-global singleton, so a sibling test's own series (`probe0`, …)
+    // live in the same family and sort ahead of the ones this test just wrote. Asserting a
+    // hard-coded prefix would therefore describe *those* series and pass or fail on a fact about
+    // test order rather than about the code. The property to prove is relational: the string the
+    // screen hands out names one of the series the same response listed.
+    let series = response.body["series"]
+        .as_array()
+        .expect("the query answers a series list");
+    let named = series.iter().any(|entry| {
+        entry["labels"].as_array().is_some_and(|labels| {
+            labels
+                .iter()
+                .filter_map(|value| value.as_str())
+                .any(|value| promql.contains(value))
+        })
+    });
+    assert!(
+        named,
+        "the promql names no listed series: {promql} (series: {series:?})"
+    );
+}
