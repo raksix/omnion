@@ -367,6 +367,10 @@ export function SettingsTab({ organization }: { organization: Organization }) {
                 value={entry.key}
                 checked={policy === entry.key}
                 onChange={() => setPolicy(entry.key)}
+                // The hook a QA pass targets. A radio group has no `<select>` to point at, and a
+                // pass that reaches for one writes the policy into the header's site switcher —
+                // the same wrong-element trap the locale hook was added for.
+                data-organization-settings-policy={entry.key}
                 className="mt-0.5"
               />
               <span className="min-w-0">
@@ -428,6 +432,7 @@ export function SettingsTab({ organization }: { organization: Organization }) {
         <button
           type="submit"
           disabled={saving}
+          data-organization-settings-save
           className="inline-flex items-center gap-1.5 rounded-lg bg-accent-strong px-3 py-1.5 text-[12.5px] font-medium text-canvas transition disabled:opacity-60"
         >
           {saving ? (
