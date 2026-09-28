@@ -1637,6 +1637,119 @@ async function uploadDuplicateSample(page) {
  * file the radio named (not the first one), and the result panel says the bytes are *pending*
  * rather than reclaimed. It then re-reads the API to prove the group is really gone.
  */
+async function runMediaGrants(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "media", action: "media-grants", ...step });
+  };
+
+  // A real file, resolved the way the other media passes do — from the library listing.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  const uploaded = await uploadMediaSample(page);
+  await page.waitForTimeout(1500);
+  note({ step: "upload", ...uploaded });
+  const fileId = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  if (!fileId) {
+    return { ok: false, reason: "the library rendered no file to reach the permissions tab" };
+  }
+
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.click("#media-tab-permissions").catch(() => {});
+  await page.waitForSelector('[data-testid="media-grants-tab"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="media-grants-tab"]').count()) > 0;
+  note({ step: "tab", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the permissions tab did not render" };
+  }
+
+  // The narrowing rule has to be *on the screen*. A tab that only shows a table teaches an
+  // operator that a grant hands capabilities out, which is the one thing it must not do.
+  const body = await page.locator('[data-testid="media-grants-tab"]').innerText().catch(() => "");
+  note({ step: "states-the-rule", states: /narrow/i.test(body) });
+  const hasGrantAccess = await page.locator("button:has-text('Grant access')").count();
+  note({ step: "no-grant-access-button", hasGrantAccess });
+
+  // The chain a file inherits from. It is on the tab whether or not it is empty, and an empty
+  // list here would be a chain that silently does not exist.
+  const chainNodes = await page.locator('[data-testid="media-grants-chain-node"]').count();
+  note({ step: "chain", chainNodes });
+
+  // The empty state explains that a grant only ever takes something away, rather than showing
+  // an empty table that reads as "nothing is configured".
+  const emptyRows = await page.locator('[data-testid="media-grant-row"]').count();
+  const emptyCopy = await page.locator("text=No grants on this").count();
+  note({ step: "empty", emptyRows, emptyCopy });
+  await shot(page, "page-media-file-detail-permissions");
+
+  // The subject picker opens, offers the organization's own subjects, and a group is marked as
+  // the row that survives somebody joining and leaving a team.
+  await page.click('[data-testid="media-grant-add"]').catch(() => {});
+  await page.waitForSelector('[data-testid="media-grant-form"]', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const subjects = await page.locator('[data-testid="media-grant-subjects"] button').count();
+  note({ step: "picker", subjects });
+  if (subjects === 0) {
+    return { ok: false, reason: "the subject picker offered nobody" };
+  }
+
+  // A deny with no capability is refused by the form, naming what it has to say. Sent to the
+  // API it is a 400 that writes nothing, so the walk proves the screen catches it first.
+  await page.click('[data-testid="media-grant-subjects"] button').catch(() => {});
+  await page.click('[data-testid="media-grant-effect-deny"]').catch(() => {});
+  for (const bit of ["can_read", "can_write", "can_delete", "can_share"]) {
+    const box = page.locator(`[data-testid="media-grant-bit-${bit}"]`);
+    if (await box.isChecked().catch(() => false)) {
+      await box.uncheck().catch(() => {});
+    }
+  }
+  await page.click('[data-testid="media-grant-save"]').catch(() => {});
+  await page.waitForTimeout(600);
+  const denied = await page.locator('[data-testid="media-grant-field-error"]').innerText().catch(() => "");
+  note({ step: "empty-deny-refused", denied });
+  const emptyDenyRefused = /tick at least one/i.test(denied);
+
+  // A real deny: read is ticked, it saves, and the row says what it does and where it applies.
+  await page.check('[data-testid="media-grant-bit-can_read"]').catch(() => {});
+  await page.click('[data-testid="media-grant-save"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const rows = await page.locator('[data-testid="media-grant-row"]').count();
+  const denies = await page.locator('[data-testid="media-grants-deny-count"]').count();
+  const namedByName = await page.evaluate(() => {
+    const row = document.querySelector('[data-testid="media-grant-row"]');
+    return row ? row.textContent : null;
+  });
+  note({ step: "saved", rows, denies, namedByName });
+  await shot(page, "page-media-file-detail-permissions-deny");
+
+  // The row resolves its subject's *name*. A uuid in that cell teaches nobody which grant to
+  // remove, and the walk is the only layer that sees the cell rather than the data.
+  const showsLabel = namedByName ? !/[0-9a-f]{8}-[0-9a-f]{4}/.test(namedByName) : false;
+  note({ step: "shows-a-name", showsLabel });
+
+  // Removing it is immediate, and the empty state comes back. The confirmation is a
+  // `window.confirm` and the harness accepts dialogs globally, so this is one click: a second
+  // one would remove a grant that no longer exists and turn a passing check into a 404.
+  await page.click('[data-testid="media-grant-remove"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const afterRemove = await page.locator('[data-testid="media-grant-row"]').count();
+  const afterNotices = await page.locator('[data-testid="media-grants-notice"]').count();
+  note({ step: "removed", afterRemove, afterNotices });
+  await shot(page, "page-media-file-detail-permissions-empty");
+
+  return {
+    ok: rendered && subjects > 0 && emptyDenyRefused && rows === 1 && afterRemove === 0,
+    emptyDenyRefused,
+    showsLabel,
+    steps,
+  };
+}
+
 async function runMediaDuplicates(page, report) {
   const steps = [];
   const note = (step) => {
@@ -3597,6 +3710,12 @@ async function main() {
   // actually serves the bytes, and a revoke stops it on the very next request.
   report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
   log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+
+  // The permissions tab (REQ-010, slice 4): the narrowing rule stated on the screen, the
+  // chain a file inherits from, a deny refused when it names nothing, and a real deny that
+  // names its subject by name rather than by uuid.
+  report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
+  log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
 
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the

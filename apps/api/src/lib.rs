@@ -18,6 +18,7 @@ pub mod intent_resolver;
 pub mod request_log;
 pub mod routes;
 pub mod scope;
+pub mod retention_runner;
 pub mod search_runner;
 pub mod secrets_runner;
 pub mod state;

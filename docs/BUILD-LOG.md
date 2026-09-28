@@ -1,3 +1,89 @@
+## 2026-09-28 — REQ-010 slice 4 (scanning half + grants half) · the access layer, and a red that had been hiding for four ticks
+
+build media: folder and file grants, with a deny that wins at any depth
+
+REQ-010 slice 4, the permissions half. A permission says whether an account may
+touch the library; a grant says **not this one, not here**. That asymmetry is the
+whole design, and the alternative — a layer that could also hand capabilities out —
+would be a second, un-audited source of truth beside the permission catalogue. The
+first thing anybody would build on such a layer is a "grant a contractor read on the
+whole library" button that quietly bypasses IAM.
+
+**0047_media_grants.sql** creates the table with the XOR constraint (a grant on
+neither node is a grant on the whole site; one on both is ambiguous in exactly the
+way two resolvers disagree), the unique (node, subject) index and three lookups.
+Deliberately **no `sites` trigger**, unlike 0028/0029/0044 which all closed the
+"a site created after the migration has nothing" gap: a grant attaches to a folder
+or a file, and a new site has neither until somebody opens the library, so there is
+no node for a trigger to write to.
+
+**`resolve()` is a pure function with no pool in it**, because a deny-wins rule
+tested only over HTTP is a rule somebody refactors away while changing a handler.
+The answer is "the union of the allows, minus the union of the denies" and not a
+fold in list order: a fold lets a file allow recorded after a folder deny undo it,
+and lets a root allow re-open a file whose own grant says no. A subject named
+*only* by denies gets nothing rather than "everything except what was refused".
+
+**The gate.** `ensure_servable` is two halves now, in an order — grant, then scan.
+The public renderer and the share-token route call the **scan half alone**: a grant
+narrows a sign-in and cannot describe an anonymous visitor, so applying one there
+would break every published page the moment somebody narrowed a folder. Share
+*creation* resolves the chain's `share` bit on its own, so a writer with no share
+bit is refused a capability their role would otherwise have let them hand out.
+
+**Three defects the walks found, none of which a unit test could have seen.**
+
+*One.* A deny with no bit set removes nothing and reads as one that does; refused
+at the API with the field named, and refused by the screen first.
+
+*Two, and it is the one that matters.* `delete_one` resolved the grant's node,
+which loaded the file, which ran the tenancy check and answered `403` — confirming
+that another tenant's grant id exists, which is precisely the oracle the 404 rule
+exists to prevent. The lookup now scopes by organization **in the same `where`**,
+so there is no window in which an id's existence leaks, and the walk proves both
+halves: a foreign grant answers 404 *and* the refusal did not delete their row.
+
+*Three.* A URL with two path parameters and a one-parameter handler is the shape
+axum rejects with a bare `500` and no body. The grant delete route now carries the
+grant id alone, because the row already knows the node it was written on. Half a
+tick went into reading that 500 as an unrelated panic before the shape was read
+off the mount list.
+
+**Also fixed: a pre-existing red that had been hiding for four ticks.** The EXIF
+fixture computed the sub-directory's offsets without IFD0's four-byte
+next-directory pointer, so the *lens* pointer landed inside the value area and
+overwrote the first two bytes of the camera make. The reader then reported no
+camera at all — and a null `exif` column is a perfectly legal answer to "what did
+the camera say", so every piece of evidence pointed at the reader instead of at the
+fixture. The value area is now written by allocation with named pairs rather than by
+arithmetic, and a new test calls the reader on the builder's own output and asserts
+every field: no database, no object store, no walk, and the bytes next to the
+answer. Two of the walk's helpers also could not express what they were asserting —
+a `jsonb` decode cannot hold the null that this whole feature exists to distinguish
+from "read nothing" — so `media_column` returns `Option<Value>` and `media_int`
+reads the integer columns.
+
+**Proof.** `--test media_grants` → **8 walks, 0 failures**, against a disposable
+database (`scripts/qa/run-media-walk.sh`, because the shared development database
+carries a sibling wave's migrations and the suite dies with `VersionMissing` before
+reaching an assertion). Every value is read **out of PostgreSQL** wherever a row is
+concerned, because a response that omits a field is indistinguishable from one that
+stored it and chose not to say so. A file deny refuses the raw route with a `403`
+naming where the deny was found, while a bystander holding every permission still
+reads the same file. A folder deny reaches a file two folders down and the tab
+shows the three-node chain with the folder that carries it marked. A group deny
+reaches its members, and **leaving the team restores access on the next request**.
+A deny naming only `share` leaves reading alone while the create route refuses. An
+untouched chain serves every file. `cargo test -p omnion-media --lib` → **164**
+(was 148), `-p omnion-api --lib` → **140** (was 127), `--test media` → **14** (was
+red), `--test media_shares` → **5**, `--test media_scan` unchanged. `apps/admin`
+`tsc --noEmit` clean.
+
+**Next.** Slice 4's last third: retention policies with the daily worker and its run
+log, and reference-based purge refusal plus the repair scan — which is also what
+finally gives the Usage and Activity tabs rows to read. Done when a retention run
+removes exactly the eligible rows and a purge names the resources holding a file.
+
 ## 2026-09-28 — REQ-010 slice 3 (four fifths) · duplicates, and the row that survives the merge
 
 - **What shipped.** **`0038_media_duplicates.sql`**, `crates/media/src/duplicates.rs`,
