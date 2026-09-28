@@ -108,7 +108,15 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * The one request every client function goes through.
+ *
+ * Exported for the module clients that live in their own files (`crm-intake-api.ts`): a second
+ * copy of this would produce a second `ApiError` class, and a screen that catches `ApiError`
+ * from here would not catch that one — an error state that silently never renders is worse
+ * than a duplicated function.
+ */
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
