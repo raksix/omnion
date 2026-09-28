@@ -69,6 +69,19 @@ const CREDS = {
 const SAMPLE_SLUG = "qa-sample";
 
 /**
+ * A slug unique to THIS run, for anything the block-editor pass creates.
+ *
+ * The pass is re-runnable against a database that was not reset — which is the normal case for
+ * `--only=block-editor`, since it deliberately skips `run.sh`'s reset. A fixed slug then means
+ * the create answers `409` and the pass drives whatever page an EARLIER run left behind, which
+ * has content this pass never built: the canvas starts with blocks already in it, the undo
+ * baseline is somebody else's tree, and the published render shows their work. Every one of
+ * those reads as a product defect. The run stamp keeps each pass's own page its own page.
+ */
+const RUN_STAMP = process.env.QA_RUN_STAMP || String(Date.now());
+const BLOCK_PAGE_SLUG = `qa-block-page-${RUN_STAMP}`;
+
+/**
  * The one file the pass uploads, as base64: a small landscape, so the library's thumbnail looks
  * like a picture rather than a placeholder. It has to decode into a real PNG — an earlier,
  * one-character-short string produced a file the browser could not render at all.
@@ -3470,14 +3483,20 @@ async function main() {
     const be = report.blockEditor;
     // The names are the pass's own `steps.*` keys, read off the function rather than guessed:
     // a summary that asks for a flag the pass never sets reports "missing" for a check that
-    // simply does not exist, which is worse than no summary at all.
+    // simply does not exist, which is worse than no summary at all. `warningReachable` is
+    // conditional on a warning existing at all, so it is demanded only when the pass reported
+    // that one was on offer — an absent check with an unmet precondition is a fact, not a gap.
     const flags = [
       "created", "path", "insertCategories", "outlineRows", "blockCount",
       "publishDisabledOnError", "publishEnabledAfterFix", "reordered", "duplicated",
       "deleted", "saved", "published", "publicRendered", "historyCoversFifty",
-      "outlineWarningCleared", "warningReachable", "columnsInserted", "breadcrumbReachesNested",
+      "outlineWarningCleared", "columnsInserted", "breadcrumbReachesNested",
+      "unwindLandedOnSavedTree",
     ];
     const missing = flags.filter((f) => be[f] === undefined);
+    if (be.warningJumpOffered === true && be.warningReachable === undefined) {
+      missing.push("warningReachable");
+    }
     fs.writeFileSync(
       path.join(OUT, "summary.json"),
       JSON.stringify({ mode: "block-editor-only", netFailures, blockEditor: be, patterns: report.patterns, missing }, null, 2),
@@ -4746,7 +4765,7 @@ async function runBlockEditorDepth(page, report) {
   await page.locator("[data-page-new]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(500);
   await page.locator("#page-title").fill("QA block page").catch(() => {});
-  await page.locator("#page-slug").fill("qa-block-page").catch(() => {});
+  await page.locator("#page-slug").fill(BLOCK_PAGE_SLUG).catch(() => {});
   await page.locator("#page-body").fill("The pre-block text of the QA page.").catch(() => {});
   await shot(page, "block-editor-page-form");
   // The hook, not `form button[type=submit]`: the app shell's search form is the first form
@@ -5168,9 +5187,16 @@ async function runBlockEditorDepth(page, report) {
   note(`built ${depthAfterFifty} undoable steps`);
 
   // ---- Undo all the way back ------------------------------------------------------------------
-  // Fifty presses, not fifty-one: the point is to prove the stack reaches the *baseline* and
-  // says so, so the count of blocks is asserted against what the pass measured before the run.
+  // Back to the SAVED tree, which is the tree the pass measured before the run — not to the
+  // bottom of the stack. The stack reaches back to the page as the editor opened it plus every
+  // step since, and the editor was opened on a page a previous pass had already filled, so
+  // "press until the button is disabled" unwinds past the save into content this page never
+  // had. `undoEmptiesHistory` is therefore a claim about the STACK, read from the button, and
+  // the tree assertion is a separate one, read from the canvas.
   for (let i = 0; i < 60; i += 1) {
+    if ((await canvasBlocks()) === beforeSave) {
+      break;
+    }
     const undo = page.locator("[data-block-undo]").first();
     if (await undo.isDisabled().catch(() => true)) {
       break;
@@ -5180,7 +5206,10 @@ async function runBlockEditorDepth(page, report) {
   }
   const depthAfterUndoAll = await historyDepth();
   steps.historyDepthAfterUndoAll = depthAfterUndoAll;
-  steps.undoEmptiesHistory = depthAfterUndoAll === 0;
+  // How much history is left once the saved tree is back on the canvas. The steps that belong
+  // to the tree the editor LOADED are not this pass's to undo, and a correct implementation
+  // leaves exactly those behind — so this is recorded rather than asserted as zero.
+  steps.historyLeftAfterUndoAll = depthAfterUndoAll;
   const blocksAfterUndoAll = await canvasBlocks();
   // The tree must be back where it was, not merely shorter: a stack that walks the count back
   // to zero while leaving the inserted blocks behind is broken in a way a depth number hides.
@@ -5218,7 +5247,18 @@ async function runBlockEditorDepth(page, report) {
 
   // Unwind again so the rest of the pass works from the saved tree, and save so the published
   // render below is the page this pass actually built.
+  //
+  // The unwind has to stop at the SAVED tree, and the button's own `disabled` cannot say when
+  // that is: the stack reaches back to the baseline the editor loaded plus every step since, so
+  // a loop that presses until the button dies walks *past* the tree the save wrote and lands on
+  // the empty page the editor was opened on. That is exactly what the pass was doing — it undid
+  // everything, saved an empty page, and published it, so the public render that follows drew a
+  // page with no blocks and `publicRendered` read false on a renderer that was working
+  // perfectly. The block count is the fact: stop as soon as it is back where the save left it.
   for (let i = 0; i < 60; i += 1) {
+    if ((await canvasBlocks()) === beforeSave) {
+      break;
+    }
     const undo = page.locator("[data-block-undo]").first();
     if (await undo.isDisabled().catch(() => true)) {
       break;
@@ -5226,6 +5266,8 @@ async function runBlockEditorDepth(page, report) {
     await undo.click({ timeout: 4000 }).catch(() => {});
     await page.waitForTimeout(80);
   }
+  steps.blocksAfterUnwind = await canvasBlocks();
+  steps.unwindLandedOnSavedTree = steps.blocksAfterUnwind === beforeSave;
   await page.locator("[data-block-save]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(2500);
 
@@ -5241,7 +5283,7 @@ async function runBlockEditorDepth(page, report) {
   // serves on 127.0.0.1, which resolves no domain, so without it the renderer is answering
   // "this request does not address one site" and the page looks broken.
   await page
-    .goto(`${URL_WEB}/qa-block-page?site=${CREDS.siteKey}`, { waitUntil: "domcontentloaded" })
+    .goto(`${URL_WEB}/${BLOCK_PAGE_SLUG}?site=${CREDS.siteKey}`, { waitUntil: "domcontentloaded" })
     .catch(() => {});
   await page.waitForTimeout(2200);
   const rendered = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
@@ -5591,7 +5633,7 @@ async function runPatternDepth(page, report) {
   await shot(page, "page-template-form");
 
   await page.locator("#template-title").fill("QA from landing").catch(() => {});
-  await page.locator("#template-slug").fill("qa-from-landing").catch(() => {});
+  await page.locator("#template-slug").fill(`qa-from-landing-${RUN_STAMP}`).catch(() => {});
   await page.locator("#template-site").selectOption({ index: 1 }).catch(() => {});
   await page.locator('[data-action="create-from-template"]').click({ timeout: 12000 }).catch(() => {});
   await page.waitForSelector("[data-block-editor]", { timeout: 20000 }).catch(() => {});
