@@ -325,10 +325,20 @@ export function updatePage(
 
 // -- Patterns and page templates (REQ-063, slice 3) --------------------------------------------------
 
-/** The pattern library, optionally narrowed to one category. */
-export async function fetchPatterns(category?: string): Promise<ContentPattern[]> {
-  const query = category ? `?category=${encodeURIComponent(category)}` : "";
-  const body = await request<PatternListResponse>(`/api/v1/patterns${query}`);
+/**
+ * The pattern library, optionally narrowed to one category and one tenant.
+ *
+ * The tenant is a parameter rather than something the server infers because the platform Owner
+ * has *no* primary organization — that is what makes it an Owner — so a route that only falls back
+ * to the account's own tenant answers the Owner `400 organization_required` on the one screen it
+ * opens first. Every tenant-addressed read in this client takes it the same way (`fetchSites`).
+ */
+export async function fetchPatterns(category?: string, organizationId?: string): Promise<ContentPattern[]> {
+  const query = new URLSearchParams();
+  if (category) query.set("category", category);
+  if (organizationId) query.set("organization_id", organizationId);
+  const suffix = query.size ? `?${query.toString()}` : "";
+  const body = await request<PatternListResponse>(`/api/v1/patterns${suffix}`);
   return body.patterns;
 }
 
@@ -406,8 +416,9 @@ export function deletePattern(patternId: string): Promise<void> {
 }
 
 /** The page template gallery, with the platform's own starting points. */
-export async function fetchPageTemplates(): Promise<PageTemplateSummary[]> {
-  const body = await request<TemplateListResponse>("/api/v1/page-templates");
+export async function fetchPageTemplates(organizationId?: string): Promise<PageTemplateSummary[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<TemplateListResponse>(`/api/v1/page-templates${query}`);
   return body.templates;
 }
 

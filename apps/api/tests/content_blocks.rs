@@ -2109,3 +2109,152 @@ async fn the_preview_frame_needs_the_pages_read_key() {
 
     fixture.cleanup().await;
 }
+
+/// The pattern and template galleries answer the platform Owner.
+///
+/// The Owner is the account with **no** primary organization — that absence is what makes it an
+/// Owner — and the gallery routes used to fall back to `user.organization_id` and nothing else, so
+/// the account the panel creates on first run was answered `400 organization_required` on the two
+/// screens that are supposed to be its first content work. The browser pass caught it as several
+/// hundred 400s on `/api/v1/patterns` and `/api/v1/page-templates`; a route-level test is where it
+/// should have been caught, because the failure is a property of the account, not of the browser.
+///
+/// Two halves, and the second is the one that makes the first safe: naming a tenant must be a
+/// selector, never a door. An account that does not hold the organization still gets a refusal,
+/// so adding a query parameter did not turn the gallery into a cross-tenant read.
+#[tokio::test]
+async fn the_galleries_answer_the_owner_and_still_refuse_a_foreign_tenant() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.platform_token().await;
+    let editor = fixture.editor_token().await;
+
+    let call = |request: Request<Body>| {
+        let state = fixture.state.clone();
+        async move {
+            let response = routes::router(state)
+                .oneshot(request)
+                .await
+                .expect("router must answer");
+            let status = response.status();
+            let bytes = response.into_body().collect().await.expect("body reads").to_bytes();
+            (
+                status,
+                if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                },
+            )
+        }
+    };
+
+    // Without a selector the Owner has nothing to fall back on, and this is exactly the request
+    // the panel used to send.
+    let refused = call(request(Method::GET, "/api/v1/patterns", Some(&owner), None)).await;
+    assert_eq!(
+        refused.0,
+        StatusCode::BAD_REQUEST,
+        "a tenant-addressed read still has to name a tenant: {}",
+        refused.1
+    );
+    assert_eq!(refused.1["error"]["code"], json!("organization_required"));
+
+    // Naming its tenant answers, on both galleries.
+    for uri in ["/api/v1/patterns", "/api/v1/page-templates"] {
+        let ok = call(request(
+            Method::GET,
+            &format!("{uri}?organization_id={}", fixture.org),
+            Some(&owner),
+            None,
+        ))
+        .await;
+        assert_eq!(ok.0, StatusCode::OK, "{uri} must answer the owner: {}", ok.1);
+    }
+
+    // The templates read seeds the system set, so it has something to answer with.
+    let seeded = call(request(
+        Method::GET,
+        &format!("/api/v1/page-templates?organization_id={}", fixture.org),
+        Some(&owner),
+        None,
+    ))
+    .await;
+    let templates = seeded.1["templates"].as_array().expect("templates");
+    assert!(
+        !templates.is_empty(),
+        "the owner's first read seeds the system templates: {}",
+        seeded.1
+    );
+
+    // A pattern the owner saves is readable by the same selector, and by a member of the tenant
+    // without naming anything — the two callers that already worked must keep working.
+    let saved = call(request(
+        Method::POST,
+        "/api/v1/patterns",
+        Some(&owner),
+        Some(json!({
+            "organization_id": fixture.org,
+            "key": format!("owner-{}", Uuid::new_v4().simple()),
+            "name": "Owner pattern",
+            "blocks": [{ "type": "text", "props": { "text": "Saved by the owner" } }],
+        })),
+    ))
+    .await;
+    assert_eq!(saved.0, StatusCode::CREATED, "{}", saved.1);
+
+    let member_read = call(request(
+        Method::GET,
+        "/api/v1/patterns",
+        Some(&editor),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        member_read.0,
+        StatusCode::OK,
+        "an account with a primary tenant still needs no selector: {}",
+        member_read.1
+    );
+    assert!(
+        member_read.1["patterns"]
+            .as_array()
+            .expect("patterns")
+            .iter()
+            .any(|p| p["id"] == saved.1["id"]),
+        "and it sees what the owner saved into its tenant"
+    );
+
+    // The refusal that matters: another tenant, named explicitly, is still refused.
+    let foreign_org = Uuid::new_v4();
+    sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
+        .bind(foreign_org)
+        .bind("Not Yours")
+        .bind(format!("other-{}", Uuid::new_v4().simple()))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the other organization must be created");
+
+    let editor_refused = call(request(
+        Method::GET,
+        &format!("/api/v1/patterns?organization_id={foreign_org}"),
+        Some(&editor),
+        None,
+    ))
+    .await;
+    assert!(
+        matches!(
+            editor_refused.0,
+            StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST
+        ),
+        "naming a tenant the account does not hold is refused, not served: {} {}",
+        editor_refused.0,
+        editor_refused.1
+    );
+    assert!(
+        editor_refused.1["patterns"].is_null(),
+        "and it returns no patterns: {}",
+        editor_refused.1
+    );
+}

@@ -146,6 +146,27 @@ pub struct PatternsQuery {
     /// Optional category filter.
     #[serde(default)]
     pub category: Option<String>,
+    /// The organization whose library is being read.
+    ///
+    /// The panel's Owner account is the account that has *no* primary organization — that is what
+    /// makes it an Owner — so a route that only ever falls back to `user.organization_id` answers
+    /// the owner `400 organization_required` on a screen it is the primary audience of. The
+    /// selector is checked against the caller's own scope by `organization_in_scope` exactly like
+    /// the write routes, so naming an organization the caller does not hold is still a refusal and
+    /// not a way to read another tenant's library.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/page-templates`.
+///
+/// The same selector as `PatternsQuery`, and for the same reason: the templates screen is one of
+/// the two the Owner opens first, and an owner with no primary organization could not read it.
+#[derive(Debug, Deserialize)]
+pub struct TemplatesQuery {
+    /// The organization whose template set is being read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 /// `POST /api/v1/patterns` — create, or replace the pattern that already owns the key.
@@ -228,7 +249,7 @@ pub async fn list_patterns(
     current: CurrentSession,
     Query(query): Query<PatternsQuery>,
 ) -> Result<Json<PatternsResponse>, ApiError> {
-    let organization_id = organization_in_scope(&current, None)?;
+    let organization_id = organization_in_scope(&current, query.organization_id)?;
     let listed =
         patterns::list_patterns(state.db().pool(), organization_id, query.category.as_deref())
             .await?;
@@ -243,8 +264,13 @@ pub async fn get_pattern(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(pattern_id): Path<Uuid>,
+    Query(query): Query<PatternsQuery>,
 ) -> Result<Json<PatternBody>, ApiError> {
-    let organization_id = organization_in_scope(&current, None)?;
+    let organization_id = organization_in_scope(&current, query.organization_id)?;
+    // A path-addressed read has no body to name an organization in, so the selector rides the
+    // query string for the same reason `PatternsQuery` carries it: the Owner has no primary
+    // organization, and the panel reaches this screen by id. `organization_in_scope` still
+    // refuses a caller naming an organization it does not hold.
     let pattern = patterns::find_pattern(state.db().pool(), organization_id, pattern_id)
         .await?
         .ok_or(Content404::Pattern)?;
@@ -261,8 +287,13 @@ pub async fn get_pattern_blocks(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(pattern_id): Path<Uuid>,
+    Query(query): Query<PatternsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let organization_id = organization_in_scope(&current, None)?;
+    let organization_id = organization_in_scope(&current, query.organization_id)?;
+    // A path-addressed read has no body to name an organization in, so the selector rides the
+    // query string for the same reason `PatternsQuery` carries it: the Owner has no primary
+    // organization, and the panel reaches this screen by id. `organization_in_scope` still
+    // refuses a caller naming an organization it does not hold.
     let pattern = patterns::find_pattern(state.db().pool(), organization_id, pattern_id)
         .await?
         .ok_or(Content404::Pattern)?;
@@ -416,8 +447,9 @@ pub async fn delete_pattern(
 pub async fn list_templates(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(query): Query<TemplatesQuery>,
 ) -> Result<Json<TemplatesResponse>, ApiError> {
-    let organization_id = organization_in_scope(&current, None)?;
+    let organization_id = organization_in_scope(&current, query.organization_id)?;
     seed_system_templates(&state, organization_id).await?;
     let listed = patterns::list_templates(state.db().pool(), organization_id).await?;
     Ok(Json(TemplatesResponse {

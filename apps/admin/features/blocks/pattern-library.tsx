@@ -31,6 +31,7 @@ import { countBlocks, describeTree, keyProblem } from "./block-tree-summary";
  */
 const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
 import { PatternEditor } from "./pattern-editor";
+import { useSession } from "@/lib/session";
 
 /** One library row's local state: the editor's open/close plus a per-row error. */
 type RowState = { editing: boolean; error: string | null };
@@ -63,9 +64,13 @@ export function PatternLibrary() {
     };
   }, []);
 
+  // The Owner has no primary tenant, so the library names one explicitly. Without it this screen
+  // is the account's `400 organization_required` rather than its first screen.
+  const organizationId = useSession().user?.organization_id ?? undefined;
+
   const load = useCallback(() => {
     setError(null);
-    fetchPatterns()
+    fetchPatterns(undefined, organizationId)
       .then((listed) => setPatterns(listed))
       .catch((cause: unknown) => {
         setPatterns([]);
@@ -75,7 +80,7 @@ export function PatternLibrary() {
             : "The pattern library could not be loaded.",
         );
       });
-  }, []);
+  }, [organizationId]);
 
   useEffect(load, [load]);
 

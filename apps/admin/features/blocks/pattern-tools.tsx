@@ -19,6 +19,7 @@ import type { BlockRegistry, ContentBlock, ContentPattern } from "@/lib/types";
 import { Library, Plus } from "lucide-react";
 
 import { ApiError, fetchPatternBlocks, fetchPatterns, savePattern } from "@/lib/api";
+import { useSession } from "@/lib/session";
 import { countBlocks, describeTree, keyFromName } from "./block-tree-summary";
 
 type Props = {
@@ -41,9 +42,12 @@ export function PatternTools({ registry, blocks, selectedPath, onInsert, onClose
   const [busyId, setBusyId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const load = useCallback(() => {
+    // See the pattern library: the Owner holds no primary tenant and has to name one.
+  const organizationId = useSession().user?.organization_id ?? undefined;
+
+const load = useCallback(() => {
     setError(null);
-    fetchPatterns()
+    fetchPatterns(undefined, organizationId)
       .then(setPatterns)
       .catch((cause: unknown) => {
         setPatterns([]);
@@ -53,7 +57,7 @@ export function PatternTools({ registry, blocks, selectedPath, onInsert, onClose
             : "The pattern library could not be loaded.",
         );
       });
-  }, []);
+  }, [organizationId]);
 
   useEffect(load, [load]);
 

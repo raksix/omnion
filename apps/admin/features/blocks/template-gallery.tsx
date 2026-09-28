@@ -29,6 +29,7 @@ import {
 } from "@/lib/api";
 import { describeTree } from "./block-tree-summary";
 import { UseTemplateForm } from "./use-template-form";
+import { useSession } from "@/lib/session";
 
 /** A registry-shaped value for when the registry request failed. */
 const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
@@ -36,6 +37,9 @@ const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
 /** The template gallery. */
 export function TemplateGallery() {
   const router = useRouter();
+  // The Owner holds no primary tenant, so the gallery names one: see the pattern library for the
+  // same argument. Both screens are the ones a fresh installation opens first.
+  const organizationId = useSession().user?.organization_id ?? undefined;
   const [templates, setTemplates] = useState<PageTemplateSummary[] | null>(null);
   const [registry, setRegistry] = useState<BlockRegistry | null>(null);
   const [sites, setSites] = useState<Site[]>([]);
@@ -59,7 +63,7 @@ export function TemplateGallery() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchPageTemplates()
+    fetchPageTemplates(organizationId)
       .then((listed) => {
         if (!cancelled) {
           setTemplates(listed);
@@ -87,7 +91,7 @@ export function TemplateGallery() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [organizationId]);
 
   const visible = useMemo(() => {
     if (!templates) {
