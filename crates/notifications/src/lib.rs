@@ -38,6 +38,16 @@ pub use preferences::{
     DIGEST_CADENCES, IN_APP, PreferenceCell, Preferences, Settings, StatedPreference,
     default_quiet_hours, validate_quiet_hours, validate_settings, validate_stated,
 };
+pub use push::{
+    ChannelReadiness, MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow,
+    PrunedSubscription, PushSubscription, RegisterOutcome, RegisterReport, RetryOutcome,
+    SUBSCRIPTION_STALE_DAYS, channel_readiness, list_outbox, list_subscriptions, outbox_counts,
+    prune_deliveries, prune_endpoints, prune_stale, register, remove, retry_delivery,
+};
+pub use router::{
+    RecipientRule, RouteReport, RouteRule, RoutedEvent, create_rule, dedupe_key, delete_rule,
+    list_rules, render, resolve_recipients, route, rules_for_event,
+};
 pub use store::{
     archive, delete, find, list, mark_all_read, record, record_many, set_read, set_read_many,
     summary, validate_categories, validate_channel, within_emit_budget,

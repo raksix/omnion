@@ -433,13 +433,24 @@ pub async fn outbox_counts(pool: &PgPool, organization_id: Option<Uuid>) -> Resu
     })
 }
 
-/// Put one failed delivery back on the queue.
+/// What happened to a retry request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetryOutcome {
+    /// The row was `failed` and is queued again.
+    Requeued,
+    /// The row is not `failed` — it already went, or it is already queued.
+    NotRetryable,
+}
+
+/// Put one failed delivery back on the queue, and say which of the two things happened.
 ///
 /// **Only a `failed` row is retryable.** A `sent` row has already reached somebody — re-sending
 /// it is a second copy of a message that arrived, and a `pending` row is already queued, so
-/// "retry" on one is a duplicate delivery scheduled for the future. Both answer `false` and the
-/// route turns that into a `409` naming the state it is in.
-pub async fn retry_delivery(pool: &PgPool, id: Uuid) -> Result<bool> {
+/// "retry" on one is a duplicate delivery scheduled for the future. Both answer
+/// [`RetryOutcome::NotRetryable`] rather than an error, because the caller's next action is
+/// the same either way: do not press the button again.
+pub async fn retry_delivery(pool: &PgPool, id: Uuid) -> Result<RetryOutcome> {
     let result: PgQueryResult = sqlx::query(
         "update notification_deliveries \
          set status = 'pending', attempts = 0, next_attempt_at = now(), error = null, \
@@ -449,7 +460,11 @@ pub async fn retry_delivery(pool: &PgPool, id: Uuid) -> Result<bool> {
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    Ok(if result.rows_affected() > 0 {
+        RetryOutcome::Requeued
+    } else {
+        RetryOutcome::NotRetryable
+    })
 }
 
 /// Delete delivery rows older than [`OUTBOX_RETENTION_DAYS`], and report how many went.
@@ -483,6 +498,136 @@ fn validate_endpoint(endpoint: &str, p256dh: &str, auth: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// What one channel's readiness is, and why.
+///
+/// `ready` is a fact about the installation; `reason` is a sentence a settings screen can put
+/// next to a cell that does nothing. The two are separate because a channel can be *partly*
+/// there — an organization with a mail transport but no from-address has one, and the honest
+/// answer names the missing half rather than saying "not configured" for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelReadiness {
+    /// The channel's name, from the closed list.
+    pub channel: String,
+    /// Whether a send over this channel would be attempted at all.
+    pub ready: bool,
+    /// Why, in one sentence. Never empty, including when it is ready.
+    pub reason: String,
+}
+
+/// Read every channel's readiness from the organization's own configuration.
+///
+/// **The reason is computed, not returned by the channel.** A readiness endpoint that answers
+/// `{"email": {"ready": false}}` forces the panel to write "not configured" in four places,
+/// and the fourth one will be wrong. Each branch below names the *specific* thing that is
+/// missing, so the settings screen never has to guess which half of a channel is absent.
+pub async fn channel_readiness(pool: &PgPool) -> Vec<ChannelReadiness> {
+    let configured: Vec<(String, bool, serde_json::Value)> =
+        sqlx::query_as("select channel, enabled, config from notification_channels")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+    readiness_for(&configured)
+}
+
+/// One channel row as the readiness table reads it.
+type ConfiguredChannel = (String, bool, serde_json::Value);
+
+/// The readiness of every channel, given what the organization has configured.
+///
+/// Split out as a pure function over a plain slice so the interesting half — *which* missing
+/// piece produces *which* sentence — is unit-testable without a database. The read above only
+/// supplies the facts.
+///
+/// The slice is the input rather than a lookup closure because a closure over a borrow has to
+/// satisfy a higher-ranked lifetime bound that `&[_]` satisfies for free, and the signature
+/// that compiles is also the one that reads like the data it consumes.
+fn readiness_for(configured: &[ConfiguredChannel]) -> Vec<ChannelReadiness> {
+    use crate::vocabulary::CHANNELS;
+
+    let find = |channel: &str| {
+        configured
+            .iter()
+            .find(|(name, _, _)| name == channel)
+            .map(|(_, enabled, config)| (*enabled, config.clone()))
+    };
+
+    CHANNELS
+        .iter()
+        .map(|channel| {
+            let (ready, reason) = match *channel {
+                // The bell needs no configuration because the platform *is* the transport.
+                "in_app" => (
+                    true,
+                    "always available — the bell is the platform itself".to_owned(),
+                ),
+                "email" => match find("email") {
+                    None => (
+                        false,
+                        "no mail transport is configured for this organization".to_owned(),
+                    ),
+                    Some((false, _)) => (false, "the mail transport is switched off".to_owned()),
+                    Some((true, config)) => {
+                        // A transport with no from-address sends from nobody, and the bounce
+                        // goes to a null sender that most receivers drop. Naming the missing
+                        // key is the difference between a fixable report and "e-mail is broken".
+                        if config
+                            .get("from_address")
+                            .and_then(|v| v.as_str())
+                            .is_none_or(str::is_empty)
+                        {
+                            (false, "the mail transport has no from-address".to_owned())
+                        } else {
+                            (true, "the mail transport is configured".to_owned())
+                        }
+                    }
+                },
+                "web_push" => match find("web_push") {
+                    None => (false, "no push service key is configured".to_owned()),
+                    Some((false, _)) => (
+                        false,
+                        "push is switched off for this organization".to_owned(),
+                    ),
+                    Some((true, config)) => {
+                        if config
+                            .get("public_key")
+                            .and_then(|v| v.as_str())
+                            .is_none_or(str::is_empty)
+                        {
+                            (
+                                false,
+                                "the push service key is present but has no public key".to_owned(),
+                            )
+                        } else {
+                            (true, "the push service is configured".to_owned())
+                        }
+                    }
+                },
+                "webhook" => (
+                    true,
+                    "delivery rides the platform's existing event bus".to_owned(),
+                ),
+                "chat" => (
+                    false,
+                    "no chat connector is installed on this installation".to_owned(),
+                ),
+                // A channel the closed list grows into later, before this build knows what it
+                // needs. "Unknown" rather than "ready": a channel nobody has implemented must
+                // not be advertised as working.
+                other => (
+                    false,
+                    format!("the platform does not implement {other} yet"),
+                ),
+            };
+            ChannelReadiness {
+                channel: (*channel).to_owned(),
+                ready,
+                reason,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -592,5 +737,159 @@ mod tests {
     fn the_error_code_is_the_one_the_route_maps() {
         let error: NotificationError = validate_endpoint("nope", "k", "a").unwrap_err();
         assert_eq!(error.code(), "invalid_notification");
+    }
+
+    // -- channel readiness -------------------------------------------------------------------
+
+    /// One configured row, for the tests below.
+    fn configured(channel: &str, enabled: bool, config: serde_json::Value) -> ConfiguredChannel {
+        (channel.to_owned(), enabled, config)
+    }
+
+    /// No configuration at all: every channel that needs something says which thing.
+    ///
+    /// The assertion that matters is that no `reason` is empty and that the two channels with
+    /// the most likely "is it working?" question do not share a sentence — a readiness endpoint
+    /// whose reasons are all the same string tells the panel nothing it could not have guessed.
+    #[test]
+    fn an_unconfigured_installation_names_what_is_missing_per_channel() {
+        let readiness = readiness_for(&[]);
+        assert_eq!(readiness.len(), crate::vocabulary::CHANNELS.len());
+        assert!(
+            readiness.iter().all(|entry| !entry.reason.is_empty()),
+            "every channel answers with a reason, ready or not"
+        );
+
+        let email = readiness
+            .iter()
+            .find(|e| e.channel == "email")
+            .expect("email");
+        assert!(!email.ready);
+        assert!(email.reason.contains("mail transport"), "{}", email.reason);
+
+        let push = readiness
+            .iter()
+            .find(|e| e.channel == "web_push")
+            .expect("web_push");
+        assert!(!push.ready);
+        assert!(push.reason.contains("push service"), "{}", push.reason);
+        assert_ne!(
+            email.reason, push.reason,
+            "two channels with two repairs must not share one sentence"
+        );
+
+        // in_app needs nothing, and saying so is what stops an administrator from going
+        // looking for a setting that does not exist.
+        let in_app = readiness
+            .iter()
+            .find(|e| e.channel == "in_app")
+            .expect("in_app");
+        assert!(in_app.ready);
+    }
+
+    #[test]
+    fn a_transport_with_no_from_address_is_not_the_same_as_no_transport() {
+        // The whole reason `reason` exists: these are two different repairs, and collapsing
+        // them into "e-mail is not configured" is what makes a report unfixable.
+        let half = readiness_for(&[configured("email", true, serde_json::json!({}))]);
+        let half_email = half.iter().find(|e| e.channel == "email").expect("email");
+        assert!(
+            !half_email.ready,
+            "a null-sender transport is not a working one"
+        );
+        assert!(
+            half_email.reason.contains("from-address"),
+            "the missing half is named: {}",
+            half_email.reason
+        );
+
+        let whole = readiness_for(&[configured(
+            "email",
+            true,
+            serde_json::json!({"from_address": "hi@example.com"}),
+        )]);
+        let whole_email = whole.iter().find(|e| e.channel == "email").expect("email");
+        assert!(whole_email.ready);
+        assert!(
+            whole_email.reason.contains("configured"),
+            "{}",
+            whole_email.reason
+        );
+    }
+
+    #[test]
+    fn a_switched_off_channel_says_off_rather_than_missing() {
+        // "Not configured" for a channel the administrator deliberately disabled sends them
+        // looking for a setting that is already there.
+        let readiness = readiness_for(&[configured("email", false, serde_json::json!({}))]);
+        let email = readiness
+            .iter()
+            .find(|e| e.channel == "email")
+            .expect("email");
+        assert!(!email.ready);
+        assert!(email.reason.contains("switched off"), "{}", email.reason);
+    }
+
+    #[test]
+    fn an_empty_string_config_value_counts_as_missing() {
+        // `{"from_address": ""}` is what a form that cleared its field writes, and treating it
+        // as configured is how an installation ends up sending from nobody.
+        let readiness = readiness_for(&[configured(
+            "email",
+            true,
+            serde_json::json!({"from_address": ""}),
+        )]);
+        let email = readiness
+            .iter()
+            .find(|e| e.channel == "email")
+            .expect("email");
+        assert!(!email.ready, "an empty from-address is not an address");
+    }
+
+    #[test]
+    fn a_push_key_with_no_public_key_is_not_a_working_push_service() {
+        // The push half of the same rule: a key row with an empty `public_key` is what an
+        // installation that pasted the server key and forgot the client one looks like.
+        let half = readiness_for(&[configured("web_push", true, serde_json::json!({}))]);
+        let push = half
+            .iter()
+            .find(|e| e.channel == "web_push")
+            .expect("web_push");
+        assert!(!push.ready);
+        assert!(push.reason.contains("public key"), "{}", push.reason);
+
+        let whole = readiness_for(&[configured(
+            "web_push",
+            true,
+            serde_json::json!({"public_key": "BEl6…"}),
+        )]);
+        let ready = whole
+            .iter()
+            .find(|e| e.channel == "web_push")
+            .expect("web_push");
+        assert!(ready.ready);
+    }
+
+    #[test]
+    fn one_channels_configuration_does_not_make_another_channel_ready() {
+        // A `find` that matched on the wrong column would make configuring e-mail light up
+        // push as well — the kind of cross-wiring a matrix screen makes invisible, because both
+        // cells simply turn green.
+        let readiness = readiness_for(&[configured(
+            "email",
+            true,
+            serde_json::json!({"from_address": "hi@example.com"}),
+        )]);
+        let push = readiness
+            .iter()
+            .find(|e| e.channel == "web_push")
+            .expect("web_push");
+        assert!(!push.ready, "push is not ready because e-mail is");
+    }
+
+    #[test]
+    fn the_outbox_page_and_the_inbox_page_share_one_cap() {
+        // Asserted in the vocabulary so a future channel cannot quietly get a different one.
+        assert_eq!(MAX_OUTBOX_PAGE, crate::vocabulary::MAX_PAGE);
     }
 }

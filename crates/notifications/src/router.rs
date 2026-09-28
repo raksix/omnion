@@ -465,6 +465,67 @@ pub async fn route(pool: &PgPool, event: &RoutedEvent) -> Result<RouteReport> {
     Ok(report)
 }
 
+/// Every rule the router has, enabled or not, oldest first.
+///
+/// The admin screen's list. `enabled = false` rows are returned rather than hidden so a
+/// disabled rule is a row somebody can switch back on instead of a rule that has to be
+/// retyped — and so the list can say "12 rules, 1 disabled" honestly.
+pub async fn list_rules(pool: &PgPool) -> Result<Vec<RouteRule>> {
+    Ok(sqlx::query_as::<_, RouteRule>(
+        "select id, event_name, category, priority, recipient, title_template, url_template, \
+                enabled, created_by, created_at \
+         from notification_routes order by created_at, id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Write one rule and return the row as stored.
+///
+/// The `on conflict … do nothing` clause is what turns a duplicate `POST` into a `409` at the
+/// *route* rather than a `500` from the partial unique index — and returning the stored row
+/// rather than the input means the answer carries the id and the timestamp the database
+/// chose, not the ones the client hoped for.
+pub async fn create_rule(pool: &PgPool, rule: &RouteRule) -> Result<RouteRule> {
+    let row: Option<RouteRule> = sqlx::query_as(
+        "insert into notification_routes \
+         (event_name, category, priority, recipient, title_template, url_template, enabled, \
+          created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8) \
+         on conflict (event_name, category, recipient) do nothing \
+         returning id, event_name, category, priority, recipient, title_template, url_template, \
+                   enabled, created_by, created_at",
+    )
+    .bind(&rule.event_name)
+    .bind(&rule.category)
+    .bind(&rule.priority)
+    .bind(rule.recipient.encode())
+    .bind(&rule.title_template)
+    .bind(&rule.url_template)
+    .bind(rule.enabled)
+    .bind(rule.created_by)
+    .fetch_optional(pool)
+    .await?;
+
+    row.ok_or_else(|| {
+        crate::error::NotificationError::invalid(format!(
+            "a rule for {} → {} → {} already exists",
+            rule.event_name,
+            rule.category,
+            rule.recipient.encode()
+        ))
+    })
+}
+
+/// Remove one rule. `false` when there was nothing to remove.
+pub async fn delete_rule(pool: &PgPool, id: Uuid) -> Result<bool> {
+    let result = sqlx::query("delete from notification_routes where id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
