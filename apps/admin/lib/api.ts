@@ -8,11 +8,14 @@ import type {
   CreatedMediaShare,
   Media,
   MediaBulkResult,
+  MediaCrossSiteReport,
+  MediaDuplicateReport,
   MediaFile,
   MediaFilePage,
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
+  MediaMergeResult,
   MediaPreset,
   MediaShare,
   MediaStorageProbe,
@@ -563,6 +566,62 @@ export function revokeAllMediaShares(mediaId: string): Promise<{ revoked: number
     `/api/v1/media/${encodeURIComponent(mediaId)}/shares/revoke-all`,
     { method: "POST" },
   );
+}
+
+// --------------------------------------------------------------------------------------------
+// Duplicate detection and merge (docs/requests/REQ-010, slice 3)
+// --------------------------------------------------------------------------------------------
+
+/**
+ * The duplicate report of one site.
+ *
+ * `expand` asks for each group's members. It is off by default because a library with four
+ * hundred duplicate pairs would otherwise answer a report nobody scrolls with four thousand rows.
+ */
+export function fetchMediaDuplicates(
+  siteId: string,
+  options: { expand?: boolean } = {},
+): Promise<MediaDuplicateReport> {
+  const params = new URLSearchParams({ site_id: siteId });
+  if (options.expand) {
+    params.set("expand", "1");
+  }
+  return request<MediaDuplicateReport>(`/api/v1/media/duplicates?${params}`);
+}
+
+/**
+ * The installation-wide report, for a platform account.
+ *
+ * A *separate* function rather than an option on the above: the two reports have different
+ * shapes and different affordances, and a caller that got one when it asked for the other would
+ * find a `Merge group` button on a row that cannot be merged.
+ */
+export function fetchCrossSiteDuplicates(siteIds: string[]): Promise<MediaCrossSiteReport> {
+  const params = new URLSearchParams({ sites: siteIds.join(",") });
+  return request<MediaCrossSiteReport>(`/api/v1/media/duplicates?${params}`);
+}
+
+/**
+ * Merge a duplicate group down to one file.
+ *
+ * `keep` is required and comes from the operator's own choice. There is no default and no
+ * "suggested" value, because a merge that picked for itself breaks a live page and the operator
+ * finds out from a 404 rather than from this report.
+ */
+export function mergeMediaDuplicates(input: {
+  siteId: string;
+  /** The **full** checksum from the report. */
+  checksum: string;
+  keep: string;
+}): Promise<MediaMergeResult> {
+  return request<MediaMergeResult>("/api/v1/media/duplicates/merge", {
+    method: "POST",
+    body: JSON.stringify({
+      site_id: input.siteId,
+      checksum: input.checksum,
+      keep: input.keep,
+    }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
