@@ -65,6 +65,14 @@ const MANAGER_PERMISSIONS: [&str; 15] = [
     "sites.read",
 ];
 
+/// What the reader additionally is *not* given: the flagged fields. The suite proves the
+/// redaction with a reader and without it.
+const SENSITIVE_PERMISSIONS: [&str; 3] = [
+    "crm.contacts.read",
+    "crm.fields.sensitive.read",
+    "sites.read",
+];
+
 /// A writer in the **second** organization: the powers a manager holds, scoped to another tenant.
 ///
 /// It exists so the cross-tenant write can be proved honestly. The route guard answers `403` to a
