@@ -49,7 +49,13 @@ impl StorageDriver {
         }
     }
 
-    fn parse(raw: &str) -> Result<Self> {
+    /// Parse a driver name, with a message a settings form can show.
+    ///
+    /// Public because a per-site settings row stores a driver *name* (`0029`), and the
+    /// connection test has to turn that name into a driver before it can open anything. The
+    /// error names the accepted values rather than listing a type, because the caller of this
+    /// function is a form field and not a developer.
+    pub fn parse(raw: &str) -> Result<Self> {
         match raw {
             "s3" | "minio" => Ok(Self::S3),
             "fs" | "file" | "filesystem" | "local" => Ok(Self::Fs),

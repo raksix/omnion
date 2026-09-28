@@ -24,6 +24,30 @@ use crate::transform::{Derivative, ImageFormat, NewPreset, Preset, Recipe, valid
 const PRESET_COLUMNS: &str = "id, site_id, name, width, height, fit, format, quality, \
                               watermark_media_id, created_at, updated_at";
 
+/// The name every site is guaranteed to have, seeded by the migration.
+pub const STANDARD_PRESET: &str = "standard";
+
+/// Give a site the presets it can always rely on.
+///
+/// The migration seeds `standard` for every site that existed *when it ran*. A site created
+/// afterwards gets nothing, and a page that already asks for `?preset=standard` would silently
+/// fall back to full-size originals on that site — a regression that appears only on new sites,
+/// which is exactly where nobody is looking. The site-creation path calls this, and it is
+/// idempotent so a caller may call it again after any repair.
+pub async fn ensure_default_presets(pool: &PgPool, site_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "insert into media_transformation_presets \
+           (site_id, name, width, height, fit, format, quality) \
+         values ($1, $2, 1200, 630, 'cover', 'webp', 80) \
+         on conflict (site_id, name) do nothing",
+    )
+    .bind(site_id)
+    .bind(STANDARD_PRESET)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Every preset of a site, in the order the settings screen lists them.
 pub async fn list_presets(pool: &PgPool, site_id: Uuid) -> Result<Vec<Preset>> {
     let sql = format!(
@@ -67,6 +91,19 @@ pub async fn find_preset(pool: &PgPool, site_id: Uuid, id: Uuid) -> Result<Optio
         .bind(id)
         .fetch_optional(pool)
         .await?)
+}
+
+/// Load a preset by id or answer [`MediaError::PresetNotFound`].
+///
+/// The edit and delete routes need this: without it, an edit of a deleted id and an edit that
+/// simply changed nothing are the same `404`, and a client cannot tell "you are holding a stale
+/// id" from "the name you sent is wrong".
+pub async fn require_preset_by_id(pool: &PgPool, site_id: Uuid, id: Uuid) -> Result<Preset> {
+    find_preset(pool, site_id, id)
+        .await?
+        .ok_or_else(|| MediaError::PresetNotFound {
+            name: id.to_string(),
+        })
 }
 
 /// Load a preset by name or answer [`MediaError::PresetNotFound`].

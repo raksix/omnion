@@ -109,6 +109,64 @@ export type MediaFolderTree = {
   folders: MediaFolder[];
 };
 
+/** One transformation preset (`GET /api/v1/media/transformation-presets`). */
+export type MediaPreset = {
+  id: string;
+  name: string;
+  width: number | null;
+  height: number | null;
+  /** `cover` | `contain` | `fill`. */
+  fit: string;
+  /** `webp` | `jpeg` | `png`. */
+  format: string;
+  quality: number;
+  /** What the settings screen reads: `1200 x 630 · cover · WebP q80`. */
+  summary: string;
+  /** The query a page appends, e.g. `?preset=card`. */
+  example_query: string;
+};
+
+/**
+ * A site's storage settings (`GET /api/v1/media/settings`).
+ *
+ * There is no credential field here and there is never going to be one: the API stores a
+ * *reference* to the key the deployment already holds, so a settings screen that could render a
+ * secret is a screen a future change has to be trusted not to make.
+ */
+export type MediaStorageSettings = {
+  driver: string;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  path_prefix: string;
+  public_base_url: string;
+  /** Where a public file will actually be served from, in words. */
+  public_base_summary: string;
+  signed_url_ttl_seconds: number;
+  default_visibility: string;
+  max_upload_mb: number;
+  allowed_content_types: string[];
+  /** Whether the row has ever been written since it was created. */
+  configured: boolean;
+  /** The privacy consequence of `default_visibility`, spelled out. */
+  visibility_note: string;
+};
+
+/** What a save or a connection test sends. Every field is optional and folded onto the row. */
+export type MediaStorageSettingsInput = Partial<
+  Omit<MediaStorageSettings, "public_base_summary" | "configured" | "visibility_note">
+>;
+
+/** The answer to a connection test (`POST /api/v1/media/settings/test-connection`). */
+export type MediaStorageProbe = {
+  ok: boolean;
+  detail: string;
+  driver: string;
+  target: string;
+  public_base_url: string;
+  elapsed_ms: number;
+};
+
 /** One file as the browser reads it (`GET /api/v1/media/files`). */
 export type MediaFile = Media & {
   folder_id: string | null;

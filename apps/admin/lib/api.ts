@@ -12,6 +12,10 @@ import type {
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
+  MediaPreset,
+  MediaStorageProbe,
+  MediaStorageSettings,
+  MediaStorageSettingsInput,
   MediaReplaceResult,
   MediaTrash,
   MediaVersionList,
@@ -326,9 +330,16 @@ export function deleteMedia(mediaId: string): Promise<null> {
   return request<null>(`/api/v1/media/${encodeURIComponent(mediaId)}`, { method: "DELETE" });
 }
 
-/** Browser URL of one file's bytes, read with the session cookie. */
-export function mediaRawUrl(mediaId: string): string {
-  return `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
+/**
+ * Browser URL of one file's bytes, read with the session cookie.
+ *
+ * `preset` names a transformation (REQ-010 slice 3). Without it the URL serves the original
+ * bytes exactly as before, so every existing caller keeps working; with it the answer is a
+ * generated derivative, addressed by a hash of its inputs.
+ */
+export function mediaRawUrl(mediaId: string, preset?: string): string {
+  const base = `/api/v1/media/${encodeURIComponent(mediaId)}/raw`;
+  return preset ? `${base}?preset=${encodeURIComponent(preset)}` : base;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4077,4 +4088,99 @@ export async function downloadSecretAuditExport(filter: SecretAuditFilter = {}):
     );
   }
   return response.text();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transformation presets (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** Every transformation preset of a site. */
+export function fetchMediaPresets(siteId: string): Promise<{ presets: MediaPreset[] }> {
+  return request<{ presets: MediaPreset[] }>(
+    `/api/v1/media/transformation-presets?${mediaQuery(siteId)}`,
+  );
+}
+
+/** What a create or edit carries. Every field is optional except the name and a dimension. */
+export type MediaPresetInput = {
+  name: string;
+  width?: number | null;
+  height?: number | null;
+  fit?: string;
+  format?: string;
+  quality?: number;
+};
+
+/** Create one preset. */
+export function createMediaPreset(
+  siteId: string,
+  input: MediaPresetInput,
+): Promise<MediaPreset> {
+  return request<MediaPreset>(
+    `/api/v1/media/transformation-presets?${mediaQuery(siteId)}`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+/** Edit one preset. An edit leaves the old derivatives in place, addressed by their old key. */
+export function updateMediaPreset(
+  siteId: string,
+  id: string,
+  input: MediaPresetInput,
+): Promise<MediaPreset> {
+  return request<MediaPreset>(
+    `/api/v1/media/transformation-presets/${encodeURIComponent(id)}?${mediaQuery(siteId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** Remove a preset, and with it every derivative built from it. */
+export function deleteMediaPreset(siteId: string, id: string): Promise<null> {
+  return request<null>(
+    `/api/v1/media/transformation-presets/${encodeURIComponent(id)}?${mediaQuery(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage settings (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** A site's storage settings. */
+export function fetchMediaStorageSettings(siteId: string): Promise<MediaStorageSettings> {
+  return request<MediaStorageSettings>(`/api/v1/media/settings?${mediaQuery(siteId)}`);
+}
+
+/**
+ * Save a site's storage settings.
+ *
+ * A `PUT` whose body is folded onto the row field by field: a form that sends six of ten fields
+ * does not reset the other four to a platform default, which is how a settings screen "saves"
+ * and loses the bucket.
+ */
+export function saveMediaStorageSettings(
+  siteId: string,
+  input: MediaStorageSettingsInput,
+): Promise<MediaStorageSettings> {
+  return request<MediaStorageSettings>(`/api/v1/media/settings?${mediaQuery(siteId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Prove that a configuration reaches a bucket — by writing, not by reading.
+ *
+ * The candidate is the body as sent, so the answer describes the form on screen rather than the
+ * row that happens to be saved. A refused value answers with the same field a save would have
+ * refused, so a person is never sent to fix a field on one path that the other accepted.
+ */
+export function testMediaStorageConnection(
+  siteId: string,
+  input: MediaStorageSettingsInput,
+): Promise<MediaStorageProbe> {
+  return request<MediaStorageProbe>(`/api/v1/media/settings/test-connection?${mediaQuery(siteId)}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
