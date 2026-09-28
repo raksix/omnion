@@ -3681,6 +3681,11 @@ async function main() {
   // board, and the inbox needs nothing but itself.
   await runCrmLeadsDepth(page, report);
 
+  // The empty / loading / error state sweep (REQ-051's last acceptance box). It runs last of the
+  // CRM passes and **restores the network before it returns**: it answers the CRM list reads by
+  // hand, and a stub left installed would make the sign-out step below look like a broken panel.
+  await runCrmStateSweep(page, report);
+
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
   if ((await signOut.count()) > 0) {
@@ -5200,6 +5205,143 @@ async function runCrmLeadsDepth(page, report) {
 
   report.crmLeads = steps;
   log(`crm leads depth: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The empty, loading and error state of every CRM screen (REQ-051, the last acceptance box).
+ *
+ * ## Why this pass exists
+ *
+ * The three states were asserted by reading the code, and code that renders an empty state still
+ * renders nothing when the *read* fails: the six screens each hand-rolled their own error block,
+ * two of them had lost the retry, and none of them could show a request id because the API's
+ * refusal did not carry one. A screen's error state is the state a person only ever sees once —
+ * usually at the worst moment — so it is the one that cannot be left to "the code obviously does".
+ *
+ * ## How the failure is produced
+ *
+ * The read is failed **at the network layer**, with a real 503 and a real refusal body carrying a
+ * request id, rather than by pointing the screen at a bad URL or by stubbing `fetch`. A stubbed
+ * `fetch` proves the component's own branch; a real HTTP answer proves the whole chain — the
+ * request, the panel's error mapper, the header fallback and the rendered id — which is the chain
+ * that was broken.
+ *
+ * Each screen is checked for the three things the box asks of it: a sentence a person can read, a
+ * button that asks again, and — when the API named one — the request id. The retry is then
+ * **pressed**, because a retry that is wired to nothing is exactly the "dead button" the platform
+ * forbids, and the only way to know is to press it and watch the screen recover.
+ */
+async function runCrmStateSweep(page, report) {
+  const steps = {};
+
+  // The API is answered by hand for the list reads only. Everything else — the shell, the nav,
+  // the session, the shell's own data — is the live stack, so what fails is exactly the read
+  // under test and nothing else.
+  const REQUEST_ID = "qa9f2c1d4e7b84a3c5d6e8f0a1b2c3d4e";
+  let failNext = true;
+  const stub = async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const isCrmListRead =
+      request.method() === "GET" &&
+      (/\/api\/v1\/crm\/(contacts|companies|deals|activities|leads)$/.test(path) ||
+        path === "/api/v1/crm/deals");
+    if (!isCrmListRead || !failNext) {
+      return route.continue();
+    }
+    failNext = false;
+    return route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      headers: { "x-request-id": REQUEST_ID },
+      body: JSON.stringify({
+        error: {
+          code: "dependency_unavailable",
+          message: "The CRM store is not answering right now.",
+          request_id: REQUEST_ID,
+        },
+      }),
+    });
+  };
+  await page.route("**/api/v1/crm/**", stub);
+
+  // ---- one screen per list, each with the same refusal ----------------------------------------
+  const screens = [
+    { path: "/crm/contacts", qa: "crm-contacts-error", label: "contacts" },
+    { path: "/crm/companies", qa: "crm-companies-error", label: "companies" },
+    { path: "/crm/deals", qa: "crm-deals-error", label: "deals" },
+    { path: "/crm/activities", qa: "crm-activities-error", label: "activities" },
+    { path: "/crm/leads", qa: "crm-leads-error", label: "leads" },
+  ];
+
+  for (const screen of screens) {
+    failNext = true;
+    await page.goto(`${URL_ADMIN}${screen.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    // The strip and the block are two shapes of the same state: a screen that keeps its own body
+    // shows a strip, a screen that replaced its list shows a block. Both count.
+    const state = page
+      .locator(`[data-qa='${screen.qa}'], [data-qa='${screen.qa.replace(/-error$/, "-body-error")}']`)
+      .first();
+    await state.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+    const text = (await state.innerText().catch(() => "")).trim();
+    steps[`${screen.label}_hasAState`] = (await state.count()) > 0;
+    steps[`${screen.label}_readsAsASentence`] = text.length > 10;
+    // The id is the whole point of the box: a refusal the reader cannot quote is a refusal the
+    // reader cannot report. The server's refusal carries it in the body, so the panel prints it.
+    steps[`${screen.label}_showsTheRequestId`] = text.includes(REQUEST_ID);
+    steps[`${screen.label}_hasARetry`] =
+      (await page.locator(`[data-qa='${screen.qa}-retry'], [data-qa='${screen.qa.replace(/-error$/, "-body-error")}-retry']`).count()) > 0;
+    if (screen.label === "contacts") {
+      await shot(page, "page-crm-contacts-error");
+    }
+  }
+
+  // ---- the retry actually retries ------------------------------------------------------------
+  // Pressed on the last screen, where the stub has already fired once and the next read is the
+  // live stack. A retry wired to nothing leaves the strip up, and that is the assertion.
+  failNext = false;
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  failNext = true;
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  const before = page.locator("[data-qa='crm-contacts-error']").first();
+  await before.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  steps.theScreenWasBrokenBeforeTheRetry = (await before.count()) > 0;
+  await page.locator("[data-qa='crm-contacts-error-retry']").first().click({ timeout: 8000 }).catch(() => {});
+  await page
+    .waitForFunction(
+      () => document.querySelectorAll("[data-qa='crm-contacts-error']").length === 0,
+      undefined,
+      { timeout: 20000 },
+    )
+    .catch(() => {});
+  steps.theRetryRecoversTheScreen =
+    (await page.locator("[data-qa='crm-contacts-error']").count()) === 0 &&
+    (await page.locator("[data-qa='crm-row'], [data-qa='crm-contacts-empty']").count()) > 0;
+  await shot(page, "page-crm-contacts-after-retry");
+
+  // ---- and a refusal with no id invents none --------------------------------------------------
+  // A network failure never reached the server, so there is nothing to correlate: a screen that
+  // printed a made-up id would look more useful than it is and point an operator at the wrong log
+  // line. The id is shown when there is one and absent when there is not.
+  await page.unroute("**/api/v1/crm/**");
+  await page.route("**/api/v1/crm/contacts*", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: { code: "dependency_unavailable", message: "The CRM store is not answering." },
+      }),
+    }),
+  );
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const anonymous = page.locator("[data-qa='crm-contacts-error']").first();
+  await anonymous.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  const anonymousText = (await anonymous.innerText().catch(() => ""));
+  steps.noIdIsInventedWhenTheServerNamedNone = !/request\s+[0-9a-f]{8}/i.test(anonymousText);
+  await page.unroute("**/api/v1/crm/contacts*");
+
+  report.crmStates = steps;
+  log(`crm state sweep: ${JSON.stringify(steps)}`);
 }
 
 /**

@@ -25,6 +25,7 @@ import { Check, Download, Pencil, Plus, Upload, X } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
+import { ErrorState, toScreenError, type ScreenErrorValue } from "@/components/error-state";
 import { LoadingTable } from "@/components/loading-table";
 import { ApiError } from "@/lib/api";
 import {
@@ -100,7 +101,7 @@ export function ContactsView() {
   const [total, setTotal] = useState(0);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
@@ -245,7 +246,7 @@ export function ContactsView() {
         if (cancelled) {
           return;
         }
-        setError(cause instanceof ApiError ? cause.message : "The contacts could not be loaded.");
+        setError(toScreenError(cause, "The contacts could not be loaded."));
       });
     return () => {
       cancelled = true;
@@ -1009,16 +1010,22 @@ export function ContactsView() {
       ) : null}
 
       {error ? (
-        <div className="flex flex-col items-center gap-3 px-6 py-10 text-center">
-          <p className="text-[12.5px] text-accent-strong">{error}</p>
-          <button
-            type="button"
-            onClick={reload}
-            className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
-          >
-            Try again
-          </button>
-        </div>
+        <ErrorState
+          error={error}
+          onRetry={reload}
+          qa="crm-contacts-error"
+          action={
+            <button
+              type="button"
+              data-qa-guard="crm-depth"
+              onClick={openCreate}
+              className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong"
+            >
+              <Plus className="size-3.5" aria-hidden />
+              Create contact
+            </button>
+          }
+        />
       ) : rows === null ? (
         <LoadingTable columns={6} rows={8} />
       ) : rows.length === 0 ? (

@@ -24,6 +24,7 @@ import { AlertTriangle, ArrowLeftRight, LayoutGrid, List, Plus, Sparkles, X } fr
 import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
+import { ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
 import { ApiError } from "@/lib/api";
 import {
   CRM_CURRENCIES,
@@ -119,7 +120,7 @@ export function DealsView() {
   const [mode, setMode] = useState<"board" | "list">("board");
   const [pipelineId, setPipelineId] = useState<string>("");
   const [search, setSearch] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -213,7 +214,7 @@ export function DealsView() {
         setBoard(null);
       }
     } catch (problem) {
-      setError(problem instanceof ApiError ? problem.message : "The board could not be loaded.");
+      setError(toScreenError(problem, "The board could not be loaded."));
     }
   }, [mode, pipelineId, search, organizationId]);
 
@@ -267,7 +268,7 @@ export function DealsView() {
         setReloadToken((token) => token + 1);
       } catch (problem) {
         setBoard(before);
-        setError(problem instanceof ApiError ? problem.message : "The move was refused.");
+        setError(toScreenError(problem, "The move was refused."));
       }
       return true;
     },
@@ -291,7 +292,7 @@ export function DealsView() {
       setReloadToken((token) => token + 1);
     } catch (problem) {
       setBoard(before);
-      setError(problem instanceof ApiError ? problem.message : "The move was refused.");
+      setError(toScreenError(problem, "The move was refused."));
     }
   }, [outcome, board]);
 
@@ -477,12 +478,11 @@ export function DealsView() {
       }
     >
       {error ? (
-        <p role="alert" className="border-b border-line bg-danger-soft px-4 py-2.5 text-[12px] text-danger">
-          {error}
-          <button type="button" onClick={() => setReloadToken((token) => token + 1)} className="ml-2 underline">
-            Retry
-          </button>
-        </p>
+        <ErrorStrip
+          error={error}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-deals-error"
+        />
       ) : null}
       {notice ? (
         <p className="border-b border-line bg-canvas px-4 py-2.5 text-[12px] text-muted">{notice}</p>
@@ -1126,7 +1126,7 @@ export function PipelinesSettingsView() {
   const [pipelines, setPipelines] = useState<CrmPipeline[] | null>(null);
   const [selected, setSelected] = useState<string>("");
   const [rows, setRows] = useState<CrmPipeline["stages"]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
@@ -1142,7 +1142,7 @@ export function PipelinesSettingsView() {
         setSelected((current) => current || first);
       })
       .catch((problem) =>
-        setError(problem instanceof ApiError ? problem.message : "The pipelines could not be loaded."),
+        setError(toScreenError(problem, "The pipelines could not be loaded.")),
       );
   }, [reloadToken, organizationId]);
 
@@ -1178,7 +1178,7 @@ export function PipelinesSettingsView() {
       setNotice("The stages were saved.");
       setReloadToken((token) => token + 1);
     } catch (problem) {
-      setError(problem instanceof ApiError ? problem.message : "The stages could not be saved.");
+      setError(toScreenError(problem, "The stages could not be saved."));
     } finally {
       setSaving(false);
     }
@@ -1224,9 +1224,11 @@ export function PipelinesSettingsView() {
       }
     >
       {error ? (
-        <p role="alert" className="border-b border-line bg-danger-soft px-4 py-2.5 text-[12px] text-danger">
-          {error}
-        </p>
+        <ErrorStrip
+          error={error}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-stages-error"
+        />
       ) : null}
       {notice ? (
         <p className="border-b border-line bg-canvas px-4 py-2.5 text-[12px] text-muted">{notice}</p>

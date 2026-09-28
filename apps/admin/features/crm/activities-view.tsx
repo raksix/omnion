@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { ErrorState, ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
 import { ApiError } from "@/lib/api";
 import {
   CRM_ACTIVITY_KINDS,
@@ -106,7 +107,7 @@ const EMPTY_FORM: FormState = {
 /** `/crm/activities`: the feed, the filters and the form that fills it. */
 export function ActivitiesView() {
   const [rows, setRows] = useState<CrmActivity[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [kind, setKind] = useState("");
@@ -135,7 +136,7 @@ export function ActivitiesView() {
       });
       setRows(page.items ?? []);
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "The activity feed could not be read.");
+      setError(toScreenError(failure, "The activity feed could not be read."));
       setRows([]);
     }
   }, [search, kind, done, reloadToken, organizationId]);
@@ -235,9 +236,11 @@ export function ActivitiesView() {
       </nav>
 
       {error ? (
-        <p role="alert" className="border-b border-line bg-danger-soft px-4 py-2.5 text-[12px] text-danger">
-          {error}
-        </p>
+        <ErrorStrip
+          error={error}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-activities-error"
+        />
       ) : null}
       {notice ? (
         <p role="status" className="border-b border-line bg-success-soft px-4 py-2.5 text-[12px] text-success">
@@ -307,7 +310,23 @@ export function ActivitiesView() {
             )}
           </div>
 
-          {rows === null ? (
+          {error ? (
+            <ErrorState
+              error={error}
+              onRetry={() => setReloadToken((token) => token + 1)}
+              qa="crm-activities-body-error"
+              action={
+                <button
+                  type="button"
+                  onClick={() => subjectRef.current?.focus()}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white"
+                >
+                  <Plus aria-hidden className="h-3.5 w-3.5" />
+                  Log an activity
+                </button>
+              }
+            />
+          ) : rows === null ? (
             <ActivitySkeleton />
           ) : rows.length === 0 ? (
             <EmptyState
@@ -533,7 +552,7 @@ export function RecordTimeline(props: {
 }) {
   const { record, id, limit = 25 } = props;
   const [entries, setEntries] = useState<CrmTimelineEntry[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
@@ -558,7 +577,7 @@ export function RecordTimeline(props: {
       })
       .catch((failure: unknown) => {
         if (!cancelled) {
-          setError(failure instanceof Error ? failure.message : "The timeline could not be read.");
+          setError(toScreenError(failure, "The timeline could not be read."));
           setEntries([]);
         }
       });
@@ -571,19 +590,11 @@ export function RecordTimeline(props: {
 
   if (error) {
     return (
-      <div className="space-y-2">
-        <p role="alert" className="text-[12px] text-danger">
-          {error}
-        </p>
-        <button
-          type="button"
-          data-qa="timeline-retry"
-          onClick={() => setReloadToken((token) => token + 1)}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-canvas"
-        >
-          Try again
-        </button>
-      </div>
+      <ErrorState
+        error={error}
+        onRetry={() => setReloadToken((token) => token + 1)}
+        qa="timeline-error"
+      />
     );
   }
 

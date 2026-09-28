@@ -39,6 +39,15 @@ export class ApiError extends Error {
   /** Stable machine-readable code from the API error body. */
   readonly code: string;
   /**
+   * The id of the request that failed, when the API named one.
+   *
+   * It travels in the refusal body *and* in the `x-request-id` header, and the panel prefers the
+   * body because a body is what survives being pasted into a ticket. An error state that shows a
+   * sentence and no id leaves the reader nothing to quote (REQ-051's acceptance box asks for
+   * exactly that id), so every error strip in the panel prints it when it is there.
+   */
+  readonly requestId: string | null;
+  /**
    * Structured detail the API attached to the refusal.
    *
    * A security-policy refusal names the `field` it refused, a step-up refusal names the
@@ -51,12 +60,14 @@ export class ApiError extends Error {
     code: string,
     message: string,
     details: Record<string, unknown> | null = null,
+    requestId: string | null = null,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.requestId = requestId;
   }
 
   /** `true` when the session is missing or expired. */
@@ -77,6 +88,8 @@ export type ErrorBody = {
     code?: string;
     message?: string;
     details?: Record<string, unknown>;
+    /** The request this refusal answers, when the API stamped one (see `ApiError.requestId`). */
+    request_id?: string;
   };
 };
 
@@ -119,6 +132,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       body.error?.code ?? "unknown_error",
       body.error?.message ?? `The API answered with status ${response.status}.`,
       body.error?.details ?? null,
+      // The header is the fallback: a proxy that rewrites the body, or a refusal served from a
+      // cache, can lose `error.request_id` while the header still names the request.
+      body.error?.request_id ?? response.headers.get("x-request-id"),
     );
   }
 

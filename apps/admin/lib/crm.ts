@@ -21,14 +21,21 @@ async function readFailure(response: Response): Promise<ApiError> {
   const text = await response.text();
   let code = "unknown_error";
   let message = `The API answered with status ${response.status}.`;
+  let details: Record<string, unknown> | null = null;
+  let requestId: string | null = response.headers.get("x-request-id");
   try {
     const body = JSON.parse(text) as ApiErrorBody;
     code = body.error?.code ?? code;
     message = body.error?.message ?? message;
+    // `details` is read here too, not only in the platform client: the form attaches
+    // `error.details.field` to its input, so a module client that drops the object turns every
+    // field-level refusal into a generic banner with nothing under the field.
+    details = body.error?.details ?? null;
+    requestId = body.error?.request_id ?? requestId;
   } catch {
     // A non-JSON body is still an error; the status stays in the message.
   }
-  return new ApiError(response.status, code, message);
+  return new ApiError(response.status, code, message, details, requestId);
 }
 
 /** One JSON call, with the same session, accept header and error shape the panel uses. */

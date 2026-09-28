@@ -40,6 +40,7 @@ import {
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { ErrorState, ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
 
 import { useCrmTenant } from "./crm-tenant";
 import { ApiError } from "@/lib/api";
@@ -100,7 +101,7 @@ export function LeadsView() {
   const params = useSearchParams();
 
   const [inbox, setInbox] = useState<CrmLeadInbox | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
   const [draining, setDraining] = useState(false);
@@ -124,7 +125,7 @@ export function LeadsView() {
     })
       .then(setInbox)
       .catch((problem) =>
-        setError(problem instanceof ApiError ? problem.message : "The lead inbox could not be loaded."),
+        setError(toScreenError(problem, "The lead inbox could not be loaded.")),
       );
   }, [outcome, params.get("search"), reloadToken, organizationId]);
 
@@ -185,7 +186,7 @@ export function LeadsView() {
       );
       setReloadToken((token) => token + 1);
     } catch (problem) {
-      setError(problem instanceof ApiError ? problem.message : "The drain could not be run.");
+      setError(toScreenError(problem, "The drain could not be run."));
     } finally {
       setDraining(false);
     }
@@ -250,13 +251,11 @@ export function LeadsView() {
       </header>
 
       {error ? (
-        <p
-          role="alert"
-          className="flex items-center gap-2 border-b border-line bg-danger-soft px-4 py-2.5 text-[12px] text-danger"
-        >
-          <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
-          {error}
-        </p>
+        <ErrorStrip
+          error={error}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-leads-error"
+        />
       ) : null}
       {notice ? (
         <p className="border-b border-line bg-canvas px-4 py-2.5 text-[12px] text-muted">
@@ -299,7 +298,13 @@ export function LeadsView() {
         ) : null}
       </nav>
 
-      {inbox === null ? (
+      {error ? (
+        <ErrorState
+          error={error}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-leads-body-error"
+        />
+      ) : inbox === null ? (
         <div className="flex flex-1 items-center justify-center gap-2 text-[12.5px] text-muted">
           <Loader2 className="size-4 animate-spin" aria-hidden /> Loading the inbox…
         </div>
@@ -435,7 +440,7 @@ function LeadRouting({
 }) {
   const [view, setView] = useState<CrmLeadSettingsView | null>(null);
   const [draft, setDraft] = useState<SettingsDraft>(EMPTY_DRAFT);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ScreenErrorValue>(null);
   const [fieldError, setFieldError] = useState<{ field: string; message: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
@@ -456,11 +461,7 @@ function LeadRouting({
           source_label: loaded.settings.source_label,
         });
       })
-      .catch((problem) =>
-        setError(
-          problem instanceof ApiError ? problem.message : "The routing could not be loaded.",
-        ),
-      );
+      .catch((problem) => setError(toScreenError(problem, "The routing could not be loaded.")));
   }, [reloadToken, organizationId]);
 
   const save = useCallback(async () => {
@@ -493,9 +494,7 @@ function LeadRouting({
           message: refused.message,
         });
       } else {
-        setError(
-          problem instanceof ApiError ? problem.message : "The routing could not be saved.",
-        );
+        setError(toScreenError(problem, "The routing could not be saved."));
       }
     } finally {
       setSaving(false);
@@ -508,9 +507,11 @@ function LeadRouting({
       className="border-b border-line bg-canvas px-4 py-3"
     >
       {error ? (
-        <p role="alert" className="mb-2 text-[12px] text-danger">
-          {error}
-        </p>
+        <ErrorStrip
+          error={error}
+          onRetry={() => setReloadToken((token) => token + 1)}
+          qa="crm-lead-routing-error"
+        />
       ) : null}
 
       {view === null ? (
