@@ -1,6 +1,6 @@
 # REQ-117 — Forms → CRM Lead Pipeline
 
-> **Status:** in-progress (slice 1) · **Captured:** 2026-09-26 · **Layer:** modules/website + modules/crm
+> **Status:** in-progress (slice 1: store + HTTP) · **Captured:** 2026-09-26 · **Layer:** modules/website + modules/crm
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -154,7 +154,10 @@ Consumed: `content.form.submitted` (the single intake trigger — the marketing 
 - [ ] `Convert` creates or links the contact, creates a deal in the configured pipeline and stage with the mapped amount, and optionally opens a REQ-052 quotation draft linked back to the lead; the stepper shows each step's state.
 - [ ] A quotation accepted through REQ-052's public link marks the lead and its deal converted, and the customer path through REQ-008 runs when commerce is installed.
 - [ ] The autoresponder is sent once per accepted lead through the mail path and its delivery is recorded on the timeline; a rejected spam submission sends nothing.
-- [~] The keyed endpoint's **mechanism** is built: a 32-character key from a 32-symbol ambiguity-free alphabet, stored as a SHA-256 digest and shown once, verified by re-hashing and comparing digests, rotated by writing a fresh digest (so the old key dies on the same write). The hourly ceiling is counted from the source's own leads inside `capture`. The `202`/`401`/`429` HTTP answers and the honeypot-stores-nothing path land with the router in the next slice. → 7 unit tests, incl. 100 distinct keys and rotation.
+- [~] The keyed endpoint's **mechanism** is built: a 32-character key from a 32-symbol ambiguity-free alphabet, stored as a SHA-256 digest and shown once, verified by re-hashing and comparing digests, rotated by writing a fresh digest (so the old key dies on the same write). The hourly ceiling is counted from the source's own leads inside `capture`. → 7 unit tests, incl. 100 distinct keys and rotation.
+- [x] The public surface answers `202` / `401` / `429` as documented, and `401` is **one** answer for an unknown key, a wrong key and a paused source. A `x-idempotency-key` header makes a retry find the row the first attempt wrote. The body carries a reference and one of `accepted` / `duplicate` / `rejected` — never a match, a score or a key. → `apps/api/src/routes/crm_intake.rs`; the key is returned exactly once, by create and rotate, and never by a read.
+- [x] A `Test mapping` runs a payload through the mapping and answers the fields it *would* produce without writing anything. → `POST /api/v1/crm/intake/sources/{id}/test`.
+- [~] The inbox and the lead detail are readable, editable, respondable, rejectable and deletable behind `crm.leads.read` / `crm.leads.manage`; the duplicate queue reads. **A lead edit cannot rewrite its own evidence** — no `received_at`, no `payload`, no `spam_score` — and `Mark responded` is idempotent on the instant, so a double click cannot rewrite the measurement an SLA report rests on. → 166 lib tests; the screens are the next slice of work.
 - [ ] Every state change writes an audit entry with actor, before/after and request id, and the detail timeline renders exactly those entries.
 - [ ] Cross-organization ids answer `404` for every route, and `crm.leads.read` without `crm.leads.convert` refuses conversion with `403` and writes nothing.
 - [ ] All seven screens have empty, loading and error states with zero high findings, and the inbox plus lead detail work at 390 px with the sticky action bar usable.

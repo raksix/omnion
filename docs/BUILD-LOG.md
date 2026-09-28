@@ -2733,3 +2733,48 @@ hours, the digest job, the e-mail and webhook adapters and the delivery rows in 
   `content.form.submitted` listener, the public keyed endpoint with its `202`/`401`/`429`
   answers, and the permission family (`crm.leads.read`, `crm.leads.manage`, `crm.intake.manage`).
   Then the three screens and the walkthrough routes, which is where the slice closes.
+
+### Tick 2 — REQ-117 slice 1, the HTTP layer (`df81076`, `93d030b`)
+
+- **What.** The router (`apps/api/src/routes/crm_intake.rs`), the permission family and the two
+  store functions the router needed. The public endpoint `POST /api/v1/crm/intake/{source_key}`
+  is unauthenticated in the ordinary sense and authenticates by the source's own hashed key; the
+  inbox, the lead detail, the duplicate queue and the source editor are behind
+  `crm.leads.read` / `.manage` and `crm.intake.manage`.
+
+- **The answer contract of the public surface is three lines.** `401` for an unknown key, a wrong
+  key and a paused source — one answer, because a distinct answer for "paused" is a source
+  enumeration. `429` for the source's own hourly ceiling. `202` for everything else, *including* a
+  submission the store filed as spam; the body says `accepted` / `duplicate` / `rejected` and
+  never discloses a match, a score or a key. A client-supplied `x-idempotency-key` makes a retry
+  find the row the first attempt wrote, capped at 128 characters because it is stored on the lead.
+
+- **`Test mapping` writes nothing.** It runs the mapping, the transforms and the contactability
+  check over a pasted payload and answers the fields the payload *would* produce. A preview that
+  stored rows would be a second capture path with a worse authentication story than the keyed
+  endpoint itself.
+
+- **A lead edit cannot rewrite its own evidence.** `LeadPatch` has no `received_at`, no `payload`
+  and no `spam_score`: a verdict its own subject can edit is not a verdict. `record_response` is
+  idempotent on the *instant* (`coalesce(first_response_at, now())`), so a double click on
+  `Mark responded` cannot rewrite the measurement a whole SLA report rests on.
+
+- **Proof.** `cargo build -p omnion-api` clean · `cargo clippy -p omnion-api -p
+  omnion-module-crm-intake --all-targets` adds no warning · `cargo test -p omnion-api --lib` →
+  **166 passed** (6 new: the status filter, the owner filter, the date filter failing closed, `?owner=me`
+  resolving to the session rather than the query, the patch dropping unknown keys, the idempotency
+  key's trim and cap) · `-p omnion-module-crm-intake` **65 passed** · `-p omnion-permissions`
+  **62 passed**.
+
+- **The gate caught the role change, which is the point.** Adding `crm.leads.read` to the member
+  role failed `the_lower_roles_do_not_hold_management_permissions`, which asserts that role's key
+  list *by value*. The list now carries the lead read plus two explicit negatives
+  (`crm.leads.manage`, `crm.intake.manage`): a member sees a lead and cannot touch one.
+
+- **Not done in this slice, on purpose.** The `content.form.submitted` consumer (REQ-064 is wave
+  2b and its event does not exist on this branch yet — the keyed endpoint is the capture path
+  until it merges), `crm.leads.assign` / `convert` (slice 3), and all seven admin screens.
+
+- **Next.** The consumer once REQ-064's event exists on the branch, then the four slice-1 screens
+  (`/crm/leads`, `/crm/leads/{id}`, `/crm/leads/duplicates`, `/crm/settings/intake`) and the
+  walkthrough routes, which is where acceptance 15 and 16 close.
