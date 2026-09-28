@@ -3252,3 +3252,28 @@ seen the minimap, the marquee or an undo.
 **Next.** Re-run the w3 pass first — the builder's interaction depth is unproven in a browser.
 Then: `⌘A` and `Shift+click`, palette keyboard-add, edge selection and `Del` on an edge, and the
 inspector's expression autocomplete.
+
+## 2026-09-28 · omnion-wave3 · REQ-004 slice 2 (interaction depth, part 3)
+
+**What.** Palette drag-and-drop, and — the real find — the connection gesture itself.
+`connect` had been defined in `builder-view.tsx` since slice 1 and called by nothing: the
+port button selected the node and stopped. The builder could select and delete an edge but
+had no way to draw one, which is the most-used action in a node editor. It now starts a
+draft on press-port, completes on press-node, and refuses with a *named* reason (unknown
+port lists the legal ones; self-connection and occupied port say so in the author's terms)
+shown on the canvas. Connections are now routed through `commit`, so they are undoable —
+they were the one edit the acceptance criteria name ("add, move, connect, delete") that the
+history could not restore. Escape cancels a half-drawn link instead of clearing the node
+selection out from under an in-flight gesture. Drag is HTML5 rather than pointer events
+because a palette item is a `button`, and a button answering a pointer-drag has to suppress
+the click that a plain click fires.
+
+**Proof.** `pnpm --filter @omnion/admin test` 12/12 · `pnpm typecheck` clean · QA pass
+running (`QA_STACK=w3`, ports 18082/3102/3202, database omnion_qa_w3) — see the outcome in
+the next entry. `palette-drag` measures the drop *point*, not just the node count, so a
+handler that ignores the viewport cannot pass it; `port-connect` and `port-connect-escape`
+drive the connect gesture and read the notice's tone and text.
+
+**Next.** Read the pass: `palette-drag`, `port-connect`, `port-connect-escape`, `undo`,
+`shift-click-multi`, `⌘A`, edge delete + undo. Then the 409 two-tab criterion and Table
+mode.
