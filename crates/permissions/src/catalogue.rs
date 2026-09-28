@@ -324,6 +324,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         description: "Read the secrets audit trail and acknowledge anomaly flags",
     },
     PermissionDef {
+        key: "observability.read",
+        category: "observability",
+        description: "Read logs, traces, metric catalogue, exporters and alert state",
+    },
+    PermissionDef {
+        key: "observability.manage",
+        category: "observability",
+        description: "Change observability settings, alert rules and silences",
+    },
+    PermissionDef {
+        key: "observability.exporters.manage",
+        category: "observability",
+        description: "Add, edit and test telemetry exporters",
+    },
+    PermissionDef {
         key: "iam.sessions.read",
         category: "iam",
         description: "Read active sessions",
@@ -545,6 +560,24 @@ mod tests {
             "analytics",
         ] {
             assert!(categories.contains(expected), "missing category {expected}");
+        }
+    }
+
+    #[test]
+    fn the_observability_family_is_catalogued() {
+        // REQ-126: the admin centre is guarded by `observability.*`, and the split matters —
+        // reading telemetry is not the power to reconfigure telemetry export.
+        for key in [
+            "observability.read",
+            "observability.manage",
+            "observability.exporters.manage",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("observability"),
+                "{key} belongs to the observability category"
+            );
         }
     }
 
