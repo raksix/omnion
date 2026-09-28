@@ -4306,7 +4306,19 @@ async fn a_rule_on_a_deal_stage_change_runs_exactly_once() {
     let idle = matcher::drain(fixture.db.pool(), 100)
         .await
         .expect("the matcher must run");
-    assert!(idle.is_idle(), "a move to the same stage must not fire the rule: {idle:?}");
+    // **No rule fired**, not "the drain had nothing to do". `is_idle` is false whenever the
+    // cursor moved, and in a shared database other walks leave their own events on the bus — a
+    // report of `evaluated: 13, matched: 0, runs: []` is the rule staying quiet while the drain
+    // does its work, which is exactly the property under test. Asserting `is_idle` here measured
+    // how many other tests had run first.
+    assert_eq!(
+        idle.matched, 0,
+        "a move to the same stage must not match a rule: {idle:?}"
+    );
+    assert!(
+        idle.runs.is_empty(),
+        "a move to the same stage must start no run: {idle:?}"
+    );
     assert_eq!(
         runs_of_workflow(&fixture.db, Uuid::parse_str(&rule_id).expect("a uuid")).await,
         0,
