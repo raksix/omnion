@@ -74,6 +74,7 @@ pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod automation_approvals;
+pub mod automation_operations;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -608,6 +609,23 @@ pub fn router(state: AppState) -> Router {
     let execution_resume_from =
         post(automation::resume_from).layer(guards::require(&state, "workflows.run"));
 
+    // The operations surfaces of slice 4: the definition history an operator reads to
+    // answer "what did this rule look like on Tuesday", the restore that puts it back, the
+    // templates gallery and the audit tab. Reading a history is `workflows.read` — the
+    // same power that reads the rule; **restoring is a definition write**, so it is
+    // `workflows.manage` and it is audited exactly like a `PUT`. A restore that carried
+    // only run power would let anybody who may fire a rule rewrite it.
+    let automation_versions =
+        get(automation_operations::list_versions).layer(guards::require(&state, "workflows.read"));
+    let automation_version_restore = post(automation_operations::restore_version)
+        .layer(guards::require(&state, "workflows.manage"));
+    let automation_version =
+        get(automation_operations::get_version).layer(guards::require(&state, "workflows.read"));
+    let automation_audit =
+        get(automation_operations::list_audit).layer(guards::require(&state, "workflows.read"));
+    let automation_templates =
+        get(automation_operations::list_templates).layer(guards::require(&state, "workflows.read"));
+
     // Pending approvals (docs/requests/REQ-003 slice 3). Reading the gates and letting a
     // parked run go on are one power, and deliberately NOT `workflows.run`: the person who
     // writes a rule must not be the person who waves through everything that rule parks.
@@ -915,6 +933,17 @@ pub fn router(state: AppState) -> Router {
         .route("/events", events)
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
+        .route("/automations/templates", automation_templates)
+        .route("/automations/{id}/versions", automation_versions)
+        .route(
+            "/automations/{id}/versions/{version_id}",
+            automation_version,
+        )
+        .route(
+            "/automations/{id}/versions/{version_id}/restore",
+            automation_version_restore,
+        )
+        .route("/automations/{id}/audit", automation_audit)
         .route("/automations/{id}", automation_entry)
         .route("/automations/{id}/test", automation_test)
         .route("/automations/{id}/listen", automation_listen)
