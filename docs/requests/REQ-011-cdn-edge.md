@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (`ca65085`) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -97,21 +97,21 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
 
 ### Acceptance criteria
 
-- [ ] `crates/cdn` exists with a provider adapter trait and the three shipped adapters, unit-tested.
-- [ ] Migration `0011_cdn_edge.sql` applies on a fresh database and on one with existing rows.
+- [x] `crates/cdn` exists with a provider adapter trait and the three shipped adapters, unit-tested. (`ad1eae0`, `cba486c`)
+- [x] Migration applies on a fresh database and on one with existing rows. (shipped as `0048_cdn_edge.sql` — `0011` was taken; also fixed the `unique (coalesce(...))` in `0047_media_grants.sql`, which is what actually stopped every migration after it from applying. `d11c9e9`, `262bb98`)
 - [ ] `/cdn` shows real provider state, queue depth and the last 20 purges from the API.
-- [ ] Create, edit, disable, delete and reorder cache rules from `/cdn/rules`; priority persists.
-- [ ] The rule form rejects an empty name, a malformed pattern and a TTL above the cap with a field message.
+- [ ] Create, edit, disable, delete and reorder cache rules from `/cdn/rules`; priority persists. (API half proved — `0e2993c`, 15/15. The `/cdn/rules` screens are not built yet.)
+- [x] The rule form rejects an empty name, a malformed pattern and a TTL above the cap with a field message. (API half: each refusal names its own field. `0e2993c`)
 - [ ] Purge by URL list runs end to end and the history row reaches `succeeded` with per-item results.
 - [ ] Purge by tag and "everything" both work; "everything" requires the typed confirmation.
 - [ ] Publishing a page produces a purge row automatically within one worker tick, honouring trigger toggles.
 - [ ] A provider error marks the purge `failed`, records the provider message and leaves items retryable.
 - [ ] Retry from the history drawer requeues only failed items and updates the counts.
-- [ ] Public page and media responses carry `Cache-Control`, `ETag` and `Surrogate-Key` headers.
-- [ ] Media responses answer `If-None-Match` with `304` and a matching `ETag`.
+- [x] Public page and media responses carry `Cache-Control`, `ETag` and `Surrogate-Key` headers. (`ca65085`, 13/13)
+- [ ] Media responses answer `If-None-Match` with `304` and a matching `ETag`. (The handler does — `c02f67c`, and `304` is proved for the page route in `ca65085`. The media walk itself is not written yet; ticked only when it is.)
 - [ ] Purge console rejects more than 500 targets and an invalid URL with a clear message.
-- [ ] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP.
-- [ ] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`.
+- [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
+- [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
 - [ ] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
 

@@ -3080,3 +3080,76 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
+
+## Wave 5 · REQ-011 slice 1, the second half — a rule that changed nothing, found by running its own tests
+
+- **What.** The crate, the migration, the permission, the API and fifteen integration walks
+  were all in place and green by inspection. The rule engine was never called. The public
+  surface wrote a literal `public, max-age=3600` into every response, so a cache rule an
+  operator created changed nothing a visitor's browser did, and the `/cdn/rules` table was
+  a screen that described a policy nothing enforced. This tick is the seam: `routes/cdn_cache.rs`
+  loads a site's ordered rules, decides, and renders that decision — headers, `ETag`,
+  `Surrogate-Key`, `Vary`, and a `304` for a conditional read.
+
+- **A router that panicked while being built, taking every route with it.** `POST /cdn/rules`
+  merged `create_rule` *and* `reorder_rules`. Two handlers for one method on one path is not
+  an ambiguous route to axum — it is a panic during router construction, so the whole
+  application refused to start, not just the CDN surface. Reorder has its own path now, which
+  is what the request specifies anyway. It read as working because **no API suite had ever
+  been run against this router**: `apps/api/tests/cdn.rs` shipped with fifteen tests that had
+  never been executed.
+
+- **The fifteen walks failed for five different reasons and none of them was the product.**
+  The login helper read `body["token"]` — the session token is in a cookie and nowhere else,
+  so a successful sign-in read as a failed fixture. The error assertions read `body["code"]`
+  at the top level while the API nests under `error`, as every other suite already does. The
+  audit table is `audit_log`, not `audit_entries`. The platform settings row is
+  installation-wide and survives `cleanup`, so the second run's insert was refused and the
+  partial unique index looked broken. And the reorder walk compared against the order the
+  rules *started* in — which passes for a store that ignored the request entirely and fails
+  for one that obeyed it.
+
+- **The one that would have been fixed in the wrong place.** That last assertion said the
+  store was broken. A temporary diagnostic read the rows out of PostgreSQL and printed both
+  orders: the store had done exactly what it was sent, and the assertion was wrong. Editing
+  the store to satisfy it would have replaced a correct transaction with a wrong one. The fix
+  is to assert the sentence the test name claims — *the order the client sent is the order
+  stored* — which is strictly closer to the name than what it replaced.
+
+- **Two real product bugs, both of which the walks could not have found.**
+  `resolve_settings` promised to fall back to the installation-wide row and never could:
+  `where site_id is not distinct from $1` matches the site's own row and nothing else, so a
+  site without one reported "no CDN is configured" while the installation had a provider
+  running. And `unique (coalesce(...), coalesce(...), ...)` in `0047_media_grants.sql` is a
+  syntax error — a table-level `UNIQUE` constraint takes column names, not expressions — and
+  because migrations apply as a set, it stopped *every later migration* from applying too.
+  Fifteen CDN walks failing on a media migration is what finally made it visible.
+
+- **A lifetime that a handler could not satisfy.** `RequestShape` borrowed its cookie and
+  header name lists, which is fine for a unit test building one from literals and impossible
+  for a handler: it parses a `HeaderMap` into a local, and the local dies at the `await` the
+  decision needs. Three workarounds were tried and all three were worse — a self-referential
+  `ShapeInput`, a `Box::leak` that leaked a string per request, a temporary dropped while
+  borrowed. The lifetime was the bug, so it is gone: every field is owned, at the cost of two
+  small allocations per public request.
+
+- **Proof, measured.** `cargo test -p omnion-cdn` → **59 passed** (was 43; the ETag/Vary module
+  adds 16 and the builder fixtures replaced six struct literals). `cargo test -p omnion-api
+  --lib` → **180 passed** (was 127). `cargo test --test cdn` → **15 passed, 0 failed** (was
+  0 passed, 15 failed — the suite had never run). `cargo test --test cdn_headers` → **13
+  passed, 0 failed**, new, and the walk that matters is
+  `a_rule_an_operator_creates_changes_the_cache_control_of_a_matching_page`: the same public
+  URL, read before and after a rule is created, carrying `private, no-store` and then
+  `public, max-age=60`. `--test public` → 5, `--test media_shares` → 2. `apps/admin`
+  `tsc --noEmit` clean.
+
+- **One pre-existing failure left standing, honestly.** `--test media` fails 2 of 13
+  (`a_camera_record_is_read_from_the_bytes_and_never_holds_a_coordinate` and
+  `a_replacement_replaces_the_camera_record_rather_than_inheriting_it`): the EXIF fixture
+  builder writes into a slice one byte past its end (`range end index 164 out of range for
+  slice of length 163`). It is a bug in the test's own byte assembly, it touches no CDN code,
+  and it was failing before this tick. Not fixed here because it belongs to REQ-010.
+
+- **Next.** The admin screens — `/cdn`, `/cdn/rules` with the drag reorder, the rule form with
+  its live match tester, `/cdn/purge`, `/cdn/purges`, `/cdn/settings` — and the media 304 walk.
+  Then the walkthrough, which is still owed an honest pass on this box.
