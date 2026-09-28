@@ -5128,19 +5128,27 @@ async function runBlockEditorDepth(page, report) {
 
   // The visibility control lives in the inspector's Visibility section, and its effect on the
   // canvas is a badge — a setting that changes nothing on screen is a setting nobody can check.
+  //
+  // The badge is asserted on the SELECTED block, not on the page. `hide_on` belongs to one
+  // block's `meta`, the control is the selected block's, and the badge is drawn by that block
+  // row — so a page-wide count answers "does any block have this badge" and the pass sets it on
+  // one. A different block that was already hidden makes that true on a run where the step
+  // failed, which is the same class of error as a page-wide counter read as an item's own state.
   const hideOn = page.locator("[data-block-hide-on]").first();
   steps.visibilityControlPresent = (await hideOn.count()) > 0;
   await hideOn.selectOption("mobile").catch(() => {});
   await page.waitForTimeout(1200);
-  steps.hiddenBadge = (await page.locator("[data-block-hidden-on=mobile]").count()) > 0;
+  const selectedRow = page.locator("[data-block-canvas-block].ring-accent").first();
+  const badgeRow = (await selectedRow.count()) > 0 ? selectedRow : page.locator('[data-block-canvas-block=heading]').first();
+  steps.hiddenBadge = (await badgeRow.locator("[data-block-hidden-on=mobile]").count()) > 0;
   steps.hiddenBadgeText = (
-    (await page.locator("[data-block-hidden-on=mobile]").first().innerText().catch(() => "")).replace(/\s+/g, " ").trim()
+    (await badgeRow.locator("[data-block-hidden-on=mobile]").first().innerText().catch(() => "")).replace(/\s+/g, " ").trim()
   );
   // `none` is stored as absence, so clearing the control leaves the block with no settings at all
   // and the badge goes with it.
   await hideOn.selectOption("none").catch(() => {});
   await page.waitForTimeout(1200);
-  steps.hiddenBadgeCleared = (await page.locator("[data-block-hidden-on]").count()) === 0;
+  steps.hiddenBadgeCleared = (await badgeRow.locator("[data-block-hidden-on]").count()) === 0;
   await shot(page, "page-block-editor-visibility");
   note("used the per-viewport visibility control");
 
@@ -5165,13 +5173,17 @@ async function runBlockEditorDepth(page, report) {
 
   steps.undoControlPresent = (await page.locator("[data-block-undo]").count()) > 0;
   steps.redoControlPresent = (await page.locator("[data-block-redo]").count()) > 0;
-  // A fresh editor has nothing to undo, and the button says so by being disabled — the
-  // alternative is a button that eats a press and changes nothing.
-  steps.undoStartsDisabled = await page.locator("[data-block-undo]").first().isDisabled().catch(() => false);
+  // The undo button is enabled here, and it is CORRECTLY enabled: by this point the pass has
+  // inserted three blocks, fixed a validation error, built a three-column layout and driven the
+  // heading-order rule — roughly seventeen steps. The step's own comment used to call this "a
+  // freshly opened editor" and assert the button disabled, which described an editor that had
+  // been open for four minutes and edited seventeen times. The number that matters is the one
+  // the criterion names, and it is read after the fifty-step run below.
+  steps.undoEnabledAfterEdits = await page.locator("[data-block-undo]").first().isEnabled().catch(() => false);
   steps.redoStartsDisabled = await page.locator("[data-block-redo]").first().isDisabled().catch(() => false);
   const depthAtOpen = await historyDepth();
-  steps.historyDepthAtOpen = depthAtOpen;
-  note("read the undo history depth on a freshly opened editor");
+  steps.historyDepthBeforeFifty = depthAtOpen;
+  note(`read the undo history depth after the pass's own edits: ${depthAtOpen}`);
 
   // ---- Save first, so the undo below is literally "⌘Z after a save" ---------------------------
   const beforeSave = await canvasBlocks();
