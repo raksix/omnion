@@ -118,6 +118,23 @@ export function DealsView() {
   const [list, setList] = useState<CrmDeal[] | null>(null);
   const [pipelines, setPipelines] = useState<CrmPipeline[]>([]);
   const [mode, setMode] = useState<"board" | "list">("board");
+  // A phone gets the list.
+  //
+  // The board is a set of 256px columns side by side, which is the right thing on a desktop and
+  // the wrong thing on 390px: a person has to scroll horizontally to compare two stages, and the
+  // stage a card is in — the one number that decides what to do next — is off screen. So below the
+  // `md` breakpoint the list is the default, and the board stays one tap away rather than being
+  // taken away. This runs *after* the first paint on purpose: reading the viewport during render
+  // would make the server and the client disagree about what the first frame is, and a hydration
+  // mismatch is a worse defect than a one-frame flash of the list.
+  const [phoneDefaulted, setPhoneDefaulted] = useState(false);
+  useEffect(() => {
+    if (phoneDefaulted) return;
+    if (window.matchMedia("(max-width: 767px)").matches) {
+      setMode("list");
+    }
+    setPhoneDefaulted(true);
+  }, [phoneDefaulted]);
   const [pipelineId, setPipelineId] = useState<string>("");
   const [search, setSearch] = useState("");
   // Two errors, not one. `error` is what an *action* refused (a drag, an archive) and it is a
@@ -553,7 +570,10 @@ export function DealsView() {
             }
           />
         ) : (
-          <div className="flex gap-3 overflow-x-auto p-4" data-qa-board="pipeline">
+          <div
+            className="flex gap-3 overflow-x-auto p-4 md:overflow-visible"
+            data-qa-board="pipeline"
+          >
             {board.columns.map((column, index) => {
               const cards = board.deals.filter((deal) => deal.stage_id === column.stage_id);
               return (
@@ -579,8 +599,11 @@ export function DealsView() {
                   }}
                 >
                   {/* The header carries the count, the sum and the weighted sum — the three
-                      numbers a person reads a column for, in that order. */}
-                  <header className="border-b border-line px-3 py-2.5">
+                      numbers a person reads a column for, in that order. It sticks on a phone
+                      because the board scrolls horizontally *within* a page that also scrolls
+                      vertically: a column header that scrolls away leaves a card with no name on
+                      it, which is the state the mobile box exists to prevent. */}
+                  <header className="sticky top-0 z-10 border-b border-line bg-surface/95 px-3 py-2.5 backdrop-blur">
                     <div className="flex items-center justify-between gap-2">
                       <h3 className="truncate text-[12.5px] font-medium">{column.name}</h3>
                       <span className="rounded-full bg-surface px-1.5 py-0.5 text-[11px] text-muted">

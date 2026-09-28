@@ -57,6 +57,7 @@ import { formatTimestamp } from "@/lib/format";
 
 import {
   CrmAvatar,
+  CrmRow,
   CrmShell,
   CrmSortHeader,
   CrmStatusBadge,
@@ -1165,9 +1166,9 @@ export function ContactsView() {
             </thead>
             <tbody>
               {rows.map((contact, index) => (
-                <tr
+                <CrmRow
                   key={contact.id}
-                  id={`crm-contact-${contact.id}`}
+                  index={index}
                   className={`border-t border-line transition hover:bg-canvas/60 ${
                     contact.archived_at ? "opacity-60" : ""
                   }`}
@@ -1315,7 +1316,7 @@ export function ContactsView() {
                       ) : null}
                     </span>
                   </td>
-                </tr>
+                </CrmRow>
               ))}
             </tbody>
           </table>

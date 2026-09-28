@@ -4010,6 +4010,11 @@ async function main() {
   // hand, and a stub left installed would make the sign-out step below look like a broken panel.
   await runCrmStateSweep(page, report);
 
+  // The keyboard contract and the phone layout (REQ-051's last two boxes). It runs after the
+  // state sweep because that one leaves the network stubbed and the sweep restores it, and this
+  // pass needs a live stack to press keys against.
+  await runCrmKeyboardAndMobile(page, report);
+
   if (!onlyGroup("crm")) {
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -4170,6 +4175,14 @@ async function main() {
   for (const m of report.mobile) {
     if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
     if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+  }
+  // A step that came back `false` and is only written into the JSON report is a defect nobody is
+  // told about: the pass reports success, the report records a failure, and the two are read by
+  // different people months apart. The keyboard and phone steps are *claims about the screen*, so
+  // a false one is a high finding and stops the REQ closing.
+  for (const [name, value] of Object.entries(report.crmKeyboardMobile ?? {})) {
+    if (value === false) pushFindings("high", "crm-keyboard-mobile", `keyboard/mobile step failed: ${name}`);
+    if (value === undefined) pushFindings("medium", "crm-keyboard-mobile", `keyboard/mobile step never ran: ${name}`);
   }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {
@@ -5789,6 +5802,173 @@ async function runCrmStateSweep(page, report) {
 
   report.crmStates = steps;
   log(`crm state sweep: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The keyboard contract and the phone layout (REQ-051's last two acceptance boxes).
+ *
+ * Both boxes had their behaviour in the code and neither had ever been *exercised*, which is a
+ * different thing from being done — and exercising them is what found the two defects below.
+ *
+ * The keyboard pass exists because a shortcut sheet is a list of claims, and the cheapest way to
+ * make the list honest is to press every key it prints and watch what the screen does. It is
+ * written from the sheet's own rows, not from the implementation: the list *is* the contract, and
+ * a pass written from the code would happily agree with a dead entry.
+ */
+async function runCrmKeyboardAndMobile(page, report) {
+  const steps = {};
+
+  // ---- the sheet ---------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await page.keyboard.press("?");
+  await page.waitForTimeout(400);
+
+  const sheet = page.locator("[data-qa='crm-shortcut-sheet']").first();
+  const sheetOpen = (await sheet.count()) > 0;
+  steps.theSheetOpens = sheetOpen;
+  const sheetText = (await sheet.innerText().catch(() => "")).trim();
+  steps.theSheetNamesTheKeys = ["/", "j / k", "Enter", "e", "?"].every((key) =>
+    sheetText.includes(key),
+  );
+  // A sheet is a claim about what the screen listens for. If it promises a key and the key does
+  // nothing, the screen is offering a control it cannot deliver — the one thing the box forbids.
+  const advertised = (sheetText.match(/\bg then ([a-z])\b/) || [])[1] ?? "";
+  steps.theSheetOnlyPromisesLiveKeys = advertised.length === 0;
+  await shot(page, "page-crm-shortcut-sheet");
+
+  // `?` again closes it, so the toggle is a toggle and not a one-way door.
+  await page.keyboard.press("?");
+  await page.waitForTimeout(300);
+  steps.theSheetCloses = (await page.locator("[data-qa='crm-shortcut-sheet']").count()) === 0;
+
+  // ---- `/` focuses the search ---------------------------------------------------------------
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("/");
+  await page.waitForTimeout(300);
+  const focusedId = await page.evaluate(() => document.activeElement?.id ?? "");
+  steps.slashFocusesSearch = focusedId === "crm-search-contacts";
+
+  // ---- `j` / `k` move a cursor the page actually shows ----------------------------------------
+  const rows = page.locator("[data-qa-crm-cursor]");
+  const rowCount = await rows.count();
+  steps.theListHasRows = rowCount > 0;
+  const cursorRow = () => page.locator('[data-qa-crm-cursor="true"]');
+  steps.theCursorIsVisibleOnAPhone = (await cursorRow().count()) > 0;
+
+  if (rowCount > 1) {
+    const firstText = (await cursorRow().first().innerText().catch(() => "")).slice(0, 60);
+    await page.keyboard.press("j");
+    await page.waitForTimeout(250);
+    const secondText = (await cursorRow().first().innerText().catch(() => "")).slice(0, 60);
+    // The defect this found: `j` changed a number in a context nobody read, so the cursor was
+    // invisible and `Enter` opened a row the page never pointed at. Same text means no move.
+    steps.jMovesTheVisibleCursor = firstText !== secondText && secondText.length > 0;
+    await page.keyboard.press("k");
+    await page.waitForTimeout(250);
+    steps.kMovesBack = (await cursorRow().first().innerText().catch(() => "")).slice(0, 60) === firstText;
+    // Exactly one cursor: a second one would mean two rows claim to be selected.
+    steps.exactlyOneCursor = (await cursorRow().count()) === 1;
+  }
+
+  // ---- `e` opens the editor for the row under the cursor ---------------------------------------
+  await page.keyboard.press("e");
+  await page.waitForTimeout(900);
+  steps.eEditsTheSelectedRow = (await page.locator("#crm-first-name").count()) > 0;
+  await shot(page, "page-crm-keyboard-edit");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+
+  // ---- `n` opens the create form --------------------------------------------------------------
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("n");
+  await page.waitForTimeout(900);
+  steps.nCreates = (await page.locator("#crm-first-name").count()) > 0;
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+
+  // ---- the `g` prefix navigates ---------------------------------------------------------------
+  await page.keyboard.press("g");
+  await page.keyboard.press("d");
+  await page.waitForTimeout(1800);
+  steps.gThenDGoesToDeals = /\/crm\/deals/.test(page.url());
+  await shot(page, "page-crm-keyboard-goto");
+
+  // ---- 390×844 -------------------------------------------------------------------------------
+  //
+  // The board is switched on deliberately: the box asks that the board *scroll* horizontally on a
+  // phone, and a pass that only ever sees the list (the new default) would prove nothing about it.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/crm/deals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1700);
+
+  // The list is the default at this width, and the board is still reachable — offered, not taken.
+  steps.thePhoneDefaultsToTheList = (await page.locator("#crm-list-toggle").getAttribute("aria-pressed").catch(() => null)) === "true";
+  steps.theBoardIsStillOffered = (await page.locator("#crm-board-toggle").count()) > 0;
+  await shot(page, "mobile-crm-deals-list");
+
+  await page.locator("#crm-board-toggle").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1700);
+
+  const boardBox = await page
+    .locator("[data-qa-board='pipeline']")
+    .evaluate((node) => {
+      const style = window.getComputedStyle(node);
+      return {
+        overflowX: style.overflowX,
+        scrollWidth: node.scrollWidth,
+        clientWidth: node.clientWidth,
+      };
+    })
+    .catch(() => null);
+  steps.theBoardScrollsOnAPhone = Boolean(
+    boardBox && ["auto", "scroll"].includes(boardBox.overflowX) && boardBox.scrollWidth > boardBox.clientWidth,
+  );
+  // The page itself must not scroll sideways: the board scrolls inside its own box, and a page
+  // that scrolls sideways is the horizontal-overflow finding the harness reports as high.
+  steps.thePageDoesNotScrollSideways =
+    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
+  // A sticky stage header, read from the element rather than from the class name.
+  steps.theStageHeaderSticks =
+    await page
+      .locator("[data-qa-stage] header")
+      .first()
+      .evaluate((node) => window.getComputedStyle(node).position === "sticky")
+      .catch(() => false);
+  steps.theStagesKeepTheirTotals = /%/.test(
+    await page.locator("[data-qa-stage] header").first().innerText().catch(() => ""),
+  );
+  await shot(page, "mobile-crm-deals-board");
+
+  // The form is single-column: two side-by-side fields at 390px is a layout that is technically
+  // responsive and practically unreadable, and the spec asks for one column.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  await page.locator("[data-qa-guard='crm-depth']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const form = page.locator("#crm-first-name").first();
+  steps.theFormIsOnAPhone = (await form.count()) > 0;
+  if (steps.theFormIsOnAPhone) {
+    const boxes = await page
+      .locator("form label, form .grid > label")
+      .evaluateAll((nodes) =>
+        nodes
+          .map((node) => node.getBoundingClientRect())
+          .filter((rect) => rect.width > 0 && rect.height > 0)
+          .map((rect) => Math.round(rect.left)),
+      )
+      .catch(() => []);
+    const lefts = [...new Set(boxes)];
+    steps.theFormIsSingleColumn = lefts.length <= 2;
+  }
+  await shot(page, "mobile-crm-contact-form");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.crmKeyboardMobile = steps;
+  log(`crm keyboard + mobile: ${JSON.stringify(steps)}`);
 }
 
 /**

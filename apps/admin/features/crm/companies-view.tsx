@@ -41,7 +41,7 @@ import {
 } from "@/lib/crm";
 import { formatTimestamp } from "@/lib/format";
 
-import { CrmAvatar, CrmShell, CrmSortHeader, CrmStatusBadge, CrmTag } from "./crm-parts";
+import { CrmAvatar, CrmRow, CrmShell, CrmSortHeader, CrmStatusBadge, CrmTag } from "./crm-parts";
 import { useCrmTenant } from "./crm-tenant";
 
 /** What the company form holds while it is open. */
@@ -781,10 +781,10 @@ export function CompaniesView() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((company) => (
-                <tr
+              {rows.map((company, index) => (
+                <CrmRow
                   key={company.id}
-                  id={`crm-company-${company.id}`}
+                  index={index}
                   className={`border-t border-line transition hover:bg-canvas/60 ${
                     company.archived_at ? "opacity-60" : ""
                   }`}
@@ -876,7 +876,7 @@ export function CompaniesView() {
                       </button>
                     ) : null}
                   </td>
-                </tr>
+                </CrmRow>
               ))}
             </tbody>
           </table>

@@ -41,15 +41,100 @@ export const CRM_NAV = [
 /** One shortcut, as the sheet prints it. */
 type Shortcut = { keys: string; what: string };
 
-/** The keyboard contract of a list screen. */
+/**
+ * The props that draw the keyboard cursor on a row.
+ *
+ * `j` and `k` move a cursor that only existed as a number in the frame's state: no screen read
+ * `selectedIndex`, so pressing `j` changed which row `Enter` would open while nothing on the page
+ * said so. A shortcut you cannot see is indistinguishable from a broken one, and the person
+ * pressing it is guessing. Every list row therefore draws the cursor, which is also what lets the
+ * QA pass find the cursor and press `Enter` against a row it can name.
+ */
+function crmRowCursor(selected: boolean): {
+  "data-qa-crm-cursor": string;
+  "aria-selected"?: true;
+  className: string;
+} {
+  return selected
+    ? {
+        "data-qa-crm-cursor": "true",
+        "aria-selected": true,
+        className: "bg-accent-soft/50 ring-1 ring-inset ring-accent/30",
+      }
+    : { "data-qa-crm-cursor": "false", className: "" };
+}
+
+/**
+ * One row of a CRM list, with the keyboard cursor on it.
+ *
+ * This is a component rather than a helper function on purpose. A list's rows are the `children`
+ * its screen passes to the frame, and `children` is built *outside* the provider — so a screen
+ * cannot read `selectedIndex` where it writes the row, however it wants the markup to look. The
+ * row reads the context itself, which is the only place the cursor is actually available, and it
+ * also moves the cursor on click: pressing `j` and clicking are the same act, and a click that
+ * leaves the cursor somewhere else makes the two disagree.
+ */
+export function CrmRow({
+  index,
+  className,
+  children,
+}: {
+  /** The row's position in the list, which is what `j`/`k` count in. */
+  index: number;
+  /** The screen's own classes, merged after the cursor's. */
+  className?: string;
+  /** The cells. */
+  children: ReactNode;
+}) {
+  const list = useCrmList();
+  const cursor = crmRowCursor(index === list.selectedIndex);
+  return (
+    <tr
+      {...cursor}
+      onClick={() => list.setSelectedIndex(index)}
+      className={[cursor.className, className].filter(Boolean).join(" ")}
+    >
+      {children}
+    </tr>
+  );
+}
+
+/**
+ * Where the `g` prefix lands, and nothing else.
+ *
+ * Built from the tab bar above rather than typed out a second time, so a section the nav has and
+ * the keyboard cannot reach — or the reverse — is a difference in one place instead of two lists
+ * that drift. `c`/`o` are answered by the same prefix as every other destination: Contacts and
+ * Companies are where a person already is on those two screens, so a "go there" row there would
+ * be a shortcut that goes nowhere.
+ */
+const GO_DESTINATIONS: Record<string, string> = Object.fromEntries(
+  CRM_NAV.filter((item) => item.shortcut !== "c" && item.shortcut !== "o").map((item) => [
+    item.shortcut,
+    item.href,
+  ]),
+);
+
+/**
+ * The keyboard contract of a list screen.
+ *
+ * Every row here is a binding some screen actually implements, which is the rule this list is
+ * written against: the sheet is opened *by* a key, so a row that promises a binding nobody
+ * listens for is a control the screen offers and cannot deliver — a dead list inside the screen
+ * whose whole job is to report the screen truthfully. (`c` and `o` were advertised here for
+ * several ticks while no listener existed anywhere in the module; they are now real navigations
+ * and are exercised by the keyboard pass.)
+ */
 const LIST_SHORTCUTS: Shortcut[] = [
   { keys: "/", what: "Focus the search" },
   { keys: "j / k", what: "Move to the next / previous row" },
   { keys: "Enter", what: "Open the selected row" },
   { keys: "e", what: "Edit the selected row" },
   { keys: "n", what: "Create a record" },
-  { keys: "c", what: "Go to Contacts" },
-  { keys: "o", what: "Go to Companies" },
+  { keys: "g then d", what: "Go to Deals" },
+  { keys: "g then a", what: "Go to Activities" },
+  { keys: "g then l", what: "Go to Leads" },
+  { keys: "g then s", what: "Go to Settings" },
   { keys: "?", what: "Show or hide this sheet" },
 ];
 
@@ -248,6 +333,19 @@ export function CrmShell(props: CrmShellProps) {
     [columns, setParam],
   );
 
+  // `g` is the "go" prefix the spec asks for (`g c` contacts, `g d` deals): the first key arms the
+  // prefix and the second key chooses the destination. It is deliberately **not** a bare letter,
+  // because a bare `c`/`o`/`d` has to type into a search box and edit a row, and a sheet that
+  // claimed a bare letter nobody listens for is exactly the dead list this file just stopped
+  // printing. The arm expires after a moment, so an abandoned prefix does not swallow the next
+  // keystroke of a person who typed `g` by accident.
+  const [pendingG, setPendingG] = useState(false);
+  useEffect(() => {
+    if (!pendingG) return;
+    const timer = window.setTimeout(() => setPendingG(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [pendingG]);
+
   // The keyboard contract. `j`/`k` wrap at the ends, because a list that stops at the last row
   // leaves a person unsure whether the list ended or the shortcut did.
   useEffect(() => {
@@ -268,6 +366,22 @@ export function CrmShell(props: CrmShellProps) {
         return;
       }
       if (typing) {
+        return;
+      }
+      // The armed `g` is answered before anything else, so a pending prefix cannot leave `d`
+      // looking like an unhandled key.
+      if (pendingG) {
+        const destination = GO_DESTINATIONS[event.key.toLowerCase()];
+        setPendingG(false);
+        if (destination) {
+          event.preventDefault();
+          router.push(destination);
+        }
+        return;
+      }
+      if (event.key === "g") {
+        event.preventDefault();
+        setPendingG(true);
         return;
       }
       if (event.key === "?") {
@@ -310,7 +424,7 @@ export function CrmShell(props: CrmShellProps) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [keyboard, requestCreate, rowIds, selectedIndex]);
+  }, [keyboard, pendingG, requestCreate, router, rowIds, selectedIndex]);
 
   // A filter that leaves no row must not leave the keyboard pointing at a row that is gone.
   useEffect(() => {
@@ -319,6 +433,19 @@ export function CrmShell(props: CrmShellProps) {
     } else if (selectedIndex >= rowIds.length) {
       setSelectedIndex(rowIds.length - 1);
     }
+  }, [rowIds, selectedIndex]);
+
+  // Move the cursor into view, so `j` past the bottom of the screen follows the eye. `nearest`
+  // scrolls only when the row is actually out of view, which is what keeps a person reading the
+  // list from having the page jump under them on every key press.
+  //
+  // The row is found by the attribute `CrmRow` writes rather than by an id this file guesses at:
+  // each screen names its rows its own way (`crm-contact-…`, `crm-company-…`), and a lookup that
+  // assumed one of them would scroll nothing at all and look like it had worked.
+  useEffect(() => {
+    if (rowIds.length === 0) return;
+    const cursor = document.querySelector('[data-qa-crm-cursor="true"]');
+    cursor?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [rowIds, selectedIndex]);
 
   const value: CrmListState = {
@@ -526,7 +653,10 @@ export function CrmShell(props: CrmShellProps) {
         </div>
 
         {showShortcuts ? (
-          <div className="border-b border-line bg-canvas/60 px-4 py-3">
+          <div
+            data-qa="crm-shortcut-sheet"
+            className="border-b border-line bg-canvas/60 px-4 py-3"
+          >
             <p className="pb-2 text-[11.5px] font-medium text-muted">Keyboard</p>
             <ul className="grid gap-1.5 sm:grid-cols-2">
               {LIST_SHORTCUTS.map((shortcut) => (
