@@ -2720,3 +2720,54 @@ particular no `request-failed` on any `/api/v1/notifications` URL, which is the 
 signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
 behind `notifications.admin`, the event router turning existing bus events into notifications,
 and the per-channel delivery rows in the drawer.
+
+## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
+
+**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
+`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
+endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
+with their guards travelling with each group.
+
+**The decision the whole slice rests on: a `permission:` recipient rule resolves through
+`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
+one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
+expired grants and explicit denials, and a notification that reaches somebody who lost the key
+is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
+`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
+cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
+that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
+zero for and the crate's resolution answers one.
+
+**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
+no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
+nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
+is asserted by serialising the body and searching the JSON for the secret.
+
+**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
+`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
+button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
+list used `filter_map`, which would answer with four channels and render a settings matrix whose
+missing column is indistinguishable from one the reader switched off. And the outbox check
+constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
+
+**The live gate found three of its own assertions were wrong**, which is the more useful half:
+the role fixture expected a survivor where the honest answer is zero; the outbox projection check
+counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
+`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
+now assertions that would fail if the code regressed.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
+`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
+`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
+and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
+moves the failed row while the delivered one stays at 1 → 1.
+
+**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
+gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
+rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
+
+**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
+assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
+and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
+before running the pass again — the no-untested-screen rule applies to a screen that does not yet
+exist as much as to one that does.
