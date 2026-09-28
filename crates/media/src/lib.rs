@@ -20,6 +20,7 @@ pub mod model;
 pub mod pixels;
 pub mod preset_store;
 pub mod probe;
+pub mod storage_settings;
 pub mod transform;
 pub mod validation;
 pub mod versions;
@@ -49,6 +50,12 @@ pub use preset_store::{
     list_presets, require_preset, require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
+pub use storage_settings::{
+    ConnectionProbe, MAX_SIGNED_URL_TTL, MAX_UPLOAD_MB, MIN_SIGNED_URL_TTL, MIN_UPLOAD_MB,
+    NewSiteStorage, SiteStorage, describe_public_base, describe_target,
+    effective_max_upload_bytes, probe_key, read_storage_settings, validate_new as validate_storage,
+    write_storage_settings,
+};
 pub use transform::{
     Derivative, Fit, ImageFormat, MAX_PRESET_DIMENSION, MAX_PRESET_NAME_LENGTH, NewPreset, Preset,
     Recipe, derivative_prefix, validate_dimensions, validate_new, validate_preset_name,

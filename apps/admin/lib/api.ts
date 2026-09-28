@@ -13,6 +13,9 @@ import type {
   MediaFolder,
   MediaFolderTree,
   MediaPreset,
+  MediaStorageProbe,
+  MediaStorageSettings,
+  MediaStorageSettingsInput,
   MediaReplaceResult,
   MediaTrash,
   MediaVersionList,
@@ -3867,10 +3870,53 @@ export function updateMediaPreset(
   );
 }
 
-/** Remove one preset, and with it every derivative built from it. */
+/** Remove a preset, and with it every derivative built from it. */
 export function deleteMediaPreset(siteId: string, id: string): Promise<null> {
   return request<null>(
     `/api/v1/media/transformation-presets/${encodeURIComponent(id)}?${mediaQuery(siteId)}`,
     { method: "DELETE" },
   );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage settings (docs/requests/REQ-010, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** A site's storage settings. */
+export function fetchMediaStorageSettings(siteId: string): Promise<MediaStorageSettings> {
+  return request<MediaStorageSettings>(`/api/v1/media/settings?${mediaQuery(siteId)}`);
+}
+
+/**
+ * Save a site's storage settings.
+ *
+ * A `PUT` whose body is folded onto the row field by field: a form that sends six of ten fields
+ * does not reset the other four to a platform default, which is how a settings screen "saves"
+ * and loses the bucket.
+ */
+export function saveMediaStorageSettings(
+  siteId: string,
+  input: MediaStorageSettingsInput,
+): Promise<MediaStorageSettings> {
+  return request<MediaStorageSettings>(`/api/v1/media/settings?${mediaQuery(siteId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Prove that a configuration reaches a bucket — by writing, not by reading.
+ *
+ * The candidate is the body as sent, so the answer describes the form on screen rather than the
+ * row that happens to be saved. A refused value answers with the same field a save would have
+ * refused, so a person is never sent to fix a field on one path that the other accepted.
+ */
+export function testMediaStorageConnection(
+  siteId: string,
+  input: MediaStorageSettingsInput,
+): Promise<MediaStorageProbe> {
+  return request<MediaStorageProbe>(`/api/v1/media/settings/test-connection?${mediaQuery(siteId)}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }

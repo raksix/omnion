@@ -70,6 +70,18 @@ pub enum MediaError {
     /// A transformation preset is not usable as written.
     #[error("{0}")]
     InvalidPreset(String),
+    /// A storage setting is not usable as written.
+    ///
+    /// The `field` is the wire name of the setting, and the settings screen renders the message
+    /// under exactly that field. A bare check-constraint refusal arrives as a 500 whose only
+    /// clue is a column name, which is a message under nothing.
+    #[error("{field}: {message}")]
+    InvalidStorageSetting {
+        /// Which setting was refused.
+        field: String,
+        /// What a correct value looks like.
+        message: String,
+    },
     /// No preset with that name (or that id) on this site.
     #[error("no transformation preset named `{name}` on this site")]
     PresetNotFound {

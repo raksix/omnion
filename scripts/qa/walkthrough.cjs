@@ -1657,12 +1657,23 @@ async function runMediaPresets(page, report) {
   note({ step: "created", created });
   await shot(page, "media-presets-created");
 
-  // The preset URL must answer with transformed bytes. This runs in the page, against the
-  // session cookie, so the check is against the real API rather than a fixture.
-  const served = await page.evaluate(async () => {
-    const link = document.querySelector('a[href^="/api/v1/media/"]');
-    if (!link) return { ok: false, reason: "no preset example URL on the screen" };
-    const url = link.getAttribute("href").replace("<file-id>", "");
+  // The preset URL must answer with transformed bytes. The id comes from the library listing
+  // (a real file) and the query from the screen's own `data-preset-query`, so the URL is
+  // assembled the way a page assembles it rather than copied out of the table.
+  const fileId = await page.evaluate(() => {
+    const rows = document.querySelectorAll("code[data-preset-query]");
+    return rows.length > 0 ? rows[0].getAttribute("data-preset-query") : null;
+  });
+  note({ step: "preset-query", fileId });
+
+  const served = await page.evaluate(async (query) => {
+    // The library is where a real file id lives; asking for the listing keeps this in the page
+    // with the session cookie, so the bytes come from the real API.
+    const listed = await fetch("/api/v1/media/files?limit=1", { credentials: "same-origin" });
+    const page1 = await listed.json();
+    const file = page1.files && page1.files[0];
+    if (!file || !query) return { ok: false, reason: "no file or no preset query" };
+    const url = `/api/v1/media/${file.id}/raw${query}`;
     const response = await fetch(url, { credentials: "same-origin" });
     const buffer = new Uint8Array(await response.arrayBuffer());
     return {
@@ -1675,7 +1686,7 @@ async function runMediaPresets(page, report) {
         .map((b) => b.toString(16).padStart(2, "0"))
         .join(""),
     };
-  });
+  }, fileId);
   note({ step: "preset-url", ...served });
 
   await shot(page, "media-presets-table");
