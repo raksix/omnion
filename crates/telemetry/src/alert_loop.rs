@@ -148,7 +148,8 @@ pub async fn emit_transitions(pool: &PgPool, report: &PassReport) -> usize {
         }
     }
     for transition in report.resolved_transitions() {
-        if crate::events::try_emit(pool, crate::events::ALERT_RESOLVED, transition.payload()).await {
+        if crate::events::try_emit(pool, crate::events::ALERT_RESOLVED, transition.payload()).await
+        {
             written += 1;
         }
     }
@@ -178,6 +179,36 @@ pub async fn deliver(pool: &PgPool) -> Result<usize, crate::TelemetryError> {
     Ok(claimed.len())
 }
 
+/// The bundled rules the panel seeds, as `(name, expression)`.
+///
+/// This is a `const` rather than a literal inside the function because it is a **contract with
+/// the shipped bundle**, and a contract that can only be read by executing the code that honours
+/// it cannot be checked. `infra/observability/alerts.yml` ships the same rules written for
+/// Prometheus; `bundle_rules` asserts that every rule here appears in that file and watches the
+/// same family, so the two cannot drift apart unnoticed.
+///
+/// It was a literal in the function body for the whole of slice 4, and the first check written
+/// against it had to *read the source text* to compare them. That check passed while seeing one
+/// of the four rules — a source scraper that quietly misses an entry reports agreement, which is
+/// the failure mode this crate has now produced three separate times.
+///
+/// **These expressions are deliberately in the evaluator's smaller grammar**, not PromQL: the
+/// panel evaluates them itself against the in-process registry, where `rate()` and
+/// `histogram_quantile()` have nothing to compute over. The file's versions are the same
+/// thresholds written for a real Prometheus.
+pub const BUNDLED_RULES: &[(&str, &str)] = &[
+    (
+        "HighErrorRate",
+        r#"omnion_http_requests_total{status="5xx"} > 0.05"#,
+    ),
+    ("SlowRequests", "omnion_http_request_duration_seconds > 1.5"),
+    ("QueueBacklog", "omnion_queue_depth > 100"),
+    (
+        "ExporterDroppingTelemetry",
+        "omnion_exporter_dropped_total > 0",
+    ),
+];
+
 /// Seed the bundled rules into `obs_alert_rules`.
 ///
 /// Called at boot. A `bundled` rule is **upserted on `name`**: an operator's edit to a bundled
@@ -185,26 +216,8 @@ pub async fn deliver(pool: &PgPool) -> Result<usize, crate::TelemetryError> {
 /// thresholds someone tuned during an incident is a bundle that undoes the incident response.
 /// The `checksum` is stored so the seed can report which rules it has since changed on disk.
 pub async fn seed_bundled_rules(pool: &PgPool) -> Result<usize, crate::TelemetryError> {
-    let seeded: Vec<(String, String)> = vec![
-        (
-            "HighErrorRate".to_owned(),
-            r#"omnion_http_requests_total{status="5xx"} > 0.05"#.to_owned(),
-        ),
-        (
-            "SlowRequests".to_owned(),
-            "omnion_http_request_duration_seconds > 1.5".to_owned(),
-        ),
-        (
-            "QueueBacklog".to_owned(),
-            "omnion_queue_depth > 100".to_owned(),
-        ),
-        (
-            "ExporterDroppingTelemetry".to_owned(),
-            "omnion_exporter_dropped_total > 0".to_owned(),
-        ),
-    ];
     let mut written = 0;
-    for (name, expr) in &seeded {
+    for (name, expr) in BUNDLED_RULES {
         // A bundled rule whose expression does not parse is a bug in THIS file, not in the
         // operator's data, so it is logged loudly and skipped rather than written — a rule that
         // the evaluator will refuse on every pass is worse than a missing one, because the panel
@@ -222,8 +235,8 @@ pub async fn seed_bundled_rules(pool: &PgPool) -> Result<usize, crate::Telemetry
                  updated_at = now() \
              returning id",
         )
-        .bind(name)
-        .bind(expr)
+        .bind(*name)
+        .bind(*expr)
         .bind(summary_for(name))
         .fetch_one(pool)
         .await;

@@ -1,14 +1,24 @@
 # Omnion alert rules for Prometheus (REQ-126, slice 4).
 #
-# The same four rules the panel seeds into `obs_alert_rules` with `source = 'bundled'`. Run them
-# HERE if you want Alertmanager's routing and silences; run them in Omnion if you want the
-# panel's timeline. Running both means two notifications per incident — set
-# `OMNION_ALERTS_EVALUATOR=false` to turn off the built-in loop.
+# The same rules the panel seeds into `obs_alert_rules` with `source = 'bundled'`, written in
+# PromQL for a Prometheus that has a query engine. Run them HERE if you want Alertmanager's
+# routing and silences; run them in Omnion if you want the panel's timeline. Running both means
+# two notifications per incident — set `OMNION_ALERTS_EVALUATOR=false` to turn off the built-in
+# loop.
 #
-# Every expression here uses only families the registry declares, and every one of them is
-# asserted to parse against it in `crates/telemetry/src/alert_loop.rs`. A rule naming a family
-# this build does not emit is a rule that never fires, and a rule that never fires looks exactly
-# like a healthy system.
+# Every expression here uses only families the registry declares, and only labels those families
+# declare. **That is checked, not asserted**: `crates/telemetry/src/bundle_rules.rs` parses this
+# file and fails the build when a rule names a family this build does not emit, when a matcher
+# names a label the family does not have (which matches the empty set — the rule imports, reviews
+# clean, and can never fire), or when a rule the panel runs is missing from here. The first draft
+# of that check said this file was "the same four rules the panel seeds"; it was ten, and nothing
+# had noticed.
+#
+# The file is the RICHER set. The panel evaluates its own rules against the in-process registry
+# using a deliberately small grammar (`<family> {labels} <op> <number>`), so expressions like the
+# `histogram_quantile` below cannot be expressed there. The panel's four are the same thresholds
+# in the simpler form — see `BUNDLED_RULES` in `crates/telemetry/src/alert_loop.rs`, and the
+# cross-check that keeps the two sets from drifting apart.
 
 groups:
   - name: omnion-api
