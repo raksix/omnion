@@ -422,9 +422,15 @@ pub async fn public_shared(
         // a 404 that looks like a wrong token, which sends the holder to the wrong person.
         .ok_or_else(|| share_refusal(ShareRefusal::FileUnavailable))?;
 
-    // The file's own rules, applied through the link. A trashed or quarantined file is not
-    // served, and this is deliberately evaluated here rather than at creation.
-    if media.deleted_at.is_some() || media.scan_status == "flagged" {
+    // The file's own rules, applied through the link, through the *same* gate the panel's raw
+    // path uses. The earlier hand-rolled check here knew two states — trashed and flagged —
+    // and would have served a file the site's policy holds because nobody updated it when the
+    // `pending`/`error` states arrived. One gate means the panel and a share link cannot
+    // disagree about what a file is.
+    if media.deleted_at.is_some() {
+        return Err(share_refusal(ShareRefusal::FileUnavailable));
+    }
+    if crate::routes::media::ensure_servable(&state, &media).await.is_err() {
         return Err(share_refusal(ShareRefusal::FileUnavailable));
     }
 

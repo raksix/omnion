@@ -137,6 +137,13 @@ impl ApiError {
     /// needs to know that a refusal *names* the thing it refused over (a cap, an accepted set).
     /// There is deliberately no setter — a message that can be rewritten after construction is a
     /// message no longer derived from the code that produced it.
+    ///
+    /// The human-readable explanation, for assertions and for a log line.
+    ///
+    /// The companion of [`ApiError::code`]: the code is what a client branches on and the
+    /// message is what a person reads, so a test that checks one without the other pins half
+    /// the contract — and it is the message that has to name the field and the three legal
+    /// values, which is the part a client cannot reconstruct.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -732,6 +739,20 @@ impl From<MediaError> for ApiError {
             MediaError::InvalidStorageSetting { field, message } => {
                 Self::bad_request("invalid_storage_setting", message)
                     .with_details(serde_json::json!({ "field": field }))
+            }
+            // Same rule for the scanning settings, with its own code so a client can tell a
+            // bad scanner endpoint from a bad storage endpoint — they are different screens
+            // and different people fix them.
+            MediaError::InvalidScanSetting { field, reason } => {
+                Self::bad_request("invalid_scan_setting", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
+            // A release with no reason is a `400`, not a `409`: the request was well-formed and
+            // the refusal is about an empty field, so the caller can fix it and try again
+            // without a state having changed underneath them.
+            MediaError::InvalidReleaseReason => {
+                Self::bad_request("release_reason_required", MediaError::InvalidReleaseReason.to_string())
+                    .with_details(serde_json::json!({ "field": "reason" }))
             }
             other => Self::bad_request("invalid_request", other.to_string()),
         }

@@ -72,3 +72,13 @@ rpassword = "7"
 # three codecs the presets can emit are pulled in — decoding is the same set the header probe
 # already understands, so a file the library accepts is a file the transformer can read.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# Build cost control. The box has 6 cores and up to seven writers compile at once, so
+# the dev profile drops full debuginfo (line tables are enough to read a test failure)
+# and dependency crates get a little optimisation. Both cut seconds per build and
+# hundreds of megabytes per worktree, and neither affects what the code does.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
