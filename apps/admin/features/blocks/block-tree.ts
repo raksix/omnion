@@ -427,6 +427,51 @@ export function breadcrumb(
   return trail;
 }
 
+/**
+ * Place a block group into the tree.
+ *
+ * Three cases, and they are three different intents rather than one "insert" with defaults:
+ *
+ * - **no selection** — the group goes at the end of the top level. A hero pattern dropped
+ *   above a page's own heading would silently become the page's heading, and an author who
+ *   asked to "insert a pattern" on an empty page meant "start the page with this", not
+ *   "bury it under whatever was already there".
+ * - **selection is a container** — the group goes inside it, at the end. A pattern that opens
+ *   with a heading and a paragraph is a *body*, and the container the author just made is where
+ *   a body goes.
+ * - **selection is a leaf** — the group goes after it, at the same level. Appending into a text
+ *   block would nest the pattern inside a paragraph.
+ *
+ * The blocks arrive with ids the server minted for this insertion, so nothing here rewrites
+ * identity: the pattern's own ids stay in the library, the page's tree gets its own, and the
+ * revision diff can later say which block came from where.
+ */
+export function insertGroup(
+  blocks: ContentBlock[],
+  selected: number[] | null,
+  group: ContentBlock[],
+): ContentBlock[] {
+  if (selected === null) {
+    return [...blocks, ...group];
+  }
+  const target = blockAt(blocks, selected);
+  if (target?.children) {
+    return updateBlock(blocks, selected, (block) => ({
+      ...block,
+      children: [...(block.children ?? []), ...group],
+    }));
+  }
+  // `insertAfter` takes one block and a path, and the path moves as the group grows — so the
+  // group is folded in one at a time, each insertion landing after the one before it.
+  let next = blocks;
+  let anchor = selected;
+  for (const block of group) {
+    next = insertAfter(next, anchor, block);
+    anchor = [...anchor.slice(0, -1), anchor[anchor.length - 1] + 1];
+  }
+  return next;
+}
+
 /** The words a page is made of, for the editor's bottom bar. */
 export function wordCount(blocks: ContentBlock[]): number {
   let total = 0;

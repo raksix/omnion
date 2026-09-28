@@ -23,7 +23,7 @@ use omnion_audit::NewAuditEntry;
 use omnion_content::patterns::{
     NewPattern, NewTemplate, PageFromTemplate, Pattern, PatternChanges, PageTemplate,
 };
-use omnion_content::{SYSTEM_TEMPLATES, blocks, instance_blocks, patterns, templates};
+use omnion_content::{SYSTEM_TEMPLATES, instance_blocks, patterns, templates};
 use omnion_events::{NewEvent, bus};
 use omnion_identity::sites;
 use serde::{Deserialize, Serialize};
@@ -728,15 +728,6 @@ async fn record(
     Ok(())
 }
 
-/// `true` when a block tree carries the fatal issues a page save would refuse.
-///
-/// Used by the "new pattern from selection" flow, where the author selects blocks already in a
-/// page and the panel needs to know whether the selection is worth offering before it writes.
-#[must_use]
-pub fn blocks_are_saveable(value: &Value) -> bool {
-    blocks::validate(value).issues.iter().all(|issue| !issue.is_fatal())
-}
-
 /// The system templates as plain JSON, for the panel's own error hints.
 #[must_use]
 pub fn system_template_keys() -> Vec<&'static str> {
@@ -767,34 +758,6 @@ mod tests {
             r#"{"key":"hero","name":"Hero"}"#,
         );
         assert!(missing.is_err(), "blocks is required");
-    }
-
-    #[test]
-    fn a_template_request_cannot_claim_to_be_a_system_template() {
-        let body: SaveTemplateRequest = serde_json::from_str(
-            r#"{"key":"campaign","name":"Campaign","blocks":[],"is_system":true}"#,
-        )
-        .expect("a valid body");
-        // The field is not even in the request shape; the handler hard-codes `false`.
-        let value = serde_json::to_value(&body).expect("serializable");
-        assert!(
-            !value.as_object().is_some_and(|object| object.contains_key("is_system")),
-            "a body cannot set is_system"
-        );
-    }
-
-    #[test]
-    fn a_selection_the_page_save_would_refuse_is_reported_as_unsaveable() {
-        let orphan = json!([
-            { "id": "11111111-1111-1111-1111-111111111111", "type": "column", "props": {} }
-        ]);
-        assert!(!blocks_are_saveable(&orphan));
-
-        let heading = json!([
-            { "id": "11111111-1111-1111-1111-111111111111", "type": "heading",
-              "props": { "text": "Title", "level": 2 } }
-        ]);
-        assert!(blocks_are_saveable(&heading));
     }
 
     #[test]

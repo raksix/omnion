@@ -565,6 +565,18 @@ fn normalize_block_payload(value: Value) -> Result<Value> {
             issue.message, issue.code
         )));
     }
+    // The registry's defaults are filled in here for the same reason `pages::update_page` fills
+    // them in: a stored payload is one the renderer can draw without guessing. A pattern kept
+    // its props sparse while the page it was cut from stored them whole, so "insert this
+    // pattern" would have landed a page whose tree the revision diff then reported as *every
+    // block changed* — the author had changed nothing, the two writers had normalised
+    // differently. One normaliser, one stored shape.
+    for block in &mut blocks {
+        // `normalize` is `#[must_use]` (it returns the block) but mutates in place —
+        // a `let _ =` here would be the only way to satisfy the attribute without
+        // looking like a discarded value.
+        let _normalized = crate::blocks::normalize(block);
+    }
     Ok(blocks_to_value(&blocks))
 }
 

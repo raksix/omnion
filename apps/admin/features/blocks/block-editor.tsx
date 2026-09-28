@@ -23,6 +23,7 @@ import {
   Copy,
   Eye,
   Layers,
+  Library,
   Pencil,
   Plus,
   Rocket,
@@ -40,6 +41,7 @@ import { pageTitle } from "@/lib/types";
 import { BlockCanvas } from "@/features/blocks/block-canvas";
 import { BlockInspector, InsertPanel } from "@/features/blocks/block-inspector";
 import { blockLabel, blockSummary, definitionFor } from "@/features/blocks/block-library";
+import { PatternTools } from "@/features/blocks/pattern-tools";
 import {
   MAX_COLUMNS,
   MAX_DEPTH,
@@ -52,6 +54,7 @@ import {
   duplicateBlock,
   insertAfter,
   insertColumns,
+  insertGroup,
   moveBlock,
   newBlock,
   removeBlock,
@@ -103,6 +106,7 @@ export function BlockEditor() {
   const [validated, setValidated] = useState(false);
   const [blockCount, setBlockCount] = useState(0);
   const [insertOpen, setInsertOpen] = useState(false);
+  const [patternToolsOpen, setPatternToolsOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -433,6 +437,16 @@ export function BlockEditor() {
           </button>
           <button
             type="button"
+            data-pattern-tools-toggle
+            onClick={() => setPatternToolsOpen((open) => !open)}
+            aria-expanded={patternToolsOpen}
+            className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+          >
+            <Library className="size-3.5" aria-hidden />
+            Patterns
+          </button>
+          <button
+            type="button"
             data-block-save
             onClick={save}
             disabled={saving}
@@ -478,6 +492,22 @@ export function BlockEditor() {
           registry={registry}
           onPick={insert}
           onClose={() => setInsertOpen(false)}
+        />
+      ) : null}
+
+      {patternToolsOpen ? (
+        <PatternTools
+          registry={registry}
+          blocks={blocks}
+          selectedPath={selected}
+          onInsert={(patternBlocks) => {
+            // A pattern lands where the author is: inside a container they just made, after the
+            // block they just selected, or — with nothing selected — at the end of the page.
+            // `insertGroup` owns those three cases; the reason for each lives there.
+            setBlocks((current) => insertGroup(current, selected, patternBlocks));
+            setPatternToolsOpen(false);
+          }}
+          onClose={() => setPatternToolsOpen(false)}
         />
       ) : null}
 
