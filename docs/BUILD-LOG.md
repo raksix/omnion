@@ -2341,3 +2341,52 @@ automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted
   card** to `scripts/qa/walkthrough.cjs`'s depth passes — it is not in the route list yet, so the
   walkthrough would not visit the screen the previous tick shipped and the pass would prove
   nothing about it. It is the last gate for closing REQ-051.
+
+## 2026-09-28 — wave 4 · REQ-051 slice 4 part five: the copilot gets a card, and the first w4 QA pass reaches the end of the route list
+
+**What.** The two copilot endpoints have been reachable only from `curl` since they shipped. They
+are proved, guarded by `crm.copilot.use`, audited on both paths and unit-tested — and no person has
+ever been able to ask for one. The DoD is explicit that a REQ is not done until a human can use it
+end to end, and an endpoint without a screen is that claim unfalsified. This adds the screen: a
+**Copilot** button on every board card, a side panel that answers `summarize` and `follow-up`, and
+`runCrmCopilotDepth` in the walkthrough.
+
+**Three decisions, and why.**
+
+- **The button is on the card, not in a row menu.** On the board the card *is* the record; a menu
+  would make every question begin with "which card?". The panel follows the focused card and takes
+  focus when it opens, so the keyboard is not stranded behind a layer. Escape closes it.
+- **A refusal is rendered as a sentence.** This installation connects no provider, so the honest
+  outcome is the failure path — and that is precisely the path that has to be legible. A button
+  that does nothing is not a bug report anyone can file.
+- **The draft marker is read, not assumed.** `is_draft` drives a visible flag that turns amber and
+  reads "written to the record" if a response ever claims otherwise. The client must not quietly
+  undo the promise the server makes from the other end. The answer renders in a **text node**: the
+  server's sanitiser already reduced it to plain text, and rendering markup here would hand that
+  guarantee back to a future refactor.
+
+`?focus=<id>&copilot=1` opens the panel on arrival, so a shared link — or a palette row added later
+— lands on the answer rather than on a card whose panel stays shut.
+
+**Proof.** `pnpm typecheck` → **2/2**. `cargo test -p omnion-module-crm --lib` → **146/146**. The
+w4 QA pass ran end to end on the private stack (`QA_STACK=w4`, ports 18083/3103/3203, database
+`omnion_qa_w4`).
+
+**Environment note — two disk deaths in one tick, both self-inflicted, both the same lesson.**
+`/mnt/apopic` is a 60 GB mount shared by seven writers. The first pass died at
+`ENOSPC … appendFileSync` in the walkthrough's own `clicks.jsonl`; a screenshot failure is a
+warning, a `record()` write is fatal. Recovery was mechanical: QA artefacts, `.rmeta` files, the
+incremental directory, and `target/debug/deps` binaries — **a re-linkable build artefact, never a
+result** — which returned 1.3 GB. Two details worth keeping:
+
+* `target/debug/omnion-api` is a **hard link** to `target/debug/deps/omnion_api-<hash>` (link count
+  2). Deleting the `deps` copy costs a link and leaves the running binary intact; deleting the
+  binary would make the next QA pass rebuild the whole API. Check `stat -c %h` before assuming a
+  file is the only copy.
+* Deleting the deps binaries **while** `run.sh` was between its build check and its `pm2 restart`
+  is what made the first pass's `omnion-qa-api-w4` answer nothing on `:18083`. A maintenance window
+  on a build directory is a window on a *running service*.
+
+**Next.** The `form.submitted` consumer (REQ-064) and the workflow-trigger proof (wave 3's engine).
+Then REQ-051's last three acceptance boxes — the empty/loading/error sweep, the 390×844 mobile pass
+and the keyboard sheet — and only then the status line may read `done`.
