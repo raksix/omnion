@@ -4279,6 +4279,148 @@ export async function previewAiRouting(input: {
   });
 }
 
+// -------------------------------------------------------------------------------------------
+// The route decision log (REQ-098, slice 3).
+// -------------------------------------------------------------------------------------------
+
+/** One row of the decision log. */
+export type AiDecisionRow = {
+  id: number;
+  created_at: string;
+  task: string | null;
+  feature: string | null;
+  requested: string | null;
+  resolved_label: string | null;
+  resolved_model_id: string | null;
+  /** 0-based: 0 is the primary, anything above it is a fallback. */
+  fallback_index: number;
+  used_fallback: boolean;
+  unresolved: boolean;
+  rule: string;
+  requirements: string[];
+  reason: string;
+  run_id: string | null;
+};
+
+/** One page of the log. */
+export type AiDecisionPage = {
+  rows: AiDecisionRow[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+/** One decision with its full candidate walk. */
+export type AiDecisionDetail = AiDecisionRow & {
+  walk: AiWalkEntry[];
+  scope: string;
+  rules: string[];
+};
+
+/** A task that could not resolve, with the reason. */
+export type AiUnresolvedTask = {
+  task: string;
+  reason: string;
+  occurrences: number;
+  last_failed_at: string | null;
+};
+
+/** The filters the log screen offers. */
+export type AiDecisionFilter = {
+  task?: string;
+  feature?: string;
+  modelId?: string;
+  fallback?: boolean;
+  unresolved?: boolean;
+  from?: string;
+  to?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** The filters as a query string, shared by the table and the CSV export. */
+function decisionFilterParams(filter: AiDecisionFilter): string {
+  const params = new URLSearchParams();
+  if (filter.task) params.set("task", filter.task);
+  if (filter.feature) params.set("feature", filter.feature);
+  if (filter.modelId) params.set("model_id", filter.modelId);
+  if (filter.fallback) params.set("fallback", "true");
+  if (filter.unresolved) params.set("unresolved", "true");
+  if (filter.from) params.set("from", filter.from);
+  if (filter.to) params.set("to", filter.to);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  if (filter.offset) params.set("offset", String(filter.offset));
+  return params.toString();
+}
+
+/** One page of the decision log. */
+export async function fetchAiDecisions(
+  filter: AiDecisionFilter = {},
+): Promise<AiDecisionPage> {
+  const suffix = decisionFilterParams(filter);
+  return request<AiDecisionPage>(
+    suffix ? `/api/v1/ai/logs/decisions?${suffix}` : "/api/v1/ai/logs/decisions",
+  );
+}
+
+/**
+ * The decision log as CSV, for the same filters the table is showing.
+ *
+ * Returns the text rather than triggering a download itself: the screen owns the button, so the
+ * export is a control the walkthrough can click and assert on, and a `window.location`
+ * navigation cannot be observed at all. The same filters go into the path as the table's — the
+ * two reads are only the same read if the query strings are, which is why one helper builds it.
+ */
+export async function fetchAiDecisionsCsv(filter: AiDecisionFilter = {}): Promise<string> {
+  const suffix = decisionFilterParams(filter);
+  const path = suffix
+    ? `/api/v1/ai/logs/decisions.csv?${suffix}`
+    : "/api/v1/ai/logs/decisions.csv";
+
+  let response: Response;
+  try {
+    response = await fetch(path, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+  if (!response.ok) {
+    // The refusal is usually a guard's plain-text 401/403 rather than the API's JSON error
+    // shape, so the body is reported as it arrived instead of being parsed into nothing.
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  return response.text();
+}
+
+/** One decision with its walk. */
+export async function fetchAiDecision(id: number): Promise<AiDecisionDetail> {
+  return request<AiDecisionDetail>(`/api/v1/ai/logs/decisions/${id}`);
+}
+
+/** The tasks that cannot resolve, with the reason. */
+export async function fetchAiUnresolved(): Promise<{
+  scope: Record<string, string>;
+  unresolved: AiUnresolvedTask[];
+  ok: boolean;
+}> {
+  return request("/api/v1/ai/routing/unresolved");
+}
+
+/** The newest decision per task, for the routing screen's "Last resolved" column. */
+export async function fetchAiLastResolved(): Promise<Record<string, AiDecisionRow>> {
+  return request<Record<string, AiDecisionRow>>("/api/v1/ai/routing/last-resolved");
+}
+
 /**
  * The scope fields a JSON body carries.
  *

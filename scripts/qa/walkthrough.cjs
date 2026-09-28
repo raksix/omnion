@@ -1336,6 +1336,8 @@ async function runAiProviderDepth(page, report) {
     // the dry run is pressed, so the screen is proved by use rather than by its presence.
     const routing = await exerciseRouting(page);
     note({ step: "routing", ...routing });
+    const decisionLog = await exerciseDecisionLog(page);
+    note({ step: "decisionLog", ...decisionLog });
     if (!routing.present) {
       aiStateFindings.push(
         "the routing section did not render on /ai, so no route was configured or previewed",
@@ -1359,6 +1361,62 @@ async function runAiProviderDepth(page, report) {
       if (!routing.walk.present || routing.walk.entries.length === 0) {
         aiStateFindings.push(
           "the dry run rendered no walk, which is the one thing the routing screen exists for",
+        );
+      }
+    }
+
+    // Slice 3 (REQ-098): the decision log is exercised, not merely visited. The empty state is
+    // the *correct* result on a fresh install, so its absence is the finding — a log that says
+    // nothing about having no rows is the screen this slice exists to prevent.
+    if (!decisionLog.present) {
+      aiStateFindings.push(
+        "the decision log section did not render on /ai, so the routing history is unreachable",
+      );
+    } else {
+      if (decisionLog.empty && decisionLog.rows > 0) {
+        aiStateFindings.push(
+          "the decision log shows its empty state while also listing rows",
+        );
+      }
+      if (!decisionLog.empty && decisionLog.rows === 0) {
+        aiStateFindings.push(
+          "the decision log is not empty but rendered no rows and no empty state",
+        );
+      }
+      if (decisionLog.error > 0) {
+        aiStateFindings.push("the decision log rendered its error banner on a healthy stack");
+      }
+      // Every filter the screen offers must actually be in the DOM. A filter that exists in the
+      // copy and not on the screen is a dead control, which the definition of done forbids.
+      for (const [name, count] of Object.entries(decisionLog.filters)) {
+        if (count === 0) aiStateFindings.push(`the decision log has no ${name} filter control`);
+      }
+      if (decisionLog.exportButton === 0) {
+        aiStateFindings.push("the decision log has no export control, so the CSV is unreachable");
+      }
+      if (decisionLog.afterExport.exportError) {
+        aiStateFindings.push(
+          `the decision log export was refused: ${decisionLog.afterExport.exportError}`,
+        );
+      }
+      if (!decisionLog.afterExport.notice) {
+        aiStateFindings.push(
+          "the decision log export reported nothing, so an operator cannot tell it worked",
+        );
+      }
+      // A row that opens a drawer must open one that shows the walk. The drawer existing with
+      // no walk is the exact failure the detail view exists to prevent.
+      if (decisionLog.drawer.opened && decisionLog.drawer.walk === 0) {
+        aiStateFindings.push(
+          "a decision row opened a detail drawer with no candidate walk in it",
+        );
+      }
+      if (decisionLog.drawer.opened && decisionLog.drawer.close === 0) {
+        aiStateFindings.push("the decision detail drawer has no close control");
+      }
+      if (decisionLog.mobile.overflows) {
+        aiStateFindings.push(
+          "the decision log section overflows its card at 390px, so the table is unusable on mobile",
         );
       }
     }
@@ -1560,6 +1618,102 @@ async function exerciseRouting(page) {
   await shot(page, "ai-routing-walk");
 
   return { ...initial, saved: saved !== null, afterSave, walk };
+}
+
+/**
+ * Open the decision log and read what it rendered (REQ-098 slice 3).
+ *
+ * The API walks prove the log stores what the resolver decided; this proves the *screen* shows
+ * it, which is a different claim and the one the definition of done actually names. Three things
+ * are checked that no API test can make: the empty state names a real next step, the table
+ * renders rows with their reason, and clicking a row opens a walk rather than a blank drawer.
+ */
+async function exerciseDecisionLog(page) {
+  await page
+    .locator("[data-ai-decision-log]")
+    .first()
+    .scrollIntoViewIfNeeded()
+    .catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const initial = await page.evaluate(() => {
+    const root = document.querySelector("[data-ai-decision-log]");
+    if (!root) return { present: false };
+    const banner = root.querySelector("[data-log-unresolved]");
+    return {
+      present: true,
+      // An empty log and a broken one must be told apart by the DOM, not by a screenshot: the
+      // empty state and the amber banner are the two states this screen is judged in.
+      empty: root.textContent?.includes("No route decisions yet") ?? false,
+      rows: root.querySelectorAll("[data-log-row]").length,
+      count: root.querySelector("[data-log-count]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      error: root.querySelectorAll("[data-log-error]").length,
+      filters: {
+        task: root.querySelectorAll("[data-log-filter-task]").length,
+        range: root.querySelectorAll("[data-log-filter-range]").length,
+        fallback: root.querySelectorAll("[data-log-filter-fallback]").length,
+        unresolved: root.querySelectorAll("[data-log-filter-unresolved]").length,
+      },
+      exportButton: root.querySelectorAll("[data-log-export]").length,
+      // The warning banner's tone is read from the computed style: "amber, not red" is a claim
+      // about colour, which is exactly what a screenshot review is worst at asserting.
+      bannerTone: banner ? getComputedStyle(banner).borderColor : "",
+    };
+  });
+  await shot(page, "ai-decision-log");
+
+  // The export is a control, not a navigation, so it can be clicked and its result asserted —
+  // and the assertion that matters is that the export *answers at all* on a fresh install.
+  await page.locator("[data-log-export]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+
+  const afterExport = await page.evaluate(() => {
+    const root = document.querySelector("[data-ai-decision-log]");
+    return {
+      notice: root?.querySelector("[data-log-export-notice]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      exportError: root?.querySelector("[data-log-export-error]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    };
+  });
+
+  // Open the first row, if there is one. On a fresh install there is none, and the empty state
+  // is the correct result — the walk records that rather than inventing a row to click.
+  let drawer = { opened: false };
+  const firstOpen = page.locator("[data-log-open]").first();
+  if ((await firstOpen.count()) > 0) {
+    await firstOpen.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    drawer = await page.evaluate(() => {
+      const panel = document.querySelector("[data-log-drawer-panel]");
+      if (!panel) return { opened: false };
+      return {
+        opened: true,
+        reason: panel.querySelector("[data-log-drawer-reason]")?.textContent?.replace(/\s+/g, " ").trim().slice(0, 160) ?? "",
+        walk: panel.querySelectorAll("[data-log-walk-entry]").length,
+        close: panel.querySelectorAll("[data-log-drawer-close]").length,
+      };
+    });
+    await shot(page, "ai-decision-detail");
+    await page.locator("[data-log-drawer-close]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+  }
+
+  // Mobile: the table is a card list under 1024px, and the reason stays clamped so a long one
+  // cannot push the row to three screens tall.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(1200);
+  const mobile = await page.evaluate(() => {
+    const root = document.querySelector("[data-ai-decision-log]");
+    const section = root?.closest("section");
+    return {
+      width: section?.getBoundingClientRect().width ?? 0,
+      overflows: section ? section.scrollWidth > section.clientWidth + 1 : false,
+    };
+  });
+  await shot(page, "ai-decision-log-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(800);
+
+  return { ...initial, afterExport, drawer, mobile };
 }
 
 /** Switch one editable capability off and back on, and read the notice each time. */

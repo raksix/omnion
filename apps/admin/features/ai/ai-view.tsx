@@ -59,6 +59,7 @@ import {
 import { formatTimestamp } from "@/lib/format";
 
 import { AiHealthPanels } from "./ai-health-panel";
+import { AiDecisionLogScreen } from "./ai-decision-log";
 import { AiRoutingScreen } from "./ai-routing";
 import { ModelCatalog } from "./model-catalog";
 
@@ -1400,6 +1401,23 @@ export function AiView() {
           ) : (
             <AiRoutingScreen models={models} />
           )}
+        </div>
+      </section>
+
+      {/* The decision log (REQ-098 slice 3) sits directly under routing because it is the other
+          half of the same question: routing says what *would* answer, the log says what *did*.
+          Putting them apart on separate pages would make an operator hold one in their head
+          while reading the other. */}
+      <section className="rounded-xl border border-line bg-surface">
+        <header className="border-b border-line px-4 py-3">
+          <h2 className="text-[13.5px] font-semibold">Decision log</h2>
+          <p className="text-[12px] text-muted">
+            What answered each request, and why — including the candidates that were skipped and
+            the fallbacks that had to take over.
+          </p>
+        </header>
+        <div className="px-4 py-4">
+          <AiDecisionLogScreen />
         </div>
       </section>
 
