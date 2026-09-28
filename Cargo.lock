@@ -1370,6 +1370,7 @@ dependencies = [
  "omnion-identity",
  "omnion-media",
  "omnion-module-analytics",
+ "omnion-module-crm",
  "omnion-notifications",
  "omnion-onboarding",
  "omnion-permissions",
@@ -1528,6 +1529,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-crm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "time",
@@ -3425,5 +3439,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
- "omnion-module-crm",
-name = "omnion-module-crm"
