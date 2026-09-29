@@ -99,6 +99,7 @@ pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
 pub mod menus;
+pub mod members;
 pub mod newsletter;
 pub mod notifications;
 pub mod notifications_admin;
@@ -1114,6 +1115,47 @@ pub fn router(state: AppState) -> Router {
     let public_newsletter_issue = get(newsletter::public_issue);
     let public_newsletter_lists = get(newsletter::public_lists);
 
+    // Memberships (REQ-064, slice 4c). Two powers, and the split is the point: a member table
+    // shows every address on the site, so "somebody may look at it" must not also mean
+    // "somebody may block the one member they dislike, mint them a password reset, or delete
+    // them". `memberships.manage` additionally owns the SITE's policy, because gating decides
+    // who can read which published page.
+    //
+    // The public half carries no guard and no member session of the platform's own kind: these
+    // are the routes a browser with no account on this installation posts to. The literal
+    // segments are declared before the parameterised ones so axum ranks `/members/verify`
+    // ahead of a hypothetical `/members/{id}`.
+    let members_read = get(members::list_members).layer(guards::require(&state, "memberships.read"));
+    let members_create =
+        post(members::create_member).layer(guards::require(&state, "memberships.manage"));
+    let member_read = get(members::get_member).layer(guards::require(&state, "memberships.read"));
+    let member_write = patch(members::patch_member)
+        .layer(guards::require(&state, "memberships.manage"))
+        .merge(
+            delete(members::delete_member).layer(guards::require(&state, "memberships.manage")),
+        );
+    let member_block =
+        post(members::block_member).layer(guards::require(&state, "memberships.manage"));
+    let member_verify =
+        post(members::verify_member).layer(guards::require(&state, "memberships.manage"));
+    let member_send_verification = post(members::send_verification)
+        .layer(guards::require(&state, "memberships.manage"));
+    let member_send_reset =
+        post(members::send_reset).layer(guards::require(&state, "memberships.manage"));
+    let member_signout_everywhere = post(members::signout_everywhere)
+        .layer(guards::require(&state, "memberships.manage"));
+    let member_settings_read =
+        get(members::get_settings).layer(guards::require(&state, "memberships.read"));
+    let member_settings_write =
+        put(members::put_settings).layer(guards::require(&state, "memberships.manage"));
+    let public_member_signup = post(members::public_signup);
+    let public_member_signin = post(members::public_signin);
+    let public_member_signout = post(members::public_signout);
+    let public_member_me = get(members::public_me).merge(put(members::public_update_me));
+    let public_member_verify = get(members::public_verify);
+    let public_member_reset = post(members::public_password_reset);
+    let public_member_gate = get(members::public_gate);
+
     // Comments (REQ-064, slice 4a). Two powers and one public surface. `comments.read` opens
     // the inbox, `comments.manage` changes a row and edits the policy — and the two are
     // deliberately separate, because the value of the split is exactly the case where a site
@@ -1582,6 +1624,32 @@ pub fn router(state: AppState) -> Router {
             "/public/newsletter/{key}/subscribe",
             public_newsletter_subscribe,
         )
+        // Memberships (REQ-064, slice 4c). The panel is the table, the drawer and the policy;
+        // the `/public` half is the visitor's own signup, sign-in, profile, the two link clicks
+        // and the gate probe a theme asks before it draws a page. The per-site policy hangs off
+        // `/sites/{id}`, beside the other per-site surfaces.
+        //
+        // The literal segments are declared BEFORE `/members/{id}` so axum ranks
+        // `/members/settings`-style paths ahead of it — a route registered after a
+        // parameterised sibling is unreachable, and the visitor's sign-in is the one link a
+        // member area cannot afford to lose.
+        .route("/members", members_read)
+        .route("/members", members_create)
+        .route("/members/{id}", member_read.merge(member_write))
+        .route("/members/{id}/block", member_block)
+        .route("/members/{id}/verify", member_verify)
+        .route("/members/{id}/send-verification", member_send_verification)
+        .route("/members/{id}/send-reset", member_send_reset)
+        .route("/members/{id}/sign-out-everywhere", member_signout_everywhere)
+        .route("/sites/{site_id}/members/settings", member_settings_read)
+        .route("/sites/{site_id}/members/settings", member_settings_write)
+        .route("/public/members/signup", public_member_signup)
+        .route("/public/members/signin", public_member_signin)
+        .route("/public/members/signout", public_member_signout)
+        .route("/public/members/me", public_member_me)
+        .route("/public/members/verify", public_member_verify)
+        .route("/public/members/password-reset", public_member_reset)
+        .route("/public/members/gate", public_member_gate)
         // Comments (REQ-064, slice 4a). The inbox is `/comments`, the policy hangs off the site
         // it belongs to (`/sites/{id}/comment-settings`, beside the other per-site surfaces) and
         // the visitor's two routes live under `/public` where every unauthenticated surface on

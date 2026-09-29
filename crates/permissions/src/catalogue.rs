@@ -156,6 +156,25 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Create lists, import and export subscribers, change states, send issues",
     },
+    // Memberships (REQ-064, slice 4c). The split is the same one the comment and newsletter
+    // inboxes draw, and the argument is sharpest here: reading a member table already shows
+    // every address on the site AND every place they last signed in from. An account that may
+    // only look must not be able to unblock the one member it dislikes, mint a password reset
+    // for them, or delete them — those are powers over a person, not over a record.
+    //
+    // `memberships.manage` is also what changes the SITE's policy (signup on or off, whether
+    // verification is required, what a gated page answers). Gating decides who can read which
+    // published page, so whoever holds it can quietly make a page readable again.
+    PermissionDef {
+        key: "memberships.read",
+        category: "content",
+        description: "Read visitor accounts, their sign-in history and the membership policy",
+    },
+    PermissionDef {
+        key: "memberships.manage",
+        category: "content",
+        description: "Create, verify, block and delete members, send resets, change the site policy",
+    },
     // Media.
     PermissionDef {
         key: "media.read",

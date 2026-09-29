@@ -237,6 +237,24 @@ catalogue! {
     "A page's translation was published.",
     [("page_id", Uuid, req), ("site_id", Uuid, req), ("locale", String, req)];
 
+    // ---- Memberships (REQ-064, slice 4c) -----------------------------------------------------
+    // A member is a VISITOR, and these are visitor facts. The payloads carry ids and the
+    // site's own role words — never an address and never a name. An event travels to every
+    // subscriber on the bus, which is a much larger audience than the panel that shows the
+    // member table, so anything personal belongs in the audit log and not here.
+    "members.member.created", "content", Live,
+    "A visitor created a member account on the site.",
+    [("member_id", Uuid, req), ("site_id", Uuid, req), ("status", String, req)];
+    "members.member.verified", "content", Live,
+    "A member proved they own the address, or an operator vouched for them.",
+    [("member_id", Uuid, req), ("site_id", Uuid, req), ("status", String, req)];
+    "members.member.blocked", "content", Live,
+    "A member was blocked, and their live sessions were dropped with them.",
+    [("member_id", Uuid, req), ("site_id", Uuid, req), ("status", String, req)];
+    "members.member.signed_in", "content", Live,
+    "A member started a visitor session.",
+    [("member_id", Uuid, req), ("site_id", Uuid, req)];
+
     // ---- Media ---------------------------------------------------------------------------------
     // The upload fact is `media.created`, not `media.uploaded`. The registry is written from
     // what the code emits rather than from what the request imagined: renaming the row to

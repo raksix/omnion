@@ -598,6 +598,39 @@ impl From<ContentError> for ApiError {
                 "invalid_token",
                 "that link is not valid — it may have expired or already been used",
             ),
+            // Memberships (REQ-064, slice 4c). Every one of these is an explicit STATUS
+            // assignment rather than falling through to the catch-all's `invalid_request`,
+            // which is the trap the newsletter half above records: an unmapped variant turns a
+            // refused sign-in into "your request was malformed" and a cross-tenant member into a
+            // form mistake.
+            ContentError::InvalidMember(message) => Self::bad_request("invalid_member", message),
+            ContentError::MemberNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "member_not_found",
+                "no such member",
+            ),
+            // 409 and not 404, and the distinction matters: this variant is only ever returned
+            // by the PANEL's "add a member", where a signed-in operator has to be told their
+            // click did not work. The public signup catches it and answers 202 with the same
+            // body either way, so nothing is disclosed to a visitor.
+            ContentError::MemberEmailTaken(email) => Self::new(
+                StatusCode::CONFLICT,
+                "member_email_taken",
+                format!("{email} already has an account on this site"),
+            ),
+            // 401, not 403: the caller is not who they claim to be. And ONE message for the
+            // four refusals behind it (unknown address, wrong password, not verified,
+            // blocked) — a sign-in form that distinguishes them is a list of every address on
+            // the site and a way to find out which of them are members.
+            ContentError::InvalidCredentials => Self::unauthorized(
+                "invalid_credentials",
+                "that e-mail and password do not match an account here",
+            ),
+            ContentError::VerificationNotRequired => Self::bad_request(
+                "verification_not_required",
+                "this site does not require verification — turn it on in membership settings first",
+            ),
+            ContentError::WeakPassword(message) => Self::bad_request("weak_password", message),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }
