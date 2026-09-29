@@ -190,7 +190,7 @@ pub async fn create_alert_rule(
     State(state): State<AppState>,
     session: CurrentSession,
     Json(input): Json<AlertRuleInput>,
-) -> Result<Json<AlertRuleView>, ApiError> {
+) -> Result<(StatusCode, Json<AlertRuleView>), ApiError> {
     validate_rule(&input)?;
 
     let row: alerts::Rule = sqlx::query_as(
@@ -226,13 +226,25 @@ pub async fn create_alert_rule(
         .await
         .map_err(map_error)?
         .expect("the row was just written");
-    Ok(Json(AlertRuleView::from(alerts::RuleWithState {
-        rule: found,
-        state: None,
-        value: None,
-        silenced: false,
-        silenced_until: None,
-    })))
+    // `201` like every other create on this platform, and for the same reason `create_silence`
+    // below says it: `Json(..)` alone serializes as `200`, which is what a `GET` of the same
+    // resource answers. A walk asserted `201` against this route and got `200` — a create
+    // indistinguishable from a read, on a resource that the panel then re-fetches anyway.
+    //
+    // The rule is not "creates return 201" because the HTTP spec says so (`201` is optional
+    // without a `Location` header). It is that 34 other creates in this binary already do it, so a
+    // client that special-cases one create out of thirty-five is a client that will eventually be
+    // wrong about the one.
+    Ok((
+        StatusCode::CREATED,
+        Json(AlertRuleView::from(alerts::RuleWithState {
+            rule: found,
+            state: None,
+            value: None,
+            silenced: false,
+            silenced_until: None,
+        })),
+    ))
 }
 
 /// The rule patch. Every field is optional, but a misspelled one is still refused.
@@ -701,7 +713,7 @@ pub async fn create_silence(
     State(state): State<AppState>,
     session: CurrentSession,
     Json(input): Json<SilenceInput>,
-) -> Result<Json<SilenceView>, ApiError> {
+) -> Result<(StatusCode, Json<SilenceView>), ApiError> {
     if input.reason.trim().is_empty() {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -849,14 +861,22 @@ pub async fn create_silence(
         }
     }
 
-    Ok(Json(SilenceView::from(alerts::Silence {
-        id: row.id,
-        rule_id: row.rule_id,
-        reason: row.reason,
-        starts_at: row.starts_at,
-        ends_at: row.ends_at,
-        created_by: row.created_by,
-    })))
+    // `201` like every other create on this platform (`content.rs`, `iam.rs`, `iam_policy.rs`, …).
+    // `Json(..)` alone serializes as `200`, which is indistinguishable from the answer to a
+    // `GET` — so a client that creates a silence and a client that reads one get the same
+    // status, and only the body says which happened. The walk that found it asserted `201`
+    // against the documented shape and got `200` from a route that had never been exercised.
+    Ok((
+        StatusCode::CREATED,
+        Json(SilenceView::from(alerts::Silence {
+            id: row.id,
+            rule_id: row.rule_id,
+            reason: row.reason,
+            starts_at: row.starts_at,
+            ends_at: row.ends_at,
+            created_by: row.created_by,
+        })),
+    ))
 }
 
 fn end_before_start(ends_at: OffsetDateTime, starts_at: OffsetDateTime) -> bool {
@@ -941,7 +961,11 @@ pub struct SettingsCapsView {
 }
 
 /// One per-module raise, resolved against the clock.
-#[derive(Debug, Serialize)]
+// `Clone` because the save path hands the expired entries back to the view builder by value: the
+// entry is resolved once, written to the row in its non-expired form, and returned to the caller
+// in its expired one — two consumers of one resolution, and re-resolving to get the second would
+// read a clock that has already moved past it.
+#[derive(Debug, Clone, Serialize)]
 pub struct LevelOverrideView {
     /// The module path prefix.
     pub target: String,
@@ -1124,6 +1148,27 @@ pub async fn read_observability_settings(
     _session: CurrentSession,
 ) -> Result<Json<ObservabilitySettingsView>, ApiError> {
     let pool = state.db().pool();
+    settings_view(pool, &[]).await.map(Json)
+}
+
+/// The one settings body, plus any expired override the caller should still be shown.
+///
+/// `expired` is the argument because of a disagreement the save path and the read path used to
+/// have. The write resolves the submitted overrides, marks an entry whose `expires_at` has
+/// passed as `expired: true`, and then **does not store it** — so a plain re-read afterwards
+/// cannot show it, because it is gone. That made the answer to "you raised `omnion_secrets` to
+/// `trace`" a response listing no raises at all: correct about the row, useless to the operator
+/// who pressed the button, and the screen could not tell them the raise they just made was
+/// already dead.
+///
+/// The acceptance line for this behaviour says the expired override is "returned to the panel as
+/// `expired: true` and is NOT written back", which is two claims about two different things —
+/// the row and the answer. So the answer carries the entry (`expired: true`) and the row does not
+/// carry it, and the caller's screen shows a greyed-out raise that is already back at the default.
+async fn settings_view(
+    pool: &sqlx::PgPool,
+    expired: &[LevelOverrideView],
+) -> Result<ObservabilitySettingsView, ApiError> {
     let row: SettingsRow = sqlx::query_as(
         "select sampling_ratio, logs_retention_days, traces_retention_days, log_level_default, \
                 log_level_overrides, cardinality_budget, prometheus_public \
@@ -1152,9 +1197,14 @@ pub async fn read_observability_settings(
         cardinality_budget: i64::from(row.cardinality_budget),
         prometheus_public: row.prometheus_public,
     };
-    let level_overrides = input.resolve_overrides(now)?;
+    let resolved = input.resolve_overrides(now)?;
+    // The caller's expired entries come last and are appended rather than merged in: they are not
+    // in the row, so a `dedup` would be a policy this file does not need, and a caller that passed
+    // one has already decided it wants to see it.
+    let mut level_overrides = resolved;
+    level_overrides.extend_from_slice(expired);
 
-    Ok(Json(ObservabilitySettingsView {
+    Ok(ObservabilitySettingsView {
         sampling_ratio: row.sampling_ratio,
         // The columns are `int` and the view is `i64`, so every number in the JSON body has the
         // same width. A client that had to know which Postgres type was behind each field is a
@@ -1178,7 +1228,7 @@ pub async fn read_observability_settings(
              own authentication is held in the secret store — never in this screen."
                 .to_owned(),
         level_overrides,
-    }))
+    })
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1287,6 +1337,13 @@ pub async fn save_observability_settings(
 
     let overrides = input.resolve_overrides(OffsetDateTime::now_utc())?;
     let stored = input.compacted(&overrides);
+    // What the caller submitted but the row will not keep, so the answer can say "this raise has
+    // already expired" instead of silently listing no raises at all. See `settings_view`.
+    let expired: Vec<LevelOverrideView> = overrides
+        .iter()
+        .filter(|row| row.expired)
+        .cloned()
+        .collect();
 
     sqlx::query(
         "update obs_log_settings set \
@@ -1378,7 +1435,7 @@ pub async fn save_observability_settings(
     .await
     .map_err(audit_error)?;
 
-    read_observability_settings(State(state), session).await
+    settings_view(pool, &expired).await.map(Json)
 }
 
 /* ── the bundle manifest ─────────────────────────────────────────────────────────────────────── */
