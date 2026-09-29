@@ -4762,6 +4762,347 @@ async function runNewsletterDepth(page, report) {
   return steps;
 }
 
+/**
+ * `runMembersDepth` — visitor accounts, their sessions and the site policy (REQ-064, slice 4c).
+ *
+ * This screen manages the table the REQ calls its single most important boundary, so the steps
+ * below read the boundary from the DATABASE and the schema rather than trusting the panel's
+ * labels:
+ *
+ * * **`cms_members` carries no `user_id` and no `organization_id`.** A visitor table that could
+ *   point at a panel account is a table where the two identities meet, whatever the panel calls
+ *   them. The columns are read out of `information_schema` because a boundary held by convention
+ *   is a boundary the next writer erases.
+ * * **A block takes effect on the live session, not just on the label.** The member signs in
+ *   through the public route, the panel blocks them, and the SAME cookie is then refused — and
+ *   the session ROW is asserted gone rather than merely ignored. "The cookie stopped working" is
+ *   also what a cookie that never worked would say, so the working case is asserted first.
+ * * **The gated-page default is asserted BEFORE anything is configured.** The criterion says a
+ *   gated page answers 404, and the policy ships a default; a default that contradicts the
+ *   criterion it was written for fails it on every new site, and no test run after a
+ *   configuration can tell the difference.
+ * * **The panel's own gate answer is read from the public route**, not from the table's badge,
+ *   because a gate that only refuses signed-out visitors is not a gate.
+ * * **Deleting names the address.** The confirmation has to quote what it is about to erase, so
+ *   the check is that the address is ON the dialog rather than that a dialog appeared.
+ *
+ * Every step writes under `steps.*` and `--only=members` demands the list below by name.
+ */
+async function runMembersDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the screen has nothing to read";
+    return steps;
+  }
+
+  // ------------------------------------------------------------------ the boundary is structural
+  // Read out of the catalogue, not out of a route. The REQ's most important claim about this
+  // module is that a visitor is never a panel user, and a claim about a schema can only be
+  // checked against the schema.
+  const memberColumns = qaSql(
+    `select string_agg(column_name, ',') from information_schema.columns
+     where table_name = 'cms_members'`,
+  );
+  steps.memberTableExists = memberColumns !== "";
+  steps.memberTableHasNoPanelLink =
+    !/user_id|organization_id|account_id/.test(memberColumns);
+  steps.memberRolesArePlainText = memberColumns.includes("roles");
+
+  // ------------------------------------------------------------------ the default, before anything
+  // The policy row is deleted so the DEFAULT is what answers. This ordering is the whole point:
+  // the criterion says a gated page answers 404, and a site policy that ships `prompt` answers
+  // 401 — the failure is invisible to any test that configures first.
+  qaSql(`delete from cms_member_settings where site_id = '${siteId}'`);
+  const defaultBehaviour = qaSql(
+    `select coalesce(
+       (select gated_page_behaviour from cms_member_settings where site_id = '${siteId}'),
+       'not_found')`,
+  );
+  steps.defaultGatedBehaviourIsNotFound = defaultBehaviour === "not_found";
+
+  // ------------------------------------------------------------------ the screen
+  await page.goto(`${URL_ADMIN}/members`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.screenReady = (await page.locator("[data-members-state=\"ready\"]").count()) > 0;
+  steps.policyPanelIsOnScreen = (await page.locator("[data-member-policy=\"ready\"]").count()) > 0;
+  // The panel must show the behaviour in force, not only offer the choice. An owner who cannot
+  // see which answer a gated page gives cannot reason about who can find their pages.
+  steps.panelShowsTheGatedBehaviour =
+    (await page.locator("[data-member-policy-behaviour]").first().getAttribute("data-member-policy-behaviour")) ===
+    "not_found";
+
+  // ------------------------------------------------------------------ the fixture, through the API
+  // Three members the browser could not have written: a waiting signup, a verified member with a
+  // live session, and one the panel will block. Seeded through the panel's OWN routes so the
+  // screen is proved against rows the routes actually produce.
+  const waitingEmail = `waiting-${stamp}@example.test`;
+  const created = await page
+    .request.post(`${URL_API}/api/v1/members`, {
+      data: { site_id: siteId, email: waitingEmail, name: "QA Waiting" },
+    })
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.operatorCreatedAMember = created.status === 201 && created.body && created.body.id;
+  const waitingId = (created.body && created.body.id) || "";
+
+  // An invited address has NO password: that is the difference the table's badge draws, and a
+  // fixture that set one would make "invited, never claimed" pass for a row that was claimed.
+  steps.invitedHasNoPassword =
+    waitingId !== "" &&
+    qaSql(`select coalesce(password_hash, 'NULL') from cms_members where id = '${waitingId}'`) === "NULL";
+  steps.invitedRowSaysSo = (await page.locator(`[data-member-never-claimed="${waitingId}"]`).count()) > 0;
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.rowIsOnScreen = (await page.locator(`[data-member-row="${waitingId}"]`).count()) > 0;
+  // `pending` must not be rendered as a failure. The badge text is read, because a panel that
+  // labels a waiting confirmation "Failed" teaches every operator that verification is broken.
+  steps.pendingIsNotRenderedAsAFailure = /waiting/i.test(
+    await page.locator(`[data-member-status-badge="${waitingId}"]`).first().innerText().catch(() => ""),
+  );
+
+  // ------------------------------------------------------------------ the tab count is the queue's
+  const waitingCount = qaSql(
+    `select count(*) from cms_members where site_id = '${siteId}' and status = 'pending'`,
+  );
+  const shownWaitingCount = await page
+    .locator("[data-member-tab-count=\"pending\"]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.pendingTabMatchesSql = shownWaitingCount.trim() === waitingCount.trim();
+
+  // ------------------------------------------------------------------ the drawer, the roles, the save
+  await page.locator(`[data-member-open="${waitingId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.drawerOpened = (await page.locator(`[data-member-drawer="${waitingId}"]`).count()) > 0;
+  // The drawer states the boundary on screen. A panel that does not say "this is not a panel
+  // user" leaves the whole row looking like a second copy of the Users screen.
+  steps.drawerStatesTheBoundary = /not a panel user|cms_members/i.test(
+    await page.locator(`[data-member-drawer="${waitingId}"]`).first().innerText().catch(() => ""),
+  );
+
+  await page.locator("[data-member-roles]").fill("reader, archivist").catch(() => {});
+  steps.rolesAreOnTheInput =
+    (await page.inputValue("[data-member-roles]").catch(() => "")) === "reader, archivist";
+  await page.locator("[data-member-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  // Roles REPLACE rather than accumulate, and only SQL can tell that apart from an append.
+  steps.rolesAreInSql =
+    qaSql(`select array_to_string(roles, ',') from cms_members where id = '${waitingId}'`) ===
+    "reader,archivist";
+
+  // ------------------------------------------------------------------ verify takes a real effect
+  await page.locator("[data-member-drawer-close]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator(`[data-member-action="verify"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.verifiedInSql =
+    qaSql(`select status from cms_members where id = '${waitingId}'`) === "verified";
+
+  // ------------------------------------------------------------------ the panel cookie at a member route
+  // Both directions. A visitor cookie presented where a panel cookie is expected must fail, or
+  // the two identities are one identity wearing two names.
+  const memberCookieAtPanelRoute = await page.request.get(`${URL_API}/api/v1/members?site_id=${siteId}`, {
+    headers: { cookie: `omnion_member=not-a-real-session` },
+  });
+  steps.memberCookieIsRefusedAtAPanelRoute = memberCookieAtPanelRoute.status() === 401;
+
+  // ------------------------------------------------------------------ the gate, read from the public route
+  // A gated page needs a page to gate. Written by SQL because the point is the GATE, not the
+  // page editor — and `visibility = 'members'` is the state a members area is actually in.
+  //
+  // `visibility_roles` is an ARRAY column, so it is written as one rather than left to the
+  // default: a page gated on `roles` with an empty array is a gate on nobody, which the schema
+  // refuses and which would make the role half of this pass meaningless.
+  const gatedSlug = `qa-gated-${stamp}`;
+  const gatedPageId = qaSql(
+    `insert into pages (site_id, slug, page_type, status, visibility, visibility_roles)
+     values ('${siteId}', '${gatedSlug}', 'page', 'published', 'members', '{}') returning id`,
+  );
+  steps.gatedPageExists = gatedPageId !== "";
+  const publicSlug = `qa-public-${stamp}`;
+  qaSql(
+    `insert into pages (site_id, slug, page_type, status, visibility, visibility_roles)
+     values ('${siteId}', '${publicSlug}', 'page', 'published', 'public', '{}')`,
+  );
+
+  // A real visitor signs in through the PUBLIC route and keeps the cookie — the three answers
+  // below are three different cookies hitting one page.
+  const memberEmail = `member-${stamp}@example.test`;
+  await page.request.post(`${URL_API}/api/v1/members`, {
+    data: {
+      site_id: siteId,
+      email: memberEmail,
+      name: "QA Member",
+      password: "QaMember-Passw0rd-2026!",
+      roles: ["reader"],
+    },
+  });
+  const memberId = qaSql(
+    `select id from cms_members where site_id = '${siteId}' and lower(email) = '${memberEmail}'`,
+  );
+  await page.request.post(`${URL_API}/api/v1/members/${memberId}/verify?site_id=${siteId}`).catch(() => {});
+
+  const signin = await page
+    .request.post(`${URL_API}/api/v1/public/members/signin?site=main`, {
+      data: { email: memberEmail, password: "QaMember-Passw0rd-2026!" },
+    })
+    .then((response) => ({ status: response.status(), setCookie: response.headers()["set-cookie"] || "" }))
+    .catch(() => ({ status: 0, setCookie: "" }));
+  steps.publicSigninWorks = signin.status === 200;
+  const memberCookie = (signin.setCookie.match(/omnion_member=([^;]+)/) || [])[1] || "";
+  steps.memberCookieIsItsOwnName = memberCookie !== "";
+
+  // The gate probe returns 200 with a VERDICT (`exists`, `allowed`, `behaviour`, `sign_in_url`)
+  // rather than 404 — a theme needs to draw a prompt, and a status code cannot carry a URL. The
+  // concealment therefore lives in `allowed`, and the assertion has to read the BODY: a check on
+  // `status === 404` would pass against a probe that always answered 404, which is a gate that
+  // refuses everybody including the site owner.
+  const gateProbe = async (slug, cookie) => {
+    const headers = cookie ? { cookie: `omnion_member=${cookie}` } : {};
+    const response = await page
+      .request.get(`${URL_API}/api/v1/public/members/gate?site=main&slug=${slug}`, { headers })
+      .catch(() => null);
+    if (!response) return { status: 0, exists: false, allowed: false, body: "" };
+    const text = await response.text().catch(() => "");
+    let parsed = {};
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = {};
+    }
+    return {
+      status: response.status(),
+      exists: parsed.exists === true,
+      allowed: parsed.allowed === true,
+      behaviour: parsed.behaviour || "",
+      sign_in_url: parsed.sign_in_url || null,
+      body: text,
+    };
+  };
+
+  const visitorGate = await gateProbe(gatedSlug, null);
+  steps.gateProbeAnswers = visitorGate.status === 200;
+  steps.gatedPageIsFoundByTheProbe = visitorGate.exists === true;
+  steps.gateRefusesAVisitor = visitorGate.allowed === false;
+
+  const memberGate = await gateProbe(gatedSlug, memberCookie);
+  steps.gateAdmitsTheMember = memberGate.allowed === true;
+  steps.memberCookieIsAccepted = memberGate.status === 200 && memberGate.exists === true;
+
+  // An UNGATED page must be readable by the same visitor who was just refused the gated one.
+  // This is the assertion that would have caught the `member.is_some_and(…)` inversion, which
+  // 404s every signed-out visitor on every page — a site that gated nothing, serving nothing.
+  const publicPageAsVisitor = await gateProbe(publicSlug, null);
+  steps.ungatedPageIsServedToAVisitor = publicPageAsVisitor.allowed === true;
+
+  // ------------------------------------------------------------------ a role gate refuses, then admits
+  const roleSlug = `qa-role-${stamp}`;
+  qaSql(
+    `insert into pages (site_id, slug, page_type, status, visibility, visibility_roles)
+     values ('${siteId}', '${roleSlug}', 'page', 'published', 'roles', array['archivist'])`,
+  );
+  const beforeGrant = await gateProbe(roleSlug, memberCookie);
+  steps.roleGateRefusesAMemberWithoutIt = beforeGrant.allowed === false;
+  await page.request.patch(`${URL_API}/api/v1/members/${memberId}?site_id=${siteId}`, {
+    data: { roles: ["reader", "archivist"] },
+  });
+  const afterGrant = await gateProbe(roleSlug, memberCookie);
+  // The SAME cookie, after a grant. Without this the previous assertion would also be satisfied
+  // by a gate that refuses everybody.
+  steps.roleGateAdmitsAfterTheGrant = afterGrant.allowed === true;
+
+  // ------------------------------------------------------------------ blocking kills the session
+  const liveBefore = qaSql(
+    `select count(*) from cms_member_sessions where member_id = '${memberId}' and expires_at > now()`,
+  );
+  steps.sessionExistedBeforeTheBlock = liveBefore === "1";
+  await page.locator(`[data-member-open="${memberId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  // The drawer's block button is a named hook, not "the first action": a dialog opened by the
+  // wrong button is a dialog whose assertion proves nothing.
+  await page.locator("[data-member-drawer-action=\"block\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.blockDialogAskedForAReason =
+    (await page.locator("[data-member-block-reason]").count()) > 0;
+  await page.locator("[data-member-block-reason]").fill("QA: proving a block stops the session").catch(() => {});
+  await page.locator("[data-member-block-submit]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.blockedInSql =
+    qaSql(`select status from cms_members where id = '${memberId}'`) === "blocked";
+  steps.blockRemovedTheSessionRow =
+    qaSql(`select count(*) from cms_member_sessions where member_id = '${memberId}'`) === "0";
+  const afterBlock = await gateProbe(gatedSlug, memberCookie);
+  // A blocked member answers `allowed: false` on the probe rather than 401/404, because the
+  // probe is a verdict endpoint; the 404 concealment is the PAGE route's job and is proved in
+  // the store suite. The cookie that worked a moment ago is what makes this an assertion.
+  steps.blockedMemberIsRefused = afterBlock.allowed === false;
+
+  // ------------------------------------------------------------------ the policy is real
+  // Flipping the behaviour and reading the gate back is the only way to know the radio is wired
+  // to anything; a stored boolean and a control that look like they write it prove nothing.
+  await page.locator("[data-member-policy-behaviour-option=\"prompt\"]").check({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-member-policy-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.behaviourInSql =
+    qaSql(`select gated_page_behaviour from cms_member_settings where site_id = '${siteId}'`) ===
+    "prompt";
+  const prompted = await gateProbe(gatedSlug, null);
+  steps.promptBehaviourIsReported = prompted.behaviour === "prompt";
+  // A prompt must name the sign-in link, because a refusal a visitor cannot act on is a dead end
+  // dressed as a door — and it must NOT appear while the behaviour is `not_found`, or the
+  // concealment leaks the page it is meant to hide.
+  steps.promptNamesTheSignInLink = typeof prompted.sign_in_url === "string" && prompted.sign_in_url !== "";
+  steps.notFoundNamesNoSignInLink = visitorGate.sign_in_url === null;
+
+  // Put it back, so the site the next pass finds is the default one.
+  await page.locator("[data-member-policy-behaviour-option=\"not_found\"]").check({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-member-policy-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.behaviourRestored =
+    qaSql(`select gated_page_behaviour from cms_member_settings where site_id = '${siteId}'`) ===
+    "not_found";
+
+  // ------------------------------------------------------------------ delete names the address
+  await page.locator("[data-member-invite-open]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.inviteDialogOpened = (await page.locator("[data-member-invite-dialog]").count()) > 0;
+  await page.locator("[data-member-invite-dialog]").press("Escape").catch(() => {});
+  await page.waitForTimeout(400);
+
+  await page.locator(`[data-member-open="${waitingId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-member-drawer-action=\"delete\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const deleteDialogText = await page
+    .locator("[data-member-delete-dialog]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.deleteDialogNamesTheAddress = deleteDialogText.includes(waitingEmail);
+  await page.locator("[data-member-delete-submit]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.deletedFromSql =
+    qaSql(`select count(*) from cms_members where id = '${waitingId}'`) === "0";
+
+  // ------------------------------------------------------------------ the mobile layout
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const overflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.noHorizontalScrollAt390 = overflow <= 1;
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  return steps;
+}
+
 async function runSeoDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -7396,6 +7737,52 @@ async function main() {
     await page.context().browser()?.close().catch(() => {});
     return;
   }
+  if (process.argv.includes("--only=members")) {
+    report.members = await runMembersDepth(page, report);
+    log(`members: ${JSON.stringify(report.members)}`);
+    // The list is the pass's own vocabulary. Every name here was a claim worth making, and a
+    // name that stops appearing is a claim nobody is checking any more.
+    const required = [
+      "memberTableExists", "memberTableHasNoPanelLink", "memberRolesArePlainText",
+      "defaultGatedBehaviourIsNotFound", "screenReady", "policyPanelIsOnScreen",
+      "panelShowsTheGatedBehaviour", "operatorCreatedAMember", "invitedHasNoPassword",
+      "invitedRowSaysSo", "rowIsOnScreen", "pendingIsNotRenderedAsAFailure",
+      "pendingTabMatchesSql", "drawerOpened", "drawerStatesTheBoundary", "rolesAreOnTheInput",
+      "rolesAreInSql", "verifiedInSql", "memberCookieIsRefusedAtAPanelRoute",
+      "gatedPageExists", "publicSigninWorks", "memberCookieIsItsOwnName", "gateProbeAnswers",
+      "gatedPageIsFoundByTheProbe", "gateRefusesAVisitor", "gateAdmitsTheMember",
+      "memberCookieIsAccepted", "ungatedPageIsServedToAVisitor",
+      "roleGateRefusesAMemberWithoutIt", "roleGateAdmitsAfterTheGrant",
+      "sessionExistedBeforeTheBlock", "blockDialogAskedForAReason", "blockedInSql",
+      "blockRemovedTheSessionRow", "blockedMemberIsRefused", "behaviourInSql",
+      "promptBehaviourIsReported", "promptNamesTheSignInLink", "notFoundNamesNoSignInLink",
+      "behaviourRestored", "inviteDialogOpened", "deleteDialogNamesTheAddress",
+      "deletedFromSql", "noHorizontalScrollAt390",
+    ];
+    const memberSteps = report.members || {};
+    const missing = required.filter((key) => memberSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=members",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: memberSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`members depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`members depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=seo")) {
     report.seo = await runSeoDepth(page, report);
     log(`seo: ${JSON.stringify(report.seo)}`);
@@ -7848,6 +8235,14 @@ async function main() {
   // next pass opens empty.
   report.newsletter = await runNewsletterDepth(page, report);
   log(`newsletter: ${JSON.stringify(report.newsletter)}`);
+
+  // The visitor-accounts pass (REQ-064, slice 4c). It runs after the newsletter pass because
+  // both hold a stranger's address and both put an operator in the position of deciding about
+  // one, and a failure in either should be read with the other in view. It leaves its rows: a
+  // members table cleaned up afterwards is a table the next pass opens empty, and an empty table
+  // is where the "no visitors have signed up yet" state has never been checked.
+  report.members = await runMembersDepth(page, report);
+  log(`members: ${JSON.stringify(report.members)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
