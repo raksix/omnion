@@ -1174,6 +1174,79 @@ export type CdnCacheRule = {
   updated_at: string;
 };
 
+/** One row of the event feed, as `/api/v1/events` answers it. */
+export type EventRow = {
+  id: number;
+  name: string;
+  organization_id: string | null;
+  site_id: string | null;
+  actor_user_id: string | null;
+  payload: unknown;
+  created_at: string;
+};
+
+/** One page of the feed: the rows plus the keyset the next page is read with. */
+export type EventPage = {
+  events: EventRow[];
+  /** Id of the last row, to pass back as `cursor`. `null` at the end of the feed. */
+  next_cursor: number | null;
+  /** Whether a further page exists behind this one. */
+  has_more: boolean;
+};
+
+/** What narrows the feed. Every field is optional; set fields are combined with AND. */
+export type EventFilters = {
+  /** Exact names, any of which may match. */
+  name?: string[];
+  site_id?: string;
+  actor_user_id?: string;
+  /** RFC 3339 lower bound. */
+  from?: string;
+  /** RFC 3339 upper bound. */
+  to?: string;
+  /** Keyset cursor: the previous page's last row id. */
+  cursor?: number;
+  limit?: number;
+};
+
+/** One payload field of one event name, as the catalogue describes it. */
+export type CatalogueField = {
+  name: string;
+  kind: "uuid" | "string" | "integer" | "boolean" | "timestamp" | "json" | "any";
+  required: boolean;
+};
+
+/** One entry of the event catalogue. */
+export type CatalogueEntry = {
+  name: string;
+  area: string;
+  group: string;
+  description: string;
+  status: "live" | "reserved";
+  payload_fields: CatalogueField[];
+  /** Deliveries this name produced in the last 24 hours, for this organization. */
+  deliveries_24h: number;
+};
+
+/** ---------------------------------------------------------------------------------------------
+ * The webhook endpoints and their delivery history (REQ-016, slice 2).
+ * ------------------------------------------------------------------------------------------- */
+
+/** One endpoint as the API describes it. `secret` is present exactly once, at creation. */
+export type WebhookEndpoint = {
+  id: string;
+  organization_id: string;
+  name: string;
+  url: string;
+  /** Expanded subscription list, including every name a group wildcard covers. */
+  events: string[];
+  enabled: boolean;
+  /** Shown only in the creation response. Every other read omits the key entirely. */
+  secret?: string;
+  created_at: string;
+  updated_at: string;
+};
+
 /** What the rule form sends. Every field is optional and folded onto the stored row. */
 export type CdnCacheRuleInput = {
   site_id: string;
@@ -1401,4 +1474,95 @@ export type CdnProviderProbe = {
   latency_ms: number;
   status: number | null;
   message: string;
+};
+
+/** Every endpoint this account may see. */
+export type WebhookList = { webhooks: WebhookEndpoint[] };
+
+/** What a test delivery queued. */
+export type WebhookTestReport = { event_id: number; deliveries: number };
+
+/** A rotation's answer: the endpoint, and the one secret it will ever show again. */
+export type WebhookRotation = WebhookEndpoint & { secret: string };
+
+/** One queued delivery, as the history read describes it. */
+export type WebhookDelivery = {
+  id: string;
+  event_id: number;
+  event_name: string;
+  status: "pending" | "delivered" | "failed";
+  attempts: number;
+  max_attempts: number;
+  next_attempt_at: string;
+  response_status: number | null;
+  error: string | null;
+  delivered_at: string | null;
+  created_at: string;
+  /** What asked for this row: the bus, an operator's test, or a forced replay. */
+  trigger: "event" | "test" | "replay";
+  /** How long the receiver took. `null` until the row has run. */
+  duration_ms: number | null;
+  redeliver_count: number;
+  replayed_at: string | null;
+};
+
+/** The keyset one page hands to the next. Both halves, or the API refuses it. */
+export type WebhookDeliveryCursor = { at: string; id: string };
+
+/** One page of a delivery history. */
+export type WebhookDeliveryPage = {
+  deliveries: WebhookDelivery[];
+  /** How many rows the filter matches, so the table can say "25 of 340". */
+  total: number;
+  has_more: boolean;
+  next_cursor: WebhookDeliveryCursor | null;
+};
+
+/** What narrows a delivery history. Set fields combine with AND; `status` and `name` are OR. */
+export type WebhookDeliveryFilters = {
+  /** Statuses, any of which may match. */
+  status?: string[];
+  /** Event names, any of which may match. */
+  name?: string[];
+  from?: string;
+  to?: string;
+  /** Substring of the delivery id or the event name. */
+  q?: string;
+  cursor_at?: string;
+  cursor_id?: string;
+  limit?: number;
+};
+
+/** One row of a bulk redelivery that did not move, and why. */
+export type WebhookRedeliverSkip = { delivery_id: string; code: string; message: string };
+
+/** A bulk redelivery's answer: what moved, and what did not with a reason each. */
+export type WebhookRedeliverBatch = { queued: number; skipped: WebhookRedeliverSkip[] };
+
+/** What an endpoint's receiver has been doing. */
+export type WebhookStats = {
+  window_hours: number;
+  /** Settled **traffic** rows the receiver accepted; test rows are excluded. */
+  delivered: number;
+  /** Settled traffic rows that ran out of attempts; test rows are excluded. */
+  failed: number;
+  /** Rows still waiting, whatever their age. */
+  pending: number;
+  /** Every row in the window, tests included. */
+  total: number;
+  /** Rows an operator asked for by hand, reported apart from the rate. */
+  tests: number;
+  /** Share of settled traffic rows accepted; `null` when none settled. */
+  success_rate: number | null;
+  /** 95th percentile receiver duration; `null` when nothing ran. */
+  p95_duration_ms: number | null;
+};
+
+/** The whole catalogue, grouped by area for the picker. */
+export type EventCatalogue = {
+  areas: string[];
+  events: CatalogueEntry[];
+  live_count: number;
+  reserved_count: number;
+  max_subscriptions: number;
 };

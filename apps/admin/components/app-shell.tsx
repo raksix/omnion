@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X, type LucideIcon } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -36,6 +36,15 @@ const NAV: readonly NavItem[] = [
   // overview would otherwise light up for the whole section and the active entry would be
   // whichever the reader happened to be furthest from.
   { href: "/cdn", label: "CDN", icon: Gauge },
+  // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
+  // Settings because both answer the same question from the bus's side — "what does the
+  // platform think happened" and "who was told" — and an operator chasing a missing webhook
+  // needs both on the same shelf.
+  { href: "/events", label: "Events", icon: Activity },
+  // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
+  // rather than under Settings because the two are the same investigation from both ends:
+  // the feed says what happened, this says who was told and whether they got it.
+  { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
   { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },

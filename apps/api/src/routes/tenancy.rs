@@ -542,6 +542,26 @@ pub async fn update_site(
     let site = site_in_scope_for_write(&state, &current, site_id).await?;
     let updated = sites::update_site(state.db().pool(), site.id, &body.changes()).await?;
 
+    // Archiving is a different fact from editing and is worth its own name: a receiver that
+    // has to stop serving a hostname, drain a cache or close an index entry keys off it, and
+    // a rename tells it nothing. Emitted only on the transition, so a rename does not lie
+    // about an archive that did not happen.
+    if site.status != "archived" && updated.status == "archived" {
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new("site.archived")
+                .organization(updated.organization_id)
+                .site(updated.id)
+                .actor(current.user.id)
+                .payload(json!({
+                    "site_id": updated.id,
+                    "key": updated.key,
+                    "name": updated.name,
+                })),
+        )
+        .await?;
+    }
+
     // A rename or a theme change is worth finding again: the index re-reads the site row.
     bus::emit(
         state.db().pool(),
@@ -633,6 +653,24 @@ pub async fn add_domain(
     let site = site_in_scope_for_write(&state, &current, site_id).await?;
     let domain = sites::add_domain(state.db().pool(), site.id, &body.host, body.is_primary).await?;
 
+    // A hostname appearing is a fact a receiver acts on: certificate automation, cache
+    // invalidation, a reindex. The site supplies the organization, so the delivery can only
+    // reach endpoints of the organization that owns the site.
+    emit(
+        &state,
+        NewEvent::new("domain.added")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "domain_id": domain.id,
+                "site_id": site.id,
+                "hostname": domain.host,
+                "is_primary": domain.is_primary,
+            })),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "site.domain.added")
@@ -686,6 +724,23 @@ pub async fn remove_domain(
         ));
     };
 
+    // The host goes out with the row, so the payload carries the hostname itself: a receiver
+    // cannot look the name up afterwards, and the hostname is the only key it holds.
+    emit(
+        &state,
+        NewEvent::new("domain.removed")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(json!({
+                "domain_id": removed.id,
+                "site_id": site.id,
+                "hostname": removed.host,
+                "was_primary": removed.is_primary,
+            })),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "site.domain.removed")
@@ -702,6 +757,26 @@ pub async fn remove_domain(
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// Record a tenancy fact on the platform's bus (REQ-016 slice 2).
+///
+/// The domain lifecycle used to be audit-only: an operator could read the trail, but software
+/// watching the platform never heard a hostname appear or disappear. A host is exactly the
+/// kind of fact another system needs in real time — to issue a certificate, invalidate a cache,
+/// or drop an address from an index — so it goes on the bus like every other name the
+/// catalogue lists.
+async fn emit(state: &AppState, event: NewEvent) -> Result<(), ApiError> {
+    let report = bus::emit(state.db().pool(), event).await?;
+
+    tracing::debug!(
+        event_id = report.event.id,
+        deliveries = report.deliveries,
+        name = %report.event.name,
+        "tenancy event recorded"
+    );
+
+    Ok(())
+}
 
 /// Write an audit row; a privileged action is not reported as successful without one.
 async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
