@@ -147,6 +147,14 @@ pub struct ExecutionSummary {
     pub finished_at: Option<OffsetDateTime>,
     /// Error of the failing step, when the run failed.
     pub error: Option<String>,
+    /// The graph node the run was started at, when it was started with *Run from here*.
+    ///
+    /// `None` for a whole run. It is on the summary rather than only the detail because
+    /// the run *list* is where an operator asks "which of these did I start halfway
+    /// down?" — a list of runs that cannot tell a full run from a partial one shows the
+    /// same two rows and the reader has to open each one to find out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_from_node: Option<String>,
 }
 
 impl ExecutionSummary {
@@ -161,6 +169,7 @@ impl ExecutionSummary {
             started_at: execution.started_at,
             finished_at: execution.finished_at,
             error: execution.error.clone(),
+            started_from_node: execution.started_from_node.clone(),
         }
     }
 }
@@ -178,6 +187,22 @@ pub struct StepBody {
     pub action: Option<String>,
     /// `pending`, `running`, `waiting`, `succeeded`, `failed` or `cancelled`.
     pub status: String,
+    /// The graph node this step came from, when the rule was started from a graph.
+    ///
+    /// This is what paints the status pill on the builder canvas, and it is emitted
+    /// whenever the column is set rather than only for graph rules: a step whose node is
+    /// unknown must read as "no node" on the client, and a `null` that had to be
+    /// distinguished from an absent key is a distinction a client will eventually get
+    /// wrong. Rules defined before the builder carry `None` here and are the reason this
+    /// field is optional rather than defaulted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Why a `skipped` step did not run, in the run's own words (REQ-004 slice 3).
+    ///
+    /// The trace's whole claim is that it says *why*, and a reason is only a reason if it
+    /// reaches the reader unedited — the server writes it, so the server sends it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
     /// Attempts made so far.
     pub attempts: i32,
     /// Attempts allowed in total.
@@ -213,6 +238,8 @@ impl StepBody {
             kind: step.kind.clone(),
             action: step.action.clone(),
             status: step.status.clone(),
+            node_id: step.node_id.clone(),
+            skip_reason: step.skip_reason.clone(),
             attempts: step.attempts,
             max_attempts: step.max_attempts,
             on_error: step.on_error.clone(),

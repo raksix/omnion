@@ -1865,5 +1865,60 @@ async fn run_from_here_starts_at_the_node_and_marks_the_prefix_skipped() {
         unknown.body
     );
 
+    // The two fields the canvas paints with, read off the *response body* rather than off
+    // the database. Both were stored correctly and neither was on the wire, which is the
+    // shape of bug a row-level test cannot see: the write worked, the read did not, and
+    // the builder had nothing to paint with.
+    let detail = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflow-executions/{execution_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        detail.status,
+        StatusCode::OK,
+        "the run must be readable: {}",
+        detail.body
+    );
+    assert_eq!(
+        detail.body["started_from_node"], "b",
+        "the run has to say where it started: {}",
+        detail.body
+    );
+
+    let steps = detail.body["steps"]
+        .as_array()
+        .expect("a run's steps are an array");
+    let skipped_on_wire = steps
+        .iter()
+        .find(|step| step["status"] == "skipped")
+        .unwrap_or_else(|| panic!("the skipped step is on the wire: {steps:?}"));
+    assert_eq!(
+        skipped_on_wire["node_id"], "a",
+        "a step has to name the node it came from, or the canvas cannot paint it: \
+         {skipped_on_wire}"
+    );
+    assert!(
+        skipped_on_wire["skip_reason"].as_str().unwrap_or_default().contains("\"b\""),
+        "the reason reaches the client verbatim — the trace's whole claim is that it says \
+         WHY, and a reason that only exists in a column is not one: {skipped_on_wire}"
+    );
+
+    // A run whose steps are all attributed to a node, so the canvas has something to key
+    // on. A step with a null node is not an error — a rule defined before the builder has
+    // none — but it must be *absent* rather than an empty string, or a client that keys on
+    // the value will paint one card with a status belonging to no node.
+    assert!(
+        steps
+            .iter()
+            .all(|step| step["node_id"].is_null() || step["node_id"].is_string()),
+        "node_id is either absent or a string, never a number: {steps:?}"
+    );
+
     fixture.cleanup().await;
 }

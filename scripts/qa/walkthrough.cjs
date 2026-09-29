@@ -7977,10 +7977,41 @@ note({
             step_no: step.step_no,
             status: step.status,
             skip_reason: step.skip_reason ?? null,
+            node_id: step.node_id ?? null,
           })),
         };
       }, workflowId).catch(() => null);
     }
+
+    // Criterion 2 reads the CANVAS, not the API: the pill is the thing being claimed, and
+    // reading the same rows back from the server would pass even if the card rendered
+    // nothing at all. The canvas is the surface under test.
+    const painted = await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll("[data-node-id]"));
+      const withPill = cards
+        .map((card) => {
+          const pill = card.querySelector("[data-node-status]");
+          return {
+            nodeId: card.getAttribute("data-node-id"),
+            status: pill?.getAttribute("data-node-status") ?? null,
+            shape: pill?.getAttribute("data-node-status-shape") ?? null,
+            stepNos: pill?.getAttribute("data-node-step-nos") ?? null,
+            title: pill?.getAttribute("title") ?? null,
+          };
+        })
+        .filter((entry) => entry.status !== null);
+      return { cardsOnCanvas: cards.length, painted };
+    }).catch(() => ({ cardsOnCanvas: cardCount, painted: [] }));
+
+    // A pill on a node the run never reached is a claim about work the engine did not do,
+    // and nothing on screen distinguishes it from a real one — so the canvas's set of
+    // painted nodes is compared against the run's, not just counted.
+    const runNodes = new Set(
+      (after?.steps ?? []).map((step) => step.node_id).filter((id) => typeof id === "string"),
+    );
+    const paintedIds = painted.painted.map((entry) => entry.nodeId);
+    const paintedButNotInRun = paintedIds.filter((id) => !runNodes.has(id));
+    const skippedPill = painted.painted.find((entry) => entry.status === "skipped") ?? null;
 
     const skippedRows = (after?.steps ?? []).filter((step) => step.status === "skipped");
     const firstSkipped = skippedRows[0] ?? null;
@@ -8005,6 +8036,17 @@ note({
       firstRunnableNo: runnable[0]?.step_no ?? null,
       firstSkippedNo: firstSkipped?.step_no ?? null,
       startedFrom: after?.startedFrom ?? null,
+      // Criterion 2: every node the run touched is painted, and nothing else is. The
+      // second half is the assertion that catches a pill on a node that ran nothing.
+      pillsPainted: painted.painted.length,
+      paintedButNotInRun,
+      skippedPillFound: skippedPill !== null,
+      // The pill's own tooltip has to carry the run's reason, not a word that satisfies
+      // "says why" while saying nothing.
+      skippedPillNamesNode:
+        skippedPill && firstSkipped
+          ? new RegExp(after?.startedFrom ?? "x").test(skippedPill.title ?? "")
+          : null,
       ruleCount: Array.isArray(before?.workflows) ? before.workflows.length : null,
     });
     await shot(page, "page-workflow-builder-run-from-here");
