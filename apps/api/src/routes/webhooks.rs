@@ -414,6 +414,26 @@ pub async fn create_webhook(
     )
     .await?;
 
+    // The endpoint's own lifecycle belongs on the bus, not only in the audit trail. An
+    // organization that watches itself through a second receiver needs to know a consumer
+    // appeared \u2014 that is how a downstream system knows to start looking for a class of
+    // event it was not previously told about. The name is the endpoint's own, never its
+    // secret.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.created")
+            .organization(endpoint.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "endpoint_id": endpoint.id,
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "events": endpoint.events,
+                "enabled": endpoint.enabled,
+            })),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "webhook.endpoint.created")
@@ -487,6 +507,36 @@ pub async fn update_webhook(
         metadata["secret_rotated"] = json!(true);
     }
 
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.updated")
+            .organization(updated.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "endpoint_id": updated.id,
+                "name": updated.name,
+                "url": updated.url,
+                "events": updated.events,
+                "enabled": updated.enabled,
+                "secret_rotated": rotated,
+            })),
+    )
+    .await?;
+
+    // A rotation is its own fact, and it is the one a receiver most needs: the old signature
+    // stops verifying, and a receiver that does not hear this starts rejecting every delivery
+    // it was being sent. The secret itself is never in the payload \u2014 only that it changed.
+    if rotated {
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new("webhook.secret.rotated")
+                .organization(updated.organization_id)
+                .actor(current.user.id)
+                .payload(json!({ "endpoint_id": updated.id, "name": updated.name })),
+        )
+        .await?;
+    }
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "webhook.endpoint.updated")
@@ -512,6 +562,15 @@ pub async fn delete_webhook(
     if !store::delete_endpoint(state.db().pool(), endpoint.id).await? {
         return Err(endpoint_not_found());
     }
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.removed")
+            .organization(endpoint.organization_id)
+            .actor(current.user.id)
+            .payload(json!({ "endpoint_id": endpoint.id, "name": endpoint.name })),
+    )
+    .await?;
 
     record(
         &state,
@@ -567,6 +626,25 @@ pub async fn test_webhook(
                 "message": "This is a test delivery from Omnion.",
             })),
         &[endpoint.id],
+    )
+    .await?;
+
+    // The test delivery is addressed to one endpoint with `emit_to`, so recording it as an
+    // event as well would be pointless \u2014 it is aimed at the endpoint that was just tested
+    // and reaches nobody else. The catalogue carries `webhook.endpoint.tested` for the other
+    // direction: a second receiver watching the organization needs to know this endpoint was
+    // proven, which is a fact about the endpoint rather than about a delivery.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.tested")
+            .organization(endpoint.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "endpoint_id": endpoint.id,
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "deliveries": report.deliveries,
+            })),
     )
     .await?;
 
