@@ -36,7 +36,7 @@ pub use preference_store::{
 };
 pub use preferences::{
     DIGEST_CADENCES, IN_APP, PreferenceCell, Preferences, Settings, StatedPreference,
-    default_quiet_hours, validate_quiet_hours, validate_settings, validate_stated,
+    default_quiet_hours, format_clock, validate_quiet_hours, validate_settings, validate_stated,
 };
 pub use push::{
     ChannelReadiness, MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow,

@@ -2895,6 +2895,138 @@ button would go green while the login ignored it.
 **Three boundaries, each with a test saying why.** A **trailing slash is not a mismatch**, because
 every discovery URL is built by appending to the configured issuer and operators type the other
 form; everything else is compared exactly, since a normalization that trims more would accept a
+
+## Tick 50 — the quiet window that came back wearing a different spelling
+
+Two commits, `c48db9d` (the fix) and `60a28ea` (the gate), both pushed, tree clean.
+
+**What.** The previous tick's `next_hint` told this one to go and run the browser pass. It could
+not: `qa-slot.sh` allows one pass at a time and the box was at load 13 with six sibling passes
+compiling, so a pass started under those conditions would have timed out having measured
+nothing. The two settings boxes the hint named — `quietSaved` and `digestPersisted` — were the
+honest place to start instead, and reading why they were false turned up something the browser
+pass had been reporting faithfully for two ticks.
+
+**The defect.** `notification_settings.quiet_hours_start` is a Postgres `time` column, and
+`read_settings` selected it with `::text`. Postgres prints a `time` that way as `22:00:00` —
+seconds always present, zero-padded. The platform's clock vocabulary is `HH:MM`: the shape the
+form sends, the shape `validate_quiet_hours` accepts, and the shape `parse_clock` reads. So
+every window that was saved correctly came back in a spelling nothing could parse,
+`parse_clock` answered `None`, and `in_quiet_hours` took the arm its own doc comment promises
+("no window at all means `false`"). The setting a reader had just turned on decided nothing from
+the next request onwards, and the settings form could not read back what it had written.
+
+Nothing about it fails loudly. The save is a `200`. The row in Postgres is exactly what was
+asked for. The digest half of the same row — a string column — came back fine, which is why
+`digestPersisted` failed for a *second*, unrelated reason in the pass while the two fields
+looked equally broken.
+
+**Why the pass could not have told you.** `quietSaved` asserts the time input still reads
+`22:00` after a save, and `digestPersisted` asserts the two selects. Both were false, but they
+were false for different reasons, and only one of them was a defect. Reading the *values* the
+pass had collected — not the booleans — is what separated them: `timezoneSaved` was true
+alongside two false fields, and timezone is a plain `text` column.
+
+**The fix.** `to_char(quiet_hours_start, 'HH24:MI')` in the read, so the shape is produced by
+one literal in the SQL. `parse_clock` also tolerates a seconds field, so a row written before
+this change is still a window rather than its absence — a widening that has to be paid for
+with a test, because "accepts more" is how a parser turns into a function that accepts
+anything with a colon in it. `format_clock` is the write-side counterpart that names the shape,
+and the round trip between the two is asserted over five instants.
+
+**One mistake worth recording.** The first version of the fix declared the columns
+`Option<time::Time>` and let `format_clock` do the work. It compiled — `query_as` checks its
+types at *decode* time, not at compile time — and came back as a `500` on the settings screen:
+`mismatched types; Rust type Option<time::Time> (as SQL type TIME) is not compatible with SQL
+type TEXT`. The fix for that is the one line the comment now explains: `to_char` returns
+`text`, so the column is decoded as `Option<String>`.
+
+**Proof, in both directions.** `scripts/qa/run-notifications-http.sh` now has two legs that
+own the seam, and the order is the point: save through the API, read the row out of Postgres to
+prove the write happened, *then* read it back through the API and compare the exact string.
+Against the pre-fix tree (stashed, rebuilt, re-run) the gate printed
+`FAIL quiet hours did not round trip: row=[22:00 07:00 weekly 3 17] api=[22:00:00..07:00:00 hour=17]`
+— the row correct, the API's own answer unusable. Against the fix: **PASS 15/15**. A gate that
+only read the API back would have passed against a store answering with whatever it was handed.
+
+`cargo test -p omnion-notifications` → **83** (79 + 4 new). `cargo test -p omnion-api --lib` →
+**188**. `tsc --noEmit` in `apps/admin` → exit 0.
+
+**Still not proven, and not claimed.** No browser pass has run against a binary built after
+this, so the keyboard leg (`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`,
+`shiftEMarkedVisible`, `slashFocusedFilter`) and the browser's own `quietSaved` /
+`digestPersisted` are open. REQ-021 stays **in-progress** for that reason alone.
+
+**Next.** Run `bash scripts/qa/run.sh` with no `QA_STACK` override when the box is under load
+~6 and `qa-slot` is free — verify `stat -c %y target/debug/omnion-api` is newer than `c48db9d`
+*before* reading any finding, because the pass tears the stack down. Require
+`report.notifications.keyboardRows > 0` and the five keyboard keys, and
+`notificationSettings.quietSaved` + `digestPersisted`, which the data path can now support.
+The other open item is unchanged: the 74 `/media/*` high findings, which are REQ-010 slice 4's
+remaining gate.
+
+### Wave 5b · REQ-065 slice 3 — ordered role rules, and a dry run that cannot disagree with sign-in
+
+**What.** A verified directory identity now resolves to a role, and the resolution is one function
+called from two places. `0118` gives the rules their own table; `crates/identity/src/sso/role_rules.rs`
+is the language and the evaluator, `role_rule_store.rs` the storage, and
+`apps/api/src/routes/iam_role_rules.rs` the three endpoints (read, replace, dry run). The editor is
+`apps/admin/features/iam/role-rules-editor.tsx`, wired into the same drawer as the attribute map —
+the wizard's own order is Basics → Connection → Attribute mapping → Role mapping → Enable, and a
+fourth step on its own route would make that order a lie.
+
+**The first thing this tick did was not feature work.** `git merge origin/main` came back with a
+conflict in `BUILD-LOG.md` (append-only, as always) and — while resolving it — a duplicate sqlx
+version. `main` ships `0051_notification_routes`, `wave2-cms` ships `0051_cms_menus_publishing`,
+`wave3-automation` ships `0051_workflow_graph`, and I had shipped `0051_identity_providers`. A
+duplicate migration version is not a build error: the migrator reports `VersionMismatch` and the
+whole suite dies in `live_state` with zero assertions run, which reads as total regression rather
+than as one number chosen twice. REQ-065 reserves `0116–0125` for exactly this wave and that band is
+free on every branch, so both files moved there and both proofs moved with them —
+`run-iam-directory.sh` **PASS 6/6** (including a *populated* `auth_providers` table, the case a
+renumber breaks most easily) and `run-iam-attribute-map.sh` **PASS 14/14**. The lesson is not "read
+the ledger", which the invariant file already says: it is that a number is a **shared namespace
+across nine worktrees**, and the released high-water on `origin/main` at commit time is the only
+authoritative reading of it.
+
+**Two findings the work forced, both live.**
+
+The claim-path reader split on dots, and claim names are routinely URIs —
+`https://claims.example.com/team` becomes five segments and none of them exist. A rule on a
+URI-named claim would silently never match, which reads to an operator as *the rule is wrong* and
+sends them to edit a rule that was correct. Exact keys are now tried before the dotted path, so a URI
+claim reaches itself and `department` still reaches `{"user": {"department": …}}`.
+
+The regex guard was justified, in the first draft, as catastrophic backtracking. **That is false**,
+and the comment said it, which is worse than not having a comment. I probed the crate rather than
+assuming: `regex` is a finite automaton with no backtracker, and the textbook `(x+x+)+y` matches in
+**89µs** against 40 non-matching characters. Rejecting it would be superstition dressed as a
+security control. What actually costs is program size — `a{1,1000000}` is 12 characters of source
+and 64KB of compiled automaton, rebuilt on *every sign-in* — so the guard is a size ceiling, a
+repetition-expansion ceiling and a nesting ceiling, and the comment now says exactly that.
+
+**Proof.**
+
+- `cargo test -p omnion-identity --lib` → **191 passed** (was 166)
+- `cargo test -p omnion-api --lib` → **194 passed** (was 165)
+- `cargo test -p omnion-api --test iam_role_rules` → **1 passed**, isolated database, **run twice**
+- `bash scripts/qa/run-iam-role-rules.sh` → **PASS 18/18** (35 migrations in filename order)
+- `pnpm --filter @omnion/admin typecheck` → clean
+
+**Two mistakes this walk made, both worth more than the feature.** `cleanup()` ran immediately
+after `new()`, deleting the very accounts the sessions belonged to, so every authenticated call
+answered `401 invalid_session` — which reads like a broken endpoint rather than a fixture that
+deleted its own credentials. And the session came from login's *body*; it comes from `Set-Cookie`,
+and a walk that reads only the body authenticates as nobody. Both are now asserted-by-construction
+rather than by memory.
+
+**Not claimed.** `iam.role_rule_matched` is emitted by the evaluator's shape but is not yet fired
+from the callback, and the dry run deliberately evaluates the **stored** rules, not unsaved ones. The
+browser pass still has not reached `/settings/iam/authentication` — it is queued behind sibling
+writers and the full suite is 30+ minutes — so the REQ stays open and slice 3 is not closed.
+
+**Next.** Wire `resolve()` into `finish_sign_in` so a real callback fires `iam.role_rule_matched` and
+writes `role via rule #N` into the sign-in audit, then close slice 3 with the browser pass.
 different host. An **unreadable key set is not an absent one** — the probe carries a `Result`, not a
 `Vec`, because "this provider publishes no key we trust" and "that `jwks_uri` is wrong" send an
 operator to two different places. A provider with **no** configured issuer is told, not failed: its
@@ -3235,66 +3367,3 @@ two halves of the settings box are honestly unproven despite the box being ticke
 `digestPersisted` — and extend the settings pass to change those two fields rather than merely render
 them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
 REQ-010 slice 4's remaining gate.
-
-### Wave 5b · REQ-065 slice 3 — ordered role rules, and a dry run that cannot disagree with sign-in
-
-**What.** A verified directory identity now resolves to a role, and the resolution is one function
-called from two places. `0118` gives the rules their own table; `crates/identity/src/sso/role_rules.rs`
-is the language and the evaluator, `role_rule_store.rs` the storage, and
-`apps/api/src/routes/iam_role_rules.rs` the three endpoints (read, replace, dry run). The editor is
-`apps/admin/features/iam/role-rules-editor.tsx`, wired into the same drawer as the attribute map —
-the wizard's own order is Basics → Connection → Attribute mapping → Role mapping → Enable, and a
-fourth step on its own route would make that order a lie.
-
-**The first thing this tick did was not feature work.** `git merge origin/main` came back with a
-conflict in `BUILD-LOG.md` (append-only, as always) and — while resolving it — a duplicate sqlx
-version. `main` ships `0051_notification_routes`, `wave2-cms` ships `0051_cms_menus_publishing`,
-`wave3-automation` ships `0051_workflow_graph`, and I had shipped `0051_identity_providers`. A
-duplicate migration version is not a build error: the migrator reports `VersionMismatch` and the
-whole suite dies in `live_state` with zero assertions run, which reads as total regression rather
-than as one number chosen twice. REQ-065 reserves `0116–0125` for exactly this wave and that band is
-free on every branch, so both files moved there and both proofs moved with them —
-`run-iam-directory.sh` **PASS 6/6** (including a *populated* `auth_providers` table, the case a
-renumber breaks most easily) and `run-iam-attribute-map.sh` **PASS 14/14**. The lesson is not "read
-the ledger", which the invariant file already says: it is that a number is a **shared namespace
-across nine worktrees**, and the released high-water on `origin/main` at commit time is the only
-authoritative reading of it.
-
-**Two findings the work forced, both live.**
-
-The claim-path reader split on dots, and claim names are routinely URIs —
-`https://claims.example.com/team` becomes five segments and none of them exist. A rule on a
-URI-named claim would silently never match, which reads to an operator as *the rule is wrong* and
-sends them to edit a rule that was correct. Exact keys are now tried before the dotted path, so a URI
-claim reaches itself and `department` still reaches `{"user": {"department": …}}`.
-
-The regex guard was justified, in the first draft, as catastrophic backtracking. **That is false**,
-and the comment said it, which is worse than not having a comment. I probed the crate rather than
-assuming: `regex` is a finite automaton with no backtracker, and the textbook `(x+x+)+y` matches in
-**89µs** against 40 non-matching characters. Rejecting it would be superstition dressed as a
-security control. What actually costs is program size — `a{1,1000000}` is 12 characters of source
-and 64KB of compiled automaton, rebuilt on *every sign-in* — so the guard is a size ceiling, a
-repetition-expansion ceiling and a nesting ceiling, and the comment now says exactly that.
-
-**Proof.**
-
-- `cargo test -p omnion-identity --lib` → **191 passed** (was 166)
-- `cargo test -p omnion-api --lib` → **194 passed** (was 165)
-- `cargo test -p omnion-api --test iam_role_rules` → **1 passed**, isolated database, **run twice**
-- `bash scripts/qa/run-iam-role-rules.sh` → **PASS 18/18** (35 migrations in filename order)
-- `pnpm --filter @omnion/admin typecheck` → clean
-
-**Two mistakes this walk made, both worth more than the feature.** `cleanup()` ran immediately
-after `new()`, deleting the very accounts the sessions belonged to, so every authenticated call
-answered `401 invalid_session` — which reads like a broken endpoint rather than a fixture that
-deleted its own credentials. And the session came from login's *body*; it comes from `Set-Cookie`,
-and a walk that reads only the body authenticates as nobody. Both are now asserted-by-construction
-rather than by memory.
-
-**Not claimed.** `iam.role_rule_matched` is emitted by the evaluator's shape but is not yet fired
-from the callback, and the dry run deliberately evaluates the **stored** rules, not unsaved ones. The
-browser pass still has not reached `/settings/iam/authentication` — it is queued behind sibling
-writers and the full suite is 30+ minutes — so the REQ stays open and slice 3 is not closed.
-
-**Next.** Wire `resolve()` into `finish_sign_in` so a real callback fires `iam.role_rule_matched` and
-writes `role via rule #N` into the sign-in audit, then close slice 3 with the browser pass.
