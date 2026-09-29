@@ -31,7 +31,8 @@ pub mod validation;
 
 pub use error::{EventsError, Result};
 pub use model::{
-    DEFAULT_MAX_ATTEMPTS, Delivery, DeliveryStatus, EndpointChanges, Event, NewEndpoint, NewEvent,
-    WebhookEndpoint,
+    DEFAULT_EVENT_RETENTION_DAYS, DEFAULT_MAX_ATTEMPTS, MAX_RETENTION_DAYS, MIN_RETENTION_DAYS,
+    Delivery, DeliveryStatus, EndpointChanges, Event, NewEndpoint, NewEvent, RetentionRun,
+    RetentionStatus, SweepReport, WebhookEndpoint,
 };
 pub use signature::{SIGNATURE_HEADER, verify};

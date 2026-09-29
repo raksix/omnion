@@ -23,7 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{
-    EndpointChanges, NewEndpoint, NewEvent, WebhookEndpoint, bus, store, validation,
+    EndpointChanges, EventsError, NewEndpoint, NewEvent, WebhookEndpoint, bus, store, validation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -138,6 +138,19 @@ pub struct DeliveryBody {
     /// When it was queued.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// `event`, `test` or `replay` — what asked for this delivery.
+    pub trigger: String,
+    /// How long the receiver took in milliseconds, when it has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i32>,
+    /// How many times an operator has forced this row again.
+    pub redeliver_count: i32,
+    /// When it was last forced again.
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub replayed_at: Option<OffsetDateTime>,
 }
 
 impl DeliveryBody {
@@ -155,11 +168,20 @@ impl DeliveryBody {
             error: delivery.error.clone(),
             delivered_at: delivery.delivered_at,
             created_at: delivery.created_at,
+            trigger: delivery.trigger.clone(),
+            duration_ms: delivery.duration_ms,
+            redeliver_count: delivery.redeliver_count,
+            replayed_at: delivery.replayed_at,
         }
     }
 }
 
-/// The deliveries of one endpoint.
+/// The deliveries of one endpoint (the original unfiltered shape).
+///
+/// Kept because `GET /webhooks/{id}/deliveries` answered this for a release; the filtered read
+/// is the same path with query parameters, and a client that sends none gets this shape's
+/// `deliveries` key plus the two paging fields. A client built against the old body keeps
+/// working, which is what a deprecation window is for.
 #[derive(Debug, Serialize)]
 pub struct DeliveriesResponse {
     /// The deliveries, newest first.
@@ -247,6 +269,95 @@ pub struct CatalogueResponse {
     pub reserved_count: usize,
     /// The most selections one endpoint may subscribe to.
     pub max_subscriptions: usize,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// One sweep's outcome, in the shape the run log stores and the screen reads back.
+#[derive(Debug, Serialize)]
+pub struct RetentionRunBody {
+    /// Run id.
+    pub id: Uuid,
+    /// The organization swept; `null` is the platform's own events.
+    pub organization_id: Option<Uuid>,
+    /// When the sweep began.
+    pub started_at: OffsetDateTime,
+    /// When it finished.
+    pub finished_at: Option<OffsetDateTime>,
+    /// The window that was applied, days.
+    pub window_days: i32,
+    /// The instant older rows were swept.
+    pub cutoff: OffsetDateTime,
+    /// Events removed.
+    pub events_deleted: i32,
+    /// Delivery rows removed with them.
+    pub deliveries_deleted: i32,
+    /// Why the sweep could not finish, if it could not.
+    pub error: Option<String>,
+}
+
+impl RetentionRunBody {
+    fn build(run: &omnion_events::RetentionRun) -> Self {
+        Self {
+            id: run.id,
+            organization_id: run.organization_id,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            window_days: run.window_days,
+            cutoff: run.cutoff,
+            events_deleted: run.events_deleted,
+            deliveries_deleted: run.deliveries_deleted,
+            error: run.error.clone(),
+        }
+    }
+}
+
+/// `GET /api/v1/events/retention` — the window, the counts, and the last sweep.
+#[derive(Debug, Serialize)]
+pub struct RetentionStatusBody {
+    /// The organization described; `null` is the platform's own events.
+    pub organization_id: Option<Uuid>,
+    /// The window in force, days.
+    pub window_days: i32,
+    /// Shortest window the API accepts, so the screen can bound its own input.
+    pub min_days: i32,
+    /// Longest window the API accepts.
+    pub max_days: i32,
+    /// Events currently on the bus.
+    pub events: i64,
+    /// Events old enough to be swept on the next tick.
+    pub due: i64,
+    /// The last finished sweep, if this organization has ever been swept.
+    pub last_run: Option<RetentionRunBody>,
+    /// The last finished sweeps, newest first.
+    pub recent_runs: Vec<RetentionRunBody>,
+}
+
+/// What a manual sweep removed.
+#[derive(Debug, Serialize)]
+pub struct SweepBody {
+    /// The organization swept.
+    pub organization_id: Option<Uuid>,
+    /// The window that was applied.
+    pub window_days: i32,
+    /// The instant older rows were swept.
+    pub cutoff: OffsetDateTime,
+    /// Events removed.
+    pub events_deleted: i64,
+    /// Delivery rows removed with them.
+    pub deliveries_deleted: i64,
+    /// The run-log row this sweep wrote.
+    pub run_id: Uuid,
+}
+
+/// `PATCH /api/v1/events/retention` — set the window.
+#[derive(Debug, Deserialize)]
+pub struct SetRetentionRequest {
+    /// New window, days. Refused outside 1…3650 rather than clamped, because a silent clamp
+    /// answers `200` with a number the caller did not ask for.
+    pub window_days: i32,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -403,6 +514,140 @@ fn invalid_query(field: &str, because: &str) -> ApiError {
         format!("`{field}` is not usable: {because}"),
     )
 }
+
+/// `GET /api/v1/webhooks/{id}/deliveries` — one page of an endpoint's history.
+#[derive(Debug, Serialize)]
+pub struct DeliveryPageBody {
+    /// The rows, newest first.
+    pub deliveries: Vec<DeliveryBody>,
+    /// How many rows the filter matches in total, so the table's header can say
+    /// "showing 25 of 340" instead of implying that 25 is all there is.
+    pub total: i64,
+    /// Whether a further page exists.
+    pub has_more: bool,
+    /// Cursor for the next page: the last row's `(created_at, id)`, or `None` at the end.
+    ///
+    /// Both halves, because the read sorts by `created_at desc, id desc` and a cursor on one
+    /// column of a two-column order can repeat a row when two deliveries share a timestamp —
+    /// which is the normal case, not an edge case, when the bus fans out to several endpoints.
+    pub next_cursor: Option<DeliveryCursorBody>,
+}
+
+/// The pair one page's cursor is made of.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryCursorBody {
+    /// `created_at` of the previous page's last row, RFC 3339.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    /// That row's id.
+    pub id: Uuid,
+}
+
+/// `POST /api/v1/webhooks/{id}/deliveries/{delivery_id}/redeliver` — one row forced again.
+#[derive(Debug, Serialize)]
+pub struct RedeliverBody {
+    /// The delivery that was queued.
+    pub delivery_id: Uuid,
+    /// Its new status (`pending`).
+    pub status: &'static str,
+    /// How many times it has now been forced (1 after the first).
+    pub redeliver_count: i32,
+}
+
+/// `POST /api/v1/webhooks/{id}/deliveries/redeliver` — many rows, each answered on its own.
+#[derive(Debug, Serialize)]
+pub struct RedeliverManyBody {
+    /// How many of the requested ids moved.
+    pub queued: usize,
+    /// The ones that did not, with the code and sentence explaining each.
+    pub skipped: Vec<RedeliverSkipBody>,
+}
+
+/// Why one id in a bulk redelivery did not move.
+#[derive(Debug, Serialize)]
+pub struct RedeliverSkipBody {
+    /// The id as the caller wrote it.
+    pub delivery_id: Uuid,
+    /// Machine-readable reason.
+    pub code: &'static str,
+    /// The sentence the operator reads.
+    pub message: &'static str,
+}
+
+/// `GET /api/v1/webhooks/{id}/stats` — what the receiver has been doing.
+#[derive(Debug, Serialize)]
+pub struct EndpointStatsBody {
+    /// Window the numbers cover, in hours.
+    pub window_hours: i64,
+    /// Rows the receiver accepted.
+    pub delivered: i64,
+    /// Rows that ran out of attempts.
+    pub failed: i64,
+    /// Rows still waiting, whatever their age.
+    pub pending: i64,
+    /// Rows queued in the window, tests included — the history really does contain them.
+    pub total: i64,
+    /// Rows in the window an operator asked for by hand.
+    pub tests: i64,
+    /// Share of settled **traffic** rows that were accepted, or `null` when none settled.
+    pub success_rate: Option<f64>,
+    /// 95th percentile receiver duration in the window, or `null` when nothing ran.
+    pub p95_duration_ms: Option<i32>,
+}
+
+/// `POST /api/v1/webhooks/{id}/secret/rotate`.
+#[derive(Debug, Serialize)]
+pub struct RotateSecretBody {
+    /// The endpoint, without its old secret.
+    #[serde(flatten)]
+    pub endpoint: EndpointBody,
+    /// The new secret, shown exactly once — the same rule as creation.
+    pub secret: String,
+}
+
+/// `?status=&name=&from=&to=&q=&cursor=&limit=` on a delivery history read.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeliveryQuery {
+    /// How many rows to return.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// One status, repeatable; several mean "any of these".
+    #[serde(default)]
+    pub status: Vec<String>,
+    /// One event name, repeatable; several mean "any of these".
+    #[serde(default)]
+    pub name: Vec<String>,
+    /// Lower bound of the window, RFC 3339.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Upper bound of the window, RFC 3339.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Substring of the delivery id or the event name.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Keyset cursor: `created_at` of the previous page's last row, RFC 3339.
+    #[serde(default)]
+    pub cursor_at: Option<String>,
+    /// The id that goes with `cursor_at`.
+    #[serde(default)]
+    pub cursor_id: Option<Uuid>,
+}
+
+/// `POST /api/v1/webhooks/{id}/deliveries/redeliver`.
+#[derive(Debug, Deserialize)]
+pub struct RedeliverManyRequest {
+    /// The rows to force again, at most 100.
+    pub delivery_ids: Vec<Uuid>,
+}
+
+/// How many rows one bulk redelivery may name.
+///
+/// A cap rather than a limit: the operation is one `update` per id, so a caller naming ten
+/// thousand would hold a database connection for as long as it took to run ten thousand
+/// statements, and the 100 that fit in a request body is already far more than a person
+/// selecting by hand.
+const MAX_REDELIVERY_BATCH: usize = 100;
 
 /// What a test delivery queued.
 #[derive(Debug, Serialize)]
@@ -710,21 +955,322 @@ pub async fn delete_webhook(
 }
 
 /// `GET /api/v1/webhooks/{id}/deliveries` — the queue history of one endpoint.
+///
+/// The hand parser again, for the same reason as the event feed: `Query<DeliveryQuery>` would
+/// answer a plain-text `400` for one `?status=`, which is a failure the panel would render as
+/// an empty table rather than as an error. Every status is validated against the stored
+/// vocabulary so a typo says `unknown_delivery_status` instead of quietly matching nothing.
 pub async fn list_deliveries(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(endpoint_id): Path<Uuid>,
-    Query(query): Query<LimitQuery>,
-) -> Result<Json<DeliveriesResponse>, ApiError> {
+    query: axum::extract::RawQuery,
+) -> Result<Json<DeliveryPageBody>, ApiError> {
     let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let query = parse_delivery_query(query.0.as_deref())?;
 
-    let deliveries = store::list_deliveries(state.db().pool(), endpoint.id, limit).await?;
+    let mut names = Vec::with_capacity(query.name.len());
+    for raw in &query.name {
+        names.push(validation::validate_event_name(raw)?);
+    }
 
-    Ok(Json(DeliveriesResponse {
-        deliveries: deliveries.iter().map(DeliveryBody::build).collect(),
+    // Both halves of the cursor, or neither: a `cursor_at` without its `cursor_id` would be a
+    // row-comparison against a null id, which Postgres answers by refusing — a 500 on a
+    // request the panel builds itself, so it is refused here by name instead.
+    let before = match (query.cursor_at.as_deref(), query.cursor_id) {
+        (None, None) => None,
+        (Some(raw), Some(id)) => Some((
+            parse_instant(Some(raw), "cursor_at")?.ok_or_else(|| {
+                invalid_delivery_query("cursor_at", "it is not an RFC 3339 timestamp")
+            })?,
+            id,
+        )),
+        _ => {
+            return Err(invalid_delivery_query(
+                "cursor",
+                "a cursor needs both `cursor_at` and `cursor_id`",
+            ));
+        }
+    };
+
+    let filter = store::DeliveryFilter {
+        statuses: query.status,
+        names,
+        from: parse_instant(query.from.as_deref(), "from")?,
+        to: parse_instant(query.to.as_deref(), "to")?,
+        search: query.q,
+        before,
+        limit: query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE),
+    };
+
+    let page = store::list_deliveries_filtered(state.db().pool(), endpoint.id, &filter).await?;
+
+    // The cursor is the last row's own `(created_at, id)`, exclusive, so the next page cannot
+    // re-serve the row the cursor names.
+    let next_cursor = page.has_more.then(|| page.deliveries.last()).flatten().map(|row| {
+        DeliveryCursorBody {
+            at: row.created_at,
+            id: row.id,
+        }
+    });
+
+    Ok(Json(DeliveryPageBody {
+        deliveries: page.deliveries.iter().map(DeliveryBody::build).collect(),
+        total: page.total,
+        has_more: page.has_more,
+        next_cursor,
     }))
 }
+
+/// Parse the delivery read's query string by hand — see [`parse_events_query`] for why.
+///
+/// The one addition to the event parser's rules: a `status` is checked against the stored
+/// vocabulary, because a filter that matches nothing because of a typo is indistinguishable
+/// from an endpoint that has had no failures, and those two send an operator opposite ways.
+fn parse_delivery_query(raw: Option<&str>) -> Result<DeliveryQuery, ApiError> {
+    let mut query = DeliveryQuery::default();
+    let Some(raw) = raw else {
+        return Ok(query);
+    };
+
+    for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_token(key);
+        let value = decode_query_token(value);
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "status" => query.status.push(value),
+            "name" => query.name.push(value),
+            "from" => query.from = Some(value),
+            "to" => query.to = Some(value),
+            "q" => query.q = Some(value),
+            "cursor_at" => query.cursor_at = Some(value),
+            "cursor_id" => {
+                query.cursor_id = Some(value.parse().map_err(|_| {
+                    invalid_delivery_query("cursor_id", "it is not a uuid")
+                })?)
+            }
+            "limit" => {
+                query.limit = Some(value.parse().map_err(|_| {
+                    invalid_delivery_query("limit", "it is not a whole number")
+                })?)
+            }
+            _ => {}
+        }
+    }
+
+    for status in &query.status {
+        if omnion_events::model::DeliveryStatus::parse(status).is_none() {
+            return Err(invalid_delivery_query(
+                "status",
+                "it is not pending, delivered or failed",
+            ));
+        }
+    }
+
+    Ok(query)
+}
+
+/// The delivery read's one refusal, naming the parameter.
+fn invalid_delivery_query(field: &str, because: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_delivery_query",
+        format!("`{field}` is not usable: {because}"),
+    )
+}
+
+/// `POST /api/v1/webhooks/{id}/secret/rotate` — replace the signing secret.
+///
+/// A separate route rather than a `PATCH` with `secret`, because the two differ in what the
+/// caller gets back: a rotation *shows* the new secret exactly once (a receiver cannot be
+/// reconfigured with a secret it never saw), and a `PATCH` never does. Folding rotation into
+/// the update route would have made the secret a field that appears and disappears according to
+/// which verb the panel happened to use.
+pub async fn rotate_secret(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(endpoint_id): Path<Uuid>,
+) -> Result<Json<RotateSecretBody>, ApiError> {
+    let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
+    let secret = validation::generate_secret();
+
+    let updated = store::update_endpoint(
+        state.db().pool(),
+        endpoint.id,
+        omnion_events::EndpointChanges {
+            secret: Some(secret.clone()),
+            ..Default::default()
+        },
+    )
+    .await?
+    .ok_or_else(endpoint_not_found)?;
+
+    // The payload names the endpoint and nothing else: a rotation's own event is the one an
+    // operator subscribes to in order to reconfigure a fleet, and it must not be the vector
+    // that leaks the value it is announcing.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.secret.rotated")
+            .organization(updated.organization_id)
+            .actor(current.user.id)
+            .payload(json!({ "endpoint_id": updated.id, "name": updated.name })),
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.secret.rotated")
+            .target("webhook_endpoint", updated.id.to_string())
+            .metadata(json!({ "name": updated.name }))
+            .ip_address(address.as_text())
+            .organization(updated.organization_id),
+    )
+    .await?;
+
+    Ok(Json(RotateSecretBody {
+        endpoint: EndpointBody::build(&updated),
+        secret,
+    }))
+}
+
+/// `POST /api/v1/webhooks/{id}/deliveries/{delivery_id}/redeliver` — force one row again.
+pub async fn redeliver_one(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path((endpoint_id, delivery_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RedeliverBody>, ApiError> {
+    let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
+    // The count comes back from the update itself, so the number reported is the one this call
+    // wrote rather than one a second read might have caught after somebody else pressed the
+    // same button concurrently.
+    let redeliver_count = store::redeliver(state.db().pool(), endpoint.id, delivery_id).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.delivery.redelivered")
+            .target("webhook_delivery", delivery_id.to_string())
+            .metadata(json!({
+                "endpoint": endpoint.name,
+                "redeliver_count": redeliver_count,
+            }))
+            .ip_address(address.as_text())
+            .organization(endpoint.organization_id),
+    )
+    .await?;
+
+    Ok(Json(RedeliverBody {
+        delivery_id,
+        status: "pending",
+        redeliver_count,
+    }))
+}
+
+/// `POST /api/v1/webhooks/{id}/deliveries/redeliver` — force many rows, each answered on its own.
+pub async fn redeliver_many(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(endpoint_id): Path<Uuid>,
+    Json(body): Json<RedeliverManyRequest>,
+) -> Result<Json<RedeliverManyBody>, ApiError> {
+    let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
+
+    if body.delivery_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "empty_redelivery_batch",
+            "name at least one delivery to send again",
+        ));
+    }
+    if body.delivery_ids.len() > MAX_REDELIVERY_BATCH {
+        return Err(ApiError::bad_request(
+            "redelivery_batch_too_large",
+            format!("name at most {MAX_REDELIVERY_BATCH} deliveries at once"),
+        ));
+    }
+
+    let outcomes = store::redeliver_many(state.db().pool(), endpoint.id, &body.delivery_ids).await?;
+
+    let mut queued = 0;
+    let mut skipped = Vec::new();
+    for (id, outcome) in outcomes {
+        match outcome {
+            Ok(_) => queued += 1,
+            Err(EventsError::RedeliveryRefused { code, message }) => {
+                // The code and sentence come from the crate's own enum rather than being
+                // rebuilt here, so a fourth refusal there cannot reach the panel under one of
+                // these three labels — and a store error, which is not a per-row answer, has
+                // already stopped the batch above rather than being reported as a skip.
+                skipped.push(RedeliverSkipBody {
+                    delivery_id: id,
+                    code,
+                    message,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+    }
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.delivery.redelivered")
+            .target("webhook_endpoint", endpoint.id.to_string())
+            .metadata(json!({ "queued": queued, "skipped": skipped.len() }))
+            .ip_address(address.as_text())
+            .organization(endpoint.organization_id),
+    )
+    .await?;
+
+    // `200` with per-id outcomes rather than `207` or a refusal: the request itself was
+    // honoured, and a batch where half the rows are already pending is a normal outcome of a
+    // multi-select, not a failure of the call.
+    Ok(Json(RedeliverManyBody { queued, skipped }))
+}
+
+/// `GET /api/v1/webhooks/{id}/stats` — what this receiver has been doing.
+pub async fn endpoint_stats(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(endpoint_id): Path<Uuid>,
+    Query(query): Query<StatsQuery>,
+) -> Result<Json<EndpointStatsBody>, ApiError> {
+    let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
+    let window_hours = query.window_hours.unwrap_or(DEFAULT_STATS_WINDOW_HOURS).clamp(1, 24 * 365);
+
+    let stats = store::endpoint_stats(
+        state.db().pool(),
+        endpoint.id,
+        OffsetDateTime::now_utc() - time::Duration::hours(window_hours),
+    )
+    .await?;
+
+    Ok(Json(EndpointStatsBody {
+        window_hours,
+        delivered: stats.delivered,
+        failed: stats.failed,
+        pending: stats.pending,
+        total: stats.total,
+        tests: stats.tests,
+        success_rate: stats.success_rate,
+        p95_duration_ms: stats.p95_duration_ms,
+    }))
+}
+
+/// `?window_hours=` on the stats read.
+#[derive(Debug, Deserialize)]
+pub struct StatsQuery {
+    /// How far back the numbers reach, in hours.
+    #[serde(default)]
+    pub window_hours: Option<i64>,
+}
+
+/// The default stats window: a day, which is long enough to cover a nightly batch and short
+/// enough that a receiver which broke this morning does not still look green tomorrow.
+const DEFAULT_STATS_WINDOW_HOURS: i64 = 24;
 
 /// `POST /api/v1/webhooks/{id}/test` — queue one signed `webhook.test` delivery.
 ///
@@ -869,6 +1415,171 @@ fn parse_instant(raw: Option<&str>, field: &'static str) -> Result<Option<Offset
                 format!("`{field}` is not an RFC 3339 timestamp"),
             )
         })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention handlers (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// How many runs the status read returns in its `recent_runs` list.
+const RETENTION_RUN_HISTORY: i64 = 5;
+
+/// `GET /api/v1/events/retention` — the window, the counts and the last sweeps.
+///
+/// It is `events.read` like the feed, because reading how much history is kept is reading the
+/// bus. **Changing** it is `webhooks.manage`, which is the stronger of the two keys, because
+/// shortening a window is a destructive action on somebody's audit trail and a caller with
+/// only `events.read` must not be able to trigger it by accident or by a link.
+pub async fn retention_status(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<RetentionStatusBody>, ApiError> {
+    let organization_id = current.user.organization_id;
+    let status = store::retention_status(state.db().pool(), organization_id).await?;
+    let recent_runs = store::list_retention_runs(state.db().pool(), organization_id, RETENTION_RUN_HISTORY)
+        .await?;
+
+    Ok(Json(RetentionStatusBody {
+        organization_id,
+        window_days: status.window_days,
+        min_days: omnion_events::MIN_RETENTION_DAYS,
+        max_days: omnion_events::MAX_RETENTION_DAYS,
+        events: status.events,
+        due: status.due,
+        last_run: status.last_run.as_ref().map(RetentionRunBody::build),
+        recent_runs: recent_runs.iter().map(RetentionRunBody::build).collect(),
+    }))
+}
+
+/// `PATCH /api/v1/events/retention` — set the window.
+///
+/// A **platform** account (`organization_id = None`) is refused by name rather than silently
+/// writing a window onto a column it does not own: the sweeper applies each organization's own
+/// window, and a platform account has no window to set, so accepting the write would answer
+/// `200` and change nothing. The refusal says which account shape the route wants.
+pub async fn set_retention(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<SetRetentionRequest>,
+) -> Result<Json<RetentionStatusBody>, ApiError> {
+    let Some(organization_id) = current.user.organization_id else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "retention_scope_required",
+            "a retention window belongs to an organization; this account is platform level",
+        ));
+    };
+
+    // Validated before the write, so the refusal names the field and the range rather than
+    // arriving as a check-constraint violation from the database.
+    let days = validation::validate_retention_window(body.window_days)?;
+    let previous = store::retention_window(state.db().pool(), Some(organization_id)).await?;
+    let stored = store::set_retention_window(state.db().pool(), organization_id, days).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.retention.changed")
+            .target("organization", organization_id.to_string())
+            .metadata(json!({ "previous_window_days": previous, "window_days": stored }))
+            .ip_address(address.as_text())
+            .organization(Some(organization_id)),
+    )
+    .await?;
+
+    // The audit row is the record of the *change*; the bus is where the modules watch for one.
+    // The event is emitted to nobody by fan-out unless an endpoint subscribes to it, which is
+    // the same rule every other lifecycle event follows.
+    let _ = bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.retention.changed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "previous_window_days": previous,
+                "window_days": stored,
+            })),
+    )
+    .await;
+
+    let status = store::retention_status(state.db().pool(), Some(organization_id)).await?;
+    let recent_runs =
+        store::list_retention_runs(state.db().pool(), Some(organization_id), RETENTION_RUN_HISTORY)
+            .await?;
+
+    Ok(Json(RetentionStatusBody {
+        organization_id: Some(organization_id),
+        window_days: status.window_days,
+        min_days: omnion_events::MIN_RETENTION_DAYS,
+        max_days: omnion_events::MAX_RETENTION_DAYS,
+        events: status.events,
+        due: status.due,
+        last_run: status.last_run.as_ref().map(RetentionRunBody::build),
+        recent_runs: recent_runs.iter().map(RetentionRunBody::build).collect(),
+    }))
+}
+
+/// `POST /api/v1/events/retention/sweep` — run one sweep now.
+///
+/// The button exists because "the weekly worker will get to it" is not an answer an operator can
+/// act on the morning they need the disk back, and because a policy nobody can run on demand
+/// is a policy that is only ever tested by a failure. It writes the same run log the worker
+/// writes, so a manual sweep and a scheduled one are the same record — which is what makes the
+/// log trustworthy.
+pub async fn sweep_retention(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+) -> Result<Json<SweepBody>, ApiError> {
+    let Some(organization_id) = current.user.organization_id else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "retention_scope_required",
+            "a retention sweep belongs to an organization; this account is platform level",
+        ));
+    };
+
+    let window_days = store::retention_window(state.db().pool(), Some(organization_id)).await?;
+    let report = store::sweep_events(state.db().pool(), Some(organization_id), window_days).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.retention.swept")
+            .target("organization", organization_id.to_string())
+            .metadata(json!({
+                "window_days": report.window_days,
+                "events_deleted": report.events_deleted,
+                "deliveries_deleted": report.deliveries_deleted,
+            }))
+            .ip_address(address.as_text())
+            .organization(Some(organization_id)),
+    )
+    .await?;
+
+    // A manual sweep emits the same event a scheduled one would, and the answer says **no
+    // counts** were routed to endpoints rather than staying silent about it. The reason is
+    // that the counts are already in the run log the caller gets back in the response, and a
+    // payload that duplicated them is a second place for the two to disagree — but the
+    // *occurrence* is a fact a subscriber subscribed to, and a fan-out that queues nothing
+    // because a module decided the event "is only an audit fact" is a fan-out that silently
+    // drops events.
+    let _ = bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.retention.swept")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({ "window_days": report.window_days })),
+    )
+    .await;
+
+    Ok(Json(SweepBody {
+        organization_id: Some(organization_id),
+        window_days: report.window_days,
+        cutoff: report.cutoff,
+        events_deleted: report.events_deleted,
+        deliveries_deleted: report.deliveries_deleted,
+        run_id: report.run_id,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------

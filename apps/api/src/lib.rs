@@ -13,6 +13,7 @@ pub mod cookies;
 pub mod crm_autoresponder_runner;
 pub mod dto;
 pub mod error;
+pub mod event_retention_runner;
 pub mod event_runner;
 pub mod guards;
 pub mod intent_resolver;

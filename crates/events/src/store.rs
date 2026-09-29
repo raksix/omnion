@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::error::{EventsError, Result};
 use crate::model::{
-    DEFAULT_MAX_ATTEMPTS, DELIVERY_COLUMNS, Delivery, DeliveryJob, ENDPOINT_COLUMNS, EVENT_COLUMNS,
-    EndpointChanges, Event, NewEndpoint, NewEvent, WebhookEndpoint,
+    DEFAULT_EVENT_RETENTION_DAYS, DEFAULT_MAX_ATTEMPTS, DELIVERY_COLUMNS, Delivery, DeliveryJob,
+    ENDPOINT_COLUMNS, EVENT_COLUMNS, EndpointChanges, Event, NewEndpoint, NewEvent, RetentionRun,
+    RetentionStatus, SweepReport, WebhookEndpoint,
 };
 
 /// Record one event inside an existing transaction.
@@ -88,9 +89,14 @@ pub async fn enqueue_for_endpoints(
         return Ok(0);
     }
 
+    // `trigger` is stamped here rather than left to the column's default. The default is
+    // `event`, which is right for the fan-out and wrong here: a row queued by an operator
+    // pressing "Test" is not traffic, and the stats read deliberately keeps it out of the
+    // success rate. Stamping it at the only place a test is queued is what makes the column
+    // true rather than aspirational.
     let result = sqlx::query(
-        "insert into webhook_deliveries (endpoint_id, event_id, max_attempts) \
-         select w.id, $1, $3 from webhook_endpoints w where w.id = any ($2) \
+        "insert into webhook_deliveries (endpoint_id, event_id, max_attempts, trigger) \
+         select w.id, $1, $3, 'test' from webhook_endpoints w where w.id = any ($2) \
          on conflict (endpoint_id, event_id) do nothing",
     )
     .bind(event.id)
@@ -335,7 +341,14 @@ pub struct DeliveryStats {
     pub pending: i64,
     /// Rows queued, in the window.
     pub total: i64,
-    /// Share of settled rows that were accepted, 0.0–1.0; `None` when nothing settled yet.
+    /// Rows in the window an operator asked for by hand (the `test` trigger).
+    ///
+    /// Reported rather than folded in, because a test delivery is a probe somebody pressed and
+    /// not traffic the platform produced. It is counted in `total` — it really is a row in the
+    /// history — and left out of `success_rate`, where it would otherwise let an operator make
+    /// a broken receiver look healthy by pressing the button.
+    pub tests: i64,
+    /// Share of settled **non-test** rows that were accepted, 0.0–1.0; `None` when none settled.
     pub success_rate: Option<f64>,
     /// 95th percentile receiver duration in the window; `None` when nothing ran.
     pub p95_duration_ms: Option<i32>,
@@ -343,23 +356,36 @@ pub struct DeliveryStats {
 
 /// Summarise one endpoint's history since `since`.
 ///
-/// `success_rate` counts only **settled** rows (`delivered` + `failed`). Including `pending`
-/// in the denominator is the single most misleading thing a webhook dashboard can do: a queue
-/// that just took a thousand deliveries shows 0% while every one of them is about to succeed,
-/// which sends the operator to debug a receiver that is working perfectly.
+/// `delivered` and `failed` count **traffic** only — rows whose trigger is not `test` — and
+/// `success_rate` is their ratio over the settled ones. Two exclusions, each for a reason:
+///
+/// * `pending` is not in the denominator. It is the single most misleading thing a webhook
+///   dashboard can do: a queue that just took a thousand deliveries reads 0% while every one
+///   of them is about to succeed, which sends the operator to debug a receiver that is working
+///   perfectly.
+/// * A `test` row is not in either. It was asked for by a button, and counting it would let an
+///   operator make a broken receiver look healthy by pressing the button — the one number on
+///   this screen that must not be under the operator's own control.
+///
+/// `total` still counts every row in the window, tests included, because the history really
+/// does contain them and a header that hid them would make the table disagree with its own
+/// count.
 pub async fn endpoint_stats(
     pool: &PgPool,
     endpoint_id: Uuid,
     since: OffsetDateTime,
 ) -> Result<DeliveryStats> {
-    // Four counts, no `max`: the slowest single delivery is not a number anybody acts on, and
-    // the percentile below is computed from the full sample where it is.
-    let row: (i64, i64, i64, i64) = sqlx::query_as(
+    // The two outcome columns and the two test-aware ones are counted separately: the rate is
+    // built from traffic, and `total`/`tests` describe the whole history. `max` is absent on
+    // purpose — the slowest single delivery is not a number anybody acts on, and the percentile
+    // below is computed from the full sample where it is.
+    let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "select \
-             count(*) filter (where status = 'delivered'), \
-             count(*) filter (where status = 'failed'), \
+             count(*) filter (where status = 'delivered' and trigger <> 'test'), \
+             count(*) filter (where status = 'failed' and trigger <> 'test'), \
              count(*) filter (where status = 'pending'), \
-             count(*) \
+             count(*), \
+             count(*) filter (where trigger = 'test') \
          from webhook_deliveries \
          where endpoint_id = $1 and created_at >= $2",
     )
@@ -368,13 +394,22 @@ pub async fn endpoint_stats(
     .fetch_one(pool)
     .await?;
 
+    let (delivered, failed, pending, total, tests) = row;
+
+    // The rate's denominator is the *traffic* that actually reached a receiver and got an
+    // answer. It excludes `pending` (a queue that just took a thousand deliveries would read
+    // 0% while every one of them is about to succeed) and the test rows (a probe somebody
+    // pressed is not the platform delivering anything, and counting it would let an operator
+    // make a broken receiver look healthy by pressing the button).
+    let settled = delivered + failed;
+
     // The percentile is a second, smaller read rather than a window function: the 95th
     // percentile of the *delivered* rows is the number, and filtering to delivered first means
     // a pile of slow failures cannot drag it — a slow failure is a retry, not a latency budget.
     let durations: Vec<i32> = sqlx::query_scalar(
         "select duration_ms from webhook_deliveries \
          where endpoint_id = $1 and status = 'delivered' and duration_ms is not null \
-           and created_at >= $2 \
+           and created_at >= $2 and trigger <> 'test' \
          order by duration_ms asc",
     )
     .bind(endpoint_id)
@@ -382,16 +417,14 @@ pub async fn endpoint_stats(
     .fetch_all(pool)
     .await?;
 
-    let p95 = percentile_95(&durations);
-
-    let settled = row.0 + row.1;
     Ok(DeliveryStats {
-        delivered: row.0,
-        failed: row.1,
-        pending: row.2,
-        total: row.3,
-        success_rate: (settled > 0).then(|| row.0 as f64 / settled as f64),
-        p95_duration_ms: p95,
+        delivered,
+        failed,
+        pending,
+        total,
+        tests,
+        success_rate: (settled > 0).then(|| delivered as f64 / settled as f64),
+        p95_duration_ms: percentile_95(&durations),
     })
 }
 
@@ -458,8 +491,18 @@ pub const MAX_REDELIVERIES: i32 = 10;
 /// A `pending` row is refused rather than reset, and that is the one place this operation could
 /// double-send: the runner has already claimed it and is holding a lease, so a reset would hand
 /// the same row to the next claim while the first attempt is still in flight.
-pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> Result<()> {
-    let updated = sqlx::query(
+/// Returns the row's new `redeliver_count`, so the caller can report how many times it has now
+/// been forced without a second read — and, more importantly, so the number it reports is the
+/// one the *update* wrote rather than one a follow-up query might observe after somebody else
+/// pressed the button again.
+pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> Result<i32> {
+    // `query_scalar` rather than `query`: this is a single `integer` column, and the count it
+    // returns is the number the *update* wrote — the same statement, so there is no window in
+    // which a second reader could see a different value.
+    //
+    // `fetch_optional`, not `fetch_one`: the `where` clause is the whole refusal policy, so
+    // "no row" is the normal answer for a pending row or a capped one, not an error.
+    let updated: Option<i32> = sqlx::query_scalar(
         "update webhook_deliveries \
          set status = 'pending', attempts = 0, next_attempt_at = now(), \
              claimed_at = null, response_status = null, error = null, \
@@ -468,16 +511,17 @@ pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> R
              redeliver_count = redeliver_count + 1, replayed_at = now() \
          where id = $1 and endpoint_id = $2 \
            and status <> 'pending' \
-           and redeliver_count < $3",
+           and redeliver_count < $3 \
+         returning redeliver_count",
     )
     .bind(delivery_id)
     .bind(endpoint_id)
     .bind(MAX_REDELIVERIES)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
 
-    if updated.rows_affected() == 1 {
-        return Ok(());
+    if let Some(redeliver_count) = updated {
+        return Ok(redeliver_count);
     }
 
     // Nothing was updated, so find out which of the three reasons it was — the operator's next
@@ -522,13 +566,24 @@ pub async fn redeliver_many(
     pool: &PgPool,
     endpoint_id: Uuid,
     delivery_ids: &[Uuid],
-) -> Result<Vec<(Uuid, Result<()>)>> {
+) -> Result<Vec<(Uuid, Result<i32>)>> {
     let mut outcomes = Vec::with_capacity(delivery_ids.len());
     for id in delivery_ids {
-        // A store error (the database not answering) does stop the batch, because nothing
-        // after it could be reached either. A *refusal* does not: those are per-row answers
-        // and the point of the batch is to report them individually.
-        outcomes.push((*id, redeliver(pool, endpoint_id, *id).await));
+        // A store error (the database not answering) *does* stop the batch, because nothing
+        // after it could be reached either and a partial answer presented as a complete one is
+        // worse than an error. A *refusal* does not stop it: those are per-row answers, and
+        // the point of the batch is to report each one separately.
+        match redeliver(pool, endpoint_id, *id).await {
+            // A store error (the database not answering) *does* stop the batch, because
+            // nothing after it could be reached either, and a partial answer presented as a
+            // complete one is worse than an error. A *refusal* does not stop it: those are
+            // per-row answers, and the point of the batch is to report each one separately.
+            Ok(count) => outcomes.push((*id, Ok(count))),
+            Err(refusal @ EventsError::RedeliveryRefused { .. }) => {
+                outcomes.push((*id, Err(refusal)));
+            }
+            Err(other) => return Err(other),
+        }
     }
     Ok(outcomes)
 }
@@ -631,6 +686,261 @@ pub async fn list_events(pool: &PgPool, filter: &EventFilter) -> Result<EventPag
     Ok(EventPage {
         events: rows,
         has_more,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// Read one organization's window, or the platform default when it has never set one.
+///
+/// `coalesce($2, $1)` rather than a plain read: the column is `not null default 30`, so a
+/// `None` here can only mean the organization row does not exist yet, and answering with the
+/// documented default is what lets the screen render before the first organization does.
+pub async fn retention_window(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<i32> {
+    let days: i32 = sqlx::query_scalar(
+        "select coalesce((select event_retention_days from organizations where id = $1), $2)",
+    )
+    .bind(organization_id)
+    .bind(DEFAULT_EVENT_RETENTION_DAYS)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(days)
+}
+
+/// Set one organization's window.
+///
+/// The write is refused by the **store** rather than only by the API, because the store is also
+/// reached by a future import and by an operator's own SQL: a check constraint that holds the
+/// range makes the rule true everywhere instead of true in one handler. The check constraint on
+/// the column is the backstop; this read-back is what the caller returns to the screen.
+pub async fn set_retention_window(
+    pool: &PgPool,
+    organization_id: Uuid,
+    days: i32,
+) -> Result<i32> {
+    let stored: i32 = sqlx::query_scalar(
+        "update organizations set event_retention_days = $2, updated_at = now() \
+         where id = $1 returning event_retention_days",
+    )
+    .bind(organization_id)
+    .bind(days)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(EventsError::OrganizationNotFound(organization_id))?;
+
+    Ok(stored)
+}
+
+/// How much of one organization's history is on the bus, and how much of it is due.
+///
+/// Two counts in one statement, because the screen shows both and two round trips could be
+/// answered by two different instants — the panel would then draw "3,412 events, 12 due" where
+/// the 12 came from a moment after the 3,412, which is a pair of numbers that cannot both be
+/// true.
+///
+/// `due` counts only events that **could** be swept, so it is the same predicate the sweep
+/// itself uses: an event pinned by a pending delivery is counted in `events` and never in
+/// `due`, and a screen that said "12 due" while the sweeper removes 0 would be lying.
+pub async fn retention_counts(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<(i64, i64)> {
+    let row: (i64, i64) = sqlx::query_as(
+        "select count(*) as total, \
+                count(*) filter (where e.created_at < now() - make_interval(days => o.window) \
+                                  and not exists (select 1 from webhook_deliveries d \
+                                                  where d.event_id = e.id and d.status = 'pending')) \
+         as due \
+         from events e \
+         cross join (select coalesce((select event_retention_days from organizations where id = $1), $2) \
+                     as window) o \
+         where ($1::uuid is null or e.organization_id = $1)",
+    )
+    .bind(organization_id)
+    .bind(DEFAULT_EVENT_RETENTION_DAYS)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// How much history this organization keeps, and the last sweep that ran against it.
+pub async fn retention_status(pool: &PgPool, organization_id: Option<Uuid>) -> Result<RetentionStatus> {
+    let window_days = retention_window(pool, organization_id).await?;
+    let (events, due) = retention_counts(pool, organization_id).await?;
+
+    let last_run = sqlx::query_as::<_, RetentionRun>(
+        "select id, organization_id, started_at, finished_at, window_days, cutoff, \
+                events_deleted, deliveries_deleted, error \
+         from event_retention_runs \
+         where organization_id is not distinct from $1 and finished_at is not null \
+         order by started_at desc limit 1",
+    )
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(RetentionStatus {
+        organization_id,
+        window_days,
+        last_run,
+        events,
+        due,
+    })
+}
+
+/// The last sweeps of one organization, newest first.
+pub async fn list_retention_runs(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<RetentionRun>> {
+    let runs = sqlx::query_as::<_, RetentionRun>(
+        "select id, organization_id, started_at, finished_at, window_days, cutoff, \
+                events_deleted, deliveries_deleted, error \
+         from event_retention_runs \
+         where organization_id is not distinct from $1 and finished_at is not null \
+         order by started_at desc limit $2",
+    )
+    .bind(organization_id)
+    .bind(limit.clamp(1, 50))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(runs)
+}
+
+/// Every organization that has events on the bus, with its window, oldest first.
+///
+/// The sweeper's work list. `oldest first` is deliberate: every instance of the API runs this
+/// worker, and an ordering that is stable across instances is what stops two of them from
+/// sweeping the same organization's head of the list on the same tick. Two runners racing is
+/// not a correctness problem — the delete is idempotent and the counts are each truthful about
+/// their own work — but it is wasted work, and a batch bound turns "wasted" into "the tail never
+/// gets reached".
+pub async fn organizations_with_events(pool: &PgPool, batch: i64) -> Result<Vec<(Option<Uuid>, i32)>> {
+    let rows = sqlx::query_as::<_, (Option<Uuid>, i32)>(
+        "select e.organization_id, \
+                coalesce((select event_retention_days from organizations o where o.id = e.organization_id), $2) \
+         from events e \
+         group by e.organization_id \
+         order by min(e.created_at) asc \
+         limit $1",
+    )
+    .bind(batch.clamp(1, 500))
+    .bind(DEFAULT_EVENT_RETENTION_DAYS)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Remove one organization's events that are older than its window, and log the run.
+///
+/// **The predicate is the whole design.** An event is swept only when it is past the window
+/// *and* it has no `pending` delivery:
+///
+/// ```text
+/// delete from events e
+///  where e.organization_id is not distinct from $1
+///    and e.created_at < $2
+///    and not exists (select 1 from webhook_deliveries d
+///                     where d.event_id = e.id and d.status = 'pending')
+/// ```
+///
+/// The obvious query — "delete old events, let `on delete cascade` take the deliveries" — is
+/// the bug the `not exists` exists to prevent. A `pending` row means the runner has not
+/// delivered it yet: `next_attempt_at` is in the future, or a runner that claimed it died, or
+/// the endpoint is disabled and the row has not been settled. Cascading that away deletes a
+/// fact a receiver is still owed, and the receiver's only symptom is that the delivery never
+/// arrived and nothing in the platform says why.
+///
+/// The delete and the run-log write share one transaction, so the log can never claim a sweep
+/// that did not happen. The counters come from the statements themselves rather than from a
+/// `count` before the delete: a count and a delete that disagree is a log that lies about its
+/// own run.
+pub async fn sweep_events(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    window_days: i32,
+) -> Result<SweepReport> {
+    let cutoff = now() - Duration::days(window_days as i64);
+    let mut tx = pool.begin().await?;
+
+    let run_id: Uuid = sqlx::query_scalar(
+        "insert into event_retention_runs (organization_id, window_days, cutoff) \
+         values ($1, $2, $3) returning id",
+    )
+    .bind(organization_id)
+    .bind(window_days)
+    .bind(cutoff)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // The deliveries are counted, not selected: the cascade does the deleting, and a number
+    // the log can carry is all the screen needs to say "the deliveries went with them".
+    let swept = sqlx::query(
+        "with due as ( \
+             select e.id from events e \
+             where e.organization_id is not distinct from $1 \
+               and e.created_at < $2 \
+               and not exists (select 1 from webhook_deliveries d \
+                                where d.event_id = e.id and d.status = 'pending') \
+         ) \
+         delete from webhook_deliveries d using due where d.event_id = due.id",
+    )
+    .bind(organization_id)
+    .bind(cutoff)
+    .execute(&mut *tx)
+    .await?;
+    // `rows_affected` is a `u64` in this sqlx version and the report carries `i64`, so the
+    // conversion saturates rather than wraps: a sweep that removed more than `i64::MAX` rows
+    // is not reachable, and a wrapped negative count on a run log is a number nobody can
+    // explain. Saturation is the honest answer and the branch is unreachable either way.
+    let deliveries_deleted = i64::try_from(swept.rows_affected()).unwrap_or(i64::MAX);
+
+    // The deliveries of *settled* rows only — the `pending` ones were excluded above, so this
+    // count is what the cascade will actually remove and the two statements cannot disagree.
+    let events_deleted = sqlx::query(
+        "delete from events e \
+         where e.organization_id is not distinct from $1 \
+           and e.created_at < $2 \
+           and not exists (select 1 from webhook_deliveries d \
+                            where d.event_id = e.id and d.status = 'pending')",
+    )
+    .bind(organization_id)
+    .bind(cutoff)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let events_deleted = i64::try_from(events_deleted).unwrap_or(i64::MAX);
+
+    let finished_at: OffsetDateTime = sqlx::query_scalar(
+        "update event_retention_runs set finished_at = now(), events_deleted = $2, \
+                deliveries_deleted = $3 where id = $1 returning finished_at",
+    )
+    .bind(run_id)
+    .bind(i32::try_from(events_deleted).unwrap_or(i32::MAX))
+    .bind(i32::try_from(deliveries_deleted).unwrap_or(i32::MAX))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(SweepReport {
+        run_id,
+        organization_id,
+        window_days,
+        cutoff,
+        events_deleted,
+        deliveries_deleted,
+        finished_at,
     })
 }
 

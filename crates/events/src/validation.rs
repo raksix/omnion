@@ -8,6 +8,7 @@
 use rand::RngCore;
 
 use crate::error::{EventsError, Result};
+use crate::model::{MAX_RETENTION_DAYS, MIN_RETENTION_DAYS};
 
 /// Longest event name the platform records.
 pub const MAX_EVENT_NAME: usize = 96;
@@ -166,9 +167,55 @@ pub fn generate_secret() -> String {
     hex::encode(bytes)
 }
 
+/// Validate a retention window in days.
+///
+/// The refusal names **the field and the range**, because a bare "invalid" leaves the caller
+/// guessing which of the two bounds it crossed — and the two bounds mean opposite things to an
+/// operator: the floor is "you cannot keep nothing", the ceiling is "that is ten years, and
+/// your bus will be unreadable long before then".
+///
+/// The bounds come from the model rather than being written here, so the column's check
+/// constraint, the API's refusal and this function cannot drift apart.
+pub fn validate_retention_window(days: i32) -> Result<i32> {
+    if !(MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(&days) {
+        return Err(EventsError::invalid_retention(format!(
+            "event_retention_days must be between {MIN_RETENTION_DAYS} and {MAX_RETENTION_DAYS}, \
+             and {days} is not"
+        )));
+    }
+
+    Ok(days)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retention_window_outside_the_range_is_refused_by_name() {
+        // Both ends, not just the obvious one: a caller asking for 0 is asking to keep
+        // nothing, and a caller asking for 4000 is asking for ten years of an unreadable
+        // bus. Neither is a typo the platform may guess its way out of.
+        for days in [0, -1, MAX_RETENTION_DAYS + 1] {
+            let refused = validate_retention_window(days).expect_err("the window must be refused");
+            assert_eq!(refused.code(), "invalid_retention_window");
+            assert!(
+                refused.to_string().contains("event_retention_days"),
+                "the refusal names the field: {refused}"
+            );
+        }
+
+        // `.expect` rather than comparing the whole `Result`: the error type deliberately does
+        // not derive `PartialEq` (it carries a `sqlx::Error`, which is not comparable and should
+        // never be), so an equality assertion on the `Result` would be asserting a property of
+        // the error type that the taxonomy is right not to have. The success value is what the
+        // boundary is about.
+        assert_eq!(validate_retention_window(1).expect("the floor is valid"), 1);
+        assert_eq!(
+            validate_retention_window(MAX_RETENTION_DAYS).expect("the ceiling is valid"),
+            MAX_RETENTION_DAYS
+        );
+    }
 
     #[test]
     fn event_names_are_dotted_and_lower_case() {
