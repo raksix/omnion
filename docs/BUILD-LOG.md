@@ -6150,3 +6150,63 @@ what might be there. (b) `objects/` grows one file per object, and the delete ro
 remove the directory as well as the run's own JSON — check that before the restore wizard
 exists, because an operator who deletes a backup and finds the files still there will assume
 the product lied.
+
+### Tick 67 — the guard that deleted the build, and the three checkboxes that copied nothing (2026-09-29)
+
+**What.** Two commits, and the first one is the reason this tick's every-tick gate failed twice
+before any of my own code was reached.
+
+**The build died twice, and neither red was mine.** `cargo test -p omnion-environment` failed with
+`could not write output to target/debug/deps/unicode_bidi-….rcgu.o: No such file or directory
+(os error 2)` — and then again on `sqlx-macros-core`, and then again on a temp dir. Three
+different crates, three reruns, always on a dependency three or more levels from anything being
+edited. That is not a broken dependency and not a full disk (`/mnt/apopic` was at 94%, `df`
+said 3.4 G free): **`scripts/qa/disk-guard.sh` removed the `target/` directory underneath a
+running rustc.** Its per-worktree ceiling tested *size alone*, and the liveness test the file
+already had — `in_use`, which reads `CARGO_TARGET_DIR` out of `/proc/N/environ` — was never
+called from that step. Step 5, the last-resort sweep, *did* call it. The two cliffs disagreed.
+
+**And the liveness test could not have saved it anyway.** `worktree_busy` derives the worktree
+from the target directory's **name**: `/dev/shm/omnion-w2-target` → `omnion-w2`. A worktree's own
+`target/` has the basename `target`, so the same code derived the name **`omnion-target`**, a
+directory that does not exist, scanned two non-existent paths, found nothing, and returned
+"idle" — during any ordinary `cargo test` on this box. The guard was structurally incapable of
+seeing the most common build shape there is. This is the half that matters: adding the missing
+`reclaimable` call without fixing this would have produced a fix that passes review and deletes
+the build anyway.
+
+The fix asks the worktree **by parent** when that parent is a worktree (`.git` present) — no name
+convention, no guessing — and keeps the name rule for the tmpfs targets it was written for. Steps
+1 and 4 now both require `reclaimable` and *announce* a skip, because a silent skip is how a
+ceiling stops being enforced without anybody noticing. `scripts/qa/disk-guard-selftest.sh` (new)
+covers all three states with a 50 MB fixture and a scaled ceiling: idle is reclaimed, a live
+build keeps its target, its incremental cache and a writable output directory, and idle is
+reclaimed again afterwards so "kept" cannot become a loophole. **Verified red before the change
+and green after — 7/7.**
+
+**The real defect, underneath.** The staging clone wizard offered six checkboxes. Three — menus,
+site settings, theme — return `0` from the clone runner, and they carried the same label and the
+same weight as the three that do copy, so a tick was accepted, stored on the job, priced into the
+estimate, and then produced nothing. Worse, the panel's guard was **a different rule from the
+crate's**: it counted ticked boxes, so un-ticking the three real areas while leaving the three
+shared ones ticked satisfied the screen and produced an environment with nothing in it — the
+exact "looks cloned and is empty" state the runner's `require_areas` guard exists to prevent,
+reachable through the browser because two halves of one feature disagreed about what "selected"
+means. `Area::copies()` / `Area::note()` now declare the truth in the crate, the API carries both
+on every option, the shared areas are listed unticked and explained rather than hidden, the
+panel counts areas that actually copy, and the confirmation repeats the boundary because it is the
+last screen before the button. The unit test reads the runner off disk rather than restating
+which arms copy, and matches the **Rust** variant name rather than the wire name so a shared
+`Area::Menus | Area::SiteSettings => 0,` arm is judged once for both of its variants.
+
+**Proof.** `disk-guard-selftest.sh` **7/7** (red on the pre-fix file, green after) ·
+`omnion-environment` — 50 passed, 0 failed (see next) · `apps/admin` `tsc --noEmit` clean ·
+`pnpm typecheck` 2/2 successful.
+
+**Next.** (a) `omnion-api --test environments` is still owed for the clone areas, and the four
+`runEnvironmentsDepth` claims — including "ticking only the shared areas still blocks the step" —
+still have never executed. (b) **The guard fix is on `wave5`; the cron runs main's copy**
+(`~/.hermes/scripts/omnion-disk-guard.sh` execs `/mnt/apopic/omnion/scripts/qa/disk-guard.sh`),
+so the ceiling is still deleting default-target builds until main picks it up. Until then this
+branch builds with `CARGO_TARGET_DIR=/dev/shm/w5-target`, which the *name* rule on main's copy
+does protect.
