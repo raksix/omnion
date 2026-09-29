@@ -139,12 +139,21 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| cookie.split(';').next())
-        .map(str::to_owned);
+    // BOTH cookies, not the first one. A sign-in sets `omnion_session` and `omnion_csrf`, and the
+    // CSRF layer refuses a mutation that presents only the session -- so a walk holding one of the
+    // two is no longer a request the panel can make, and every post it issues reads `403` for a
+    // reason that has nothing to do with what it is testing.
+    let cookie = Some(
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|raw| raw.split(';').next())
+            .filter(|pair| pair.starts_with("omnion_session=") || pair.starts_with("omnion_csrf="))
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
     let bytes = response
         .into_body()
         .collect()
@@ -212,10 +221,9 @@ async fn sign_in(state: &AppState) -> String {
         .cookie
         .as_deref()
         .expect("login sets a session cookie");
-    let token = cookie
-        .split_once('=')
-        .map(|(_, value)| value)
-        .expect("the cookie carries a value");
+    // The whole `Cookie` header is kept, name and value: it now carries BOTH cookies, so
+    // unwrapping the session out of it would drop the CSRF token the mutation layer needs.
+    let token = cookie.to_owned();
     token.to_owned()
 }
 
@@ -223,7 +231,7 @@ fn authed(method: Method, path: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(path)
-        .header(header::COOKIE, format!("omnion_session={token}"))
+        .header(header::COOKIE, token.clone())
         .body(Body::empty())
         .expect("a request builds")
 }
@@ -232,7 +240,7 @@ fn json_request(method: Method, path: &str, token: &str, body: Value) -> Request
     Request::builder()
         .method(method)
         .uri(path)
-        .header(header::COOKIE, format!("omnion_session={token}"))
+        .header(header::COOKIE, token.clone())
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .expect("a request builds")

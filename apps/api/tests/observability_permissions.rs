@@ -203,12 +203,21 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .insert(axum::extract::ConnectInfo(peer));
 
     let status = response.status();
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| cookie.split(';').next())
-        .map(str::to_owned);
+    // BOTH cookies, not the first one. A sign-in sets `omnion_session` and `omnion_csrf`, and the
+    // CSRF layer refuses a mutation that presents only the session -- so a walk holding one of the
+    // two is no longer a request the panel can make, and every post it issues reads `403` for a
+    // reason that has nothing to do with what it is testing.
+    let cookie = Some(
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|raw| raw.split(';').next())
+            .filter(|pair| pair.starts_with("omnion_session=") || pair.starts_with("omnion_csrf="))
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
     let bytes = response
         .into_body()
         .collect()

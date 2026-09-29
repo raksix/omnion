@@ -4803,3 +4803,51 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+
+## Wave 6 — tick 18 — the log explorer screen, and what the CSRF merge broke underneath it
+
+**What.** The `/observability/logs` screen and the ~150 lines of `apps/admin/lib/api.ts` it needed
+(`79d6b78`), then the harness repair that the merged CSRF layer forced (`e674639`, `d242f43`).
+
+**The slice.** Slice 1 shipped the log API in an earlier tick and left the panel with no way to
+read it. The screen reads the bounded store and keeps the two ways of finding nothing apart: an
+empty store and an over-narrow filter both arrive as an empty `entries` array, and an operator
+who cannot tell them apart concludes the platform stopped logging — so `stored_total` decides
+which sentence renders. A request id is validated in the component rather than forwarded, because
+a typo rendered as "the log store could not be read" is the worst thing a debug screen can say to
+the person debugging it; the complaint is attached to the input and the rows underneath are left
+untouched. Request-id filtering switches to the timeline route, which is oldest-first where the
+explorer is newest-first, and the screen says so rather than looking broken.
+
+**The defect the walk-through found, which was not on the list.** Main's CSRF layer
+(`headers_middleware`) refuses a cookie-authenticated mutation that presents only the session.
+Four of this REQ's walks captured exactly that — `Get(SET_COOKIE)` returns the FIRST cookie and a
+sign-in sets TWO. So the layer was correct and the walks had quietly stopped being requests the
+panel can make. The tell was a `403` on an assertion about **body validation**: a `422` proves the
+guard let the request through, so a `403` where a `422` was expected is the guard, not the body.
+All four now forward the whole `Cookie` header, and the token is read out of the sign-in response
+rather than recomputed — a walk that recomputes it would keep passing if the sign-in stopped
+issuing one.
+
+**Proof.**
+
+- `cargo test -p omnion-telemetry` → **179 passed**, 0 failed
+- `cargo test -p omnion-api --test observability_logs` → **3 passed** (was 2/3; the third failed on
+  the CSRF refusal)
+- `pnpm typecheck` → 2/2 clean · `pnpm build` → 2/2, and `/observability/logs` appears in the route
+  table
+- `bun build scripts/qa/walkthrough.cjs --target node` → clean (the walkthrough is not covered by
+  `pnpm typecheck`, so this is the only syntax gate it has)
+
+**Still open, named rather than written off.** The whole-workspace gate and the browser pass did
+not finish this tick. The gate was started correctly (`scripts/qa/run-workspace-tests.sh`, never
+bare — see the script's own header) but the box is running nine writers against a 32 GB shared
+tmpfs and my run sat queued behind six other cargo invocations. What it DID report before the box
+crowded it: `--test automation` 0/5 and `--test workflows` 4/18, all `403 csrf_unavailable`, which
+are **wave 3's and wave 5's walks with the same defect this tick fixed in mine** — a harness gap in
+shared code, not a product defect. That is worth one owner-level decision rather than seven writers
+patching their own files.
+
+**Next tick.** Run the private-stack pass
+(`QA_STACK=w6 QA_API_PORT=18085 QA_ADMIN_PORT=3105 QA_WEB_PORT=3205 bash scripts/qa/run.sh`), tick
+the walkthrough line, and close REQ-126 if the browser pass is clean.

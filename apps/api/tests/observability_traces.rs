@@ -68,12 +68,21 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| cookie.split(';').next())
-        .map(str::to_owned);
+    // BOTH cookies, not the first one. A sign-in sets `omnion_session` and `omnion_csrf`, and the
+    // CSRF layer refuses a mutation that presents only the session -- so a walk holding one of the
+    // two is no longer a request the panel can make, and every post it issues reads `403` for a
+    // reason that has nothing to do with what it is testing.
+    let cookie = Some(
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|raw| raw.split(';').next())
+            .filter(|pair| pair.starts_with("omnion_session=") || pair.starts_with("omnion_csrf="))
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
     let request_id = response
         .headers()
         .get("x-request-id")
@@ -155,10 +164,9 @@ async fn sign_in(state: &AppState) -> (Uuid, String) {
         .cookie
         .as_deref()
         .expect("login sets a session cookie");
-    let token = cookie
-        .split_once('=')
-        .map(|(_, value)| value)
-        .expect("the cookie carries a value");
+    // The whole `Cookie` header is kept, name and value: it now carries BOTH cookies, so
+    // unwrapping the session out of it would drop the CSRF token the mutation layer needs.
+    let token = cookie.to_owned();
     (user.id, token.to_owned())
 }
 
@@ -166,7 +174,7 @@ fn authed(method: Method, path: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(path)
-        .header(header::COOKIE, format!("omnion_session={token}"))
+        .header(header::COOKIE, token.clone())
         .body(Body::empty())
         .expect("a request with a method builds")
 }
@@ -380,8 +388,18 @@ async fn a_five_hundred_is_sampled_at_a_zero_ratio_and_is_findable_by_request_id
 
     // Prove the whole path: index a failed request's trace the way the middleware would at the end
     // of a 5xx, then read it back through the search.
+    // A FRESH trace id per run. `trace_store::upsert` conflicts on `trace_id`, so a constant one
+    // updates the row the PREVIOUS run left behind — and `coalesce(excluded.request_id, …)` then
+    // keeps that row's ORIGINAL request id, so the write appears to succeed while the search for
+    // this run's id finds nothing. The symptom is a walk that passes the first time and fails on
+    // every run after it, which is the hardest shape to read: the assertion says "a 5xx at ratio
+    // 0.0 is not findable" when the truth is "the second run overwrote the first run's key".
     let mut guard = tracing_spine::TracingGuard::start(
-        Span::root("b".repeat(32), "HTTP GET /api/v1/does-not-exist", "api"),
+        Span::root(
+            uuid::Uuid::new_v4().simple().to_string(),
+            "HTTP GET /api/v1/does-not-exist",
+            "api",
+        ),
         request_id,
         false,
         SamplingDecision::RatioDropped,
@@ -608,7 +626,7 @@ async fn a_reader_cannot_add_an_exporter_and_an_owner_ones_mutation_is_audited()
     let reader_token = login
         .cookie
         .as_deref()
-        .and_then(|cookie| cookie.split_once('=').map(|(_, value)| value.to_owned()))
+        .map(str::to_owned)
         .expect("a session cookie");
 
     let body = json!({
@@ -623,7 +641,7 @@ async fn a_reader_cannot_add_an_exporter_and_an_owner_ones_mutation_is_audited()
         Request::builder()
             .method(Method::POST)
             .uri("/api/v1/observability/exporters")
-            .header(header::COOKIE, format!("omnion_session={reader_token}"))
+            .header(header::COOKIE, reader_token.clone())
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.clone()))
             .expect("the create request builds"),
@@ -642,7 +660,7 @@ async fn a_reader_cannot_add_an_exporter_and_an_owner_ones_mutation_is_audited()
         Request::builder()
             .method(Method::POST)
             .uri("/api/v1/observability/exporters")
-            .header(header::COOKIE, format!("omnion_session={token}"))
+            .header(header::COOKIE, token.clone())
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .expect("the create request builds"),
