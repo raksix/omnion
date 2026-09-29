@@ -1,4 +1,4 @@
--- Omnion · 0052 · The attribute map gets a table of its own (REQ-065, slice 2).
+-- Omnion · 0117 · The attribute map gets a table of its own (REQ-065, slice 2).
 --
 -- Slice 1 widened the provider *registry* (0051). The wizard's third step — external attribute →
 -- panel field, with a transform and a required flag — has nowhere to live: `config.role_mappings`

@@ -1,4 +1,4 @@
--- Omnion · 0051 · The provider registry becomes directory-aware (REQ-065, slice 1).
+-- Omnion · 0116 · The provider registry becomes directory-aware (REQ-065, slice 1).
 --
 -- `0011_iam_advanced.sql` carries `auth_providers` and REQ-006 shipped the OIDC, OAuth2 and
 -- SAML half of it (`crates/identity/src/sso`). This migration widens the **registry row** and

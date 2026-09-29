@@ -1107,10 +1107,10 @@ mod tests {
     fn the_migration_and_the_struct_agree_about_the_columns() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../database/migrations/0051_identity_providers.sql"
+            "/../../database/migrations/0116_identity_providers.sql"
         );
         let migration = std::fs::read_to_string(path).unwrap_or_else(|error| {
-            panic!("cannot read 0051_identity_providers.sql ({error}); the closed lists live in it")
+            panic!("cannot read 0116_identity_providers.sql ({error}); the closed lists live in it")
         });
         for column in [
             "last_test_at",

@@ -2,7 +2,7 @@
 # REQ-065's slice-2 gate: the attribute map against a real database.
 #
 # The unit tests prove the configuration language, the transforms and the projection. They cannot
-# prove that 0052 applies, that the unique index really refuses a second row writing one field,
+# prove that 0117 applies, that the unique index really refuses a second row writing one field,
 # that the enum checks are present at all, or — the one that matters most — that a migration
 # written for a populated world behaves like it. Those are statements about a live database, so
 # this is a disposable stack: its own database, no ports, dropped at the end.
@@ -11,7 +11,7 @@
 #
 # The shape follows the slice-1 gate deliberately: migrations are applied **file by file in
 # filename order**, so a migration that only happens to work after a later one cannot pass. That
-# also proves 0052 sits correctly in the ledger, which is the failure nobody notices until two
+# also proves 0117 sits correctly in the ledger, which is the failure nobody notices until two
 # branches pick the same number.
 set -euo pipefail
 
@@ -50,7 +50,7 @@ refused() {
 }
 
 # ---------------------------------------------------------------------------------------------
-echo "[iam-attr-map] 1. applying the migration set in filename order (the gate on 0052)"
+echo "[iam-attr-map] 1. applying the migration set in filename order (the gate on 0117)"
 for f in database/migrations/*.sql; do
   psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -v ON_ERROR_STOP=1 -q -f "$f" >/dev/null
 done

@@ -2,7 +2,7 @@
 # REQ-065's slice-1 gate: the directory registry against a real database.
 #
 # The unit tests prove the configuration language, the ladder and the gate. They cannot prove
-# that 0051 applies, that the widened `kind` check actually accepts a directory, that the row a
+# that 0116 applies, that the widened `kind` check actually accepts a directory, that the row a
 # directory needs is storable, or — the one that matters most — that a *populated* database
 # survives the new constraints. Those are statements about a live database, so this is a
 # disposable stack: its own database, no ports, dropped at the end.
@@ -10,14 +10,14 @@
 #   bash scripts/qa/run-iam-directory.sh
 #
 # It answers six questions the unit tests cannot:
-#   1. does 0051 apply cleanly on top of the released set, in filename order?
+#   1. does 0116 apply cleanly on top of the released set, in filename order?
 #   2. does the widened `kind` check accept `ldap` and `active_directory`?
 #   3. does a directory row carry its test state — including "never tested", which is `null`
 #      and not `false`?
 #   4. does the database refuse a negative sync interval, as the crate does?
 #   5. does the column list every provider query selects — a column in Rust and not in the
 #      migration is a query that fails at runtime and passes every unit test?
-#   6. does a *populated* provider table (the case 0051's `drop constraint` has to get right)
+#   6. does a *populated* provider table (the case 0116's `drop constraint` has to get right)
 #      survive the migration?
 set -euo pipefail
 
@@ -42,14 +42,14 @@ echo "[iam-directory] creating a disposable database"
 q() { psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -v ON_ERROR_STOP=1 -tAq -c "$1"; }
 
 # ---------------------------------------------------------------------------------------------
-echo "[iam-directory] 1. applying the migration set in filename order (this is the gate on 0051)"
+echo "[iam-directory] 1. applying the migration set in filename order (this is the gate on 0116)"
 # File-by-file, exactly as sqlx applies them, so a migration that only works after a later one
 # cannot pass here. ON_ERROR_STOP=1 means a failure ends the script — which is the gate.
 for f in database/migrations/*.sql; do
   psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -v ON_ERROR_STOP=1 -q -f "$f" >/dev/null
 done
 count=$(find database/migrations -name '*.sql' | wc -l)
-echo "  applied $count migrations, 0051 included"
+echo "  applied $count migrations, 0116 included"
 
 # ---------------------------------------------------------------------------------------------
 echo "[iam-directory] 2. the widened kind check accepts both directory kinds"
@@ -63,7 +63,7 @@ for kind in ldap active_directory; do
   slug="qa-${kind//_/-}"
   pid=$(q "insert into auth_providers (organization_id, slug, kind, name, config) \
            values ('$ORG', '$slug', '$kind', 'QA $kind', '{}') returning id")
-  [ -n "$pid" ] || fail "the kind check refused `$kind` — 0051 did not widen it"
+  [ -n "$pid" ] || fail "the kind check refused `$kind` — 0116 did not widen it"
 done
 echo "  ldap and active_directory both accepted"
 
@@ -129,8 +129,8 @@ index_present=$(q "select count(*) from pg_indexes where indexname = 'auth_provi
 echo "  6 registry columns + 1 partial index present"
 
 # ---------------------------------------------------------------------------------------------
-echo "[iam-directory] 6. a POPULATED provider table survives 0051"
-# This is the case the `drop constraint` exists for. Applying 0051 to an empty table proves
+echo "[iam-directory] 6. a POPULATED provider table survives 0116"
+# This is the case the `drop constraint` exists for. Applying 0116 to an empty table proves
 # nothing about a table with rows in it, and a release migration that only works on an empty
 # database is a migration that breaks the first real install.
 PGORGPOP=$(q "insert into organizations (id, name, slug) values (gen_random_uuid(), 'QA Pop', 'qa-pop') returning id")
@@ -139,8 +139,8 @@ q "insert into auth_providers (organization_id, slug, kind, name, config, enable
 q "insert into auth_providers (organization_id, slug, kind, name, config, enabled) values \
    ('$PGORGPOP', 'legacy-saml', 'saml', 'Legacy SAML', '{}', true)" >/dev/null
 psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -v ON_ERROR_STOP=1 -q \
-     -f database/migrations/0051_identity_providers.sql >/dev/null 2>&1 \
-  && fail "re-applying 0051 succeeded — it is not idempotent, which is fine, but the check below is the real test"
+     -f database/migrations/0116_identity_providers.sql >/dev/null 2>&1 \
+  && fail "re-applying 0116 succeeded — it is not idempotent, which is fine, but the check below is the real test"
 
 # Re-applying an `add column` is expected to fail on a *fresh* file, so instead assert what
 # matters: the pre-existing rows are still there, still enabled, and still readable through the
