@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
+import { BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, GitBranch, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -29,6 +29,8 @@ const NAV = [
   { href: "/crm/leads", label: "Lead inbox", icon: UserCog },
   { href: "/crm/leads/duplicates", label: "Duplicate leads", icon: Copy },
   { href: "/crm/settings/intake", label: "Intake sources", icon: KeyRound },
+  { href: "/crm/settings/assignment", label: "Assignment rules", icon: GitBranch },
+  { href: "/crm/settings/sla", label: "Response targets", icon: Timer },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

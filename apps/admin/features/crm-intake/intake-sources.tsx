@@ -525,7 +525,7 @@ export function IntakeSources() {
         >
           SLA
         </button>
-        ) and arrive with the module&apos;s second slice.
+        ), each with its own screen.
       </p>
     </div>
   );

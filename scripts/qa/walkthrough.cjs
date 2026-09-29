@@ -3562,6 +3562,199 @@ async function runGoalAndRealtimeDepth(page, report) {
  * The honeypot and the too-fast submitter are part of the same surface, so one submission is
  * posted with the honeypot filled and must land as `spam`, not as a lead somebody will call.
  */
+/**
+ * REQ-117 slice 2 — the assignment chain, the simulator and the SLA policies.
+ *
+ * Three claims here are only provable by driving the real screen against the real API, and
+ * each has bitten an implementation that only had the unit tests:
+ *
+ * 1. **A created rule actually fires.** The server bug this guards was a created rule landing
+ *    *below* the seeded catch-all, so it saved, listed, and never won. A unit test on the
+ *    evaluator cannot see it; only a create-then-simulate can.
+ * 2. **The simulator explains the loser.** The result must name the winning rule AND at
+ *    least one rule it passed over, with the condition key that missed. A preview that only
+ *    says who won is the thing the screen is not allowed to be.
+ * 3. **The simulator does not consume fairness.** Running it twice must leave the pool's
+ *    cursor where it was. This is the claim most likely to be quietly wrong: a simulator that
+ *    advances the cursor changes who gets the next lead, and nobody notices until a lead goes
+ *    to the "wrong" person weeks later.
+ */
+async function runCrmAssignmentDepth(page, report) {
+  const steps = {};
+  const tag = Math.random().toString(36).slice(2, 8);
+
+  // 1. Seed a pool rule through the API, so the simulator has something to be fair about.
+  const people = await page.evaluate(async (suffix) => {
+    const response = await fetch("/api/v1/crm/assignment/rules", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: `QA pool ${suffix}`,
+        conditions: { has_email: true },
+        target_kind: "pool",
+        pool_user_ids: [
+          "11111111-1111-1111-1111-111111111111",
+          "22222222-2222-2222-2222-222222222222",
+          "33333333-3333-3333-3333-333333333333",
+        ],
+        active: true,
+      }),
+    });
+    return response.ok ? await response.json() : null;
+  }, tag);
+  steps.poolRuleCreated = Boolean(people && people.id);
+  steps.poolRulePosition = people ? people.position : null;
+
+  // 2. A country rule ABOVE it, created through the UI, so "add a rule" is measured.
+  await page.goto(`${URL_ADMIN}/crm/settings/assignment`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="assignment-rules"], [data-testid="assignment-error"]', {
+    timeout: 12000,
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.rulesRendered = (await page.locator("[data-testid='assignment-rules']").count()) > 0;
+  steps.ruleCount = await page.locator("[data-testid='assignment-rule']").count();
+  steps.skippedListRendered = (await page.locator("[data-testid='assignment-skipped']").count()) > 0;
+  await shot(page, "page-crm-assignment-rules");
+
+  // The editor: add a country rule and save it through the form.
+  await page.locator('[data-testid="assignment-add"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector('[data-testid="rule-editor"]', { timeout: 6000 }).catch(() => {});
+  await page.locator('[data-testid="rule-name"]').fill(`QA country ${tag}`).catch(() => {});
+  await page.locator('[data-testid="rule-condition-country"]').check({ timeout: 4000 }).catch(() => {});
+  await page.locator('[data-testid="rule-condition-input-country"]').fill("TR").catch(() => {});
+  await page.locator('[data-testid="rule-target"]').selectOption("queue").catch(() => {});
+
+  // The refusal the editor makes before the round trip: a ticked but blank condition.
+  await page.locator('[data-testid="rule-condition-region"]').check({ timeout: 4000 }).catch(() => {});
+  steps.emptyConditionNamed = (
+    await page.locator('[data-testid="rule-empty-condition"]').innerText().catch(() => "")
+  ).includes("region");
+  steps.saveDisabledOnEmptyCondition =
+    (await page.locator('[data-testid="rule-save"]').isDisabled().catch(() => false)) === true;
+  await page.locator('[data-testid="rule-condition-region"]').uncheck({ timeout: 4000 }).catch(() => {});
+  steps.saveEnabledAfterFix = (await page.locator('[data-testid="rule-save"]').isDisabled().catch(() => true)) === false;
+  await shot(page, "page-crm-assignment-editor");
+  await page.locator('[data-testid="rule-save"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.ruleCountAfterSave = await page.locator("[data-testid='assignment-rule']").count();
+  steps.savedAboveTheCatchAll =
+    (await page.locator("[data-testid='assignment-rule']").first().innerText().catch(() => "")).includes(
+      `QA country ${tag}`,
+    );
+
+  // 3. The simulator: a Turkish payload must win the country rule, and an unnamed country
+  //    must pass it over WITH the key that missed.
+  await page.locator('[data-testid="simulator-payload"]').fill(
+    JSON.stringify({ country: "TR", email: "visitor@example.invalid" }, null, 2),
+  );
+  await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector('[data-testid="simulator-result"]', { timeout: 8000 }).catch(() => {});
+  const winner = await page.locator('[data-testid="simulator-winner"]').innerText().catch(() => "");
+  steps.simulatorNamesWinner = winner.includes(`QA country ${tag}`);
+  steps.simulatorExplainsLosers =
+    (await page.locator("[data-testid='simulator-skip']").count()) > 0 &&
+    (await page
+      .locator("[data-testid='simulator-skip']")
+      .first()
+      .getAttribute("data-failed-on")
+      .catch(() => "")) !== null;
+  steps.simulatorSaysItWroteNothing =
+    (await page.locator("[data-testid='simulator-result']").innerText().catch(() => "")).includes(
+      "nothing was written",
+    );
+  await shot(page, "page-crm-assignment-simulator");
+
+  // A German payload must NOT win the TR rule, and the skip must name "country".
+  await page.locator('[data-testid="simulator-payload"]').fill(
+    JSON.stringify({ country: "DE", email: "visitor@example.invalid" }, null, 2),
+  );
+  await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const failedOn = await page
+    .locator("[data-testid='simulator-skip']")
+    .first()
+    .getAttribute("data-failed-on")
+    .catch(() => "");
+  steps.simulatorNamesTheFailingKey = failedOn === "country";
+
+  // 4. The fairness claim: running the simulator must not move the cursor.
+  const cursorBefore = await page.evaluate(async (ruleId) => {
+    const response = await fetch("/api/v1/crm/assignment/rules", { credentials: "same-origin" });
+    const rules = await response.json();
+    return rules.find((r) => r.id === ruleId)?.round_robin_cursor ?? null;
+  }, people ? people.id : null);
+  for (let n = 0; n < 3; n += 1) {
+    await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(900);
+  }
+  const cursorAfter = await page.evaluate(async (ruleId) => {
+    const response = await fetch("/api/v1/crm/assignment/rules", { credentials: "same-origin" });
+    const rules = await response.json();
+    return rules.find((r) => r.id === ruleId)?.round_robin_cursor ?? null;
+  }, people ? people.id : null);
+  steps.simulatorDidNotAdvanceTheCursor =
+    cursorBefore !== null && cursorBefore === cursorAfter;
+  steps.poolShowsItsNextMember = (
+    await page.locator("[data-testid='assignment-rule']").allInnerTexts()
+  ).some((text) => text.includes("next:"));
+
+  // 5. Reorder: the rule moves and the chain renumbers, proved by the rendered order.
+  const orderBefore = (await page.locator("[data-testid='assignment-rule']").allInnerTexts()).map(
+    (t) => t.split("\n")[0],
+  );
+  await page.locator('[data-testid="rule-down-0"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const orderAfter = (await page.locator("[data-testid='assignment-rule']").allInnerTexts()).map(
+    (t) => t.split("\n")[0],
+  );
+  steps.reorderChangedTheOrder = orderBefore[0] !== orderAfter[0];
+  steps.positionsAreDense = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-testid='assignment-rule']")).map(
+      (el) => Number(el.getAttribute("data-position")),
+    ).every((position, index) => position === index),
+  );
+
+  // 6. The SLA screen: a business-hours policy with a reminder that collides with the breach
+  //    must be refused in the form, in a sentence, before the round trip.
+  await page.goto(`${URL_ADMIN}/crm/settings/sla`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="sla-policies"], [data-testid="sla-error"]', {
+    timeout: 12000,
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.policiesRendered = (await page.locator("[data-testid='sla-policies']").count()) > 0;
+  steps.policyCount = await page.locator("[data-testid='sla-policy']").count();
+  steps.scopeNoteShown = (await page.locator('[data-testid="sla-scope-note"]').innerText().catch(() => ""))
+    .toLowerCase()
+    .includes("holiday");
+  await shot(page, "page-crm-sla-policies");
+
+  await page.locator('[data-testid="sla-add"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector('[data-testid="sla-editor"]', { timeout: 6000 }).catch(() => {});
+  await page.locator('[data-testid="sla-name"]').fill(`QA hours ${tag}`).catch(() => {});
+  await page.locator('[data-testid="sla-business-hours"]').check({ timeout: 4000 }).catch(() => {});
+  steps.windowShownWhenChecked = (await page.locator('[data-testid="sla-window"]').count()) > 0;
+  await page.locator('[data-testid="sla-minutes"]').selectOption("240").catch(() => {});
+  await page.locator('[data-testid="sla-reminder"]').selectOption("240").catch(() => {});
+  steps.reminderCollisionNamed = (
+    await page.locator('[data-testid="sla-reminder-collision"]').innerText().catch(() => "")
+  ).includes("same minute");
+  steps.slaSaveDisabledOnCollision =
+    (await page.locator('[data-testid="sla-save"]').isDisabled().catch(() => false)) === true;
+  await shot(page, "page-crm-sla-editor");
+  await page.locator('[data-testid="sla-reminder"]').selectOption("30").catch(() => {});
+  steps.slaSaveEnabledAfterFix =
+    (await page.locator('[data-testid="sla-save"]').isDisabled().catch(() => true)) === false;
+  await page.locator('[data-testid="sla-save"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.policyCountAfterSave = await page.locator("[data-testid='sla-policy']").count();
+  steps.policyReadsInHours = (
+    await page.locator("[data-testid='sla-policy']").allInnerTexts()
+  ).some((text) => text.includes("within 4 h"));
+
+  return steps;
+}
+
 async function runCrmIntakeDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -4997,6 +5190,13 @@ async function main() {
     { path: "/crm/leads", name: "crm-leads" },
     { path: "/crm/leads/duplicates", name: "crm-lead-duplicates" },
     { path: "/crm/settings/intake", name: "crm-intake-sources" },
+    // Slice 2's two settings screens. They are walked as routes AND driven by their own
+    // depth pass: the route walk proves the screen renders with its empty and populated
+    // states, and the pass below proves the two claims that only a real click can prove —
+    // that the simulator names the rule that WON *and* the one that lost with the key that
+    // missed, and that running it does not consume the round-robin cursor.
+    { path: "/crm/settings/assignment", name: "crm-assignment-rules" },
+    { path: "/crm/settings/sla", name: "crm-sla-policies" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -5127,6 +5327,9 @@ async function main() {
   // change the row. It creates and removes its own sources, and runs after the count-sensitive
   // passes because it writes leads into the same inbox the metrics count.
   report.crmIntake = await runDepthPass("crm-intake", () => runCrmIntakeDepth(page, report));
+  report.crmAssignment = await runDepthPass("crm-assignment", () =>
+    runCrmAssignmentDepth(page, report),
+  );
   log(`crm intake: ${JSON.stringify(report.crmIntake)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
