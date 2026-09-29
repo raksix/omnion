@@ -153,6 +153,41 @@ OMNION_ADMIN_NAME="$QA_ADMIN_NAME" \
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
+step "seeding the QA tenant and site"
+# The admin seed on every boot creates the OWNER account and nothing else: no organization,
+# no site. The walkthrough's wizard then sees a user, so `needs_setup` (`!has_users`) is false,
+# the wizard is skipped — and every site-scoped screen is left with nothing to render. The
+# result looked like a broken product: `/cdn` asked for `?site_id=` and got a 400, the purge
+# depth pass reported "no QA site to purge for", and the pass filed 170 high findings against a
+# feature that had simply never been given a tenant to look at.
+#
+# The fixture belongs here and not in the walkthrough: the walkthrough is what is under test, and
+# a pass that invents its own tenant is a pass whose empty states are its own invention.
+#
+# `docker exec -i` is load-bearing. Without the `-i` the heredoc never reaches psql, the command
+# succeeds against an empty stdin, and the seed silently does nothing — which is the same failure
+# this step exists to prevent, one layer further down. The row counts below are printed so a
+# silently-empty seed is visible in the pass log rather than inferred from the findings.
+docker exec -i "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB_NAME" -v ON_ERROR_STOP=1 <<'QA_SEED'
+delete from sites;
+delete from organizations;
+update users set organization_id = null;
+insert into organizations (id, name, slug, status, event_retention_days, created_at, updated_at)
+select gen_random_uuid(), 'QA Organization', 'qa-organization', 'active', 30, now(), now()
+where not exists (select 1 from organizations);
+update users set organization_id = (select id from organizations limit 1) where organization_id is null;
+insert into sites (organization_id, key, name, status, theme, created_at, updated_at)
+select (select id from organizations limit 1), 'main', 'QA Main Site', 'active', 'minimal', now(), now()
+where not exists (select 1 from sites);
+QA_SEED
+QA_ORG=$(docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB_NAME" -t -A -c "select count(*) from organizations" 2>/dev/null || echo 0)
+QA_SITE=$(docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB_NAME" -t -A -c "select count(*) from sites where key = 'main'" 2>/dev/null || echo 0)
+step "QA fixture: ${QA_ORG} organization(s), ${QA_SITE} site(s) keyed 'main'"
+if [ "$QA_SITE" != "1" ]; then
+  echo "[qa] the QA fixture has no site keyed 'main' — every site-scoped screen would walk empty" >&2
+  exit 1
+fi
+
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
 if pm2 describe "$ADMIN_NAME" >/dev/null 2>&1; then

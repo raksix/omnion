@@ -5294,10 +5294,6 @@ async function runCdnPurgeDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
   const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
-  if (!site) {
-    steps.skipped = "no QA site to purge for";
-    return steps;
-  }
 
   // A failed fixture, written directly: the pass must not depend on a provider being down,
   // and a `generic_http` adapter pointed at a closed port would make every run slower and
@@ -5450,10 +5446,6 @@ async function runCdnRulesDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
   const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
-  if (!site) {
-    steps.skipped = "no QA site to attach a rule to";
-    return steps;
-  }
   // A 403 here is a real finding rather than a setup problem: the owner seeds the roles on
   // boot, so an owner without `cdn.manage` means the permission did not reach the role.
   expectRefusal(
