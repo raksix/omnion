@@ -278,8 +278,20 @@ export function MenuEditor({ menuId }: { menuId: string }) {
           // "Nest under the row above" — the keyboard equivalent of dropping onto a row.
           if (index <= 0) return list;
           const newParent = siblings[index - 1];
-          if (depthOf(newParent, new Map(list.map((row) => [row.id, row]))) >= maxDepth) return list;
+          if (depthOf(newParent, new Map(list.map((row) => [row.id, row]))) >= maxDepth) {
+            setNotice(
+              `Menus nest at most ${maxDepth} levels deep, and this row would be one deeper.`,
+            );
+            return list;
+          }
           const newSiblings = list.filter((row) => row.parent_id === newParent.id);
+          // The new parent is expanded here, and NOT inside the updater. A side effect inside a
+          // `setItems` updater is the version React may run twice or defer, and the symptom is
+          // worse than a missing expansion: the row keeps its place under a COLLAPSED parent, so it
+          // leaves the tree entirely and the editor sees the row they just nested simply vanish —
+          // the move looks like a delete, and pressing undo is the only way out.
+          const expandParent = newParent.id;
+          setExpanded((current) => new Set([...current, expandParent]));
           return list.map((row) =>
             row.id === id
               ? { ...row, parent_id: newParent.id, position: newSiblings.length }
@@ -322,7 +334,10 @@ export function MenuEditor({ menuId }: { menuId: string }) {
         const target = list.find((row) => row.id === targetId);
         if (!source || !target) return list;
         const map = new Map(list.map((row) => [row.id, row]));
-        if (nest && depthOf(target, map) >= maxDepth) return list;
+        if (nest && depthOf(target, map) >= maxDepth) {
+          setNotice(`Menus nest at most ${maxDepth} levels deep, and this drop would be one deeper.`);
+          return list;
+        }
         // A branch cannot be dropped inside itself: the walk below would loop forever on save.
         if (nest) {
           let cursor: string | null = targetId;
@@ -332,6 +347,9 @@ export function MenuEditor({ menuId }: { menuId: string }) {
           }
         }
         const parentId = nest ? targetId : target.parent_id;
+        // A drop that lands a row under a collapsed parent has the same vanishing-row symptom as
+        // the keyboard nest, so the branch is opened the same way — outside the updater.
+        if (nest) setExpanded((current) => new Set([...current, targetId]));
         const siblings = list.filter((row) => row.parent_id === parentId && row.id !== sourceId);
         return list.map((row) =>
           row.id === sourceId
