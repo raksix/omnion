@@ -3235,3 +3235,66 @@ two halves of the settings box are honestly unproven despite the box being ticke
 `digestPersisted` — and extend the settings pass to change those two fields rather than merely render
 them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
 REQ-010 slice 4's remaining gate.
+
+### Wave 5b · REQ-065 slice 3 — ordered role rules, and a dry run that cannot disagree with sign-in
+
+**What.** A verified directory identity now resolves to a role, and the resolution is one function
+called from two places. `0118` gives the rules their own table; `crates/identity/src/sso/role_rules.rs`
+is the language and the evaluator, `role_rule_store.rs` the storage, and
+`apps/api/src/routes/iam_role_rules.rs` the three endpoints (read, replace, dry run). The editor is
+`apps/admin/features/iam/role-rules-editor.tsx`, wired into the same drawer as the attribute map —
+the wizard's own order is Basics → Connection → Attribute mapping → Role mapping → Enable, and a
+fourth step on its own route would make that order a lie.
+
+**The first thing this tick did was not feature work.** `git merge origin/main` came back with a
+conflict in `BUILD-LOG.md` (append-only, as always) and — while resolving it — a duplicate sqlx
+version. `main` ships `0051_notification_routes`, `wave2-cms` ships `0051_cms_menus_publishing`,
+`wave3-automation` ships `0051_workflow_graph`, and I had shipped `0051_identity_providers`. A
+duplicate migration version is not a build error: the migrator reports `VersionMismatch` and the
+whole suite dies in `live_state` with zero assertions run, which reads as total regression rather
+than as one number chosen twice. REQ-065 reserves `0116–0125` for exactly this wave and that band is
+free on every branch, so both files moved there and both proofs moved with them —
+`run-iam-directory.sh` **PASS 6/6** (including a *populated* `auth_providers` table, the case a
+renumber breaks most easily) and `run-iam-attribute-map.sh` **PASS 14/14**. The lesson is not "read
+the ledger", which the invariant file already says: it is that a number is a **shared namespace
+across nine worktrees**, and the released high-water on `origin/main` at commit time is the only
+authoritative reading of it.
+
+**Two findings the work forced, both live.**
+
+The claim-path reader split on dots, and claim names are routinely URIs —
+`https://claims.example.com/team` becomes five segments and none of them exist. A rule on a
+URI-named claim would silently never match, which reads to an operator as *the rule is wrong* and
+sends them to edit a rule that was correct. Exact keys are now tried before the dotted path, so a URI
+claim reaches itself and `department` still reaches `{"user": {"department": …}}`.
+
+The regex guard was justified, in the first draft, as catastrophic backtracking. **That is false**,
+and the comment said it, which is worse than not having a comment. I probed the crate rather than
+assuming: `regex` is a finite automaton with no backtracker, and the textbook `(x+x+)+y` matches in
+**89µs** against 40 non-matching characters. Rejecting it would be superstition dressed as a
+security control. What actually costs is program size — `a{1,1000000}` is 12 characters of source
+and 64KB of compiled automaton, rebuilt on *every sign-in* — so the guard is a size ceiling, a
+repetition-expansion ceiling and a nesting ceiling, and the comment now says exactly that.
+
+**Proof.**
+
+- `cargo test -p omnion-identity --lib` → **191 passed** (was 166)
+- `cargo test -p omnion-api --lib` → **194 passed** (was 165)
+- `cargo test -p omnion-api --test iam_role_rules` → **1 passed**, isolated database, **run twice**
+- `bash scripts/qa/run-iam-role-rules.sh` → **PASS 18/18** (35 migrations in filename order)
+- `pnpm --filter @omnion/admin typecheck` → clean
+
+**Two mistakes this walk made, both worth more than the feature.** `cleanup()` ran immediately
+after `new()`, deleting the very accounts the sessions belonged to, so every authenticated call
+answered `401 invalid_session` — which reads like a broken endpoint rather than a fixture that
+deleted its own credentials. And the session came from login's *body*; it comes from `Set-Cookie`,
+and a walk that reads only the body authenticates as nobody. Both are now asserted-by-construction
+rather than by memory.
+
+**Not claimed.** `iam.role_rule_matched` is emitted by the evaluator's shape but is not yet fired
+from the callback, and the dry run deliberately evaluates the **stored** rules, not unsaved ones. The
+browser pass still has not reached `/settings/iam/authentication` — it is queued behind sibling
+writers and the full suite is 30+ minutes — so the REQ stays open and slice 3 is not closed.
+
+**Next.** Wire `resolve()` into `finish_sign_in` so a real callback fires `iam.role_rule_matched` and
+writes `role via rule #N` into the sign-in audit, then close slice 3 with the browser pass.
