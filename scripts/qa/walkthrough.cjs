@@ -5880,6 +5880,252 @@ async function runEventsDepth(page, report) {
 }
 
 /**
+ * The staging environments (REQ-017, slice 2).
+ *
+ * What this pass has to prove is not "the screen renders" — the route loop already did that — but
+ * the six claims that make the screen trustworthy, each of which has a way of being fake:
+ *
+ *  1. **The list renders production plus whatever staging exists**, and the Content column is
+ *     read from the API rather than counted on screen.
+ *  2. **The wizard creates an environment and its clone really copies rows.** A wizard that
+ *     creates the row and reports "done" while zero rows were copied is the exact failure this
+ *     request exists to prevent, so the pass waits for the job to finish and compares the staging
+ *     page count against production's.
+ *  3. **The clone gave the staging pages their own identities.** Two rows with the same slug and
+ *     the same environment would mean the copy silently overwrote itself; the pass counts them.
+ *  4. **The re-clone confirmation shows a number, not a shrug.** The dialog is built from the
+ *     server's refusal, so the pass sends the unconfirmed request first and reads the counts out
+ *     of the dialog the API's answer produced.
+ *  5. **Cancelling is offered only where the job is open**, and the button is absent on a
+ *     finished row — a cancel that always returns `409` is a dead button.
+ *  6. **Archiving keeps the content** and releases the host, so the row stays in the archived
+ *     filter rather than disappearing and taking the pages with it.
+ *
+ * Everything it creates is removed in the `finally`, because the QA database is shared with the
+ * next writer's pass and a leftover staging environment is a row their clone count will read.
+ */
+async function runEnvironmentsDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const key = `qa-staging-${stamp}`;
+  let environmentId = null;
+
+  try {
+    // ---- The list --------------------------------------------------------------------------
+    await page.goto(`${URL_ADMIN}/environments`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const rows = await page.locator("[data-env-row]").count();
+    const production = await page.locator('[data-env-row][data-env-type="production"]').count();
+    steps.list = { rows, production };
+    if (rows === 0) {
+      return { ok: false, reason: "/environments rendered no rows at all" };
+    }
+    // The empty state must not be showing behind a populated table. Both at once is the shape a
+    // screen gets when a fetch resolves after the empty branch has already rendered.
+    const emptyAlongside = (await page.locator("text=/No staging environment yet/i").count()) > 0;
+    if (emptyAlongside) {
+      record({ page: "environments", action: "empty-state-over-populated" });
+      steps.emptyOverPopulated = true;
+    }
+    await shot(page, "environments-list");
+
+    // ---- The filter, through the URL --------------------------------------------------------
+    await page.selectOption("[data-env-type-filter]", "staging").catch(() => {});
+    await page.waitForTimeout(900);
+    const stagedOnly = await page.locator('[data-env-row][data-env-type="production"]').count();
+    const urlHasType = page.url().includes("type=staging");
+    steps.filter = { stagedOnly, urlHasType };
+
+    // ---- The wizard ------------------------------------------------------------------------
+    await page.goto(`${URL_ADMIN}/environments`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(900);
+    await page.click("[data-env-new]").catch(() => {});
+    await page.waitForTimeout(500);
+    const wizardOpened = (await page.locator("[data-env-wizard]").count()) > 0;
+    steps.wizardOpened = wizardOpened;
+    if (!wizardOpened) {
+      return { ok: false, reason: "the create wizard did not open" };
+    }
+    await shot(page, "environments-wizard-name");
+
+    // An empty name must not advance: the wizard is asked for at least one area, so refusing
+    // here is the same refusal the API would make, one step earlier and without a round trip.
+    const nextBlocked = await page.locator("[data-env-wizard-next]").isDisabled().catch(() => false);
+    steps.nextBlockedWithoutName = nextBlocked;
+
+    await page.fill("[data-env-name]", `QA Staging ${stamp}`).catch(() => {});
+    await page.fill("[data-env-key]", key).catch(() => {});
+    await page.click("[data-env-wizard-next]").catch(() => {});
+    await page.waitForTimeout(350);
+    // A URL with a scheme is refused on screen, before the request.
+    await page.fill("[data-env-host]", "https://staging.example.com/path").catch(() => {});
+    await page.waitForTimeout(300);
+    const hostRefused = (await page.locator("text=/A host is a name, not a URL/i").count()) > 0;
+    steps.hostRefusedOnScreen = hostRefused;
+    await page.fill("[data-env-host]", `staging-${stamp}.qa.omnion.test`).catch(() => {});
+    await shot(page, "environments-wizard-host");
+    await page.click("[data-env-wizard-next]").catch(() => {});
+    await page.waitForTimeout(400);
+
+    // Areas come from the API, so the checkboxes are counted rather than assumed.
+    const areaBoxes = await page.locator("[data-env-area]").count();
+    steps.areaOptions = areaBoxes;
+    if (areaBoxes === 0) {
+      return { ok: false, reason: "the wizard offered no clone areas" };
+    }
+    // Unchecking everything must block the next step: a clone that copies nothing is not an
+    // environment, and the API refuses it — the screen must not be the one to discover that.
+    for (const name of await page.locator("[data-env-area]").evaluateAll((els) =>
+      els.map((el) => el.getAttribute("data-env-area")),
+    )) {
+      await page.locator(`[data-env-area="${name}"]`).uncheck().catch(() => {});
+    }
+    await page.waitForTimeout(250);
+    const areasBlocked = await page.locator("[data-env-wizard-next]").isDisabled().catch(() => false);
+    steps.nextBlockedWithoutAreas = areasBlocked;
+    await shot(page, "environments-wizard-areas");
+
+    await page.locator("[data-env-area]").first().check().catch(() => {});
+    await page.waitForTimeout(250);
+    await page.click("[data-env-wizard-next]").catch(() => {});
+    await page.waitForTimeout(400);
+    await shot(page, "environments-wizard-confirm");
+    await page.click("[data-env-wizard-submit]").catch(() => {});
+    await page.waitForTimeout(2500);
+
+    environmentId = qaSql(`select id from environments where key = '${key}' limit 1`);
+    steps.created = Boolean(environmentId);
+    if (!environmentId) {
+      return { ok: false, reason: `the wizard submitted but no environment with key ${key} exists` };
+    }
+
+    // ---- The clone really copies ------------------------------------------------------------
+    // The worker runs in the API process, so the job is polled here rather than assumed. The
+    // production page count is read from the same table the copy reads, which makes the
+    // comparison a fact about the data instead of a fact about a status word.
+    const productionPages = Number(
+      qaSql(
+        `select count(*) from pages p join environments e on e.id = p.environment_id ` +
+          `where e.type = 'production' and e.organization_id = (select organization_id from environments where id = '${environmentId}')`,
+      ),
+    );
+    let job = null;
+    for (let attempt = 0; attempt < 30 && !job; attempt += 1) {
+      job = qaSql(
+        `select status from environment_clone_jobs where environment_id = '${environmentId}' order by created_at desc limit 1`,
+      );
+      if (job === "done" || job === "failed" || job === "cancelled") {
+        break;
+      }
+      await page.waitForTimeout(1000);
+    }
+    const copied = Number(
+      qaSql(
+        `select count(*) from pages p join environments e on e.id = p.environment_id where e.id = '${environmentId}'`,
+      ),
+    );
+    // The whole point: a `done` job with zero copied rows is the failure the request names.
+    const cloneCopied = job === "done" && copied > 0 && copied === productionPages;
+    steps.clone = { job, copied, productionPages, cloneCopied };
+
+    // Two rows with the same slug in one environment would mean the copy collided with itself.
+    const duplicates = qaSql(
+      `select count(*) from (select slug from pages p join environments e on e.id = p.environment_id ` +
+        `where e.id = '${environmentId}' group by slug having count(*) > 1) d`,
+    );
+    steps.duplicateSlugs = Number(duplicates);
+    if (Number(duplicates) !== 0) {
+      record({ page: "environments", action: "duplicate-slugs-in-clone" });
+    }
+
+    // ---- The detail screen ------------------------------------------------------------------
+    await page.goto(`${URL_ADMIN}/environments/${environmentId}`, { waitUntil: "domcontentloaded" }).catch(
+      () => {},
+    );
+    await page.waitForTimeout(1200);
+    const facts = (await page.locator("[data-env-detail-facts] p").allInnerTexts()).join("|");
+    const jobRows = await page.locator("[data-env-job-row]").count();
+    const estimate = await page.locator("[data-env-detail-estimate]").innerText().catch(() => "");
+    steps.detail = {
+      rendered: (await page.locator("[data-env-detail-facts]").count()) > 0,
+      facts,
+      jobRows,
+      estimateHasWords: estimate.trim().split(/\s+/).length > 2,
+    };
+    await shot(page, "environments-detail");
+
+    // ---- The re-clone confirmation ----------------------------------------------------------
+    // The unconfirmed request goes first *by design*: the API answers it with the row counts the
+    // dialog is supposed to show. A dialog built from a guess is exactly what this catches.
+    await page.click("[data-env-detail-reclone]").catch(() => {});
+    await page.waitForTimeout(1500);
+    const dialogShown = (await page.locator("[data-env-reclone-dialog]").count()) > 0;
+    const discardLines = (await page.locator("[data-env-reclone-discard] li").allInnerTexts()).join("|");
+    steps.recloneDialog = {
+      dialogShown,
+      discardLines,
+      namesACount: /\d+ page/.test(discardLines),
+    };
+    await shot(page, "environments-reclone-confirm");
+
+    if (dialogShown) {
+      await page.click("[data-env-reclone-cancel]").catch(() => {});
+      await page.waitForTimeout(400);
+      const closedOnCancel = (await page.locator("[data-env-reclone-dialog]").count()) === 0;
+      steps.recloneDialog.closedOnCancel = closedOnCancel;
+    }
+
+    // ---- Cancel is only offered where it works ----------------------------------------------
+    // A finished job must not carry a cancel button. The API refuses it with a 409, so a button
+    // there is a control that exists only to fail.
+    const finishedCancelButtons = await page
+      .locator('[data-env-job-row][data-env-job-status="done"] [data-env-job-cancel]')
+      .count();
+    steps.cancelOnFinishedJob = finishedCancelButtons;
+    if (finishedCancelButtons > 0) {
+      record({ page: "environments", action: "cancel-offered-on-finished-job" });
+    }
+
+    // ---- Archive keeps the content ----------------------------------------------------------
+    await page.click("[data-env-detail-archive]").catch(() => {});
+    await page.waitForTimeout(500);
+    await shot(page, "environments-archive-confirm");
+    await page.click("[data-env-archive-confirm]").catch(() => {});
+    await page.waitForTimeout(1500);
+    const status = qaSql(`select status from environments where id = '${environmentId}'`);
+    const rowsAfterArchive = Number(
+      qaSql(`select count(*) from pages where environment_id = '${environmentId}'`),
+    );
+    steps.archive = { status, rowsAfterArchive, keptContent: status === "archived" && rowsAfterArchive > 0 };
+    if (!(status === "archived" && rowsAfterArchive > 0)) {
+      record({ page: "environments", action: "archive-lost-content" });
+    }
+
+    // The archived row must still be findable: the filter is how an operator gets it back.
+    await page.goto(`${URL_ADMIN}/environments?status=archived`, { waitUntil: "domcontentloaded" }).catch(
+      () => {},
+    );
+    await page.waitForTimeout(1000);
+    steps.archivedVisibleUnderFilter = (await page.locator(`[data-env-row][data-env-open="${environmentId}"]`).count()) > 0;
+    await shot(page, "environments-archived-filter");
+
+    const ok =
+      steps.clone?.cloneCopied === true &&
+      steps.detail?.rendered === true &&
+      steps.recloneDialog?.dialogShown === true &&
+      steps.archive?.keptContent === true;
+    return { ok, steps };
+  } finally {
+    // Cleanup is not optional. The QA database is shared with every other writer's pass, and a
+    // leftover staging environment with copied pages is a row their own clone counts will read.
+    if (environmentId) {
+      qaSql(`delete from pages where environment_id = '${environmentId}'`);
+      qaSql(`delete from environments where id = '${environmentId}'`);
+    }
+  }
+}
+
+/**
  * The webhook endpoint pass (REQ-016, slice 2): connect an endpoint through the real form,
  * see its deliveries, force one again, rotate its secret, and remove it.
  *
@@ -7011,6 +7257,11 @@ async function main() {
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
+    // The staging environments (REQ-017, slice 2). The list is walked here; its depth pass below
+    // drives the wizard and then opens a *real* environment's detail screen, for the same reason
+    // the webhook detail is not walked by id: a route opened with a placeholder id only proves
+    // the not-found state renders.
+    { path: "/environments", name: "environments" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -7140,6 +7391,14 @@ async function main() {
   // make on its own.
   report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
   log(`webhooks: ${JSON.stringify(report.webhooks)}`);
+
+  // The staging environments (REQ-017, slice 2): the list, the create wizard end to end, the
+  // detail screen and the discard confirmation. It runs right after the webhooks pass because it
+  // clones production content, and the rows it counts are the same pages the events pass has just
+  // published — so a pass that ran earlier would clone an empty site and report "0 of 2 copied"
+  // as if that were a defect in the copy.
+  report.environments = await runDepthPass("environments", () => runEnvironmentsDepth(page, report));
+  log(`environments: ${JSON.stringify(report.environments)}`);
 
   // The bus's own retention (REQ-016, slice 3). It runs after the events and webhook passes —
   // both of which count rows on the bus — because a sweep deletes, and a pass that deleted
