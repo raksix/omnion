@@ -28,7 +28,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
+use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::sites::{self, NewSite};
 use omnion_identity::users::{self, NewUser};
@@ -136,7 +136,12 @@ fn test_storage() -> omnion_storage::Storage {
 }
 
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // A cookie-authenticated write is refused outright when the process has no CSRF secret
+    // configured, so a suite that leaves it to the environment measures 403s on whatever
+    // machine happens to run it — which is how a whole file of walks can be red for a reason
+    // that has nothing to do with themes.
+    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
     let db = match Db::connect(&config.database).await {
         Ok(db) => db,
         Err(error) => {
@@ -165,9 +170,9 @@ async fn create_organization(db: &Db) -> Uuid {
     .fetch_one(db.pool())
     .await
     .expect("the organization must be created");
-    seed::seed_defaults(db.pool(), Some(id))
+    seed::ensure(db.pool())
         .await
-        .expect("the catalogue must seed");
+        .expect("the IAM seed must run");
     id
 }
 
@@ -279,7 +284,7 @@ async fn create_site(db: &Db, organization_id: Uuid, key: &str) -> omnion_identi
             organization_id,
             key: key.to_owned(),
             name: "Themes Site".to_owned(),
-            domain: None,
+            theme: None,
         },
     )
     .await
@@ -312,29 +317,20 @@ async fn mirror_bundled(db: &Db, keys: &[&str]) {
 /// A published page the public route can answer with, so "the visitor sees the new theme" is
 /// a statement about a real request rather than about a row.
 async fn publish_page(db: &Db, site_id: Uuid, slug: &str) {
-    let page = omnion_content::pages::create_page(
+    let (page, _) = omnion_content::pages::create_page(
         db.pool(),
         omnion_content::NewPage {
             site_id,
             slug: slug.to_owned(),
+            page_type: Some("page".to_owned()),
             title: "Themed page".to_owned(),
-            page_type: "page".to_owned(),
+            body: Some("Hello from the theme suite.".to_owned()),
+            summary: None,
             created_by: None,
         },
     )
     .await
     .expect("the page must be created");
-    omnion_content::pages::update_page(
-        db.pool(),
-        page.id,
-        &omnion_content::PageChanges {
-            title: Some("Themed page".to_owned()),
-            body: Some("Hello from the theme suite.".to_owned()),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("the draft must save");
     omnion_content::pages::publish_page(db.pool(), page.id)
         .await
         .expect("the page must publish");
@@ -343,13 +339,21 @@ async fn publish_page(db: &Db, site_id: Uuid, slug: &str) {
 /// Every walk in this file is skipped, loudly, when PostgreSQL is absent — and then asserts.
 /// A suite that silently passes because it never ran is a suite that reports a number nobody
 /// earned.
+///
+/// The expansion is an async BLOCK, not a sequence of statements. A macro arm that expands to
+/// bare statements at expression position does not parse, which is why the "no database" case
+/// is a `match` arm rather than the `let … else` this used to use.
 macro_rules! walk {
     ($state:expr, $body:expr) => {
-        let Some((state, db)) = live_state().await else {
-            eprintln!("SKIP: no database, this walk did not run");
-            return Ok(());
-        };
-        $body(state, db).await
+        async {
+            match live_state().await {
+                Some((state, db)) => $body(state, db).await,
+                None => {
+                    eprintln!("SKIP: no database, this walk did not run");
+                    Ok(())
+                }
+            }
+        }
     };
 }
 
@@ -412,7 +416,7 @@ async fn activating_a_theme_changes_what_a_signed_out_visitor_receives() -> Test
         mirror_bundled(&db, &["minimal", "corporate"]).await;
         publish_page(&db, site.id, "themed").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner");
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
         let auth = login(&state, &db, &email).await;
 
         // The site before: the renderer says `minimal`.
@@ -478,7 +482,7 @@ async fn rollback_restores_the_displaced_key_and_stays_reversible() -> TestResul
         let site = create_site(&db, organization_id, "gallery-rollback").await;
         mirror_bundled(&db, &["minimal", "corporate", "agency"]).await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner");
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
         let auth = login(&state, &db, &email).await;
 
         for key in ["corporate", "agency"] {
@@ -546,7 +550,7 @@ async fn rolling_back_a_site_that_never_switched_is_refused() -> TestResult {
         let organization_id = create_organization(&db).await;
         let site = create_site(&db, organization_id, "gallery-norollback").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner");
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
         let auth = login(&state, &db, &email).await;
 
         let response = call(
@@ -581,14 +585,19 @@ async fn re_activating_the_active_theme_keeps_the_rollback_target() -> TestResul
         let site = create_site(&db, organization_id, "gallery-noop").await;
         mirror_bundled(&db, &["minimal", "corporate"]).await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner");
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
         let auth = login(&state, &db, &email).await;
 
+        // The state is cloned INSIDE the closure, not outside it: the `async move` block below
+        // takes ownership, so a closure that borrowed it would be `FnOnce` and the second
+        // `activate("corporate")` in this walk would not compile. The repetition is the point
+        // of the walk, so the closure has to be callable twice.
         let activate = |key: &'static str| {
             let auth = Auth {
                 token: auth.token.clone(),
                 session_id: auth.session_id.clone(),
             };
+            let state = state.clone();
             let site_id = site.id;
             async move {
                 call(
@@ -634,7 +643,7 @@ async fn a_key_no_live_theme_carries_is_refused_and_writes_nothing() -> TestResu
         let site = create_site(&db, organization_id, "gallery-unknown").await;
         let other_organization = create_organization(&db).await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner");
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
         let auth = login(&state, &db, &email).await;
 
         // An upload that belongs to the OTHER organization, written directly: the installer
@@ -694,7 +703,7 @@ async fn the_gallery_is_readable_without_the_power_to_activate() -> TestResult {
         let site = create_site(&db, organization_id, "gallery-guards").await;
         mirror_bundled(&db, &["minimal", "corporate"]).await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader");
+        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader").await;
         let auth = login(&state, &db, &email).await;
 
         let read = call(
@@ -749,7 +758,7 @@ async fn a_tenant_upload_is_not_in_another_tenants_gallery() -> TestResult {
         let site = create_site(&db, organization_id, "gallery-tenant").await;
         mirror_bundled(&db, &["minimal"]).await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader");
+        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader").await;
         let auth = login(&state, &db, &email).await;
 
         sqlx::query(
@@ -796,7 +805,7 @@ async fn bundled_themes_are_mirrored_in_place_and_carry_no_tenant() -> TestResul
         let organization_id = create_organization(&db).await;
         let site = create_site(&db, organization_id, "gallery-bundled").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader");
+        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader").await;
         let auth = login(&state, &db, &email).await;
 
         mirror_bundled(&db, &["corporate", "agency"]).await;

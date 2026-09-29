@@ -57,6 +57,7 @@ pub const AA_LARGE: f64 = 3.0;
 /// row, and a diff computed in the browser against a field list that happens to match today is
 /// a diff that silently stops covering a field the REQ added in slice 3.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsRevision {
     /// Primary key.
     pub id: Uuid,
@@ -102,6 +103,7 @@ const REVISION_COLUMNS: &str = "id, site_id, revision_no, theme_key, tokens, typ
 /// and "this draft is older than what is live" (a restore made the published revision
 /// newer). A single `settings` field can express one of those and lies about the rest.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     /// Site the view is for.
     pub site_id: Uuid,
@@ -121,6 +123,7 @@ pub struct SettingsView {
 
 /// A row in the history list: enough to render, not the whole payload.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct RevisionSummary {
     /// Primary key.
     pub id: Uuid,
@@ -148,6 +151,7 @@ pub struct RevisionSummary {
 /// it is stored here precisely so that the value a caller compares twice is the value it saw
 /// on screen, and `Eq` would be a claim the type cannot keep.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContrastFinding {
     /// The token that failed, e.g. `text` on `surface`.
     pub foreground: String,
@@ -354,7 +358,7 @@ pub async fn list_revisions(pool: &PgPool, site_id: Uuid) -> Result<Vec<Revision
 
     let rows = sqlx::query_as::<_, RevisionRow>(
         "select r.id, r.revision_no, r.theme_key, r.created_at, r.created_by, \
-                u.name as created_by_name, \
+                u.display_name as created_by_name, \
                 (r.id = coalesce($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)) as is_published, \
                 (r.id = coalesce($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)) as is_draft, \
                 (select source.revision_no from theme_settings_revisions source \

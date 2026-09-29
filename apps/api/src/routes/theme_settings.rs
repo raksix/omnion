@@ -322,14 +322,17 @@ fn diff(
     // need a cast at every comparison and still not type-check the mixed entries.
     let mut changes = Vec::new();
     for (name, was, now) in [
-        ("theme_key", json!(before.theme_key), json!(after.theme_key)),
-        ("default_mode", json!(before.default_mode), json!(after.default_mode)),
+        // The diff's field NAMES are the wire names, not the column names: the panel renders
+        // them straight into labels, and `default_mode` next to `typography` in a history
+        // screen is a column name leaking into the product.
+        ("themeKey", json!(before.theme_key), json!(after.theme_key)),
+        ("defaultMode", json!(before.default_mode), json!(after.default_mode)),
         ("tokens", before.tokens.clone(), after.tokens.clone()),
         ("typography", before.typography.clone(), after.typography.clone()),
         ("layout", before.layout.clone(), after.layout.clone()),
         ("branding", before.branding.clone(), after.branding.clone()),
         (
-            "header_footer",
+            "headerFooter",
             before.header_footer.clone(),
             after.header_footer.clone(),
         ),
