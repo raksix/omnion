@@ -1293,6 +1293,18 @@ fn extract_links(body: &str) -> Vec<(String, Option<String>)> {
     out
 }
 
+/// How many links a body carries.
+///
+/// Published because the moderation policy needs the SAME number the broken-link view counts
+/// (REQ-064 slice 4a): "two links is a person, three is a link farm" is a claim about the links
+/// on the page, and two implementations of "a link" would make the rule drift from the thing it
+/// is a rule about. Returns the link count, never a list — a caller that wants the links wants
+/// the crawl, which has its own entry point.
+#[must_use]
+pub fn count_links(body: &str) -> usize {
+    extract_links(body).len()
+}
+
 /// Read one attribute out of an opening tag.
 fn attribute(tag: &str, name: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();

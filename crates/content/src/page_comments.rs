@@ -39,6 +39,13 @@ pub const MAX_AUTHOR_NAME: usize = 120;
 /// Longest accepted stored client hints (an address and a user agent, nothing more).
 pub const MAX_CLIENT_HINT: usize = 400;
 
+/// The stored reason for a body that was already submitted on this page.
+///
+/// A `const` rather than an inline literal because it is compared by a test and read by the
+/// panel; the id of the earlier comment is appended to it, so what a moderator reads is
+/// "duplicate of an earlier comment (<id>)" rather than a bare label.
+pub const SPAM_DUPLICATE: &str = "duplicate of an earlier comment";
+
 /// The four inbox tabs, in the order the panel shows them.
 pub const COMMENT_STATUSES: [&str; 4] = ["pending", "approved", "spam", "trash"];
 
@@ -432,21 +439,8 @@ impl CommentStore {
             )));
         }
 
-        if new.parent_id.is_some() {
-            // A reply must name a real top-level comment ON THIS PAGE. The trigger refuses a
-            // third level, but the trigger is the last line of defence: answering a comment on
-            // another page is a data error, not a depth error.
-            let parent_ok: bool = sqlx::query_scalar(
-                "select exists (select 1 from cms_comments \
-                 where id = $1 and page_id = $2 and parent_id is null)",
-            )
-            .bind(new.parent_id)
-            .bind(new.page_id)
-            .fetch_one(&self.pool)
-            .await?;
-            if !parent_ok {
-                return Err(ContentError::CommentNotFound);
-            }
+        if let Some(parent_id) = new.parent_id {
+            self.check_reply_parent(new.page_id, parent_id).await?;
         }
 
         if new.link_count > settings.max_links_per_comment {
@@ -482,9 +476,23 @@ impl CommentStore {
                 .await?);
         }
 
-        if self.duplicate(new.page_id, &email, &body).await? {
+        if let Some(_earlier) = self.duplicate(new.page_id, &email, &body).await? {
+            // The second copy is WRITTEN and marked, not refused: the whole point of the rule is
+            // that a moderator can see somebody submitted twice, and a hard unique index makes
+            // that impossible — the second insert is exactly what the index forbids, so the
+            // evidence the rule exists to produce cannot be stored. The duplicate check is the
+            // store's, and the store's answer is a row.
             return Ok(self
-                .write(new, &body, &name, &email, ip_hint, user_agent, Decision::Spam("duplicate of an earlier comment"), None)
+                .write(
+                    new,
+                    &body,
+                    &name,
+                    &email,
+                    ip_hint,
+                    user_agent,
+                    Decision::Spam(SPAM_DUPLICATE),
+                    None,
+                )
                 .await?);
         }
 
@@ -526,16 +534,10 @@ impl CommentStore {
             "the reply needs a display name",
         )?;
 
-        let parent_ok: bool = sqlx::query_scalar(
-            "select exists (select 1 from cms_comments where id = $1 and page_id = $2)",
-        )
-        .bind(new.parent_id)
-        .bind(new.page_id)
-        .fetch_one(&self.pool)
-        .await?;
-        if !parent_ok {
-            return Err(ContentError::CommentNotFound);
-        }
+        // A moderator is held to the same two-level rule as a visitor. "Reply as site" that can
+        // start a third level is a thread nobody can render, and a moderator is exactly the
+        // person who would notice that the answer disappeared.
+        self.check_reply_parent(new.page_id, new.parent_id).await?;
 
         let sql = format!(
             "insert into cms_comments \
@@ -717,6 +719,11 @@ impl CommentStore {
                 }
                 Some(parent_id) => {
                     if let Some((_, at)) = index_by_id.iter().find(|(id, _)| *id == parent_id) {
+                        // The badge belongs to the THREAD, not to the reply: a reader looks at
+                        // the question and decides whether it was answered, and a flag carried by
+                        // the answer itself is a flag they have to go and find. Set it on the
+                        // parent as the reply is stitched on.
+                        threads[*at].has_staff_reply |= row.is_staff_reply;
                         threads[*at].replies.push(public_of(row));
                     }
                     // A reply whose parent is not approved is deliberately DROPPED rather than
@@ -980,6 +987,31 @@ impl CommentStore {
         Ok((recent >= i64::from(allowed)).then_some("too many comments from one address"))
     }
 
+    /// Check that a reply answers a real TOP-LEVEL comment on this page.
+    ///
+    /// Two questions with two answers, and one query that answers both. A reply to a comment on
+    /// another page, or to one that has been deleted, is `comment_not_found` — there is nothing
+    /// to answer. A reply to a REPLY is `comment_too_deep`, and the two must not share a code:
+    /// the first is a caller's data error that any client can fix by re-reading the thread, and
+    /// the second is the platform's own two-level rule, which no client can fix by trying again.
+    /// The trigger in the migration refuses the depth as well; this is the check that can name
+    /// it before the write, so the visitor is told the rule rather than a constraint name.
+    async fn check_reply_parent(&self, page_id: Uuid, parent_id: Uuid) -> Result<()> {
+        let parent: Option<i16> = sqlx::query_scalar(
+            "select reply_depth from cms_comments where id = $1 and page_id = $2",
+        )
+        .bind(parent_id)
+        .bind(page_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match parent {
+            None => Err(ContentError::CommentNotFound),
+            Some(0) => Ok(()),
+            Some(_) => Err(ContentError::CommentThreadTooDeep),
+        }
+    }
+
     /// How many approved comments this address has on the site.
     async fn approved_count(&self, site_id: Uuid, email: &str) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
@@ -993,33 +1025,45 @@ impl CommentStore {
         Ok(count)
     }
 
-    /// Whether this exact body was already submitted on the page by this address.
-    async fn duplicate(&self, page_id: Uuid, email: &str, body: &str) -> Result<bool> {
-        let seen: bool = sqlx::query_scalar(
-            "select exists (select 1 from cms_comments \
+    /// The id of the earlier comment this body duplicates, if there is one.
+    ///
+    /// Returns the id rather than a bool for the same reason the row records a reason: a
+    /// moderator reading "duplicate of an earlier comment" needs to know WHICH one, and there
+    /// is exactly one answer to that question that a boolean cannot carry.
+    async fn duplicate(&self, page_id: Uuid, email: &str, body: &str) -> Result<Option<Uuid>> {
+        let earlier: Option<Uuid> = sqlx::query_scalar(
+            "select id from cms_comments \
              where page_id = $1 and lower(author_email) = lower($2) \
-               and md5(body) = md5($3) and status <> 'trash')",
+               and md5(body) = md5($3) and status <> 'trash' \
+             order by created_at asc limit 1",
         )
         .bind(page_id)
         .bind(email)
         .bind(body)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(seen)
+        Ok(earlier)
     }
 
     /// An account that may be recorded as having approved an auto-approved comment.
     ///
     /// `approved_by` is a foreign key, and an auto-approved comment has no moderator — but the
     /// column records *that* a decision was made and by whom, and NULL would be
-    /// indistinguishable from a comment nobody looked at. The site's first admin is the honest
-    /// value: the site's own policy approved it, and the site's owner owns the policy.
+    /// indistinguishable from a comment nobody looked at. The site's first account is the
+    /// honest value: the site's own policy approved it, and whoever owns the policy owns the
+    /// decision.
+    ///
+    /// The lookup is against `role_bindings`, which is the table that exists. A first draft
+    /// joined `user_site_roles` — a table this platform has never had — and a query against a
+    /// missing relation is a 500 on every auto-approved comment, which is to say on every
+    /// comment once `auto_approve_after_comments` is turned on. That is a feature nobody uses
+    /// until the day somebody does.
     async fn moderator_for(&self, site_id: Uuid) -> Result<Option<Uuid>> {
         let account: Option<Uuid> = sqlx::query_scalar(
-            "select u.id from users u \
-             join user_site_roles r on r.user_id = u.id \
-             where r.site_id = $1 and u.is_active \
-             order by u.created_at asc limit 1",
+            "select rb.user_id from role_bindings rb \
+             where rb.site_id = $1 and rb.user_id is not null \
+               and rb.revoked_at is null and (rb.expires_at is null or rb.expires_at > now()) \
+             order by rb.created_at asc limit 1",
         )
         .bind(site_id)
         .fetch_optional(&self.pool)
@@ -1055,9 +1099,10 @@ fn public_of(row: &Comment) -> PublicComment {
         body: row.body.clone(),
         replies: Vec::new(),
         created_at: row.created_at,
-        // The panel shows one "replied" badge per thread rather than one per reply, and the
-        // thread is the thing a reader sees.
-        has_staff_reply: row.is_staff_reply,
+        // A top-level comment's own flag. A REPLY sets its parent's flag instead (see
+        // `thread_for_page`), because the badge is drawn on the question — so a reply's own
+        // copy of this field is always false and a reader must never be shown it.
+        has_staff_reply: row.is_staff_reply && row.parent_id.is_none(),
     }
 }
 
@@ -1451,6 +1496,105 @@ mod tests {
         assert!(filter.limit > 200, "the caller sent it; the store is what clamps it");
 
         assert!(InboxFilter::default().status.is_none(), "no status means all four tabs");
+    }
+
+    #[test]
+    fn the_staff_reply_badge_belongs_to_the_question_not_the_answer() {
+        // The bug this pins: the flag was copied onto whichever row carried it, so the thread
+        // said `has_staff_reply: false` while its own `replies[0]` said true. A reader looks at
+        // the question to decide whether it was answered, and the answer's own flag is a flag
+        // they have to go and find. The store stitches, so the store is where it is proved.
+        let mut thread = public_of(&Comment {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            site_id: Uuid::new_v4(),
+            page_id: Uuid::new_v4(),
+            parent_id: None,
+            reply_depth: 0,
+            author_name: "Alan".to_owned(),
+            author_email: "alan@example.test".to_owned(),
+            ip_hint: None,
+            user_agent: None,
+            body: "Does the export include attachments?".to_owned(),
+            status: "approved".to_owned(),
+            spam_reason: None,
+            approved_at: None,
+            approved_by: None,
+            is_staff_reply: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        assert!(!thread.has_staff_reply, "an unanswered question is not answered");
+
+        let answer = public_of(&Comment {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            site_id: Uuid::new_v4(),
+            page_id: thread.id,
+            parent_id: Some(thread.id),
+            reply_depth: 1,
+            author_name: "The team".to_owned(),
+            author_email: String::new(),
+            ip_hint: None,
+            user_agent: None,
+            body: "It does.".to_owned(),
+            status: "approved".to_owned(),
+            spam_reason: None,
+            approved_at: None,
+            approved_by: None,
+            is_staff_reply: true,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        assert!(
+            !answer.has_staff_reply,
+            "a reply never claims to be the answer to itself"
+        );
+
+        // The line `thread_for_page` runs when it stitches the reply on — and the value it
+        // reads is the ROW's flag, not the reply's, which is why the two differ above and the
+        // line still does the right thing.
+        let staff_row = Comment {
+            is_staff_reply: true,
+            ..Comment {
+                id: answer.id,
+                organization_id: Uuid::new_v4(),
+                site_id: Uuid::new_v4(),
+                page_id: thread.id,
+                parent_id: Some(thread.id),
+                reply_depth: 1,
+                author_name: "The team".to_owned(),
+                author_email: String::new(),
+                ip_hint: None,
+                user_agent: None,
+                body: "It does.".to_owned(),
+                status: "approved".to_owned(),
+                spam_reason: None,
+                approved_at: None,
+                approved_by: None,
+                is_staff_reply: true,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+            }
+        };
+        thread.has_staff_reply |= staff_row.is_staff_reply;
+        assert!(
+            thread.has_staff_reply,
+            "the thread reads as answered even though the reply's own flag is false"
+        );
+
+        // A visitor's reply does NOT set the badge, and that is the assertion that would have
+        // caught a `has_staff_reply` that really meant "this row is a reply".
+        thread.has_staff_reply = false;
+        let visitor_row = Comment {
+            is_staff_reply: false,
+            ..staff_row
+        };
+        thread.has_staff_reply |= visitor_row.is_staff_reply;
+        assert!(
+            !thread.has_staff_reply,
+            "a visitor's answer is not the site answering"
+        );
     }
 
     #[test]

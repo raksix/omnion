@@ -67,7 +67,15 @@ create table cms_comments (
         check (status in ('pending', 'approved', 'spam', 'trash')),
     constraint cms_comments_body_not_blank check (length(btrim(body)) > 0),
     constraint cms_comments_name_not_blank check (length(btrim(author_name)) > 0),
-    constraint cms_comments_email_not_blank check (length(btrim(author_email)) > 0)
+    -- A VISITOR must give an address; a MODERATOR reply must not. `is_staff_reply` is the
+    -- discriminator, and the two halves are the same constraint rather than two, because a
+    -- row that is neither is exactly what a bug produces: `length(btrim(author_email)) > 0
+    -- or is_staff_reply` lets a blank address through on a visitor's comment while still
+    -- refusing a blank one on a reply. The address is a column, not a join to `users`, because
+    -- a comment must be submittable by somebody who has no account at all.
+    constraint cms_comments_author_email_check check (
+        is_staff_reply or length(btrim(author_email)) > 0
+    )
 );
 
 -- `reply_depth` is GENERATED from the parent reference rather than passed in, so a client that
@@ -119,10 +127,20 @@ create index cms_comments_page_approved_idx
     on cms_comments (page_id, created_at)
     where status = 'approved' and parent_id is null;
 
--- Uniqueness the store relies on: a visitor who double-clicks Send does not create two rows.
--- Trash is excluded on purpose — a trashed row is a moderator's record, and restoring it must
--- not collide with a newer comment that happens to say the same thing.
-create unique index cms_comments_dedupe_idx
+-- No unique index on (page, author, body) — deliberately, and it is worth writing down WHY,
+-- because the obvious design is the one that does not work.
+--
+-- A unique index here would make a double-clicked Send button a *database error* on the second
+-- insert, which is the opposite of the rule's purpose: the rule exists so a moderator can SEE
+-- that somebody submitted twice, and the second row is the evidence. Refusing the insert means
+-- the only record of the double submission is a 500 in a log. The store checks for a duplicate
+-- and WRITES the row with `spam_reason` set, so the queue shows both copies and says which
+-- came first.
+--
+-- The genuine double-click case is handled at its real source instead: the public route is
+-- idempotent by way of the honeypot and the fill-time floor, and a second identical submission
+-- lands in Spam where it is visible rather than invisible.
+create index cms_comments_duplicate_lookup_idx
     on cms_comments (page_id, lower(author_email), md5(body))
     where status <> 'trash';
 

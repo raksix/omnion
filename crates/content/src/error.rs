@@ -170,6 +170,11 @@ pub enum ContentError {
     /// this is a no-op, not a failure.
     #[error("{0}")]
     CommentAlreadyInState(String),
+    /// A reply named a reply. The platform's two-level rule, told apart from a missing comment
+    /// because the two mean opposite things for the caller: one is "I have the wrong id", the
+    /// other is "this platform does not do that, and no retry will change it".
+    #[error("a reply cannot answer another reply")]
+    CommentThreadTooDeep,
     /// A banned address tried to comment. The message names the reason a moderator recorded,
     /// because "you are banned" with no reason is the one answer a person will argue with.
     #[error("comment refused: {0}")]
@@ -230,6 +235,7 @@ impl ContentError {
             Self::CommentNotFound => "comment_not_found",
             Self::CommentAlreadyInState(_) => "comment_already_in_state",
             Self::CommentBanned(_) => "comment_banned",
+            Self::CommentThreadTooDeep => "comment_thread_too_deep",
             Self::SiteNotFound => "site_not_found",
         }
     }
