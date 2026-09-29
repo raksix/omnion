@@ -860,15 +860,18 @@ pub async fn close_stocktake(
     }
 
     if view.lines_pending > 0 {
-        return Err(InventoryError::invalid(
-            "stocktake",
-            "lines",
-            format!(
-                "{} line(s) on this sheet have not been counted — an uncounted shelf is not an \
-                 empty one",
-                view.lines_pending
-            ),
-        ));
+        // **`InvalidStatusChange` (409), not `Invalid` (400)**, and the choice is the module's
+        // own precedent rather than a new distinction: this is the same refusal a transfer gives
+        // when it is dispatched after it was received — the request is well formed and the
+        // document is not in a state that permits the step. A 400 would tell the person filling
+        // the sheet that they typed the request wrong, and they did not: they typed it correctly
+        // and have a shelf left to walk. The sentence carries the count so the next action is
+        // obvious.
+        return Err(InventoryError::InvalidStatusChange(format!(
+            "this sheet has {} line(s) nobody has counted yet — an uncounted shelf is not an \
+             empty one, so closing now would post stock nobody measured",
+            view.lines_pending
+        )));
     }
 
     let mut movements = Vec::new();
