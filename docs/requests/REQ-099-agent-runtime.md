@@ -99,12 +99,34 @@
 > - *The re-attach is a replay of the step rows, not a subscription.* That is what makes "replay
 >   matches SSE" measurable rather than asserted: the same rows produce both.
 >
-> Still open in slice 1: the **Skills tab, the Runs tab and the Workspace tab** — the workspace
-> needs the `ai_agent_files` table and the object storage it indexes, which is slice 2's
-> migration. A tab that lists nothing is a tab that lies, so none of the three is faked here.
-> REQ-099 is not closeable: the loop-level deadline/budget/cancel tests, the output-verification
-> helper, the skills, the guardrail events, the SDK example and the QA pass over the new screens
-> are all still open.
+> **Slice 2, first commit — the workspace** (`crates/ai-hub/src/workspace.rs`, migration
+> `0153_ai_agent_files.sql`, `routes/ai_agent_workspace.rs`, the Workspace tab, the walkthrough's
+> `runAiAgentsDepth` extension). The agent's scratch area: the inputs a run is told to read and
+> the outputs it keeps. Three rules, each a way a workspace leaks or lies, and each proved twice
+> — by the function *and* by a check constraint, because a rule the code enforces and the
+> schema does not is a rule a restore, a migration or a future writer sails past.
+>
+> - **The path is an identifier, not prose.** Relative, ≤ 512 characters, no control character,
+>   no `..` *segment*, no drive letter, no trailing separator. The `..` check is a segment
+>   comparison and not a substring one, so `..hidden.md` stays a legal file name — the test
+>   that pins it is the one that keeps a substring check from creeping back in.
+> - **The quota is arithmetic over rows, never a running sum in memory.** `sum(size_bytes) where
+>   agent_id = $1` is correct after a process dies between "bytes stored" and "counter
+>   incremented"; a counter is off by one file until the next restart. A replacement *refunds*
+>   the old size, so a workspace at 99 MB can still correct a file — a cap that only adds makes
+>   overwriting impossible exactly when somebody most wants to.
+> - **The storage key is derived, never supplied**: `agents/{agent_id}/{sha256}`. The agent id is
+>   in the key, so two agents writing `notes.md` cannot collide; the path is *not*, so a path can
+>   never be steered into another file's address; the checksum makes a re-upload of identical
+>   bytes reuse one object instead of leaving an orphan.
+>
+> Still open in slice 2: the goal's workspace references (a run naming its inputs) and the SDK.
+> The **Skills tab and the Runs tab** are slice 3, and the tab bar renders only the two that
+> exist — a tab that opens onto nothing is a tab that lies.
+>
+> Still open in slice 1: the output-verification helper, the guardrail bus events, the SDK
+> example and the QA pass over the new screens. REQ-099 is not closeable: the approval decision
+> and resume are REQ-101's, and the skills are slice 3.
 
 ## Request
 
@@ -225,8 +247,8 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 - [ ] The output-verification helper forces exactly one repair turn on a malformed answer and fails the run with `output_schema` on the second failure.
 - [ ] A skill attaching an unknown tool key fails validation with the key named, and a disabled skill is absent from the assembled prompt (test asserts the prompt).
 - [ ] A skill with a mismatched checksum is refused at run start with the reason shown on the Skills tab.
-- [ ] Workspace paths with `..`, an absolute path or a control character are refused; per-file and per-agent caps are enforced with stable codes.
-- [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both). *(the runs half is proved — `get_run` in another organization is `None`; the workspace half ships with slice 2)*
+- [x] Workspace paths with `..`, an absolute path or a control character are refused; per-file and per-agent caps are enforced with stable codes. *(proved on both sides of the boundary, because a rule the code enforces and the schema does not is a rule a restore or a migration sails past. Twelve unit tests call `validate_path` with values the test wrote — `../secrets.txt`, `/etc/passwd`, `C:\notes.md`, `notes\n.md`, `notes.md/`, `..hidden.md` — and four walks prove the *database* refuses the same shapes by constraint name. The caps are arithmetic: `sum(size_bytes) where agent_id = $1`, so a deleted file releases its bytes and a replacement refunds the old size. The walk that fills a workspace to exactly 100 MB asserts the asymmetry that matters: a replacement at the same size goes through, a *new* file at the same size is refused with "100 MB … already stored in 10 file(s)", and deleting one file makes room. Both limits are `MAX_FILE_BYTES` / `MAX_AGENT_BYTES` in the crate, quoted by the panel rather than retyped.)*
+- [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both). *(both halves are now proved at the store: `get_file` by path, `get_file_by_id` by row id, `list_files` and `delete_file` all answer `None`/`false` for another organization, and the file is still there afterwards — a single un-scoped query is a cross-tenant read and there are four of them. Two agents in *one* organization also do not share a namespace, which is the half the unique index on `(agent_id, path)` gives for free. The route's 404 is REQ-101's remaining wiring.)*
 - [x] A run's cost equals the sum of its `ai_usage` rows for the same window, asserted against SQL in the test. *(proved against the step rows, which is the recomputable half; the `ai_usage` join needs the provider call in slice 1's remaining half)*
 - [ ] Run telemetry (steps, tools used, tokens, cost) is visible per run and rolled up per agent for 30 days, and equals the underlying rows.
 - [ ] The SDK example runs a two-tool agent against a stub provider inside the workspace test suite without the API layer.

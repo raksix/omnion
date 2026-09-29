@@ -6412,6 +6412,92 @@ async function runAiAgentsDepth(page, report) {
   await page.waitForTimeout(600);
   endRefusalWindow("/api/v1/ai/runs");
 
+  // ---- the workspace tab (REQ-099 slice 2) ---------------------------------------------------------
+  //
+  // Driven through the UI, not by seeding a row: the tab's whole job is the path, the quota and
+  // the refusal, and a seeded row proves none of them. The three assertions that matter are the
+  // ones a seeded file cannot pass — the quota moved, the path column shows what was typed, and
+  // a traversal is refused *in the field* rather than silently becoming a different file.
+  await page.goto(`${URL_ADMIN}/ai/agents/${agentId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.agentTabs = await page.locator("[data-agent-tab]").count();
+  steps.workspaceTabPresent = (await page.locator('[data-agent-tab="workspace"]').count()) > 0;
+  await page.locator('[data-agent-tab="workspace"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.workspaceEmpty = (await page.locator("text=No workspace file yet").count()) > 0;
+  steps.usageBar = (await page.locator('[role="progressbar"][aria-label="Workspace usage"]').count()) > 0;
+  // The bar's label carries the pair, because "12%" alone does not say whether to delete a file
+  // or to stop uploading.
+  steps.usageNamesFiles = /file/.test(
+    (await page.locator('[role="progressbar"][aria-label="Workspace usage"]').locator("xpath=..").innerText().catch(() => "")),
+  );
+  steps.dropZone = (await page.locator("text=Add a workspace file").count()) > 0;
+  await shot(page, "ai-workspace-empty");
+
+  // Upload through the real input. `setInputFiles` on the hidden input is the same path the
+  // Choose-a-file button drives, so a broken handler fails here exactly as it would for a user.
+  const workspacePath = "qa/input.csv";
+  await page
+    .locator('input[type="file"]')
+    .setInputFiles({
+      name: "input.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from("invoice,total\n1,42\n"),
+    })
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  steps.pathFieldAsked = (await page.locator("#workspace-path").count()) > 0;
+  if (steps.pathFieldAsked) {
+    await page.locator("#workspace-path").fill(workspacePath).catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("text=Upload").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+  }
+  steps.workspaceRow = (await page.locator(`text=${workspacePath}`).count()) > 0;
+  steps.workspaceHasDownload = (await page.locator("text=Download").count()) > 0;
+  steps.workspaceHasDelete = (await page.locator("text=Delete").count()) > 0;
+  await shot(page, "ai-workspace-file");
+
+  // A traversal is refused in the field, with the rule named — and nothing is created.
+  const filesAfterUpload = qaSql(`select count(*) from ai_agent_files where agent_id = '${agentId}'`);
+  if (steps.pathFieldAsked) {
+    await page
+      .locator('input[type="file"]')
+      .setInputFiles({
+        name: "escape.csv",
+        mimeType: "text/csv",
+        buffer: Buffer.from("x\n"),
+      })
+      .catch(() => {});
+    await page.waitForTimeout(500);
+    await page.locator("#workspace-path").fill("../escape.csv").catch(() => {});
+    await page.locator("text=Upload").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+  steps.traversalRefused = (await page.locator("text=walks out of the workspace").count()) > 0;
+  steps.traversalCreatedNothing =
+    qaSql(`select count(*) from ai_agent_files where agent_id = '${agentId}'`) === filesAfterUpload;
+  await shot(page, "ai-workspace-refusal");
+
+  // The download is a real address with the path encoded per segment, so a subdirectory file is
+  // reachable rather than 404ing on a `%2F`.
+  steps.downloadHref = await page
+    .locator(`a:has-text("Download")`)
+    .first()
+    .getAttribute("href")
+    .catch(() => "");
+  steps.downloadHrefEncodesPath =
+    typeof steps.downloadHref === "string" && steps.downloadHref.includes("qa/input.csv");
+
+  // Clean up the workspace file so the pass does not leave bytes behind for the next one.
+  await page
+    .locator(`tr:has-text("${workspacePath}") button:has-text("Delete")`)
+    .first()
+    .click({ timeout: 4000 })
+    .catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.workspaceBackToEmpty = (await page.locator("text=No workspace file yet").count()) > 0;
+
   // ---- the run history and the trace ---------------------------------------------------------------
   await page.goto(`${URL_ADMIN}/ai/runs`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1800);
