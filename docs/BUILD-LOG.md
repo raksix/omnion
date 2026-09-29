@@ -5385,3 +5385,37 @@ blocked: the QA slot is held by another writer's live pass (w6) and free RAM is 
 
 **Commits.** `9e506bd` (the migration), `98218f1` (the gate and the 0/7), `9e75568` (the intake
 gate's two-sided assertion), `6a009b0` (retiring the two workarounds).
+
+### The browser pass, and the six ticks it took to read one screenshot
+
+**A browser pass is not a gate result until you have looked at the screen.** The pass this tick waited
+~17 minutes for the slot, acquired it, and died with
+`the pass has no tenant to walk: needs_setup=false organization=null`. Six prior ticks logged that
+class of message as "the slot is held by another writer" — the resource story — and this tick proved
+it was never the resource story at all: **the slot was held for 17 minutes, and the pass that followed
+still could not write a single row.**
+
+The cause was in the first screenshot. `qa-artifacts/20260929-164954/shots/010-setup-organization.png`
+carries the wizard's own red banner, and it reads:
+
+    cookie-authenticated changes are refused because no CSRF secret is configured
+    (set OMNION_CSRF_SECRET)
+
+The committed `run.sh` **exports that secret** — `d36847f`, "fix(qa): the CSRF secret every stack was
+missing". An **uncommitted edit by a parallel session in this worktree removed the line**, and the
+pass runs the working tree, not HEAD. Two writers sharing a checkout means `git status` is part of
+every gate's preconditions: a red pass whose cause is a dirty tree is a fact about the tree.
+
+**Proved rather than argued.** Driving the same three POSTs by hand against a live API with the
+secret set creates the organization and binds the owner (`onboarding_state.organization_id` stops
+being null); the API's log shows `first-run owner signed in`. The whole wizard path is sound. The
+pass was measuring a half-built harness, and every one of its failures pointed at the CRM.
+
+**Left alone deliberately.** Reverting the other session's line would have restored my pass and
+destroyed their in-flight work on a shared file. It stays uncommitted, and this entry says so rather
+than quietly fixing it.
+
+**A harness that dies before its first product assertion should say which precondition failed.** The
+pass named a *symptom* (`organization=null`) and the screenshot named the *cause*. Six ticks of
+"the slot is held" would have been one `grep OMNION_CSRF_SECRET scripts/qa/run.sh` away from the
+truth — the cheapest check on this box is still the one nobody runs.
