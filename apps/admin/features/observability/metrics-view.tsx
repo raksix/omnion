@@ -54,7 +54,7 @@ const WINDOWS: { label: string; minutes: number }[] = [
 /** The kind chip's tone. A histogram and a counter are read very differently, so they look different. */
 const KIND_TONE: Record<string, string> = {
   counter: "bg-positive-soft text-positive",
-  gauge: "bg-accent-soft text-accent",
+  gauge: "bg-accent-soft text-accent-strong",
   histogram: "bg-caution-soft text-caution",
 };
 
@@ -593,7 +593,7 @@ export function MetricsView() {
                 aria-pressed={windowMinutes === option.minutes}
                 className={`rounded-md border px-2 py-1 text-[12px] ${
                   windowMinutes === option.minutes
-                    ? "border-accent bg-accent-soft text-accent"
+                    ? "border-accent bg-accent-soft text-accent-strong"
                     : "border-line hover:bg-quiet-soft"
                 }`}
               >

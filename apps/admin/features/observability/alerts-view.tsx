@@ -1061,6 +1061,11 @@ export function AlertsView() {
                             onClick={() => void removeRule(rule)}
                             className="rounded border border-line px-2 py-1 text-xs text-danger hover:bg-danger-soft"
                             data-alert-rule-delete
+                            // The icon is the whole button, so the name has to live here: an
+                            // icon-only control with no label is announced as "button" and a
+                            // screen-reader user cannot tell the four deletes apart.
+                            aria-label={`Delete the alert rule ${rule.name}`}
+                            title={`Delete ${rule.name}`}
                           >
                             <Trash2 className="inline h-3 w-3" aria-hidden />
                           </button>
