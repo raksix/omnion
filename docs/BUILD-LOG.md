@@ -4255,3 +4255,34 @@ on a correct merge, because the base is a prefix of ours and was double-counted.
 **Next.** The rerun is walking with the gates decoupled. Settle it, then the retention steps
 committed last tick (they have still never executed) and the REQ-064 form-editor card that waits
 on a module this branch does not carry.
+
+### the rerun — the database is fixed, the box is the wall
+
+With the gates decoupled the rerun behaves **completely differently**, and the difference is the
+proof. Before the fix the API took a graceful shutdown at the first CRM route and the walk
+recorded an offline page for every route after it. This time the API was still answering when the
+walk reached the `iam-*` block, and **no route in the whole list recorded a
+`request-failed`, `console-error` or `click-error`**.
+
+It still did not reach the CRM screens, and that is a different failure with a different owner:
+the browser tab died at `iam-groups` with `Target page, context or browser has been closed` and
+everything after it is a cascade of the same line (34 `route-failed`, 8 depth passes). Five other
+stacks hold Chrome on this box; `free` shows 32 G with 1 G free. The pass then hit the 1500 s
+wall-clock while the depth phase was still running. **Both are the box, not the screens** — the
+same class of signal this branch recorded as `screen failed` before it was corrected to
+`tab died`, and the log line to write is the one already in the ledger: "this turn's error is
+not the REQ's".
+
+**What is settled, and what is not.** Settled: the five screens last tick blamed are sound, the
+`3 elements` was never a session problem, and the fault was the shared database — all three now
+have a mechanism rather than a theory, and the guard fails loudly if the name ever comes back.
+Not settled: REQ-117 still has **no browser pass over its own screens**, because this box cannot
+walk 49 routes with five other writers on it. The next tick either takes a slot and walks the
+CRM routes alone (`QA_ROUTES=crm` style narrowing if the harness supports it, or a slot waited
+for with `QA_SLOTS=1`) or the REQ stays **in-progress**. **REQ-117 is not closed on a pass that
+never visited it** — the retention steps committed last tick have still never executed, for the
+third tick running.
+
+**Next.** Re-run with the slot waited for rather than skipped (`QA_SLOTS=1`), so the pass starts
+on a box that can hold a browser. The gates are decoupled, so nothing else can take the API down
+under it now.
