@@ -99,7 +99,7 @@ step "API on :$API_PORT (database omnion_qa)"
 QA_API_BIN="${QA_API_BIN:-$ROOT/target/debug/omnion-api}"
 if [ ! -x "$QA_API_BIN" ] \
    || [ -n "$(find database/migrations -name '*.sql' -newer "$QA_API_BIN" -print -quit)" ]; then
-  log "building the API (missing or stale at $QA_API_BIN)"
+  step "building the API (missing or stale at $QA_API_BIN)"
   step "building the API (first pass, or a migration changed since the last build)"
   # `CARGO_TARGET_DIR` has to be honoured, or a caller that points `QA_API_BIN` at an
   # out-of-tree build gets a rebuild into the default `target/` — the full disk this override
@@ -109,11 +109,14 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
+  # The binary pm2 starts must be `QA_API_BIN`, not the default path: a writer that built
+  # out of tree (a full worktree disk) passed a working `QA_API_BIN` through the staleness
+  # check and then had pm2 report `Script not found` for a path that was never built.
   OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
-    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+    pm2 start "$QA_API_BIN" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
