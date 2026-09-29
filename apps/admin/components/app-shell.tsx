@@ -36,6 +36,7 @@ import {
   Sparkles,
   Timer,
   UserCog,
+  UserRoundCheck,
   UsersRound,
   Webhook,
   X,
@@ -72,6 +73,11 @@ const NAV = [
   // decide about a stranger's address. Everything before them in this shelf is an outbound or
   // authored surface.
   { href: "/newsletter", label: "Newsletter", icon: Mail },
+  // Visitor accounts (REQ-064, slice 4c). It sits directly after Newsletter because both hold
+  // a stranger's address and both ask an operator to decide about one — and the icon differs on
+  // purpose: `UserCog` already means a PANEL user two rows down, and an operator who confuses
+  // the two is about to grant a visitor a set of platform permissions.
+  { href: "/members", label: "Members", icon: UserRoundCheck },
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },

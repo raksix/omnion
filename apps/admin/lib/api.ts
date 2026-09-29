@@ -48,6 +48,11 @@ import type {
   CommentSettingsDocument,
   CreatedMediaShare,
   ImportReport,
+  Member,
+  MemberDelivery,
+  MemberDetail,
+  MemberList,
+  MemberSettingsDocument,
   NewsletterIssue,
   NewsletterList,
   NewsletterListRow,
@@ -5500,6 +5505,176 @@ export function removeCommentBan(siteId: string, banId: string): Promise<void> {
   return request<void>(
     `/api/v1/sites/${encodeURIComponent(siteId)}/comment-bans/${encodeURIComponent(banId)}`,
     { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Members (REQ-064, slice 4c)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The members table and its three state counts.
+ *
+ * One endpoint rather than a list plus a separate counts call: the chips and the table are one
+ * screen, and two reads can show two moments — a chip that says 4 over three rows leaves an
+ * operator wondering whether they lost a member.
+ */
+export function fetchMemberList(filters: {
+  site_id: string;
+  status?: string;
+  search?: string;
+  role?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<MemberList> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["status", "search", "role", "limit", "offset"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<MemberList>(`/api/v1/members?${query.toString()}`);
+}
+
+/** One member, with the last ten sign-ins. */
+export function fetchMember(id: string, siteId: string): Promise<MemberDetail> {
+  return request<MemberDetail>(
+    `/api/v1/members/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * The operator creates an account, with or without a password.
+ *
+ * `password` is optional on purpose: creating a row WITH a password makes a usable account the
+ * operator chose the address for, and omitting it makes an invitation the member must claim. The
+ * panel asks which, because the difference is whether the first sign-in needs a link.
+ */
+export function createMember(input: {
+  site_id: string;
+  email: string;
+  name?: string;
+  password?: string;
+  roles?: string[];
+}): Promise<Member> {
+  return request<Member>("/api/v1/members", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Edit a member.
+ *
+ * `roles` REPLACES the whole list rather than appending, and that is why the panel always sends
+ * it: a member editor that only ever adds a role cannot take one away, and a visitor who must
+ * keep a role they were granted by mistake holds it for as long as the site exists.
+ */
+export function patchMember(
+  id: string,
+  siteId: string,
+  changes: {
+    name?: string | null;
+    status?: string;
+    roles?: string[];
+    signin_note?: string | null;
+  },
+): Promise<Member> {
+  return request<Member>(
+    `/api/v1/members/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PATCH", body: JSON.stringify(changes) },
+  );
+}
+
+/**
+ * Block a member, naming the reason.
+ *
+ * A separate route rather than `patchMember({status:"blocked"})` because it is the one
+ * destructive button in the table and it carries the reason — a block with no stated reason is a
+ * decision an operator has to reverse twice.
+ */
+export function blockMember(id: string, siteId: string, reason?: string): Promise<Member> {
+  return request<Member>(
+    `/api/v1/members/${encodeURIComponent(id)}/block?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST", body: JSON.stringify({ reason: reason || undefined }) },
+  );
+}
+
+/** The operator vouches for an address they know. */
+export function verifyMember(id: string, siteId: string): Promise<Member> {
+  return request<Member>(
+    `/api/v1/members/${encodeURIComponent(id)}/verify?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Mint a fresh verification link.
+ *
+ * The answer says whether mail went out, so the panel can tell an operator that nothing was sent
+ * rather than leaving them to find out from a member who never received anything.
+ */
+export function sendMemberVerification(id: string, siteId: string): Promise<MemberDelivery> {
+  return request<MemberDelivery>(
+    `/api/v1/members/${encodeURIComponent(id)}/send-verification?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Mint a password reset link. */
+export function sendMemberReset(id: string, siteId: string): Promise<MemberDelivery> {
+  return request<MemberDelivery>(
+    `/api/v1/members/${encodeURIComponent(id)}/send-reset?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Kill every live member session. A blocked member's cookie stops on the next request. */
+export function signOutMemberEverywhere(
+  id: string,
+  siteId: string,
+): Promise<{ member_id: string; sessions_removed: number }> {
+  return request<{ member_id: string; sessions_removed: number }>(
+    `/api/v1/members/${encodeURIComponent(id)}/sign-out-everywhere?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Delete a visitor account and everything it owns.
+ *
+ * The only irreversible action on the screen, and the only one the panel puts behind a
+ * confirmation that names the address it is about to erase.
+ */
+export function deleteMember(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/members/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The site's membership policy. */
+export function fetchMemberSettings(siteId: string): Promise<MemberSettingsDocument> {
+  return request<MemberSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/members/settings`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Save the policy.
+ *
+ * The panel sends the whole document and the server applies each field it was given over the
+ * stored row — a panel that grows a field next year cannot reset the ones this year's panel knew
+ * nothing about.
+ */
+export function saveMemberSettings(
+  siteId: string,
+  settings: Partial<MemberSettingsDocument["settings"]>,
+): Promise<MemberSettingsDocument> {
+  return request<MemberSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/members/settings`,
+    { method: "PUT", body: JSON.stringify(settings) },
   );
 }
 

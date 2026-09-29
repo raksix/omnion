@@ -1997,6 +1997,98 @@ export type NewCommentReply = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// Members (REQ-064, slice 4c) — visitor accounts, their sessions, the site policy
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The three visitor states.
+ *
+ * `pending` is a signup that has not clicked its verification link. It is NOT a failure and the
+ * panel must not render it as one: a row that says "broken" for an account that is merely
+ * waiting teaches an operator that verification is broken.
+ */
+export type MemberStatus = "pending" | "verified" | "blocked";
+
+/**
+ * A visitor account, as the panel may describe them.
+ *
+ * There is deliberately no password field of any kind on this type. The API's own struct omits
+ * `password_hash` structurally rather than with `skip_serializing_if`, and a type that had the
+ * field would let the panel render one the day somebody adds it back.
+ *
+ * `has_password` is a BOOLEAN rather than the hash, and it is the only honest way to say what the
+ * panel needs: "invited, has never claimed the account" and "signed in yesterday" are two
+ * different rows the operator must be able to tell apart, and neither is answered by a hash.
+ */
+export type Member = {
+  id: string;
+  site_id: string;
+  email: string;
+  name: string | null;
+  /** The SITE's own role names. These are not panel roles and resolve to nothing in IAM. */
+  roles: string[];
+  status: MemberStatus;
+  verified_at: string | null;
+  last_signin_at: string | null;
+  has_password: boolean;
+  /** Live member sessions right now. Not panel sessions — `cms_member_sessions` only. */
+  live_sessions: number;
+  signin_note: string | null;
+  created_at: string;
+};
+
+/** One live member session, as the drawer lists them. */
+export type MemberSignin = {
+  id: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+};
+
+/** The members table and its three chips. */
+export type MemberList = {
+  members: Member[];
+  total: number;
+  counts: { pending: number; verified: number; blocked: number };
+};
+
+/** The drawer: the member plus the last ten sign-ins. */
+export type MemberDetail = {
+  member: Member;
+  recent_signins: MemberSignin[];
+};
+
+/**
+ * The site's membership policy.
+ *
+ * `gated_page_behaviour` is the one field the panel has to argue about rather than merely set:
+ * `not_found` answers 404 and discloses nothing, `prompt` answers 401 with a sign-in link and
+ * therefore advertises that the page exists. The default is `not_found` and the REQ's criterion
+ * says so, which is why this is a radio with an explanation and not a checkbox.
+ */
+export type MemberSettings = {
+  site_id: string;
+  signup_enabled: boolean;
+  require_verification: boolean;
+  default_roles: string[];
+  post_signin_redirect: string | null;
+  gated_page_behaviour: "not_found" | "prompt";
+  updated_at: string;
+};
+
+/** The settings screen in one read, with the one number the summary line needs. */
+export type MemberSettingsDocument = {
+  settings: MemberSettings;
+  verified_count: number;
+};
+
+/** What a mail-bound action reports. `unavailable` means no mail transport is configured. */
+export type MemberDelivery = {
+  member_id: string;
+  delivery: "sent" | "unavailable" | string;
+};
+
+// ---------------------------------------------------------------------------------------------
 // Newsletter (REQ-064, slice 4b) — lists, double opt-in subscribers, the sent archive
 // ---------------------------------------------------------------------------------------------
 
