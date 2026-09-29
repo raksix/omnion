@@ -14,6 +14,18 @@ const TONES: Record<string, string> = {
   archived: "bg-quiet-soft text-muted",
   disabled: "bg-quiet-soft text-muted",
   stopped: "bg-quiet-soft text-muted",
+  // CDN purge states (REQ-011). Without tones here every one of the five rendered in the
+  // quiet grey, which makes a `failed` purge and a `succeeded` one look identical in a
+  // history table — the exact reading the screen exists to prevent. `succeeded` is the
+  // only positive; `queued` and `running` are in flight and get the attention tone so a
+  // queue that is not draining is visible without opening a row.
+  succeeded: "bg-positive-soft text-positive",
+  done: "bg-positive-soft text-positive",
+  queued: "bg-caution-soft text-caution",
+  running: "bg-caution-soft text-caution",
+  partial: "bg-caution-soft text-caution",
+  pending: "bg-quiet-soft text-muted",
+  failed: "bg-accent-soft text-accent-strong",
 };
 
 /** A small pill for a lifecycle value (`draft`, `published`, …). */

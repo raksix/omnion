@@ -1053,3 +1053,138 @@ export type CdnAdapterInfo = {
   needs_zone: boolean;
   needs_credential: boolean;
 };
+
+/**
+ * A CDN adapter as `/api/v1/cdn/adapters` returns it.
+ *
+ * The two capability flags are read from a throwaway adapter instance on the server rather
+ * than from the catalogue table, so a listed capability and a shipped one cannot drift. The
+ * panel uses them to disable a mode the adapter genuinely cannot run: offering "purge by
+ * tag" to an adapter that cannot would queue work that fails at drain time.
+ */
+export type CdnAdapter = CdnAdapterInfo & {
+  supports_tags: boolean;
+  supports_purge_all: boolean;
+  /** Every catalogue entry is shipped by construction; kept for a client that renders one. */
+  shipped: boolean;
+};
+
+/** What a purge is for: absolute paths, surrogate keys, or the whole zone. */
+export type CdnPurgeKind = "url" | "tag" | "all";
+
+/**
+ * Where a purge is in its life.
+ *
+ * `running` covers a purge with items still waiting out a retry backoff, which is why it is
+ * not merged with `queued`: the operator's question is "is this moving?", and a purge whose
+ * next attempt is 40 seconds away is moving.
+ */
+export type CdnPurgeStatus = "queued" | "running" | "succeeded" | "partial" | "failed";
+
+/** One purge, as the history table and the drawer see it. */
+export type CdnPurge = {
+  id: string;
+  /** `null` once the site this purge was for has been deleted. */
+  site_id: string | null;
+  kind: CdnPurgeKind;
+  targets: string[];
+  status: CdnPurgeStatus;
+  /** The adapter that ran (or will run) it, captured when the purge was requested. */
+  provider: string;
+  item_count: number;
+  failed_count: number;
+  requested_by: string | null;
+  requested_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  /** The provider's own message, verbatim. Never a summary. */
+  error: string | null;
+  /**
+   * Whether a retry has anything to do.
+   *
+   * Computed by the server so the panel and the API cannot disagree: a retry button on a
+   * `succeeded` row is a dead button, and the request forbids those.
+   */
+  retryable: boolean;
+};
+
+/** One target inside a purge. */
+export type CdnPurgeItem = {
+  id: number;
+  target: string;
+  /** `pending` covers "waiting for its next attempt", not only "not started". */
+  status: "pending" | "running" | "done" | "failed";
+  attempts: number;
+  next_attempt_at: string;
+  response_status: number | null;
+  error: string | null;
+  done_at: string | null;
+};
+
+/** A purge plus its items — the detail drawer. */
+export type CdnPurgeDetail = {
+  purge: CdnPurge;
+  items: CdnPurgeItem[];
+};
+
+/** A page of history. `total` is the unpaged count so the panel can say "50 of 312". */
+export type CdnPurgePage = {
+  purges: CdnPurge[];
+  total: number;
+  /** The console's own cap, so the form can count before submitting. */
+  max_targets: number;
+};
+
+/** The filters the history table sends. Every one is optional and every one narrows. */
+export type CdnPurgeFilters = {
+  status?: CdnPurgeStatus | null;
+  kind?: CdnPurgeKind | null;
+  /** RFC 3339. */
+  since?: string | null;
+  /** RFC 3339. */
+  until?: string | null;
+  limit?: number | null;
+  offset?: number | null;
+};
+
+/** What the console sends. `zone_confirmed` is the typed `PURGE`, as a fact. */
+export type CdnPurgeInput = {
+  site_id: string;
+  kind: CdnPurgeKind;
+  targets: string[];
+  /** Required for `kind: "all"`; the form only sets it when the field literally says PURGE. */
+  zone_confirmed?: boolean;
+};
+
+/** The overview's cards. */
+export type CdnStatus = {
+  provider: string;
+  /** `false` when a settings row names an adapter this build does not ship. */
+  provider_shipped: boolean;
+  /** Items waiting to be attempted. */
+  queue_depth: number;
+  /** Purges that have not reached a terminal state. */
+  open_purges: number;
+  purges_24h: number;
+  succeeded_24h: number;
+  partial_24h: number;
+  failed_24h: number;
+  /**
+   * Share of the window that did not fully succeed, as a percentage.
+   *
+   * `partial` counts towards it: a purge where twenty of forty targets went through leaves
+   * a page still stale for some visitors, and a card reading 0% for that would be reporting
+   * the wrong thing. A window with no purges is `0`, never `NaN`.
+   */
+  failure_rate: number;
+  /** The last 20 purges, newest first. */
+  recent: CdnPurge[];
+};
+
+/** The inline result under the settings screen's "Test connection" button. */
+export type CdnProviderProbe = {
+  ok: boolean;
+  latency_ms: number;
+  status: number | null;
+  message: string;
+};

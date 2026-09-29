@@ -9,8 +9,16 @@ import type {
   CdnCacheRule,
   CdnCacheRuleInput,
   CdnRulesResponse,
+  CdnAdapter,
+  CdnProviderProbe,
+  CdnPurge,
+  CdnPurgeDetail,
+  CdnPurgeFilters,
+  CdnPurgeInput,
+  CdnPurgePage,
   CdnSettings,
   CdnSettingsInput,
+  CdnStatus,
   CreatedMediaShare,
   NewMediaGrant,
   Media,
@@ -4968,8 +4976,75 @@ export async function saveCdnSettings(input: CdnSettingsInput): Promise<CdnSetti
   return request("/api/v1/cdn/settings", { method: "PUT", body: JSON.stringify(input) });
 }
 
-/** The shipped provider adapters, with the fields each one needs. */
-export async function fetchCdnAdapters(): Promise<CdnAdapterInfo[]> {
-  const body = await request<{ adapters: CdnAdapterInfo[] }>("/api/v1/cdn/adapters");
+/**
+ * The shipped provider adapters, with the fields each one needs.
+ *
+ * Typed as `CdnAdapter` rather than the bare `CdnAdapterInfo` because the capability flags
+ * are what the console needs: offering "purge by tag" to an adapter that cannot do it
+ * queues work that fails an hour later at drain time, which is the worst moment to find out.
+ */
+export async function fetchCdnAdapters(): Promise<CdnAdapter[]> {
+  const body = await request<{ adapters: CdnAdapter[] }>("/api/v1/cdn/adapters");
   return body.adapters;
+}
+
+/**
+ * The overview's cards.
+ *
+ * One call rather than four: the provider state, the queue depth, the 24-hour counters and
+ * the recent list are four numbers an operator reads together, and four round trips would
+ * let them disagree with each other on screen — a purge that appears in the recent table
+ * but not the counters, because the counters were fetched a second earlier.
+ */
+export async function fetchCdnStatus(siteId: string): Promise<CdnStatus> {
+  return request(`/api/v1/cdn/status?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/** One page of purge history. */
+export async function fetchCdnPurges(
+  siteId: string,
+  filters: CdnPurgeFilters = {},
+): Promise<CdnPurgePage> {
+  const query = new URLSearchParams({ site_id: siteId });
+  if (filters.status) query.set("status", filters.status);
+  if (filters.kind) query.set("kind", filters.kind);
+  if (filters.since) query.set("since", filters.since);
+  if (filters.until) query.set("until", filters.until);
+  if (typeof filters.limit === "number") query.set("limit", String(filters.limit));
+  if (typeof filters.offset === "number") query.set("offset", String(filters.offset));
+  return request(`/api/v1/cdn/purges?${query.toString()}`);
+}
+
+/** The detail drawer: the purge plus one row per target. */
+export async function fetchCdnPurge(purgeId: string): Promise<CdnPurgeDetail> {
+  return request(`/api/v1/cdn/purges/${encodeURIComponent(purgeId)}`);
+}
+
+/**
+ * Ask for a purge.
+ *
+ * The 500-target cap is the server's, not the form's: the form counts so the operator gets
+ * an answer while typing, and the server refuses so a client that skips the count still
+ * cannot write a purge the worker will split into something the operator never saw.
+ */
+export async function createCdnPurge(input: CdnPurgeInput): Promise<CdnPurge> {
+  return request("/api/v1/cdn/purges", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * Requeue the failed items of a purge.
+ *
+ * A `409` here is the server saying this purge has nothing to retry, which is a real
+ * answer rather than a failure: the caller asked for the right thing and the state said no.
+ */
+export async function retryCdnPurge(purgeId: string): Promise<CdnPurgeDetail> {
+  return request(`/api/v1/cdn/purges/${encodeURIComponent(purgeId)}/retry`, {
+    method: "POST",
+  });
+}
+
+/** Run the configured provider's reachability check. */
+export async function testCdnProvider(siteId: string | null): Promise<CdnProviderProbe> {
+  const query = siteId === null ? "" : `?site_id=${encodeURIComponent(siteId)}`;
+  return request(`/api/v1/cdn/settings/test${query}`, { method: "POST" });
 }

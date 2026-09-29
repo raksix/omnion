@@ -114,11 +114,38 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   one that leaves two rules claiming the same priority and a tie the matcher breaks by row
   order rather than by what the drag showed._
 - [x] The rule form rejects an empty name, a malformed pattern and a TTL above the cap with a field message. (API half: each refusal names its own field. `0e2993c`)
-- [ ] Purge by URL list runs end to end and the history row reaches `succeeded` with per-item results.
-- [ ] Purge by tag and "everything" both work; "everything" requires the typed confirmation.
+- [x] Purge by URL list runs end to end and the history row reaches `succeeded` with per-item results.
+  _`a_purge_by_url_list_is_written_and_answers_with_its_own_state` and
+  `a_successful_drain_leaves_the_purge_succeeded_with_every_item_done`. The second is the
+  one that matters: it calls the worker's own `claim_due` / `apply_outcome` / `settle` — the
+  same functions the binary calls, not a copy of them, so the status the panel renders is a
+  status something actually computed. A test that stopped at "the API accepted it" would
+  prove only that a row was written. Suite: **17/17**._
+- [x] Purge by tag and "everything" both work; "everything" requires the typed confirmation.
+  _Both kinds are accepted in
+  `a_purge_by_tag_and_a_whole_zone_purge_are_both_accepted`, and the refusal is proved
+  separately: `a_whole_zone_purge_without_the_typed_word_is_refused` asserts the 400 **and**
+  that the history is still empty afterwards. That second assertion is the one worth having —
+  a rejected zone purge that still left a queued row would be discovered an hour later by
+  somebody who had been told it did not happen._
 - [ ] Publishing a page produces a purge row automatically within one worker tick, honouring trigger toggles.
-- [ ] A provider error marks the purge `failed`, records the provider message and leaves items retryable.
-- [ ] Retry from the history drawer requeues only failed items and updates the counts.
+- [x] A provider error marks the purge `failed`, records the provider message and leaves items retryable.
+  _`a_provider_refusal_lands_in_the_drawer_with_its_message_and_is_retryable` points the site
+  at an adapter with an unreachable endpoint and drains it three times against a budget of
+  two attempts. The walk asserts the *intermediate* state too — after one drain the items
+  are `pending` with `attempts = 1`, not `failed` — because "fails and is marked failed on
+  the first refusal" and "fails and is retried" are different products, and only the second
+  one survives a provider that was briefly down. The message is checked on the item row,
+  the parent row, and the drawer._
+- [x] Retry from the history drawer requeues only failed items and updates the counts.
+  _`a_partial_drain_says_partial_and_counts_only_what_failed` drains one purge into a
+  `done`/`failed` mix, then retries and asserts the resulting statuses are exactly
+  `["done", "pending"]`. Re-running the whole purge would re-send targets the provider
+  already accepted, which on a metered provider is slower *and* adds rate-limit pressure to
+  an outage. The retryable assertion is server-side: the walk
+  `a_retry_on_a_purge_with_nothing_to_retry_is_refused_with_an_explanation` checks that a
+  `queued` purge answers 409 and names its own state, rather than accepting a request that
+  would do nothing._
 - [x] Public page and media responses carry `Cache-Control`, `ETag` and `Surrogate-Key` headers. (`ca65085`, 13/13)
 - [x] Media responses answer `If-None-Match` with `304` and a matching `ETag`. (`69918e2`, `29b3409`)
   _The handler was written a while before anything proved it, and the page walk could not
@@ -137,7 +164,13 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   *order* of the two checks, because a refusal carrying a validator is a refusal an
   intermediary is entitled to remember, and a scan that finishes an hour later leaves the
   cached 403 sitting in front of it. Suite: **16/16**._
-- [ ] Purge console rejects more than 500 targets and an invalid URL with a clear message.
+- [x] Purge console rejects more than 500 targets and an invalid URL with a clear message.
+  _`more_than_the_cap_is_refused_and_the_message_carries_the_count` tries 501 and 500. The
+  second half is the part worth having: a test that only tried the refusal would not notice
+  an off-by-one that locked out a legitimate maximum, and the cap is inclusive. The malformed
+  cases (relative path, `//` prefix, embedded whitespace, a bad tag, an empty list, an
+  unknown kind) are in one walk, each asserting its **own** code — six refusals sharing one
+  "invalid" message is a form nobody can act on._
 - [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
 - [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
 - [ ] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.

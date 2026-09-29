@@ -27,9 +27,9 @@ import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
-import { ApiError, fetchCdnRules, fetchCdnSettings } from "@/lib/api";
+import { ApiError, fetchCdnRules, fetchCdnSettings, fetchCdnStatus } from "@/lib/api";
 import { useSites } from "@/lib/sites";
-import type { CdnSettings } from "@/lib/types";
+import type { CdnPurge, CdnSettings, CdnStatus } from "@/lib/types";
 
 /** One number on a card. */
 function Stat({
@@ -61,6 +61,11 @@ export function CdnOverviewView() {
   const [ruleCount, setRuleCount] = useState<number | null>(null);
   const [liveRules, setLiveRules] = useState<number | null>(null);
   const [unreadable, setUnreadable] = useState(0);
+  // Slice 2's numbers. `null` means "not read yet" and is rendered as an ellipsis, which
+  // is the same treatment the rule counts get: a dash or a zero here would be a claim
+  // about a counter nothing has written yet.
+  const [status, setStatus] = useState<CdnStatus | null>(null);
+  const [recent, setRecent] = useState<CdnPurge[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -73,8 +78,15 @@ export function CdnOverviewView() {
     // adapter is running (the installation default for a site with no row of its own),
     // and the rule list says whether anything is being cached through it. Reading only one
     // is how an overview ends up describing a provider that caches nothing.
-    Promise.all([fetchCdnSettings(siteId), fetchCdnRules(siteId ?? "")])
-      .then(([row, rules]) => {
+    Promise.all([
+      fetchCdnSettings(siteId),
+      fetchCdnRules(siteId ?? ""),
+      // The status call is a third read rather than a second because the purge counters
+      // and the recent list come from the same query: fetching them separately would let
+      // the table show a purge the counter has not counted, which reads as a bug and is.
+      siteId === null ? Promise.resolve(null) : fetchCdnStatus(siteId),
+    ])
+      .then(([row, rules, cdnStatus]) => {
         if (cancelled) {
           return;
         }
@@ -82,6 +94,10 @@ export function CdnOverviewView() {
         setRuleCount(rules.rules.length);
         setLiveRules(rules.rules.filter((rule) => rule.enabled).length);
         setUnreadable(rules.unreadable.length);
+        if (cdnStatus) {
+          setStatus(cdnStatus);
+          setRecent(cdnStatus.recent);
+        }
       })
       .catch((cause: unknown) => {
         if (!cancelled) {
@@ -154,9 +170,26 @@ export function CdnOverviewView() {
           }
         />
         <Stat
-          label="Purges"
-          value="—"
-          hint="The purge queue ships with slice 2; this card is the hook, not a zero"
+          label="Purges queued"
+          value={status === null ? "…" : String(status.queue_depth)}
+          hint={
+            status === null
+              ? "Loading"
+              : status.queue_depth === 0
+                ? "Nothing is waiting to be invalidated"
+                : `${status.queue_depth} item${status.queue_depth === 1 ? "" : "s"} across ${status.open_purges} open purge${status.open_purges === 1 ? "" : "s"}`
+          }
+        />
+        <Stat
+          label="Purges · 24 h"
+          value={status === null ? "…" : String(status.purges_24h)}
+          hint={
+            status === null
+              ? "Loading"
+              : status.purges_24h === 0
+                ? "No invalidation has been requested today"
+                : `${status.succeeded_24h} succeeded · ${status.failure_rate.toFixed(0)}% did not fully succeed`
+          }
         />
       </div>
 
@@ -183,6 +216,52 @@ export function CdnOverviewView() {
             </Link>
           }
         />
+      ) : null}
+
+      {recent.length > 0 ? (
+        <section
+          data-cdn-overview-recent
+          className="flex flex-col gap-2 rounded-xl border border-line bg-surface"
+        >
+          <header className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
+            <h2 className="text-[13px] font-medium">Recent purges</h2>
+            <Link
+              href="/cdn/purges"
+              data-cdn-overview-all-purges
+              className="inline-flex items-center gap-1 text-[12px] text-muted transition hover:text-ink"
+            >
+              All history
+              <ArrowRight className="size-3" aria-hidden />
+            </Link>
+          </header>
+          <ul className="divide-y divide-line">
+            {recent.slice(0, 8).map((purge) => (
+              <li
+                key={purge.id}
+                data-cdn-recent-row
+                data-cdn-purge-status={purge.status}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5"
+              >
+                <span className="w-40 shrink-0 truncate font-mono text-[11.5px] text-muted">
+                  {new Date(purge.requested_at).toLocaleString()}
+                </span>
+                <span className="w-12 shrink-0 text-[12px] text-muted">{purge.kind}</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-[12px]">
+                  {purge.targets.length === 1 ? purge.targets[0] : `${purge.targets.length} targets`}
+                </span>
+                <span className="shrink-0 text-[12px] text-muted">
+                  {purge.failed_count > 0 ? `${purge.failed_count} failed` : `${purge.item_count} ok`}
+                </span>
+                <span
+                  data-cdn-purge-badge
+                  className="shrink-0 rounded-full border border-line px-2 py-0.5 text-[11px]"
+                >
+                  {purge.status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
       ) : null}
 
       <div className="grid gap-3 sm:grid-cols-2">

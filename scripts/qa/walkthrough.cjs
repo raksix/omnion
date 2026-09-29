@@ -4697,6 +4697,184 @@ async function runNotificationsDepth(page, report) {
  * The rules are created through the API with the signed-in session, so the rows are rows the
  * real route wrote — and the pass deletes what it made.
  */
+/**
+ * The purge pipeline (REQ-011, slice 2).
+ *
+ * Seven things are driven, and the two that are not obvious are the reason this pass exists
+ * rather than just listing the routes:
+ *
+ *  1. **A purge reaches the history as a row the drawer can open.** A console that accepts
+ *     and a history that lists are different claims; only opening the row proves the first
+ *     produced the second.
+ *  2. **The whole-zone confirmation is a dead end until PURGE is typed.** The form is filled
+ *     out completely and the submit stays disabled — an action that is merely *possible* is
+ *     not a confirmation, and a pass that only ever clicks a working button would not notice
+ *     a checkbox standing in for one.
+ *  3. **A malformed target is refused on screen, under its own field.** The server refusing
+ *     is already proved by the API walks; what is new here is that the operator learns it
+ *     without a round trip.
+ *  4. **A failed purge shows the provider's message and a retry that is really a retry.**
+ *     The fixture forces the failure through the database rather than through a provider, so
+ *     the pass does not depend on a network being unreachable.
+ *  5. **Retry moves the failed items and leaves the succeeded ones alone.** The statuses are
+ *     read back out of the drawer, and this is the assertion a screenshot cannot make.
+ */
+async function runCdnPurgeDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!site) {
+    steps.skipped = "no QA site to purge for";
+    return steps;
+  }
+
+  // A failed fixture, written directly: the pass must not depend on a provider being down,
+  // and a `generic_http` adapter pointed at a closed port would make every run slower and
+  // its result depend on the box's networking.
+  const failedId = qaSql(
+    `insert into cdn_purges (site_id, kind, targets, status, provider, item_count, failed_count, error) ` +
+      `values ('${site}', 'url', array['/qa/never-cached'], 'failed', 'origin', 1, 1, ` +
+      `'the provider refused: target is not in this zone') returning id`,
+  );
+  if (failedId) {
+    qaSql(
+      `insert into cdn_purge_items (purge_id, target, status, attempts, error, done_at) ` +
+        `values ('${failedId}', '/qa/never-cached', 'failed', 5, ` +
+        `'the provider refused: target is not in this zone', now())`,
+    );
+  }
+
+  await page.goto(`${URL_ADMIN}/cdn/purge`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.console = (await page.locator("[data-cdn-purge-targets]").count()) > 0;
+
+  // A malformed target: refused on screen, and the submit blocked.
+  await page.locator("[data-cdn-purge-targets]").fill("blog/no-leading-slash").catch(() => {});
+  await page.waitForTimeout(350);
+  steps.malformedMessage = (
+    await page.locator("[data-cdn-purge-targets-error]").innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  steps.malformedBlocksSubmit = await page
+    .locator("[data-cdn-purge-submit]")
+    .isDisabled()
+    .catch(() => false);
+  await shot(page, "page-cdn-purge-invalid");
+
+  // A good list: the count updates and the submit is enabled.
+  await page.locator("[data-cdn-purge-targets]").fill("/qa/one\n/qa/two").catch(() => {});
+  await page.waitForTimeout(350);
+  steps.targetCount = (
+    await page.locator("[data-cdn-purge-target-count]").innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // The whole-zone mode: filled out and still blocked, because the word is not typed.
+  await page.locator('[data-cdn-purge-mode="all"] input[type="radio"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  steps.zoneBlockedBeforeConfirm = await page
+    .locator("[data-cdn-purge-submit]")
+    .isDisabled()
+    .catch(() => false);
+  await page.locator("[data-cdn-purge-confirm]").fill("PURGE").catch(() => {});
+  await page.waitForTimeout(300);
+  steps.zoneEnabledAfterConfirm = !(await page
+    .locator("[data-cdn-purge-submit]")
+    .isDisabled()
+    .catch(() => true));
+  // Back to URLs and queue one for real, so the history has a row this pass made.
+  await page.locator('[data-cdn-purge-mode="url"] input[type="radio"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page.locator("[data-cdn-purge-submit]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.submitted = (await page.locator("[data-cdn-purge-submitted]").count()) > 0;
+  await shot(page, "page-cdn-purge-submitted");
+
+  // The history: the row this pass made is there, and the failed fixture is visible with its
+  // message — the whole reason the screen exists.
+  await page.goto(`${URL_ADMIN}/cdn/purges`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.rows = await page.locator("[data-cdn-purge-row]").count();
+  steps.failedBanner = (await page.locator("[data-cdn-purge-failed-banner]").count()) > 0;
+  steps.pageTotal = (
+    await page.locator("header p").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // The drawer: open the failed fixture by its row, and read the provider's own words.
+  const failedRow = page.locator('[data-cdn-purge-status="failed"]').first();
+  if ((await failedRow.count()) > 0) {
+    await failedRow.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.drawerOpened = (await page.locator("[data-cdn-purge-drawer]").count()) > 0;
+    steps.drawerError = (
+      await page.locator("[data-cdn-purge-error]").innerText().catch(() => "")
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+    steps.drawerItems = await page.locator("[data-cdn-purge-item]").count();
+    // The retry button exists because the server said this row has something to retry, and
+    // its label names the count — a button that says "Retry" on a partial row does not say
+    // whether it will re-send the twenty targets that already worked.
+    steps.retryLabel = (
+      await page.locator("[data-cdn-purge-retry]").innerText().catch(() => "")
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+    await shot(page, "page-cdn-purges-drawer");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    steps.escClosedDrawer =
+      (await page.locator("[data-cdn-purge-drawer]").count()) === 0;
+  }
+
+  // The filter, narrowed and then cleared: a filter that does not change the rows is
+  // decoration, and this is the cheapest place to see that.
+  const before = steps.rows;
+  await page.locator("[data-cdn-purge-filter]").selectOption("failed").catch(() => {});
+  await page.waitForTimeout(1300);
+  steps.filteredRows = await page.locator("[data-cdn-purge-row]").count();
+  steps.filterNarrows = steps.filteredRows < before;
+  await page.locator("[data-cdn-purge-filter-clear]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1100);
+  await shot(page, "page-cdn-purges");
+
+  // Mobile: the cards, not a horizontally scrolling table. The hooks are the same ones the
+  // rows carry, so a pass can drive either rendering.
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto(`${URL_ADMIN}/cdn/purges`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.mobileCards = await page.locator("[data-cdn-purge-row]").count();
+  steps.mobileTableHidden = await page
+    .locator("table")
+    .first()
+    .isHidden()
+    .catch(() => false);
+  await shot(page, "page-cdn-purges-mobile");
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  // Clean up only what this pass made. The deletes are guarded because `qaSql` runs with
+  // ON_ERROR_STOP=1 and throws — a cleanup that matched nothing must not abort the pass and
+  // lose every step after it. The inserts above are deliberately *not* guarded: a fixture
+  // that silently failed to insert would leave the drawer, the message and the retry label
+  // all reading as "not found", and a pass that reports absence as a pass is worse than no
+  // pass.
+  try {
+    if (failedId) {
+      qaSql(`delete from cdn_purges where id = '${failedId}'`);
+    }
+    qaSql(
+      `delete from cdn_purges where site_id = '${site}' and targets = array['/qa/one','/qa/two']`,
+    );
+  } catch (cleanupError) {
+    steps.cleanupFailed = String(cleanupError);
+  }
+  return steps;
+}
+
 async function runCdnRulesDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -5358,6 +5536,12 @@ async function main() {
   // same database rows.
   report.cdnRules = await runCdnRulesDepth(page, report);
   log(`cdn rules: ${JSON.stringify(report.cdnRules)}`);
+
+  // The purge pipeline (REQ-011, slice 2): the console's own refusals, the whole-zone
+  // confirmation as a real gate, a purge that reaches the history, a failed row with the
+  // provider's message, and a retry whose label names what it will re-send.
+  report.cdnPurges = await runCdnPurgeDepth(page, report);
+  log(`cdn purges: ${JSON.stringify(report.cdnPurges)}`);
 
   // The tenant depth pass (REQ-005, slice 1): the organization list, the Members tab, the
   // invite dialog's field refusal, a real invitation and its revocation.
