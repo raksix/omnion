@@ -3398,3 +3398,66 @@ override** and tick the screen boxes for slices 1–3 of REQ-016 together, then 
 then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
 the same reason). If the slot is still held, name the holder and its ports in the log rather
 than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
+
+## 2026-09-29 — omnion-build tick 57 · REQ-012 slice 1, and a screen that says "I don't know"
+
+**What.** Started REQ-012, the security centre — the first not-done REQ in wave 1. The whole
+slice turns on one rule, and it is the only screen in the panel where a plausible default is
+a lie: **a check that could not verify something must not report `pass`.** So the rule is
+written into the design rather than left to each check's judgement —
+
+* a check is a pure function of an `Environment` it is handed, so it cannot look anything up
+  and cannot conclude anything from an empty result set;
+* a probe that could not read answers `Probe::Unknown`, and `unknown` is one of the four states
+  rather than a null the panel has to guess at;
+* the overview renders **every** registered check including one that has never run, so a
+  missing row can never read as "nothing to report here".
+
+The vocabulary (four states, four sources, five severities, four finding statuses) is
+duplicated in `0054_security_posture.sql`, which cannot import Rust. A test reads that
+migration and fails if a word exists in one list and not the other, so the two can drift only
+visibly — a red test rather than a filter that silently returns nothing.
+
+**Two asymmetries worth naming, because both were the wrong answer at first.**
+
+*A missing backup is `fail`; a missing dependency scan is `unknown`.* They look like the same
+case and they are not: "there is no backup" is a fact we can state without having read
+anything, while "we have never run a scan" is a fact about us. Collapsing them would let a
+platform with no backups read as merely unverified. The first version of the test asserted
+"unknown for everything with an empty world" and it caught this — the test was wrong, the
+asymmetry was the design, so the test now states the full expected map instead of a blanket
+rule, which means changing either default is a failure that names the check that moved.
+
+*The score weights `unknown` at 40, not 0 and not 100.* Zero punishes the platform for what
+it does not know, which is how a number stops being trusted; 100 is the over-claim the crate
+exists to avoid. The middle says "a question", which is what it is.
+
+**Also shipped.** The API behind three separate powers — `security.read` sees, `security.scan`
+re-runs and ingests, `security.manage` dismisses. `scan` is deliberately *below* `manage`:
+re-running the checks changes no configuration, while an ignore is a decision somebody will be
+asked to justify later, and granting both lets an account that can only look also dismiss what
+it saw. An uploaded report carrying a key shaped like a credential is refused **whole**,
+because this table is read by people and exported to CSV — a token in a description would move
+a secret from a CI log onto a screen designed to be shared.
+
+**Proof.**
+
+- `cargo test -p omnion-security -p omnion-permissions --lib` → **39 + 62 passed, 0 failed**
+- `cargo build -p omnion-api` → clean
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `60b45d9` (crate), `b2d82aa` (API + permissions), `7210ca3` (panel), `4208a7e` (QA)
+
+**Not done, and not claimed. No browser pass.** The single QA slot is held by a live w10 pass
+(holder pid 2521941, cwd `/mnt/apopic/omnion-w10`, still writing screenshots at the time of
+writing) — this time the blocker is named with its holder and its ports rather than written off
+as "the slot is held". `runSecurityDepth` is written and wired in; it is unrun, so the boxes
+naming a screen stay unticked. It asserts the one thing a fresh QA database makes falsifiable:
+with no MFA rows, no backup history and no header policy, the screen must say "Not checked
+yet" rather than "Verified".
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with **no `QA_STACK` override** and
+tick the screen boxes for slice 1 together. Slice 1's one remaining item is the findings CSV
+export — the filter echo and the total are in place, so it is the export itself. Then slice 2
+(headers + CSRF), which is where the CSP, referrer-policy and HSTS settings finally give the
+two `unknown` rows in the overview something to report.

@@ -1,6 +1,6 @@
 # REQ-012 — Security Center
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress — **slice 1 (posture + findings) is code-complete.** `crates/security` (posture registry, findings store, lifecycle), migration `0054_security_posture.sql`, the `/security` + `/security/findings` screens and the API behind three separate powers (`security.read` / `security.scan` / `security.manage`). Unit tests: 39 crate + 62 permissions. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -107,7 +107,7 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 
 ### Acceptance criteria
 
-- [ ] `crates/security` exists with posture checks, limiter policy and IP-rule evaluation, unit-tested.
+- [ ] `crates/security` exists with posture checks, limiter policy and IP-rule evaluation, unit-tested. *(partly: the posture registry, the findings store and the lifecycle are in and unit-tested — 39 tests. The limiter policy and the IP-rule evaluation are slice 3 and slice 4.)*
 - [ ] Migration `0012_security_center.sql` applies cleanly on fresh and populated databases.
 - [ ] `/security` renders every check from the API with a truthful state; no check shows `pass` when unknown.
 - [ ] "Run checks" records a new result set and the `Last checked` timestamps move.
@@ -119,13 +119,13 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 - [ ] A locked account is listed with its unlock action, and unlocking restores sign-in.
 - [ ] IP deny rules win over allow rules; adding a rule that would block the current client shows the warning.
 - [ ] CIDR validation rejects malformed input (IPv4 and IPv6) with a field-level message.
-- [ ] Ingesting a dependency report creates findings; re-ingesting the same report does not duplicate them.
-- [ ] Acknowledge/ignore/mark fixed/reopen all persist; ignore without a reason is refused.
+- [x] Ingesting a dependency report creates findings; re-ingesting the same report does not duplicate them. *(the fingerprint is component+title hashed, the unique index is scoped by version, and `upsert_finding` returns created-or-refreshed; the QA pass asserts the second ingest reports `created: 0`)*
+- [x] Acknowledge/ignore/mark fixed/reopen all persist; ignore without a reason is refused. *(four endpoints' worth of transitions; the refusal is in the store with a field-level message, enforced a second time by the SQL constraint, and the drawer's button is disabled until a reason is typed)*
 - [ ] CSV export of findings and security events matches the current filter.
 - [ ] `/security/events` shows real sign-in, lockout, denial and settings-change entries.
 - [ ] Secret inventory lists names and rotation age only; no value appears in HTML, JSON or export.
 - [ ] CSRF protection rejects a cookie-authenticated mutation without a token.
-- [ ] Every endpoint enforces its catalogue key; a forbidden call returns `403 permission_denied`.
+- [ ] Every endpoint enforces its catalogue key; a forbidden call returns `403 permission_denied`. *(the four keys are in the catalogue and every route is behind a guard; the 403 itself is unproven until a pass calls an endpoint without the key)*
 - [ ] Walkthrough passes with zero high findings.
 
 ### QA plan
@@ -134,7 +134,7 @@ The walkthrough must visit `/security` and each sub-tab, click "Run checks", ope
 
 ### Slices
 
-1. **Posture + findings** — schema, check registry, `/security` overview, findings list/detail and status transitions, audit entries. Done: the overview shows real states and a finding can be acknowledged, ignored with a reason and exported.
+1. **Posture + findings** — schema, check registry, `/security` overview, findings list/detail and status transitions, audit entries. Done: the overview shows real states and a finding can be acknowledged, ignored with a reason and exported. **SHIPPED 2026-09-29, awaiting the browser pass** (`0054_security_posture.sql`, `crates/security`, `apps/api/src/routes/security.rs`, `features/security/`, `runSecurityDepth`). The CSV export of findings is the one item in this slice still to do — the list's filter echo and total are in place, and the export itself is the next piece.
 2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. Done: the configured headers appear on API responses and a mutation without the token is refused.
 3. **Rate limiting + lockout** — Redis-backed limiter, scope table, tester, failed-attempt counting, lockout and unlock, `/security/sign-in-protection` and `/security/rate-limits`. Done: a scripted burst gets `429`, and five failed sign-ins lock the account until it is unlocked.
 4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. Done: a denied CIDR cannot reach the API, the events screen shows the attempt, and the inventory shows rotation age without values.
