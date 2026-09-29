@@ -2867,3 +2867,69 @@ is the provider-shaped half.
 
 **Next.** Read the `attribute-map-preview` steps from the pass, then slice 2's last piece: SAML
 assertion validation against a posted document and the discovery-refusal acceptance line.
+
+---
+
+## 2026-09-29 · omnion-w9 · REQ-065 slice 2, part 4 — the protocol kinds name the check that refused
+
+**What.** The OIDC and SAML kinds were given a single result from the `test` endpoint, on the
+argument that they "fail in exactly one place". They fail in four, and three of those repairs have
+nothing to do with each other: a host that publishes somebody else's issuer, a JWKS this platform
+cannot read, a certificate pasted without its BEGIN line. The panel showed one grey box for all of
+them, and an operator with a grey box has nothing to act on.
+
+`sso::protocol_steps` gives them their own ladder — **discovery** (or, for SAML, **certificate**) →
+**issuer** → **key set** → **claims** — in the crate rather than the route, so the decision is
+separable from the fetch and provable without a network. The failing step's machine name rides on
+`iam.provider_test_failed`, which previously carried it for directories only: a subscriber deciding
+whether to page somebody at 3am needs to know *which check* refused, and "the provider is broken" is
+not that.
+
+**The issuer comparison was the actual hole.** A discovery document is fetched *from* the configured
+issuer and says who it is; nothing compared the two. `require_issuer` now runs inside
+`discovery_for` — the one function every code path reads the document through — rather than in the
+callback. The metadata cache is what makes that placement matter: one document is fetched and served
+to every later sign-in, so a check a caller can skip is a check the cached path skips, and the test
+button would go green while the login ignored it.
+
+**Three boundaries, each with a test saying why.** A **trailing slash is not a mismatch**, because
+every discovery URL is built by appending to the configured issuer and operators type the other
+form; everything else is compared exactly, since a normalization that trims more would accept a
+different host. An **unreadable key set is not an absent one** — the probe carries a `Result`, not a
+`Vec`, because "this provider publishes no key we trust" and "that `jwks_uri` is wrong" send an
+operator to two different places. A provider with **no** configured issuer is told, not failed: its
+endpoints are entered by hand, there is nothing to compare, and refusing would break a legal
+configuration. And a failure **stops** the ladder, leaving the rest `pending` — a claim read against
+an issuer that was never trusted is not a claim about anything, and a green row there would be a lie
+with a checkbox.
+
+SAML's ladder starts at the certificate rather than a discovery document it does not have. Padding it
+to look like OIDC's would have made the two read alike while reporting different things, and a step
+whose verdict is a constant is a step nobody reads. Its claims step reports the group count it
+actually read back, not a hard-coded number — a group attribute wired wrongly reads back zero, and a
+sentence claiming "1 group" would report the wiring as sound.
+
+**Two tests that were broken in a way only parallel runs showed.** Both walks in `sso_live.rs`
+registered the same host on a globally unique column, and each cleared every row carrying the
+`sso-live-%` prefix before inserting — so one test's cleanup deleted the organization the other had
+inserted microseconds earlier. The failure surfaced as a foreign-key violation three statements
+later, as far from the cause as a cause and symptom can be. Each fixture takes its own host now, and
+a named `tokio::sync::Mutex` says in one line why the file is not parallel-safe. (A `std` mutex
+there would have pinned a runtime worker across every await point in the test.)
+
+**Proof.** `cargo test -p omnion-identity --lib` → **166 passed** (19 of them in this module).
+`cargo test -p omnion-api --lib` → **165 passed**. `pnpm --filter @omnion/admin typecheck` → clean.
+The live walks against the isolated `omnion_w9_iso`: `sso` **1**, `sso_live` **2** (OIDC and SAML,
+end to end, through the real stub IdP), `sso_attribute_map` **1**, `iam` **7**,
+`iam_attribute_map` **1**.
+
+**Not claimed.** The browser pass is running again and had not reached the IAM screens when the
+first attempt hit my own 25-minute cap; the full-suite walkthrough is slower than the 6–10 minutes
+the plan assumes, and a pass cut off before `/settings/iam/authentication` proves nothing about the
+new steps. The walkthrough now *reads* them — the OIDC ladder must refuse at the first step and
+leave the rest pending, and a SAML provider with a broken certificate must refuse at the
+certificate — but that is written, not yet observed.
+
+**Next.** Read `discovery-test` and `saml-test-ladder` out of the pass. Then slice 2's last piece:
+SAML assertion validation against a posted document, and the local-sign-in invariant's
+password half.
