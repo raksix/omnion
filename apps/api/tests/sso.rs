@@ -825,9 +825,23 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     );
 
     // ---- 13. An ambiguous public sign-in is refused rather than guessed ---------------------
-    // The database holds several organizations at this point, so a host that belongs to none of
-    // them cannot be resolved to one. Guessing would let a sign-in link for one tenant complete
-    // against another, so the answer names the fix instead.
+    // The refusal only exists on a **multi-organization** installation: with exactly one, the
+    // sign-in knows its organization without asking anybody, and the walk's fixture makes exactly
+    // one. This assertion therefore failed red on a fresh database and passed on a developer's
+    // machine that happened to hold a second tenant — a test whose truth depends on what else
+    // happens to be in the database is a test that measures the database, not the code.
+    //
+    // So the walk *creates* the second organization rather than assuming one. That also makes the
+    // refusal reachable on CI, which is the only place a missing premise is ever noticed.
+    let second_organization: Uuid = sqlx::query_scalar(
+        "insert into organizations (name, slug) values ($1, $2) returning id",
+    )
+    .bind("Second Test Organization")
+    .bind(format!("sso-second-{}", Uuid::new_v4().simple()))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a second organization must be created for the ambiguity to exist");
+
     let ambiguous = call(
         &fixture.state,
         public_request(
@@ -847,6 +861,18 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     assert_eq!(
         ambiguous.body["error"]["code"],
         json!("organization_required")
+    );
+
+    // …and the premise is asserted rather than assumed, so a fixture that stopped creating the
+    // second tenant would fail here with a sentence instead of confusing the next reader.
+    let organizations: i64 = sqlx::query_scalar("select count(*) from organizations")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the count must run");
+    assert!(
+        organizations > 1,
+        "the ambiguity above is only meaningful with more than one organization, and there are \
+         {organizations}"
     );
 
     // The resolved host still works, so the refusal is about the host and not about the route.
@@ -1013,6 +1039,15 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         !html.contains("evil.example"),
         "the SAML page must sanitise its return path too"
     );
+
+    // The second organization is deleted explicitly rather than left to a sweep: it is the only
+    // row this walk creates outside its own fixture, and a test that leaves the database in a
+    // state its own next run depends on has made its result depend on run order.
+    sqlx::query("delete from organizations where id = $1")
+        .bind(second_organization)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the second organization must be removable");
 
     fixture.cleanup().await;
 }
