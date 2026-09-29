@@ -768,6 +768,23 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "inventory",
         description: "Create, dispatch, receive and cancel stock transfers between locations",
     },
+    // Slice 4 is a third split rather than an entry that reuses an existing key, and the same
+    // question decides it: **what does a mistake here cost, and who else would pay it?**
+    //
+    // * `inventory.movements.record` moves a number at one place, and a mistake there is a
+    //   correction somebody can see on the ledger.
+    // * `inventory.stocktake.manage` overwrites the balance of **every** location in a scope
+    //   from a count, in one act, on the word of one person. A count that is wrong is not wrong
+    //   in one row: it is wrong in all of them at once, and the rows it writes look like real
+    //   movements unless somebody finds the document behind them.
+    //
+    // So it does not inherit the movement key, and opening a sheet is not enough: the count is
+    // the part anybody may do, and the close is the only part that writes.
+    PermissionDef {
+        key: "inventory.stocktake.manage",
+        category: "inventory",
+        description: "Count a location and post the variances a count finds",
+    },
 ];
 
 /// Look a permission up by key.

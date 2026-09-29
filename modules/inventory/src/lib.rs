@@ -39,6 +39,7 @@ pub mod ledger;
 pub mod model;
 pub mod money;
 pub mod store;
+pub mod stocktake;
 pub mod transfers;
 
 pub use error::{InventoryError, Result};
@@ -50,6 +51,11 @@ pub use model::{
 pub use store::{
     ItemQuery, ItemView, LocationView, NewItem, NewLocation, NewWarehouse, Overview, Page,
     SettingsPatch, StockLevel, StockPosition, StockQuery, StocktakeSnapshot, WarehouseView,
+};
+pub use stocktake::{
+    NewStocktake, StocktakeCount, StocktakeLine, StocktakeOutcome, StocktakeQuery, StocktakeStatus,
+    StocktakeView, cancel_stocktake, close_stocktake, count, create_stocktake, get_stocktake,
+    list_stocktakes, variance_movements,
 };
 pub use transfers::{
     NewTransfer, NewTransferLine, TransferLine, TransferQuery, TransferStepLine, TransferView,
