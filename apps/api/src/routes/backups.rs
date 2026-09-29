@@ -1402,6 +1402,61 @@ async fn observe(
     observed
 }
 
+/// `POST /api/v1/backups/sweep` — run the retention sweep now, for this tenant.
+///
+/// The background sweep runs every six hours (`OMNION_BACKUP_SWEEP_POLL_MS`), and a six
+/// hour wait is not an answer an operator can act on when the disk is filling. This is the
+/// same [`omnion_backup::sweep_organization`] the worker calls, scoped to the caller's own
+/// tenant — **not** `sweep_all`, because an operator pressing "run retention" on their own
+/// site must not delete another tenant's restore points.
+///
+/// It answers with the full report rather than a count, because the three numbers are
+/// different facts: "pruned 4" and "3 of those 4 had a stuck file" and "1 sweep failed"
+/// are three things an operator reconciles three different ways. A partial removal still
+/// deletes its row — the same call the worker makes, so the manual and the unattended path
+/// cannot disagree about what "deleted" means — and the report names what is left.
+///
+/// Behind `backup.manage` and not `backup.create`: this deletes data, and the key that lets
+/// an operator take a backup is not the key that lets one remove it.
+pub async fn sweep(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let settings = omnion_backup::load_settings(pool).await?;
+    let root = settings.local_root.clone();
+
+    let report = omnion_backup::sweep_organization(
+        pool,
+        org,
+        &root,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.sweep",
+        org.map(|id| id.to_string()).unwrap_or_else(|| "platform".to_owned()),
+        json!({
+            "walked": report.walked,
+            "candidates": report.candidates,
+            "removed": report.removed,
+            "partial": report.partial,
+            "stranded": report.stranded,
+            "destination": root,
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
 /// Write the audit entry, tolerating a failure rather than failing the action.
 ///
 /// The audit trail is not a log sink: a caller that cannot record must not report success.
