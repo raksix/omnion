@@ -1219,8 +1219,8 @@ async fn a_duplicate_body_from_one_address_is_spam_rather_than_a_second_row() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let owner = fixture.owner().await;
-
+    // No moderator touches the inbox in this walk, on purpose: the point is that the STORE
+    // decided, so a moderator's presence would only make the test weaker.
     let body = "Exactly the same sentence, twice over, from the same person.";
     let first = fixture
         .submit("203.0.113.70", "Ada", "dupe@example.test", body, None)
