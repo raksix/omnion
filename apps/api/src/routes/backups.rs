@@ -681,22 +681,82 @@ pub async fn verify(
 // Delete
 // ---------------------------------------------------------------------------------------------
 
-/// `DELETE /api/v1/backups/{id}` — remove a run.
+/// `DELETE /api/v1/backups/{id}` — remove a run **and the bytes it left on the destination**.
 ///
-/// The row and its parts go; the artifacts on the destination are slice 2's work, and the
-/// response says so rather than implying the bytes are gone. A protected run may still be
-/// deleted — "protected" is about the *prune sweep*, not about a deliberate operator action
-/// — but the audit entry records that it was protected, because that is the detail
-/// somebody will want when a restore point is gone.
+/// The order here is the whole design, and it is not a style choice:
+///
+/// 1. **Read the run first.** Its `storage_prefix` is what identifies the directory, and it
+///    is on the row that is about to be deleted. Losing the row first would lose the only
+///    record of where the bytes are.
+/// 2. **Remove the artifacts.** `remove_run_artifacts` takes the run's own directory —
+///    `<root>/<prefix>`, one directory, because the prefix is derived from the run's **id**
+///    and never from the clock.
+/// 3. **Only then delete the row.** An interrupted delete leaves a row pointing at an
+///    archive that is still there, which an operator can retry. The other order leaves a
+///    deleted row over an archive nobody can find, which is a lost restore point with no
+///    record of what it was.
+/// 4. **Answer `200` with what was removed, not `204`.** "The row is gone" and "the bytes
+///    are gone" are two facts, and the API that collapses them is the one that produced the
+///    original defect. A partial removal is reported in full — the count that came off, the
+///    count that is still on disk, and the first few paths in the operating system's words.
+///    The row still goes: a backup whose operator asked for it to be deleted is not held
+///    hostage by a file with permissions stripped from it, and the response is what tells
+///    the operator what to clean up by hand.
+///
+/// A protected run may still be deleted — "protected" is about the *prune sweep*, not about
+/// a deliberate operator action — but the audit entry records that it was protected, because
+/// that is the detail somebody will want when a restore point is gone. It also records the
+/// purge, so "the backup is gone but 3 files are still on the destination" is a sentence
+/// somebody can find in the audit trail months later.
 pub async fn delete(
     state: State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
     Path(id): Path<Uuid>,
-) -> std::result::Result<StatusCode, ApiError> {
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let org = current.user.organization_id;
     let pool = state.db().pool();
     let row = omnion_backup::find_backup(pool, id, org).await?;
+
+    if matches!(row.status.as_str(), "queued" | "running") {
+        // A run being written while it is deleted leaves artifacts nothing will ever prune:
+        // the delete would succeed, the producer would keep writing, and the leftovers are
+        // orphans no later sweep knows about. Refusing is the smaller of two bad outcomes.
+        return Err(ApiError::bad_request(
+            "backup_in_flight",
+            format!(
+                "This backup is {}. Wait for it to finish before deleting it — deleting a run \
+                 while it is writing leaves artifacts on the destination that no later prune \
+                 knows about.",
+                row.status
+            ),
+        ));
+    }
+
+    let purge = match omnion_backup::load_settings(pool).await {
+        Ok(settings) => {
+            omnion_backup::remove_run_artifacts(&settings.local_root, &row.storage_prefix).await
+        }
+        // A destination root that cannot be read is not a reason to keep the row: the delete
+        // is still the operator's decision, and the report says the bytes are unaccounted for
+        // rather than pretending they were removed.
+        Err(error) => Err(omnion_backup::BackupError::from(error)),
+    };
+
+    let purge = match purge {
+        Ok(report) => report,
+        Err(error) => omnion_backup::PurgeReport {
+            root: row.storage_prefix.clone(),
+            existed: false,
+            removed_entries: 0,
+            failed_entries: 0,
+            failures: vec![omnion_backup::PurgeFailure {
+                path: row.storage_prefix.clone(),
+                reason: error.to_string(),
+            }],
+        },
+    };
+
     omnion_backup::delete_backup(pool, id, org).await?;
     record(
         pool,
@@ -705,10 +765,18 @@ pub async fn delete(
         address.as_text(),
         "backup.deleted",
         id.to_string(),
-        json!({ "was_protected": row.protected, "status": row.status }),
+        json!({
+            "was_protected": row.protected,
+            "status": row.status,
+            "storage_prefix": row.storage_prefix,
+            "artifacts_removed": purge.removed_entries,
+            "artifacts_still_present": purge.failed_entries,
+            "destination": purge.root,
+            "purge_complete": purge.is_complete(),
+        }),
     )
     .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::to_value(&purge).unwrap_or_default()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1106,7 +1174,17 @@ async fn produce_media(state: &AppState, run: &omnion_backup::Backup) -> Part {
     // writer joins it to this and to nothing else. See `local_path_for`.
     let base = std::path::PathBuf::from(root.trim());
 
-    let objects = match omnion_backup::pending_objects(pool, None).await {
+    // The library is the run's **own organization's**, never the whole deployment's.
+    //
+    // The unscoped form — every `media` row with no deleted or purged flag — is correct on a
+    // single-tenant installation and is a data leak on a multi-tenant one: tenant A's backup
+    // would contain tenant B's files, with a green `succeeded` beside it. Every other read
+    // and write in this file is scoped by `organization_id`, and the backup was the one
+    // place that was not. A run with no organization is the single-tenant case, where
+    // `is not distinct from null` matches the sites that have no organization either.
+    let objects = match
+        omnion_backup::pending_objects_for_organization(pool, run.organization_id).await
+    {
         Ok(objects) => objects,
         Err(error) => return record_media_failure(pool, run.id, format!("the media library could not be listed: {error}")).await,
     };

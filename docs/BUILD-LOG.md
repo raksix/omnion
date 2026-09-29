@@ -5964,3 +5964,104 @@ what might be there. (b) `objects/` grows one file per object, and the delete ro
 remove the directory as well as the run's own JSON — check that before the restore wizard
 exists, because an operator who deletes a backup and finds the files still there will assume
 the product lied.
+
+## Tick 67 — 2026-09-29 — the delete had no bytes in it, and the media part had no tenant
+
+**What.** Two defects, and the second was found by the first's own fixture rather than
+looked for. The acceptance box this tick took is the one that reads like bookkeeping —
+"deleting a backup removes its artifacts from the destination" — and the bookkeeping was the
+defect.
+
+**The delete was a row delete.** `DELETE /api/v1/backups/{id}` removed the row, cascaded the
+parts, wrote the audit entry and answered `204`. Every byte stayed on the destination: the
+database export, the `objects/` tree, the media index, the three JSON parts, the manifest.
+The panel knew. It said so — *"Backup removed. Its artifacts are still on the destination
+until the next prune."*
+
+That sentence is the most instructive part. It is **honest, and it is also the bug**. A backup
+root is the one directory in this product that costs money per byte forever, and the prune
+sweep runs on its own schedule — not when an operator deletes something. So the ordinary
+path was: tidy up three old runs, watch the list go green, and keep a full copy of the
+platform's media library on disk with nothing pointing at it. Every later backup, every
+month, would do it again. The product told the operator the truth and the truth was the
+problem. **Honest phrasing is how a missing feature survives review** — a note that
+describes the gap reads as a design decision, and a design decision is not a bug report.
+
+`crates/backup/src/purge.rs` (new) removes **the run's own directory** rather than walking
+the manifest and deleting what it lists. A run that died mid-write left files the manifest
+never mentioned, and an index-driven delete leaks exactly those. The directory is a boundary
+because the prefix is derived from the run's **id** — which is why `set_prefix` refuses to
+derive it from the clock — and a unit test pins that two runs never share a directory, because
+that property is the delete's entire safety argument and it lives in another module.
+
+Three refusals, all before a byte is touched:
+
+* an **empty or relative root** — `remove_dir_all` on a relative path resolves against the
+  working directory of whatever process ran it, and for a systemd unit that is not the
+  directory an operator typed into the settings screen;
+* a `..` segment in the prefix — **rejected, not normalised**, because a normalised traversal
+  is a traversal that passed the check that was meant to stop it;
+* an **empty prefix** — which would make "delete this backup" mean "delete every backup on
+  the destination".
+
+The handler does **artifacts first, row second**, and the order is the design rather than a
+style choice: an interrupted delete then leaves a row pointing at an archive that is still
+there, which an operator can retry, instead of a deleted row over an archive nobody can find.
+It refuses a `queued`/`running` run, because deleting one mid-write leaves artifacts that no
+later prune knows about. And it answers **`200` with a `PurgeReport` rather than `204`**,
+because "the row is gone" and "the bytes are gone" are two separate facts — the API that
+collapsed them into a status code is what produced the defect. A partial removal reports the
+count that came off, the count still on disk, and the first few paths in the operating
+system's own words; the panel renders all three sentences differently, because "nothing was
+ever there", "twelve files deleted" and "eleven of twelve deleted and here is the one that is
+not" are three facts an operator reconciles differently.
+
+**The tenancy leak, found by the delete walk's fixture.** The part asked for
+`pending_objects(pool, None)` — every `media` row on the deployment — while every other read
+and write in the file is scoped by `organization_id`. **A backup of tenant A contained tenant
+B's files**, the run reported `succeeded`, and `verify` called it clean. The pre-existing
+media walk had been green for a tick because *every test in the suite creates media for one
+organization*, so "the whole deployment" and "this organization's library" are the same set.
+The stranger's rows even named themselves in a failure message — `34 of 36 objects could not
+be copied — share-guarded.txt: no object is stored under "shares/4c70..."` — before anyone read
+the cause. `pending_objects_for_organization` joins through `sites`, and is a **separate
+function rather than an extra parameter** so the unsafe form cannot be reached by forgetting
+an argument. The walk gives each organization a site and a file and requires each archive to
+name only its own — the stranger's run too, because a fix that scoped by *excluding* the
+other org passes the first half and still leaks.
+
+**The repeat, and by now it is a pattern rather than an incident.** Tick 66 found a half that
+**counted**; this tick found a half that **scoped wrongly**. Same shape, same family: a backup
+half that satisfies every assertion in its own test and disagrees with reality. Three of the
+four defects in this feature now share it. The rule that catches the tenancy one, and that
+would have caught it a tick earlier: **if a walk's fixture only ever creates one tenant's
+data, the walk cannot see a tenancy bug — a suite needs a stranger, always, even when the
+assertion is about bytes.** And the second-order version, which cost three runs: when a walk
+touches shared QA state (a unique-constrained `media.storage_key`, or a `backup_settings`
+row), name the isolation explicitly in the fixture, or the second run fails as a constraint
+violation that reads like a product defect.
+
+**Proof.** `omnion-backup --lib` **80/0** (16 in `purge`, including the count-before test the
+walk forced) · `omnion-api --test backups` — the delete walk green in isolation
+(`--exact …` 1/0 in 7.8s) and the tenancy walk green; `apps/admin` `tsc --noEmit` clean.
+Three failures during the tick were **my own test bugs, not the product's**, and they are
+recorded because each one asserted a thing the product never claimed: a `manifest.json` FILE
+(the manifest is a `jsonb` column, never a file), an `objects/` count that forgot the site
+sub-directory, and a per-session CSRF token reused across two sessions — a `403` from a token
+that has nothing to do with tenancy, which a test that reuses a token will misread as a
+product defect.
+
+**Blocker, third tick running, unchanged and not worked around.** The browser pass did not
+run. `qa-slot.sh` was held by a live sibling for the whole window (pid 3490157, then 142641)
+and the box peaked at load 53. `/mnt/apopic` also hit **100%** mid-tick — `os error 28` at
+parse time and `ld` dying with a **Bus error** while linking, which reads like an unrelated
+failure and is not. Reclaimed `target/debug/incremental` **in this worktree only**, after
+checking with `/proc/<pid>/cwd` that no live rustc had it open, and left w2/w3/w5/w7 alone.
+`runBackupDepth`, `runMediaRetention` and `runSecurityDepth` stay written-but-unrun, so
+REQ-010, REQ-012 and REQ-013 do not close on tests alone.
+
+**Next.** (a) The restore path (REQ-013 slice 2) now has an archive it can read: the media
+index is written and `pending_objects_for_organization` says whose files a run may restore,
+so `restore preview` can count what it can put back. (b) The prune sweep must use
+`remove_run_artifacts` too — it deletes the same directories by its own path today, which is
+the third half that could disagree with this one.

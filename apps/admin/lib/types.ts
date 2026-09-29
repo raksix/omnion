@@ -2743,6 +2743,34 @@ export interface BackupVerification {
   summary: string;
 }
 
+/** One destination entry a delete could not remove. */
+export interface BackupPurgeFailure {
+  /** The path as the operating system named it. */
+  path: string;
+  /** The operating system's own words — `permission denied (os error 13)`. */
+  reason: string;
+}
+
+/**
+ * What removing a run actually did on the destination.
+ *
+ * The row being gone and the bytes being gone are two separate facts, and the screen says so
+ * rather than collapsing them: a `204` would render "removed" over a directory that is still
+ * full of the platform's media library.
+ */
+export interface BackupPurge {
+  /** The directory that was targeted, in full. */
+  root: string;
+  /** Whether the run's directory existed at all before the delete. */
+  existed: boolean;
+  /** How many filesystem entries were removed, at any depth. */
+  removed_entries: number;
+  /** How many could not be removed and are still on the destination. */
+  failed_entries: number;
+  /** The first few failures, with the operating system's own words. */
+  failures: BackupPurgeFailure[];
+}
+
 /** The result of taking a backup. */
 export interface BackupCreateResult {
   /** The finished run. */
