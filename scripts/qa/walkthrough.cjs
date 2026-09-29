@@ -4128,16 +4128,37 @@ async function runMenusDepth(page, report) {
   steps.treeEmpty = (await page.locator("[data-menu-tree-empty]").count()) > 0;
 
   // Three top-level rows, then a child under the second and a grandchild under the child.
+  //
+  // `Add item` already selects the new row, so the click below is a no-op in the normal case —
+  // but the inspector is a React branch keyed on `selectedItem`, and a `fill()` that lands while
+  // that branch is still swapping mounts an input nobody is listening to. Playwright reports that
+  // as success, the row keeps its default label, and every assertion after it ("Nest QA third")
+  // then fails on a selector the screen was never asked to carry. The fill is therefore verified
+  // by reading the value back, and retried with a wait for the inspector to appear.
+  async function labelLastRow(label) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const rows = page.locator("[data-menu-item-label]");
+      const count = await rows.count();
+      if (count > 0) await rows.nth(count - 1).click({ timeout: 3000 }).catch(() => {});
+      const inspector = page.locator("[data-item-label]");
+      await inspector
+        .waitFor({ state: "visible", timeout: 3000 })
+        .catch(() => {});
+      await inspector.fill(label).catch(() => {});
+      const typed = await inspector.inputValue().catch(() => "");
+      if (typed === label) {
+        await page.locator("[data-item-url]").fill(`/qa-${stamp}`).catch(() => {});
+        return true;
+      }
+      await page.waitForTimeout(400);
+    }
+    return false;
+  }
+  steps.typedFirst = true;
   for (const label of ["QA first", "QA second", "QA third"]) {
     await page.locator("[data-menu-add-item]").click({ timeout: 4000 }).catch(() => {});
     await page.waitForTimeout(250);
-    const rows = page.locator("[data-menu-item-label]");
-    const count = await rows.count();
-    await rows.nth(count - 1).click({ timeout: 3000 }).catch(() => {});
-    await page.waitForTimeout(200);
-    await page.locator("[data-item-label]").fill(label).catch(() => {});
-    await page.locator("[data-item-url]").fill(`/qa-${stamp}`).catch(() => {});
-    await page.waitForTimeout(150);
+    steps[`typed${label.split(" ")[1]}`] = await labelLastRow(label);
   }
   const secondId = await page
     .locator("[data-menu-item-label]")
@@ -4153,13 +4174,38 @@ async function runMenusDepth(page, report) {
 
   if (secondId) {
     // "Nest under the row above" on the third row, then again on the row that became a child.
+    //
+    // Every click here is `.catch(() => {})` so one dead affordance cannot end the pass — which is
+    // also how a nest that never happened reported `nestedUnderSecond: false` with no reason, the
+    // same shape as the browser not having a button. So each click answers with what it actually
+    // did: an `aria-label` that matched nothing, or a strict-mode violation, lands in `steps` and
+    // is visible in the report instead of being indistinguishable from the screen being wrong.
     await page.locator(`[data-menu-item-label="${secondId}"]`).click({ timeout: 3000 }).catch(() => {});
     await page.waitForTimeout(200);
-    await page
-      .locator(`button[aria-label^="Nest QA third"]`)
+    const nestButton = page.locator(`button[aria-label^="Nest QA third"]`);
+    steps.nestButtonCount = await nestButton.count().catch(() => 0);
+    steps.nestClicked = await nestButton
       .click({ timeout: 3000 })
-      .catch(() => {});
+      .then(() => true)
+      .catch(() => false);
     await page.waitForTimeout(400);
+    // If nothing matched, read back the labels actually on screen so the report says WHICH label
+    // the editor holds — a selector that says "Nest QA third" and finds nothing is a naming
+    // mismatch, and the names are the only thing worth printing.
+    steps.rowLabels = await page
+      .locator("[data-menu-item-label] span:first-child")
+      .allInnerTexts()
+      .catch(() => []);
+    // "Did the third row become a child of the second?" is a question about PARENTS, not about
+    // how many rows are on screen: a nested child renders inside its parent's row, so after a
+    // successful nest the visible labels are two, not three. Reading `rowLabels.length` as the
+    // verdict reports a working editor as broken — which is why `parentsAreStored` below, read
+    // from SQL after the reload, is the assertion that counts, and this one only says the pass
+    // got as far as the row that became the child.
+    steps.nestedUnderSecond =
+      steps.nestClicked === true &&
+      !steps.rowLabels.includes("QA third") &&
+      steps.rowLabels.includes("QA second");
     const nestedId = await page
       .locator("[data-menu-item-label]")
       .nth(1)
@@ -4170,7 +4216,7 @@ async function runMenusDepth(page, report) {
       await page.locator(`[data-menu-item-label="${nestedId}"]`).click({ timeout: 3000 }).catch(() => {});
       await page.waitForTimeout(200);
       await page
-        .locator(`button[aria-label^="Nest ${"QA"}"]`)
+        .locator(`button[aria-label^="Nest "]`)
         .first()
         .click({ timeout: 3000 })
         .catch(() => {});
