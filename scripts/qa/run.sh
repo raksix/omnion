@@ -87,7 +87,7 @@ stop_stack
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database omnion_qa)"
+step "API on :$API_PORT (database $QA_DB_NAME)"
 # The binary lives in `$CARGO_TARGET_DIR` when the caller sets one, and this box has seven
 # writers sharing one 60G mount — so building into the worktree's own `target/` is how that
 # mount reaches 100% and how `cargo build` starts failing with "No space left on device". The
@@ -131,15 +131,25 @@ if [ -n "$RUNNING_BIN" ] && [ "$RUNNING_BIN" != "$API_BIN" ]; then
   step "the pm2 entry runs $RUNNING_BIN, not $API_BIN — re-registering"
   pm2 delete "$API_NAME" >/dev/null 2>&1 || true
 fi
-if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  pm2 restart "$API_NAME" >/dev/null
-else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
-  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-  OMNION_PORT="$API_PORT" \
-  OMNION_ENV=development \
-    pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
-fi
+# The admin account is seeded from the environment on *every* boot, not only when the database is
+# empty. The DB reset above drops every account, so a pass that restarts an already-registered
+# process boots an API with no user at all: the panel then serves `/login` instead of `/setup`,
+# the walkthrough has nothing to sign in with, and the pass dies at "could not sign in after
+# wizard" — a failure that names the harness and says nothing about the code under test. Passing
+# the seed on the restart path too is what keeps the credentials in `walkthrough.cjs` and the
+# account the API creates the same pair.
+QA_ADMIN_EMAIL="${QA_ADMIN_EMAIL:-qa-owner@omnion.test}"
+QA_ADMIN_PASSWORD="${QA_ADMIN_PASSWORD:-OmnionQa-Passw0rd-2026!}"
+QA_ADMIN_NAME="${QA_ADMIN_NAME:-QA Owner}"
+pm2 delete "$API_NAME" >/dev/null 2>&1 || true
+OMNION_DATABASE_URL="postgres://omnion:***@127.0.0.1:5433/$QA_DB_NAME" \
+OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+OMNION_PORT="$API_PORT" \
+OMNION_ENV=development \
+OMNION_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
+OMNION_ADMIN_PASSWORD="$QA_ADMIN_PASSWORD" \
+OMNION_ADMIN_NAME="$QA_ADMIN_NAME" \
+  pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
@@ -169,6 +179,28 @@ step "browser walkthrough"
 # and measured as usual, and both the summary and the report are stamped with the scope. Set it
 # when the box cannot afford a full pass — seven writers on one 32 GB host cannot each run one.
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" ${QA_ONLY:+--only "$QA_ONLY"}
+WALK_RC=$?
+
+# A walkthrough that died still leaves a `summary.json` behind, and that file is the most
+# dangerous artifact in this harness: `{"fatal": "could not sign in"}` is a *pass* to anything
+# that only checks whether the file exists or whether it has findings, and this script used to
+# go on to write a clean QA-LATEST report and exit 0. Absence of evidence was being filed as
+# evidence. Treat a dead run — or a scope that walked no pages — as a failed gate, loudly.
+if [ "$WALK_RC" -ne 0 ]; then
+  echo "[qa] the walkthrough exited $WALK_RC — see $OUT/summary.json" >&2
+  exit "$WALK_RC"
+fi
+if node -e '
+const fs = require("fs");
+const out = process.argv[1];
+const scope = process.argv[2] || "";
+const s = JSON.parse(fs.readFileSync(out + "/summary.json", "utf8"));
+if (s.fatal) { console.error("[qa] the walkthrough was fatal: " + s.fatal); process.exit(1); }
+const pages = (s.pages || []).length;
+if (pages === 0) { console.error("[qa] the walkthrough recorded no pages" + (scope ? " for scope " + scope : "") + " — a scope that matches nothing is a finding, not a pass"); process.exit(1); }
+' "$OUT" "${QA_ONLY:-}" ; then :; else
+  exit 1
+fi
 
 step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
