@@ -155,24 +155,59 @@ export class ApiError extends Error {
    * `action`; without this the panel could only print the sentence.
    */
   readonly details: Record<string, unknown> | null;
+  /**
+   * Seconds the API asked the caller to wait, from `Retry-After`.
+   *
+   * `null` on everything that is not a refusal with a window behind it, and that distinction is
+   * the point: a screen that retried blindly would spin against the very limiter it exists to
+   * diagnose, and an operator watching a page refresh into `429` learns less from the error than
+   * from the number of seconds the platform is willing to wait.
+   */
+  readonly retryAfterSeconds: number | null;
 
   constructor(
     status: number,
     code: string,
     message: string,
     details: Record<string, unknown> | null = null,
+    retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 
   /** `true` when the session is missing or expired. */
   get isUnauthenticated(): boolean {
     return this.status === 401;
   }
+
+  /**
+   * `true` when the platform refused the request because a scope's budget is spent.
+   *
+   * A screen handles this differently from every other error: it says what was refused, by which
+   * scope and when to try again — instead of a "something went wrong" banner that implies the
+   * panel is broken when it is in fact doing exactly what it was configured to do.
+   */
+  get isRateLimited(): boolean {
+    return this.status === 429;
+  }
+}
+
+/**
+ * Read the wait the API attached, or `null` when there is none.
+ *
+ * Parsed rather than trusted: a header the platform sent is still a string that came off a wire,
+ * and `Number("soon")` is a number.
+ */
+function retryAfterOf(response: Response): number | null {
+  const raw = response.headers.get("retry-after");
+  if (!raw) return null;
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
 type ErrorBody = {
@@ -261,6 +296,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       body.error?.code ?? "unknown_error",
       body.error?.message ?? `The API answered with status ${response.status}.`,
       body.error?.details ?? null,
+      retryAfterOf(response),
     );
   }
 

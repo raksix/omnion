@@ -1742,10 +1742,33 @@ pub fn router(state: AppState) -> Router {
     // unreachable at boot still serves headers rather than serving none.
     let header_layer = crate::headers_middleware::install(omnion_security::HeaderPolicy::default());
 
+    // The rate limiter (REQ-012, slice 3) holds its document in the same process-wide cell the
+    // headers do, and for the same reason: read once, not per request, so a request's cost never
+    // depends on the database; `security_limiter::put_rate_limits` then replaces the numbers in
+    // place, so a save applies to the next request rather than after the next restart.
+    //
+    // `main.rs` reads the stored document before building the router and installs it; a router
+    // built without one (the in-process test harnesses) falls back to the shipped defaults rather
+    // than to no limiter at all, which is the failure mode this whole layer exists to remove.
+    let limiter_layer = crate::rate_limit_middleware::ensure_installed(&state);
+
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         .nest("/api/v1", v1)
+        // The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
+        // and the order is the design rather than an accident of where the line falls in the chain:
+        //
+        // * A limiter behind the guards would cap only callers who already hold a permission, which
+        //   leaves an anonymous spray against `POST /auth/login` uncapped — the one path worth
+        //   capping, and the only one an attacker can reach without an account.
+        // * Ahead of CSRF, because a cookie-less mutation is still a request somebody is sending and
+        //   it must spend budget whether or not it would have been refused anyway.
+        //
+        // `/healthz` and `/readyz` are inside it too, which is deliberate and cheap: they are two
+        // `GET`s a probe makes every few seconds, counted against a budget of 600 a minute, and a
+        // probe that trips the limiter is a probe that reports the platform down.
+        .layer(crate::rate_limit_middleware::rate_limit(limiter_layer.clone()))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually

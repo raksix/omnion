@@ -306,6 +306,17 @@ pub async fn put_rate_limits(
 
     let saved_policies =
         parse_rate_limits(&saved.rate_limits).unwrap_or_else(|_| policies.clone());
+
+    // The installed layer now decides by the numbers that were just saved (REQ-012, slice 3).
+    // Without this the limiter would keep enforcing whatever it read at boot, and the screen's own
+    // tester - which reads the store - would answer differently from the middleware that refuses
+    // the request. A failure here is logged and not surfaced for the same reason the header save
+    // logs its own: the write committed, and a 500 would report it as lost.
+    if !crate::rate_limit_middleware::reload_from_store(&state).await {
+        tracing::info!(
+            "the rate limits were saved; the running process picks them up from the store"
+        );
+    }
     Ok(Json(RateLimitsBody {
         scopes: saved_policies.iter().map(RateLimitBody::from).collect(),
         vocabulary: RATE_SCOPES.to_vec(),

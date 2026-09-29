@@ -17,7 +17,12 @@ pub mod event_runner;
 pub mod guards;
 pub mod headers_middleware;
 pub mod intent_resolver;
+// BOTH sides of this merge declare a module and the list is alphabetical, so the resolution is
+// "keep both" — dropping either would leave a file that nothing references (or a module with no
+// file). A merge that silently drops one side's `pub mod` compiles cleanly and fails at runtime
+// with a route that is not registered.
 pub mod publishing_runner;
+pub mod rate_limit_middleware;
 pub mod retention_runner;
 pub mod routes;
 pub mod scope;
