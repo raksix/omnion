@@ -24,6 +24,7 @@ pub mod error;
 pub mod failover;
 pub mod health;
 pub mod health_store;
+pub mod loop_engine;
 pub mod model;
 pub mod protocol;
 pub mod resolve_path;
@@ -32,6 +33,7 @@ pub mod routing;
 pub mod routing_store;
 pub mod run_store;
 pub mod store;
+pub mod tools;
 
 pub use catalog::{
     CapabilityFilter, CatalogEntry, CatalogQuery, CatalogSort, LONG_CONTEXT_TOKENS,
@@ -48,6 +50,14 @@ pub use client::{
 };
 pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
 pub use error::{AiHubError, Result};
+pub use loop_engine::{
+    Message as AgentMessage, Model, ModelAnswer, ModelError, Outcome as RunOutcome, Persist,
+    RequestedCall, Runtime, SINK_CAPACITY, ScriptedModel, Sink, run as run_agent,
+};
+pub use tools::{
+    AllowList, DenyReason, Execution, FnTool, Tool, ToolOutcome, ToolRegistry, ToolSummary,
+    decide as decide_tool_call, event_for as tool_event,
+};
 pub use failover::{
     Attempt, Plan, Progress, chain_of, final_error, is_retryable, next, pinned_provider, plan,
 };
