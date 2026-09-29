@@ -1484,3 +1484,269 @@ async fn the_session_belongs_to_the_caller_not_to_the_environment() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The change set (REQ-017 slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/// Read the change set through the API.
+async fn changes_for(fixture: &Fixture, environment_id: Uuid) -> TestResponse {
+    call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/environments/{environment_id}/changes"),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await
+}
+
+/// The slug and kind of every item, as `(slug, kind)` pairs.
+///
+/// Compared as a set rather than as a row order: the endpoint's `order by slug` is a presentation
+/// detail, and a test that pins it fails on a harmless reordering while a test that ignores order
+/// entirely misses a duplicated row. Sorting on both sides keeps the multiset honest.
+fn slugs_and_kinds(body: &Value) -> Vec<String> {
+    let mut pairs: Vec<String> = body["items"]
+        .as_array()
+        .expect("items must be an array")
+        .iter()
+        .map(|item| format!("{}:{}", item["slug"].as_str().unwrap(), item["kind"].as_str().unwrap()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// The headline walk: an edited page, a new page and a deleted page all show up, each with its
+/// editor and a timestamp, and production is untouched by the staging edits that produced them.
+#[tokio::test]
+async fn the_change_set_names_what_staging_holds_that_production_does_not() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let edited = insert_production_page(&fixture.db, fixture.site, "edited", "Edited").await;
+    let removed = insert_production_page(&fixture.db, fixture.site, "removed", "Removed").await;
+    let untouched = insert_production_page(&fixture.db, fixture.site, "quiet", "Quiet").await;
+
+    let created = fixture.create_staging("Staging", "staging-diff").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // A freshly cloned environment differs from production in nothing, and saying so is the point
+    // of the empty flag: an empty table with no words reads as a broken screen.
+    let fresh = changes_for(&fixture, environment_id).await;
+    assert_eq!(fresh.status, StatusCode::OK, "body: {}", fresh.body);
+    assert_eq!(
+        fresh.body["empty"], true,
+        "a clone is byte-identical, so nothing differs yet: {}",
+        fresh.body
+    );
+    assert_eq!(fresh.body["items"].as_array().unwrap().len(), 0);
+
+    // An *update* is not an insert. The clone already put an `edited` page in staging, so the
+    // staging side of an update is that row being changed — inserting a second one violates
+    // `pages_site_slug_key`, which is exactly the constraint migration 0148 put the environment
+    // into. Editing the copied row is also what the request describes: an editor opening a page in
+    // staging and saving it.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    // An *addition* is an insert, and only a slug production does not have can be one.
+    for (slug, title) in [("brand-new", "Brand new")] {
+        let page: Uuid = sqlx::query_scalar(
+            "insert into pages (site_id, slug, status, environment_id, updated_at) \
+             values ($1, $2, 'draft', $3, now() + interval '1 second') returning id",
+        )
+        .bind(fixture.site)
+        .bind(slug)
+        .bind(environment_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into page_revisions (page_id, revision_no, state, title, body) \
+             values ($1, 1, 'draft', $2, 'staging body')",
+        )
+        .bind(page)
+        .bind(title)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    }
+    // The delete: a staging row that simply stops existing. This is the case the SQL's outer join
+    // exists for, and it is the one a `where staging.environment_id = $1` filter silently drops —
+    // the tab would then report "nothing deleted" for an environment that removed a page.
+    sqlx::query("delete from pages where site_id = $1 and slug = 'removed' and environment_id = $2")
+        .bind(fixture.site)
+        .bind(environment_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    let diff = changes_for(&fixture, environment_id).await;
+    assert_eq!(diff.status, StatusCode::OK, "body: {}", diff.body);
+    assert_eq!(
+        slugs_and_kinds(&diff.body),
+        vec![
+            "brand-new:added".to_owned(),
+            "edited:updated".to_owned(),
+            "removed:deleted".to_owned(),
+        ],
+        "every kind of change is listed, and `quiet` is not"
+    );
+    assert_eq!(diff.body["added"], 1);
+    assert_eq!(diff.body["updated"], 1);
+    assert_eq!(diff.body["deleted"], 1);
+    assert_eq!(diff.body["empty"], false);
+    assert_eq!(
+        diff.body["production_id"], fixture.production_id().await.to_string(),
+        "the comparison names the environment it compared against"
+    );
+
+    // Each row carries the two things a reader needs to judge it.
+    for item in diff.body["items"].as_array().unwrap() {
+        // `OffsetDateTime` serialises the way every other timestamp in this API does — as the
+        // `time` crate's own array form — so the assertion is that the field is a *non-null array*,
+        // not that it is a string. Pinning a string here would fail against the shape the whole
+        // panel already parses, and "fixing" it would make this one route inconsistent with the
+        // other twenty.
+        assert!(
+            item["changed_at"].is_array(),
+            "every item is dated: {}",
+            item
+        );
+        assert!(
+            item["title"].is_string(),
+            "every item has a title a human can read, including the deleted one: {}",
+            item
+        );
+    }
+    let deleted = diff.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "deleted")
+        .unwrap();
+    assert_eq!(
+        deleted["title"], "Removed",
+        "a deleted row falls back to production's title, or it renders blank"
+    );
+
+    // And the staging edits changed no production row.
+    let production_slugs: Vec<String> =
+        sqlx::query_scalar("select slug from pages where environment_id = $1 and site_id = $2 order by slug")
+            .bind(fixture.production_id().await)
+            .bind(fixture.site)
+            .fetch_all(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        production_slugs,
+        vec!["edited".to_owned(), "quiet".to_owned(), "removed".to_owned()],
+        "production still holds every page it held before the staging edits"
+    );
+    let _ = (edited, untouched);
+}
+
+/// The tenancy and permission gates on the new route, in one walk each — they are separate
+/// assertions because a route that answers one correctly can still leak the other.
+#[tokio::test]
+async fn the_change_set_is_404_for_another_organization_and_403_without_the_key() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let created = fixture.create_staging("Staging", "staging-gate").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // 403: an account that may not deploy cannot read the diff.
+    let stranger_organization = create_organization_row(&fixture.db, "gate").await;
+    let (_, stranger) =
+        create_admin(
+            &fixture.db,
+            stranger_organization,
+            "gate",
+            &fixture.state,
+            // A real key that is the *wrong* one. `content.pages.read` is the honest choice: it
+            // exists in the catalogue, so the refusal is the guard answering rather than the
+            // seed rejecting a name it has never heard of.
+            &["content.pages.read"],
+        )
+        .await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/environments/{environment_id}/changes"),
+            Some(&stranger),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "without `deployment.read` the change set is refused: {}",
+        refused.body
+    );
+
+    // 404: an account of the same organization that holds the key still cannot read *another*
+    // organization's environment — the tenancy check, not the permission check, is what answers.
+    let outsider_organization = create_organization_row(&fixture.db, "outsider").await;
+    let (_, outsider) = create_admin(
+        &fixture.db,
+        outsider_organization,
+        "outsider",
+        &fixture.state,
+        &ALL_PERMISSIONS,
+    )
+    .await;
+    let hidden = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/environments/{environment_id}/changes"),
+            Some(&outsider),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        hidden.status,
+        StatusCode::NOT_FOUND,
+        "another organization's environment is a 404, not a 403: {}",
+        hidden.body
+    );
+}
+
+/// A change set is only meaningful against a reference, so an environment with no clone source is
+/// refused in words rather than answered as "no changes".
+#[tokio::test]
+async fn a_derived_environment_without_a_clone_source_refuses_to_be_compared() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // A production environment is exactly this case: it has no `cloned_from_environment_id`.
+    let production = fixture.production_id().await;
+    let response = changes_for(&fixture, production).await;
+    assert_eq!(
+        response.status,
+        StatusCode::CONFLICT,
+        "there is nothing to compare production against: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["error"]["code"], "environment_no_clone_source",
+        "the code is what the panel switches on: {}",
+        response.body
+    );
+}

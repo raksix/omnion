@@ -18,6 +18,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
+use omnion_environment::changes::{ChangeItem, ChangeSet};
 use omnion_environment::clone::{self, Area};
 use omnion_environment::error::EnvironmentError;
 use omnion_environment::key;
@@ -684,6 +685,94 @@ pub async fn archive_environment(
 
     let body = environment_body(pool, &archived).await?;
     Ok(Json(body))
+}
+
+/// `GET /api/v1/environments/{id}/changes` — what this staging environment holds that production
+/// does not.
+///
+/// Read-only in slice 2. The route exists and answers a real change set because the Changes tab
+/// is useless without it, and because slice 3's promotion freezes exactly what this returns — so
+/// the comparison has to be one function with one definition of "changed" rather than two that can
+/// disagree.
+pub async fn list_changes(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ChangeSetBody>, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let pool = state.db().pool();
+    // Tenancy first, and it is the read of the environment that does it: an environment of
+    // another organization answers `404` here, before a single page row is compared.
+    let environment = store::find(pool, organization_id, id).await?;
+
+    // The reference is the environment this one was *cloned from*, not "the organization's
+    // production environment". The two agree on the first clone and diverge on every later one:
+    // a re-clone from a staging environment would otherwise be compared against production and
+    // the tab would show a diff of the wrong thing. `staging_source_refused` in the model is the
+    // rule that keeps a staging source out, so the field is set for every staging environment.
+    let production_id = environment.cloned_from_environment_id.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "environment_no_clone_source",
+            "This environment has no clone source, so there is nothing to compare it against yet.",
+        )
+    })?;
+    // The source has to still exist and still be in this organization. A deleted source leaves the
+    // change set unanswerable rather than empty, and reporting "no changes" there would be the
+    // most dangerous answer the screen can give.
+    store::find(pool, organization_id, production_id).await?;
+
+    let change_set =
+        omnion_environment::changes::diff_against_production(pool, id, production_id).await?;
+
+    Ok(Json(ChangeSetBody::build(
+        &environment,
+        &change_set,
+    )))
+}
+
+/// The change set, in the shape the Changes tab reads.
+///
+/// `ChangeItem` is re-exported rather than re-declared: the panel must not be able to drift from
+/// the server's idea of what a row is, and slice 3 freezes this exact list.
+#[derive(Debug, Serialize)]
+pub struct ChangeSetBody {
+    /// The staging environment the items belong to.
+    pub environment_id: Uuid,
+    /// The environment's key, so the tab's header can name it without a second request.
+    pub environment_key: String,
+    /// The environment it is compared against — the one it was cloned from.
+    pub production_id: Uuid,
+    /// One row per changed page.
+    pub items: Vec<ChangeItem>,
+    /// Count of `added` items, so the tab header does not recount client-side.
+    pub added: i64,
+    /// Count of `updated` items.
+    pub updated: i64,
+    /// Count of `deleted` items.
+    pub deleted: i64,
+    /// `true` when nothing differs. The tab says so in words rather than showing an empty table
+    /// with no explanation, because an empty change set after a clone is the expected state.
+    pub empty: bool,
+}
+
+impl ChangeSetBody {
+    /// Flatten the store's change set into the wire shape.
+    pub fn build(
+        environment: &store::EnvironmentRow,
+        change_set: &ChangeSet,
+    ) -> ChangeSetBody {
+        ChangeSetBody {
+            environment_id: change_set.environment_id,
+            environment_key: environment.key.clone(),
+            production_id: change_set.production_id,
+            items: change_set.items.clone(),
+            added: change_set.added,
+            updated: change_set.updated,
+            deleted: change_set.deleted,
+            empty: change_set.is_empty(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1365,8 +1365,10 @@ dependencies = [
  "omnion-audit",
  "omnion-automation",
  "omnion-backup",
+ "omnion-cdn",
  "omnion-content",
  "omnion-core",
+ "omnion-environment",
  "omnion-events",
  "omnion-identity",
  "omnion-media",
@@ -1442,6 +1444,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-cdn"
+version = "0.1.0"
+dependencies = [
+ "omnion-events",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-cli"
 version = "0.1.0"
 dependencies = [
@@ -1474,6 +1491,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omnion-environment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "uuid",
 ]
 
 [[package]]
@@ -2042,6 +2072,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

@@ -1058,6 +1058,12 @@ pub fn router(state: AppState) -> Router {
     // route whose meaning depends on state the caller cannot see.
     let environment_job_cancel = post(environments::cancel_clone)
         .layer(guards::require(&state, "deployment.preview"));
+    // The change set is a *read*: it says what staging holds that production does not, and every
+    // row in it is a row the same caller can already open in the editor. Slice 3's promotion is
+    // what writes, and it is guarded separately as `deployment.promote` — so the tab can be read
+    // by somebody who can look at a staging copy without being able to push it to production.
+    let environment_changes = get(environments::list_changes)
+        .layer(guards::require(&state, "deployment.read"));
 
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
@@ -1717,6 +1723,7 @@ pub fn router(state: AppState) -> Router {
         .route("/environments/{id}", environment_one)
         .route("/environments/{id}/clone", environment_one_clone)
         .route("/environments/{id}/clone-jobs", environment_jobs)
+        .route("/environments/{id}/changes", environment_changes)
         .route(
             "/environments/{id}/clone-jobs/{job_id}/cancel",
             environment_job_cancel,

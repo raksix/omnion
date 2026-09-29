@@ -17,10 +17,13 @@
 //!   derivation from a name.
 //! * [`clone`] — the areas a clone covers, what each area copies, and how a job's per-area counts
 //!   fold into a progress figure an operator can trust while it runs.
+//! * [`changes`] — what a staging environment holds that production does not: the change set the
+//!   Changes tab lists and the promotion in slice 3 freezes.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod changes;
 pub mod clone;
 pub mod error;
 pub mod key;

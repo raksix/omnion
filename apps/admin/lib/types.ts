@@ -2067,48 +2067,6 @@ export type LockedAccountsPage = {
   accounts: LockedAccount[];
   total: number;
 };
-/** The directives this build recognises, in render order — the form's own dropdown. */
-export const CSP_DIRECTIVE_NAMES = [
-  "default-src",
-  "base-uri",
-  "object-src",
-  "frame-ancestors",
-  "script-src",
-  "script-src-elem",
-  "script-src-attr",
-  "style-src",
-  "img-src",
-  "font-src",
-  "connect-src",
-  "form-action",
-  "frame-src",
-  "media-src",
-  "worker-src",
-  "manifest-src",
-  "upgrade-insecure-requests",
-  "block-all-mixed-content",
-  "require-trusted-types-for",
-] as const;
-
-/** The `Referrer-Policy` values browsers implement. An empty choice sends no header. */
-export const REFERRER_POLICIES = [
-  "no-referrer",
-  "no-referrer-when-downgrade",
-  "origin",
-  "origin-when-cross-origin",
-  "same-origin",
-  "strict-origin",
-  "strict-origin-when-cross-origin",
-  "unsafe-url",
-] as const;
-
-/**
- * The `max-age` below which a browser ignores the whole HSTS header (~6 months).
- *
- * Kept beside the form because it is the difference between "a shorter policy" and "a policy
- * the browser silently drops", and an operator setting 3600 deserves to be told before saving.
- */
-export const MIN_HSTS_MAX_AGE = 15_768_000;
 
 /* ---------------------------------------------------------------------------------------------
  * Backups (REQ-013)
