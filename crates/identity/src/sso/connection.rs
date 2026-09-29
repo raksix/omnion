@@ -42,8 +42,8 @@ use tokio_rustls::TlsConnector;
 
 use super::ber::{
     Attribute, BerError, Filter, LdapResult, Limits, Message, Response, SearchEntry, SearchScope,
-    encode_anonymous_bind_request, encode_bind_request, encode_paged_results_request,
-    encode_search_request, encode_starttls_request, encode_unbind_request,
+    encode_anonymous_bind_request, encode_bind_request, encode_search_request,
+    encode_starttls_request, encode_unbind_request,
 };
 use super::directory::{DirectoryConfig, StepReport, TestOutcome, TestStep};
 
@@ -559,14 +559,35 @@ pub async fn run_test(
         // who exist — so it is a failure, not a note.
         return ConnectionReport {
             steps: {
+                // The row is **replaced**, not appended. `ladder` already emitted a `pending`
+                // Attributes row, so pushing a second one left the list with two rows keyed on the
+                // same step name — and the panel keys on the name, so it rendered the pending one
+                // and the sentence that names the fix never appeared. A test that looked the row
+                // up with `find` got the wrong one and reported the step as never having run,
+                // which is a confusing way to learn about a duplicate key.
                 let mut steps = ladder(&done, config.is_secure());
-                steps.push(StepReport {
-                    step: TestStep::Attributes,
-                    status: "failed",
-                    detail: format!(
-                        "the entry came back without `{required}`, which is the attribute this                          directory is configured to match logins on — the search worked, the filter                          names the wrong field"
-                    ),
-                });
+                let detail = format!(
+                    "the entry came back without `{required}`, which is the attribute this \
+                     directory is configured to match logins on — the search worked, the filter \
+                     names the wrong field"
+                );
+                match steps
+                    .iter_mut()
+                    .find(|row| row.step == TestStep::Attributes)
+                {
+                    Some(row) => {
+                        row.status = "failed";
+                        row.detail = detail;
+                    }
+                    // Unreachable for a configuration that is not secure — `ladder` always emits
+                    // Attributes — and handled rather than assumed, because a `None` here would
+                    // silently drop the only sentence the operator needs.
+                    None => steps.push(StepReport {
+                        step: TestStep::Attributes,
+                        status: "failed",
+                        detail,
+                    }),
+                }
                 steps
             },
             failing_step: Some(TestStep::Attributes),
@@ -912,6 +933,10 @@ impl DirectoryConnection {
     /// Read the root DSE: the server's naming contexts, and whether StartTLS is offered.
     pub async fn root_dse(&mut self) -> Result<Vec<String>, TransportError> {
         let id = self.next_id();
+        // The root DSE is read **without** the paging control: it is a single entry on the
+        // server's own node and a control attached to it is a request for a cursor nobody will
+        // return. The last argument pair is the page size and cookie, and a size of 0 with an
+        // empty cookie is how this client says "one page, no paging".
         let frame = encode_search_request(
             id,
             "",
@@ -920,6 +945,8 @@ impl DirectoryConnection {
             10,
             &Filter::present("objectClass"),
             &["namingContexts".to_owned(), "supportedExtension".to_owned()],
+            1,
+            &[],
         );
         self.write(&frame).await?;
         let mut contexts = Vec::new();
@@ -968,6 +995,12 @@ impl DirectoryConnection {
 
         loop {
             let id = self.next_id();
+            // **One** write. The paging control rides inside the search, so there is a single
+            // request, a single `searchResDone`, and nothing to tell apart. The earlier version
+            // wrote the search and then a separate extendedRequest carrying the control, then read
+            // once: the client consumed the *control's* completion as the search's, and the
+            // operation was left open — which is a desynchronised stream on the very first page,
+            // and a multi-page result the client could not read at all.
             let frame = encode_search_request(
                 id,
                 base,
@@ -976,16 +1009,10 @@ impl DirectoryConnection {
                 30,
                 filter,
                 attributes,
+                self.page_size(),
+                &cookie,
             );
             self.write(&frame).await?;
-
-            // The control rides on its own request, immediately before the search, and its
-            // message id is the search's — an LDAP server matches the control to the operation by
-            // message id, and sending it with a different one is a server that returns a page and
-            // then never returns a cookie.
-            let paged_id = self.next_id();
-            let control = encode_paged_results_request(paged_id, self.page_size(), &cookie);
-            self.write(&control).await?;
 
             let page_start = entries.len() as u32;
             // Written once and read once, at the bottom of the loop; the initial `None` is the
@@ -1110,6 +1137,10 @@ impl DirectoryConnection {
             have += read;
         }
         let first = header[1];
+        // Declared here so the frame can be rebuilt from one place below, whichever form the
+        // length took. A short-form message leaves it all zero, which is exactly what the frame
+        // must contain.
+        let mut length_bytes = [0u8; 4];
         let (length, header_len) = if first & 0x80 == 0 {
             (first as usize, 2usize)
         } else {
@@ -1126,7 +1157,6 @@ impl DirectoryConnection {
             }
             // The long form's own length bytes are read one at a time into their own buffer,
             // for the same reason: a read larger than the bytes wanted is a read that discards.
-            let mut length_bytes = [0u8; 4];
             let mut filled = 0usize;
             while filled < count {
                 let read = self.read(&mut length_bytes[filled..count]).await?;
@@ -1147,8 +1177,22 @@ impl DirectoryConnection {
             ));
         }
 
+        // The frame carries the **whole** header, short form or long, and the long form's length
+        // bytes are part of it.
+        //
+        // The first version copied `header[..header_len]` out of a two-byte buffer, so any
+        // message over 127 bytes panicked with an out-of-range slice — and a message over 127
+        // bytes is every group entry with more than one member, which is the normal case for a
+        // real directory. Worse than that, it is a **remote panic**: a server that announced
+        // `0x84` crashed the client rather than being refused, and a crash in a task that walks
+        // somebody else's group graph is a denial of service an operator can trigger by editing
+        // a group.
         let mut frame = vec![0u8; header_len + length];
-        frame[..header_len].copy_from_slice(&header[..header_len]);
+        frame[0] = header[0];
+        frame[1] = header[1];
+        for (index, byte) in length_bytes.iter().take(header_len.saturating_sub(2)).enumerate() {
+            frame[2 + index] = *byte;
+        }
         let mut filled = header_len;
         while filled < frame.len() {
             let read = self.read(&mut frame[filled..]).await?;

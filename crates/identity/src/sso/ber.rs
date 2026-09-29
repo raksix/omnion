@@ -559,7 +559,19 @@ pub fn encode_anonymous_bind_request(message_id: i64) -> Vec<u8> {
     encoder.finish()
 }
 
-/// A search request. `attributes` empty means "all user attributes".
+/// A search request, with the paged-results control **attached**.
+///
+/// `cookie` empty on the first page and the server's own cursor on every one after. RFC 2696
+/// §2.1 puts the control in the request's `controls` field; the older "send an extendedRequest
+/// with the same message id" pattern still works against some servers, and this client used it —
+/// and the live walk showed what it costs. The client wrote the search, then the control, then
+/// read once. The stub answered the search and then the control, so the client consumed the
+/// control's `searchResDone` as the search's and the operation was left open. Against a real
+/// directory the two requests are pipelined and the order is a server detail, so a client that
+/// depends on it is depending on the wrong thing — and a client that cannot tell the two
+/// completions apart cannot read a *multi-page* result at all.
+///
+/// `attributes` empty means "all user attributes".
 #[must_use]
 pub fn encode_search_request(
     message_id: i64,
@@ -569,6 +581,8 @@ pub fn encode_search_request(
     time_limit: i64,
     filter: &Filter,
     attributes: &[String],
+    page_size: u32,
+    cookie: &[u8],
 ) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.sequence(|outer| {
@@ -588,27 +602,20 @@ pub fn encode_search_request(
                     attrs.octet_string(attribute.as_bytes());
                 }
             });
-        });
-    });
-    encoder.finish()
-}
-
-/// The paged-results extended request (RFC 2696).
-#[must_use]
-pub fn encode_paged_results_request(message_id: i64, size: u32, cookie: &[u8]) -> Vec<u8> {
-    let mut control = Encoder::new();
-    control.sequence(|value| {
-        value.integer(i64::from(size));
-        value.octet_string(cookie);
-    });
-    let control = control.finish();
-
-    let mut encoder = Encoder::new();
-    encoder.sequence(|outer| {
-        outer.integer(message_id);
-        outer.application(op::EXTENDED_REQUEST, |op| {
-            op.context_primitive(0, PAGED_RESULTS_OID.as_bytes());
-            op.context_primitive(1, &control);
+            // The control, in the request's own control field. An empty cookie says "first
+            // page"; a non-empty one is the cursor the previous `searchResDone` returned.
+            let mut value = Encoder::new();
+            value.integer(i64::from(page_size));
+            value.octet_string(cookie);
+            let value = value.finish();
+            // A control is `SEQUENCE { controlType, criticality, controlValue }`, and the
+            // criticality is a BOOLEAN — omitted means FALSE, which is what a client wants: a
+            // server that does not support paging answers without it rather than refusing.
+            op.sequence(|control| {
+                control.context_primitive(0, PAGED_RESULTS_OID.as_bytes());
+                control.boolean(false);
+                control.context_primitive(1, &value);
+            });
         });
     });
     encoder.finish()
@@ -1521,5 +1528,100 @@ mod tests {
                 "`{text}` must be refused, not repaired"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+
+    /// A search request's envelope must carry the operation inside it.
+    ///
+    /// Found by the live walk, and the shape of the failure is why it is worth a test of its own:
+    /// the frame the client wrote announced an envelope of **two** bytes — the message id and
+    /// nothing else — and then wrote the 124-byte search operation *beside* it. A server that
+    /// read the envelope literally would answer a request for a message with no operation, and a
+    /// walk against one reports "the directory sent something this client could not read", which
+    /// names the server rather than the encoder.
+    #[test]
+    fn a_search_request_puts_the_operation_inside_the_envelope() {
+        // A **substring** filter, because that is the shape the group walk produces and the
+        // shape the live walk found broken. An equality filter is short enough to stay in the
+        // short length form, so a test built from one passes against an encoder that gets the
+        // long form wrong.
+        // The exact shape the group walk builds: a substring with an `initial`, an `any` and a
+        // `final_`, which is three components and therefore the longest filter this client can
+        // emit. A one-component filter stays inside the short length form and would never have
+        // found the bug.
+        let filter = Filter::Substring {
+            attribute: "member".to_owned(),
+            initial: Some("uid=frank".to_owned()),
+            any: vec!["ou=people".to_owned()],
+            final_: Some("dc=example,dc=com".to_owned()),
+        };
+        let encoded_length = filter.to_filter_string().len();
+        assert!(
+            encoded_length > 40,
+            "the filter must be long enough to force the long length form, not {encoded_length}"
+        );
+        let frame = encode_search_request(
+            4,
+            "ou=people,dc=example,dc=com",
+            SearchScope::Subtree,
+            100,
+            30,
+            &filter,
+            &[
+                "member".to_owned(),
+                "distinguishedName".to_owned(),
+                "cn".to_owned(),
+                "uid".to_owned(),
+            ],
+            500,
+            &[],
+        );
+        // The long-form boundary: a body of 128 or more must announce `0x81 0x80`-or-more, and a
+        // body of exactly 129 must be `0x81 0x81`. Asserted directly because a wrong length byte
+        // here produces a frame that *parses* on the writer's side and fails on the reader's, with
+        // an error about the reader.
+        assert_eq!(frame[1] & 0x80 != 0, frame.len() - 2 >= 0x80, "length form must match the size");
+        if frame[1] & 0x80 != 0 {
+            let count = (frame[1] & 0x7F) as usize;
+            let mut declared = 0usize;
+            for byte in &frame[2..2 + count] {
+                declared = declared * 256 + *byte as usize;
+            }
+            assert_eq!(
+                declared,
+                frame.len() - 2 - count,
+                "the declared length must equal the bytes that follow it"
+            );
+        }
+        let message = Message::decode(&frame, Limits::default())
+            .expect("a frame this crate wrote must decode");
+        assert_eq!(message.message_id, 4);
+        // And the envelope's declared length must equal what it actually contains — the
+        // assertion that the live walk turned up, here as a unit test so it can never regress
+        // without a socket.
+        let mut decoder = Decoder::new(&frame);
+        let envelope = decoder.next().expect("a value").expect("a value");
+        assert!(
+            decoder.is_empty(),
+            "the envelope must be the whole frame, not a prefix of it"
+        );
+        // The frame is the header **plus** the body, and the header is three bytes in the long
+        // form — two plus one length byte. The first draft of this assertion added 2 regardless,
+        // which is off by one for every message over 127 bytes, and it is the same off-by-one the
+        // live stub had: a check that does not account for the form it is reading.
+        let declared_header = if frame[1] & 0x80 == 0 {
+            2
+        } else {
+            2 + (frame[1] & 0x7F) as usize
+        };
+        assert_eq!(
+            envelope.body.len() + declared_header,
+            frame.len(),
+            "the frame is exactly its header and its body"
+        );
     }
 }

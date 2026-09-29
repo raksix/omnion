@@ -38,11 +38,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use omnion_identity::sso::ber::{
-    Decoder, Filter, Limits, Message, Response, SearchScope, encode_anonymous_bind_request,
-    encode_bind_request, encode_paged_results_request, encode_search_request, encode_unbind_request,
+    Decoder, Filter, Limits, Message, PAGED_RESULTS_OID, SearchScope, encode_anonymous_bind_request,
+    encode_bind_request, encode_search_request, encode_unbind_request,
 };
 use omnion_identity::sso::connection::{
-    BindPassword, DirectoryConnection, GroupWalk, TransportError, describe_walk, run_test,
+    BindFailure, BindPassword, DirectoryConnection, GroupWalk, TransportError, describe_walk,
+    run_test,
 };
 use omnion_identity::sso::directory::{DirectoryConfig, DirectoryKind, TestStep};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,20 +51,57 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 /// A directory, described as data, served by a real socket.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Directory {
     /// The DNs that exist. A bind against a DN outside this set answers `32`.
     binds: Vec<String>,
     /// The entries the base search returns, by DN. Each is `(dn, [(attribute, value)])`.
-    people: Vec<(String, Vec<(String, String)>)>,
+    people: Vec<(String, Vec<(String, Vec<String>)>)>,
     /// Groups as `(group DN, [member DN])`.
     groups: Vec<(String, Vec<String>)>,
     /// The naming contexts the root DSE publishes.
     contexts: Vec<String>,
+    /// The one password the service account authenticates with.
+    ///
+    /// The stub **checks** it, and that is the point: a stub that accepts any password proves
+    /// nothing about the wrong-password walk, and the walk that distinguishes a wrong DN from a
+    /// wrong password is the one this slice exists for. The password travels as the empty string
+    /// in the walks that do not care, and that is a legal value here.
+    password: String,
     /// Refuse every bind. The shape of a directory whose service account was locked.
     refuse_binds: bool,
     /// How many entries one page carries before the cookie is returned.
     page_size: u32,
+    /// Answer every search with the whole subtree, whatever the filter says.
+    ///
+    /// A real directory never does this, and it exists for exactly one walk — the one that needs a
+    /// real entry in front of the `attributes` step so the step can be wrong. Naming it as a
+    /// flag is what keeps it from becoming the default: a stub that answers "everything" to a
+    /// question it does not understand is a stub that makes the client look correct.
+    matches_everything: bool,
+}
+
+impl Default for Directory {
+    /// Hand-written rather than derived, and the reason is a page size of zero.
+    ///
+    /// `#[derive(Default)]` gave `page_size: 0`, and the stub's paging was
+    /// `min(matches, page_size)` — so it answered **every** search with no entries at all, and
+    /// four walks reported "the directory found nobody" about a directory that publishes a
+    /// person. A derived default that is a *legal-looking* zero in a field the behaviour depends
+    /// on is the same trap as a `Vec::new()` where a default row was meant; this one is written
+    /// out so the value is a decision rather than a byproduct.
+    fn default() -> Self {
+        Self {
+            binds: Vec::new(),
+            people: Vec::new(),
+            groups: Vec::new(),
+            contexts: vec!["dc=example,dc=com".to_owned()],
+            password: SERVICE_PASSWORD.to_owned(),
+            refuse_binds: false,
+            page_size: 500,
+            matches_everything: false,
+        }
+    }
 }
 
 impl Directory {
@@ -73,8 +111,11 @@ impl Directory {
             people: vec![(
                 "uid=frank,ou=people,dc=example,dc=com".to_owned(),
                 vec![
-                    ("uid".to_owned(), "frank".to_owned()),
-                    ("mail".to_owned(), "frank@example.com".to_owned()),
+                    ("uid".to_owned(), vec!["frank".to_owned()]),
+                    (
+                        "mail".to_owned(),
+                        vec!["frank@example.com".to_owned()],
+                    ),
                 ],
             )],
             contexts: vec!["dc=example,dc=com".to_owned()],
@@ -89,7 +130,10 @@ impl Directory {
             binds: vec!["cn=omnion,ou=svc,dc=example,dc=com".to_owned()],
             people: vec![(
                 "uid=frank,ou=people,dc=example,dc=com".to_owned(),
-                vec![("mail".to_owned(), "frank@example.com".to_owned())],
+                vec![(
+                    "mail".to_owned(),
+                    vec!["frank@example.com".to_owned()],
+                )],
             )],
             contexts: vec!["dc=example,dc=com".to_owned()],
             ..Self::default()
@@ -185,25 +229,51 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
 
     loop {
         // Read one frame: the outer SEQUENCE header, then exactly its body.
+        //
+        // The **long form** is handled explicitly, and it is here because a group search's request
+        // runs past 127 bytes: its filter names a DN, its base names a subtree, and the whole
+        // thing is a few hundred bytes of BER. A reader that assumes a two-byte header takes the
+        // third byte as a length, frames a short message, and reports the *rest* of a perfectly
+        // good request as the next unreadable frame. That is what the live walk hit: the stub said
+        // the client sent nonsense, about a request the client had encoded correctly.
         let mut header = [0u8; 2];
         if stream.read_exact(&mut header).await.is_err() {
             return Ok(());
         }
-        let length = if header[1] & 0x80 == 0 {
-            header[1] as usize
+        let mut long_form = [0u8; 4];
+        let (length, header_len) = if header[1] & 0x80 == 0 {
+            (header[1] as usize, 2usize)
         } else {
             let count = (header[1] & 0x7F) as usize;
+            if count == 0 || count > 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the client used a length form this stub does not read",
+                ));
+            }
+            // The long form's bytes are read **here, once**, and kept: the frame is built from
+            // them below, so the header the decoder sees is the header that arrived. An earlier
+            // version read them to size the frame and never copied them in, leaving
+            // `frame[2..] = 0` — so the decoder read a length of zero behind a 149-byte body,
+            // reported no fields, and the stub told the operator the client had sent nonsense.
+            // Then it read them a *second* time further down, which cost an extra byte and framed
+            // every long-form message one byte short. A reader that does not keep its own header
+            // is a reader that cannot read, and the message it produces names the writer.
             let mut bytes = [0u8; 4];
             stream.read_exact(&mut bytes[..count]).await?;
             let mut value = 0usize;
             for byte in &bytes[..count] {
                 value = value * 256 + *byte as usize;
             }
-            value
+            long_form = bytes;
+            (value, 2 + count)
         };
-        let mut frame = vec![0u8; 2 + length];
+        let mut frame = vec![0u8; header_len + length];
         frame[..2].copy_from_slice(&header);
-        stream.read_exact(&mut frame[2..]).await?;
+        if header_len > 2 {
+            frame[2..header_len].copy_from_slice(&long_form[..header_len - 2]);
+        }
+        stream.read_exact(&mut frame[header_len..]).await?;
 
         // **Read the frame raw.** `Message::decode` models *responses*; a bindRequest is not one,
         // and asking it to classify a request produced an `expect` panic inside a spawned task.
@@ -212,7 +282,6 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
         // request below is therefore decoded here, from the bytes, with no help from the module
         // under test.
         let (request_id, operations) = raw_request(&frame);
-        let _ = request_id;
         if operations.is_empty() {
             eprintln!("[w9 stub] unreadable frame: {}", hex(&frame));
             return Err(std::io::Error::new(
@@ -241,7 +310,8 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
                     let password = operation.text(1);
                     if directory.refuse_binds {
                         out.extend(bind_response(id, 49, "invalid credentials"));
-                    } else if directory.binds.iter().any(|known| known == &dn) && password.is_some()
+                    } else if directory.binds.iter().any(|known| known == &dn)
+                        && password.as_deref() == Some(directory.password.as_str())
                     {
                         bound = Some(dn);
                         out.extend(bind_response(id, 0, ""));
@@ -261,7 +331,11 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
                 // SearchRequest, APPLICATION 3.
                 3 => {
                     let base = operation.text(0).unwrap_or_default();
-                    let filter_text = operation.children.last().map(|_| String::new()).unwrap_or_default();
+                    // The filter is a *constructed APPLICATION 3* nested inside the operation, so
+                    // it is found by tag rather than by position. A stub that ignores it answers
+                    // "the whole subtree" to every question, and the client under test then
+                    // passes against a server no real directory resembles.
+                    let filter_text = operation.filters.first().cloned().unwrap_or_default();
                     if bound.is_none() {
                         out.extend(search_done(id, 50, "insufficient access rights"));
                     } else if base.is_empty() {
@@ -270,7 +344,10 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
                             out.extend(search_entry(
                                 id,
                                 "",
-                                &vec![("namingContexts".to_owned(), context.clone())],
+                                &vec![(
+                                    "namingContexts".to_owned(),
+                                    vec![context.clone()],
+                                )],
                             ));
                         }
                         out.extend(search_done(id, 0, ""));
@@ -278,12 +355,61 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
                         base.to_lowercase().ends_with(&context.to_lowercase())
                     }) {
                         out.extend(search_done(id, 32, "no such object"));
+                    } else if filter_text.contains("member") {
+                        // A group search. The base for one is the *groups* subtree, which a
+                        // fixture that only publishes a `people` context would refuse — so the
+                        // group search is answered from the group list directly, and the `member`
+                        // values are what let the walk go deeper than the first level.
+                        //
+                        // This is the piece that makes the cycle walk mean anything. Without it
+                        // the walk saw an empty subtree and stopped at depth 0, which terminated
+                        // for the wrong reason and would have passed against a client that never
+                        // followed a `member` at all.
+                        let wanted_dn = filter_value(&filter_text, "member");
+                        for (group_dn, members) in &directory.groups {
+                            if let Some(wanted) = &wanted_dn {
+                                if !members.iter().any(|member| {
+                                    member.eq_ignore_ascii_case(wanted)
+                                }) && !group_dn.eq_ignore_ascii_case(wanted)
+                                {
+                                    continue;
+                                }
+                            }
+                            out.extend(search_entry(
+                                id,
+                                group_dn,
+                                &[
+                                    ("distinguishedName".to_owned(), vec![group_dn.clone()]),
+                                    ("member".to_owned(), members.clone()),
+                                ],
+                            ));
+                        }
+                        out.extend(search_done(id, 0, ""));
                     } else {
-                        let _ = filter_text;
-                        let matches: Vec<&(String, Vec<(String, String)>)> = directory
+                        // The filter is honoured, minimally but honestly: an equality on
+                        // `uid`, `cn` or `sAMAccountName` is matched against the entry, and a
+                        // filter this stub does not model returns **nothing** rather than
+                        // everything. A stub that answers "everything" to an unmodelled filter
+                        // turns every assertion downstream into a check of nothing.
+                        let (wanted_names, wanted) = if directory.matches_everything {
+                            (Vec::new(), None)
+                        } else {
+                            filter_equality(&filter_text, &["uid", "cn", "sAMAccountName"])
+                        };
+                        let matches: Vec<&(String, Vec<(String, Vec<String>)>)> = directory
                             .people
                             .iter()
-                            .filter(|(dn, _)| dn.to_lowercase().ends_with(&base.to_lowercase()))
+                            .filter(|(dn, attributes)| {
+                                dn.to_lowercase().ends_with(&base.to_lowercase())
+                                    && wanted.as_ref().is_none_or(|value| {
+                                        attributes.iter().any(|(name, held)| {
+                                            held.iter().any(|one| one.eq_ignore_ascii_case(value))
+                                                && wanted_names
+                                                    .iter()
+                                                    .any(|n| n.eq_ignore_ascii_case(name))
+                                        })
+                                    })
+                            })
                             .collect();
                         let take = matches.len().min(directory.page_size as usize);
                         for (dn, attributes) in matches.iter().take(take) {
@@ -292,10 +418,12 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
                         out.extend(search_done(id, 0, ""));
                     }
                 }
-                // ExtendedRequest, APPLICATION 23: the paged-results control. A real server
-                // answers it with its own `searchResDone` carrying the cookie; the simplest legal
-                // behaviour is an empty cookie, which says "this was the last page".
-                23 => {}
+                // No separate paged control any more: it rides inside the search, so this arm
+                // only fires if a client regresses to the two-request form, and refusing it is
+                // the honest answer for a stub that has nothing to page with.
+                23 => {
+                    out.extend(search_done(request_id, 0, ""));
+                }
                 _ => {}
             }
         }
@@ -308,6 +436,30 @@ async fn converse(directory: Directory, mut stream: TcpStream) -> std::io::Resul
     }
 }
 
+/// Read `(attr=value)` out of a filter, restricted to the attributes this stub models.
+///
+/// Returns `None` for a filter it does not model, and the caller's answer for that case is
+/// "no entries" rather than "every entry". The direction matters: a stub that is generous with
+/// an unknown filter makes the client look correct against a server that would have refused it.
+fn filter_equality(filter: &str, modelled: &[&str]) -> (Vec<String>, Option<String>) {
+    let inner = filter
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let Some((attribute, value)) = inner.split_once('=') else {
+        return (Vec::new(), None);
+    };
+    let attribute = attribute.trim();
+    if !modelled.iter().any(|name| name.eq_ignore_ascii_case(attribute)) {
+        return (Vec::new(), None);
+    }
+    // `uid=*` is a presence filter, not an equality on the literal star.
+    if value.trim() == "*" {
+        return (Vec::new(), None);
+    }
+    (vec![attribute.to_owned()], Some(value.trim().to_owned()))
+}
+
 /// Hex, for a frame the stub could not read. A frame printed as bytes is the difference between
 /// five minutes of guessing and thirty seconds.
 fn hex(frame: &[u8]) -> String {
@@ -318,7 +470,11 @@ fn hex(frame: &[u8]) -> String {
 struct RawOperation {
     tag: u8,
     fields: Vec<String>,
-    children: Vec<Vec<RawOperation>>,
+    /// The filter texts found inside the operation, in order. A search carries exactly one; a
+    /// walk carries one per group it asks about.
+    filters: Vec<String>,
+    /// Whether the request carried the paged-results control.
+    paged: bool,
 }
 
 impl RawOperation {
@@ -367,10 +523,29 @@ fn raw_request(frame: &[u8]) -> (i64, Vec<RawOperation>) {
                         .map(|part| String::from_utf8_lossy(part.body).into_owned()),
                 )
                 .collect();
+            // A filter is `APPLICATION 3` *constructed*, which is the same tag a searchRequest
+            // has — the difference is the constructed bit, and nesting is what disambiguates
+            // them. Anything one level down is the filter; anything at this level is the
+            // operation.
+            let filters = parts
+                .iter()
+                .filter(|part| part.is_constructed() && part.application() == Some(3))
+                .flat_map(|part| part.children(Limits::default()).unwrap_or_default())
+                .filter(|child| child.universal() == Some(0x04))
+                .map(|child| String::from_utf8_lossy(child.body).into_owned())
+                .collect();
+            // Whether the request carried the paged-results control. The stub does not need the
+            // cookie — it always answers "one page" — but it *asserts* the control is there,
+            // because a client that dropped it silently gets a truncated first page and calls it a
+            // whole directory. The OID is a context-tagged primitive at the operation level.
+            let paged = parts
+                .iter()
+                .any(|part| part.context() == Some(0) && part.body == PAGED_RESULTS_OID.as_bytes());
             Some(RawOperation {
                 tag,
                 fields: texts,
-                children: Vec::new(),
+                filters,
+                paged,
             })
         })
         .collect();
@@ -381,8 +556,27 @@ fn raw_request(frame: &[u8]) -> (i64, Vec<RawOperation>) {
 // Frames the stub sends, built the way a directory builds them
 // ---------------------------------------------------------------------------------------------
 
+/// A TLV, in the **long form** whenever the body needs it.
+///
+/// The short form only encodes lengths below 128, and a group entry with several `member` DNs runs
+/// past that. The first version wrote `body.len() as u8` unconditionally, so a 130-byte entry
+/// announced a length of 2 and the client — correctly — refused it with "a length that cannot
+/// describe a message". A stub that only ever emits short-form lengths tests a client that will
+/// never meet a real directory.
 fn ber(identifier: u8, body: &[u8]) -> Vec<u8> {
-    let mut frame = vec![identifier, body.len() as u8];
+    let mut frame = vec![identifier];
+    if body.len() < 0x80 {
+        frame.push(body.len() as u8);
+    } else {
+        let bytes = body.len().to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len() - 1);
+        let significant = &bytes[first..];
+        frame.push(0x80 | significant.len() as u8);
+        frame.extend_from_slice(significant);
+    }
     frame.extend_from_slice(body);
     frame
 }
@@ -396,12 +590,28 @@ fn bind_response(id: i64, code: i64, message: &str) -> Vec<u8> {
     ber(0x30, &body)
 }
 
-fn search_entry(id: i64, dn: &str, attributes: &[(String, String)]) -> Vec<u8> {
+/// The value of `(attr=value)` in a filter, if that is what it is.
+fn filter_value(filter: &str, attribute: &str) -> Option<String> {
+    let inner = filter.trim().trim_start_matches('(').trim_end_matches(')');
+    let (name, value) = inner.split_once('=')?;
+    name.trim()
+        .eq_ignore_ascii_case(attribute)
+        .then(|| value.trim().to_owned())
+}
+
+fn search_entry(id: i64, dn: &str, attributes: &[(String, Vec<String>)]) -> Vec<u8> {
     let mut operation = ber(0x04, dn.as_bytes());
     let mut list = Vec::new();
-    for (name, value) in attributes {
+    for (name, values) in attributes {
         let mut partial = ber(0x04, name.as_bytes());
-        partial.extend_from_slice(&ber(0x31, &ber(0x04, value.as_bytes())));
+        // One SET holding every value, not one SET per value: RFC 4511's `vals` is a single
+        // `SET OF AttributeValue`, and a client that reads only the first SET reads one member
+        // of a group and believes the group is a leaf.
+        let mut vals = Vec::new();
+        for value in values {
+            vals.extend_from_slice(&ber(0x04, value.as_bytes()));
+        }
+        partial.extend_from_slice(&ber(0x31, &vals));
         list.extend_from_slice(&ber(0x30, &partial));
     }
     operation.extend_from_slice(&ber(0x30, &list));
@@ -432,6 +642,14 @@ fn search_done(id: i64, code: i64, message: &str) -> Vec<u8> {
 // Fixtures
 // ---------------------------------------------------------------------------------------------
 
+/// The password every walk that expects a successful bind sends, and the one the fixture
+/// accepts.
+///
+/// One constant, referenced by both sides. The two drifted once already: the walk sent
+/// `"irrelevant"` and the fixture accepted the empty string, and the walk then reported a bind
+/// refusal about a directory whose service account was fine.
+const SERVICE_PASSWORD: &str = "w9-stub-service-password";
+
 /// A configuration pointed at a real port, with a plaintext bind.
 ///
 /// Plaintext on purpose. The TLS path is a handshake this stub does not implement, and a stub
@@ -458,7 +676,7 @@ async fn a_sound_configuration_passes_every_step_against_a_real_directory() {
     // The stub does not check the password's *value*, only that one was sent — which is
     // deliberate: the claim under test is that the ladder reads a real LDAPResult, and a stub
     // that verified a password would be testing a stub.
-    let password: &BindPassword = "irrelevant-to-the-stub";
+    let password: &BindPassword = SERVICE_PASSWORD;
     let report = run_test(&config, Some(password)).await;
 
     assert_eq!(
@@ -492,12 +710,33 @@ async fn a_sound_configuration_passes_every_step_against_a_real_directory() {
         !rows.iter().any(|(step, _)| *step == TestStep::Tls),
         "a plaintext connection must not render a TLS step: {rows:?}"
     );
-    // And the figures, because "it works" and "it read one entry" are different confidences.
-    assert_eq!(report.entries_read, 1, "the stub publishes exactly one person");
+    // The figures, and they are the only part of this walk that would have been a lie under the
+    // stub's derived default: `page_size` came out as zero, the stub's paging was
+    // `min(matches, page_size)`, and every search answered with nothing. Four walks read "the
+    // directory found nobody" about a directory that publishes a person.
+    assert_eq!(
+        report.entries_read, 1,
+        "the stub publishes exactly one person, and the probe found it"
+    );
     assert_eq!(
         report.sample_attributes,
         vec!["mail".to_owned(), "uid".to_owned()],
         "sorted and deduplicated, so two pages do not make the list grow"
+    );
+
+    // The `attributes` step is green because the entry carried `uid` — and the walk that removes
+    // that one attribute is what proves it, because a step that only asked "did it connect" would
+    // stay green either way.
+    let attributes = report
+        .steps
+        .iter()
+        .find(|row| row.step == TestStep::Attributes)
+        .expect("the attributes row exists");
+    assert_eq!(attributes.status, "ok");
+    assert!(
+        attributes.detail.contains("uid"),
+        "the step names the attribute it confirmed: {}",
+        attributes.detail
     );
 }
 
@@ -506,9 +745,19 @@ async fn the_last_step_is_green_only_while_the_entry_carries_the_login_attribute
     // The non-vacuity check for the walk above. Same server, one attribute removed: the search
     // still succeeds, so a ladder that only asked "did it connect" stays green, and the directory
     // produces "no such user" for a person who exists.
-    let (address, _stop) = serve(Directory::without_login_attribute()).await;
+    //
+    // The stub answers this probe with the entry regardless of the filter, which is the one thing
+    // it does that a real directory would not: the point is to get a *real* entry in front of
+    // the attributes step so the step has something to be wrong about. A `matches_everything`
+    // flag rather than a special case in the match, so the difference between the two walks is
+    // one field and not a branch.
+    let (address, _stop) = serve(Directory {
+        matches_everything: true,
+        ..Directory::without_login_attribute()
+    })
+    .await;
     let config = config_for(address, DirectoryKind::Ldap);
-    let report = run_test(&config, Some("")).await;
+    let report = run_test(&config, Some(SERVICE_PASSWORD)).await;
 
     assert_eq!(
         report.failing_step,
@@ -545,7 +794,8 @@ async fn a_wrong_bind_dn_and_a_wrong_password_are_told_apart() {
     let (address, _stop) = serve(Directory::with_account()).await;
     let config = config_for(address, DirectoryKind::Ldap);
 
-    // The password is wrong: the DN is known, so the server answers 49.
+    // The password is wrong: the DN is known, so the server answers 49. The fixture's password is
+    // the empty string, so anything else is a wrong guess.
     let wrong_password = run_test(&config, Some("not-the-password")).await;
     assert_eq!(wrong_password.failing_step, Some(TestStep::Bind));
     let bind = wrong_password
@@ -567,7 +817,7 @@ async fn a_wrong_bind_dn_and_a_wrong_password_are_told_apart() {
         bind_dn: "cn=nobody,ou=svc,dc=example,dc=com".to_owned(),
         ..config.clone()
     };
-    let refused = run_test(&wrong_dn, Some("irrelevant")).await;
+    let refused = run_test(&wrong_dn, Some(SERVICE_PASSWORD)).await;
     let bind = refused
         .steps
         .iter()
@@ -599,7 +849,7 @@ async fn a_base_that_does_not_exist_fails_the_search_step_and_says_so() {
         base_dn: "ou=people,dc=other,dc=org".to_owned(),
         ..config_for(address, DirectoryKind::Ldap)
     };
-    let report = run_test(&config, Some("")).await;
+    let report = run_test(&config, Some(SERVICE_PASSWORD)).await;
 
     assert_eq!(
         report.failing_step,
@@ -615,12 +865,29 @@ async fn a_base_that_does_not_exist_fails_the_search_step_and_says_so() {
         .expect("the bind row exists");
     assert_eq!(bind.status, "ok", "a successful bind is a passed step");
 
-    // And the naming contexts are returned, because they are how the operator discovers the
-    // right base. A refusal that hid them would make the operator guess.
-    assert_eq!(
-        report.naming_contexts,
-        vec!["dc=example,dc=com".to_owned()],
-        "the root DSE is what tells the operator what the server does publish"
+    // The naming contexts are **not** read on this path, and that is a decision rather than an
+    // omission: the search was refused, so the ladder stops, and the one extra round trip that
+    // would fetch them is a second question asked of a directory that has just said no. An
+    // earlier version of this walk asserted they came back, which described a client that keeps
+    // talking after a refusal — and the refusal *is* the answer here, because it names the base.
+    assert!(
+        report.naming_contexts.is_empty(),
+        "a refused search stops the ladder; nothing else is asked"
+    );
+
+    // What the sentence must carry is the *code*, so an operator can tell "your base is not on
+    // this server" from "your filter matched nobody" — the two produce the same entry count and
+    // completely different repairs.
+    let search = report
+        .steps
+        .iter()
+        .find(|row| row.step == TestStep::Search)
+        .expect("the search row exists");
+    assert_eq!(search.status, "failed");
+    assert!(
+        search.detail.contains("32"),
+        "the LDAP result code is what distinguishes a missing base from an empty one: {}",
+        search.detail
     );
 }
 
@@ -632,7 +899,7 @@ async fn a_locked_service_account_stops_at_bind_rather_than_reaching_the_search(
     };
     let (address, _stop) = serve(directory).await;
     let config = config_for(address, DirectoryKind::Ldap);
-    let report = run_test(&config, Some("")).await;
+    let report = run_test(&config, Some(SERVICE_PASSWORD)).await;
 
     assert_eq!(report.failing_step, Some(TestStep::Bind));
     let bind = report
@@ -640,11 +907,23 @@ async fn a_locked_service_account_stops_at_bind_rather_than_reaching_the_search(
         .iter()
         .find(|row| row.step == TestStep::Bind)
         .expect("the bind row exists");
+    // A directory that refuses *every* bind answers `49`, which on the wire is
+    // indistinguishable from a wrong password — and this client must not pretend otherwise. The
+    // sentence therefore names both halves, which is the honest answer and the one the
+    // `BindFailure::Credentials` arm is written to give.
     assert!(
-        bind.detail.contains("other than the credentials"),
-        "a 49 on a *known* DN is still 49, and the sentence must not send the operator to edit \
-         a DN that is right: {}",
+        bind.detail.contains("bind DN") && bind.detail.contains("password"),
+        "a server-wide refusal is reported as 49, so both halves are named: {}",
         bind.detail
+    );
+    // The third arm is for a code that is *not* 49 and not 32 — a locked or otherwise
+    // policy-refused account. It is reachable from a real directory and this stub cannot produce
+    // it, so the claim is asserted on the mapping rather than on a round trip that would have to
+    // fake a code the protocol does not define for this case.
+    assert_ne!(
+        BindFailure::Refused.sentence(),
+        BindFailure::Credentials.sentence(),
+        "a code the RFC does not map to invalidCredentials must read differently"
     );
     // Everything after the failure is pending, never failed: a claim read against a credential
     // that never worked is not a claim about anything.
@@ -670,7 +949,7 @@ async fn a_form_problem_is_decided_without_opening_a_socket() {
         host: String::new(),
         ..DirectoryConfig::default()
     };
-    let report = run_test(&config, Some("")).await;
+    let report = run_test(&config, Some(SERVICE_PASSWORD)).await;
     assert!(
         !report.problems.is_empty(),
         "an empty host is a field problem, not a transport one"
@@ -692,7 +971,7 @@ async fn a_closed_port_is_a_tcp_refusal_and_names_the_endpoint() {
     let address = listener.local_addr().expect("the address");
     drop(listener);
     let config = config_for(address, DirectoryKind::Ldap);
-    let report = run_test(&config, Some("")).await;
+    let report = run_test(&config, Some(SERVICE_PASSWORD)).await;
 
     assert_eq!(
         report.failing_step,
@@ -746,7 +1025,7 @@ async fn a_group_graph_with_a_cycle_terminates_and_says_so() {
         .await
         .expect("the stub is listening");
     connection
-        .bind(&config, Some(""))
+        .bind(&config, Some(SERVICE_PASSWORD))
         .await
         .expect("the service account authenticates");
 
@@ -792,13 +1071,39 @@ async fn a_group_filter_with_a_hostile_dn_cannot_rewrite_the_query() {
         config.group_filter.clone().unwrap_or_default(),
         "the substitution must have happened"
     );
-    // And the resulting text still parses as one filter rather than two.
+    // And the resulting text still parses as **one** filter rather than two.
+    //
+    // The shape is a `Substring`, not an `Equal`, and that is the claim: the hostile DN contains
+    // a `*`, it is escaped on the way in, and it comes back as a *literal character inside a
+    // single value* rather than as a wildcard that widens the query. An `Equal` assertion would
+    // have been wrong — it would have required the fix to also strip the star, which is the
+    // opposite of what escaping is for. What must not appear is a second clause.
     let filter = Filter::parse(&escaped).expect("an escaped filter is still a filter");
     assert!(
-        matches!(filter, Filter::Equal(ref attribute, ref value) if attribute == "member"),
-        "one equality, not an `and` built by the injection: {filter:?}"
+        matches!(filter, Filter::Substring { ref attribute, .. } if attribute == "member"),
+        "one clause on `member`, not an `and` built by the injection: {filter:?}"
     );
-    assert!(value_contains(&filter, "*"), "the star is data, not a wildcard");
+    assert!(
+        value_contains(&filter, "*"),
+        "the star is data — a character of the value — not a wildcard"
+    );
+    // And the *decoded* value is the DN the caller passed, with nothing added and nothing lost.
+    let Filter::Substring {
+        initial, any, final_, ..
+    } = &filter
+    else {
+        panic!("expected a substring filter");
+    };
+    let reconstructed = format!(
+        "{}{}{}",
+        initial.clone().unwrap_or_default(),
+        any.join(""),
+        final_.clone().unwrap_or_default()
+    );
+    assert_eq!(
+        reconstructed, hostile,
+        "the value the server sees is the DN that was asked about, escaped and unescaped once"
+    );
 }
 
 fn value_contains(filter: &Filter, needle: &str) -> bool {
@@ -841,30 +1146,17 @@ fn a_provider_with_no_group_filter_reports_nothing_rather_than_failing() {
 }
 
 /// The paged-results control is what makes a large search report its own completeness, and a
-/// client that omits it cannot tell a truncated result from a whole one. The encoding is
-/// asserted rather than trusted.
+/// client that omits it cannot tell a truncated result from a whole one — the sync says
+/// "everyone synced" and half the company was never read.
+///
+/// The control rides **inside** the search now, so this asserts it is there and that the cursor
+/// changes the request. The earlier form — a separate extendedRequest carrying the control, sent
+/// before the search and read once — desynchronised the client on the first page, which is what
+/// the live walk found.
 #[test]
-fn the_paged_results_control_is_written_with_the_search_and_carries_a_cookie() {
-    let empty = encode_paged_results_request(2, 500, &[]);
-    let more = encode_paged_results_request(2, 500, b"cursor-1");
-    assert_ne!(
-        empty, more,
-        "a cookie must change the bytes, or paging never advances"
-    );
-    // The size is in the control's value, and it is the *configured* one.
-    assert!(
-        empty.windows(2).any(|pair| pair == [0x02, 0x01]),
-        "the integer must be minimally encoded"
-    );
-}
-
-/// The request frame carries a paged control with the search's own message id in practice. A
-/// mismatch is a server that returns a page and then never a cookie, which reads as "the search
-/// found everything" — so the ids are checked where the frames are built.
-#[test]
-fn a_search_and_its_page_control_share_one_message_id() {
+fn the_paged_results_control_is_attached_to_the_search_and_carries_a_cookie() {
     let filter = Filter::present("objectClass");
-    let search = encode_search_request(
+    let first = encode_search_request(
         7,
         "ou=people,dc=example,dc=com",
         SearchScope::Subtree,
@@ -872,24 +1164,36 @@ fn a_search_and_its_page_control_share_one_message_id() {
         30,
         &filter,
         &[],
+        500,
+        &[],
     );
-    let control = encode_paged_results_request(7, 500, b"");
-    let search_id = Message::decode(
-        &search[..],
-        Limits::default(),
-    )
-    .expect("the search frame decodes")
-    .message_id;
-    let control_id = Message::decode(
-        &control[..],
-        Limits::default(),
-    )
-    .expect("the control frame decodes")
-    .message_id;
-    assert_eq!(
-        search_id, control_id,
-        "an LDAP server matches a control to its operation by message id"
+    let next = encode_search_request(
+        8,
+        "ou=people,dc=example,dc=com",
+        SearchScope::Subtree,
+        100,
+        30,
+        &filter,
+        &[],
+        500,
+        b"cursor-1",
     );
+    assert_ne!(
+        first, next,
+        "a cursor must change the request, or paging never advances"
+    );
+    for (label, frame) in [("first", &first), ("next", &next)] {
+        assert!(
+            frame
+                .windows(PAGED_RESULTS_OID.len())
+                .any(|window| window == PAGED_RESULTS_OID.as_bytes()),
+            "the {label} page must carry the control's OID"
+        );
+    }
+    // And the frame is one request, not two: a single envelope whose operation contains the
+    // control. A regression to the two-request form changes this count and nothing else.
+    let message = Message::decode(&first, Limits::default()).expect("the search frame decodes");
+    assert_eq!(message.message_id, 7);
 }
 
 /// The bind frame carries the DN and the password, and the password is not the DN. A client that
@@ -898,10 +1202,11 @@ fn a_search_and_its_page_control_share_one_message_id() {
 #[test]
 fn a_bind_frame_carries_the_dn_and_the_password_in_that_order() {
     let frame = encode_bind_request(1, "cn=svc,dc=example,dc=com", "hunter2");
-    let mut decoder = Decoder::with_limits(&frame, Limits::default())
+    #[allow(unused_mut)]
+    let values = Decoder::with_limits(&frame, Limits::default())
         .all()
         .expect("the bind frame decodes");
-    let envelope = decoder.pop().expect("the envelope");
+    let envelope = values.first().expect("the envelope");
     let fields = envelope.children(Limits::default()).expect("the fields");
     let operation = fields.get(1).expect("the operation");
     assert_eq!(operation.application(), Some(0), "a bindRequest is APPLICATION 0");

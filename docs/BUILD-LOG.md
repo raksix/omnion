@@ -5188,3 +5188,99 @@ trap.
 pass — correct queueing, not a deadlock). When it lands, read `page-iam-provider-deletion-blocked`
 and `-reassigned`; `722ac57`'s assertions still have not executed, and REQ-065 does not close
 before they do. After that: REQ-066 MFA/passkeys and device trust.
+
+## tick 20 — REQ-065 slice 4 part 14: a directory that actually binds (partial)
+
+**The criterion was absent rather than unproven.** `crates/identity/src/sso/directory.rs:19` said
+outright that nothing in it performed a search. So `POST /iam/providers/{id}/test` ran
+`test_steps` — the decidable half, which never opened a socket and therefore could never report
+`ok` — and every directory an operator had ever added read `incomplete` however well configured it
+was. The enable gate, which requires a passing test, refused to switch on a directory that worked.
+The criterion reads "binds with a service account, searches the configured base and resolves nested
+groups to the depth cap; a wrong bind DN produces a field-level error naming the bind step", and
+none of it had an implementation.
+
+Two modules make the ladder real, and the split is the point: the configuration questions stay unit
+tests that need no directory, and the questions about bytes are tests over captured frames.
+
+* **`ber`** — the narrow, bounded dialect RFC 4511 defines. Depth, breadth and length caps that
+  refuse rather than recurse; the indefinite length form rejected; a short body an error and never
+  a partial value. A truncated `mail` octet string that read as `mail` would be a directory
+  telling you a person is somebody else.
+* **`connection`** — resolve, dial, negotiate TLS by either path, bind, page a search, walk the
+  group graph to its cap.
+
+Six decisions the tests pin, because collapsing any two produces a plausible wrong product.
+
+* **A paged search, not a size limit.** AD refuses a size limit above its own `MaxPageSize` and
+  truncates silently below it, so a size-limited search returns the first N people and reports
+  success: the sync looks healthy and half the company is never provisioned. RFC 2696 is the only
+  mechanism that reports its own completeness.
+* **A bind refusal splits the credential.** RFC 4511 collapses a wrong DN and a wrong password
+  into `49` on purpose, which is right for the start route and wrong behind an authenticated panel
+  whose whole job is to make the test actionable. `noSuchObject` already names the half, so the
+  module listens — and the walk proves the two sentences differ, which a client that mapped both
+  to one would fail.
+* **A cap reached is a reported outcome.** `hit_depth_cap` is a value the caller must handle, not a
+  detail: a walk that stopped early has not found all the groups a person belongs to, and a
+  `when_group` rule on one of them will silently not match. A cycle is a separate flag, because a
+  cap is configured and a cycle is a directory bug.
+* **Verification off is refused, not relaxed.** `verify_tls: false` cannot negotiate at all; the
+  only way past a certificate the platform will not trust is the explicit `allow_insecure`, which
+  builds a *different* verifier rather than flipping a flag inside one.
+* **The filter grammar is closed.** `and`/`or`/`not`/`=`/`>=`/`<=`/`=…*…`; anything else is
+  refused by name rather than passed through as a string, which would defeat the escaping
+  `escape_filter_value` exists to provide.
+* **Nothing here writes a row.** Every sentence is composed in the module and the server's own text
+  is sanitized at the boundary — on *whitespace-separated tokens*, not characters, because a DN is
+  one token and a character scanner leaves its fragments behind. (Truncation is not redaction: the
+  structure is at the *front* of a `diagnosticMessage`, so cutting the tail kept the whole DN.)
+
+**The live walk, and what only a socket found.** `apps/api/tests/iam_directory_live.rs` is a second
+`tokio` task speaking the real protocol on a real `TcpListener` — not a mock in the mocking-library
+sense, because a hand-rolled transport would be a second copy of the client's own assumptions and
+would agree with every bug it has. It found four defects no amount of reading would have:
+
+1. **The client could not read a single reply.** The message reader declared an 8-byte header buffer
+   and read into all of it, on the reasonable-sounding argument that a socket returns whatever is
+   available. Over a stream that is false — the kernel fills as much as it has — so a 14-byte reply
+   arrived 8-at-a-time and six bytes were **discarded**, and the frame was rebuilt from the header
+   alone. Every read is now bounded by the bytes wanted.
+2. **The search stopped one message early.** Reaching the entry cap `break`ed out of the read loop,
+   leaving the `searchResDone` in the socket, so the next operation on the connection consumed the
+   *previous* search's completion. An LDAP operation is one request and one completion; a client
+   that leaves either unread cannot reuse the connection.
+3. **A remote panic on any message over 127 bytes.** `frame[..header_len].copy_from_slice(&header[..header_len])`
+   with a two-byte header and a `header_len` up to six. A group entry with more than one member is
+   the normal case, so this was reached by ordinary use — and a server announcing `0x84` crashed
+   the client rather than being refused, which is a denial of service an operator triggers by
+   editing a group.
+4. **The attributes-failure branch appended a second row** for a step the ladder had already
+   emitted as pending, and the panel keys on the step name — so it rendered the pending row and the
+   sentence naming the fix never appeared.
+
+Three more in the filter parser, one of them a security claim. `value()` unescaped while reading,
+so a `\*` the caller had escaped reached the substring splitter as a bare `*` and was read as a
+**wildcard**: a group named `cn=x)(objectClass=*,ou=groups` turned "the groups of this person" into
+"every entry with an objectClass". The value now stays escaped until after the split. And the split
+put the last component in both `final_` and `any`, so `ab*cd*ef` rendered as `ab*cd*ef*ef` — a
+renderer that changes the meaning of what it renders is worse than none, because the sync log is
+where an operator goes to see what was asked for.
+
+**The lesson that cost the most time and is worth the most.** The first stub decoded the client's
+requests with `Message::decode`, which models *responses*; it panicked inside a spawned task, tokio
+swallowed the panic, and the client timed out against a server that had answered correctly. A bug
+in the fixture presented as a bug in the code under test, with nothing in the log. Every task
+outcome is now printed, and the stub reads the raw bytes with no help from the module it tests.
+
+**Proof.** `cargo test -p omnion-identity --lib` → **245 passed**; `-p omnion-api --lib` → **224**;
+`pnpm typecheck` → clean. Commits `1161199` (the modules and the route) and `51c3df3` (the walk and
+the codec fixes it found).
+
+**Not claimed, and the tree says so.** One walk in `iam_directory_live.rs` is red — the cyclic
+group graph — and the fix for it, together with the client's long-form-length panic fix, is written
+but **unverified**: `/dev/shm` reached 100% partway through this tick (seven sibling writers'
+target directories) and the build could not complete. `51c3df3` is the last state proven green. The
+browser pass is still queued behind w3's live pass and has not run, so criterion 3 stays unticked
+and the REQ stays open — correctly, because a criterion about binding and searching is not proven
+by a unit test and a half-finished walk.
