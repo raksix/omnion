@@ -11,7 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    ai_health_runner, ai_log_runner, analytics_runner, automation_runner, event_retention_runner,
+    ai_health_runner, ai_log_runner, analytics_runner, automation_runner, ai_agent_runner,
+    event_retention_runner,
     event_runner, search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
@@ -156,6 +157,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _probes = ai_health_runner::spawn(state.clone());
     } else {
         tracing::info!("the AI health probe runner is disabled (OMNION_AI_HEALTH_RUNNER=false)");
+    }
+
+    // The agent runner (REQ-099, slice 1) claims queued agent runs and executes the loop. It has
+    // its **own** switch, not a reading of the health probe's, because it is the one background
+    // task that spends money: an installation that wants its providers probed but refuses to let
+    // an agent act on its own says `OMNION_AI_RUNNER=false`, and the run-start endpoint then
+    // answers `503 runner_disabled` rather than queueing work nothing will pick up.
+    if state.config().ai_hub.agent_runner_enabled {
+        let _agents = ai_agent_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the agent runner is disabled (OMNION_AI_RUNNER=false)");
     }
 
     // The route decision pruner (REQ-098, slice 3) drops decisions past the 90-day window once
