@@ -95,7 +95,30 @@ step "API on :$API_PORT (database omnion_qa)"
 if [ ! -x target/debug/omnion-api ] \
    || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
-  cargo build -p omnion-api
+  # Build somewhere the disk guard cannot delete from under the compiler.
+  #
+  # `scripts/qa/disk-guard.sh` drops a worktree's `target/` whenever the box falls under its
+  # `MIN_FREE_GB` floor, and on a busy box it is *always* under that floor — so a pass that
+  # compiles into `target/` is a pass that dies with "could not write output to
+  # target/debug/deps/…: No such file or directory", a hundred seconds in, with a report that
+  # says the build failed and no mention of a guard. A compiler whose output directory is deleted
+  # mid-run does not recover, and the pass dies however many times it is retried.
+  #
+  # CARGO_BUILD_TARGET_DIR, when set, is tmpfs: it is not under /mnt/apopic, so the guard's glob
+  # cannot see it, and it is far faster than the loop device. The binary is then *installed* into
+  # `target/debug/` with a copy to a temporary name and one rename, so `target/debug/omnion-api` is
+  # never a half-written file that a later pass mistakes for a good build.
+  BUILD_TARGET_DIR="${CARGO_BUILD_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+  if [ -n "$BUILD_TARGET_DIR" ] && [ "$BUILD_TARGET_DIR" != "target" ]; then
+    mkdir -p "$BUILD_TARGET_DIR" target/debug
+    step "building into ${BUILD_TARGET_DIR} (the disk guard may drop target/ at any time)"
+    CARGO_TARGET_DIR="$BUILD_TARGET_DIR" CARGO_INCREMENTAL=0 cargo build -p omnion-api
+    cp "$BUILD_TARGET_DIR/debug/omnion-api" "target/debug/.omnion-api.new" \
+      && mv -f "target/debug/.omnion-api.new" "target/debug/omnion-api"
+    touch "target/debug/omnion-api"   # newer than every migration, so this pass is the last build
+  else
+    cargo build -p omnion-api
+  fi
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
