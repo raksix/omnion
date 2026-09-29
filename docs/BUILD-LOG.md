@@ -3700,3 +3700,57 @@ question.
 and move to slice 4 part 3 — SCIM tokens and the `Users`/`Groups` endpoints the QA plan drives
 end to end. If it died on the tab again, record that and build the SCIM half, which is the part
 that does not need the browser to be correct.
+
+
+## 2026-09-29 · tick 9 addendum · slice 4 part 3, and the disk that ended the pass
+
+**A second ledger describing the same directory is worse than one bad ledger.** `0119` added
+`directory_sync_runs`; SCIM writes every provisioning request to `provisioning_log` and never
+touched the run. The log is a good record of *requests* and a bad record of *work*: no run, so
+"did the overnight push work" has no answer, and no `partial`, which is the *normal* state of a
+connector whose IdP keeps sending a user whose externalId is already taken. A boolean "ok" over
+that is the sentence an operator acts on by doing nothing.
+
+**A push has no transaction and no natural end, so a run is bounded by idleness.** `0123` adds
+one column, not a table: a run untouched for fifteen minutes is closed by the next request that
+arrives. Two consequences, both wanted — a request never waits for a "next" request to close its
+run, so a connector that stops halfway still gets a run that ends with whatever it managed; and the
+duration is the *window*, not the work, so the panel says "open for" rather than calling it a sweep
+time. Fifteen minutes is bounded on both sides deliberately: longer and an hourly connector's run
+is still "running" this morning, shorter and one batched push becomes three rows — the same "42s
+describes four hours" problem `finish_run` exists to prevent, in the other direction.
+
+**A nullable backfill column is a third state nobody asked for.** `last_seen_at` is backfilled
+from `started_at` so every existing run has a liveness matching its own beginning; a null there
+would read as "never seen" and would close a live run on the next request.
+
+**`for update` on the open run, or two concurrent pushes each open one** and each write its work
+into a run nobody reads. That is the same lesson the attribute map's transaction taught, at a
+smaller scale and with a quieter failure.
+
+**Recount the counters when the run closes; never take the caller's slice.** `count(*) filter
+(where …)` over the log means there is no path by which a caller asserts "4 created" and the run
+row says 4 while the log says 3. The `detail <> ''` guard keeps a bare `201` with no entity out of
+the work count — that is a request, not a created user. And a close with no countable lines is
+`failed` with a message, **not** `ok` with zeroes: "nothing arrived" and "everything worked" are
+different sentences.
+
+**The touch belongs in the log helper, not at fifteen call sites.** Every SCIM outcome passes
+through one function, so a run there cannot miss a line or double-count one. A call at each
+handler would be a rule somebody has to remember.
+
+**A SCIM failure has no retry button in the protocol but it does have an operator**, so it is
+recorded as a failed subject. Otherwise it lives only in a log line nobody reads and the run
+reports `error_count: 0` over three refusals — a run lying by omission rather than by assertion.
+
+**The walk is blocked by the disk, not by the change.** `/` hit 99% (1.6 G of 123 G free) with
+eight writers' test databases on it, PostgreSQL went into recovery mid-suite, and the QA
+walkthrough began failing pages with `ENOSPC`. `cargo test -p omnion-api --test scim` failed on
+`could not extend file: No space left on device` — which reads like a schema error and is not one.
+Slice 4 part 3's HTTP walk is therefore **written but unrun**, and that is the honest state of it:
+the crate tests (199) and the build are the proof, and the end-to-end SCIM round trip against a
+real token is not.
+
+**Next.** Free disk (the `omnion_*` test databases are ~15–20 MB each and there are dozens), rerun
+`--test scim` and the new walk, then read the QA pass — which has now reached the walkthrough but
+not the IAM screens.
