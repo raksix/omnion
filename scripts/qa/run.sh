@@ -104,6 +104,14 @@ if [ ! -x "$QA_API_BIN" ] \
   # `CARGO_TARGET_DIR` has to be honoured, or a caller that points `QA_API_BIN` at an
   # out-of-tree build gets a rebuild into the default `target/` — the full disk this override
   # exists to avoid.
+  # `omnion-core` is the crate that owns `sqlx::migrate!("../../database/migrations")`, and
+  # sqlx embeds the directory at *that* crate's compile. So a renamed or added migration does
+  # not reach the binary through `-p omnion-api`: cargo sees the api crate as up to date, prints
+  # `Finished` in under a minute, and the API then dies on `migration N was previously applied
+  # but has been modified` — a failure that reads as a database problem and is a build-graph
+  # one. The fix is to make the embedding crate recompile, which is a cache problem rather
+  # than a source one.
+  cargo clean -p omnion-core --target-dir ${CARGO_TARGET_DIR:-target} 2>/dev/null || true
   cargo build ${CARGO_TARGET_DIR:+--target-dir "$CARGO_TARGET_DIR"} -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
