@@ -6320,3 +6320,103 @@ stays unticked: a screen that typechecks is not a screen that was walked.
 scripts/qa/run.sh` when the slot clears — the store/save round trip, the refusal that names its
 field, and the unconfigured banner are all asserted by a pass that has not executed.
 (2) slice 1b's catalogue, gated on REQ-008 arriving, not on this branch being ready.
+
+## Tick 69 — the restore preview, and the two rules three ticks of unit tests had passed
+
+**REQ-013 slice 2a.** `GET /api/v1/backups/{id}/restore-preview` plus the panel that reads it.
+The decisions live in a pure module (`crates/backup/src/restore.rs`) so the rules are
+unit-tested with no stack, and the live-data comparison is a separate one
+(`crates/backup/src/preview.rs`) so a change in how it is counted cannot silently alter which
+warnings fire. The route re-reads every artifact, compares each part's size against the
+manifest, and prices the restore against the live library.
+
+**It found two defects in shipped code.** Both are the fourth instance of one shape — **a rule
+that is tested and that nothing obeys** — and neither was findable by a unit test, because in
+both cases the unit test was the reason it survived.
+
+**1. A media part's recorded size could never match its own artifact.** `finish_media_part`
+recorded `bytes_copied + index bytes` as `size_bytes`, with a doc comment saying that
+`size_bytes` is "what `verify_manifest` compares against the artifact on disk". That reasoning
+is backwards: `storage_path` for the media part names the **index alone**, so a size including
+the copied objects' bytes can never equal the length of that one file. The two agree only when
+`bytes_copied` is zero — which is exactly what the `verify` walk's fixture was, because that
+suite's library has no objects. So `verify` reported every real media backup as mismatched,
+for ever, and the new preview refused to offer it as a restore point. **Both verdicts were
+correct; the number was wrong.** The preview is the first reader that compares a media
+artifact's length on a run with a non-empty library.
+
+**2. `produce_all` never read `run.scopes`.** It walked all five `PARTS` unconditionally, so a
+backup requested for `["database"]` produced five artifacts: the scopes were validated by
+`normalise_scopes`, stored, normalised, and rendered in the drawer's five checkboxes, and then
+ignored at the only point that mattered. **Four existing walks request `["database"]` and none
+of them noticed**, because each asserted on the part it *wanted* rather than on the number of
+parts, and the two extra artifacts are perfectly valid files. The scope selector was a dead
+control with a green tick beside it. A consequence worth recording: a media-only run whose one
+part failed used to be `partial` — the correct verdict about four parts the operator never
+asked for — and is now honestly `failed`. `summarise` is untouched and still right; what
+changed is the set of parts it is handed.
+
+**A third finding, in the new code, from a test with a realistic id.** The typed confirmation
+sliced the first eight hex characters off the run's id. For a v4 uuid that is fine and looks
+random. For a **v7** uuid — whose leading bytes are a millisecond timestamp — "the first eight
+hex characters" is a *clock*: two backups taken three hours apart produced the identical phrase
+`RESTORE 000001a0`, and every run inside a ~50-day window shares one. A guard that restores the
+wrong run is worse than no guard, because it looks like one. The phrase is now a **hash of the
+id**, which mixes the timestamp with the random tail whatever the id's layout, and the id is
+validated first so an unnameable run still yields no phrase at all. The regression test uses two
+v7-shaped ids sharing a timestamp prefix.
+
+**Two smaller ones in my own code, both the silence class.** `LiveCounts::dropped` documented a
+zero floor that `saturating_sub` does not provide — saturating means stop at `i64::MIN`, not
+stop at zero, so an inconsistent live pair rendered as a negative loss. And the
+healthy-archive fixture stamped `now` at a round epoch (Jan 2027) that made every archive look
+107 days old, which is why the first "healthy archive" test failed on a `stale_archive`
+warning it had just proved absent.
+
+**Why the preview is behind `backup.read` and not `backup.restore`.** Reading a warning is free
+and changes nothing; gating it behind the destructive key means the first time an operator
+meets this screen is a 403 that never showed them what they were agreeing to. The expensive
+permission is for the button *after* it.
+
+**Why there is no restore button.** The safety backup, the typed confirmation's enforcement and
+the abort path are the next slice. A "Restore" button that could not be pressed is a dead
+button, which this product does not ship; the panel that explains the restore and asks for
+nothing is a working one. The phrase is **shown** rather than demanded for the same reason.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **103/0** (85 before: +18 preview model) |
+| `omnion-api --test backups` | **15/15** (12 before: +3 preview walks) |
+| `apps/admin` `tsc --noEmit` | clean |
+
+The three new walks are over the **real router and the real filesystem**. The load-bearing one
+prices a one-file archive over a two-file library at exactly **one** lost item, and then proves
+it wrote **nothing**: part rows, run status, `storage_prefix`, `finished_at`, the media rows and
+the archive's directory on the destination are all byte-identical before and after, read back
+out of **PostgreSQL** rather than from the response — a response body cannot prove the database
+was not written to, and this is the one property the whole slice exists for. The second refuses
+a truncated artifact and issues **no phrase**. The third requires a stranger's run to be a 404
+whose message does not name the tenancy rule, because `403 cross_organization` confirms the id
+exists and turns a preview into a restore-point oracle.
+
+**Toolchain, four facts, all of which read like product defects and none was one.**
+`VersionMissing(19)` on the default test database is a **stale QA database from a sibling's
+tree** — the shared migration namespace again, and the default `omnion` database carries a
+version-19 row from `omnion-w2`/`w5`/`w6`, none of which have a 0019 in this tree. The walks ran
+against a disposable `omnion_build_69` instead, which is the rule for a suite database the whole
+box shares. `cargo fmt -p omnion-backup` **rewrote five files I had not touched**; the diff was
+pure whitespace and was reverted with `git checkout --` on exactly the foreign five, which is why
+the `git diff --name-only` comparison is done by hand every tick. The doc-comment linter reports
+`async fn is not permitted in Rust 2015` on every `async` in the crate — the toolchain linter
+does not pass the edition, and `cargo build` is the authority. And a doc comment containing
+`**/` inside a Python triple-quoted string closes the string: two patches this tick failed to
+parse for that reason, and the fix is the `patch` tool, not `execute_code`.
+
+**Next.** (a) The destructive half of the restore: part selection, the mandatory safety backup
+before the first write, the enforced phrase behind `backup.restore`, abort until the import
+begins, and the `backup.restored` audit entry. (b) The `partial` box is still unticked — a run
+where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
+is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
+read the price, the warnings and the phrase, so when the slot frees there is something to run.

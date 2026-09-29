@@ -751,6 +751,12 @@ pub fn router(state: AppState) -> Router {
         delete(backups::delete).layer(guards::require(&state, "backup.manage"));
     // The manual retention sweep. `backup.manage`, not `backup.create`: this removes data,
     // and the key that lets an operator take a backup is not the key that lets one remove it.
+    // The preview is a GET that writes nothing, so it sits under `backup.read`: reading a
+    // warning is free and non-destructive, and gating it behind `backup.restore` would mean
+    // the first time an operator meets this screen is a 403 that never showed them what
+    // they were agreeing to.
+    let backups_restore_preview: MethodRouter<AppState, Infallible> =
+        get(backups::restore_preview).layer(guards::require(&state, "backup.read"));
     let backups_sweep: MethodRouter<AppState, Infallible> =
         post(backups::sweep).layer(guards::require(&state, "backup.manage"));
     let backup_schedules_read: MethodRouter<AppState, Infallible> =
@@ -1643,6 +1649,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backups/{id}", backups_detail)
         .route("/backups/{id}", backups_delete)
         .route("/backups/{id}/manifest", backups_manifest)
+        .route("/backups/{id}/restore-preview", backups_restore_preview)
         .route("/backups/{id}/verify", backups_verify)
         .route("/backup-schedules", backup_schedules_read)
         .route("/backup-settings", backup_settings_read)
