@@ -17,6 +17,10 @@ tracing.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
+# `request_id::scope` is a `tokio::task_local!`, and the reason it is a task-local rather than a
+# thread-local is that `tokio::spawn` moves a future between worker threads (see the module docs).
+# This is the module's only non-optional tokio dependency.
+tokio.workspace = true
 
 [dev-dependencies]
 # The slice-2 gate (scripts/qa/run-crm-assignment.sh) needs a real database, because the
