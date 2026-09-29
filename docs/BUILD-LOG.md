@@ -4096,3 +4096,50 @@ agents table's 30-day cell on both the desktop row and the mobile card — asser
 rather than a zero — and the run detail's telemetry panel, asserting the two costs *agree*
 rather than that the panel exists. Then the approval decision and resume (REQ-101) are the only
 boxes REQ-099 still cannot close on its own.
+
+**The QA pass, after four attempts and two real defects it found.**
+
+`/tmp/w7-qa-tick23e.log` — the walkthrough itself completed (`QA_EXIT=0`, 53 pages, 1724
+clicks, 1677 screenshots) and the API booted, which is itself the proof that the router fix
+landed. But the pass is **not** a clean one and REQ-099 is not closed on it:
+
+- The sign-in never landed: `passkeys: signed-in-on-loopback → reachedApp: false`, and the
+  mobile pass reported "the sign-in did not land". Every request after that returned 403, and
+  22 048 console errors and 22 040 failed requests follow from that one failure rather than
+  from 22 048 defects.
+- Consequently `aiAgents` and `aiSkills` both report `{"ok": false, "steps": []}` — the depth
+  passes ran with no session, so **my new assertions never executed**. They are written and
+  parse; they are not proved.
+- The finding count (`43 560 high`) is that cascade, not a verdict on the screens.
+
+**Two real defects the pass did find, both mine, both invisible to every other gate.**
+
+3. `POST /ai/skills` had two `MethodRouter`s merged onto it — `create_skill_route` and
+   `validate_skill_route`. axum refuses that at **router construction**, so the API panicked on
+   boot. The handler has always been written for `POST /ai/skills/{key}/validate`; the router was
+   the only place that disagreed. This is slice 3's defect, and it survived because nothing in
+   the repository can see it: the store suites link the library without calling `router()`, the
+   crate tests do not link the API, `tsc` reads types (two routers on one path are well-typed)
+   and `cargo build` succeeds. `apps/api/tests/router_builds.rs` now calls `router()` and
+   nothing else — **verified in both directions**: it fails with the duplicate merged back in
+   and passes without it.
+4. Two harness defects, both reporting as "the API did not answer":
+   - `pm2 restart` re-executes the path pm2 recorded when the process was **first started**, so
+     a process left over from a pass that ran before the fix kept running the old binary. The
+     API is now deleted and started, never restarted. A pass is a fresh start; "restart" was
+     quietly reusing the past.
+   - The connection URL carried a literal `***` where the password goes — a credential-shaped
+     value that a tool masked on the way to the screen and that was then pasted back into the
+     file. It was **committed, and it is on `main`**, so every writer's pass was starting an API
+     with a wrong password. It now comes from the environment or `.env`.
+
+**The pattern across all four failures today is one thing.** Each reported a symptom of
+something other than itself — a router panic attributed to the API, a stale binary attributed
+to the code, a password error attributed to the database — and each sent the reader to the
+wrong system. Two of the four were found only by reading the panic's *text* rather than its
+first line. The router test is the general answer: build the thing, in a gate, where a boot-time
+failure is a red line instead of an afternoon.
+
+**Next.** First thing: find why the sign-in does not land on a freshly reset QA database, because
+every depth pass depends on it and it is currently zeroing this writer's and possibly others'
+results. Then re-run the pass and fix `runAiAgentsDepth` against a real session. Then REQ-100.
