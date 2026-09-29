@@ -88,7 +88,7 @@ pub struct IssuedToken {
 
 /// Column list of every sync-log query.
 const LOG_COLUMNS: &str = "id, organization_id, direction, resource, external_id, entity_id, \
-     action, outcome, detail, created_at";
+     action, outcome, detail, revoked_sessions, created_at";
 
 /// One line of the sync log.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -111,6 +111,14 @@ pub struct SyncLogEntry {
     pub outcome: String,
     /// One readable line about what happened.
     pub detail: String,
+    /// Live sessions this line ended (`0126`).
+    ///
+    /// The count lives in a column rather than only inside `detail` because `detail` is English
+    /// prose: it cannot be summed, filtered, sorted, or rendered as a number, and every consumer
+    /// that wants the figure has to re-parse a sentence. Zero means the line revoked nothing,
+    /// and for the five write paths that never revoke that is the true value — a nullable column
+    /// would add an "unknown" state that nothing can produce and every reader must decide about.
+    pub revoked_sessions: i32,
     /// When it happened.
     pub created_at: OffsetDateTime,
 }
@@ -132,6 +140,13 @@ pub struct NewSyncEntry {
     pub outcome: String,
     /// One readable line.
     pub detail: String,
+    /// Live sessions this line ended. `None` means "this surface has no revocation to report",
+    /// which is the true answer for five of the six write paths — and the column's `not null
+    /// default 0` is what that means on the row, so no caller has to invent a zero.
+    ///
+    /// A `u64` here would be a second type for one number the database constrains to be
+    /// non-negative, and the conversion belongs at the one place that can reject it.
+    pub revoked_sessions: Option<u64>,
 }
 
 /// SHA-256 of a secret, hex encoded — the only form that reaches the database.
@@ -409,10 +424,17 @@ pub async fn log_sync(
         )));
     }
 
+    // The count is bounded by `i32::MAX` rather than wrapped: a wrapped negative would reach the
+    // panel as "−3 sessions ended", which is a sentence about nothing, and the `0126` check
+    // constraint would reject the row anyway — with a database error about a constraint on a
+    // column the caller was never told about. Refusing by name is the same answer with a subject.
+    let revoked = checked_revoked_sessions(entry.revoked_sessions)?;
+
     let sql = format!(
         "insert into provisioning_log \
-         (organization_id, direction, resource, external_id, entity_id, action, outcome, detail) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8) returning {LOG_COLUMNS}"
+         (organization_id, direction, resource, external_id, entity_id, action, outcome, detail, \
+          revoked_sessions) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, coalesce($9::bigint, 0)) returning {LOG_COLUMNS}"
     );
 
     sqlx::query_as(&sql)
@@ -424,9 +446,31 @@ pub async fn log_sync(
         .bind(&entry.action)
         .bind(&entry.outcome)
         .bind(&entry.detail)
+        .bind(revoked)
         .fetch_one(pool)
         .await
         .map_err(IdentityError::from)
+}
+
+/// A caller's revocation count, narrowed to what the `0126` column can hold.
+///
+/// `None` is passed through as `None` so the SQL's `coalesce(…, 0)` is the single place "no
+/// revocation to report" becomes a number, rather than each of the six write paths inventing a
+/// zero of its own. The bound is checked rather than cast: a `u64` above `i32::MAX` cast to
+/// `i64` is still a number, but cast to `i32` — which is what the column is — wraps negative and
+/// the row is then refused by the check constraint, with a database error naming a column the
+/// caller was not told about. The refusal here names the field.
+fn checked_revoked_sessions(count: Option<u64>) -> Result<Option<i64>> {
+    match count {
+        Some(value) if value > i64::from(i32::MAX) as u64 => {
+            Err(IdentityError::InvalidProvisioning(format!(
+                "{value} sessions ended is more than one sync line can report \
+                 (the maximum is {})",
+                i32::MAX
+            )))
+        }
+        other => Ok(other.map(|value| value as i64)),
+    }
 }
 
 /// The most recent sync lines of an organization, newest first.
@@ -502,5 +546,54 @@ mod tests {
         let secret = "omsc_12345678_abcdef";
         assert_eq!(hash_token(secret), hash_token(secret));
         assert_ne!(hash_token(secret), secret);
+    }
+
+    /// A count that cannot be a `0126` row is refused, and the refusal names the number.
+    ///
+    /// This is the guard that a `log_sync` call cannot reach in an integration test: a real
+    /// session list long enough to overflow an `i32` is not something a test can honestly build,
+    /// so the only way to prove the boundary is to hand the function a number no set of sessions
+    /// could produce. The `detail` string is a fixed `too many` in every case rather than
+    /// interpolated, so the assertion reads against the *error* and not against a sentence the
+    /// function happened to phrase today — and the error is checked to name the offending value,
+    /// because a refusal that does not say which number is useless to whoever has to fix it.
+    #[test]
+    fn a_count_no_set_of_sessions_could_produce_is_refused_by_name() {
+        let error = checked_revoked_sessions(Some(i32::MAX as u64 + 1))
+            .expect_err("a value above the column ceiling must not be accepted");
+        let message = error.to_string();
+        assert!(
+            message.contains(&(i64::from(i32::MAX) + 1).to_string()),
+            "the refusal must name the offending value, got: {message}"
+        );
+        assert!(
+            message.contains(&i32::MAX.to_string()),
+            "the refusal must name the ceiling, got: {message}"
+        );
+
+        // One below the ceiling is a legal row, and that is the boundary this assertion exists
+        // for: an `is_some_and(|c| c > …)` that is off by one would refuse a real count and turn
+        // an extreme offboarding into a failed sync line.
+        assert_eq!(
+            checked_revoked_sessions(Some(i32::MAX as u64)).expect("the ceiling is legal"),
+            Some(i64::from(i32::MAX))
+        );
+    }
+
+    /// "No revocation to report" stays `None` all the way to the column, where `not null
+    /// default 0` is what turns it into a number.
+    ///
+    /// The alternative — defaulting to `Some(0)` here — is a one-character difference that reads
+    /// as identical and is not: it makes every one of the six write paths that never revoke
+    /// *assert* a claim of having revoked nothing, and a caller that later grows a revocation
+    /// path would have no way to tell the default apart from a real measurement. `None` means
+    /// "not this surface's business", which is the truth for five of them.
+    #[test]
+    fn a_silent_surface_stays_none_rather_than_claiming_zero() {
+        assert_eq!(checked_revoked_sessions(None).expect("None is always legal"), None);
+        // And a real zero is a *measurement* and survives: "this line revoked nothing" and
+        // "this line cannot revoke" are different sentences and must not collapse into one
+        // value, so `Some(0)` is carried rather than normalised to `None`.
+        assert_eq!(checked_revoked_sessions(Some(0)).expect("zero is legal"), Some(0));
     }
 }
