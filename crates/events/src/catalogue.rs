@@ -267,6 +267,16 @@ catalogue! {
     "themes.theme.rolled_back", "content", Live,
     "The theme a site was on before its last activation was restored.",
     [ ( "site_id", Uuid, req ), ( "theme_key", String, req ), ( "previous_theme_key", String, opt ) ] ;
+    // Settings (REQ-062 slice 2). Only the PUBLISH is on the bus: it is the single write in
+    // this module a signed-out visitor can observe, so it is the single write worth
+    // invalidating a CDN cache for. A draft save deliberately has no row — announcing it would
+    // make every save a cold cache for real visitors. `theme_key` and `revision_no` are `opt`
+    // rather than `req` because a consumer that only wants "this site restyled" should not
+    // have to parse a number, and a required field an emitter cannot always fill is a promise
+    // the platform cannot keep.
+    "themes.settings.published", "content", Live,
+    "A site's theme settings revision went live.",
+    [ ( "site_id", Uuid, req ), ( "theme_key", String, opt ), ( "revision_no", Integer, opt ) ] ;
 
     // ---- Media ---------------------------------------------------------------------------------
     // The upload fact is `media.created`, not `media.uploaded`. The registry is written from

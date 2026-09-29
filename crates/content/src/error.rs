@@ -176,6 +176,42 @@ pub enum ContentError {
     /// The site has no activation row, so there is nothing to roll back to (REQ-062 slice 1).
     #[error("this site has no theme activation to roll back from")]
     RollbackUnavailable,
+    /// No settings revision carries this number for this site (REQ-062 slice 2).
+    ///
+    /// The number is in the message rather than a bare "not found" because the caller passed
+    /// one and needs to know which one was wrong: the history screen asks for revision 4 and a
+    /// 404 that only says "no such revision" sends the operator looking for a missing row
+    /// instead of a stale link.
+    #[error("this site has no settings revision numbered {0}")]
+    ThemeSettingsRevisionNotFound(i32),
+    /// Publish was asked for with no draft saved yet.
+    ///
+    /// A separate variant from a generic bad request, because it is the one state where the
+    /// panel's Publish button is simply the wrong button: the answer names the action that
+    /// would work instead.
+    #[error("this site has no saved draft to publish — save one first")]
+    ThemeSettingsNothingToPublish,
+    /// The draft is older than what is live, so publishing would move the site backwards.
+    ///
+    /// Both numbers are carried so the screen can say which is which rather than refusing
+    /// without telling the operator which of their two tabs is stale.
+    #[error(
+        "the draft is revision {draft_no} but revision {published_no} is the one that is live; \
+         reload before publishing"
+    )]
+    ThemeSettingsDraftStale {
+        /// The draft's number.
+        draft_no: i32,
+        /// The live revision's number.
+        published_no: i32,
+    },
+    /// The draft's tokens fail the WCAG AA contrast check and the caller did not acknowledge.
+    ///
+    /// Kept distinct from a validation error because the payload was *legal* — a colour is a
+    /// colour. It is a warning the product makes the operator look at, which is why publishing
+    /// it needs an explicit acknowledgement rather than a correction.
+    #[error("the settings fail the contrast check: {0}")]
+    ThemeSettingsContrastRefused(String),
     /// No comment carries this identifier, or it belongs to another site (REQ-064 slice 4a).
     #[error("no such comment")]
     CommentNotFound,
@@ -332,6 +368,10 @@ impl ContentError {
             Self::SiteNotFound => "site_not_found",
             Self::ThemeNotFound(_) => "theme_not_found",
             Self::RollbackUnavailable => "theme_rollback_unavailable",
+            Self::ThemeSettingsRevisionNotFound(_) => "theme_settings_revision_not_found",
+            Self::ThemeSettingsNothingToPublish => "theme_settings_nothing_to_publish",
+            Self::ThemeSettingsDraftStale { .. } => "theme_settings_draft_stale",
+            Self::ThemeSettingsContrastRefused(_) => "theme_settings_contrast_required",
         }
     }
 }

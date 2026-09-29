@@ -161,6 +161,18 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Activate or roll back the theme of a site",
     },
+    // Customizing a theme is a THIRD power, not a second spelling of activation, and the split
+    // is about who can change what a visitor sees rather than *which* theme. An account that
+    // may publish the settings is rewriting every page's typography, colour and header on a
+    // live site — that is a design power — while activation only chooses between designs that
+    // already ship. Splitting them lets a brand owner switch between a prepared pair of themes
+    // without being able to recolour the primary brand, which is the setup most teams actually
+    // want.
+    PermissionDef {
+        key: "themes.customize",
+        category: "content",
+        description: "Edit, publish and restore a site's theme settings",
+    },
     PermissionDef {
         key: "newsletter.read",
         category: "content",
