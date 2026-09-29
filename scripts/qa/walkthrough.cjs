@@ -8356,7 +8356,19 @@ async function runWorkflowBuilderDepth(page, report) {
       params: {},
       position: { x: 600, y: 40 },
     });
-    const edge = (from, to, port) => ({ source: from, source_port: port, target: to });
+    // `Edge` carries a REQUIRED `id` and refuses unknown fields, so an edge without one is
+    // refused by the deserializer before validation ever runs. The first draft of this probe
+    // built `{source, source_port, target}` and got `valid: null` with an empty `codes` on all
+    // six cases — which the note recorded as "the validator found nothing", when in fact the
+    // request never reached the validator. Ids are derived from the endpoints so the
+    // duplicate-edge case carries two DIFFERENT ids for one port pair: identity is the edge's
+    // own, and it is the (source, port, target) triple the validator calls a duplicate.
+    const edge = (from, to, port, seq = 0) => ({
+      id: `e-${from}-${port}-${to}-${seq}`,
+      source: from,
+      source_port: port,
+      target: to,
+    });
     const spine = () => [edge("t1", "a1", "out"), edge("a1", "e1", "success")];
 
     const cases = {
@@ -8385,7 +8397,9 @@ async function runWorkflowBuilderDepth(page, report) {
       },
       duplicate_edge: {
         nodes: [trigger("t1"), act("a1"), finish("e1")],
-        edges: [edge("t1", "a1", "out"), edge("t1", "a1", "out"), edge("a1", "e1", "success")],
+        // Same (source, port, target) twice, under two ids — the pair is what the validator
+        // keys on, so reusing one id would make this a different case entirely.
+        edges: [edge("t1", "a1", "out"), edge("t1", "a1", "out", 1), edge("a1", "e1", "success")],
       },
     };
 
@@ -9791,17 +9805,43 @@ async function runWorkflowTableDepth(page, report) {
 
   // A rule of our own: the pass must not depend on whatever another writer's pass left behind.
   const ruleName = `QA table rule ${Date.now().toString(36)}`;
+  // The create is a *definition*, and a definition is a trigger plus steps: `WorkflowInput`
+  // deserializes `trigger` and `steps` as required, so `{name, description}` alone was
+  // refused as a missing field before any of the table code under test ran — the pass then
+  // returned on `id: null` and every row below it read empty, which is how criterion 8 sat
+  // unmeasured for three ticks. The trigger is structured (`{"kind":"manual"}`, never the
+  // bare string), and one task step is the smallest definition the engine accepts.
   const created = await page.evaluate(async (name) => {
     const response = await fetch("/api/v1/workflows", {
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name, description: "table mode probe" }),
+      body: JSON.stringify({
+        name,
+        description: "table mode probe",
+        trigger: { kind: "manual" },
+        steps: [
+          {
+            name: "Only step",
+            kind: "task",
+            action: "log",
+            params: { message: "table mode probe" },
+          },
+        ],
+      }),
     });
     return { status: response.status, body: await response.json().catch(() => null) };
   }, ruleName);
   const workflowId = created.body?.id ?? created.body?.workflow?.id ?? null;
-  note({ step: "create", status: created.status, id: workflowId });
+  // `StepDefinition` is `deny_unknown_fields`, so a rejected body says WHICH field in the
+  // refusal. Recording it turns "the create failed" into the next action; an empty string
+  // here meant the next four ticks each guessed at the payload instead of reading this.
+  note({
+    step: "create",
+    status: created.status,
+    id: workflowId,
+    refusal: created.status >= 400 ? (created.body?.error?.message ?? "").slice(0, 200) : null,
+  });
   if (!workflowId) {
     log(`workflow-table: ${JSON.stringify(steps)}`);
     return steps;
