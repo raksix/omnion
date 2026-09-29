@@ -3594,3 +3594,65 @@ walks and the constraint the fixture hit).
 (`cdn_purges`, `cdn_purge_items`), the console, the worker drain with retry and the history
 drawer. The migration number is the live question — the shared high-water mark moved while
 this tick ran, so the next writer to take 0051 will collide.
+
+## 2026-09-29 · REQ-011 slice 2 · the purge pipeline
+
+**What.** The queue and the invalidation path end to end. `0054_cdn_purge_queue.sql` adds
+`cdn_purges` and `cdn_purge_items`; `omnion_cdn::purge` holds the decisions that have no I/O
+(target validation and normalisation, batch splitting, the backoff curve, the fold from item
+outcomes to a parent status); `apps/api/src/routes/cdn_purge.rs` is the nine-route surface;
+`apps/api/src/cdn_purge_runner.rs` is the drain; the panel gets `/cdn/purges` (history,
+filters, detail drawer) and `/cdn/purge` (the console), and the overview's third card is
+real data instead of a dash.
+
+**The one defect the walks found, and it is the kind that never shows up in a unit test.**
+`claim_due` is a `with due as (...)` CTE feeding an `update ... from due ... returning`. The
+RETURNING list was unqualified and the CTE exposes a column called `id` of its own, so
+PostgreSQL refused the statement with `column reference "id" is ambiguous`. That is a runtime
+failure on the first item the worker ever claimed — the drain shipped in a state where every
+purge would log a failure and nothing would ever reach a provider. It compiles, passes clippy,
+and is a string, so nothing short of running the statement against a database can find it. The
+fix qualifies every name with the table alias and renames the CTE column to `claimed_id`, so
+the two relations do not even offer the same name.
+
+**Three test-side findings worth keeping, because each was me asserting the wrong thing.**
+
+* A cross-organization read answers **403, not 404**. The row exists; "not found" would be a
+  lie that also happens to leak less. The honest answer names the reason, and the walk now
+  asserts the code as well as the status.
+* The API's error envelope is `{"error": {code, message, details}}`. Ten walks read
+  `body["code"]`, got `Null`, and reported the *refusal* as the failure — a green-looking
+  failure list that was actually ten correct refusals. Read the envelope.
+* A settings row naming an adapter this build does not ship **cannot be created**: the
+  migration has a `provider in (...)` check underneath the API's guard. The first version of
+  that walk inserted the row with `.ok()`, which swallowed the error, and then asserted a
+  refusal that could not be provoked. The walk now proves both layers and asserts the
+  constraint *by name* in the database error.
+
+**The backoff is a schedule, so the test waits by reading it.** The walk that exhausts a
+two-attempt budget used to sleep a guessed twelve seconds. It now polls `next_attempt_at`
+until nothing is pending, because an item waiting out a backoff is invisible to `claim_due`
+and a drain issued too early claims nothing — which the walk would then have blamed on the
+attempt budget. Same for the test helper: it now calls `mark_running` exactly as
+`cdn_purge_runner::tick` does, because a helper that is not the worker's logic will drift
+from it and the `started_at` it left null looked like a product bug.
+
+**Proof.** `cargo test -p omnion-api --test cdn_purge -- --test-threads=1` against the
+isolated `omnion_qa_w5` database → **17 passed / 0 failed**. `cargo test -p omnion-cdn` →
+**94 passed** (was 70). `pnpm typecheck` → 2 successful, 0 errors. `cargo build -p omnion-api`
+→ clean. `node --check scripts/qa/walkthrough.cjs` → clean.
+
+**Browser gate.** The pass is queued for the shared QA slot (one other writer holds it), and
+`runCdnPurgeDepth` plus the two new routes are in the inventory. **Not yet run — slice 2 is
+not closed until it is.** Three of the request's own boxes are also still open and are slice
+3's job: the automatic `page.published` → purge subscription, and the trigger toggles in
+settings actually gating it.
+
+**Commits.** `aea978d` (the queue, the backoff and the states), `933447a` (the claim fix),
+`442ebe2` (the drain worker), `0c1006d` (the routes and the 17 walks), `69ba2c7` (the two
+screens, the badge tones, the overview counters, the walkthrough extension).
+
+**Next.** Close slice 2 on the browser pass, then slice 3: `page.published` / `page.unpublished`
+/ `page.deleted` / `media.replaced` / `theme.activated` / `site.domain.changed` mapped through
+the rule set into one enqueued purge, gated by the `auto_purge` toggles the settings screen
+already stores.

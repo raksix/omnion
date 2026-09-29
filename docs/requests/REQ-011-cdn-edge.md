@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (`ca65085`) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slice 2 built, `69ba2c7`; browser gate pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -202,6 +202,22 @@ The walkthrough must visit `/cdn`, `/cdn/purges`, `/cdn/purge`, `/cdn/rules`, `/
    the operator typed something — an empty field that looked like "no key stored" sends
    somebody to re-enter a working key, and one that rendered the saved key is a leak.
 2. **Purge pipeline** — purge tables, provider adapters, purge console, worker drain with retry, history and detail drawer. Done: a manual purge of one URL and one tag reaches `succeeded`, and a forced adapter failure retries then lands `failed` with the message visible.
+   *Status:* **the code and the walks are done; the browser gate is still queued.** The queue
+   (`0054`), the crate's decisions (`omnion_cdn::purge`), the nine routes, the drain worker and
+   both screens shipped this tick, proved by **17/17** integration walks against
+   `omnion_qa_w5`. Both halves of the slice's own "Done" sentence are asserted: a URL purge
+   and a tag purge reach `succeeded` with every item `done`, and a forced adapter failure
+   retries once — with the intermediate state checked, because "fails on the first refusal"
+   and "retries" are different products — then lands `failed` with the provider's message on
+   the item, on the parent row and in the drawer. The retry moves only the failed items.
+   **The `runCdnPurgeDepth` browser pass has not run yet** (the shared QA slot is held by
+   another writer), so this slice is not closed.
+
+   The bug the walks found is the note worth keeping from this slice: `claim_due`'s RETURNING
+   list was unqualified against a CTE that exposes a column called `id`, and PostgreSQL
+   refused the statement at runtime on the first item the worker ever claimed. It compiles,
+   passes clippy, and is a string — so the drain shipped unable to do its one job with every
+   unit test green. The only thing that found it was a walk that runs the statement.
 3. **Automatic invalidation** — event subscription for publish/unpublish/media/theme/domain, trigger toggles in settings. Done: publishing a page from the panel queues a purge automatically and the new version is served after it completes.
 4. **Provider + settings depth** — adapter catalogue, masked credentials, `generic_http` signed payload, `cdn.purge.failed` webhook, counters on the overview. Done: a test endpoint receives a correctly signed purge payload and the overview counters reflect it.
 
