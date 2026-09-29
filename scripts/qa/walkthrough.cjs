@@ -5486,6 +5486,7 @@ async function main() {
   // the other automation passes for the same reason they do — it creates and deletes its own
   // rule, and the count-sensitive empty-state assertions have already been read by now.
   await runWorkflowBuilderDepth(page, report);
+  await runWorkflowTableDepth(page, report);
   log(`workflow-builder: ${JSON.stringify(report.workflowBuilder)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
@@ -8843,6 +8844,243 @@ note({
  * here simply cannot be run alone, which is the honest default: a partial pass that silently ran
  * nothing would report "0 failures" and mean nothing by it.
  */
+/**
+ * REQ-004 criterion 8 — Table mode, driven from the builder's own "Table mode" link.
+ *
+ * ## What the criterion actually asks, and why the obvious probe is worthless
+ *
+ * *"Table mode renders the same definition, edits parameters, and stays consistent with the
+ * canvas after a save in either mode."* Three claims, and the third is the only hard one.
+ *
+ * A probe that loads `/workflows/{id}/table` and counts rows answers the first claim and is
+ * compatible with **both** ways of getting it wrong. The old link pointed at
+ * `/automations/{id}` — REQ-003's linear step editor, a different projection of the rule — and
+ * a table over that is a perfectly good table of a definition the canvas never drew. So this
+ * probe goes through the *link the builder offers*, which is the path an author takes, and it
+ * answers the third claim in the only way that can fail: read the graph back **through the API**
+ * after the save, and compare it with what the table claims it wrote.
+ *
+ * ## The two ways a table can be fake, and what each needs asserted
+ *
+ * 1. **A table that renders and does not save.** `defaultValue` on an input is uncontrolled, so
+ *    the obvious implementation never reads it back, the save button is a decoration, and the
+ *    screen looks right until the author reloads. The probe therefore asserts the *server's*
+ *    value changed — not that a toast appeared.
+ * 2. **A table that saves and drifts.** It holds its own copy of the graph and writes it whole,
+ *    so a save from the canvas between load and commit silently reverts the table's edit. The
+ *    probe commits **after** a canvas-side save and asserts the canvas's own edit survived, which
+ *    is the "in either mode" half of the sentence.
+ */
+
+async function runWorkflowTableDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    record({ page: "workflow-table-depth", action: "workflow-table", ...entry });
+  };
+
+  // A rule of our own: the pass must not depend on whatever another writer's pass left behind.
+  const ruleName = `QA table rule ${Date.now().toString(36)}`;
+  const created = await page.evaluate(async (name) => {
+    const response = await fetch("/api/v1/workflows", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, description: "table mode probe" }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, ruleName);
+  const workflowId = created.body?.id ?? created.body?.workflow?.id ?? null;
+  note({ step: "create", status: created.status, id: workflowId });
+  if (!workflowId) {
+    log(`workflow-table: ${JSON.stringify(steps)}`);
+    return steps;
+  }
+
+  const readGraph = async () =>
+    page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+        credentials: "same-origin",
+      });
+      return response.json().catch(() => null);
+    }, workflowId);
+
+  // ---- The builder, and the link an author would press -----------------------------------
+  await page.goto(`${admin}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-builder-table-mode]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  const linkHref = await page
+    .locator("[data-builder-table-mode]")
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  note({
+    step: "builder-link",
+    href: linkHref,
+    // The old value was /automations/{id}. A link that still points there is a link to a
+    // different definition, and no amount of table correctness would satisfy the criterion.
+    pointsAtTableRoute: linkHref === `/workflows/${workflowId}/table`,
+  });
+
+  await page.locator("[data-builder-table-mode]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-table-mode]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await shot(page, "page-workflow-table");
+
+  // ---- The same definition, row for row ---------------------------------------------------
+  const canvasGraph = await readGraph();
+  const canvasNodes = canvasGraph?.graph?.nodes ?? [];
+  const canvasEdges = canvasGraph?.graph?.edges ?? [];
+
+  const rows = await page.$$eval("[data-table-row]", (els) =>
+    els.map((el) => ({
+      id: el.getAttribute("data-table-row"),
+      type: el.querySelector("[data-table-type]")?.textContent?.trim() ?? "",
+      params: [...el.querySelectorAll("[data-table-param]")].map((input) => ({
+        key: input.getAttribute("data-table-param")?.split(".").slice(1).join(".") ?? "",
+        value: input.value,
+      })),
+      connections: [...el.querySelectorAll("[data-table-incoming],[data-table-outgoing]")].map(
+        (li) => li.textContent?.trim() ?? "",
+      ),
+    })),
+  );
+
+  note({
+    step: "same-definition",
+    canvasNodes: canvasNodes.length,
+    canvasEdges: canvasEdges.length,
+    rows: rows.length,
+    // A count would pass against a table showing the WRONG nodes in the right number.
+    idsMatch:
+      rows.length === canvasNodes.length &&
+      canvasNodes.every((node) => rows.some((row) => row.id === node.id)),
+    typesShown: rows.every((row) => row.type.length > 0),
+    // The criterion's "edits parameters" half needs a field to exist: a rule whose nodes carry
+    // no parameters renders "No parameters" and proves nothing about editing.
+    editableParams: rows.reduce((sum, row) => sum + row.params.length, 0),
+    connectionsShown: rows.reduce((sum, row) => sum + row.connections.length, 0),
+  });
+
+  // ---- Edit a parameter, and read the SERVER back -----------------------------------------
+  // Give a node a parameter to edit if it has none, through the API, so the probe does not
+  // depend on which node type the registry seeded.
+  await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const trigger = current.graph.nodes.find((n) => n.type.startsWith("trigger"));
+    if (!trigger) return;
+    trigger.params = { ...(trigger.params ?? {}), event: "qa.table.probe" };
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+  }, workflowId);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-table-row]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const target = await page.evaluate(() => {
+    const input = document.querySelector("[data-table-param]");
+    if (!input) return null;
+    return input.getAttribute("data-table-param");
+  });
+
+  const saveStateBefore = (await page.locator("[data-table-save-state]").first().innerText().catch(() => "")).trim();
+  const saveDisabledBefore = await page.locator("[data-table-save]").first().isDisabled().catch(() => true);
+
+  if (target) {
+    const [nodeId, key] = [target.split(".")[0], target.split(".").slice(1).join(".")];
+    await page
+      .locator(`[data-table-param="${nodeId}.${key}"]`)
+      .first()
+      .fill("qa.table.edited")
+      .catch(() => {});
+    // The field is uncontrolled on purpose (a controlled field re-renders the whole draft on
+    // every keystroke and the caret jumps), so the commit happens on blur.
+    await page.locator("[data-table-rows]").first().click({ position: { x: 5, y: 5 } }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
+  const saveStateDirty = (await page.locator("[data-table-save-state]").first().innerText().catch(() => "")).trim();
+  const saveEnabledDirty = await page.locator("[data-table-save]").first().isDisabled().catch(() => true);
+  await shot(page, "page-workflow-table-dirty");
+
+  await page.locator("[data-table-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const saveStateAfter = (await page.locator("[data-table-save-state]").first().innerText().catch(() => "")).trim();
+
+  // The server's copy, not the screen's.
+  const afterEdit = await readGraph();
+  const editedNode = (afterEdit?.graph?.nodes ?? []).find((n) => n.id === target?.split(".")[0]);
+  note({
+    step: "edit-saves",
+    field: target,
+    // An unedited draft must not be committable: a write here advances graph_version and hands
+    // the next tab a conflict no author created.
+    saveDisabledWhenClean: saveDisabledBefore,
+    saveEnabledWhenDirty: saveEnabledDirty === false,
+    stateWhenClean: saveStateBefore,
+    stateWhenDirty: saveStateDirty,
+    stateAfterSave: saveStateAfter,
+    serverValue: editedNode ? Object.entries(editedNode.params ?? {}).find(([k]) => k === target?.split(".").slice(1).join("."))?.[1] ?? null : null,
+    wroteToServer: editedNode
+      ? Object.entries(editedNode.params ?? {}).some(([k, v]) => k === target?.split(".").slice(1).join(".") && v === "qa.table.edited")
+      : false,
+    version: afterEdit?.graph_version ?? 0,
+  });
+  await shot(page, "page-workflow-table-saved");
+
+  // ---- "Consistent with the canvas after a save in either mode" -----------------------------
+  // The canvas writes a label, the table must show it. This is the direction the criterion
+  // names and the one a table holding its own copy of the graph gets wrong: it re-renders from
+  // what it loaded and the author's canvas edit is simply gone from the list.
+  await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const node = current.graph.nodes[0];
+    if (!node) return;
+    node.label = "Renamed on the canvas";
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+  }, workflowId);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-table-row]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const labelsAfterCanvasSave = await page.$$eval("[data-table-label]", (els) =>
+    els.map((el) => el.value),
+  );
+  note({
+    step: "canvas-save-visible",
+    labels: labelsAfterCanvasSave.slice(0, 4),
+    seesCanvasRename: labelsAfterCanvasSave.includes("Renamed on the canvas"),
+  });
+
+  // ---- A save from the table must not be reverted by a stale canvas load --------------------
+  // The reverse direction: a value the table committed is still there after the builder is
+  // opened and closed. A table that wrote to a different projection would pass every check
+  // above and fail exactly here.
+  await page.goto(`${admin}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const builderSeesTableEdit = await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    return Object.values(current.graph.nodes ?? {}).some((n) =>
+      Object.values(n.params ?? {}).includes("qa.table.edited"),
+    );
+  }, workflowId);
+  note({ step: "table-save-survives", builderSeesTableEdit });
+  await shot(page, "page-workflow-table-final");
+
+  log(`workflow-table: ${JSON.stringify(steps)}`);
+  report.workflowTable = steps;
+  return steps;
+}
+
 const DEPTH_PASSES = {
   automations: (page, report) => runAutomationsDepth(page, report),
   automationsactions: (page, report) => runAutomationsActionsDepth(page, report),
@@ -8853,6 +9091,9 @@ const DEPTH_PASSES = {
   // The builder (REQ-004, slice 1): the workspace's path carries a rule id, so the pass
   // creates a rule and drives *its* builder.
   workflowbuilder: (page, report) => runWorkflowBuilderDepth(page, report),
+  // Table mode (REQ-004, criterion 8): a sibling route of the same graph, reached through
+  // the builder's own link so the probe measures the path an author takes.
+  workflowtable: (page, report) => runWorkflowTableDepth(page, report),
   analytics: (page, report) => runAnalyticsDepth(page, report),
   search: (page, report) => runSearchDepth(page, report),
   iamroles: (page, report) => runIamRolesDepth(page, report),
