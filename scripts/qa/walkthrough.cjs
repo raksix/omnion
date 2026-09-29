@@ -1125,6 +1125,130 @@ async function runEarlyDepthPass(name, run, { context, adopt, prepare }) {
 }
 
 /**
+ * REQ-133 slice 1 — the project detail screen, driven against a REAL project id.
+ *
+ * The list route is walked statically; this screen cannot be, because its id is not known until
+ * something reads it. A route entry with a literal `{id}` would visit a 404 and the report would
+ * call it a pass — which is the "no untested screen is accepted" rule failing in the one place it
+ * is easiest to fake. So the pass discovers the project through the API the screen itself uses,
+ * walks the screen it found, and the assertions are the ones the REQ's acceptance list is
+ * actually about:
+ *
+ *   1. a project renders with its key, its name and its members, and the members are PEOPLE —
+ *      names and addresses, not uuids (a list of ids teaches the reader the column is an id);
+ *   2. the default project is marked protected and offers no archive control, because archiving
+ *      it would break every insert path that does not pass a project;
+ *   3. the last owner's remove control is disabled, and says why in its title — the API refuses
+ *      it too, and a screen that offers a button the server will reject is a lie;
+ *   4. a project id that does not exist renders the not-found state, in the words the API used
+ *      and NOT a permission message, because "you are not allowed" confirms the row exists.
+ *
+ * A project is created if the organization has none beyond the default, because the members
+ * screen with one member and no way to add anyone is not the screen the REQ describes.
+ */
+async function runProjectsDepth(page, report) {
+  const steps = {};
+  log("projects: discovering a project through the API");
+
+  // 1 · find or make one. `fetch` runs in the page so it carries the session cookie.
+  const discovered = await page.evaluate(async () => {
+    const list = await fetch("/api/v1/projects", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    const rows = Array.isArray(list?.projects) ? list.projects : [];
+    if (rows.length > 0) {
+      return { created: false, project: rows[0], total: rows.length };
+    }
+    const made = await fetch("/api/v1/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ key: "QA", name: "QA project" }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    return { created: true, project: made, total: rows.length };
+  });
+  steps.discoveredTotal = discovered.total;
+  steps.createdBecauseNoneExisted = discovered.created;
+  const project = discovered.project;
+  if (!project?.id) {
+    record({ page: "qa", action: "projects-depth-unreachable", reason: "no project and none creatable" });
+    return { ok: false, steps: Object.keys(steps).length, steps_: steps };
+  }
+  steps.projectId = project.id;
+  steps.projectKey = project.key;
+  steps.projectIsDefault = project.is_default === true;
+
+  // 2 · the detail screen with that id.
+  await page.goto(`${URL_ADMIN}/automation/projects/${project.id}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.detailRendered = (await page.locator("[data-project-members]").count()) > 0;
+  steps.keyRendered = (await page.locator("[data-project-key]").count()) > 0;
+  steps.nameRendered = (await page.locator("[data-project-name]").count()) > 0;
+  steps.memberRows = await page.locator("[data-project-member]").count();
+  await shot(page, "page-project-detail");
+
+  // 3 · the roster is people, not ids. A row whose name and address are both a bare uuid is the
+  //     id-shaped control this module's own header says not to build.
+  const memberText = (await page.locator("[data-project-member]").allInnerTexts()).join(" | ");
+  const uuidOnly = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  steps.rosterShowsPeople = !memberText.split("|").some(
+    (cell) => cell.trim().length > 0 && uuidOnly.test(cell.trim()),
+  );
+  steps.rosterSample = memberText.slice(0, 160);
+
+  // 4 · the role control is a real role, and the screen explains what it may do.
+  const roleValues = await page
+    .locator("[data-project-role] option")
+    .evaluateAll((els) => els.map((el) => el.value));
+  steps.roleOptions = roleValues.join(",");
+  steps.rolesAreTheFour = ["owner", "editor", "operator", "viewer"].every((r) => roleValues.includes(r));
+
+  // 5 · the default project is protected: no archive control is offered at all.
+  if (project.is_default) {
+    steps.archiveControlAbsentOnDefault =
+      (await page.locator("[data-project-toggle-archive]").count()) === 0;
+  } else {
+    steps.archiveControlPresent = (await page.locator("[data-project-toggle-archive]").count()) > 0;
+  }
+
+  // 6 · the last owner's remove control is disabled, and says why. One owner is the seeded
+  //     state, so this is the common case rather than a rare one.
+  const ownerRows = await page.locator("[data-project-member]").evaluateAll((rows) =>
+    rows.map((row) => {
+      const select = row.querySelector("[data-project-role]");
+      return select ? select.value : null;
+    }),
+  );
+  steps.ownerCount = ownerValues(ownerRows).length;
+  if (steps.ownerCount <= 1) {
+    const lastOwnerRemove = page.locator("[data-project-remove-member]").first();
+    steps.lastOwnerRemoveDisabled = await lastOwnerRemove.isDisabled().catch(() => false);
+    steps.lastOwnerTitle = (await lastOwnerRemove.getAttribute("title").catch(() => "")) || "";
+  }
+
+  // 7 · the not-found state. A made-up uuid must render the API's own words, and must NOT say
+  //     anything about permission: the 404 is chosen precisely so the panel cannot confirm that
+  //     a project exists.
+  await page.goto(`${URL_ADMIN}/automation/projects/00000000-0000-4000-8000-000000000000`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const notFoundText = await page.locator("body").innerText().catch(() => "");
+  steps.notFoundRendered = /no such project/i.test(notFoundText);
+  steps.notFoundLeaksPermission = /not allowed|forbidden|permission|unauthor/i.test(notFoundText);
+  await shot(page, "page-project-not-found");
+
+  return { ok: true, steps: Object.keys(steps).length, steps_: steps };
+}
+
+/** How many of a member table's rows carry the owner role. */
+function ownerValues(roles) {
+  return roles.filter((role) => role === "owner");
+}
+
+/**
  * The backup centre, driven end to end (REQ-013, slice 1).
  *
  * The assertion that matters is not "the screen rendered" — it is that the five parts
@@ -6901,6 +7025,11 @@ async function main() {
     // missed, and that running it does not consume the round-robin cursor.
     { path: "/crm/settings/assignment", name: "crm-assignment-rules" },
     { path: "/crm/settings/sla", name: "crm-sla-policies" },
+    // REQ-133 slice 1's list screen. The detail screen is NOT here and cannot be: its id is
+    // unknown until something reads it, and a route with a literal `{id}` would visit a 404
+    // and the report would count that as a visit. The `projects` depth pass below discovers a
+    // real id through the API and walks the screen it found.
+    { path: "/automation/projects", name: "projects" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -6981,6 +7110,17 @@ async function main() {
   // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
   // cannot run is a finding of its own ("this screen did not answer"), not a reason to end the
   // whole run before the remaining screens have been looked at.
+  // REQ-133 slice 1's detail screen. It needs a real project id, so the pass discovers one
+  // through the API and walks the screen it found -- a static route entry with a literal `{id}`
+  // would visit a 404 and the report would call that a pass.
+  report.projects = await runEarlyDepthPass("projects", (p) => runProjectsDepth(p, report), {
+    context,
+    adopt,
+    prepare,
+  });
+  page = adopt.page;
+  log(`projects: ${JSON.stringify(report.projects)}`);
+
   report.mediaFiles = await runDepthPass("media-file-manager", () =>
     runMediaFileManager(page, report),
   );
@@ -7356,7 +7496,7 @@ async function main() {
   const walkedRoutes = report.pages.filter((r) => !r.skipped);
   const skippedRoutes = report.pages.filter((r) => r.skipped);
   const depthNames = [
-    "crm-intake", "crm-assignment", "media-file-manager", "media-file-detail", "media-presets",
+    "crm-intake", "crm-assignment", "projects", "media-file-manager", "media-file-detail", "media-presets",
     "media-storage", "media-shares", "media-grants", "media-duplicates", "media-retention",
     "events-console", "webhooks", "event-retention", "security",
   ];
