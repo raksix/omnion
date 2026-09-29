@@ -159,7 +159,11 @@ pub struct BackupPage {
 }
 
 /// How many runs are in each terminal state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// It derives `Serialize` because the API returns it verbatim in two responses, and a filter
+/// chip rendered from a count the endpoint did not send is a chip that can disagree with the
+/// footer underneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct StatusTotals {
     /// Waiting to start.
     pub queued: i64,
@@ -601,6 +605,24 @@ pub async fn start_run(pool: &PgPool, backup_id: Uuid) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Set a run's storage prefix, once the run's own id is known.
+///
+/// The prefix cannot be built in the insert because it is derived from the generated id, and
+/// it cannot be built before the insert because there is no id yet — so the run is inserted
+/// with an empty prefix and given one immediately after. Deriving it from the **id** rather
+/// than from the clock is the part that matters: two runs started inside the same second
+/// would share a prefix, and the second would overwrite the first's artifacts.
+pub async fn set_prefix(pool: &PgPool, id: Uuid, prefix: &str) -> Result<Backup> {
+    sqlx::query_as::<_, BackupRow>(&format!(
+        "update backups set storage_prefix = $2 where id = $1 returning {BACKUP_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(prefix)
+    .fetch_one(pool)
+    .await
+    .map_err(BackupError::from)
 }
 
 /// Delete a run. Its parts cascade; its artifacts do not, and slice 2 owns removing those.
