@@ -1,8 +1,8 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
 > **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record,
-> the loop, the real provider model, the background runner and the HTTP surface —
-> `0fc9fe4`, `0e6b0fb`, `424284b`, `9f3747f`, `2e0a30d`, `011654d`, `30eefc9`, `cf2368d`) ·
+> the loop, the real provider model, the background runner, the HTTP surface and the panel —
+> `0fc9fe4`, `0e6b0fb`, `424284b`, `9f3747f`, `2e0a30d`, `011654d`, `30eefc9`, `cf2368d`, `91bf56e`) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 >
@@ -75,9 +75,36 @@
 >   the reaper was quietly relying on being able to queue two runs for one agent; the partial
 >   unique index is the real guarantee, and the test is now what says so.
 >
-> Still open in slice 1: **the run list and trace screens**, the workspace and the run sheet UI.
-> The walkthrough now visits `/ai/agents` and `/ai/runs`, and both list routes are live; no
-> screen has had a browser pass yet, so REQ-099 is not closeable.
+> **Slice 1, panel commit** (`91bf56e`, walkthrough `490c7c4`): the five screens the route surface
+> was missing. `/ai/agents` (the table, its tool column that names the approvals count, the
+> query-string filters, bulk Enable/Disable, Run/Duplicate/Disable/Delete with a type-to-confirm),
+> `/ai/agents/new` and `/ai/agents/[id]` (**one** shared form, because a limit tightened in one and
+> not the other is a limit that lies in the screen where somebody is about to spend money),
+> `/ai/runs` (the history, where a parked run is **amber and not red**), and `/ai/runs/[id]` (the
+> trace as an accordion whose arguments are the *store's* redaction behind a tap). The Run sheet is
+> shared by the list and the form, and a 409 is an answer rather than an error: the API hands back
+> the existing run's id, so the sheet offers to watch that run instead of showing a red banner at
+> somebody who double-pressed Run.
+>
+> Four decisions the panel forced, none of which the route had to make:
+>
+> - *A duplicate is born disabled.* A copy that can spend money the moment it is created is a
+>   second thing nobody has decided about yet.
+> - *The model picker drops models that cannot call tools once the tool list is non-empty.* The
+>   runtime refuses that pairing, and an agent with tools pinned to a tool-less model is an agent
+>   whose every run ends in a provider error.
+> - *The key box is disabled after create, not hidden.* It appears in URLs and in workflow node
+>   configuration, so it cannot change; a missing field reads as a bug, a read-only one with the
+>   reason stated reads as a decision.
+> - *The re-attach is a replay of the step rows, not a subscription.* That is what makes "replay
+>   matches SSE" measurable rather than asserted: the same rows produce both.
+>
+> Still open in slice 1: the **Skills tab, the Runs tab and the Workspace tab** — the workspace
+> needs the `ai_agent_files` table and the object storage it indexes, which is slice 2's
+> migration. A tab that lists nothing is a tab that lies, so none of the three is faked here.
+> REQ-099 is not closeable: the loop-level deadline/budget/cancel tests, the output-verification
+> helper, the skills, the guardrail events, the SDK example and the QA pass over the new screens
+> are all still open.
 
 ## Request
 
@@ -203,7 +230,7 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 - [x] A run's cost equals the sum of its `ai_usage` rows for the same window, asserted against SQL in the test. *(proved against the step rows, which is the recomputable half; the `ai_usage` join needs the provider call in slice 1's remaining half)*
 - [ ] Run telemetry (steps, tools used, tokens, cost) is visible per run and rolled up per agent for 30 days, and equals the underlying rows.
 - [ ] The SDK example runs a two-tool agent against a stub provider inside the workspace test suite without the API layer.
-- [ ] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text.
+- [x] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text. *(the five screens this slice ships all carry the three states: `LoadingTable` while the fetch is in flight, an `EmptyState` that names what is missing and offers the action that gets past it — "No agent yet" with Create agent, "No run yet" with a link to the agents table — and a banner carrying the API's own message with a real Retry. A filtered list that matched nothing says "No agent matches these filters" rather than showing the empty state's "nothing exists", because those are different facts. The type-to-confirm delete, the duplicate, the bulk bar and the Run sheet are all wired to real calls; the walkthrough drives each of them.)*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan

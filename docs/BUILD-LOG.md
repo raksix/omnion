@@ -3758,3 +3758,71 @@ REQ-099.**
 empty and populated states, the run sheet, the step accordion with arguments behind a tap), then
 `/ai/agents/[id]` and `/ai/runs/[id]`, then a QA pass over both with the walkthrough clicking the
 rows it walks.
+
+
+## Tick 19 — REQ-099 slice 1, commits eight and nine: the panel (`91bf56e`, `490c7c4`)
+
+**What landed.** The five screens the HTTP surface was missing, plus the walkthrough pass that
+drives them. `lib/api.ts` gains the agent runtime's client (fourteen calls and two stream
+readers); `features/ai/ai-agents-list.tsx`, `agent-form.tsx`, `ai-runs-list.tsx`,
+`ai-run-detail.tsx` and the shared `run-sheet.tsx`; five routes under `app/ai/`; and two sidebar
+entries. The routes land beside `/ai` in the shell rather than inside it, because the two
+screens answer two different questions and an operator reads them in that order: *what may I let
+this do* (the configuration) and *what did it already do, and what did that cost* (the history).
+
+**Four decisions the panel forced that the route did not have to make.**
+
+- *A duplicate is born disabled.* The copy button writes a real row — same prompt, same tools,
+  same limits, `-copy` suffixed key with a counter for the collision — and `enabled: false`. A
+  copy that can spend money the moment it is created is a second thing nobody has decided about
+  yet, and "Duplicate" is the button people press fastest.
+- *The model picker drops models that cannot call tools once the tool list is non-empty.* The
+  runtime refuses that pairing (`agent.approval_not_allowed` has the same shape of problem), and
+  an agent with tools pinned to a tool-less model is an agent whose every run ends in a provider
+  error. The select's own hint says why the list shrank, so the missing models read as a rule
+  rather than as a bug.
+- *The key box is disabled after create, not hidden, and the reason is printed above it.* The
+  key appears in URLs and in workflow node configuration, so it cannot change; a missing field
+  reads as a bug, a read-only one with the reason stated reads as a decision.
+- *A 409 is an answer, not an error.* The API hands back the **existing** run's id because the
+  one-active-run partial unique index is the guarantee; a double-pressed Run is the normal case,
+  not the exceptional one. The sheet therefore offers "watch that run" rather than a red banner
+  at somebody who did nothing wrong.
+
+**The trace's redaction is the store's, not a second rule.** The arguments behind a step are
+whatever `run_store::redact_arguments` wrote before the row existed. A client-side copy of the
+rule is a second answer to "which keys are secret" that can disagree with the first, and the
+person reading the trace is not the agent's author — so the panel shows the redaction and does
+not re-derive it.
+
+**And the re-attach is a replay, which is what makes the acceptance box measurable.**
+`/ai/runs/[id]` tails `GET /runs/{id}/events` while the run is going, and that endpoint reads
+the *step rows*. The same rows produce the live stream and the reloaded trace, so "replay matches
+SSE" is a comparison rather than a promise.
+
+**Proof.**
+
+- `pnpm typecheck` (`apps/admin` `tsc --noEmit`) → clean, 0 errors
+- `node --check scripts/qa/walkthrough.cjs` → clean
+- `cargo test -p omnion-ai-hub --lib` → **240 passed**
+- `cargo test -p omnion-api --test ai_agent_runs` → **18 passed**
+- Commits: `91bf56e`, `490c7c4`
+
+**The walkthrough, and why its assertions are about position.** A route walked by path proves
+its empty state renders and nothing else, so `runAiAgentsDepth` asks the questions instead: is
+the key refusal **in its field** (position, not existence — a banner at the top is where a reader
+fixes the wrong input), does the tool column actually say "approvals: 1", is the 409 offered as
+a link, are the trace's arguments behind a tap and do they open when tapped, and is the key box
+disabled after create. The two refusals it provokes are registered with
+`expectRefusal`, so a 500 inside their windows is still a finding — a form filled with
+placeholders should be rejected, not crash the API.
+
+**Not done, and named rather than written off.** The **Skills tab, the Runs tab and the Workspace
+tab** are absent on purpose: the workspace needs `ai_agent_files` and the object storage it
+indexes, which is slice 2's migration, and a tab that lists nothing is a tab that lies. The
+loop-level deadline / token-budget / cancellation tests, the output-verification helper, the
+guardrail bus events and the SDK example are all still open. **Do not close REQ-099** — nine
+acceptance boxes are unticked and no browser pass has run over the new screens yet.
+
+**Next.** The QA pass over the new screens (the private `w7` stack), then the loop-level stop
+tests with the `ScriptedModel::slow` seam, then slice 2's migration and the workspace.
