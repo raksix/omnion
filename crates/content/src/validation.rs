@@ -188,7 +188,9 @@ pub fn validate_key(key: &str, field: &str) -> Result<String> {
 pub fn validate_text(value: &str, max: usize, field: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(ContentError::InvalidName(format!("the {field} must not be empty")));
+        return Err(ContentError::InvalidName(format!(
+            "the {field} must not be empty"
+        )));
     }
     if value.chars().count() > max {
         return Err(ContentError::InvalidName(format!(

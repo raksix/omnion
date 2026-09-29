@@ -173,17 +173,25 @@ fn landing_blocks() -> Value {
         ),
         heading("Why teams choose this", 2),
         card_grid(cards()),
-        columns(2, json!([
-            column(json!([
-                heading("How it works", 2),
-                text("Author in blocks, publish a revision, keep the history."),
-            ])),
-            column(json!([
-                heading("What you get", 2),
-                text("A CMS, a workflow engine and an API on one core."),
-            ])),
-        ])),
-        cta("Ready when you are", "Create a page from this template and make it yours.", "Start now", "/signup"),
+        columns(
+            2,
+            json!([
+                column(json!([
+                    heading("How it works", 2),
+                    text("Author in blocks, publish a revision, keep the history."),
+                ])),
+                column(json!([
+                    heading("What you get", 2),
+                    text("A CMS, a workflow engine and an API on one core."),
+                ])),
+            ])
+        ),
+        cta(
+            "Ready when you are",
+            "Create a page from this template and make it yours.",
+            "Start now",
+            "/signup"
+        ),
     ])
 }
 

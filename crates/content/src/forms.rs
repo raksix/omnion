@@ -36,14 +36,7 @@ use crate::validation::{validate_key, validate_text};
 
 /// The field types the builder's palette offers, in the order the palette shows them.
 pub const FIELD_TYPES: [&str; 8] = [
-    "text",
-    "textarea",
-    "select",
-    "radio",
-    "checkbox",
-    "date",
-    "file",
-    "consent",
+    "text", "textarea", "select", "radio", "checkbox", "date", "file", "consent",
 ];
 
 /// Lifecycle states a form carries.
@@ -374,7 +367,11 @@ fn validate_field(field: &NewFormField) -> Result<FormFieldShape> {
             FIELD_TYPES.join(", ")
         )));
     }
-    let width = if field.width == "half" { "half" } else { "full" };
+    let width = if field.width == "half" {
+        "half"
+    } else {
+        "full"
+    };
     if !field.rules.is_object() {
         return Err(ContentError::InvalidFormField(format!(
             "the rules of field {key:?} must be a JSON object"
@@ -615,10 +612,11 @@ pub fn validate_answer(field: &FormField, answer: &Value) -> Option<String> {
         let shaped = match kind {
             "email" => text.contains('@') && !text.starts_with('@') && !text.ends_with('@'),
             "url" => text.starts_with("http://") || text.starts_with("https://"),
-            "tel" => text.chars().all(|c| {
-                c.is_ascii_digit()
-                    || matches!(c, '+' | '-' | ' ' | '(' | ')' | '.')
-            }) && text.chars().any(|c| c.is_ascii_digit()),
+            "tel" => {
+                text.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | ' ' | '(' | ')' | '.'))
+                    && text.chars().any(|c| c.is_ascii_digit())
+            }
             // An unknown format name validates nothing; refusing on it would make a future
             // rule name a breaking change to every form already saved.
             _ => true,
@@ -651,10 +649,8 @@ pub fn validate_answer(field: &FormField, answer: &Value) -> Option<String> {
             let Some(picked) = parse_iso_date(&text) else {
                 return Some("please enter a date as YYYY-MM-DD".to_owned());
             };
-            for (rule_name, message) in [
-                ("min_date", "on or after"),
-                ("max_date", "on or before"),
-            ] {
+            for (rule_name, message) in [("min_date", "on or after"), ("max_date", "on or before")]
+            {
                 if let Some(bound) = rule(rule_name).and_then(Value::as_str) {
                     // An unparseable bound validates nothing rather than everything: refusing
                     // every submission over a typo in the panel is the worse failure.
@@ -685,7 +681,9 @@ pub fn validate_answer(field: &FormField, answer: &Value) -> Option<String> {
                 let allowed: Vec<&str> = types.iter().filter_map(Value::as_str).collect();
                 if !allowed.is_empty() {
                     let suffix = text.rsplit('.').next().unwrap_or_default().to_lowercase();
-                    if !allowed.iter().any(|t| t.trim_start_matches('.').eq_ignore_ascii_case(&suffix))
+                    if !allowed
+                        .iter()
+                        .any(|t| t.trim_start_matches('.').eq_ignore_ascii_case(&suffix))
                     {
                         return Some(format!("please upload one of: {}", allowed.join(", ")));
                     }
@@ -756,7 +754,9 @@ pub fn spam_score(answers: &Map<String, Value>) -> i32 {
         }
         // Cyrillic inside an otherwise Latin answer is the cheapest reliable signal that a
         // message was machine-generated for a form in another language.
-        if text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)) && text.chars().any(|c| c.is_ascii_alphabetic()) {
+        if text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+            && text.chars().any(|c| c.is_ascii_alphabetic())
+        {
             score += 20;
         }
     }
@@ -863,9 +863,8 @@ async fn insert_fields(
 
 /// Every form of one site.
 pub async fn list_forms(pool: &PgPool, site_id: Uuid) -> Result<Vec<Form>> {
-    let sql = format!(
-        "select {FORM_COLUMNS} from cms_forms where site_id = $1 order by created_at desc"
-    );
+    let sql =
+        format!("select {FORM_COLUMNS} from cms_forms where site_id = $1 order by created_at desc");
     Ok(sqlx::query_as::<_, Form>(&sql)
         .bind(site_id)
         .fetch_all(pool)
@@ -883,11 +882,7 @@ pub async fn find_form(pool: &PgPool, site_id: Uuid, id: Uuid) -> Result<Option<
 }
 
 /// Read the form whose key is its public address.
-pub async fn find_form_by_key(
-    pool: &PgPool,
-    site_id: Uuid,
-    key: &str,
-) -> Result<Option<Form>> {
+pub async fn find_form_by_key(pool: &PgPool, site_id: Uuid, key: &str) -> Result<Option<Form>> {
     let sql = format!("select {FORM_COLUMNS} from cms_forms where site_id = $1 and key = $2");
     Ok(sqlx::query_as::<_, Form>(&sql)
         .bind(site_id)
@@ -954,7 +949,10 @@ pub async fn update_form(
         Some(name) => Some(validate_text(name, MAX_FORM_NAME_LENGTH, "name")?),
         None => None,
     };
-    let submit_action = changes.submit_action.as_deref().unwrap_or(&current.submit_action);
+    let submit_action = changes
+        .submit_action
+        .as_deref()
+        .unwrap_or(&current.submit_action);
     let submit_message = changes
         .submit_message
         .as_deref()
@@ -1027,12 +1025,7 @@ pub async fn update_form(
 ///
 /// Publishing is refused for a form with no fields: the live site would render an empty form
 /// that accepts nothing, which is worse than one that is obviously not ready.
-pub async fn set_form_status(
-    pool: &PgPool,
-    site_id: Uuid,
-    id: Uuid,
-    status: &str,
-) -> Result<Form> {
+pub async fn set_form_status(pool: &PgPool, site_id: Uuid, id: Uuid, status: &str) -> Result<Form> {
     if !FORM_STATUSES.contains(&status) {
         return Err(ContentError::InvalidFormField(format!(
             "{status:?} is not a form state ({})",
@@ -1248,11 +1241,7 @@ pub async fn count_submissions(
 }
 
 /// Read one submission, scoped to the form that owns it.
-pub async fn find_submission(
-    pool: &PgPool,
-    form_id: Uuid,
-    id: Uuid,
-) -> Result<Option<Submission>> {
+pub async fn find_submission(pool: &PgPool, form_id: Uuid, id: Uuid) -> Result<Option<Submission>> {
     let sql = format!(
         "select {SUBMISSION_COLUMNS} from cms_form_submissions where form_id = $1 and id = $2"
     );
@@ -1537,7 +1526,10 @@ mod tests {
         // The same empty answer on an optional field is not a refusal — otherwise making a
         // field optional would be impossible, which is the flag's whole purpose.
         field.required = false;
-        assert_eq!(validate_answer(&field, &Value::String("   ".to_owned())), None);
+        assert_eq!(
+            validate_answer(&field, &Value::String("   ".to_owned())),
+            None
+        );
     }
 
     #[test]
@@ -1562,7 +1554,10 @@ mod tests {
     fn both_option_shapes_read_the_same() {
         let typed = json!([{"value": "gold", "label": "Gold"}]);
         assert_eq!(option_labels(typed.as_array().unwrap()), vec!["gold"]);
-        assert_eq!(option_labels(json!(["gold"]).as_array().unwrap()), vec!["gold"]);
+        assert_eq!(
+            option_labels(json!(["gold"]).as_array().unwrap()),
+            vec!["gold"]
+        );
     }
 
     #[test]
@@ -1691,7 +1686,11 @@ mod tests {
             "body".to_owned(),
             json!("buy https://a.example https://b.example https://c.example"),
         )]);
-        assert_eq!(spam_score(&many), 45, "a link dump is the strongest single signal");
+        assert_eq!(
+            spam_score(&many),
+            45,
+            "a link dump is the strongest single signal"
+        );
         // The ceiling is a ceiling: the signals add up and stop, so a long mixed-language
         // answer with a link dump cannot report a score a screen would read as 100% certain spam.
         let overflowing = serde_json::Map::from_iter([

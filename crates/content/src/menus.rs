@@ -433,7 +433,11 @@ pub async fn list_menus(pool: &PgPool, site_id: Uuid) -> Result<Vec<Menu>> {
 }
 
 /// One menu of a site, with its items in tree order.
-pub async fn find_menu(pool: &PgPool, site_id: Uuid, id: Uuid) -> Result<Option<(Menu, Vec<MenuItem>)>> {
+pub async fn find_menu(
+    pool: &PgPool,
+    site_id: Uuid,
+    id: Uuid,
+) -> Result<Option<(Menu, Vec<MenuItem>)>> {
     let sql = format!("select {MENU_COLUMNS} from cms_menus where site_id = $1 and id = $2");
     let menu = sqlx::query_as::<_, Menu>(&sql)
         .bind(site_id)
@@ -448,11 +452,7 @@ pub async fn find_menu(pool: &PgPool, site_id: Uuid, id: Uuid) -> Result<Option<
 }
 
 /// A menu of a site by key — the theme addresses a location, the editor addresses a key.
-pub async fn find_menu_by_key(
-    pool: &PgPool,
-    site_id: Uuid,
-    key: &str,
-) -> Result<Option<Menu>> {
+pub async fn find_menu_by_key(pool: &PgPool, site_id: Uuid, key: &str) -> Result<Option<Menu>> {
     let key = validate_key(key, "menu key")?;
     let sql = format!("select {MENU_COLUMNS} from cms_menus where site_id = $1 and key = $2");
     sqlx::query_as::<_, Menu>(&sql)
@@ -528,7 +528,9 @@ pub async fn update_menu(
     };
 
     if changes.is_empty() {
-        return read_menu(pool, site_id, id).await?.ok_or(ContentError::MenuNotFound);
+        return read_menu(pool, site_id, id)
+            .await?
+            .ok_or(ContentError::MenuNotFound);
     }
 
     let mut tx = pool.begin().await?;
@@ -576,7 +578,11 @@ pub async fn save_menu(
     let locations = validate_locations(&save.locations)?;
     let mut items = save.items.clone();
     for item in &mut items {
-        item.id = if item.id.is_nil() { Uuid::new_v4() } else { item.id };
+        item.id = if item.id.is_nil() {
+            Uuid::new_v4()
+        } else {
+            item.id
+        };
         item.item_type = validate_item_type(&item.item_type)?;
         item.visibility = validate_visibility(&item.visibility)?;
         item.label = validate_text(&item.label, MAX_LABEL_LENGTH, "item label")?;
@@ -924,9 +930,7 @@ fn map_menu_write_error(error: sqlx::Error, key: &str) -> ContentError {
         .and_then(|rest| rest.split(' ').next())
     {
         return match constraint {
-            "cms_menus_site_key_key" => {
-                ContentError::MenuKeyTaken(key.to_owned())
-            }
+            "cms_menus_site_key_key" => ContentError::MenuKeyTaken(key.to_owned()),
             "cms_menu_items_menu_page_key" => ContentError::InvalidMenuItem(
                 "this menu already links to one of those pages".to_owned(),
             ),
@@ -1017,10 +1021,7 @@ mod tests {
     fn an_item_cannot_be_its_own_parent() {
         let mut node = item(None, "loop");
         node.parent_id = Some(node.id);
-        assert_eq!(
-            check_tree(&[node]).unwrap_err().code(),
-            "invalid_menu_item"
-        );
+        assert_eq!(check_tree(&[node]).unwrap_err().code(), "invalid_menu_item");
     }
 
     #[test]
@@ -1033,7 +1034,9 @@ mod tests {
         .unwrap();
         assert_eq!(claimed, vec!["header".to_owned(), "footer".to_owned()]);
         assert_eq!(
-            validate_locations(&["sidebar-nav".to_owned()]).unwrap_err().code(),
+            validate_locations(&["sidebar-nav".to_owned()])
+                .unwrap_err()
+                .code(),
             "invalid_location"
         );
     }

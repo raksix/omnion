@@ -139,6 +139,28 @@ pub enum ContentError {
     /// No submission carries this identifier, or it belongs to another form.
     #[error("no such submission in this form")]
     SubmissionNotFound,
+    /// A redirect rule is unusable (a path that is not site-relative, a code or pattern the
+    /// manager does not offer, or a rule that would send a visitor in a circle).
+    #[error("invalid redirect: {0}")]
+    InvalidRedirect(String),
+    /// Two rules would send a visitor back and forth. Raised before the rule is written, with
+    /// the path the cycle closes on, because the alternative is discovering it from a browser.
+    #[error("redirect loop: {0}")]
+    RedirectLoop(String),
+    /// No redirect rule carries this identifier, or it belongs to another site.
+    #[error("no such redirect rule")]
+    RedirectNotFound,
+    /// A page's SEO payload is unusable (a relative canonical, a schema type this generator
+    /// does not build, a `robots` list that says both `index` and `noindex`).
+    #[error("invalid SEO settings: {0}")]
+    InvalidSeo(String),
+    /// A broken-link row does not carry this identifier, or it belongs to another site.
+    #[error("no such broken link")]
+    BrokenLinkNotFound,
+    /// The site these SEO rows would belong to does not exist. Separate from a generic 404 on
+    /// purpose: a redirect for a site that was deleted is a caller bug, not a missing resource.
+    #[error("no such site")]
+    SiteNotFound,
 }
 
 /// Result alias used across the content crate.
@@ -187,6 +209,12 @@ impl ContentError {
             Self::FormNotFound => "form_not_found",
             Self::FormKeyTaken(_) => "form_key_taken",
             Self::SubmissionNotFound => "submission_not_found",
+            Self::InvalidRedirect(_) => "invalid_redirect",
+            Self::RedirectLoop(_) => "redirect_loop",
+            Self::RedirectNotFound => "redirect_not_found",
+            Self::InvalidSeo(_) => "invalid_seo",
+            Self::BrokenLinkNotFound => "broken_link_not_found",
+            Self::SiteNotFound => "site_not_found",
         }
     }
 }

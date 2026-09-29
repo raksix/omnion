@@ -224,7 +224,11 @@ pub async fn find_pending(
 /// `(page_id, action) where status = 'pending'` is what makes the two a single write: a second
 /// `POST` for a page that already has one is an update, so a page can never show two "scheduled"
 /// lines and never be published twice by two entries.
-pub async fn schedule(pool: &PgPool, organization_id: Uuid, new: NewSchedule) -> Result<PublishingEntry> {
+pub async fn schedule(
+    pool: &PgPool,
+    organization_id: Uuid,
+    new: NewSchedule,
+) -> Result<PublishingEntry> {
     let action = validate_action(&new.action)?;
     let timezone = new.timezone.trim();
     if timezone.is_empty() || timezone.len() > 64 {
@@ -301,11 +305,7 @@ pub async fn reschedule(
 /// Cancel a pending entry. A cancelled entry is kept, not deleted: the queue is the record of
 /// what was going to happen, and a row that vanished leaves "did we publish or cancel?" with no
 /// answer in the data.
-pub async fn cancel(
-    pool: &PgPool,
-    organization_id: Uuid,
-    id: Uuid,
-) -> Result<PublishingEntry> {
+pub async fn cancel(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Result<PublishingEntry> {
     let sql = format!(
         "update cms_publishing_queue \
          set status = 'cancelled', result = 'cancelled by an editor', updated_at = now() \
@@ -419,12 +419,7 @@ pub async fn claim_entry(pool: &PgPool, id: Uuid) -> Result<Option<PublishingEnt
 ///
 /// The `pending` guard is deliberate: a retry that runs twice must not turn a `done` row back
 /// into a `failed` one, so the second attempt is a no-op rather than a correction.
-pub async fn finish(
-    pool: &PgPool,
-    id: Uuid,
-    result: &str,
-    error: &str,
-) -> Result<()> {
+pub async fn finish(pool: &PgPool, id: Uuid, result: &str, error: &str) -> Result<()> {
     let status = if error.is_empty() { "done" } else { "failed" };
     sqlx::query(
         "update cms_publishing_queue set status = $2, result = $3, error = $4, updated_at = now() \

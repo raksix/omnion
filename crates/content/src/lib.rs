@@ -19,6 +19,7 @@ pub mod pages;
 pub mod patterns;
 pub mod publishing;
 pub mod sanitize;
+pub mod seo;
 pub mod templates;
 pub mod translations;
 pub mod validation;
@@ -41,15 +42,13 @@ pub use error::{ContentError, Result};
 // the modules keep their own constant so a bound may move without editing the other.
 pub use forms::{
     FIELD_TYPES, FORM_STATUSES, Form, FormChanges, FormField, MAX_ANSWER_LENGTH, MAX_ANSWERS,
-    MAX_FIELD_TEXT_LENGTH,
-    MAX_FORM_NAME_LENGTH, MAX_OPTIONS, NewFormField, NewSubmission, SUBMISSIONS_STATUSES,
-    SUBMIT_ACTIONS, Submission, SubmissionOutcome, SubmissionQuery, answers_summary,
-    bulk_submission_status,
-    consent_text, count_submissions, create_form, delete_form, delete_submission, find_form,
-    find_form_by_key, find_submission, list_fields, list_forms, list_submissions, matches_pattern,
-    option_labels, read_form, save_fields, set_form_status, set_submission_status, spam_score,
-    submissions_in_last_hour, submissions_to_csv, submit_public, update_form, validate_answer,
-    validate_submission,
+    MAX_FIELD_TEXT_LENGTH, MAX_FORM_NAME_LENGTH, MAX_OPTIONS, NewFormField, NewSubmission,
+    SUBMISSIONS_STATUSES, SUBMIT_ACTIONS, Submission, SubmissionOutcome, SubmissionQuery,
+    answers_summary, bulk_submission_status, consent_text, count_submissions, create_form,
+    delete_form, delete_submission, find_form, find_form_by_key, find_submission, list_fields,
+    list_forms, list_submissions, matches_pattern, option_labels, read_form, save_fields,
+    set_form_status, set_submission_status, spam_score, submissions_in_last_hour,
+    submissions_to_csv, submit_public, update_form, validate_answer, validate_submission,
 };
 pub use menus::{
     Audience, ITEM_TYPES, LOCATIONS, MAX_ITEMS, MAX_LABEL_LENGTH, Menu, MenuChanges, MenuItem,
@@ -57,18 +56,6 @@ pub use menus::{
     find_menu, find_menu_by_key, find_menu_by_location, list_items, list_menus, read_menu,
     rendered_menu, save_menu, update_menu,
 };
-pub use publishing::{
-    ACTIONS, NewSchedule, PublishingEntry, QueueQuery, cancel, claim_due, claim_entry,
-    find_entry, find_pending, finish, list_queue, publish_now, reschedule, retry, run_entry,
-    schedule,
-};
-pub use patterns::{
-    MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate, PageTemplate,
-    Pattern, PatternChanges, delete_pattern, delete_template, find_pattern, find_pattern_by_key,
-    find_template, find_template_by_key, instance_blocks, list_patterns, list_templates,
-    save_pattern, save_template, update_pattern,
-};
-pub use templates::{ABOUT, BLOG_POST, CONTACT, LANDING, PRICING, SYSTEM_TEMPLATES, SystemTemplate};
 pub use model::{
     DEFAULT_PAGE_TYPE, NewPage, NewRevisionTranslation, Page, PageChanges, PageRevision,
     REVISION_RESOURCE, Translation,
@@ -78,8 +65,21 @@ pub use pages::{
     latest_revision, list_pages, list_revisions, publish_page, restore_revision, unpublish_page,
     update_page,
 };
+pub use patterns::{
+    MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate,
+    PageTemplate, Pattern, PatternChanges, delete_pattern, delete_template, find_pattern,
+    find_pattern_by_key, find_template, find_template_by_key, instance_blocks, list_patterns,
+    list_templates, save_pattern, save_template, update_pattern,
+};
+pub use publishing::{
+    ACTIONS, NewSchedule, PublishingEntry, QueueQuery, cancel, claim_due, claim_entry, find_entry,
+    find_pending, finish, list_queue, publish_now, reschedule, retry, run_entry, schedule,
+};
 pub use sanitize::{
     ALLOWED_ATTRIBUTES, ALLOWED_TAGS, ALLOWED_URL_SCHEMES, SanitizeReport, allowed_embed_hosts,
     embed_host_is_allowed, sanitize_html,
+};
+pub use templates::{
+    ABOUT, BLOG_POST, CONTACT, LANDING, PRICING, SYSTEM_TEMPLATES, SystemTemplate,
 };
 pub use translations::{revision_translations, set_revision_translation};

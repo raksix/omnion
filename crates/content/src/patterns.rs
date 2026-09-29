@@ -33,8 +33,7 @@ pub const MAX_NAME_LENGTH: usize = 120;
 pub const MAX_DESCRIPTION_LENGTH: usize = 500;
 
 /// Column list for every `Pattern` query.
-const PATTERN_COLUMNS: &str =
-    "id, organization_id, key, name, category, description, blocks, created_by, created_at, updated_at";
+const PATTERN_COLUMNS: &str = "id, organization_id, key, name, category, description, blocks, created_by, created_at, updated_at";
 
 /// Column list for every `PageTemplate` query.
 const TEMPLATE_COLUMNS: &str = "id, organization_id, key, name, page_type, description, blocks, \
@@ -354,16 +353,13 @@ pub async fn update_pattern(
 }
 
 /// Remove a pattern. `false` when the organization has no such pattern.
-pub async fn delete_pattern(
-    pool: &PgPool,
-    organization_id: Uuid,
-    id: Uuid,
-) -> Result<bool> {
-    let deleted = sqlx::query("delete from content_patterns where id = $1 and organization_id = $2")
-        .bind(id)
-        .bind(organization_id)
-        .execute(pool)
-        .await?;
+pub async fn delete_pattern(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Result<bool> {
+    let deleted =
+        sqlx::query("delete from content_patterns where id = $1 and organization_id = $2")
+            .bind(id)
+            .bind(organization_id)
+            .execute(pool)
+            .await?;
     Ok(deleted.rows_affected() > 0)
 }
 
@@ -393,10 +389,7 @@ fn reidentify(blocks: &mut [Block]) {
 // ---------------------------------------------------------------------------------------------
 
 /// List an organization's templates, name order.
-pub async fn list_templates(
-    pool: &PgPool,
-    organization_id: Uuid,
-) -> Result<Vec<PageTemplate>> {
+pub async fn list_templates(pool: &PgPool, organization_id: Uuid) -> Result<Vec<PageTemplate>> {
     let sql = format!(
         "select {TEMPLATE_COLUMNS} from content_page_templates \
          where organization_id = $1 order by name asc, key asc"
@@ -534,14 +527,14 @@ pub async fn create_page_from_template(
 /// A system template is refused: the gallery offers the platform's own starting points, and
 /// removing one would leave a "New page from template" flow that cannot deliver what it
 /// advertises. A custom template is the author's to delete.
-pub async fn delete_template(
-    pool: &PgPool,
-    organization_id: Uuid,
-    id: Uuid,
-) -> Result<bool> {
+pub async fn delete_template(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Result<bool> {
     let sql = "delete from content_page_templates \
                where id = $1 and organization_id = $2 and is_system = false";
-    let deleted = sqlx::query(sql).bind(id).bind(organization_id).execute(pool).await?;
+    let deleted = sqlx::query(sql)
+        .bind(id)
+        .bind(organization_id)
+        .execute(pool)
+        .await?;
     Ok(deleted.rows_affected() > 0)
 }
 
@@ -605,7 +598,11 @@ pub fn pattern_needs_attention(stored: &Value) -> Vec<crate::blocks::BlockIssue>
 
 /// Count a block and everything under it.
 fn count_with_children(block: &Block) -> usize {
-    1 + block.children.iter().map(count_with_children).sum::<usize>()
+    1 + block
+        .children
+        .iter()
+        .map(count_with_children)
+        .sum::<usize>()
 }
 
 /// The text a page created from a template carries in its `body`.
@@ -695,7 +692,11 @@ mod tests {
 
         let before: Vec<Uuid> = walk_ids(&original);
         let after: Vec<Uuid> = walk_ids(&inserted);
-        assert_eq!(before.len(), after.len(), "the block count travels with the pattern");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the block count travels with the pattern"
+        );
         for (was, now) in before.iter().zip(after.iter()) {
             assert_ne!(
                 was, now,
@@ -743,7 +744,9 @@ mod tests {
 
         let issues = pattern_needs_attention(&stored);
         assert!(
-            issues.iter().any(|issue| issue.code == "block_column_orphan"),
+            issues
+                .iter()
+                .any(|issue| issue.code == "block_column_orphan"),
             "the library card says what is still wrong: {issues:?}"
         );
     }
@@ -767,7 +770,10 @@ mod tests {
         ]);
         let stored = normalize_block_payload(dirty).expect("a saveable tree");
         let text = stored.to_string();
-        assert!(!text.contains("script"), "the stored payload keeps no script: {text}");
+        assert!(
+            !text.contains("script"),
+            "the stored payload keeps no script: {text}"
+        );
         assert!(text.contains("ok"), "the safe part of the markup is kept");
     }
 
@@ -775,7 +781,10 @@ mod tests {
     fn block_text_is_what_search_and_seo_read() {
         let blocks = instance_blocks(&tree()).expect("a readable tree");
         let text = block_text(&blocks);
-        assert!(text.contains("Welcome"), "a heading's words are in the body: {text}");
+        assert!(
+            text.contains("Welcome"),
+            "a heading's words are in the body: {text}"
+        );
         assert!(
             text.contains("A column with words."),
             "a nested block's words are in the body too: {text}"
@@ -811,20 +820,25 @@ mod tests {
     }
 }
 
-    #[test]
-    fn probe_which_prop() {
-        let payload = serde_json::json!([
-            { "id": "11111111-1111-1111-1111-111111111111", "type": "heading",
-              "props": { "text": "Welcome", "level": "h1" } },
-            { "id": "22222222-2222-2222-2222-222222222222", "type": "columns",
-              "props": { "columns": 2 },
-              "children": [
-                { "id": "33333333-3333-3333-3333-333333333333", "type": "column", "props": {}, "children": [] },
-                { "id": "44444444-4444-4444-4444-444444444444", "type": "column", "props": {},
-                  "children": [ { "id": "55555555-5555-5555-5555-555555555555", "type": "text",
-                                  "props": { "text": "A column with words." } } ] }
-              ] }
-        ]);
-        let r = crate::validate(&payload);
-        for i in &r.issues { println!("PROBE {} {} {} sev={}", i.block_id, i.path, i.code, i.severity); }
+#[test]
+fn probe_which_prop() {
+    let payload = serde_json::json!([
+        { "id": "11111111-1111-1111-1111-111111111111", "type": "heading",
+          "props": { "text": "Welcome", "level": "h1" } },
+        { "id": "22222222-2222-2222-2222-222222222222", "type": "columns",
+          "props": { "columns": 2 },
+          "children": [
+            { "id": "33333333-3333-3333-3333-333333333333", "type": "column", "props": {}, "children": [] },
+            { "id": "44444444-4444-4444-4444-444444444444", "type": "column", "props": {},
+              "children": [ { "id": "55555555-5555-5555-5555-555555555555", "type": "text",
+                              "props": { "text": "A column with words." } } ] }
+          ] }
+    ]);
+    let r = crate::validate(&payload);
+    for i in &r.issues {
+        println!(
+            "PROBE {} {} {} sev={}",
+            i.block_id, i.path, i.code, i.severity
+        );
     }
+}
