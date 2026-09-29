@@ -1477,6 +1477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-environment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sqlx",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-events"
 version = "0.1.0"
 dependencies = [
