@@ -142,6 +142,25 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Use the platform's AI chat",
     },
+    // The agent runtime (REQ-099). Three keys, and the split is the point: reading an agent is
+    // knowing how the installation's AI is configured, changing one is a write, and *running* one
+    // spends the installation's money and acts on its behalf through tools. An operator who can
+    // see a system prompt is not automatically somebody who should be able to press Run.
+    PermissionDef {
+        key: "ai.agents.read",
+        category: "ai",
+        description: "Read agents and their run history",
+    },
+    PermissionDef {
+        key: "ai.agents.manage",
+        category: "ai",
+        description: "Create, change and remove agents",
+    },
+    PermissionDef {
+        key: "ai.agents.run",
+        category: "ai",
+        description: "Start, cancel and resume agent runs",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {

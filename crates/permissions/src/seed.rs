@@ -91,6 +91,11 @@ const BASE_ROLES: &[BaseRole] = &[
             // silently re-points every copilot on every site, which is an owner's decision.
             "ai.usage.read",
             "ai.chat",
+            // An agent manager configures the installation's AI operators: read them, change
+            // them. It does NOT get `ai.agents.run` — running spends tokens and acts through
+            // tools, which is a separate decision from configuring what an agent may do.
+            "ai.agents.read",
+            "ai.agents.manage",
             "workflows.read",
             "workflows.manage",
             "workflows.run",
