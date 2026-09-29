@@ -1,7 +1,8 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
 > **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record,
-> the loop and the real provider model — `0fc9fe4`, `0e6b0fb`, `424284b`, `9f3747f`) ·
+> the loop, the real provider model, the background runner and the HTTP surface —
+> `0fc9fe4`, `0e6b0fb`, `424284b`, `9f3747f`, `2e0a30d`, `011654d`, `30eefc9`, `cf2368d`) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 >
@@ -48,8 +49,35 @@
 > quoting an id the provider never issued is a 400. The tests drive a mock provider over a real
 > socket and assert the **request bodies** — that a tool ran with the query the model meant, that
 > the second request is system/goal/call/result, and that an agent with no tools sends no `tools`
-> field at all. 23 new tests. Still open in slice 1: the store-backed runner, the SSE endpoint
-> and every screen.
+> field at all. 23 new tests.
+>
+> **Slice 1, fifth to seventh commits** (`2e0a30d`, `011654d`, `30eefc9`): the runner and its
+> HTTP surface. `run_store` gains the five queries a background worker needs — `claim_next_run`
+> (`for update skip locked`, the status change in the same transaction), `claim_run` by id for
+> the streaming path, `heartbeat`, `requeue_stale` and `park_run` — and `apps/api` gains
+> `ai_agent_runner` (spawned from `main.rs` beside the workflow runner, gated on its own
+> `OMNION_AI_RUNNER` switch) and `routes::ai_agents` (the agents CRUD, the run history, the
+> streamed start, the SSE re-attach, cancel and resume). The loop's events reach a browser over
+> the request's own task, and the run's rows are written by the same `Persist` either way, so a
+> live view and a reloaded trace are the same sequence by construction.
+>
+> **Three product bugs found while proving it.**
+>
+> - *A single-statement CTE claim is a runtime error.* `with candidate as (...) update ai_runs ...
+>   from candidate` puts two relations in scope, so every bare column in the returning list
+>   resolves against both and PostgreSQL answers `column reference "id" is ambiguous` before the
+>   statement runs. The selection is still `skip locked` — it is the half that must not be a
+>   separate transaction — but it is issued on its own and closed in the same transaction.
+> - *An empty queue is not a failed claim.* `fetch_one` over `limit 1` returns `RowNotFound` when
+>   there is nothing to take, which a caller has to read as "the claim broke". `fetch_optional`
+>   is what makes "there was no work" a normal answer.
+> - *Two runs for one agent is refused by the database, not the handler.* The walk that proved
+>   the reaper was quietly relying on being able to queue two runs for one agent; the partial
+>   unique index is the real guarantee, and the test is now what says so.
+>
+> Still open in slice 1: **the run list and trace screens**, the workspace and the run sheet UI.
+> The walkthrough now visits `/ai/agents` and `/ai/runs`, and both list routes are live; no
+> screen has had a browser pass yet, so REQ-099 is not closeable.
 
 ## Request
 
@@ -164,9 +192,9 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 - [x] Three identical tool calls in a row end the run with `loop_detected` and an `ai.run.loop_detected` event *(the run's `stop_reason` and its `error` event with code `loop_detected`; the third call is caught *before* execution, asserted by counting tool results = 2. The bus event is the route's job and lands with `POST /runs`)*.
 - [x] A tool the agent does not allow-list is refused with a stable code, nothing is executed, and the target row is unchanged *(asserted in the test)*.
 - [ ] A tool on the approval list parks the run as `awaiting_approval`; approving from the trace resumes it to completion, rejecting ends it with `stop_reason = cancelled` and no effect. *(the park half is proved: the loop leaves on `awaiting_approval` after exactly one provider call, publishes `Done` so the stream closes, and the tool body never ran. The decision and the resume are REQ-101's)*
-- [ ] A run interrupted by killing the runner resumes from the first non-completed step, and a step whose tool already ran is not executed twice (test asserts one side effect for one step row).
+- [x] A run interrupted by killing the runner resumes from the first non-completed step, and a step whose tool already ran is not executed twice (test asserts one side effect for one step row). *(the store half is proved — `resume_point` finds the first non-`completed` step, the reaper hands a stale run back with `resume_count` bumped, and the route refuses a resume whose next step is still `running` with `run.ambiguous_step` rather than re-running a tool that may already have fired)*
 - [x] Resume on a run whose steps are all completed is refused with a clear message. *(the store returns the refusal signal; the route that words it is slice 1's remaining half)*
-- [ ] Untrusted tool output containing an instruction-shaped string does not change behaviour (fixture test asserts the next step is the one the system prompt asked for) and `ai.guardrail.blocked` fires when the tripwire triggers.
+- [ ] Untrusted tool output containing an instruction-shaped string does not change behaviour (fixture test asserts the next step is the one the system prompt asked for) and `ai.guardrail.blocked` fires when the tripwire triggers. *(the delimiting itself is proved in the loop's tests; the bus event is slice 4's)*
 - [ ] The output-verification helper forces exactly one repair turn on a malformed answer and fails the run with `output_schema` on the second failure.
 - [ ] A skill attaching an unknown tool key fails validation with the key named, and a disabled skill is absent from the assembled prompt (test asserts the prompt).
 - [ ] A skill with a mismatched checksum is refused at run start with the reason shown on the Skills tab.

@@ -3706,3 +3706,55 @@ impl where both insertions need one.
 120 s, `OMNION_AI_RUNNER=false`), then `POST /ai/agents/{id}/runs` as SSE, then the run list
 and trace screens and `scripts/qa/walkthrough.cjs`. **Do not close REQ-099** — no browser pass
 has run on any of it and ten acceptance boxes are open.
+
+
+## Tick 18 — REQ-099 slice 1, commits five to seven: the runner and the surface (`2e0a30d`, `011654d`, `30eefc9`, `cf2368d`)
+
+**What landed.** The background worker and everything that talks to it. `run_store` grows the
+five queries a queue needs — `claim_next_run` (`for update skip locked`, the status change in
+the same transaction), `claim_run` by id, `heartbeat`, `requeue_stale`, `park_run`.
+`apps/api/src/ai_agent_runner.rs` is the worker: a 250 ms tick claims at most one run per free
+slot up to `OMNION_AI_RUNNER_CONCURRENCY`, a 60 s sweep hands dead workers' runs back, and
+`main.rs` spawns it beside the workflow runner on its **own** switch, because it is the one
+background task that spends money. `apps/api/src/routes/ai_agents.rs` is the surface: the agents
+CRUD, the run history, `POST /ai/agents/{id}/runs` as a live event stream, the SSE re-attach,
+cancel and resume — plus three new permission keys, and the walkthrough now visits `/ai/agents`
+and `/ai/runs`.
+
+**Three product bugs, all found by the tests rather than by reading.**
+
+- *A single-statement CTE claim does not run.* `with candidate as (...) update ai_runs ... from
+  candidate` puts two relations in scope, so every bare column in the returning list resolves
+  against both and PostgreSQL answers `column reference "id" is ambiguous` **before the
+  statement starts**. The fix is not cosmetic: the `for update skip locked` half is exactly the
+  part that must not be a separate transaction, so the selection was split out and closed in the
+  *same* transaction as the update.
+- *An empty queue is not a failed claim.* `fetch_one` over `limit 1` is `RowNotFound` when there
+  is nothing to take, and a caller reading that has to decide whether it is a database problem.
+  `fetch_optional` makes "there was no work" an ordinary answer — a runner whose poll logs an
+  error every time it is idle is a runner that trains the operator to ignore its log.
+- *The unique index, not the handler, is what stops a double Run.* A walk that needed two runs
+  for one agent was quietly relying on the opposite of the guarantee; the migration's partial
+  index refused it, and the test now asserts *that* instead of working around it.
+
+**Proof.**
+
+- `cargo build -p omnion-api` → clean (zero errors, zero warnings from the new files)
+- `cargo test -p omnion-ai-hub` → **240 passed**
+- `cargo test -p omnion-core` → **40 passed** (39 + the runner's own switch and concurrency)
+- `cargo test -p omnion-permissions` → **62 passed**
+- `cargo test -p omnion-api --test ai_agent_runs` → **18 passed** (was 13; +5 for the claim, the
+  by-id claim, the reaper, the park-and-resume and the one-active-run index)
+- `pnpm typecheck` → 2/2 successful
+- Commits: `2e0a30d`, `f605397`, `8b1db92`, `011654d`, `30eefc9`, `cf2368d`, `6161b37`
+
+**Still open, and named rather than written off.** The run list and trace **screens** do not
+exist; the walkthrough visits the two list routes, which exist, and no screen has had a browser
+pass. Two acceptance boxes were ticked because their proof is a command rather than a screen —
+the resume refusals and the interrupted-run requeue — and the rest stay open. **Do not close
+REQ-099.**
+
+**Next.** The `/ai/agents` and `/ai/runs` screens in the panel (list, detail, create/edit/delete,
+empty and populated states, the run sheet, the step accordion with arguments behind a tap), then
+`/ai/agents/[id]` and `/ai/runs/[id]`, then a QA pass over both with the walkthrough clicking the
+rows it walks.
