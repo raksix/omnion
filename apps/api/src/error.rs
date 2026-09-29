@@ -842,7 +842,11 @@ impl From<WorkflowError> for ApiError {
                 "credential_type_unknown",
                 format!("{key:?} is not a credential type"),
             ),
-            WorkflowError::CredentialScopeDenied { field, value, allowed } => Self::bad_request(
+            WorkflowError::CredentialScopeDenied {
+                field,
+                value,
+                allowed,
+            } => Self::bad_request(
                 "credential_scope_denied",
                 format!("{field} {value:?} is not one of {}", allowed.join(", ")),
             ),

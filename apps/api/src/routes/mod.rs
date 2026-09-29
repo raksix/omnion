@@ -97,6 +97,7 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod node_packages;
 pub mod node_types;
 pub mod notifications;
 pub mod notifications_admin;
@@ -519,8 +520,8 @@ pub fn router(state: AppState) -> Router {
         put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_write: MethodRouter<AppState, Infallible> =
         put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
-    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
-        .layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -568,10 +569,10 @@ pub fn router(state: AppState) -> Router {
         put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_run: MethodRouter<AppState, Infallible> =
         post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
-        .layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
@@ -582,8 +583,8 @@ pub fn router(state: AppState) -> Router {
         post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_test: MethodRouter<AppState, Infallible> =
         post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
-    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
-        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -597,16 +598,16 @@ pub fn router(state: AppState) -> Router {
         put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_folder_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
-    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
     let media_file_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
-    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
-        .layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     // A grant is removed by its own id alone — the row knows the node it was written on, so
     // putting the node in the URL as well would make a two-parameter path with a one-parameter
     // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
@@ -724,10 +725,10 @@ pub fn router(state: AppState) -> Router {
             delete(credentials::delete_credential)
                 .layer(guards::require(&state, "workflows.credentials.manage")),
         );
-    let credential_usage =
-        get(credentials::credential_usage).layer(guards::require(&state, "workflows.credentials.read"));
-    let credential_test =
-        post(credentials::test_credential).layer(guards::require(&state, "workflows.credentials.manage"));
+    let credential_usage = get(credentials::credential_usage)
+        .layer(guards::require(&state, "workflows.credentials.read"));
+    let credential_test = post(credentials::test_credential)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
     // The replace-secret path: manage, and audited. It is a distinct route rather than a
     // branch of the PATCH so the audit entry can say "a secret was replaced" instead of
     // "a credential changed".
@@ -739,13 +740,13 @@ pub fn router(state: AppState) -> Router {
     let node_packages = get(credentials::list_node_packages)
         .layer(guards::require(&state, "workflows.credentials.read"))
         .merge(
-            post(credentials::install_node_package)
+            post(node_packages::install_node_package)
                 .layer(guards::require(&state, "workflows.credentials.manage")),
         );
-    let node_package_item = patch(credentials::update_node_package)
+    let node_package_item = patch(node_packages::set_node_package_enabled)
         .layer(guards::require(&state, "workflows.credentials.manage"))
         .merge(
-            delete(credentials::remove_node_package)
+            delete(node_packages::remove_node_package)
                 .layer(guards::require(&state, "workflows.credentials.manage")),
         );
 
@@ -1266,7 +1267,6 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
-        
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
         .route("/media/grants/{grant_id}", media_grant_delete)

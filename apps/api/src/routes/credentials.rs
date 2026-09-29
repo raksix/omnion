@@ -409,6 +409,8 @@ pub struct NodePackageBody {
     pub checksum: String,
     /// The permissions it asked for.
     pub permissions: Value,
+    /// The namespaced node keys the package installed (`package.node`, 0055).
+    pub node_keys: Value,
     /// Whether its nodes are available.
     pub enabled: bool,
     /// When it was installed.
@@ -423,6 +425,7 @@ impl From<&NodePackage> for NodePackageBody {
             source: package.source.clone(),
             checksum: package.checksum.clone(),
             permissions: package.permissions.clone(),
+            node_keys: package.node_keys.clone(),
             enabled: package.enabled,
             installed_at: package.installed_at,
         }
@@ -1200,163 +1203,6 @@ pub async fn list_node_packages(
         packages: packages.iter().map(NodePackageBody::from).collect(),
     }))
 }
-
-/// `POST /api/v1/node-packages` — record an installation.
-///
-/// The REQ delegates the install *pipeline* to REQ-044; what lands here is the ledger row and
-/// its event, and a package whose validator (REQ-087 slice 4) has not run is refused with
-/// `node_package_invalid` rather than recorded.
-pub async fn install_node_package(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    Json(body): Json<InstallPackageBody>,
-) -> Result<(StatusCode, Json<NodePackageBody>), ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
-    let key = body.key.trim().to_string();
-    if key.is_empty() || !body.checksum.trim().is_empty() && body.version.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "node_package_invalid",
-            "a package needs a key, a version and a checksum",
-        ));
-    }
-    if !body.permissions.is_array() {
-        return Err(ApiError::bad_request(
-            "node_package_invalid",
-            "permissions must be an array",
-        ));
-    }
-    if !["bundled", "marketplace", "local"].contains(&body.source.as_str()) {
-        return Err(ApiError::bad_request(
-            "node_package_invalid",
-            "source must be one of bundled, marketplace, local",
-        ));
-    }
-
-    let package = credential_store::upsert_package(
-        state.db().pool(),
-        NewNodePackage {
-            organization_id,
-            key,
-            version: body.version.trim().to_string(),
-            source: body.source.clone(),
-            checksum: body.checksum.trim().to_string(),
-            permissions: body.permissions.clone(),
-        },
-    )
-    .await
-    .map_err(map_store)?;
-
-    bus::emit(
-        state.db().pool(),
-        NewEvent::new("workflows.node_package.installed")
-            .organization(organization_id)
-            .actor(current.user.id)
-            .payload(json!({
-                "package_key": package.key,
-                "version": package.version,
-            })),
-    )
-    .await
-    .ok();
-
-    Ok((StatusCode::CREATED, Json(NodePackageBody::from(&package))))
-}
-
-/// The install body.
-#[derive(Debug, Deserialize)]
-pub struct InstallPackageBody {
-    /// Package key.
-    pub key: String,
-    /// Version being installed.
-    pub version: String,
-    /// `bundled`, `marketplace` or `local`.
-    #[serde(default = "bundled_source")]
-    pub source: String,
-    /// Content checksum.
-    pub checksum: String,
-    /// Requested permissions.
-    #[serde(default = "empty_array")]
-    pub permissions: Value,
-}
-
-/// The default package source.
-fn bundled_source() -> String {
-    "bundled".to_string()
-}
-
-/// The default permission list.
-fn empty_array() -> Value {
-    json!([])
-}
-
-/// `PATCH /api/v1/node-packages/{key}` — enable or disable.
-///
-/// Disabling is the REQ's degradation path: the nodes stop being offered and the workflows
-/// that name them keep loading. No workflow is touched, ever, by this endpoint.
-pub async fn update_node_package(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    Path(key): Path<String>,
-    Json(body): Json<UpdatePackageBody>,
-) -> Result<Json<NodePackageBody>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
-    let package = credential_store::set_package_enabled(
-        state.db().pool(),
-        organization_id,
-        key.trim(),
-        body.enabled,
-    )
-    .await
-    .map_err(map_store)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "node_package_missing",
-            format!("no package {key:?} is installed"),
-        )
-    })?;
-    Ok(Json(NodePackageBody::from(&package)))
-}
-
-/// The package update body.
-#[derive(Debug, Deserialize)]
-pub struct UpdatePackageBody {
-    /// Whether its nodes are available.
-    pub enabled: bool,
-}
-
-/// `DELETE /api/v1/node-packages/{key}` — remove, keeping the ledger row.
-pub async fn remove_node_package(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    Path(key): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
-    let removed = credential_store::remove_package(state.db().pool(), organization_id, key.trim())
-        .await
-        .map_err(map_store)?;
-    if !removed {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "node_package_missing",
-            format!("no package {key:?} is installed"),
-        ));
-    }
-    bus::emit(
-        state.db().pool(),
-        NewEvent::new("workflows.node_package.removed")
-            .organization(organization_id)
-            .actor(current.user.id)
-            .payload(json!({ "package_key": key.trim() })),
-    )
-    .await
-    .ok();
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------------------------
 
 /// Derive a credential key from a display name.
 ///

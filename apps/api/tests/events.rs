@@ -1231,7 +1231,13 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             !entry["area"].as_str().unwrap_or_default().is_empty(),
             "{name} belongs to no area"
         );
-        assert!(!entry["payload_fields"].as_array().expect("fields").is_empty(), "{name}");
+        assert!(
+            !entry["payload_fields"]
+                .as_array()
+                .expect("fields")
+                .is_empty(),
+            "{name}"
+        );
 
         // The group is the part a receiver can subscribe to as a whole, and it must agree
         // with the name: a `group` that does not prefix the `name` is a picker that would
@@ -1257,14 +1263,19 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             .iter()
             .find(|field| field["name"] == required)
             .unwrap_or_else(|| panic!("page.published must declare {required}"));
-        assert_eq!(field["required"], true, "{required} is promised as required");
+        assert_eq!(
+            field["required"], true,
+            "{required} is promised as required"
+        );
     }
 
     // The counts agree with the list, and the ceiling the panel enforces is published with
     // it so the form does not hardcode a number that can drift from the validator.
     assert_eq!(
         catalogue.body["live_count"].as_u64().expect("live_count") as usize
-            + catalogue.body["reserved_count"].as_u64().expect("reserved_count") as usize,
+            + catalogue.body["reserved_count"]
+                .as_u64()
+                .expect("reserved_count") as usize,
         entries.len(),
         "live + reserved is the whole list"
     );
@@ -1274,7 +1285,10 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         "the panel's ceiling is the validator's ceiling"
     );
     assert!(
-        !catalogue.body["areas"].as_array().expect("areas").is_empty(),
+        !catalogue.body["areas"]
+            .as_array()
+            .expect("areas")
+            .is_empty(),
         "the picker groups by area"
     );
 

@@ -42,12 +42,12 @@ use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use omnion_workflows::credential_store;
 use omnion_workflows::credentials::Credential;
+use omnion_workflows::oauth::RefreshLock;
 use omnion_workflows::oauth::{
     self, CallbackQuery, LocalBox, PkcePair, StateRejection, TokenRequest, TokenSet, build_state,
     state_hash, verify_state,
 };
 use omnion_workflows::oauth_client::{OAuthClient, PROVIDER_TIMEOUT, token_set_from_status};
-use omnion_workflows::oauth::RefreshLock;
 use omnion_workflows::oauth_refresh::{
     self, RefreshOutcome, RefreshPlan, reauth_sentence, refusal_is_about_the_credential,
 };
@@ -113,9 +113,7 @@ fn installation_material() -> Vec<u8> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            "omnion-development-mfa-key-do-not-use-in-production".to_string()
-        })
+        .unwrap_or_else(|| "omnion-development-mfa-key-do-not-use-in-production".to_string())
         .into_bytes()
 }
 
@@ -320,15 +318,21 @@ fn settle_page(outcome: &str, headline: &str) -> Html<String> {
 }
 
 /// The browser answer: a redirect when the panel URL builds, a page when it does not.
-fn settled(headers: &HeaderMap, outcome: &'static str, headline: &'static str) -> axum::response::Response {
+fn settled(
+    headers: &HeaderMap,
+    outcome: &'static str,
+    headline: &'static str,
+) -> axum::response::Response {
     let response = match settle_redirect(headers, outcome) {
         Some(location) => axum::response::Response::builder()
             .status(StatusCode::OK)
             .header(
                 axum::http::header::LOCATION,
-                location.parse::<axum::http::HeaderValue>().unwrap_or_else(|_| {
-                    axum::http::HeaderValue::from_static("/workflows/credentials")
-                }),
+                location
+                    .parse::<axum::http::HeaderValue>()
+                    .unwrap_or_else(|_| {
+                        axum::http::HeaderValue::from_static("/workflows/credentials")
+                    }),
             )
             .body(axum::body::Body::empty())
             .unwrap_or_default(),
@@ -338,10 +342,7 @@ fn settled(headers: &HeaderMap, outcome: &'static str, headline: &'static str) -
             let page = settle_page(outcome, headline);
             axum::response::Response::builder()
                 .status(StatusCode::OK)
-                .header(
-                    axum::http::header::CONTENT_TYPE,
-                    "text/html; charset=utf-8",
-                )
+                .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
                 .body(axum::body::Body::from(page.0))
                 .unwrap_or_default()
         }
@@ -563,15 +564,12 @@ pub async fn oauth_callback(
         .state
         .as_deref()
         .ok_or_else(|| state_rejection(StateRejection::Unrecognised))?;
-    let code = query
-        .code
-        .clone()
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                oauth::codes::EXCHANGE,
-                "the provider sent neither a code nor an error, so there is nothing to exchange",
-            )
-        })?;
+    let code = query.code.clone().ok_or_else(|| {
+        ApiError::bad_request(
+            oauth::codes::EXCHANGE,
+            "the provider sent neither a code nor an error, so there is nothing to exchange",
+        )
+    })?;
 
     // Two independent checks, in this order. `verify_state` proves the value is one this
     // installation minted, is inside its window, and names a live credential *in a known
@@ -720,38 +718,38 @@ pub async fn oauth_callback(
     // store is unavailable the answer is a *failure*, not a partial success: a credential
     // marked connected with no token behind it authenticates nothing, and the reader is the
     // one who finds out at run time.
-    let secret_ref =
-        match write_token_payload(state.db().pool(), organization_id, &token_set).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                let _ = oauth_store::fail_flow(
-                    state.db().pool(),
-                    organization_id,
-                    flow.id,
-                    "credential_secret_store_unavailable",
-                    error.message(),
-                )
-                .await;
-                bus::emit(
-                    state.db().pool(),
-                    NewEvent::new("workflows.credential.oauth_failed")
-                        .organization(organization_id)
-                        .payload(json!({
-                            "credential_id": credential.id,
-                            "key": credential.key,
-                            "code": "credential_secret_store_unavailable",
-                            "reason": error.message(),
-                        })),
-                )
-                .await
-                .ok();
-                return Ok(settled(
-                    &headers,
-                    "failed",
-                    "The token was not stored, so the connection was not made.",
-                ));
-            }
-        };
+    let secret_ref = match write_token_payload(state.db().pool(), organization_id, &token_set).await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = oauth_store::fail_flow(
+                state.db().pool(),
+                organization_id,
+                flow.id,
+                "credential_secret_store_unavailable",
+                error.message(),
+            )
+            .await;
+            bus::emit(
+                state.db().pool(),
+                NewEvent::new("workflows.credential.oauth_failed")
+                    .organization(organization_id)
+                    .payload(json!({
+                        "credential_id": credential.id,
+                        "key": credential.key,
+                        "code": "credential_secret_store_unavailable",
+                        "reason": error.message(),
+                    })),
+            )
+            .await
+            .ok();
+            return Ok(settled(
+                &headers,
+                "failed",
+                "The token was not stored, so the connection was not made.",
+            ));
+        }
+    };
 
     let summary = token_set.summary();
     let updated = credential_store::mark_connected(
@@ -835,17 +833,14 @@ pub async fn disconnect(
 
     omnion_audit::record(
         state.db().pool(),
-        NewAuditEntry::by_user(
-            current.user.id,
-            "workflow.credential_disconnected",
-        )
-        .organization(organization_id)
-        .target("workflow_credential", credential.id.to_string())
-        .metadata(json!({
-            "key": credential.key,
-            "was_connected": was_connected,
-            "flows_expired": flows_expired,
-        })),
+        NewAuditEntry::by_user(current.user.id, "workflow.credential_disconnected")
+            .organization(organization_id)
+            .target("workflow_credential", credential.id.to_string())
+            .metadata(json!({
+                "key": credential.key,
+                "was_connected": was_connected,
+                "flows_expired": flows_expired,
+            })),
     )
     .await
     .ok();
@@ -895,8 +890,7 @@ pub async fn refresh_credential(
         Some(secret) => Some(secret.to_string()),
         None => read_stored_client_secret(state.db().pool(), &credential).await?,
     };
-    let stored_refresh_token =
-        read_stored_refresh_token(state.db().pool(), &credential).await?;
+    let stored_refresh_token = read_stored_refresh_token(state.db().pool(), &credential).await?;
     let plan = RefreshPlan {
         credential_id: credential.id,
         token_url: config.token_url,
@@ -963,7 +957,10 @@ pub async fn refresh_credential(
                 organization_id,
                 credential.id,
                 &secret_ref,
-                summary.subject.as_deref().or(credential.oauth_subject.as_deref()),
+                summary
+                    .subject
+                    .as_deref()
+                    .or(credential.oauth_subject.as_deref()),
                 summary
                     .scopes
                     .as_deref()
@@ -1073,11 +1070,7 @@ pub async fn refresh_credential(
 // ---------------------------------------------------------------------------------------------
 
 /// Load one credential in this organization, or refuse as though it did not exist.
-async fn load(
-    pool: &PgPool,
-    organization_id: Uuid,
-    id: Uuid,
-) -> ApiResult<Credential> {
+async fn load(pool: &PgPool, organization_id: Uuid, id: Uuid) -> ApiResult<Credential> {
     credential_store::get_credential(pool, organization_id, id)
         .await
         .map_err(map_store_error)?
@@ -1192,11 +1185,7 @@ impl HttpClient {
 }
 
 impl OAuthClient for HttpClient {
-    async fn exchange_code(
-        &self,
-        token_url: &str,
-        request: &TokenRequest,
-    ) -> FlowResult<TokenSet> {
+    async fn exchange_code(&self, token_url: &str, request: &TokenRequest) -> FlowResult<TokenSet> {
         self.post(token_url, request).await
     }
 
@@ -1231,10 +1220,18 @@ mod tests {
 
     #[test]
     fn a_state_is_hashed_rather_than_stored() {
-        let state = build_state(Uuid::nil(), Uuid::nil(), &state_key(), OffsetDateTime::now_utc());
+        let state = build_state(
+            Uuid::nil(),
+            Uuid::nil(),
+            &state_key(),
+            OffsetDateTime::now_utc(),
+        );
         let hash = state_hash(&state);
         assert_eq!(hash.len(), 64, "sha-256 hex is 64 characters");
-        assert!(!hash.contains(&state), "the state itself is nowhere in the hash");
+        assert!(
+            !hash.contains(&state),
+            "the state itself is nowhere in the hash"
+        );
         assert_ne!(
             hash,
             state_hash(&format!("{state}x")),
@@ -1273,10 +1270,19 @@ mod tests {
         // handler never has to guess which tenant it is in.
         let organization = Uuid::from_u128(0x1234_5678);
         let credential = Uuid::from_u128(0xabcd);
-        let state = build_state(organization, credential, &state_key(), OffsetDateTime::now_utc());
-        let verified =
-            verify_state(&state, &state_key(), OffsetDateTime::now_utc(), Some(credential))
-                .expect("a state we just minted verifies");
+        let state = build_state(
+            organization,
+            credential,
+            &state_key(),
+            OffsetDateTime::now_utc(),
+        );
+        let verified = verify_state(
+            &state,
+            &state_key(),
+            OffsetDateTime::now_utc(),
+            Some(credential),
+        )
+        .expect("a state we just minted verifies");
         assert_eq!(verified.organization_id, organization);
         assert_eq!(verified.credential_id, credential);
     }
@@ -1373,7 +1379,9 @@ mod tests {
         assert!(query.refusal().is_none());
         assert!(query.state.is_none());
         assert!(
-            state_rejection(StateRejection::Unrecognised).message().contains("start it again"),
+            state_rejection(StateRejection::Unrecognised)
+                .message()
+                .contains("start it again"),
             "and the sentence says what to do"
         );
     }
@@ -1429,7 +1437,10 @@ mod tests {
     fn a_blank_client_id_is_treated_as_absent() {
         let mut credential = credential_stub();
         credential.settings = json!({ "client_id": "   " });
-        assert!(client_id(&credential).is_err(), "whitespace is not a client id");
+        assert!(
+            client_id(&credential).is_err(),
+            "whitespace is not a client id"
+        );
     }
 
     #[test]

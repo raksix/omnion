@@ -33,7 +33,7 @@ use crate::registry::CredentialDefinition;
 
 /// Columns of `workflow_node_packages` for one `select`.
 pub const PACKAGE_COLUMNS: &str = "id, organization_id, key, version, source, checksum, \
-     permissions, enabled, installed_at, removed_at";
+     permissions, node_keys, enabled, installed_at, removed_at";
 
 /// One installed node package.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -52,6 +52,15 @@ pub struct NodePackage {
     pub checksum: String,
     /// The permissions the package asked for, as stored JSON.
     pub permissions: serde_json::Value,
+    /// The *namespaced* node keys the package installed (`package.node`, 0055).
+    ///
+    /// Recorded at install time because the manifest that answers this belongs to whoever
+    /// installed it, and the REQ's removal promise — "flags dependent workflows instead of
+    /// breaking them" — is a promise about naming the affected workflows. A remover that
+    /// cannot name them can only say something generic, which is a warning nobody can act on.
+    /// The local names from the manifest are deliberately *not* stored: a workflow's graph
+    /// names the namespaced key, so matching on the local name finds nothing.
+    pub node_keys: serde_json::Value,
     /// Whether its nodes are available.
     pub enabled: bool,
     /// When it was installed.
@@ -75,6 +84,8 @@ pub struct NewNodePackage {
     pub checksum: String,
     /// Requested permissions, as JSON.
     pub permissions: serde_json::Value,
+    /// The namespaced node keys this install contributes, as JSON.
+    pub node_keys: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -653,11 +664,12 @@ async fn usage_in(
 pub async fn upsert_package(pool: &PgPool, new: NewNodePackage) -> Result<NodePackage> {
     let sql = format!(
         "insert into workflow_node_packages (organization_id, key, version, source, checksum, \
-           permissions) \
-         values ($1, $2, $3, $4, $5, $6) \
+           permissions, node_keys) \
+         values ($1, $2, $3, $4, $5, $6, $7) \
          on conflict (organization_id, key) where removed_at is null \
          do update set version = excluded.version, source = excluded.source, \
                        checksum = excluded.checksum, permissions = excluded.permissions, \
+                       node_keys = excluded.node_keys, \
                        enabled = true, installed_at = now() \
          returning {PACKAGE_COLUMNS}"
     );
@@ -668,9 +680,80 @@ pub async fn upsert_package(pool: &PgPool, new: NewNodePackage) -> Result<NodePa
         .bind(&new.source)
         .bind(&new.checksum)
         .bind(new.permissions)
+        .bind(new.node_keys)
         .fetch_one(pool)
         .await?;
     Ok(package)
+}
+
+/// The live row for one package key, if it is installed.
+///
+/// The install path needs the *previous* version to enforce the REQ's "equal-or-newer only",
+/// and it needs it before the upsert — an upsert that learned the old version afterwards
+/// would have already overwritten it.
+pub async fn find_package(
+    pool: &PgPool,
+    organization_id: Uuid,
+    key: &str,
+) -> Result<Option<NodePackage>> {
+    let sql = format!(
+        "select {PACKAGE_COLUMNS} from workflow_node_packages \
+         where organization_id = $1 and key = $2 and removed_at is null"
+    );
+    Ok(sqlx::query_as::<_, NodePackage>(&sql)
+        .bind(organization_id)
+        .bind(key)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// The node keys of a package row, as the strings a graph holds.
+///
+/// The column is JSON and a reader that assumed an array would panic on a `null` a pre-0055
+/// row carries, so the read is a function that answers an empty list instead: the caller's
+/// question is "which nodes does this package own" and a row written before the column existed
+/// owns none that can be named.
+pub fn package_node_keys(package: &NodePackage) -> Vec<String> {
+    package
+        .node_keys
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every (workflow id, workflow name, node keys) triple naming any of `keys`.
+///
+/// This is the remover's read: the REQ says a removal *flags dependent workflows*, and a flag
+/// without a list is a flag without an action. The same {@link NODES_EXPR} the credential
+/// usage probe uses, so a graph names a node the same way in both places.
+pub async fn workflow_node_references(
+    pool: &PgPool,
+    organization_id: Uuid,
+    keys: &[String],
+) -> Result<Vec<(Uuid, String, Vec<String>)>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "select w.id, w.name, array_remove(array_agg(distinct n->>'type'), null) as node_keys \
+         from workflows w, lateral jsonb_array_elements({NODES_EXPR}) as n \
+         where w.organization_id = $1 \
+           and exists (select 1 from unnest($2::text[]) as wanted(key) \
+                       where wanted.key = coalesce(nullif(n->>'type', ''), nullif(n->>'action', ''))) \
+         group by w.id, w.name \
+         order by w.name"
+    );
+    let rows: Vec<(Uuid, String, Vec<String>)> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(keys)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// List live packages, newest first.
