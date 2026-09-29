@@ -62,6 +62,10 @@ const SECRET_MASK: &str = "••••••••••••";
 /// table rather than a judgement call: `credential_in_use` is a `409` (the resource exists
 /// and the conflict is real), a write-only refusal is a `400` (the payload is wrong), and
 /// nothing that a caller could retry forever is a `400`.
+pub fn map_store_error(error: omnion_workflows::WorkflowError) -> ApiError {
+    map_store(error)
+}
+
 fn map_store(error: omnion_workflows::WorkflowError) -> ApiError {
     use omnion_workflows::WorkflowError as E;
     match error {
@@ -214,7 +218,12 @@ impl CredentialBody {
     }
 
     /// Describe one row, resolving its type from the registry.
-    fn describe(credential: &Credential) -> Self {
+    ///
+    /// Public because the OAuth surface (REQ-087 slice 3) answers with the *same* body: a
+    /// credential that a callback connected and one a create returned must be rendered by one
+    /// function, or the two would disagree about `has_secret` and the panel would show a
+    /// connected credential with no token.
+    pub fn describe(credential: &Credential) -> Self {
         Self::build(credential, find_credential_type(&credential.r#type))
     }
 }
@@ -1415,6 +1424,31 @@ async fn write_secrets(
 #[must_use]
 pub fn secret_mask() -> &'static str {
     SECRET_MASK
+}
+
+/// Hand a token set to the encrypted store and return the handle `workflow_credentials` keeps.
+///
+/// This is the **only** place a provider's token crosses out of memory, and it is here rather
+/// than in the OAuth module so that the one function which writes a secret is greppable and
+/// has one refusal to reason about. The same REQ-125 store that `write_secrets` names is the
+/// one that has to exist before a token can be kept; inventing a local scheme here would be
+/// the exact failure the REQ's risk line warns about, so this refuses.
+///
+/// The refusal is honest about what happened: the provider *did* issue a token, it is simply
+/// not ours to keep in this build, and the caller must say so rather than mark the credential
+/// connected. A credential showing a green chip with nothing behind it authenticates nothing,
+/// and the person who finds that out is a workflow run at three in the morning.
+pub async fn write_token_payload(
+    _pool: &sqlx::PgPool,
+    _organization_id: Uuid,
+    _token_set: &omnion_workflows::oauth::TokenSet,
+) -> Result<String, ApiError> {
+    Err(ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "secret_store_unavailable",
+        "the provider issued a token but the encrypted secret store is not available in this \
+         build, so it was not kept and the credential is not connected",
+    ))
 }
 
 #[cfg(test)]
