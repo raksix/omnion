@@ -1,4 +1,81 @@
 
+
+## tick 13 — REQ-065 slice 4 part 7 (`f0246f4`) — criterion 8, the clause that did not exist
+
+**The criterion was half absent, and the half that was missing had a helper sitting next to it.**
+The refusal half was true — `resolve_session` filters on `u.status = 'active'`, so a deactivated
+account's sessions stop resolving. The revocation half did not exist: `revoke_sessions_for_user`
+has been in `crates/identity/src/sessions.rs` since the module was written, documented "used by
+password resets and admin actions", and had **zero callers anywhere in the workspace**. Nothing
+revoked a session when a directory said a person was gone.
+
+**Why it reads as green.** Every assertion that already existed stops at "the session no longer
+works" — and it did not work. The hole is one step further out, and one step a real deployment
+takes without anybody deciding to: a directory deactivates somebody who left the company, and a
+later re-sync notices the account reappeared and sets it back to `active`. The status filter no
+longer masks the token, the session row was never touched, and every old browser tab holds a
+working session again **with its original expiry** — so "we deactivated them" turns out to have
+been a statement about the next few minutes. A status flag is a *query filter*; a session token
+is a *bearer credential* the user is already holding. Only revoking the row makes it dead.
+
+**The fix is one function, and the shape is the argument.** `set_status_and_end_sessions` flips
+the status and ends the sessions in **one transaction**, and it reads the previous status **in the
+same statement** as the write (`with previous as (select id, status … for update)`), so two
+concurrent deactivations cannot both read `active` and both believe they were the one that ended
+them. A separate `find_by_id` before the write would reintroduce exactly that race — which is why
+the read is not a convenience.
+
+Three boundaries, each asserted, because any two of them collapsing produce a plausible product:
+
+* **A status that leaves the account in service revokes nothing.** Re-activating an account is
+  not an instruction to log the person out of the tabs they just signed in with. Getting this
+  wrong is the mirror-image bug: everybody deactivated en masse for an org-wide event comes back
+  and has to sign in again.
+* **A no-op revokes nothing.** `disabled` on an already-disabled account must not clear whatever
+  sessions have appeared since — a connector re-sends whole documents on its timer, so the
+  "revoke whenever disabled" version signs a colleague out every few minutes with no action of
+  their own. This is the same lesson as the group-membership event in `f5531ff`, in the opposite
+  direction: an event (or a revocation) that fires on a *write* rather than on a *change* trains
+  its reader to ignore it.
+* **An unknown status is refused before any write.** The variant a caller can pass is a `&str`,
+  so the check has to be repeated rather than inherited — and refusing after the write would
+  leave a transaction that had to be rolled back by hand.
+
+`sqlx::FromRow` is derived and does not exist for tuples, so the row is a named `StatusUpdateRow`
+rather than `(User, String)` — which is also the better shape, because `previous_status` is the
+only reason the query exists and a positional accessor would hide what field 6 is.
+
+**The count goes in the sync log.** "deactivated" says the account is out; the count says how many
+live tokens went with it. The account row cannot say that, and an operator reading a directory
+report has no other way to learn that three people were still holding working sessions — which is
+the exact failure this slice removes.
+
+**Proof, and the part that matters most.** `run-media-walk.sh iam_deprovision_revocation` → **1
+passed** (21.1s) against a disposable database. It was **red against the previous code**: with the
+fix stashed and only the test file left, it fails at `the session must be REVOKED, not merely
+unresolvable` — after driving the real SCIM PATCH route and reading the real session row, so the
+red is a fact about the product rather than a compile error. That stash also cost three wrong
+guesses about the harness (`Config::from_env` + `BuildInfo::new`, the mint route
+`/iam/provisioning/tokens` with `name` not `label`, and a session **cookie** where a bearer was
+meant), each of which the error named precisely; the walk is copied from `scim.rs` rather than
+written from memory for that reason.
+The clause only the fix satisfies is asserted directly: deactivate → **reactivate** → the old
+token is still dead, presented to `resolve_session` after asserting that same token resolved a
+moment earlier. A test that only checks "dead afterwards" passes against a session that never
+worked, so the before-assertion is not decoration.
+`cargo test -p omnion-identity --lib` → **216 passed**; `-p omnion-api --lib` → **197**;
+`run-media-walk.sh scim` → **2 passed** (the walk that drives the same three routes and breaks
+first if the no-op rule is wrong); `tsc --noEmit` in `apps/admin` → exit 0.
+
+**Not claimed.** The panel half — the sync drawer does not yet surface `revoked_sessions`, and the
+browser pass has still not run on this branch, so criterion 18's "zero high findings" half stays
+unticked. `VersionMissing(19)` from a sibling branch's shared dev database killed the first two
+walk attempts before an assertion; the disposable-database runner is what makes the walk mean
+anything here.
+
+**Next.** The `revoked_sessions` count on the sync drawer (the panel half of this commit), then the
+live OIDC round trip against the stub IdP with a SCIM-provisioned subject, which is the one
+assertion `115cce4` still rests on unit tests and the dry run.
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
