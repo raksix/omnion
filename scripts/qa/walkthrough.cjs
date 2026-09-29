@@ -4144,6 +4144,180 @@ async function runNotificationSettingsDepth(page, report) {
  * `rescheduled` when the pass says `rescheduleMoved`, and the mode then reports every check
  * missing forever.
  */
+/**
+ * The SEO depth pass (REQ-064, slice 3).
+ *
+ * Appended to `walkthrough.cjs` as a self-contained function. It creates a redirect *through the
+ * screen*, tests it against a path, and regenerates the sitemap — then reads the stored XML back
+ * out of SQL rather than trusting the preview. Three properties the store tests cannot see are
+ * the reason it exists:
+ *
+ * * **the preview is the server's tag set.** The panel renders what the API returned; this pass
+ *   cannot see inside that, so it checks the *absence* of a client-side rebuild instead — the
+ *   sitemap's `lastmod` in SQL is the store's value, and the on-screen count must agree with it.
+ * * **a test does not count a hit.** Observable only from the button: the counter is zero after
+ *   the pass pressed it, which is the assertion that keeps the panel honest.
+ * * **an empty sitemap says why.** Before the first regeneration the panel must explain itself
+ *   rather than show a blank `<pre>`; after it, the same region must show the document.
+ *
+ * Every step writes under `steps.*` and `--only=seo` demands the list below by name, read off this
+ * function rather than off the REQ's prose.
+ */
+async function runSeoDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const from = `/qa-old-${stamp}`;
+  const to = `/qa-new-${stamp}`;
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the screen has nothing to read";
+    return steps;
+  }
+
+  // ---------------------------------------------------------------- the screen and its panels
+  await page.goto(`${URL_ADMIN}/seo`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.screenReady = (await page.locator("[data-seo-state=\"ready\"]").count()) > 0;
+  steps.redirectsPanelIsTheDefaultTab =
+    (await page.locator("[data-seo-panel=\"redirects\"]").count()) > 0;
+  steps.emptyRedirectsExplainThemselves =
+    (await page.locator("[data-seo-redirects-empty]").count()) > 0;
+
+  // ---------------------------------------------------------------- create a rule through the screen
+  await page.locator("[data-seo-redirect-new]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.redirectFormOpened = (await page.locator("[data-seo-redirect-form]").count()) > 0;
+  await page.locator("[data-seo-redirect-from-input]").fill(from).catch(() => {});
+  await page.locator("[data-seo-redirect-to-input]").fill(to).catch(() => {});
+  // Read the typed values BACK: a `fill()` that lands while React is still mounting reports
+  // success, and every assertion naming the typed path then matches nothing.
+  steps.fromIsOnTheInput = (await page.inputValue("[data-seo-redirect-from-input]").catch(() => "")) === from;
+  steps.toIsOnTheInput = (await page.inputValue("[data-seo-redirect-to-input]").catch(() => "")) === to;
+  await page.locator("[data-seo-redirect-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.ruleRowLanded = (await page.locator(`[data-seo-redirect-row="${from}"]`).count()) > 0;
+  steps.ruleIsOnScreen = await page
+    .locator(`[data-seo-redirect-row="${from}"]`)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  steps.ruleIsInSql =
+    qaSql(`select count(*) from cms_seo_redirects where from_path = '${from}'`) === "1";
+
+  // ---------------------------------------------------------------- the test does not count a hit
+  await page.locator(`[data-seo-redirect-test="${from}"]`).click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.testResultShown = (await page.locator("[data-seo-test-result]").count()) > 0;
+  steps.testNamesTheRule = (await page
+    .locator("[data-seo-test-result]")
+    .first()
+    .innerText()
+    .catch(() => "")) .includes(from);
+  steps.testSaysItDidNotCount = (await page
+    .locator("[data-seo-test-result]")
+    .first()
+    .innerText()
+    .catch(() => "")) .includes("did not count");
+  // The counter is the whole reason the test is a separate entry point.
+  steps.testCountedNoHit =
+    qaSql(`select coalesce(sum(hits), 0) from cms_seo_redirects where from_path = '${from}'`) === "0";
+  steps.hitsBadgeSaysZero = (await page
+    .locator(`[data-seo-redirect-row="${from}"] [data-seo-redirect-hits]`)
+    .first()
+    .innerText()
+    .catch(() => ""))
+    .includes("0 hit");
+
+  // ---------------------------------------------------------------- the pattern is refused as a path
+  await page.locator("[data-seo-redirect-new]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await page.locator("[data-seo-redirect-from-input]").fill("/qa-no-slash").catch(() => {});
+  await page.locator("[data-seo-redirect-to-input]").fill(to).catch(() => {});
+  await page.locator("[data-seo-redirect-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.relativeFromRefused = (await page.locator("[data-seo-redirect-error]").count()) > 0;
+  steps.relativeFromNamesTheRule =
+    (await page.locator("[data-seo-redirect-error]").first().innerText().catch(() => "")).includes("/");
+  steps.relativeFromStoredNothing =
+    qaSql(`select count(*) from cms_seo_redirects where from_path = '/qa-no-slash'`) === "0";
+
+  // ---------------------------------------------------------------- the sitemap panel
+  await page.locator("[data-seo-tab=\"sitemap\"]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.sitemapPanelOpened = (await page.locator("[data-seo-panel=\"sitemap\"]").count()) > 0;
+  steps.pageTypesAreThisSitesOwn =
+    (await page.locator("[data-seo-sitemap-types]").count()) > 0 ||
+    (await page.locator("[data-seo-no-page-types]").count()) > 0;
+  steps.robotsEditorIsPrefilled = (
+    (await page.inputValue("[data-seo-robots]").catch(() => "")) || ""
+  ).includes("User-agent");
+
+  // A robots.txt that blocks the whole site is saved WITH a warning, not refused.
+  await page.locator("[data-seo-robots]").fill("User-agent: *\nDisallow: /\n").catch(() => {});
+  await page.waitForTimeout(700);
+  steps.blockingRobotsWarns = (await page.locator("[data-seo-robots-warnings]").count()) > 0;
+  steps.blockingRobotsWarningNamesItself = (await page
+    .locator("[data-seo-robots-warnings]")
+    .first()
+    .innerText()
+    .catch(() => "")).includes("not to read it");
+  await page.locator("[data-seo-settings-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.robotsSaved = qaSql(
+    `select count(*) from cms_seo_settings where site_id = '${siteId}' and robots_txt like '%Disallow: /%'`,
+  ) === "1";
+
+  // Regenerate: the preview must show real XML and the count must match what is in SQL.
+  await page.locator("[data-seo-sitemap-regenerate]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.sitemapPreviewShown = (await page.locator("[data-seo-sitemap-preview] pre").count()) > 0;
+  const preview = await page
+    .locator("[data-seo-sitemap-preview] pre")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.previewIsRealXml = preview.startsWith("<?xml") && preview.includes("<urlset");
+  const storedUrls = qaSql(
+    `select count(*) from cms_seo_settings s, unnest(string_to_array(coalesce(s.sitemap_xml, ''), '<url>')) as part \
+     where s.site_id = '${siteId}' and part = '<url>'`,
+  );
+  const shownUrls = (await page
+    .locator("[data-seo-sitemap-preview]")
+    .first()
+    .innerText()
+    .catch(() => "")) .match(/(\d+) URL/);
+  steps.shownCountMatchesStorage = shownUrls ? shownUrls[1] === storedUrls : false;
+  steps.previewCountIsNotAFabricatedNumber = shownUrls !== null;
+
+  // ---------------------------------------------------------------- broken links
+  await page.locator("[data-seo-tab=\"broken\"]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.brokenPanelOpened = (await page.locator("[data-seo-broken-empty], [data-seo-broken-list]").count()) > 0;
+  await page.locator("[data-seo-scan]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.scanReportedSomething =
+    (await page.locator("[data-seo-notice]").count()) > 0 &&
+    ((await page.locator("[data-seo-notice]").first().innerText().catch(() => "")) || "").length > 0;
+
+  // ---------------------------------------------------------------- delete, with a confirmation that names it
+  await page.locator("[data-seo-tab=\"redirects\"]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator(`[data-seo-redirect-delete="${from}"]`).click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.deleteConfirmOpened = (await page.locator("[data-seo-confirm]").count()) > 0;
+  steps.deleteConfirmNamesThePath = (await page
+    .locator("[data-seo-confirm]")
+    .first()
+    .innerText()
+    .catch(() => "")).includes(from);
+  await page.locator("[data-seo-confirm-yes]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.deletedFromTheList = (await page.locator(`[data-seo-redirect-row="${from}"]`).count()) === 0;
+  steps.deletedFromSql = qaSql(`select count(*) from cms_seo_redirects where from_path = '${from}'`) === "0";
+
+  return steps;
+}
+
 async function runFormsDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -6366,6 +6540,54 @@ async function main() {
   // that is effectively untested, so the pass gets its own entry point. It runs the SAME function
   // the full pass calls; what it does not do is reset the database (run.sh does that) or report a
   // `summary.json` with the whole pass's counts.
+  // `--only=seo` runs the SEO toolkit's own depth pass alone.
+  //
+  // Same argument as `--only=forms` and `--only=menus`: the depth pass is written and a full pass
+  // is the only thing that reaches it, forty minutes in, on a box six writers share. A screen
+  // that can only be proved by a pass that usually dies before reaching it is a screen that is
+  // effectively untested, so the pass gets its own entry point. It runs the SAME function the
+  // full pass calls; what it does not do is reset the database (run.sh does that) or report a
+  // `summary.json` with the whole pass's counts.
+  if (process.argv.includes("--only=seo")) {
+    report.seo = await runSeoDepth(page, report);
+    log(`seo: ${JSON.stringify(report.seo)}`);
+    // The list below is the pass's own vocabulary, read off the function rather than guessed.
+    const required = [
+      "screenReady", "redirectsPanelIsTheDefaultTab", "emptyRedirectsExplainThemselves",
+      "redirectFormOpened", "fromIsOnTheInput", "toIsOnTheInput", "ruleRowLanded",
+      "ruleIsOnScreen", "ruleIsInSql", "testResultShown", "testNamesTheRule",
+      "testSaysItDidNotCount", "testCountedNoHit", "hitsBadgeSaysZero",
+      "relativeFromRefused", "relativeFromNamesTheRule", "relativeFromStoredNothing",
+      "sitemapPanelOpened", "pageTypesAreThisSitesOwn", "robotsEditorIsPrefilled",
+      "blockingRobotsWarns", "blockingRobotsWarningNamesItself", "robotsSaved",
+      "sitemapPreviewShown", "previewIsRealXml", "shownCountMatchesStorage",
+      "previewCountIsNotAFabricatedNumber", "brokenPanelOpened", "scanReportedSomething",
+      "deleteConfirmOpened", "deleteConfirmNamesThePath", "deletedFromTheList", "deletedFromSql",
+    ];
+    const seoSteps = report.seo || {};
+    const missing = required.filter((key) => seoSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=seo",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: seoSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`seo depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`seo depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=forms")) {
     report.forms = await runFormsDepth(page, report);
     log(`forms: ${JSON.stringify(report.forms)}`);
@@ -6487,6 +6709,11 @@ async function main() {
     // its address carries a form id, and a route walked with a placeholder id would only prove
     // that the 404 state renders.
     { path: "/forms", name: "forms" },
+    // The SEO toolkit (REQ-064, slice 3) — walked here so the screen is in the inventory, and
+    // driven by the depth pass below, which creates a redirect, tests it against a path, and
+    // regenerates the sitemap. Every panel is a tab on one route, so one entry covers all three
+    // rather than three routes that would each need their own placeholder.
+    { path: "/seo", name: "seo" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
