@@ -6289,6 +6289,7 @@ export async function detachAiAgentSkill(
     `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills/${encodeURIComponent(skillKey)}${skillScopeParams(organizationId)}`,
     { method: "DELETE" },
   );
+}
 
 /* ---------------------------------------------------------------------------------------------
  * Backups (REQ-013)
