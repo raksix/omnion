@@ -37,8 +37,9 @@ pub use posture::{
     unevaluated_state,
 };
 pub use store::{
-    BulkReport, count_findings, find_finding, last_run_at, latest_results, list_findings,
-    open_counts_by_severity, record_run, set_status, stale_dependency_count, upsert_finding,
+    BulkReport, bulk_set_status, count_findings, find_finding, last_run_at, latest_results,
+    list_findings, open_counts_by_severity, record_run, set_status, stale_dependency_count,
+    upsert_finding,
 };
 pub use vocabulary::{
     FINDING_STATUSES, MAX_BULK_IDS, MAX_PAGE, SEVERITIES, SOURCES, STATES,

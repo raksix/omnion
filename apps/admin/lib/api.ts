@@ -5,6 +5,13 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  SecurityBulkResult,
+  SecurityFinding,
+  SecurityFindingFilter,
+  SecurityFindingPage,
+  SecurityFindingStatus,
+  SecurityImportReport,
+  SecurityOverview,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -4825,4 +4832,109 @@ export function setRetentionWindow(windowDays: number): Promise<RetentionStatus>
 /** Run one sweep now, and answer with what it actually removed. */
 export function sweepRetention(): Promise<SweepResult> {
   return request<SweepResult>("/api/v1/events/retention/sweep", { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The posture overview.
+ *
+ * Always fetched with `cache: "no-store"`: the whole point of this screen is that it says what
+ * is true *now*, and a cached overview is a security claim with an expiry nobody chose.
+ */
+export function fetchSecurityOverview(): Promise<SecurityOverview> {
+  return request<SecurityOverview>("/api/v1/security/overview", { cache: "no-store" });
+}
+
+/**
+ * Re-evaluate every check now.
+ *
+ * The answer is a full overview rather than a run id, so the panel replaces what it has with
+ * what the server now believes — a client that merged the new states into the old rows would
+ * keep a stale `pass` for a check the run could not evaluate.
+ */
+export function runSecurityChecks(): Promise<SecurityOverview> {
+  return request<SecurityOverview>("/api/v1/security/checks/run", {
+    method: "POST",
+    cache: "no-store",
+  });
+}
+
+/** The findings list. An unknown filter value is refused by the server by name. */
+export function fetchSecurityFindings(
+  filter: SecurityFindingFilter & { offset?: number; limit?: number } = {},
+): Promise<SecurityFindingPage> {
+  const params = new URLSearchParams();
+  if (filter.severity) params.set("severity", filter.severity);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.component) params.set("component", filter.component);
+  if (filter.search) params.set("search", filter.search);
+  if (filter.offset) params.set("offset", String(filter.offset));
+  if (filter.limit) params.set("limit", String(filter.limit));
+  const query = params.toString();
+  return request<SecurityFindingPage>(
+    `/api/v1/security/findings${query ? `?${query}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** One finding, with the evidence the detail drawer shows. */
+export function fetchSecurityFinding(id: string): Promise<SecurityFinding> {
+  return request<SecurityFinding>(`/api/v1/security/findings/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * Change one finding's status.
+ *
+ * `ignore_reason` is **required by the server** for an ignore and the refusal names the field,
+ * so the form can show it on the input rather than as a generic toast. The client does not
+ * pre-validate it beyond the drawer's disabled button: a second rule that disagreed with the
+ * server's would be a second place to be wrong.
+ */
+export function setSecurityFindingStatus(
+  id: string,
+  change: {
+    status: SecurityFindingStatus;
+    ignore_reason?: string;
+    ignored_until?: string;
+    note?: string;
+  },
+): Promise<SecurityFinding> {
+  return request<SecurityFinding>(`/api/v1/security/findings/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(change),
+  });
+}
+
+/** One change, many findings, and the per-row report of what actually happened. */
+export function bulkSecurityFindingStatus(
+  ids: string[],
+  change: { status: SecurityFindingStatus; ignore_reason?: string; note?: string },
+): Promise<SecurityBulkResult> {
+  return request<SecurityBulkResult>("/api/v1/security/findings/bulk", {
+    method: "POST",
+    body: JSON.stringify({ ids, ...change }),
+  });
+}
+
+/**
+ * Ingest a CI report.
+ *
+ * The document is parsed by the platform, not by this client, and a report carrying anything
+ * that looks like a credential is refused **whole** — which is why the file is read here and
+ * sent as a value rather than being trusted field by field.
+ */
+export function importSecurityReport(
+  report: unknown,
+  source: "dependency" | "report" = "dependency",
+): Promise<SecurityImportReport> {
+  return request<SecurityImportReport>("/api/v1/security/findings/import", {
+    method: "POST",
+    body: JSON.stringify({ report, source }),
+  });
 }

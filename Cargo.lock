@@ -1375,6 +1375,7 @@ dependencies = [
  "omnion-permissions",
  "omnion-policy-engine",
  "omnion-search",
+ "omnion-security",
  "omnion-storage",
  "omnion-workflows",
  "p256",
