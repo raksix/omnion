@@ -51,6 +51,35 @@ const STEP_MS = Number(arg("step-ms", "380"));
 const QA_PG_CONTAINER = arg("db-container", process.env.QA_PG_CONTAINER || "omnion-postgres");
 const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
 
+/**
+ * `QA_ROUTES=crm` narrows a pass to the routes and depth passes whose name or path contains the
+ * given string, so one writer can measure his own screens without walking the other sixty.
+ *
+ * WHY this exists, and why it is not simply a convenience. A full pass walks 61 routes and then
+ * runs fifteen depth passes; on a box where nine writers share it, that is roughly an hour and a
+ * quarter of wall clock before the *last* pass starts. Two consequences, and the second is the
+ * expensive one. The first is slow. The second is that the run can be cut off — by a timeout, by
+ * a reboot, by the next tick — and everything after the cut is not reported at all. So the passes
+ * with the hardest-to-reproduce-by-hand assertions are the ones that never execute, and the REQ
+ * they belong to can never be closed on evidence. That is not a scheduling accident; it is a
+ * harness that can only say yes or no, and only after an hour.
+ *
+ * A filtered pass is NOT a cheaper full pass and must never be read as one. So the filter is
+ * recorded in the summary (`routeFilter`, and a `skippedByRouteFilter` entry for every route and
+ * pass left out), and `summarize.cjs` can see it. A green filtered pass says "these screens are
+ * sound", never "this release is sound" — the coverage that was left out is part of the answer.
+ */
+const ROUTE_FILTER = (process.env.QA_ROUTES || "").trim().toLowerCase();
+const passesFilter = (name) => !ROUTE_FILTER || String(name).toLowerCase().includes(ROUTE_FILTER);
+const skipped = (name, kind) => ({
+  ok: false,
+  skipped: true,
+  skippedByRouteFilter: ROUTE_FILTER,
+  kind,
+  name,
+  steps: 0,
+});
+
 const CREDS = {
   name: "QA Owner",
   email: "qa-owner@omnion.test",
@@ -991,6 +1020,10 @@ async function uploadMediaSample(page, source) {
  * never written. The error is recorded under the pass's own name so it is counted, not hidden.
  */
 async function runDepthPass(name, pass) {
+  // A filtered-out pass is reported as skipped rather than dropped, for the same reason the
+  // route walk records what it skipped: silence reads as a pass, and a green report that silently
+  // covered three screens is worse than a red one that named nine.
+  if (!passesFilter(name)) return skipped(name, "depth-pass");
   try {
     return await pass();
   } catch (cause) {
@@ -1021,6 +1054,7 @@ async function runDepthPass(name, pass) {
  * `prepare` is where that happens.
  */
 async function runEarlyDepthPass(name, run, { context, adopt, prepare }) {
+  if (!passesFilter(name)) return skipped(name, "depth-pass");
   const closedTab = /has been closed|Target closed|Page closed|browser has been closed|most likely because of a crash/i;
   let lastReason = "";
   let recovered = false;
@@ -6477,7 +6511,15 @@ async function main() {
   // memory) used to end the entire run, so every route after the crash and every depth pass
   // were skipped and no report was written at all. A page that dies is a finding about that
   // page; the pages after it still have to be looked at.
+  //
+  // `QA_ROUTES` narrows the list, and what it left out is *recorded* rather than merely absent:
+  // a route that never ran must not read as a route that passed, and the only way to keep that
+  // honest is to say so in the report itself.
   for (const route of routes) {
+    if (!passesFilter(`${route.name} ${route.path}`)) {
+      report.pages.push({ ...route, ...skipped(`${route.name} ${route.path}`, "route") });
+      continue;
+    }
     log(`page: ${route.name}`);
     try {
       await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -6898,10 +6940,36 @@ async function main() {
   const bySeverity = { high: 0, medium: 0, low: 0 };
   for (const f of findings) bySeverity[f.severity] += 1;
 
+  // A filtered pass must never be mistakable for a full one, and the place that decides is
+  // `summarize.cjs`, which reads this object. So the filter is a first-class field with the
+  // coverage it implies: how many routes and passes actually ran, how many were left out, and
+  // what they were called. A report that answers "is the build healthy" with "yes" while having
+  // walked three of sixty-one screens is not a faster pass, it is a wrong answer.
+  const walkedRoutes = report.pages.filter((r) => !r.skipped);
+  const skippedRoutes = report.pages.filter((r) => r.skipped);
+  const depthNames = [
+    "crm-intake", "crm-assignment", "media-file-manager", "media-file-detail", "media-presets",
+    "media-storage", "media-shares", "media-grants", "media-duplicates", "media-retention",
+    "events-console", "webhooks", "event-retention", "security",
+  ];
+  const skippedPasses = depthNames.filter((n) => !passesFilter(n));
+
   const summary = {
     ...report,
+    routeFilter: ROUTE_FILTER || null,
+    coverage: {
+      filtered: Boolean(ROUTE_FILTER),
+      routesTotal: report.pages.length,
+      routesWalked: walkedRoutes.length,
+      routesSkipped: skippedRoutes.length,
+      routesSkippedNames: skippedRoutes.map((r) => r.name),
+      depthPassesTotal: depthNames.length,
+      depthPassesSkipped: skippedPasses.length,
+      depthPassesSkippedNames: skippedPasses,
+    },
     counts: {
       pages: report.pages.length,
+      pagesWalked: walkedRoutes.length,
       clicks: clicks.length,
       filled: clickLines.filter((e) => e.action === "fill").length,
       forms: clickLines.filter((e) => e.action === "form").length,
@@ -6926,7 +6994,14 @@ async function main() {
   md.push(`# Omnion QA walkthrough — ${report.startedAt}`);
   md.push("");
   md.push(`- Admin: ${URL_ADMIN} · Web: ${URL_WEB}`);
-  md.push(`- Pages walked: ${report.pages.length} · interactions: ${clicks.length} clicks, ${summary.counts.filled} fills, ${summary.counts.forms} form submissions`);
+  if (ROUTE_FILTER) {
+    // Stated first, and stated as a limitation rather than a footnote: everything below was
+    // measured on a subset, and the subset has to be visible to whoever reads the verdict.
+    md.push(
+      `- **FILTERED PASS (\`QA_ROUTES=${ROUTE_FILTER}\`)** — ${walkedRoutes.length} of ${report.pages.length} routes walked and ${depthNames.length - skippedPasses.length} of ${depthNames.length} depth passes run; ${skippedRoutes.length} routes and ${skippedPasses.length} passes were **not measured**. This says the screens below are sound. It does not say the build is.`,
+    );
+  }
+  md.push(`- Pages walked: ${walkedRoutes.length} of ${report.pages.length} · interactions: ${clicks.length} clicks, ${summary.counts.filled} fills, ${summary.counts.forms} form submissions`);
   md.push(`- Screenshots: ${shots.length} · console errors: ${summary.counts.consoleErrors} · failed requests: ${netFailures.length} · dialogs: ${dialogs.length}`);
   md.push("");
   md.push(`## Findings — ${findings.length} (high ${bySeverity.high} · medium ${bySeverity.medium} · low ${bySeverity.low})`);
