@@ -2997,3 +2997,241 @@ UI, so the pass is not a gate for it; the REQ is not closed and slice 2 stays op
 
 **Next.** Slice 3: ordered role rules with operators and scope targets, the dry-run endpoint and
 panel, the `role via rule #N` audit reason, and the `iam.role_rule_matched` event.
+
+---
+
+## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
+
+**What.** The half of the notification centre that decides **how** a record reaches somebody.
+`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
+`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
+`runNotificationSettingsDepth` in the walkthrough.
+
+**Three decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
+   user per channel and would make a channel added in slice 3 a backfill instead of a
+   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
+   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
+   valid form, not an empty one.
+2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
+   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
+   guarantee, and the panel's own form is a client like any other.
+3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
+   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
+   of them is either never quiet or always quiet, and both are silent. A window that leaves no
+   waking hours is refused by name rather than stored as "e-mail is on".
+
+**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
+`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
+legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
+`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
+
+```text
+invalid type: string "approval", expected a sequence
+```
+
+for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
+priority filter on this surface had never worked, and every filtered list fell through to the
+error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
+the list read now takes `RawQuery` and parses the string itself.
+
+**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
+`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
+bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
+its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
+error element, which that call cannot affect: the assertion could only ever have passed by
+accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
+shortcut into the drawer. All three are the class of defect this harness exists to catch —
+in itself — and none of them is visible from the report, which only says `false`.
+
+**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
+gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
+takes an explicit id list, so it does not require a selection the reader never made — and rows
+carry `data-read` so the state is assertable rather than a shade of grey.
+
+**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
+**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
+Browser pass: **running**.
+
+**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
+`report.notificationSettings` to be green and **zero high findings** from this change — in
+particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
+signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
+behind `notifications.admin`, the event router turning existing bus events into notifications,
+and the per-channel delivery rows in the drawer.
+
+## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
+
+**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
+`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
+endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
+with their guards travelling with each group.
+
+**The decision the whole slice rests on: a `permission:` recipient rule resolves through
+`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
+one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
+expired grants and explicit denials, and a notification that reaches somebody who lost the key
+is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
+`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
+cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
+that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
+zero for and the crate's resolution answers one.
+
+**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
+no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
+nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
+is asserted by serialising the body and searching the JSON for the secret.
+
+**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
+`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
+button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
+list used `filter_map`, which would answer with four channels and render a settings matrix whose
+missing column is indistinguishable from one the reader switched off. And the outbox check
+constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
+
+**The live gate found three of its own assertions were wrong**, which is the more useful half:
+the role fixture expected a survivor where the honest answer is zero; the outbox projection check
+counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
+`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
+now assertions that would fail if the code regressed.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
+`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
+`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
+and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
+moves the failed row while the delivered one stays at 1 → 1.
+
+**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
+gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
+rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
+
+**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
+assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
+and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
+before running the pass again — the no-untested-screen rule applies to a screen that does not yet
+exist as much as to one that does.
+
+## Tick 48 — the pass that had been running for an hour, and what it actually said
+
+**What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
+question the last tick left open. `report.notifications` is **green on the bell, the badge, the
+grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
+`false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
+answered with status 400."*
+
+**The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
+push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
+swallowing the static segments, which is exactly what the comment above the mount says it
+prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is from **20:39**;
+slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
+filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
+disposable by design, so the lesson is to read the binary's mtime before reading the router.
+
+**What this tick fixed instead.** Two real defects, both found by hand against the live stack
+because no existing gate could reach them:
+
+1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
+   `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
+   itself: a `500` whose body quotes `violates foreign key constraint
+   "notifications_user_id_fkey"`. Four good recipients lost to one stale one, and a constraint
+   name shipped to whoever held the response. `0707141` checks recipients before the loop
+   through a new `store::existing_users` and refuses in a sentence that names *which* id is wrong.
+2. `Escape` was documented in the file header, the REQ's QA plan and the walkthrough, and it was
+   **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
+   exactly when the list had content — and the open drawer held the focus, which is why `e`,
+   `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
+
+**And the gate that had been lying.** `run-notifications-http.sh` decided its build by
+`cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
+status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
+crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
+twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
+compiler's exit status and only reads the log when that status says something went wrong.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
+`-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
+`node --check scripts/qa/walkthrough.cjs` → clean.
+`scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
+*a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
+with one bad id writes none of the good ones*.
+
+**Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
+typechecked, but no pass has run against them — the pass that found them ran against the 20:39
+binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
+this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
+**in-progress**.
+
+**Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
+newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
+and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
+`slashFocusedFilter` to recover behind them, `report.notificationSettings.loaded` to be true, and
+`report.notificationOutbox` to be **present** — that last one is the first pass that can close
+slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
+after that.
+
+## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
+
+**What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
+landed, and it answered the question the last two ticks were holding open. `report.notificationOutbox`
+exists for the first time: five chips all carrying counts, `chiptotalMatchesSql` true,
+`targetHiddenForActor` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, a removal that
+answers 204 and leaves the table, and `retryIsNotRetryable` true. `report.notificationSettings` is green
+on the matrix, the honest save notice, the round trip and the error state. `runMediaRetention` came back
+`ok: true` for the first time, which is REQ-010's blocker clearing.
+
+**The pass also produced one string that says everything.** `report.notifications` ended with
+
+```json
+"keyboardRows": 0,
+"keyboard": "no rows to drive — the list did not load"
+```
+
+which reads like a timing problem and is not one. The pass had marked its own three rows read four lines
+earlier, and the list then showed none of them. `with_read` was a `bool` defaulting to `false`, and a
+`bool` cannot tell "the client said nothing" from "the client said no" — so **every** caller that named no
+filter got an unread-only list, while the panel's own State menu labelled that same state "Unread and
+read". The screen promised a list it was not sending. Nothing failed loudly: the list rendered, the badge
+was right, and the screen simply stopped showing mail the reader had already seen.
+
+**What this tick fixed.** `ab3c105` gives `with_read` an `Option<bool>`, so absent and off stay
+distinguishable and absence means *everything*; `4933c10` fixes the three client places that assumed a
+positive flag — `filtersFrom` never sent it, `notificationQuery` dropped the `false` that *is* the
+inbox filter, and the empty state's "Show read notifications" button **set** the flag to switch read
+rows on when the correct action is to clear it. `797a3e8` adds the two gates that were missing, which
+is the part that matters: `readRowsStayVisible` immediately after the bulk action, and `inboxFilterIsHonest`
+on the other half, so a default nobody can turn off cannot pass as a fix.
+
+**Proof.** `cargo test -p omnion-api --lib` → **188 passed** (187 + the absent-vs-off test, which
+asserts the parse *and* the built query — a parser that keeps them apart and a builder that throws the
+distinction away are two different bugs and only the pair is the fix). `-p omnion-notifications` → **79**;
+`-p omnion-permissions` → **62**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check
+scripts/qa/walkthrough.cjs` → clean. `scripts/qa/run-notifications-http.sh` → **PASS 13/13** over a real
+socket, the new leg reading `all=1 inbox=0 live=1`. Browser pass: 36 pages, 1095 clicks, 88 field fills,
+39 form submissions, 84 findings (79 high, 5 medium).
+
+**On those 79 high findings, honestly.** 74 are `/media/*` and belong to REQ-010, which is the other
+in-progress REQ in this wave — 30 of them are one 422 on `/api/v1/media/{id}/raw?preset=standard` and 22
+more of the same from a second file. The remaining 5 are **this pass's own deliberate refusal probes**:
+three the 400 in-app-column lock and two the routed-500 error state, each of which the pass asserts as
+*expected* two lines later. Neither group is caused by this tick's change.
+
+**Also fixed, incidentally.** The gate I extended had two defects of its own, both caught because the
+first version of the assertion failed in a way the change had nothing to do with: `grep -c` exits 1 on
+an empty body, so under `set -e` the *inbox* leg — which is meant to be empty — aborted the whole gate
+before printing a verdict; and the row to mark is read from SQL rather than reusing the `$target` that
+the 404 check *below* assigns, because a shell script that reads a value before the line that sets it
+reports an empty id as "the endpoint refused".
+
+**Not proven, and not claimed.** No pass has yet run against the `with_read` fix, so the keyboard leg —
+`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`, `shiftEMarkedVisible`,
+`slashFocusedFilter` — is still unproven and the REQ stays **in-progress**. `quietSaved` and
+`digestPersisted` are still false: the widgets render, but the pass does not change them yet, so those
+two halves of the settings box are honestly unproven despite the box being ticked for what was proven.
+
+**Next.** Run `bash scripts/qa/run.sh` again (verify `stat -c %y target/debug/omnion-api` is newer than
+`ab3c105` first). Require `report.notifications.readRowsStayVisible`, `inboxFilterIsHonest`,
+`keyboardRows > 0` and then the five keyboard keys, plus `notificationSettings.quietSaved` and
+`digestPersisted` — and extend the settings pass to change those two fields rather than merely render
+them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
+REQ-010 slice 4's remaining gate.

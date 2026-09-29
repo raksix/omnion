@@ -47,7 +47,17 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[notif-http] building the API"
-cargo build -q -p omnion-api 2>&1 | grep -E "^(error|warning: unused)" && { echo "  build failed"; exit 1; }
+# The build's own exit status is the authority. Piping into `grep` and testing *its* status
+# reports a failure whenever the word "error" appears anywhere in a *warning* — and this
+# crate's unused-import warnings quote their own source line, so `warning: unused import:
+# \`Query\`` matched and the gate printed "build failed" over a build that had just succeeded.
+# That is a gate that reports the opposite of the truth, which is worse than no gate: it
+# burned two full runs before anyone read what it was actually matching.
+if ! cargo build -q -p omnion-api 2>/tmp/notif-http-build.log; then
+  grep -E "^error" /tmp/notif-http-build.log || tail -20 /tmp/notif-http-build.log
+  echo "  build failed"
+  exit 1
+fi
 
 echo "[notif-http] creating a disposable database"
 "${PSQL[@]}" -c "drop database if exists $DB" >/dev/null
@@ -172,6 +182,33 @@ else
   fail "the emit answered: $msg"
 fi
 
+# 7. A recipient that is not an account. The foreign key is the honest authority on who may
+#    be addressed, but it answers by refusing the *whole batch* and by naming itself in the
+#    message. So a caller who sends four good ids and one stale one loses the four, gets a
+#    500, and reads a Postgres constraint name. The claim here is two-sided: the batch that
+#    does not exist is refused in a *sentence*, and the batch that does exist is not touched
+#    by the refusal next door.
+ghost_status=$(curl -s -o /tmp/notif-ghost.json -w '%{http_code}' -X POST "$URL/api/v1/notifications/emit" \
+  -b "$COOKIE_A" -H 'content-type: application/json' \
+  -d "{\"category\":\"approval\",\"title\":\"QA ghost\",\"user_ids\":[\"00000000-0000-4000-8000-000000000000\"],\"dedupe_key\":\"qa-ghost-$RANDOM\"}")
+ghost=$(cat /tmp/notif-ghost.json)
+mixed_before=$(curl -s "$URL/api/v1/notifications/summary" -b "$COOKIE_A" | sed -n 's/.*"unread":\([0-9]*\).*/\1/p')
+mixed=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/api/v1/notifications/emit" -b "$COOKIE_A" \
+  -H 'content-type: application/json' \
+  -d "{\"category\":\"approval\",\"title\":\"QA mixed\",\"user_ids\":[\"$OWNER_ID\",\"00000000-0000-4000-8000-000000000001\"],\"dedupe_key\":\"qa-mixed-$RANDOM\"}")
+mixed_after=$(curl -s "$URL/api/v1/notifications/summary" -b "$COOKIE_A" | sed -n 's/.*"unread":\([0-9]*\).*/\1/p')
+if [ "$ghost_status" = "400" ] && echo "$ghost" | grep -q '"code":"unknown_recipient"' \
+   && ! echo "$ghost" | grep -qi 'fkey\|constraint'; then
+  pass "a recipient that is not an account is a 400 in a sentence, not a constraint name"
+else
+  fail "a ghost recipient answered ($ghost_status): $ghost"
+fi
+if [ "$mixed" = "400" ] && [ "$mixed_before" = "$mixed_after" ]; then
+  pass "a batch with one bad id writes none of the good ones"
+else
+  fail "a mixed batch answered $mixed and moved the unread count $mixed_before -> $mixed_after"
+fi
+
 # 3. Dedupe. Two emits with the same key are one row, and the second says so.
 key="qa-$RANDOM"
 first=$(curl -s -X POST "$URL/api/v1/notifications/emit" -b "$COOKIE_A" \
@@ -215,6 +252,48 @@ if [ "$grouped" = "$unread_summary" ]; then
   pass "the grouped lines sum to the total ($grouped)"
 else
   fail "grouped=$grouped total=$unread_summary"
+fi
+
+# 5. **A read notification is still a notification.** The bare list — no `with_read`, no `read`
+#    — has to include rows that have been read, and `?with_read=0` has to exclude them.
+#
+#    This is a regression gate for a real defect rather than a new claim. `with_read` was a
+#    `bool` defaulting to `false`, and a `bool` cannot tell "the client said nothing" from
+#    "the client said no" — so *every* caller that named no filter silently got unread-only,
+#    while the admin panel's State menu labelled that same state "Unread and read". Nothing
+#    failed loudly: the list rendered, the badge was right, and the screen simply stopped
+#    showing mail the reader had already seen. The browser pass found it only because it
+#    marks its own rows read and then walks straight into the keyboard step.
+#
+#    Both halves are asserted over a real socket, in this order: mark one row read, then the
+#    bare list must still be longer than the inbox list. Asserting the counts separately
+#    would pass against a list that returns nothing at all.
+#
+#    The row to mark is read from SQL here rather than reusing `$target` from the 404 check
+#    below: that variable is assigned further down, and a shell script that reads a value
+#    before the line that sets it runs with an empty string and reports it as "the endpoint
+#    refused" — a failure that names this gate and belongs to the next one.
+read_target=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select id from notifications where user_id = '$OWNER_ID' and archived_at is null limit 1")
+marked=$(curl -s -X POST "$URL/api/v1/notifications/$read_target/read" -b "$COOKIE_A" \
+  -H 'content-type: application/json' -d '{"read":true}')
+
+# `grep -c` on a body with no matches exits 1, and the script runs under `set -e`, so the
+# *inbox* leg — which is allowed to be empty, and is empty here on purpose — would abort the
+# whole gate before it printed a verdict. Counting with `tr` alone avoids the non-zero exit
+# entirely: it converts whatever came back into a digit count and never fails.
+count_rows() {
+  curl -s "$1" -b "$COOKIE_A" | tr ',' '\n' | grep -c '"id"' || true
+}
+all_rows=$(count_rows "$URL/api/v1/notifications?limit=100")
+inbox_rows=$(count_rows "$URL/api/v1/notifications?limit=100&with_read=0")
+live_rows=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select count(*) from notifications
+    where user_id = '$OWNER_ID' and archived_at is null")
+if [ -n "$marked" ] && [ "$all_rows" -gt "$inbox_rows" ] && [ "$all_rows" -eq "$live_rows" ]; then
+  pass "the bare list keeps read rows (all=$all_rows inbox=$inbox_rows live=$live_rows)"
+else
+  fail "all=$all_rows inbox=$inbox_rows live=$live_rows"
 fi
 
 # 2. Another person's notification is a 404, and the body does not carry the title.

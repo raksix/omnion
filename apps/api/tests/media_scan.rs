@@ -224,10 +224,7 @@ impl StubScanner {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("the stub scanner must bind");
-        let port = listener
-            .local_addr()
-            .expect("a local address")
-            .port();
+        let port = listener.local_addr().expect("a local address").port();
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let counter = seen.clone();
@@ -296,11 +293,7 @@ impl StubScanner {
             }
         });
 
-        Self {
-            port,
-            handle,
-            seen,
-        }
+        Self { port, handle, seen }
     }
 
     /// The endpoint an operator would type into the settings screen.
@@ -602,7 +595,12 @@ async fn login(state: &AppState, email: &str) -> String {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "login body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "login body: {}",
+        response.body
+    );
     response
         .set_cookie
         .clone()
@@ -657,20 +655,24 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
     // A site created *after* the migration has a policy row, thanks to the trigger — read out
     // of the database rather than inferred from a GET, because a GET that invents defaults is
     // exactly the gap the trigger exists to close.
-    let seeded: Option<(bool, String)> = sqlx::query_as(
-        "select enabled, on_error from media_scan_settings where site_id = $1",
-    )
-    .bind(site)
-    .fetch_optional(fixture.db.pool())
-    .await
-    .expect("the policy row must read");
+    let seeded: Option<(bool, String)> =
+        sqlx::query_as("select enabled, on_error from media_scan_settings where site_id = $1")
+            .bind(site)
+            .fetch_optional(fixture.db.pool())
+            .await
+            .expect("the policy row must read");
     let (enabled, on_error) = seeded.expect("a new site must have a scanning policy row");
     assert!(!enabled, "scanning is off until somebody turns it on");
-    assert_eq!(on_error, "hold", "an outage must not publish an unscanned file");
+    assert_eq!(
+        on_error, "hold",
+        "an outage must not publish an unscanned file"
+    );
 
     // Point the site at a real scanner that flags everything.
     let scanner = StubScanner::start(ScannerAnswer::Flagged).await;
-    fixture.enable_scanning(site, &token, &scanner.endpoint()).await;
+    fixture
+        .enable_scanning(site, &token, &scanner.endpoint())
+        .await;
 
     // The upload *succeeds* even though the scanner will flag it: the ingest half of
     // "best-effort at ingest". If this returned an error the rule would be broken.
@@ -708,9 +710,16 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
 
     // The public renderer refuses it too, with the same code: the public path is the one an
     // unauthenticated visitor reaches, and it is strictly the worst place to serve it.
-    let public_before = call(&fixture.state, request(Method::GET, &public_uri(media), None, None)).await;
+    let public_before = call(
+        &fixture.state,
+        request(Method::GET, &public_uri(media), None, None),
+    )
+    .await;
     assert_eq!(public_before.status, StatusCode::FORBIDDEN);
-    assert_eq!(public_before.body["error"]["code"], json!("file_not_scanned"));
+    assert_eq!(
+        public_before.body["error"]["code"],
+        json!("file_not_scanned")
+    );
 
     // Run the sweep.
     let sweep = call(
@@ -784,10 +793,12 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
     .await;
     assert_eq!(runs.status, StatusCode::OK);
     assert_eq!(runs.body["runs"][0]["outcome"], json!("flagged"));
-    assert!(runs.body["runs"][0]["summary"]
-        .as_str()
-        .expect("a summary")
-        .contains("held"));
+    assert!(
+        runs.body["runs"][0]["summary"]
+            .as_str()
+            .expect("a summary")
+            .contains("held")
+    );
 
     // A release with no reason is refused *before* anything is written.
     let no_reason = call(
@@ -801,7 +812,10 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
     )
     .await;
     assert_eq!(no_reason.status, StatusCode::BAD_REQUEST);
-    assert_eq!(no_reason.body["error"]["code"], json!("release_reason_required"));
+    assert_eq!(
+        no_reason.body["error"]["code"],
+        json!("release_reason_required")
+    );
     let still_open: i64 = sqlx::query_scalar(
         "select count(*) from media_quarantines where id = $1 and released_at is null",
     )
@@ -838,7 +852,11 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
         request(Method::GET, &quarantine_uri(site), Some(&reader), None),
     )
     .await;
-    assert_eq!(reader_list.status, StatusCode::OK, "a reader may see what is held");
+    assert_eq!(
+        reader_list.status,
+        StatusCode::OK,
+        "a reader may see what is held"
+    );
     assert_eq!(reader_list.body["file_count"], json!(1));
     assert_eq!(
         call(
@@ -862,20 +880,24 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
     )
     .await;
     assert_eq!(released.status, StatusCode::OK, "body: {}", released.body);
-    assert!(released.body["reason"]
-        .as_str()
-        .expect("the reason is echoed")
-        .contains("checked by hand"));
+    assert!(
+        released.body["reason"]
+            .as_str()
+            .expect("the reason is echoed")
+            .contains("checked by hand")
+    );
 
     // The quarantine row is *closed*, not deleted: the history of the hold is the whole point.
-    let closed: (Option<OffsetDateTimeAlias>, String) = sqlx::query_as(
-        "select released_at, release_reason from media_quarantines where id = $1",
-    )
-    .bind(quarantine_id)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the row must still be there");
-    assert!(closed.0.is_some(), "a release closes the row, never deletes it");
+    let closed: (Option<OffsetDateTimeAlias>, String) =
+        sqlx::query_as("select released_at, release_reason from media_quarantines where id = $1")
+            .bind(quarantine_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the row must still be there");
+    assert!(
+        closed.0.is_some(),
+        "a release closes the row, never deletes it"
+    );
     assert!(closed.1.contains("checked by hand"));
 
     // And the file serves again — but as `skipped`, never as `clean`. Nobody has said the
@@ -885,10 +907,7 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
         .fetch_one(fixture.db.pool())
         .await
         .expect("the row must read");
-    assert_eq!(
-        after_release.0, "skipped",
-        "a release is not a clean scan"
-    );
+    assert_eq!(after_release.0, "skipped", "a release is not a clean scan");
 
     let served = call(
         &fixture.state,
@@ -896,15 +915,19 @@ async fn a_flagged_file_is_held_everywhere_and_a_release_puts_it_back() {
     )
     .await;
     assert_eq!(served.status, StatusCode::OK, "body: {}", served.body);
-    assert_eq!(served.raw, b"harmless looking bytes", "the real bytes, not a stub");
+    assert_eq!(
+        served.raw, b"harmless looking bytes",
+        "the real bytes, not a stub"
+    );
 
     // The audit trail names the release, its reason and the scanner's finding.
-    let audit: Vec<(String, Value)> =
-        sqlx::query_as("select action, metadata from audit_log where target_id = $1 order by created_at")
-            .bind(media.to_string())
-            .fetch_all(fixture.db.pool())
-            .await
-            .expect("the audit log must read");
+    let audit: Vec<(String, Value)> = sqlx::query_as(
+        "select action, metadata from audit_log where target_id = $1 order by created_at",
+    )
+    .bind(media.to_string())
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the audit log must read");
     let release_entry = audit
         .iter()
         .find(|(action, _)| action == "media.scan_released")
@@ -980,7 +1003,11 @@ async fn an_unreachable_scanner_stores_the_file_and_serves_nothing() {
         request(Method::POST, &scan_run_uri(site), Some(&token), None),
     )
     .await;
-    assert_eq!(sweep.status, StatusCode::OK, "the sweep itself must not fail");
+    assert_eq!(
+        sweep.status,
+        StatusCode::OK,
+        "the sweep itself must not fail"
+    );
     assert_eq!(sweep.body["errors"], json!(1), "the scanner did not answer");
     // A pass whose only result was errors is reported as an error, never as `clean`. This is
     // the sentence that matters on the morning the scanner was down.
@@ -1046,7 +1073,9 @@ async fn a_scanner_that_changes_its_api_shape_fails_closed() {
     // The pipeline must not read the absence of a known word as a clean result, which is the
     // single worst default in a security pipeline.
     let scanner = StubScanner::start(ScannerAnswer::Nonsense).await;
-    fixture.enable_scanning(site, &token, &scanner.endpoint()).await;
+    fixture
+        .enable_scanning(site, &token, &scanner.endpoint())
+        .await;
 
     let media = upload(&fixture.state, &token, site, "odd.txt", b"bytes").await;
     let sweep = call(
@@ -1056,7 +1085,11 @@ async fn a_scanner_that_changes_its_api_shape_fails_closed() {
     .await;
     assert_eq!(sweep.status, StatusCode::OK);
     assert_eq!(sweep.body["errors"], json!(1));
-    assert_eq!(sweep.body["flagged"], json!(0), "an unreadable answer is not a flag");
+    assert_eq!(
+        sweep.body["flagged"],
+        json!(0),
+        "an unreadable answer is not a flag"
+    );
 
     let status: (String,) = sqlx::query_as("select scan_status from media where id = $1")
         .bind(media)
@@ -1087,7 +1120,9 @@ async fn a_clean_file_is_served_and_an_empty_sweep_still_logs_a_run() {
     let token = fixture.editor_token().await;
 
     let scanner = StubScanner::start(ScannerAnswer::Clean).await;
-    fixture.enable_scanning(site, &token, &scanner.endpoint()).await;
+    fixture
+        .enable_scanning(site, &token, &scanner.endpoint())
+        .await;
 
     // A sweep with nothing pending, *before* anything is uploaded, is the case the run log
     // exists for: "the last run was at 02:00 and it was clean" has to be answerable on the
@@ -1182,8 +1217,14 @@ async fn the_scan_settings_refuse_out_of_range_values_and_hold_no_secret() {
     )
     .await;
     assert_eq!(no_endpoint.status, StatusCode::BAD_REQUEST);
-    assert_eq!(no_endpoint.body["error"]["code"], json!("invalid_scan_setting"));
-    assert_eq!(no_endpoint.body["error"]["details"]["field"], json!("endpoint"));
+    assert_eq!(
+        no_endpoint.body["error"]["code"],
+        json!("invalid_scan_setting")
+    );
+    assert_eq!(
+        no_endpoint.body["error"]["details"]["field"],
+        json!("endpoint")
+    );
 
     // Each out-of-range value names its own field, on the *save* and on the *test*: the two
     // paths agreeing is the assertion, because a screen that renders the message under the
@@ -1197,7 +1238,10 @@ async fn the_scan_settings_refuse_out_of_range_values_and_hold_no_secret() {
     ] {
         for (method, uri) in [
             (Method::PUT, scan_settings_uri(site)),
-            (Method::POST, format!("/api/v1/media/scan/test?site_id={site}")),
+            (
+                Method::POST,
+                format!("/api/v1/media/scan/test?site_id={site}"),
+            ),
         ] {
             let response = call(
                 &fixture.state,
@@ -1230,7 +1274,10 @@ async fn the_scan_settings_refuse_out_of_range_values_and_hold_no_secret() {
     )
     .await;
     assert_eq!(pasted.status, StatusCode::BAD_REQUEST);
-    assert_eq!(pasted.body["error"]["details"]["field"], json!("secret_env"));
+    assert_eq!(
+        pasted.body["error"]["details"]["field"],
+        json!("secret_env")
+    );
 
     // A name is accepted, and the *response* never carries a value: scanned over the raw
     // bytes for anything that could be a credential.
@@ -1251,13 +1298,21 @@ async fn the_scan_settings_refuse_out_of_range_values_and_hold_no_secret() {
     .await;
     assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
     assert_eq!(saved.body["secret_env"], json!("MEDIA_SCAN_SECRET"));
-    assert!(saved.body["behaviour"]
-        .as_str()
-        .expect("a behaviour sentence")
-        .contains("64-MB"));
+    assert!(
+        saved.body["behaviour"]
+            .as_str()
+            .expect("a behaviour sentence")
+            .contains("64-MB")
+    );
 
     let raw = String::from_utf8_lossy(&saved.raw).to_lowercase();
-    for needle in ["\"secret\"", "access_key", "password", "credential", "bearer"] {
+    for needle in [
+        "\"secret\"",
+        "access_key",
+        "password",
+        "credential",
+        "bearer",
+    ] {
         assert!(
             !raw.contains(needle),
             "the response carries `{needle}`: {raw}"
@@ -1267,11 +1322,12 @@ async fn the_scan_settings_refuse_out_of_range_values_and_hold_no_secret() {
     // The reference is stored as a *name* and the name is not resolvable here, which the
     // screen must be able to say — "scanning is on and nothing is ever scanned" otherwise
     // looks exactly like a scanner that finds nothing.
-    let stored: (String,) = sqlx::query_as("select secret_env from media_scan_settings where site_id = $1")
-        .bind(site)
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("the row must read");
+    let stored: (String,) =
+        sqlx::query_as("select secret_env from media_scan_settings where site_id = $1")
+            .bind(site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the row must read");
     assert_eq!(stored.0, "MEDIA_SCAN_SECRET");
 
     let read = call(
@@ -1296,7 +1352,11 @@ async fn the_scan_settings_refuse_out_of_range_values_and_hold_no_secret() {
     )
     .await;
     assert_eq!(partial.body["timeout_seconds"], json!(45));
-    assert_eq!(partial.body["max_scan_mb"], json!(64), "untouched fields survive");
+    assert_eq!(
+        partial.body["max_scan_mb"],
+        json!(64),
+        "untouched fields survive"
+    );
     assert_eq!(partial.body["secret_env"], json!("MEDIA_SCAN_SECRET"));
 
     // A reader may read the policy and may not write it.
@@ -1422,7 +1482,11 @@ async fn the_scanner_probe_reports_a_real_scan_of_the_candidate() {
         ),
     )
     .await;
-    assert_eq!(failed.status, StatusCode::OK, "a dead scanner is a result, not a 500");
+    assert_eq!(
+        failed.status,
+        StatusCode::OK,
+        "a dead scanner is a result, not a 500"
+    );
     assert_eq!(failed.body["ok"], json!(false));
     assert_eq!(failed.body["status"], json!("error"));
     assert!(
@@ -1470,7 +1534,12 @@ async fn a_share_link_over_a_held_file_stops_serving() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let token_value = created.body["token"]
         .as_str()
         .expect("the token is returned exactly once")
@@ -1491,7 +1560,9 @@ async fn a_share_link_over_a_held_file_stops_serving() {
 
     // Now a scanner flags the file.
     let scanner = StubScanner::start(ScannerAnswer::Flagged).await;
-    fixture.enable_scanning(site, &token, &scanner.endpoint()).await;
+    fixture
+        .enable_scanning(site, &token, &scanner.endpoint())
+        .await;
     call(
         &fixture.state,
         request(Method::POST, &scan_run_uri(site), Some(&token), None),
@@ -1540,7 +1611,9 @@ async fn a_trashed_file_is_not_claimed_by_a_sweep() {
     let token = fixture.editor_token().await;
 
     let scanner = StubScanner::start(ScannerAnswer::Clean).await;
-    fixture.enable_scanning(site, &token, &scanner.endpoint()).await;
+    fixture
+        .enable_scanning(site, &token, &scanner.endpoint())
+        .await;
 
     let media = upload(&fixture.state, &token, site, "gone.txt", b"on its way out").await;
     call(
@@ -1589,7 +1662,9 @@ async fn a_quarantine_of_another_site_is_not_found() {
     let token = fixture.editor_token().await;
 
     let scanner = StubScanner::start(ScannerAnswer::Flagged).await;
-    fixture.enable_scanning(site, &token, &scanner.endpoint()).await;
+    fixture
+        .enable_scanning(site, &token, &scanner.endpoint())
+        .await;
     let media = upload(&fixture.state, &token, site, "held.txt", b"bytes").await;
     call(
         &fixture.state,

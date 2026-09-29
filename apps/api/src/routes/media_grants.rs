@@ -245,9 +245,7 @@ fn validate_subject_kind(kind: &str) -> Result<&'static str, ApiError> {
             ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "subject_kind",
-                format!(
-                    "A grant names a user, a group or a role — “{kind}” is none of them."
-                ),
+                format!("A grant names a user, a group or a role — “{kind}” is none of them."),
             )
         })
 }
@@ -258,11 +256,7 @@ fn validate_subject_kind(kind: &str) -> Result<&'static str, ApiError> {
 /// and holds nothing" row — inert, but honest, and the shape a partially-filled form sends
 /// before the operator ticks anything.
 fn validate_effect_and_bits(effect: &str, capabilities: Capabilities) -> Result<String, ApiError> {
-    let effect = if effect.is_empty() {
-        "allow"
-    } else {
-        effect
-    };
+    let effect = if effect.is_empty() { "allow" } else { effect };
     if effect != "allow" && effect != "deny" {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -418,15 +412,18 @@ pub async fn delete_one(
     // account carries no organization, which is not the same question.
     let (site_id, label) = match grant.target() {
         Some(GrantTarget::Folder(id)) => {
-            let Some(folder) = omnion_media::find_folder(pool, id).await.map_err(ApiError::from)?
+            let Some(folder) = omnion_media::find_folder(pool, id)
+                .await
+                .map_err(ApiError::from)?
             else {
                 return Err(grant_not_found());
             };
             (folder.site_id, format!("folder {}", folder.path))
         }
         Some(GrantTarget::File(id)) => {
-            let Some(file) =
-                omnion_media::find_file_any_state(pool, id).await.map_err(ApiError::from)?
+            let Some(file) = omnion_media::find_file_any_state(pool, id)
+                .await
+                .map_err(ApiError::from)?
             else {
                 return Err(grant_not_found());
             };
@@ -698,10 +695,7 @@ async fn write_grant(
 
 /// The id of the node a grant is on, for the audit target.
 fn grant_target_id(grant: &Grant) -> Uuid {
-    grant
-        .folder_id
-        .or(grant.media_id)
-        .unwrap_or_else(Uuid::nil)
+    grant.folder_id.or(grant.media_id).unwrap_or_else(Uuid::nil)
 }
 
 /// The chain above a file, for the tab's "inherited from" line.
@@ -804,7 +798,9 @@ async fn join_subjects(rows: Vec<Grant>, state: &AppState) -> Vec<GrantBodyOut> 
                 id: row.id,
                 subject_kind: row.subject_kind.clone(),
                 subject_id: row.subject_id,
-                subject_label: names.get(&(row.subject_kind.clone(), row.subject_id)).cloned(),
+                subject_label: names
+                    .get(&(row.subject_kind.clone(), row.subject_id))
+                    .cloned(),
                 can_read: row.can_read,
                 can_write: row.can_write,
                 can_delete: row.can_delete,
@@ -885,7 +881,8 @@ mod tests {
     #[test]
     fn an_absent_effect_means_allow() {
         assert_eq!(
-            validate_effect_and_bits("", Capabilities::from_row(true, false, false, false)).unwrap(),
+            validate_effect_and_bits("", Capabilities::from_row(true, false, false, false))
+                .unwrap(),
             "allow"
         );
     }

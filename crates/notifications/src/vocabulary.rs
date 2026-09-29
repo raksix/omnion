@@ -17,7 +17,9 @@
 /// The order is the order the bell panel renders its grouped lines in, and the order the
 /// preference matrix uses as its rows — so the two cannot disagree about what "the fifth
 /// category" is.
-pub const CATEGORIES: [&str; 6] = ["approval", "security", "update", "ticket", "system", "mention"];
+pub const CATEGORIES: [&str; 6] = [
+    "approval", "security", "update", "ticket", "system", "mention",
+];
 
 /// How urgent a notification is.
 ///
@@ -103,11 +105,7 @@ mod tests {
 
     #[test]
     fn the_lists_have_no_duplicates() {
-        for list in [
-            &CATEGORIES[..],
-            &PRIORITIES[..],
-            &CHANNELS[..],
-        ] {
+        for list in [&CATEGORIES[..], &PRIORITIES[..], &CHANNELS[..]] {
             let mut sorted = list.to_vec();
             sorted.sort_unstable();
             let before = sorted.len();
