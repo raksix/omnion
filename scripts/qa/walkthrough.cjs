@@ -4320,7 +4320,34 @@ async function runMenusDepth(page, report) {
   );
   steps.treeHasChildren = storedParents.includes(",") || (storedParents ?? "").length > 4;
   steps.parentsAreStored = steps.treeHasChildren;
-  steps.treeRendered = (await page.locator("[data-menu-tree] li").count()) >= steps.savedItems;
+  // Every STORED row has to be in the tree, and a child row is only in the DOM when its
+  // parent's branch is open — which is the correct behaviour, not a missing row. So collapsed
+  // parents are opened first, and the count is then compared with what the store holds.
+  // Counting without opening reports a working editor as broken the moment a branch is collapsed,
+  // which is the same false negative the count gave before the tree got a third level.
+  // A branch with children but no child list is collapsed, and the grip is what opens it. There
+  // is no `data-open` flag on the row, so the state is read from the DOM it produces: a parent
+  // whose `<li>` holds a nested `<ul>` is open, and one that does not is not. Clicking a grip by
+  // that condition cannot toggle an already-open branch shut, which a blind click would.
+  const collapsible = await page.locator("[data-menu-item-row]").evaluateAll((rows) =>
+    rows
+      .filter((row) => {
+        const li = row.closest("li");
+        if (!li) return false;
+        const hasChildren = li.querySelector(`[data-menu-item-row="${li.getAttribute("data-menu-item")}"] ul li`) !== null;
+        return hasChildren && li.querySelector(":scope > ul") === null;
+      })
+      .map((row) => row.getAttribute("data-menu-item-row")),
+  );
+  steps.collapsedBranchesOpened = collapsible.length;
+  for (const item of collapsible) {
+    await page.locator(`[data-menu-item-grip="${item}"]`).click({ timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(200);
+  }
+  await page.waitForTimeout(400);
+  const renderedRows = await page.locator("[data-menu-tree] li[data-menu-item]").count();
+  steps.renderedRows = renderedRows;
+  steps.treeRendered = renderedRows >= steps.savedItems;
   steps.depthLabel = await page
     .locator("[data-menu-editor-state=ready] p")
     .first()
