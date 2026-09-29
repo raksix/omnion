@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, History as HistoryIcon, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, BookMarked, Bot, History as HistoryIcon, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -37,6 +37,9 @@ const NAV = [
   // it already do, and what did that cost" (the history). An operator reads them in that order
   // and very rarely in the other one.
   { href: "/ai/agents", label: "Agents", icon: Bot },
+  // The skills registry (REQ-099, slice 3) is its own entry because it is a *library* rather
+  // than a runtime screen: an operator maintains the guidance here and attaches it over there.
+  { href: "/ai/skills", label: "Skills", icon: BookMarked },
   { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },

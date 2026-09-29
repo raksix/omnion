@@ -39,6 +39,7 @@ import {
 import { useSession } from "@/lib/session";
 
 import { RunSheet } from "./run-sheet";
+import { AgentSkills } from "./agent-skills";
 import { AgentWorkspace } from "./agent-workspace";
 
 /** The memory scopes the column accepts; the route refuses anything else. */
@@ -344,13 +345,14 @@ export function AgentForm({ agentId }: AgentFormProps) {
         Back to agents
       </Link>
 
-      {/* The tab bar, only on an existing agent. Config and Workspace are real now; Skills and
-          Runs arrive with slice 3 and are not rendered until they are, because a tab that
+      {/* The tab bar, only on an existing agent. Config, Skills and Workspace are real now;
+          Runs arrives with the last slice and is not rendered until it is, because a tab that
           opens onto nothing is a tab that lies. */}
       {agentId ? (
         <div role="tablist" aria-label="Agent sections" className="flex gap-1 overflow-x-auto border-b border-line">
           {([
             ["config", "Config"],
+            ["skills", "Skills"],
             ["workspace", "Workspace"],
           ] as const).map(([key, label]) => (
             <button
@@ -368,6 +370,10 @@ export function AgentForm({ agentId }: AgentFormProps) {
             </button>
           ))}
         </div>
+      ) : null}
+
+      {tab === "skills" && agentId ? (
+        <AgentSkills agentId={agentId} organizationId={organizationId} />
       ) : null}
 
       {tab === "workspace" && agentId ? (

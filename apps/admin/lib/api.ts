@@ -6014,3 +6014,272 @@ export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
     { method: "POST" },
   );
 }
+
+/**
+ * The skills registry (REQ-099, slice 3).
+ *
+ * The client mirrors the server's distinction between *attached* and *injected* rather than
+ * collapsing them: a row can be attached and still contribute nothing to a prompt, and a tab
+ * that renders "3 skills" above a prompt that carries one is the exact failure this API shape
+ * exists to make impossible.
+ */
+
+/** One registry row, as the table renders it. */
+export type AiSkill = {
+  /** The stable identifier. */
+  key: string;
+  /** Display name. */
+  name: string;
+  /** One line about what it is for. */
+  description: string;
+  /** When the model should reach for it. */
+  when_to_use: string;
+  /** The instruction body — data, never code. */
+  instructions: string;
+  /** Tool keys this skill is relevant to. **Not** a grant. */
+  tools: string[];
+  /** The manual version. */
+  version: number;
+  /** The digest of the definition, shown in the drawer. */
+  checksum: string;
+  /** `built_in` or `custom` — which decides whether Delete is offered. */
+  source: string;
+  /** Whether the runtime will inject it. */
+  enabled: boolean;
+  /** How many agents hold it. */
+  used_by: number;
+  /** Whether the definition is read-only. */
+  built_in: boolean;
+  /** When it last changed. */
+  updated_at: string;
+};
+
+/** One attachment, with the runtime's verdict on it. */
+export type AiAgentSkill = {
+  /** The registry key. */
+  key: string;
+  /** Display name, or the bare key when the row is gone. */
+  name: string;
+  /** Description, empty when stale. */
+  description: string;
+  /** When to use it, empty when stale. */
+  when_to_use: string;
+  /** Version, 0 when stale. */
+  version: number;
+  /** The tools it names. */
+  tools: string[];
+  /** `built_in` / `custom`, empty when stale. */
+  source: string;
+  /** The attachment order. */
+  position: number;
+  /** Whether the runtime would inject it. */
+  injected: boolean;
+  /** Why not, when it would not. */
+  withheld_reason: string | null;
+  /** A stable code for the reason. */
+  withheld_code: string | null;
+  /** Whether the row's own checksum still describes its body. */
+  checksum_ok: boolean;
+};
+
+/**
+ * The Skills tab payload.
+ *
+ * `prompt_block` is the *assembled* text the runtime would add, returned rather than
+ * reconstructed: a panel that shows each skill separately can be right about all of them and
+ * still display an order the runtime does not use.
+ */
+export type AiAgentSkills = {
+  /** The agent. */
+  agent_id: string;
+  /** Every attachment, in runtime order. */
+  skills: AiAgentSkill[];
+  /** The prompt text, or null when nothing is injected. */
+  prompt_block: string | null;
+  /** Keys that are attached but withheld. */
+  withheld: string[];
+};
+
+/** The registry list. */
+export type AiSkillList = {
+  /** This organization's skills plus the built-ins. */
+  skills: AiSkill[];
+};
+
+/** What `POST /ai/skills/{key}/validate` answers. */
+export type AiSkillValidation = {
+  /** Whether the definition would be accepted. */
+  valid: boolean;
+  /** Every problem, in check order. */
+  problems: string[];
+  /** The digest the body currently has. */
+  checksum: string;
+  /** Whether it matched a supplied expectation. */
+  checksum_matched: boolean;
+};
+
+/** The scope query every skills route shares. */
+function skillScopeParams(organizationId?: string | null): string {
+  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+}
+
+/** The registry, optionally filtered to the rows that are enabled. */
+export function fetchAiSkills(options?: {
+  organizationId?: string | null;
+  enabledOnly?: boolean;
+}): Promise<AiSkillList> {
+  const params = new URLSearchParams();
+  if (options?.organizationId) params.set("organization_id", options.organizationId);
+  if (options?.enabledOnly) params.set("enabled_only", "true");
+  const query = params.toString();
+  return request<AiSkillList>(`/api/v1/ai/skills${query ? `?${query}` : ""}`);
+}
+
+/** One definition. */
+export function fetchAiSkill(
+  key: string,
+  organizationId?: string | null,
+): Promise<AiSkill> {
+  return request<AiSkill>(
+    `/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`,
+  );
+}
+
+/** Register a custom definition. */
+export async function createAiSkill(input: {
+  key: string;
+  name: string;
+  description?: string;
+  when_to_use?: string;
+  instructions: string;
+  tools?: string[];
+  enabled?: boolean;
+  organizationId?: string | null;
+}): Promise<AiSkill> {
+  return request<AiSkill>("/api/v1/ai/skills", {
+    method: "POST",
+    body: JSON.stringify({
+      key: input.key,
+      name: input.name,
+      description: input.description ?? "",
+      when_to_use: input.when_to_use ?? "",
+      instructions: input.instructions,
+      tools: input.tools ?? [],
+      enabled: input.enabled ?? true,
+    }),
+  });
+}
+
+/** Change a definition, or enable/disable a built-in. */
+export async function updateAiSkill(
+  key: string,
+  changes: {
+    name?: string;
+    description?: string;
+    when_to_use?: string;
+    instructions?: string;
+    tools?: string[];
+    version?: number;
+    enabled?: boolean;
+  },
+  organizationId?: string | null,
+): Promise<AiSkill> {
+  return request<AiSkill>(`/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** Remove a custom skill. A built-in answers 403. */
+export async function deleteAiSkill(
+  key: string,
+  organizationId?: string | null,
+): Promise<void> {
+  await request<null>(
+    `/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** "Would this definition be accepted?" — writes nothing. */
+export function validateAiSkill(
+  key: string,
+  draft: {
+    name?: string;
+    description?: string;
+    when_to_use?: string;
+    instructions?: string;
+    tools?: string[];
+    expected_checksum?: string | null;
+  },
+  organizationId?: string | null,
+): Promise<AiSkillValidation> {
+  return request<AiSkillValidation>(
+    `/api/v1/ai/skills/${encodeURIComponent(key)}/validate${skillScopeParams(organizationId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        key,
+        name: draft.name ?? "",
+        description: draft.description ?? "",
+        when_to_use: draft.when_to_use ?? "",
+        instructions: draft.instructions ?? "",
+        tools: draft.tools ?? [],
+        expected_checksum: draft.expected_checksum ?? null,
+      }),
+    },
+  );
+}
+
+/** The Skills tab payload for one agent. */
+export function fetchAiAgentSkills(
+  agentId: string,
+  organizationId?: string | null,
+): Promise<AiAgentSkills> {
+  return request<AiAgentSkills>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * Attach one skill.
+ *
+ * The response reports `tools_not_in_agent`: the skill names a tool this agent cannot call. That
+ * is a *warning*, not a refusal — the operator may be about to grant it — but it has to be
+ * sayable out loud, because the alternative is a run that mysteriously ignores half its
+ * instructions.
+ */
+export function attachAiAgentSkill(
+  agentId: string,
+  skillKey: string,
+  organizationId?: string | null,
+): Promise<{ skill: AiAgentSkill; tools_not_in_agent: string[] }> {
+  return request<{ skill: AiAgentSkill; tools_not_in_agent: string[] }>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
+    { method: "POST", body: JSON.stringify({ skill_key: skillKey }) },
+  );
+}
+
+/** Replace the whole order — a drag produces a list, so the whole list goes. */
+export function setAiAgentSkills(
+  agentId: string,
+  skills: string[],
+  organizationId?: string | null,
+): Promise<AiAgentSkills> {
+  return request<AiAgentSkills>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
+    { method: "PUT", body: JSON.stringify({ skills }) },
+  );
+}
+
+/** Detach one skill. */
+export async function detachAiAgentSkill(
+  agentId: string,
+  skillKey: string,
+  organizationId?: string | null,
+): Promise<void> {
+  await request<null>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills/${encodeURIComponent(skillKey)}${skillScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}

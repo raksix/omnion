@@ -6268,6 +6268,174 @@ async function runRetentionDepth(page, report) {
  * Every write this pass makes is removed again, so a repeated pass does not accumulate agents.
  */
 
+/**
+ * The skills registry's depth pass (REQ-099, slice 3).
+ *
+ * Driven the way the spec's QA plan describes it: create a custom skill with a **bad tool
+ * key**, read the validation error, fix it, attach it to the agent, reorder it, and confirm
+ * the tab distinguishes *attached* from *injected*.
+ *
+ * The two steps worth explaining:
+ *
+ *  - the bad-tool-key step exists to prove the error **names the key**. A validation message
+ *    that says "unknown tool" without saying which one is a message the operator has to guess
+ *    at, and the spec asks for the key by name.
+ *  - the reorder step asserts a *disagreement*, not a state. After moving the skill down, the
+ *    API's assembled prompt must have changed; a client that re-sorted its own list would
+ *    render the new order while the runtime still used the old one, and that disagreement is
+ *    invisible from the table alone.
+ */
+async function runAiSkillsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-skills", action: "ai-skills", ...step });
+  };
+  const key = "qa-skill";
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+
+  // A previous run's leftovers. This is the QA database.
+  for (const leftover of qaSql(`select key from ai_skills where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/skills/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+
+  // ---- the registry renders, seeds included ---------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/skills`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.registryScreen = (await page.locator("[data-ai-skills]").count()) > 0;
+  steps.tableRendered = (await page.locator("[data-ai-skill]").count()) > 0;
+  // The built-in seed is the half that proves the migration ran AND that its checksums are
+  // right. A seed row whose checksum drifts from its body still *renders* — it just never
+  // reaches a prompt — so the state column is the only place that difference is visible.
+  steps.builtInSeeded =
+    (await page.locator('[data-ai-skill="summary"]').count()) > 0 &&
+    (await page.locator('[data-ai-skill="citation"]').count()) > 0;
+  steps.builtInHasNoDelete =
+    (await page.locator('[data-ai-skill-delete="summary"]').count()) === 0;
+  await shot(page, "ai-skills-registry");
+
+  // ---- the drawer -------------------------------------------------------------------------------
+  await page.locator('[data-ai-skill-open="citation"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.drawerOpened = (await page.locator("[data-ai-skill-drawer]").count()) > 0;
+  // The checksum is on the drawer because it is the thing that decides whether a row is
+  // injected, so somebody debugging "why did my skill stop working" needs it without SQL.
+  steps.drawerShowsChecksum = /[0-9a-f]{64}/.test(
+    await page.locator("[data-ai-skill-drawer]").innerText().catch(() => ""),
+  );
+  await shot(page, "ai-skills-drawer");
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.locator("[data-ai-skill-drawer]").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  // ---- create with a bad tool key, and read the error ----------------------------------------------
+  await page.locator("[data-ai-skills-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.formOpened = (await page.locator("[data-ai-skill-form]").count()) > 0;
+  await page.locator("[data-ai-skill-key]").fill(key).catch(() => {});
+  await page.locator("[data-ai-skill-name]").fill("QA skill").catch(() => {});
+  await page.locator("[data-ai-skill-instructions]").fill("Always answer in one sentence.").catch(() => {});
+  await page.locator("[data-ai-skill-tools]").fill("no-such-tool").catch(() => {});
+
+  await page.locator("[data-ai-skill-validate]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const verdict = await page.locator("[data-ai-skill-verdict]").innerText().catch(() => "");
+  steps.validationRendered = verdict.trim().length > 0;
+  // The spec's own criterion: the failure names the key. Not "unknown tool" — the tool.
+  steps.validationNamesTheTool = verdict.includes("no-such-tool");
+
+  // Fix it: drop the unknown key and create for real.
+  await page.locator("[data-ai-skill-tools]").fill("").catch(() => {});
+  await page.locator("[data-ai-skill-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.rowCreated = (await page.locator(`[data-ai-skill="${key}"]`).count()) > 0;
+  steps.customHasDelete = (await page.locator(`[data-ai-skill-delete="${key}"]`).count()) > 0;
+  await shot(page, "ai-skills-created");
+
+  // ---- attach to the agent, on the Skills tab -------------------------------------------------------
+  const agentId = qaSql("select id from ai_agents order by created_at desc limit 1") || "";
+  steps.agentForSkills = agentId !== "";
+  if (agentId) {
+    await page.goto(`${URL_ADMIN}/ai/agents/${agentId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.skillsTabPresent = (await page.locator('[data-agent-tab="skills"]').count()) > 0;
+    await page.locator('[data-agent-tab="skills"]').click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.skillsTabEmpty = (await page.locator("text=No skill attached").count()) > 0;
+    await shot(page, "ai-agent-skills-empty");
+
+    await page.locator("[data-agent-skills-add]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    steps.pickerOpened = (await page.locator("[data-agent-skills-picker]").count()) > 0;
+    await page.locator(`[data-agent-skills-attach="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.attachedRow = (await page.locator(`[data-agent-skill="${key}"]`).count()) > 0;
+    // "Injected" is the claim the runtime makes; a row that merely renders is not it.
+    steps.rowSaysInjected = (await page.locator(`[data-agent-skill="${key}"][data-injected="true"]`).count()) > 0;
+    await shot(page, "ai-agent-skills-attached");
+
+    // The assembled prompt is the API's text, not a client reconstruction.
+    steps.promptToggle = (await page.locator("[data-agent-skills-prompt]").count()) > 0;
+    await page.locator("[data-agent-skills-prompt] button").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const promptText = await page.locator("[data-agent-skills-prompt] pre").innerText().catch(() => "");
+    steps.promptShowsTheSkill = promptText.includes("one sentence");
+
+    // ---- reorder, and prove the *runtime* order moved ------------------------------------------------
+    const before = await page
+      .request.get(api(`/agents/${agentId}/skills`))
+      .then((r) => (r.ok() ? r.json() : null))
+      .catch(() => null);
+    const beforeKeys = (before?.skills ?? []).map((s) => s.key).join(",");
+    if ((before?.skills ?? []).length >= 1) {
+      // A second skill, so "move down" has somewhere to go and the change is observable.
+      const second = qaSql(`select key from ai_skills where source = 'built_in' and enabled order by key limit 1`) || "";
+      if (second) {
+        await page.request
+          .post(api(`/agents/${agentId}/skills`), { data: { skill_key: second }, failOnStatusCode: false })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForTimeout(1400);
+        await page.locator('[data-agent-tab="skills"]').click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(1200);
+        await page.locator(`[data-agent-skill-down="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(1600);
+        const after = await page
+          .request.get(api(`/agents/${agentId}/skills`))
+          .then((r) => (r.ok() ? r.json() : null))
+          .catch(() => null);
+        const afterKeys = (after?.skills ?? []).map((s) => s.key).join(",");
+        // The disagreement check: the server's order changed, so the client is not sorting for
+        // itself. A client that reordered only its own table would leave this string equal.
+        steps.reorderReachedTheServer = beforeKeys !== afterKeys && afterKeys !== "";
+        steps.reorderChangedPrompt =
+          (before?.prompt_block ?? "") !== (after?.prompt_block ?? "") &&
+          Boolean(after?.prompt_block);
+        await shot(page, "ai-agent-skills-reordered");
+      }
+    }
+  }
+
+  // ---- the empty state after a clean-up -------------------------------------------------------------
+  if (agentId) {
+    for (const attached of qaSql(
+      `select skill_key from ai_agent_skills where agent_id = '${agentId}'`,
+    )
+      .split("\n")
+      .filter(Boolean)) {
+      await page.request
+        .delete(api(`/agents/${agentId}/skills/${attached}`), { failOnStatusCode: false })
+        .catch(() => {});
+    }
+  }
+  await page
+    .request.delete(api(`/skills/${key}`), { failOnStatusCode: false })
+    .catch(() => {});
+
+  return { ok: steps.length > 0, steps };
+}
+
 async function runAiAgentsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -6897,6 +7065,12 @@ async function main() {
     // Its depth pass below refuses a bad key in the field, corrects it, and lands on the detail.
     { path: "/ai/agents/new", name: "ai-agents-new", area: "ai" },
     { path: "/ai/runs", name: "ai-runs", area: "ai" },
+    // The skills registry (REQ-099, slice 3) — its own route, because it is a library screen
+    // rather than a runtime one, and because a screen that only ever appears behind a nav click
+    // is a screen whose empty state nobody has seen. The depth pass below creates a skill with
+    // a bad tool key, reads the validation error, fixes it, attaches it to the agent and
+    // reorders it.
+    { path: "/ai/skills", name: "ai-skills", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -7034,6 +7208,13 @@ async function main() {
   // column back, the run sheet's 409 offered as a link, and the trace's arguments behind a tap.
   if (inScope("ai")) {
     report.aiAgents = await runDepthPass("ai-agents", () => runAiAgentsDepth(page, report));
+  // The skills registry's pass (REQ-099, slice 3): a custom skill with a bad tool key, the
+  // validation error that NAMES it, the fix, the attach, and a reorder checked against the
+  // server's own order rather than the table's.
+  if (inScope("ai")) {
+    report.aiSkills = await runDepthPass("ai-skills", () => runAiSkillsDepth(page, report));
+  }
+  log(`ai skills: ${JSON.stringify(report.aiSkills)}`);
   }
   log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
 

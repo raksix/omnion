@@ -5,10 +5,10 @@ import { AgentForm } from "@/features/ai/agent-form";
 export const metadata = { title: "Agent" };
 
 /**
- * One agent in full (REQ-099, slice 1): the same config form the create screen uses, so a
- * limit tightened in one is tightened in the other. The Skills, Runs and Workspace tabs land
- * with slice 2 — the workspace needs the file table the migration has not shipped yet, and a
- * tab that lists nothing is a tab that lies.
+ * One agent in full (REQ-099): the same config form the create screen uses, so a limit
+ * tightened in one is tightened in the other, plus the Skills and Workspace tabs. The Runs tab
+ * is the last slice and is not rendered until it is — a tab that lists nothing is a tab that
+ * lies.
  */
 export default async function AgentPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
