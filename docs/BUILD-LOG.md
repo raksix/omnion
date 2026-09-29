@@ -5795,3 +5795,67 @@ two unrun depth passes. (c) REQ-063's acceptance 17 still wants its full-pass ha
 
 ---
 
+
+## 2026-09-29 · wave2 · REQ-064 slice 3, the redirect CSV half (criterion 11's import/export)
+
+**What.** The one part of the redirect criterion three ticks of status lines had said was *not
+built*. It is now built, and the shape is the argument: a file is read whole and written whole.
+
+- `crates/content/src/seo_csv.rs` — the words, away from the transport. 18 unit tests, no database.
+- `crates/content/src/seo.rs` — `import_redirects` (one transaction), `export_redirects`, `redirect_pairs`.
+- `apps/api/src/routes/seo.rs` — `POST /seo/redirects/import`, `GET /seo/redirects/export`.
+- `apps/admin/features/seo/seo-view.tsx` — read the file first, write it second.
+- `apps/api/tests/cms_seo.rs` — 6 walks against real PostgreSQL.
+
+**Proof.**
+
+```
+cargo test -p omnion-content --lib                       → 226 passed (208 + 18 new)
+cargo test -p omnion-api --test cms_seo                  → 14 passed (8 + 6 new)
+cargo build -p omnion-api                                → clean
+apps/admin: tsc --noEmit                                 → 0 errors
+```
+
+**Why all-or-nothing, and not a row loop.** An owner who pastes 400 rows and reads "imported 397,
+3 failed" reasonably concludes the other 397 were saved. So a file with any row refused writes
+**nothing**, the report names the line, and *every refusal test reads the table* — an endpoint that
+reported "0 imported" while having written four rows would be perfectly well-behaved from the
+caller's side, so `rule_count` is the only witness.
+
+**Three things the walks and the unit tests refused to let me get away with.**
+
+1. **A circle inside the file is invisible to a per-row check.** `/a → /b` and `/b → /a` are each
+   fine alone; the first insert would be written before the last row had been read. The plan is now
+   simulated against itself — and against the rules *already stored*, because a file that closes a
+   loop with an existing rule is the same loop had the rows arrived in the other order.
+2. **My own CSV parser split fields on a comma inside a quoted field.** `split_records` unquoted as
+   it went, so `"/a,b"` reached `split_fields` with its separators already gone and became two
+   fields. The unit test found it in 0.01s; a walk would have found it as "row 2 is wrong" and
+   nobody would have known the parser was the reason. Records now keep their quotes; the unquoting
+   happens once, in `split_fields`.
+3. **My own test asserted a rule the store refuses.** I wrote that an external `to` keeps its
+   origin, on the reasoning that "a redirect to another site is the whole point of a 302" — and
+   `validate_redirect_path` has always refused anything that is not site-relative. Silently
+   reducing `https://partner.example/landing` to `/landing` would send a visitor to a page that
+   does not exist here, so the importer now refuses it **and says why**. `from` IS reduced, because
+   a table exported from another platform carries full URLs in every column and the origin is the
+   one part that means nothing here.
+
+**A guard is not a formality.** The import carries `seo.manage` and the export `seo.read`, and one
+walk asserts exactly that pair: an account that may *see* the rules must not be able to paste a
+file into them.
+
+**The browser pass has NOT run.** Four sibling worktrees are holding QA stacks (w4, w5, w6, w8 all
+online), the box is at load 17 with 0 GB free RAM of 32, and `/mnt/apopic` has 7.6 GB free. Starting
+a pass now would add a fifth Chromium to a machine that is already swapping, and the result would be
+untrustworthy either way. This tick is not a REQ-close tick, so the tiered gates are what was owed
+and they are green. **Acceptance 18 remains open and no walkthrough counter is claimed** — the new
+`data-seo-redirect-import-*` hooks are in the DOM but nothing has clicked them.
+
+**Next.** (a) A full pass when the box frees, which closes 18 and walks the import panel. (b) The
+queued `--only=featured-media` and `--only=members` depth passes. (c) REQ-063's `publicRendered`
+404 — answered from the database this tick: the QA stack's `omnion_qa_w2` holds **no site rows at
+all**, so the pass's `?site=main` addresses a site that does not exist. That is a harness reset
+question, not a site-scoping defect, and it is the one question between REQ-063 and `done`.
+
+---
