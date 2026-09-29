@@ -5627,3 +5627,64 @@ what might be there. (b) `objects/` grows one file per object, and the delete ro
 remove the directory as well as the run's own JSON — check that before the restore wizard
 exists, because an operator who deletes a backup and finds the files still there will assume
 the product lied.
+
+## 2026-09-29 · wave6 · REQ-127 slice 1 · the gate that had never run
+
+**What.** Ran `apps/api/tests/reliability_limits` for the first time (8 tests, never executed
+before — the previous tick's link step died on a full `/dev/shm`), shipped the
+`/settings/reliability/limits` screen, and fixed **five** defects the gate exposed plus three in
+the harness that were shaped like product bugs.
+
+**The box before the work.** `/dev/shm` 99% full, 562 MB free of 32 GB, load 87, RAM 30/32 GB,
+swap 24 GB — eight writer worktrees each parking a multi-GB `target/` in one tmpfs. `/`
+(loop11) had **19 G free the whole time**. Moving this worktree's target to
+`/opt/omnion-w6-target` took `/dev/shm` to 4.9 G free and load to 14, unblocking seven sibling
+writers as a side effect. The invariant that puts `target/` on tmpfs stays; somebody just has to
+look at the other filesystem before blaming the linker.
+
+**The five defects.** Every one a documented promise the code was not keeping:
+
+1. A **served** request carried no `X-RateLimit-*` headers. `decide_request` returned
+   `Option<ApiError>`, so the allowed path computed a verdict, spent the budget and dropped the
+   verdict; `apply_headers` was written and documented for that path and reachable only from a
+   refusal.
+2. The **`429`** carried none either — the one response where the caller most needs the ceiling,
+   the reset and the deciding policy. True before this tick, and its assertion had never run.
+3. **One dead Redis socket disabled the limiter.** `broken pipe` on a pooled connection's first
+   write → counter unreadable → fail open → real traffic never limited, with no message naming a
+   socket. `count` retries once on a fresh connection and reports a persistent failure.
+4. **`Verdict::Limited` could not say what was left** — no `remaining`, so each consumer had to
+   decide what a refused caller's remainder is.
+5. **`pick` ordered by scope only**, so "the most specific policy wins" was really "the lowest
+   priority number wins": a broad default could outrank the narrow row written to override it,
+   with both rows rendering as configured.
+
+**The three harness defects**, each of which produced a failure shaped like a product bug: a
+shared `CLIENT_IP` across all eight tests (the counter is per subject by design — it carries no
+policy id, or raising a limit would hand a subject a fresh budget and turn the screen into a
+bypass); `if let Ok(..)` around the counter clear, silently leaving the previous test's counter;
+and a killed run's teardown skipped, so the next run decided with stale rows. The dry-run walk
+also sent its request as the very caller the limiter had just refused and got 429 — that is the
+limiter working, and the tool exists for an operator who is not over budget.
+
+**Proof.**
+- `cargo test -p omnion-reliability` — **113/0** (110 before, +1 for the Redis retry, +2 for
+  specificity).
+- `cargo test -p omnion-api --test reliability_limits` — **8/8** over a live router against
+  `omnion_w6_dev`, `--test-threads=1`.
+- `apps/admin` `tsc --noEmit` — clean.
+- Commits `8b3ba7d` (screen), `fe474cb` (headers on both paths), `7008f9f` (dead socket +
+  `Limited.remaining`), `b67ac6f` (specificity), `cbc48cc` (wire shape + harness).
+
+**The wire-shape catch worth recording.** `Verdict` is
+`#[serde(tag = "decision", rename_all = "snake_case")]` — internally tagged. The client type was
+written first against serde's *external* tagging, so every field would have parsed as `undefined`
+and the screen would have rendered a confident sentence about nothing. A client type is only
+proved by the derive it is written against; `grep` for the serde attribute costs one command.
+
+**Not done, and named.** The QA browser pass still has not run against the new screen. The walk
+route is registered in `walkthrough.cjs`, the screen has its empty/populated/error/loading states
+and its keyboard map, and `tsc` is clean — but a screen nobody has opened in a browser is not a
+screen that is finished. Next tick: acquire `qa-slot.sh` on a box with room, then REQ-127 slice 2
+(idempotency: `decide`, the fingerprint and `StoredResponse::seal` are in; the store, the
+middleware and the screen are not).

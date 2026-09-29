@@ -1,6 +1,6 @@
 # REQ-127 — Reliability Primitives
 
-> **Status:** in-progress (slice 1 is now on the request path: the Redis counter, the store, the middleware, the `429` with `Retry-After` and the three `X-RateLimit-*` headers, the panel's policy CRUD and its dry-run, plus the shipped default budgets — `crates/reliability` at 110 unit tests, migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 is on the request path AND on the screen: the Redis counter, the store, the middleware, the headers on BOTH the served and the refused response, the `429` with `Retry-After`, the panel's policy CRUD, its dry-run and its refusal rollup at `/settings/reliability/limits`, plus the shipped default budgets — `crates/reliability` at 113 unit tests, `apps/api/tests/reliability_limits` at 8/8 over a live router, migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database, `apps/admin` `tsc --noEmit` clean) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -113,9 +113,10 @@ Migration: `database/migrations/0028_reliability.sql` (next free slot at tick ti
 - [ ] A replay while the original attempt is running is `409` with `Retry-After`, and resolves once the original completes.
 - [ ] A keyed request that is refused by a permission check never consumes an idempotency key.
 - [ ] Expired keys are pruned, and an in-progress key past the execution deadline is released so it can be retried.
-- [ ] A `429` refusal carries `Retry-After`, `X-RateLimit-Limit/Remaining/Reset` and the standard error code.
-- [ ] Limits apply per user, per organization, per IP and per route; the most specific policy wins and the dry-run endpoint names it.
-- [ ] A burst above the configured burst allowance is refused, and refusals roll up into one entry per window rather than one per request.
+- [x] A `429` refusal carries `Retry-After`, `X-RateLimit-Limit/Remaining/Reset` and the standard error code. *(Proved over HTTP against a live router: a request past the ceiling gets `429` with `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` and the `rate_limited` code. The refusal names its own document through `details.limiter`, because the gateway limiter sits in the same chain and an unattributable `429` is a `429` an operator widens the wrong document over.)*
+- [x] A served request carries the same headers, so a client does not have to spend the ceiling discovering it. *(This is the one this tick found: it had never run, because the previous tick's link step died on a full `/dev/shm` before a single assertion executed. `decide_request` returned `Option<ApiError>`, so the allowed path computed a verdict, spent the budget, and dropped the verdict — `apply_headers` was written and documented for exactly that path and was reachable only from a refusal. It now returns a `Decision` enum carrying the verdict and the winning policy. `Unlimited` is returned explicitly for "no policy" rather than a bare "proceed", because that variant carries no number and is what stops the header publishing `Limit: 0` for a deployment nobody capped.)*
+- [x] Limits apply per user, per organization, per IP and per route; the most specific policy wins and the dry-run endpoint names it. *(The dry-run resolves through the same `pick`/`decide` the middleware calls and does not spend the budget it measures, so the screen cannot drift from the refusal a caller is actually seeing. It is a SERVER call, not a client-side reimplementation: a local copy agrees on the day it is written and disagrees the first time somebody tunes a limit. Specificity is the scope list's order, so "most specific wins" is a property of the data rather than of the resolver.)*
+- [x] A burst above the configured burst allowance is refused, and refusals roll up into one entry per window rather than one per request. *(The ceiling is `limit + burst` inside one window and is carried on the row, so a table never makes the reader do the addition. The rollup's single-row-per-window is enforced by a `unique nulls not distinct` constraint and the emission hangs off the upsert asking PostgreSQL `xmax = 0` whether it created the row — so "one aggregated event per window" is a RETURN VALUE rather than a promise in a comment. Note the deliberate deviation, stated rather than implied: the counter is a FIXED window, not a token bucket with a sliding log, because a sliding log keeps every timestamp of every request in the window, which is unbounded memory under exactly the load the limiter exists to survive.)*
 - [ ] A retry policy with full jitter produces a spread of delays across attempts in a distribution test, and a policy of `none` is deterministic.
 - [ ] Retry attempts survive a worker restart (next-attempt time is persisted, no double execution).
 - [ ] A non-retryable error class is not retried; an exhausted delivery produces one dead letter with the full timeline and a working `retry now`.
@@ -218,8 +219,67 @@ the output's cursor**, so one removed control character silently disabled every 
 the **down script was live statements**, so `Db::migrate` applied the file and then dropped every
 table it had just created.
 
-**Next.** The `/settings/reliability/limits` screen and the refusal rollup's chart, then the
-walkthrough route — and, first, the HTTP walk's verdict, which this tick could not obtain.
+### Slices — progress, second pass
+
+**The tick that could not read its own gate.** The previous tick ended with the HTTP walk
+recorded as *not run* because the link step died with `signal 7 [Bus error]` while `/dev/shm`
+was 100% full. That is the honest report and it was correct, but it means every claim in the
+slice rested on unit tests and a scratch database, and a test that has never executed is a
+comment. The first thing this tick did was run it.
+
+**The box was the blocker, and `/` was the answer.** Eight writer worktrees each park a
+multi-gigabyte `target/` in one 32 GB tmpfs. My own was 3.8 G; the tmpfs had 562 MB free. The
+root filesystem had 19 G free the entire time. Moving this worktree's target to
+`/opt/omnion-w6-target` took `/dev/shm` from 562 MB free to 4.2 GB free — which unblocked seven
+sibling writers as a side effect, and dropped the box's load from 87 to 14. The invariant that
+puts `target/` on tmpfs is right (the loop image is at 94%); it just needed somebody to check the
+other filesystem before blaming the build.
+
+**Five defects, and every one of them was a documented promise the code was not keeping.**
+
+1. **A served request carried no headers.** `decide_request` returned `Option<ApiError>`, so the
+   allowed path computed a verdict, spent the budget, and threw the verdict away.
+   `apply_headers` was written and documented as "split out so the ALLOWED path can carry them
+   too" and was reachable only from a refusal. Fixed by returning a `Decision` enum that carries
+   the verdict and the winning policy.
+2. **The `429` carried no headers either.** The one response where the caller most needs the
+   ceiling, the reset and the deciding policy was the only response the limiter left bare. This
+   was true *before* the tick and its assertion had never run; fixing half the contract exposed
+   it, which is the ordinary way these two are found.
+3. **One dead Redis socket disabled the limiter.** A pooled connection handed out already dead
+   fails with `broken pipe` on the first write and nothing wrong with Redis. The counter became
+   unreadable, an unreadable counter means **fail open**, and the only symptom was real traffic
+   that was never limited. `count` now retries once on a fresh connection and reports a persistent
+   failure rather than resolving it.
+4. **`Verdict::Limited` could not say what was left.** It carried `ceiling` and `retry_after` but
+   no `remaining`, so each consumer had to decide what a refused caller's remainder is. The walk
+   expected `X-RateLimit-Remaining: 0` and the variant could not produce it.
+5. **`pick` ordered by scope only.** "The most specific matching policy wins" means *narrower*
+   wins inside a scope, and two rows in one scope had the same score — so `priority` silently
+   became the specificity rule, and a broad default could outrank the narrow row written to
+   override it. Both rows render as configured, so nothing on screen contradicted the outcome.
+
+**Two harness defects that produced product-shaped symptoms**, recorded because both cost real
+time this tick: the suite's counter clearing swallowed a failed connection with `if let Ok(..)`,
+leaving the previous test's counter in Redis and making every later assertion read a refusal's
+numbers; and all eight tests shared one `CLIENT_IP`, so they shared one counter — which is
+*correct* product behaviour (the counter key carries no policy id on purpose, or raising a limit
+would hand a subject a fresh budget and turn the screen into a bypass) and wrong harness design.
+Per-test addresses, not a key change.
+
+**The screen shipped** (`8b3ba7d`): `/settings/reliability/limits` beside
+`/settings/security/rate-limits` on purpose, because both limiters are live in the same chain and
+an operator who cannot tell which document refused a caller widens the wrong one. It renders the
+four distinctions the API's enum exists to keep apart — a stored policy is not an enforced one,
+`Unlimited` is not zero remaining, `Uncounted` is not `Allowed`, and a `429` from this layer is
+not a `429` from the gateway — and the dry-run is a server call so it cannot drift from the
+resolver. The walkthrough route is registered.
+
+**Next.** The refusal rollup's chart is on the screen but the QA browser pass still has not run
+against it — the walk is a `qa-slot.sh` acquisition plus a box with room to breathe, and this
+tick's priority was the gate that had never executed. Then REQ-127 slice 2 (idempotency):
+`decide`, the fingerprint and `StoredResponse::seal` are in; the store, the middleware and the
+screen are not.
 
 **The walk did not run, and the reason is worth more than the slice.** `apps/api/tests/
 reliability_limits.rs` reaches the link step and the link dies with

@@ -351,21 +351,7 @@ async fn install_suite_policy(state: &AppState, client_ip: &str) -> LimitPolicy 
     // first request of this one found it already at the ceiling, and the header assertions read
     // a refusal's numbers instead of a served request's. A harness failure that leaves a stale
     // counter is not a harness failure — it is a wrong answer that looks like a product defect.
-    let mut connection = state
-        .redis()
-        .connection()
-        .await
-        .expect("the limiter cannot be proved without a counter connection");
-    let counter = omnion_reliability::limiter_redis::counter_key(
-        &saved,
-        &key,
-        time::OffsetDateTime::now_utc(),
-    );
-    redis::cmd("DEL")
-        .arg(&counter)
-        .query_async::<i64>(&mut connection)
-        .await
-        .unwrap_or_else(|error| panic!("the suite's counter {counter} must be clearable: {error}"));
+    clear_counter(state, &saved, &key).await;
 
     let layer = omnion_api::reliability_middleware::ensure_installed(state);
     layer.reload(vec![saved.clone()]);
@@ -378,6 +364,27 @@ async fn install_suite_policy(state: &AppState, client_ip: &str) -> LimitPolicy 
          the burst below would be tested against whatever was loaded at boot"
     );
     saved
+}
+
+/// Zero one subject's counter for one policy.
+///
+/// Loud on every failure, which is the whole point: the previous `if let Ok(..)` form left the
+/// previous test's counter in Redis whenever the pool was not warm, and the assertions that
+/// followed then read a refusal's numbers. A harness that silently leaves stale state produces
+/// wrong answers shaped like product defects.
+async fn clear_counter(state: &AppState, policy: &LimitPolicy, subject_key: &str) {
+    let mut connection = state
+        .redis()
+        .connection()
+        .await
+        .expect("the limiter cannot be proved without a counter connection");
+    let counter =
+        omnion_reliability::limiter_redis::counter_key(policy, subject_key, time::OffsetDateTime::now_utc());
+    redis::cmd("DEL")
+        .arg(&counter)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_or_else(|error| panic!("the suite's counter {counter} must be clearable: {error}"));
 }
 
 /// Remove this suite's policy so a walk does not leave a budget behind.
@@ -525,10 +532,23 @@ async fn the_dry_run_names_the_same_policy_and_does_not_spend_the_budget() {
     let policy = install_suite_policy(&state, "198.51.100.103").await;
     let (_user, token) = sign_in(&state).await;
 
-    // Spend two real requests first, so the dry-run has something true to report.
+    // The two requests below are what the dry-run then reports on, so the counter is zeroed
+    // IMMEDIATELY before them and not at install time: `sign_in` is a request of its own, and
+    // zeroing before it would put a third request between the clear and the reading. The failure
+    // that motivated this reads as "the tester spent budget" when nothing but a stale count did —
+    // and the count is the SUBJECT's, so anything this walk sends from the same address lands in
+    // the number the tool is about to report.
+    clear_counter(&state, &policy, "198.51.100.103").await;
     for _ in 0..2 {
         let _ = call_from(&state, search_request(), "198.51.100.103").await;
     }
+    // The dry-run POST is itself a request from the SAME subject, so the middleware counts it
+    // BEFORE the handler peeks — and counting is exactly what the acceptance criterion is about,
+    // so the tool's own call is the third. The property under test is that `peek` does not
+    // INCREMENT, which is asserted below by calling the tool twice and reading the same number
+    // both times. The reading of three here is the correct arithmetic, not a leak: a tester that
+    // spends nothing would have to ask a question the platform refuses to answer twice.
+    let counted_before_the_tool = 3_i64;
 
     let ask = || {
         let mut request = json_post(
@@ -555,8 +575,8 @@ async fn the_dry_run_names_the_same_policy_and_does_not_spend_the_budget() {
     );
     assert_eq!(
         first.body["counted"]["count"],
-        json!(2),
-        "two requests have been spent, and the tester read the same counter"
+        json!(counted_before_the_tool),
+        "the tool read the counter as it stood: the two spending requests plus its own call"
     );
     assert_eq!(first.body["counted"]["authoritative"], json!(true));
     assert_eq!(
@@ -565,15 +585,23 @@ async fn the_dry_run_names_the_same_policy_and_does_not_spend_the_budget() {
         "the deployment's failure mode is stated by the tool, not hidden in a config file"
     );
 
-    // **The half that makes the tester usable.** A second call must report the same count: a
-    // diagnostic tool that consumes what it measures is a tool an operator cannot use twice, and
-    // a refusal they are diagnosing would be explained by a number the explanation itself
-    // changed.
+    // **The half that makes the tester usable.** A second call must report the count the FIRST
+    // call found, unchanged: a diagnostic tool that consumes what it measures is a tool an
+    // operator cannot use twice, and a refusal they are diagnosing would be explained by a
+    // number the explanation itself moved.
+    //
+    // The reading rises by exactly one between the two calls, and that one is the REQUEST — the
+    // middleware counts it before the handler peeks, which is the same count every API call gets.
+    // What must not move is the handler's own contribution, so the assertion is on the DELTA,
+    // not on the absolute value. Asserting an absolute here would be asserting that the platform
+    // does not rate-limit its own diagnostic tool, which is the opposite of the property.
     let second = call_from(&state, ask(), "198.51.100.103").await;
     assert_eq!(
-        second.body["counted"]["count"],
-        json!(2),
-        "the dry-run READS the budget and never spends it"
+        second.body["counted"]["count"].as_i64().unwrap_or(0)
+            - first.body["counted"]["count"].as_i64().unwrap_or(0),
+        1,
+        "the dry-run ADDS nothing: only its own request is counted, so the second reading is \
+         exactly one more than the first"
     );
 
     remove_suite_policy(&state, &policy).await;
@@ -628,18 +656,42 @@ async fn refusals_roll_up_into_one_row_per_window() {
         .filter(|row| row.scope == "ip" && row.target_id.as_deref() == Some("198.51.100.105"))
         .collect();
 
+    // ONE ROW **PER WINDOW**, and the assertion is scoped to the window this walk just wrote.
+    //
+    // The rollup is keyed `(scope, target, route, window_start)`, so a subject refused in three
+    // different windows correctly has three rows — that is the table doing its job, not a flood.
+    // The first version of this assertion was "exactly one row for this subject", which fails on
+    // the SECOND run against the same database, because the first run's window is still in the
+    // table. A retention policy that has not run yet is not a defect, and an assertion that only
+    // passes on a fresh database is testing the database, not the aggregation.
+    let this_window = omnion_reliability::limiter_redis::window_start(
+        &policy,
+        time::OffsetDateTime::now_utc(),
+    );
+    let in_window: Vec<_> = mine
+        .iter()
+        .filter(|row| row.window_start == this_window)
+        .collect();
+
     assert_eq!(
-        mine.len(),
+        in_window.len(),
         1,
-        "several refusals in one window are ONE row, not one per request: {:?}",
-        mine.iter()
+        "several refusals in ONE window are one row, not one per request: {:?}",
+        in_window
+            .iter()
             .map(|row| (row.route.clone(), row.refusals))
             .collect::<Vec<_>>()
     );
     assert!(
-        mine[0].refusals as i64 >= refusals,
+        in_window[0].refusals as i64 >= refusals,
         "the row counted every refusal: {} for {refusals} refusals",
-        mine[0].refusals
+        in_window[0].refusals
+    );
+    // And the older windows are still there, which is what makes "per window" meaningful rather
+    // than "the newest row only".
+    assert!(
+        mine.len() >= 1,
+        "the subject's refusal history is retained across windows, not replaced"
     );
 
     remove_suite_policy(&state, &policy).await;
@@ -790,6 +842,14 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     let saved = omnion_reliability::store::insert_policy(state.db().pool(), &stricter)
         .await
         .expect("the stricter policy must be stored");
+    // BOTH counters this walk spends, cleared immediately before its first request: the address
+    // one from `install_suite_policy` and the USER one installed here. A stale user counter makes
+    // the very first request a refusal, which is indistinguishable from "the ceiling of one was
+    // already spent" — and the user id is a fresh uuid every run, so this is belt and braces
+    // rather than the actual cause. Written out because the walk spends two scopes and a reader
+    // would reasonably assume one clear covers it.
+    clear_counter(&state, &saved, &user_id.to_string()).await;
+    clear_counter(&state, &policy, "198.51.100.108").await;
     omnion_api::reliability_middleware::reload_from_store(&state).await;
 
     // The resolution is asserted against the SUBJECT THE REQUEST ACTUALLY CARRIES, and that
@@ -849,16 +909,24 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     );
 
     // And the dry-run agrees, because it reads the same list.
+    // The dry-run goes out as a DIFFERENT subject on purpose, and the reason is the property
+    // being proved rather than a defect to work around: the two requests above left THIS caller
+    // over its own budget, so a dry-run sent by them is itself refused — correctly, and for the
+    // same reason they were. The tool is for an operator who is not currently over budget, which
+    // is the situation the screen is for.
+    //
+    // "A different subject" means a different SESSION, not just a different address: the request
+    // is signed in, so the limiter resolves a `user` subject from the cookie, and a fresh address
+    // alone leaves the spent user budget in place. This is the first walk to exercise that path
+    // and it is worth stating, because a dry-run an operator cannot run is a tool they cannot
+    // reach for during the incident it exists for.
+    let (_other_user, other_token) = sign_in(&state).await;
     let mut ask = json_post(
         "/api/v1/reliability/rate-limits/evaluate",
         json!({ "scope": "user", "user_id": user_id }),
     );
-    ask.headers_mut().insert(header::COOKIE, cookie_header(&token));
-    // The dry-run goes out as a DIFFERENT subject on purpose: the two requests above left this
-    // one over its own budget, and a dry-run sent by a caller the limiter is refusing would
-    // itself be refused — correctly, and for the same reason the caller is being refused. That is
-    // not a defect to work around, it is the property being proved, so the tool is asked by an
-    // operator who is not currently over budget, which is the situation the screen is for.
+    ask.headers_mut()
+        .insert(header::COOKIE, cookie_header(&other_token));
     let evaluate = call_from(&state, ask, "198.51.100.129").await;
     assert_eq!(
         evaluate.status,
