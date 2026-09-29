@@ -113,44 +113,40 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-/// Build a JSON request; `token` becomes the session cookie.
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
-    request_with_csrf(method, uri, token, None, body)
-}
+/// The cookies this harness is holding: session token → the CSRF token signed in with it.
+///
+/// **A jar, not a parameter.** A cookie-authenticated mutation is refused unless it carries
+/// `x-omnion-csrf`, and the value is the `omnion_csrf` cookie the sign-in response set — the
+/// browser is *handed* a token, it never derives one. `call` used to read only the first
+/// `Set-Cookie`, so this harness could never send that header, and every write test in this
+/// file answered `403 csrf_failed` whenever a CSRF secret was configured. The suite was green
+/// only while the secret was unset — green against the one configuration that refuses every
+/// mutation — and invisible precisely because the read tests keep passing. A suite that
+/// quietly stops exercising the write paths and still reports a pass is worse than a red one.
+///
+/// The alternative shape is a `csrf` parameter threaded through 57 call sites. That is a diff
+/// nobody reviews carefully, it touches every test in the file to fix the ones that write, and
+/// the next test added still has to remember it — which is how the same hole opens again. A
+/// jar is what a browser actually has, and it makes "forgot the header" unrepresentable.
+static COOKIE_JAR: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Build a JSON request that also carries a CSRF token, the way a browser does.
+/// Build a JSON request; `token` becomes the session cookie.
 ///
-/// **This is the second door to the same room, and the reason it exists matters.** A
-/// cookie-authenticated mutation is refused unless it carries `x-omnion-csrf`, and the value is
-/// the `omnion_csrf` cookie the sign-in response set — the browser is *handed* a token, it
-/// never derives one. The four-argument `request` above cannot express that, so every write
-/// test in this file has been answering `403 csrf_failed` whenever a CSRF secret is
-/// configured. The suite was green only while the secret was unset — green against the one
-/// configuration that refuses every mutation — and it is invisible precisely because the read
-/// tests keep passing.
-///
-/// A suite that quietly stops exercising the write paths and still reports a pass is worse
-/// than a red one, so the door is here rather than a secret derivation: **deriving** the token
-/// in the harness would test a client that does not exist, and would keep passing if the
-/// server ever stopped setting the cookie. A read-safe method sends no header, matching the
-/// server, and never putting a credential in a request that has no need for it.
-fn request_with_csrf(
-    method: Method,
-    uri: &str,
-    token: Option<&str>,
-    csrf: Option<&str>,
-    body: Option<Value>,
-) -> Request<Body> {
-    let header_token = if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+/// A mutation also carries the CSRF token that session signed in with, the way the browser
+/// sends it. A read-safe method sends none: the server never asks for one, and putting a
+/// credential in a request that has no need for it is its own small mistake.
+fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+    let csrf = if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
         None
     } else {
-        csrf
+        token.and_then(remembered_csrf)
     };
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(token) = token {
         builder = builder.header(header::COOKIE, format!("omnion_session={token}"));
     }
-    if let Some(header_value) = header_token {
+    if let Some(header_value) = csrf {
         builder = builder.header(omnion_security::CSRF_HEADER, header_value);
     }
 
@@ -161,6 +157,15 @@ fn request_with_csrf(
             .expect("request must build"),
         None => builder.body(Body::empty()).expect("request must build"),
     }
+}
+
+/// The CSRF token this session signed in with, if the harness has seen it.
+fn remembered_csrf(token: &str) -> Option<String> {
+    COOKIE_JAR
+        .lock()
+        .ok()
+        .and_then(|jar| jar.get(token).cloned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
@@ -505,18 +510,12 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
 }
 
 /// Sign an account in and return the raw session token.
-async fn login(state: &AppState, email: &str) -> String {
-    login_with_csrf(state, email).await.0
-}
-
-/// Sign in and return the **session token and the CSRF token**.
 ///
-/// The CSRF cookie is a second `Set-Cookie` on the same response, and the previous helper
-/// kept only the first — which is exactly how a harness ends up unable to send a header a
-/// real browser is always holding. It reads every `Set-Cookie` rather than the first one,
-/// because a helper that silently drops the credential it needs is a helper whose failure
-/// mode is an unexplained `403` in a test three files away.
-async fn login_with_csrf(state: &AppState, email: &str) -> (String, String) {
+/// The CSRF cookie that came back on the same response is filed in the jar, so every later
+/// mutation built from this token carries it. Absent is not an error: with no secret
+/// configured the server sets no cookie and asks for no header, and that configuration is the
+/// one half this suite has always run in.
+async fn login(state: &AppState, email: &str) -> String {
     let response = call(
         state,
         request(
@@ -550,11 +549,10 @@ async fn login_with_csrf(state: &AppState, email: &str) -> (String, String) {
     };
 
     let session = value_of("omnion_session").expect("login sets a session cookie");
-    // A secret that is not configured produces no CSRF cookie, and then none is needed. So the
-    // token is optional here and absent is not a panic — a panic would make this helper
-    // unusable in the one configuration the rest of the suite has always run in.
-    let csrf = value_of("omnion_csrf").unwrap_or_default();
-    (session, csrf)
+    if let Ok(mut jar) = COOKIE_JAR.lock() {
+        jar.insert(session.clone(), value_of("omnion_csrf").unwrap_or_default());
+    }
+    session
 }
 
 /// The `id` field of a response body, as text.
@@ -1717,15 +1715,14 @@ async fn a_rule_opened_from_a_list_row_carries_the_version_a_save_must_quote() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let (token, csrf) = login_with_csrf(&fixture.state, &fixture.operator_email).await;
+    let token = login(&fixture.state, &fixture.operator_email).await;
 
     let created = call(
         &fixture.state,
-        request_with_csrf(
+        request(
             Method::POST,
             "/api/v1/workflows",
             Some(&token),
-            Some(&csrf),
             Some(json!({
                 "name": "Opened from the list",
                 "organization_id": fixture.organization_a,
@@ -1813,11 +1810,10 @@ async fn a_rule_opened_from_a_list_row_carries_the_version_a_save_must_quote() {
 
     let saved = call(
         &fixture.state,
-        request_with_csrf(
+        request(
             Method::PUT,
             &format!("/api/v1/workflows/{workflow_id}/graph"),
             Some(&token),
-            Some(&csrf),
             Some(json!({ "graph": graph, "graph_version": from_list })),
         ),
     )
