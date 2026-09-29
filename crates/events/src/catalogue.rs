@@ -356,6 +356,51 @@ catalogue! {
     "A domain was detached from its site.",
     [("domain_id", Uuid, req), ("site_id", Uuid, opt), ("hostname", String, opt)];
 
+    // ---- Secrets -------------------------------------------------------------------------------
+    // Every row here has a writer in this tree. That is the direction this table is held in:
+    // `apps/api/tests/events.rs` walks the source for `bus::emit` names and refuses any that is
+    // not declared, so a name may not exist in the catalogue until something records it, and a
+    // recorded fact may not exist without a row that says what it carries. The rows were added
+    // from the emitters' own `payload(json!({ … }))`, not from the names — a catalogue row
+    // written from the event's spelling rather than its body is a signature that validates
+    // nothing, and the walk that checks the name never checks the shape.
+    "secrets.credential_validation_failed", "secrets", Live,
+    "A credential profile was tested against its upstream and the provider rejected it.",
+    [("secret_id", Uuid, req), ("name", String, req), ("kind", String, req), ("message", String, req)];
+    "secrets.credential_validation_recovered", "secrets", Live,
+    "A credential profile passed validation again after an earlier failure.",
+    [("secret_id", Uuid, req), ("name", String, req), ("kind", String, req)];
+    "secrets.credential_slot_assigned", "secrets", Live,
+    "A primary or fallback credential was bound to a slot.",
+    [("scope_type", String, req), ("scope_id", Uuid, req), ("slot", String, req),
+     ("primary", String, opt), ("fallback", String, opt)];
+    "secrets.audit_anomaly_acknowledged", "secrets", Live,
+    "An operator acknowledged a secrets audit anomaly.",
+    [("anomaly_id", Uuid, req), ("changed", Boolean, opt)];
+    "secrets.lease_issued", "secrets", Live,
+    "A consumer was granted a bounded lease on a secret.",
+    [("lease_id", Uuid, req), ("secret_id", Uuid, req), ("name", String, req),
+     ("consumer", String, req), ("environment", String, opt), ("max_uses", Integer, opt)];
+    "secrets.lease_revoked", "secrets", Live,
+    "A lease was revoked before it was used up.",
+    [("lease_id", Uuid, req), ("secret_id", Uuid, req), ("name", String, req),
+     ("consumer", String, req), ("reason", String, opt)];
+    "secrets.lease_redeemed", "secrets", Live,
+    "A lease was redeemed once and its value released to the consumer.",
+    [("lease_id", Uuid, req), ("secret_id", Uuid, req), ("name", String, req),
+     ("version", Integer, opt), ("deployment_key_id", Uuid, opt), ("consumer", String, req)];
+    "secrets.deployment_key_created", "secrets", Live,
+    "A deployment key was minted for a consumer outside the panel.",
+    [("deployment_key_id", Uuid, req), ("name", String, req), ("environment", String, opt),
+     ("scopes", String, opt), ("fingerprint", String, opt)];
+    "secrets.deployment_key_revoked", "secrets", Live,
+    "A deployment key was revoked.",
+    [("deployment_key_id", Uuid, req), ("name", String, req), ("reason", String, opt)];
+    "secrets.root_key_rotated", "secrets", Live,
+    "The root encryption key was rotated and existing versions were re-wrapped.",
+    [("job_id", Uuid, req), ("from_key_id", Uuid, opt), ("to_key_id", Uuid, opt),
+     ("versions", Integer, opt)];
+
     // ---- Plugins, themes, workflows --------------------------------------------------------------
     "plugin.installed", "plugins", Reserved,
     "A plugin was installed.",
