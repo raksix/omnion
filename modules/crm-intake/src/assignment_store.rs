@@ -691,6 +691,135 @@ pub async fn escalation_target(pool: &PgPool, lead_id: Uuid) -> Result<Option<Uu
     Ok(target.flatten())
 }
 
+/// The organizations that have at least one lead with a live first-response clock.
+///
+/// **The worker walks organizations, not the table.** A worker that read `crm_leads` directly
+/// would have to answer "which organization is this row for" per row, and the answer is a
+/// column that exists precisely so the read can be scoped. More importantly the list is
+/// bounded and ordered: given the same database and the same `now`, a run escalates the same
+/// organizations in the same order, which is what makes a half-finished run resumable.
+pub async fn organizations_with_leads(pool: &PgPool, limit: i64) -> Result<Vec<Uuid>> {
+    Ok(sqlx::query_scalar::<_, Uuid>(
+        "select distinct organization_id from crm_leads \
+         where first_response_due_at is not null and first_response_at is null \
+         order by organization_id limit $1",
+    )
+    .bind(limit.clamp(1, MAX_PAGE))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// A lead whose deadline is close enough that its owner should be reminded.
+///
+/// **A reminder is a claim problem, not a query problem.** The read is ordered by deadline so
+/// the worker is reproducible, but the guarantee that a lead is reminded *once* cannot come
+/// from the read: two app instances both see the same due row, and a `where not exists (select
+/// … from crm_lead_events)` predicate in the same statement is still a read-then-write across
+/// the two of them. The claim is the same shape as the round-robin cursor and the autoresponder
+/// reservation — the two the module has already had to learn about twice — and the return
+/// value says whether *this* caller is the one that should notify.
+pub async fn due_reminders(
+    pool: &PgPool,
+    organization_id: Uuid,
+    now: time::OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<Reminder>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        lead_id: Uuid,
+        owner_user_id: Option<Uuid>,
+        first_response_due_at: Option<time::OffsetDateTime>,
+        reminder_minutes: i32,
+    }
+    // The reminder *offset* is per policy, so the window cannot be a constant in the SQL. The
+    // read therefore widens to "unanswered and not yet reminded" and the exact per-lead
+    // predicate is applied in Rust, where the policy's own minutes are available. Narrowing
+    // further in SQL would be an optimisation for a table that holds only live leads, and it
+    // would put the reminder rule in two places at once.
+    let rows = sqlx::query_as::<_, Row>(
+        "select l.id as lead_id, l.owner_user_id, l.first_response_due_at, \
+                p.reminder_minutes \
+         from crm_leads l \
+         join crm_sla_policies p on p.id = l.sla_policy_id \
+         where l.organization_id = $1 \
+           and l.first_response_at is null \
+           and l.first_response_due_at is not null \
+           and l.status in ('new', 'assigned', 'contacted', 'qualified') \
+           and p.reminder_minutes is not null \
+           and not exists (select 1 from crm_lead_events e \
+                           where e.lead_id = l.id and e.kind = 'sla_reminded') \
+         order by l.first_response_due_at, l.received_at, l.id \
+         limit $2",
+    )
+    .bind(organization_id)
+    .bind(limit.clamp(1, MAX_PAGE))
+    .fetch_all(pool)
+    .await?;
+    // **A deadline that has already passed is not a reminder, it is a breach.** The window
+    // opens *before* the deadline, so "inside the window" is true for every lead that is
+    // already overdue — and a sweep that offered both would tell the owner "your deadline is
+    // soon" and "your deadline has passed" in the same minute. That is the one ordering which
+    // makes both messages read as noise, and the panel's own two states (`at_risk` and
+    // `breached`) agree with it.
+    //
+    // The upper edge is what the first draft was missing, and it was found by a test that
+    // asserted one notification and got two: a lead seeded 30 minutes overdue with a
+    // 15-minute reminder is inside the window *and* past the deadline, so both arms fired. The
+    // lower edge alone cannot see the difference, because the window is defined relative to the
+    // deadline and a past deadline puts every earlier instant inside it.
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let due = row.first_response_due_at?;
+            let remind_at = due - time::Duration::minutes(i64::from(row.reminder_minutes));
+            (now >= remind_at && now < due).then_some(Reminder {
+                lead_id: row.lead_id,
+                owner_user_id: row.owner_user_id,
+                due_at: due,
+                remind_at,
+            })
+        })
+        .collect())
+}
+
+/// A lead inside its reminder window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reminder {
+    pub lead_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
+    /// When the deadline arrives.
+    pub due_at: time::OffsetDateTime,
+    /// When the reminder fired — the window's open edge, kept so the trail line can say it.
+    pub remind_at: time::OffsetDateTime,
+}
+
+/// Take the reminder, *only if* this lead has not been reminded yet.
+///
+/// **The once-only guarantee is a partial unique index, not a `select … where not exists`.**
+/// The read in [`due_reminders`] filters on the absence of an `sla_reminded` line, and that
+/// filter is a read-then-write across two app instances: both see the same due row, both see
+/// no claim, and both notify. The module has now met this shape three times (the round-robin
+/// cursor, the autoresponder reservation, and this), so the answer is the same one every time
+/// — an `insert … on conflict do nothing` whose **row count** is the decision, over a partial
+/// unique index on `(lead_id) where kind = 'sla_reminded'`. A duplicate key makes the insert
+/// match zero rows, so the loser's `false` is a fact rather than an opinion.
+pub async fn mark_reminded(
+    pool: &PgPool,
+    lead_id: Uuid,
+    now: time::OffsetDateTime,
+) -> Result<bool> {
+    let inserted = sqlx::query(
+        "insert into crm_lead_events (lead_id, kind, detail) \
+         values ($1, 'sla_reminded', jsonb_build_object('reminded_at', to_char($2 at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))) \
+         on conflict (lead_id) where kind = 'sla_reminded' do nothing",
+    )
+    .bind(lead_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
+}
+
 fn map_unique(error: sqlx::Error, message: &str) -> CrmIntakeError {
     if let sqlx::Error::Database(ref db) = error {
         // 23505 is unique_violation. Matching on the code rather than the message keeps
