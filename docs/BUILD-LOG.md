@@ -5901,3 +5901,66 @@ consumed before the body, so it has to be captured inside `call`.
 acceptance 18 stays open. (b) `--only=featured-media`, then `--only=members`. (c) REQ-063's
 `publicRendered` — answered from SQL last tick, still waiting on a pass that can address a site.
 
+
+### Tick 66 — the media part was a manifest wearing a backup's name (2026-09-29)
+
+**What.** Last tick's next step was written before it was understood: *"the `media` part of a
+backup run is the place to look next: it counts rows, and a backup that only counts is a
+manifest, not a backup."* This tick took it literally. The media part did not count rows
+and copy them; it counted rows **and that was all it did**.
+
+**The defect.** `document_media` ran
+`select site_id, count(*), coalesce(sum(size_bytes), 0)::bigint from media`, wrote the result
+as JSON, and recorded that JSON as the part's artifact with a real checksum. The run reached
+`succeeded`, `verify` read the artifact back and agreed with it, and **not one byte of the
+library had been copied anywhere**. The screen said "media: 412 files, 88 MiB" and meant
+"there are 412 rows in a table, and their sizes add up".
+
+It is the same defect the crate documents twice already — a checksum over a document nobody
+wrote is a perfectly good checksum — wearing a different mask, and the mask is the lesson:
+**counting is what the database can do with the object store switched off.** The count was
+therefore available on exactly the run where the store was unreachable, and it is what made
+the row look healthy. Every pre-existing assertion in the suite passed on the broken
+implementation, which is why it needed a walk of its own.
+
+**What shipped** (`crates/backup/src/media.rs`, new, 22 unit tests). The part copies every
+object through the deployment's own `Storage` abstraction — not a vendor SDK, so a site on a
+directory and a site on a bucket both back up — one object at a time, writing each into the
+run's own directory and recording it in a `media-index.json` the restore path will walk. The
+bytes that come back are **re-hashed and compared with the library row**; a disagreement in
+size or SHA-256 is a failure, never a silent copy of something the library does not describe.
+An object over `MAX_OBJECT_BYTES` (256 MiB) is **named and skipped, not truncated** — a
+truncated image is a backup that claims to have restored a file it destroyed. A part that
+copied some of the library is a **failed** part: `summarise` makes the run `partial` and the
+error carries the count and the first three file names.
+
+**And the bug the walk found underneath it** — one the tick was not looking for. Every
+artifact in every run was written to `<root>/<prefix>/<prefix>/…`. A storage key is already
+prefix-qualified, and the writer joined it to `local_root_for(root, prefix)`, which adds the
+prefix a second time. The **reader doubled it the same way and so did the suite's path
+helper**, so all three agreed, every walk was green, and the archive sat one directory deeper
+than the manifest said. Three halves making the same mistake is not a cross-check. Fixed with
+a separate `local_path_for(root, key)` and a unit test that writes the wrong path out in full
+so the mistake cannot come back quietly. The new walk now reads the archive's location **out
+of the index the run wrote** rather than recomputing it, so the two halves *can* disagree.
+
+**Proof.** `omnion-backup --lib` 65/0 · `omnion-api --lib` 220/0 · `--test backups` **8/0**
+(the seven pre-existing walks still pass, plus `the_media_part_copies_the_librarys_bytes_and
+_a_missing_object_fails_the_run`, which uploads two real objects through `state.storage()`,
+reads the archived bytes back and compares them, checks the index's per-object size and
+checksum against the files on disk, then adds a row whose object the store does not have and
+requires `partial` with "1 of 3" in the error) · `apps/admin` `tsc --noEmit` clean. The build
+warning count is **13 before and 13 after** — none introduced.
+
+**Blocker, unchanged and not worked around.** The browser pass did not run again: `qa-slot.sh`
+is held by a sibling and the box peaked at load 36 during this tick. The Rust walks are the
+gate that shipped, and the screen for this part is unchanged, so nothing is untested in the
+UI sense — but the run against `runBackupDepth`/`runSecurityDepth` still has to happen before
+REQ-010, REQ-012 and REQ-013 close.
+
+**Next.** (a) The restore path (REQ-013 slice 2) now has a real archive to read: the index is
+written, so `restore preview` can count the objects it can put back instead of describing
+what might be there. (b) `objects/` grows one file per object, and the delete route has to
+remove the directory as well as the run's own JSON — check that before the restore wizard
+exists, because an operator who deletes a backup and finds the files still there will assume
+the product lied.

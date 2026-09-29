@@ -103,6 +103,32 @@ pub fn local_root_for(root: &str, prefix: &str) -> PathBuf {
     base.join(normalised.trim_matches('/'))
 }
 
+/// The file a full storage key lands on, under `root`.
+///
+/// **Separate from [`local_root_for`] on purpose, and the two being confused is a bug that
+/// hides from every test that uses them together.** A key is *already* prefix-qualified —
+/// `storage_key("/2026-09-29/<id>", "media")` is `/2026-09-29/<id>/media-index.json` — so
+/// joining one to `local_root_for(root, prefix)` writes the prefix twice and produces
+/// `<root>/2026-09-29/<id>/2026-09-29/<id>/media-index.json`.
+///
+/// That bug survived a full slice because the reader made the *same* mistake in the same
+/// direction, so writer and reader agreed with each other and every assertion passed while
+/// the archive sat in a directory no operator would ever look in. A backup at
+/// `/2026-09-29/<id>/2026-09-29/<id>/` is still a real backup, which is exactly why nothing
+/// complained — and exactly why the mistake is dangerous: it only becomes visible when the
+/// run is restored by hand, or when something else walks the root expecting one level.
+///
+/// The rule this function encodes: **a key is absolute with respect to the root.** Join it to
+/// the root and to nothing else.
+#[must_use]
+pub fn local_path_for(root: &str, key: &str) -> PathBuf {
+    let trimmed_key = key.trim_start_matches('/');
+    if trimmed_key.is_empty() {
+        return Path::new(root.trim()).to_path_buf();
+    }
+    Path::new(root.trim()).join(trimmed_key)
+}
+
 /// What a destination probe found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestinationReport {
@@ -359,6 +385,44 @@ mod tests {
         assert!(!report.writable);
         assert!(report.reason.contains("relative"), "{}", report.reason);
         assert!(!std::path::Path::new("relative-backups").exists());
+    }
+
+    #[test]
+    fn a_key_is_joined_to_the_root_once_and_only_once() {
+        // The bug this function exists for. A key already carries the prefix, so joining it to
+        // `local_root_for(root, prefix)` writes the prefix twice. Written out in full because
+        // the doubled path is *plausible* — it exists, it holds the backup, and every reader
+        // that made the same mistake agrees with the writer.
+        let root = "/var/lib/omnion/backups";
+        let prefix = storage_prefix("2026-09-29/abc");
+        let key = storage_key(&prefix, "media");
+
+        let doubled = local_root_for(root, &prefix).join(key.trim_start_matches('/'));
+        assert_eq!(
+            doubled.to_string_lossy(),
+            format!("{root}/2026-09-29/abc/2026-09-29/abc/media.json"),
+            "this is the mistake; the test exists so nobody reintroduces it"
+        );
+
+        let right = local_path_for(root, &key);
+        assert_eq!(
+            right.to_string_lossy(),
+            format!("{root}/2026-09-29/abc/media.json")
+        );
+    }
+
+    #[test]
+    fn a_leading_slash_on_a_key_changes_nothing() {
+        assert_eq!(
+            local_path_for("/backups", "/a/b.json").to_string_lossy(),
+            local_path_for("/backups", "a/b.json").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn an_empty_key_is_the_root_rather_than_a_file_under_it() {
+        assert_eq!(local_path_for("/backups", "").to_string_lossy(), "/backups");
+        assert_eq!(local_path_for("/backups", "/").to_string_lossy(), "/backups");
     }
 
     #[test]
