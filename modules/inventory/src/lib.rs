@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alerts;
 pub mod approvals;
 pub mod csv;
 pub mod dates;
@@ -38,6 +39,7 @@ pub mod ledger;
 pub mod model;
 pub mod money;
 pub mod store;
+pub mod transfers;
 
 pub use error::{InventoryError, Result};
 pub use items::Item;
@@ -48,4 +50,8 @@ pub use model::{
 pub use store::{
     ItemQuery, ItemView, LocationView, NewItem, NewLocation, NewWarehouse, Overview, Page,
     SettingsPatch, StockLevel, StockPosition, StockQuery, StocktakeSnapshot, WarehouseView,
+};
+pub use transfers::{
+    NewTransfer, NewTransferLine, TransferLine, TransferQuery, TransferStepLine, TransferView,
+    create_transfer, dispatch, receive,
 };

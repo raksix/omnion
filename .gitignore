@@ -10,6 +10,11 @@ target/
 # The box-wide disk guard spares a per-worktree target, so the build lives here. `target/` above
 # does not match it, and a careless `git add -A` would try to commit 30 GB of build output.
 .tmp-target/
+# The trailing slash above matches a **directory** only. When the build target is a SYMLINK into
+# tmpfs — the pattern this box needs when `/mnt/apopic` is at 100% — a careless `git add -A`
+# stages the link itself, and committing it replaces every other worker's build directory with a
+# dangling pointer to a machine that may be rebooted. The unslashed form matches both.
+.tmp-target
 .cargo/
 
 # Env / secrets
