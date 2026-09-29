@@ -32,6 +32,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assignment;
+pub mod assignment_store;
 pub mod dedupe;
 pub mod error;
 pub mod keys;
@@ -40,6 +42,16 @@ pub mod model;
 pub mod store;
 pub mod vocabulary;
 
+pub use assignment_store::{
+    Breach, NewPolicy, NewRule, claim_assignment, create_policy, create_rule, delete_policy,
+    delete_rule, due_breaches, escalation_target, find_policy, find_rule, list_policies,
+    list_rules, mark_escalated, policy_for_source, reorder_rules, stamp_assignment,
+    update_policy, update_rule,
+};
+pub use assignment::{
+    AssignmentInput, AssignmentOutcome, AssignmentRule, BusinessHours, SlaPolicy, SlaState,
+    due_at, next_position, renumber, simulate, validate_policy, validate_rule,
+};
 pub use dedupe::{Candidate, DedupePolicy, Match, MatchKey, Verdict, evaluate as dedupe_evaluate};
 pub use error::{CrmIntakeError, Result};
 pub use keys::{hash_key, hint_for, issue_key, verify_key};
@@ -49,6 +61,7 @@ pub use model::{
     SpamVerdict, contactable,
 };
 pub use vocabulary::{
-    DECISIONS, DEDUPE_POLICIES, MAX_BULK_IDS, MAX_PAGE, MAX_PAYLOAD_BYTES, SOURCE_KINDS, STATUSES,
-    is_decision, is_dedupe_policy, is_open, is_source_kind, is_status,
+    ASSIGNMENT_TARGETS, DECISIONS, DEDUPE_POLICIES, MAX_BULK_IDS, MAX_PAGE, MAX_PAYLOAD_BYTES,
+    SOURCE_KINDS, STATUSES, is_decision, is_dedupe_policy, is_open, is_round_robin_target,
+    is_source_kind, is_status,
 };
