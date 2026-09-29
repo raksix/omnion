@@ -72,6 +72,7 @@ import type {
   SeoBrokenLink,
   SeoOverview,
   SeoRedirect,
+  SeoRedirectImport,
   SeoRedirectTest,
   SeoSettings,
   FormDetail,
@@ -5412,6 +5413,68 @@ export function testSeoRedirect(ruleId: string, path: string): Promise<SeoRedire
     `/api/v1/seo/redirects/${encodeURIComponent(ruleId)}/test`,
     { method: "POST", body: JSON.stringify({ path }) },
   );
+}
+
+/**
+ * Read a CSV of redirect rules — and write nothing, unless `dryRun` is false.
+ *
+ * The default is deliberately the read: a 400-row file is something an owner wants to see
+ * before they commit it, and the report is exactly what the parse already produced. The write is
+ * a second, explicit press, and a file with anything refused writes **nothing** — the endpoint
+ * answers 422 with the lines that stopped it, which is why this is not a `request` that throws.
+ */
+export async function importSeoRedirects(input: {
+  site_id: string;
+  csv: string;
+  dry_run: boolean;
+}): Promise<SeoRedirectImport> {
+  const response = await fetch("/api/v1/seo/redirects/import", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(input),
+    credentials: "same-origin",
+  });
+  const body = (await response.json().catch(() => ({}))) as Partial<SeoRedirectImport>;
+  if (!response.ok && response.status !== 422) {
+    // 422 carries the report, so it is a result rather than a failure. Anything else is a real
+    // refusal (a 403, a 404) and gets the same treatment as every other call on this surface.
+    throw new ApiError(response.status, "redirect_import_failed", body?.summary ?? "the import could not be read");
+  }
+  return {
+    clean: body?.clean === true,
+    imported: body?.imported ?? 0,
+    accepted: body?.accepted ?? 0,
+    summary: body?.summary ?? "",
+    rejected: body?.rejected ?? [],
+  };
+}
+
+/**
+ * Download a site's rules as CSV.
+ *
+ * A `<a download>` cannot carry a panel session's headers, so this fetches the file and hands the
+ * browser an object URL — which is also why the `Content-Disposition` header is asserted on the
+ * server side rather than assumed here: this is the code that has to honour it.
+ */
+export async function downloadSeoRedirectCsv(siteId: string): Promise<void> {
+  const response = await fetch(
+    `/api/v1/seo/redirects/export?site_id=${encodeURIComponent(siteId)}`,
+    { credentials: "same-origin" },
+  );
+  if (!response.ok) {
+    throw new ApiError(response.status, "redirect_export_failed", "the export could not be read");
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "redirects.csv";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // Revoking immediately can cancel the download in some browsers; a tick is enough for the click
+  // to have been consumed, and an orphaned object URL is a leak that lasts as long as the panel.
+  setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 /** Save a site's sitemap settings and robots.txt. */

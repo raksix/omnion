@@ -1974,6 +1974,31 @@ export type SeoRedirectTest = {
   also_matched: SeoRedirect[];
 };
 
+/** One row a redirect file was refused on, with the reason a human can act on. */
+export type SeoRedirectRejection = {
+  /** 1-based line in the uploaded file, or 0 for a refusal about the file as a whole. */
+  line: number;
+  /** The row as it was read. */
+  row: string;
+  /** Why it was refused. */
+  reason: string;
+};
+
+/**
+ * What an import did, or would do on a dry run.
+ *
+ * `imported` and `accepted` are three different numbers and keeping them apart is the point: a
+ * dry run has all the accepted rows and no imported ones, and a refused file has imported none
+ * of the rows it accepted. A single "rows" number would render those two states identically.
+ */
+export type SeoRedirectImport = {
+  clean: boolean;
+  imported: number;
+  accepted: number;
+  summary: string;
+  rejected: SeoRedirectRejection[];
+};
+
 /** One broken internal link. */
 export type SeoBrokenLink = {
   id: string;
