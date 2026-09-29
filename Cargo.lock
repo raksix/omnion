@@ -1610,6 +1610,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-reliability"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "omnion-core",
+ "rand 0.8.8",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-search"
 version = "0.1.0"
 dependencies = [
