@@ -3898,3 +3898,69 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 `report.notificationOutbox` to be **present** — that last one is the first pass that can close
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
+
+## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
+
+**What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
+landed, and it answered the question the last two ticks were holding open. `report.notificationOutbox`
+exists for the first time: five chips all carrying counts, `chiptotalMatchesSql` true,
+`targetHiddenForActor` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, a removal that
+answers 204 and leaves the table, and `retryIsNotRetryable` true. `report.notificationSettings` is green
+on the matrix, the honest save notice, the round trip and the error state. `runMediaRetention` came back
+`ok: true` for the first time, which is REQ-010's blocker clearing.
+
+**The pass also produced one string that says everything.** `report.notifications` ended with
+
+```json
+"keyboardRows": 0,
+"keyboard": "no rows to drive — the list did not load"
+```
+
+which reads like a timing problem and is not one. The pass had marked its own three rows read four lines
+earlier, and the list then showed none of them. `with_read` was a `bool` defaulting to `false`, and a
+`bool` cannot tell "the client said nothing" from "the client said no" — so **every** caller that named no
+filter got an unread-only list, while the panel's own State menu labelled that same state "Unread and
+read". The screen promised a list it was not sending. Nothing failed loudly: the list rendered, the badge
+was right, and the screen simply stopped showing mail the reader had already seen.
+
+**What this tick fixed.** `ab3c105` gives `with_read` an `Option<bool>`, so absent and off stay
+distinguishable and absence means *everything*; `4933c10` fixes the three client places that assumed a
+positive flag — `filtersFrom` never sent it, `notificationQuery` dropped the `false` that *is* the
+inbox filter, and the empty state's "Show read notifications" button **set** the flag to switch read
+rows on when the correct action is to clear it. `797a3e8` adds the two gates that were missing, which
+is the part that matters: `readRowsStayVisible` immediately after the bulk action, and `inboxFilterIsHonest`
+on the other half, so a default nobody can turn off cannot pass as a fix.
+
+**Proof.** `cargo test -p omnion-api --lib` → **188 passed** (187 + the absent-vs-off test, which
+asserts the parse *and* the built query — a parser that keeps them apart and a builder that throws the
+distinction away are two different bugs and only the pair is the fix). `-p omnion-notifications` → **79**;
+`-p omnion-permissions` → **62**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check
+scripts/qa/walkthrough.cjs` → clean. `scripts/qa/run-notifications-http.sh` → **PASS 13/13** over a real
+socket, the new leg reading `all=1 inbox=0 live=1`. Browser pass: 36 pages, 1095 clicks, 88 field fills,
+39 form submissions, 84 findings (79 high, 5 medium).
+
+**On those 79 high findings, honestly.** 74 are `/media/*` and belong to REQ-010, which is the other
+in-progress REQ in this wave — 30 of them are one 422 on `/api/v1/media/{id}/raw?preset=standard` and 22
+more of the same from a second file. The remaining 5 are **this pass's own deliberate refusal probes**:
+three the 400 in-app-column lock and two the routed-500 error state, each of which the pass asserts as
+*expected* two lines later. Neither group is caused by this tick's change.
+
+**Also fixed, incidentally.** The gate I extended had two defects of its own, both caught because the
+first version of the assertion failed in a way the change had nothing to do with: `grep -c` exits 1 on
+an empty body, so under `set -e` the *inbox* leg — which is meant to be empty — aborted the whole gate
+before printing a verdict; and the row to mark is read from SQL rather than reusing the `$target` that
+the 404 check *below* assigns, because a shell script that reads a value before the line that sets it
+reports an empty id as "the endpoint refused".
+
+**Not proven, and not claimed.** No pass has yet run against the `with_read` fix, so the keyboard leg —
+`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`, `shiftEMarkedVisible`,
+`slashFocusedFilter` — is still unproven and the REQ stays **in-progress**. `quietSaved` and
+`digestPersisted` are still false: the widgets render, but the pass does not change them yet, so those
+two halves of the settings box are honestly unproven despite the box being ticked for what was proven.
+
+**Next.** Run `bash scripts/qa/run.sh` again (verify `stat -c %y target/debug/omnion-api` is newer than
+`ab3c105` first). Require `report.notifications.readRowsStayVisible`, `inboxFilterIsHonest`,
+`keyboardRows > 0` and then the five keyboard keys, plus `notificationSettings.quietSaved` and
+`digestPersisted` — and extend the settings pass to change those two fields rather than merely render
+them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
+REQ-010 slice 4's remaining gate.
