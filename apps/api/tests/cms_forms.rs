@@ -21,7 +21,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
+use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
@@ -44,8 +44,20 @@ const INBOX_EXTRA: [&str; 1] = ["forms.submissions.read"];
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
-    set_cookie: Option<String>,
+    /// Every `Set-Cookie` the response set, so a sign-in's session cookie AND its CSRF cookie
+    /// both survive. Reading only the first one loses the token and turns every write into a
+    /// 403 that reads like a broken form builder.
+    set_cookies: Vec<String>,
     body: Value,
+}
+
+/// A signed-in call carries two credentials: the session cookie, and the CSRF token that proves
+/// the caller could read the page. The panel sends the token as `x-omnion-csrf`; a suite that
+/// sends the cookie alone is testing the CSRF middleware.
+#[derive(Debug, Clone)]
+struct Credentials {
+    session: String,
+    csrf: Option<String>,
 }
 
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
@@ -54,11 +66,12 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
-    let set_cookie = response
+    let set_cookies: Vec<String> = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect();
     let bytes = response
         .into_body()
         .collect()
@@ -72,15 +85,29 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     };
     TestResponse {
         status,
-        set_cookie,
+        set_cookies,
         body,
     }
 }
 
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+fn request(
+    method: Method,
+    uri: &str,
+    token: Option<&Credentials>,
+    body: Option<Value>,
+) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(credentials) => {
+            let mut builder = builder.header(
+                header::COOKIE,
+                format!("omnion_session={}", credentials.session),
+            );
+            if let Some(csrf) = credentials.csrf.as_deref() {
+                builder = builder.header("x-omnion-csrf", csrf);
+            }
+            builder
+        }
         None => builder,
     };
     match body {
@@ -121,8 +148,15 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
+/// A test-only CSRF secret. A cookie-authenticated write is refused outright when the process
+/// has none configured, so a suite that leaves it to the environment measures 403s on whatever
+/// machine happens to run it — which is how twelve walks of this file came to be red for a
+/// reason that had nothing to do with forms.
+const CSRF_SECRET: &str = "forms-suite-csrf-secret";
+
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
     let db = match Db::connect(&config.database).await {
         Ok(db) => db,
         Err(error) => {
@@ -161,7 +195,7 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
     (user.id, email)
 }
 
-async fn login(state: &AppState, email: &str) -> String {
+async fn login(state: &AppState, email: &str) -> Credentials {
     let response = call(
         state,
         request(
@@ -178,17 +212,29 @@ async fn login(state: &AppState, email: &str) -> String {
         response.status,
         response.body
     );
-    response
-        .set_cookie
-        .as_deref()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("the cookie has a value")
-        .split_once('=')
-        .expect("the cookie is name=value")
-        .1
-        .to_owned()
+    // Sign-in sets BOTH cookies, and it is the only response that carries the CSRF token. A
+    // helper that kept only the first header lost the token silently, and every write in this
+    // suite answered 403 `csrf_failed` — which read as a broken form builder and was measured
+    // as one.
+    let mut session = None;
+    let mut csrf = None;
+    for raw in &response.set_cookies {
+        for piece in raw.split(", ") {
+            let Some((name, value)) = piece.split(';').next().unwrap_or_default().split_once('=')
+            else {
+                continue;
+            };
+            match name {
+                "omnion_session" => session = Some(value.to_owned()),
+                "omnion_csrf" => csrf = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+    }
+    Credentials {
+        session: session.expect("login must set the session cookie"),
+        csrf,
+    }
 }
 
 async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], label: &str) {
@@ -327,18 +373,18 @@ impl Fixture {
         })
     }
 
-    async fn builder(&self) -> String {
+    async fn builder(&self) -> Credentials {
         login(&self.state, &self.builder_email).await
     }
-    async fn inbox(&self) -> String {
+    async fn inbox(&self) -> Credentials {
         login(&self.state, &self.inbox_email).await
     }
-    async fn outsider(&self) -> String {
+    async fn outsider(&self) -> Credentials {
         login(&self.state, &self.outsider_email).await
     }
 
     /// Create a form with the eight field types, and return its id.
-    async fn form_with_all_types(&self, token: &str, key: &str) -> String {
+    async fn form_with_all_types(&self, token: &Credentials, key: &str) -> String {
         let created = call(
             &self.state,
             request(
@@ -359,7 +405,7 @@ impl Fixture {
     }
 
     /// Publish a form.
-    async fn publish(&self, token: &str, form_id: &str) -> TestResponse {
+    async fn publish(&self, token: &Credentials, form_id: &str) -> TestResponse {
         call(
             &self.state,
             request(
@@ -832,7 +878,7 @@ async fn the_export_of_a_filtered_inbox_returns_exactly_the_filtered_rows() {
                 .uri(format!(
                     "/api/v1/forms/{form_id}/submissions/export?status=new"
                 ))
-                .header(header::COOKIE, format!("omnion_session={token}"))
+                .header(header::COOKIE, format!("omnion_session={}", token.session))
                 .body(Body::empty())
                 .expect("request builds"),
         )
