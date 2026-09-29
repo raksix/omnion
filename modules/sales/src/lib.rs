@@ -29,10 +29,12 @@
 pub mod approvals;
 pub mod catalog;
 pub mod dates;
+pub mod documents;
 pub mod error;
 pub mod model;
 pub mod money;
 pub mod orders;
+pub mod pdf;
 pub mod quotes;
 pub mod reports;
 pub mod store;
