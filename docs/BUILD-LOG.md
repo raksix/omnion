@@ -4705,3 +4705,49 @@ a sticky bulk bar that renders the refusals **grouped by reason**.
 **Next.** The narrowed `QA_ROUTES=crm` pass. Then the walkthrough for the bulk bar itself
 (`bulkSelectsRows`, `bulkRefusalsNamed`) — written next to the hand-over steps so both halves of
 this tick's screen work are measured by the same run that finally reaches the CRM screens.
+
+---
+
+## 2026-09-29 · omnion-w8 · REQ-117 · the duplicate verdict (415ea39)
+
+**What.** Migration `0144_crm_lead_dedupe_pointers.sql` splits the two pointers the dedupe verdict
+conflated, `store::resolve_duplicate` owns reversing a verdict, `POST
+/crm/leads/{id}/duplicate-decision` exposes it, and the queue shows the score.
+
+**Two defects, both invisible for fourteen ticks.**
+
+1. `crm_leads.duplicate_of` is a foreign key to `crm_leads`; `capture` wrote a `crm_contacts` id
+   into it. On any installation with the CRM, **every** `reject_duplicate` submission raised 23503
+   and answered `500` to the visitor.
+2. The queue's `Link` button sent `PATCH { status: "assigned" }` — no `contact_id`. `patch_lead`
+   keeps the existing value, a duplicate row has none, so the row left the queue and the panel
+   announced a link it never made.
+
+**Why no gate saw it.** `crm_contacts` belongs to REQ-051 and is absent on this branch, so
+`fetch_candidates` takes its documented module-absence path and returns nothing — the duplicate
+arm is dead code in all five previous gates. **The absence branch that is supposed to be the
+default behaviour is what hid the bug on the non-default installation.** `run-crm-convert.sh` had
+already written this lesson down for the conversion path; it had not been applied here.
+
+**Proof.**
+- `bash scripts/qa/run-crm-dedupe.sh` → **10/10** (new gate: builds `crm_contacts`/`crm_companies`
+  from `0022_crm.sql` and tests the three policies against real contacts).
+- **The gate is proven to fail**: `git stash push -- modules/crm-intake/src/store.rs`, re-run →
+  `23503 crm_leads_duplicate_of_fkey` on 5/5 tests. `git stash pop` → 10/10.
+- It also caught a `real` (FLOAT4) column against Rust's `f64` on its first run.
+- Regressions: `run-crm-assign.sh` **14/14**, `run-crm-convert.sh` **6/6**, `cargo test -p
+  omnion-module-crm-intake --lib` **137/137**, `pnpm typecheck` clean, `cargo build -p omnion-api`
+  green.
+
+**Also fixed:** a bare `\u2014` in a doc string on the bulk-assign handler has been a compile error
+in HEAD since that tick. The build is not a committed gate, and a green test run does not compile
+the API — the two facts are independent and both were true at once.
+
+**Not proved.** The `QA_ROUTES=crm` pass reached the CRM routes this tick for the first time
+(`crm-leads`, `crm-intake-sources`, `crm-assignment-rules`, `crm-sla-policies` all rendering) but
+had not reached its summary when the tick ended. The queue's new `Link`/`Keep separate` steps are
+written and unexecuted, as before.
+
+**Next.** Read the pass's summary rather than its tail, then the duplicate-queue walkthrough steps.
+The unticked box that was hiding the 500 was the first line I had skipped reading closely for a
+while, which is the argument for reading the *unticked* acceptance criteria, not the ticked ones.
