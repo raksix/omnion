@@ -4121,6 +4121,118 @@ async function runCrmIntakeDepth(page, report) {
   steps.respondIsIdempotent = firstResponse === secondResponse;
   steps.respondTimelineHasTwoLines = await page.locator("[data-event=responded]").count();
 
+  // 5b. The hand-over, on the screen. This is the step four ticks of build log had been
+  //     waiting for: the store and the endpoint were gated, and nothing pressed the button.
+  //     Every claim here is measured rather than clicked-and-hoped:
+  //
+  //     1. The panel offers *people*, not uuids. A picker whose options are raw ids is the
+  //        uuid box with better styling, and an operator cannot recognise a colleague by
+  //        their account id.
+  //     2. The save is refused with an empty reason — the reason is the half of the decision
+  //        that makes the trail answerable, so it is checked before it is filled.
+  //     3. A real save writes a `reassigned`/`assigned` line, and the trail names the person
+  //        rather than an id. "Owner changed" with no name answers nobody's question.
+  //     4. The queue round trip is visible on screen: after unassigning, the header chip and
+  //        the trail both say so without a reload.
+  await page.locator("[data-lead-assign-open]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.assignPanelOpen = (await page.locator("[data-lead-assign]").count()) > 0;
+
+  // A roster needs somebody in it. The QA owner is the session that is signed in, so its own
+  // account is a real, guaranteed colleague — and the picker must be able to name them.
+  const roster = await page.evaluate(() =>
+    fetch("/api/v1/crm/leads/owners", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.rosterSize = Array.isArray(roster) ? roster.length : -1;
+  steps.rosterNamesPeople = Array.isArray(roster)
+    ? roster.every((row) => typeof row.label === "string" && row.label.length > 0)
+    : false;
+  steps.rosterHasLoad = Array.isArray(roster)
+    ? roster.some((row) => typeof row.open_leads === "number")
+    : false;
+  steps.rosterOptions = await page.locator("[data-owner-option]").count();
+  steps.rosterOptionText = (
+    await page.locator("[data-lead-assign-owner] option").allInnerTexts()
+  ).join(" | ").slice(0, 200);
+  // Not a uuid box: no option is a bare 36-character id.
+  steps.pickerIsNotUuids = !(await page.locator("[data-lead-assign-owner] option").allInnerTexts())
+    .some((text) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text.trim()));
+  await shot(page, "page-crm-lead-assign");
+
+  // The reason is required, and the panel says so before the round trip.
+  steps.assignSaveDisabledWithoutReason = await page
+    .locator("[data-lead-assign-save]")
+    .first()
+    .isDisabled()
+    .catch(() => false);
+
+  // Pick a colleague other than the current owner when the roster offers one, so the trail
+  // line under test is a genuine hand-over rather than a no-op press.
+  const pickValue = await page.evaluate(() => {
+    const select = document.querySelector("[data-lead-assign-owner]");
+    if (!select) return "";
+    const current = select.value;
+    const other = Array.from(select.options).find((option) => option.value && option.value !== current);
+    return other ? other.value : "";
+  });
+  steps.assignPickedOther = Boolean(pickValue);
+  if (pickValue) {
+    await page.selectOption("[data-lead-assign-owner]", pickValue).catch(() => {});
+    await page.locator("[data-lead-assign-reason]").fill("QA · handed over on purpose").catch(() => {});
+    await page.waitForTimeout(400);
+    steps.assignSaveEnabledWithReason = !(await page
+      .locator("[data-lead-assign-save]")
+      .first()
+      .isDisabled()
+      .catch(() => true));
+    await page.locator("[data-lead-assign-save]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.assignNotice = (await page.locator("[data-lead-notice]").innerText().catch(() => "")).slice(0, 90);
+    steps.assignTimelineLine = await page.locator("[data-event=assigned], [data-event=reassigned]").count();
+    // The trail line names a person. An id here means the roster was not consulted.
+    steps.assignTrailText = (
+      await page.locator("[data-lead-trail] li").first().innerText().catch(() => "")
+    ).slice(0, 160);
+    steps.trailNamesAPerson = steps.assignTrailText.includes("\u2192") && !/[0-9a-f]{8}-[0-9a-f]{4}/i.test(steps.assignTrailText);
+    steps.ownerChipAfterAssign = (
+      await page.locator("[data-lead-owner-chip]").innerText().catch(() => "")
+    ).trim();
+  }
+
+  // Back to the queue: the header chip and the trail must both say so, with no reload. A panel
+  // that needs a refresh to reflect its own action is a panel that will be double-pressed.
+  await page.locator("[data-lead-assign-open]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  await page.selectOption("[data-lead-assign-owner]", "").catch(() => {});
+  await page.locator("[data-lead-assign-reason]").fill("QA · back to the queue").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-lead-assign-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.ownerChipAfterUnassign = (
+    await page.locator("[data-lead-owner-chip]").innerText().catch(() => "")
+  ).trim();
+  steps.unassignVisibleWithoutReload = /unassigned/i.test(steps.ownerChipAfterUnassign);
+
+  // And the inbox reads it as a name too — the same column, not a different one.
+  await page.goto(`${URL_ADMIN}/crm/leads?owner=unassigned`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.inboxOwnerNames = await page.evaluate(() => {
+    const cells = Array.from(document.querySelectorAll("[data-lead-owner-cell]"));
+    return {
+      cells: cells.length,
+      allBadges: cells.every((cell) => /unassigned/i.test(cell.textContent ?? "")),
+      sample: (cells[0]?.textContent ?? "").trim().slice(0, 60),
+    };
+  });
+  steps.inboxOwnerFilterOffersPeople = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("#lead-owner option")).filter((o) => o.dataset.ownerFilter).length,
+  );
+  await shot(page, "page-crm-leads-owner-names");
+  await page.goto(`${URL_ADMIN}/crm/leads/${leadId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
   // `Convert`, and the stepper's answer. Two claims are measured here, both of which the
   // previous build could not make at all:
   //
