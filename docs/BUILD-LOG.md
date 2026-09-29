@@ -3632,3 +3632,90 @@ this, so the keyboard leg (`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `
 `notificationSettings.quietSaved` + `digestPersisted`, which the data path can now support.
 The other open item is unchanged: the 74 `/media/*` high findings, which are REQ-010 slice 4's
 remaining gate.
+
+---
+
+## 2026-09-29 · REQ-098 slice 5 (the cost snapshot) + three product defects slice 4 left behind
+
+**What.** The tick opened with a merge (main had moved 28 commits and taken migration `0051`),
+which produced two UNION conflicts in files that only grow — `docs/BUILD-LOG.md` and the QA
+`walkthrough.cjs` route list — and then found that the open acceptance box said something the code
+did not do.
+
+**The box was lying, and fixing it is most of the slice.** Slice 1's migration (0043) promised in
+prose that "the cost a request was billed at is derived from the price *at the moment of the call*
+and stored, so changing a price today must never move a number written last month." Nothing stored
+it. `ai_provider_usage` held token counts only, so any costs screen had to re-derive every
+historical figure from the **current** price — and an operator correcting a typo would have
+silently restated last month's spend. Slice 5 ships the store:
+
+- `database/migrations/0055_ai_usage_cost_snapshot.sql` — four columns: the two rates as they were,
+  the total, and the instant the attempt was priced.
+- `crates/ai-hub/src/cost.rs` — the figure as a **pure** function, so the arithmetic is testable
+  without a database and cannot drift from what the insert binds.
+- `NewUsage.cost` carries the snapshot **into** the store. The store never updates those columns;
+  the price is read once per call in `record_usage`, not once per row.
+
+**Three decisions in the arithmetic, each about a specific way it lies.** A missing token count
+yields a missing cost, never zero — zero is a *measurement* and an unknown is not, and
+`unwrap_or(0)` on the token counts would make an unknown render as the cheapest call in the table.
+The two sides are summed as exact decimals and rounded **once**: rounding each half first gives
+0.6 + 0.6 → 1 + 1 = 2 where the truth is 1, an over-report of 67% on that row. And a missing price
+yields a missing cost even when the tokens are known, because a number invented from a sibling
+model has no source.
+
+**Three product defects, all from slice 4, all found by running the suite rather than by reading it.**
+
+1. **An installation with nothing configured was answered `422 ai.route.unresolved`.** It is a
+   setup problem, and it now answers `409 no_default_model` — the code callers have branched on
+   since the route existed — with a message that names the thing to go and set, and **no** event:
+   an unfinished installation firing `ai.route.unresolved` on every request is the noisiest
+   possible subscriber. The predicate is `Resolved::had_candidates`, and getting it right took
+   two tries, both instructive. "The walk names a model" is wrong because the maps filter out a
+   disabled model *before* the walk sees it — so a request whose default was deliberately switched
+   off would be reported as "you have configured nothing", sending the operator to set the model
+   they had already set. The predicate is "the maps hold any row at all", and that is the
+   question the three cases actually ask.
+
+2. **An explicit pin could be answered by a different provider.** A failover pair is configured
+   with the same upstream model on both providers, so the bare `model_key` names two rows. The walk
+   recorded the key, `load_pair` split on the first `/`, found no provider called `mock-small`, and
+   fell through to a bare-key lookup — which resolved against the **default** provider. A request
+   pinning `Standby/mock-small` was served by `Preferred`, the dead one, while the walk said
+   "chosen". The fix is that the walk records **the identifier the caller sent**
+   (`ResolveRequest::explicit_identifier`), because that is the only form that survives the round
+   trip. The dry-run preview had the same bug and is fixed with it: a preview that resolves a pin
+   differently from production is worse than no preview.
+
+3. **A model key containing a slash was unreachable.** A llama.cpp endpoint publishes
+   `models/<file>.gguf`, so the walk identifier split into a provider called `models` and a model
+   called `x`. `load_pair` now resolves the provider prefix **first and commits to it** — the
+   tempting "try the prefix, then try the whole string as a key" is wrong in the case that
+   matters, because a prefixed name whose model is disabled would fall through and be answered by
+   *another* provider serving the same key. Committing to the prefix is what makes a pin a pin.
+
+**Proof.** `omnion-ai-hub --lib` → **161 passed** (was 151; 10 new — 9 cost arithmetic, 1 the pin
+identifier). Integration walks: `--test ai_hub` **14/14** (was 10/14), `--test ai_catalog`
+**11/11** (was 9/9), `--test ai_live_path` **5/5** (was 4/4), `--test ai_routing` **11/11**,
+`--test ai_decisions` **11/11** — 52 walks, zero failures.
+`pnpm --filter @omnion/admin typecheck` → clean.
+
+**Two defects were proven pre-existing before being fixed, not assumed.** `the_ai_hub_connects_a_
+provider_and_streams_a_chat_through_it` failed `422` against an expected `409`; `git stash push` of
+every slice-5 file reproduced the identical failure at HEAD, which is the only way to tell a
+regression from a flake on a box running ten builds at once.
+
+**An acceptance box that was ticked on a vacuous assertion.** Slice 1's
+`a_price_edit_never_re_prices_a_call_that_already_happened` asserted the usage-row count was
+unchanged by a price edit — on a provider that had served **nothing** (`before.0 == 0`). A table
+with no rows cannot be retro-edited, so it would also have passed against the exact implementation
+the criterion forbids. It stays (it proves the other half: a price edit writes no usage row at
+all), its doc comment now says exactly what it does and does not prove, and the real proof is
+`a_price_edit_moves_new_requests_and_leaves_a_written_history_alone`: write a call, edit the price
+through the catalog's own PATCH, write the same call again, read the **first** row back — still
+3_000 out and 500 total, while the second is 30_000 and 3_200.
+
+**Next.** `QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206 bash scripts/qa/run.sh`
+— still owed, and still the reason REQ-098 is `in-progress` rather than `done`. The pass now also
+reads the Usage tab's Cost figure and its "could not be priced" notice as **text**, because a
+screenshot cannot tell an em dash from a zero. Only then the closing box.
