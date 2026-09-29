@@ -314,6 +314,57 @@ pub async fn roles_of_group(
         .collect())
 }
 
+/// One of an account's groups, as a role rule sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipGroup {
+    /// The group.
+    pub id: Uuid,
+    /// The group slug, which is what a `when_group` rule compares against.
+    pub slug: String,
+    /// The display name, for the dry run and the audit.
+    pub name: String,
+}
+
+/// The groups an account belongs to, named — the read a group-based role rule needs.
+///
+/// Two deliberate things about this one, both of which the obvious query gets wrong:
+///
+/// * **Both the slug and the name come back.** An operator writes a rule against whichever string
+///   their directory showed them, and a directory's `CN=Engineering` is a name while a panel URL
+///   is a slug. Returning one and hoping it is the one is how a correct rule silently stops
+///   matching after somebody renames a group; the caller sees both and the panel can say which one
+///   the rule uses.
+/// * **The organization is a filter, not a join result.** A group name is not unique across
+///   tenants — "Engineering" is a group in most of them — and this read sits on the sign-in path,
+///   where widening it would let a group in another organization satisfy a rule in this one. That
+///   is a privilege grant caused by a name collision, and it is refused here rather than at the
+///   call site where it would be easy to forget.
+///
+/// `list_for_user` is unscoped and stays as it is: the authorization resolver joins groups to
+/// bindings by id, so a cross-organization *id* is inert there, and changing a hot path's shape
+/// for a security property it does not have would be a regression.
+pub async fn membership_groups(
+    pool: &PgPool,
+    user_id: Uuid,
+    organization_id: Option<Uuid>,
+) -> Result<Vec<MembershipGroup>> {
+    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "select g.id, g.slug, g.name from group_members m \
+         join groups g on g.id = m.group_id \
+         where m.user_id = $1 and ($2::uuid is null or g.organization_id = $2) \
+         order by g.slug asc",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, slug, name)| MembershipGroup { id, slug, name })
+        .collect())
+}
+
 /// Validate a group name.
 pub fn validate_name(name: &str) -> Result<String> {
     let name = name.trim().to_owned();

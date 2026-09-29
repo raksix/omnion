@@ -33,15 +33,17 @@ use omnion_identity::security;
 use omnion_identity::sso::attributes::TargetField;
 use omnion_identity::sso::challenges::{self, SsoChallenge};
 use omnion_identity::sso::claims::{self, Identity};
+use omnion_identity::sso::group_context::GroupContext;
 use omnion_identity::sso::mappings;
 use omnion_identity::sso::oidc::{self, Discovery, HttpClient, MetadataCache, VerifiedAssertion};
 use omnion_identity::sso::protocol_steps;
 use omnion_identity::sso::providers::{self, AuthProvider, ProviderKind};
 use omnion_identity::sso::provisioning::{self, ProvisionOutcome};
 use omnion_identity::sso::role_rule_store;
-use omnion_identity::sso::role_rules::{Resolution, ScopeType};
+use omnion_identity::sso::role_rules::{Resolution, ScopeType, WhenKind};
 use omnion_identity::sso::saml::{self, SamlConfig};
 use omnion_permissions::bindings;
+use omnion_permissions::groups as group_store;
 use omnion_permissions::model::Scope;
 use omnion_permissions::roles as role_store;
 use serde::Deserialize;
@@ -1079,6 +1081,61 @@ struct RoleOutcome {
     resolution: Option<Resolution>,
 }
 
+/// Build the group context a sign-in's rules are evaluated against.
+///
+/// This is the seam that makes a `when_group` rule work for a **provisioned** account, and it is
+/// the last clause of the criterion `iam.group_membership_synced` was emitted into. The chain
+/// that makes it necessary:
+///
+/// 1. A connector creates the account through `/scim/v2/Users` and adds it to a group through
+///    `/scim/v2/Groups`. Both write `group_members`.
+/// 2. The person signs in at the IdP, which is a separate system and knows nothing about SCIM.
+///    Its token carries whatever *its* policy says, and for most configurations that is **no
+///    group claim at all**.
+/// 3. The rule evaluator used to read only the claim. So the group rule the operator wrote for
+///    this person could not match, the audit said `no rule matched → default role`, and the
+///    panel's dry run — run against a *pasted sample* that happens to carry a group claim —
+///    said the rule was fine. The rule was correct and unreachable.
+///
+/// A failed membership read is reported as its own state rather than as an empty membership.
+/// Collapsing the two would resolve a group rule as a miss and grant the *default* role to
+/// somebody who was about to be granted a real one, which is a privilege change caused by a
+/// database blip — the one outcome a sign-in must not produce on its own.
+async fn group_context(
+    pool: &PgPool,
+    identity: &Identity,
+    organization_id: Option<Uuid>,
+    user_id: Uuid,
+) -> GroupContext {
+    let claim = identity.groups.clone();
+    let membership = match group_store::membership_groups(pool, user_id, organization_id).await {
+        Ok(groups) => groups,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                %user_id,
+                "stored group membership could not be read; a group role rule will not match on this sign-in"
+            );
+            return GroupContext::from_claim(claim).with_membership_unavailable();
+        }
+    };
+
+    // Both spellings are offered, because a rule is written against whichever string the
+    // operator's directory showed them. The name is only offered when it differs from the slug:
+    // for a group whose name already *is* its slug, sending both would double every value in the
+    // dry run's trace and make "why did this rule match" ambiguous between two identical entries.
+    let mut context = GroupContext::from_claim(claim);
+    let mut values = Vec::with_capacity(membership.len() * 2);
+    for group in &membership {
+        values.push(group.slug.clone());
+        if !group.name.eq_ignore_ascii_case(&group.slug) {
+            values.push(group.name.clone());
+        }
+    }
+    context.push_membership(values);
+    context
+}
+
 /// Apply the provider's role rules and answer what they decided.
 ///
 /// The ordered rules are read through [`role_rule_store::load_rules`], which is the *same* reader
@@ -1121,29 +1178,51 @@ async fn apply_mapped_roles(
             } else {
                 Resolution::Default { default_role_id }.reason()
             },
-            resolution: (!rules.rules.is_empty())
-                .then(|| Resolution::Default { default_role_id }),
+            resolution: (!rules.rules.is_empty()).then(|| Resolution::Default { default_role_id }),
         });
     };
 
     if !rules.rules.is_empty() {
-        let resolution = rules.resolve(identity, default_role_id);
+        // The group's stored membership joins the token's claim. This is the third call site that
+        // decides a sign-in's role, and it is the one that makes `when_group` mean something for a
+        // SCIM-provisioned account — the case the `iam.group_membership_synced` event exists to
+        // announce and which nothing read until now.
+        let groups = group_context(pool, identity, Some(organization_id), user_id).await;
+        let resolution = rules.resolve_with(identity, &groups, default_role_id);
         let mut applied = Vec::new();
 
         if let Resolution::Matched {
             role_id,
             scope_type,
             site_id,
+            rule,
             ..
         } = &resolution
         {
+            // A group rule that fired on **stored membership** rather than on the token says so in
+            // the audit. The two are operationally different: one is revoked by the next sign-in,
+            // the other by the next SCIM sync, and an administrator answering "why does this person
+            // have this role" needs to know which clock to watch. The value is a slug or a group
+            // name — never a member list, never a claim document.
+            let group_source = (rule.when_kind == WhenKind::Group)
+                .then(|| groups.source_of(rule.when_value.trim()))
+                .flatten();
+            if let Some(source) = group_source {
+                tracing::info!(
+                    provider = %provider.slug,
+                    group_source = source.as_str(),
+                    "a group rule fired on stored membership rather than on the token claim"
+                );
+            }
             // A site-scoped rule names a site, and the sign-in resolved one: the challenge carries
             // the organization, and the site is the one the request was addressed to. A rule that
             // names a *different* site than the person signed in at is still honoured — that is the
             // point of a site-scoped rule — but the site must belong to this organization, which is
             // the same tenant check the save path performs on the role.
             let scope = match (scope_type, site_id) {
-                (ScopeType::Site, Some(site)) if site_belongs_to(pool, *site, organization_id).await? => {
+                (ScopeType::Site, Some(site))
+                    if site_belongs_to(pool, *site, organization_id).await? =>
+                {
                     Scope::Site {
                         organization_id: Some(organization_id),
                         site_id: *site,
@@ -1172,8 +1251,13 @@ async fn apply_mapped_roles(
             }
         } else if let Resolution::Default { default_role_id } = &resolution
             && let Some(default_role) = *default_role_id
-            && let Some(key) = attach(pool, default_role, user_id, Scope::Organization { organization_id })
-                .await?
+            && let Some(key) = attach(
+                pool,
+                default_role,
+                user_id,
+                Scope::Organization { organization_id },
+            )
+            .await?
         {
             applied.push(key);
         }
@@ -1207,8 +1291,13 @@ async fn apply_mapped_roles(
                 continue;
             }
         };
-        if let Some(key) =
-            attach(pool, role.id, user_id, Scope::Organization { organization_id }).await?
+        if let Some(key) = attach(
+            pool,
+            role.id,
+            user_id,
+            Scope::Organization { organization_id },
+        )
+        .await?
         {
             applied.push(key);
         }
@@ -1217,8 +1306,13 @@ async fn apply_mapped_roles(
     // The provider's own default role rides the same path, so "every sign-in gets Editor" is one
     // ordinary row rather than a special case in the sign-in code.
     if let Some(default_role) = default_role_id
-        && let Some(key) =
-            attach(pool, default_role, user_id, Scope::Organization { organization_id }).await?
+        && let Some(key) = attach(
+            pool,
+            default_role,
+            user_id,
+            Scope::Organization { organization_id },
+        )
+        .await?
         && !applied.contains(&key)
     {
         applied.push(key);
@@ -1266,12 +1360,14 @@ async fn find_grantable_role(
     organization_id: Uuid,
     slug: &str,
 ) -> Result<Option<omnion_permissions::model::Role>, ApiError> {
-    Ok(role_store::find_role_by_key(pool, Some(organization_id), slug)
-        .await
-        .map_err(ApiError::from)?
-        .or(role_store::find_role_by_key(pool, None, slug)
+    Ok(
+        role_store::find_role_by_key(pool, Some(organization_id), slug)
             .await
-            .map_err(ApiError::from)?))
+            .map_err(ApiError::from)?
+            .or(role_store::find_role_by_key(pool, None, slug)
+                .await
+                .map_err(ApiError::from)?),
+    )
 }
 
 /// Whether a site belongs to this organization.
@@ -1302,7 +1398,12 @@ async fn site_belongs_to(
 /// `grant_if_missing` is the whole reason a second sign-in does not collect a second copy: the
 /// unique index on `(role, subject, scope)` is live, so the "already bound" case is a database
 /// fact rather than a check this code might forget.
-async fn grant(pool: &PgPool, role_id: Uuid, user_id: Uuid, scope: &Scope) -> Result<bool, ApiError> {
+async fn grant(
+    pool: &PgPool,
+    role_id: Uuid,
+    user_id: Uuid,
+    scope: &Scope,
+) -> Result<bool, ApiError> {
     let binding = bindings::grant_if_missing(
         pool,
         omnion_permissions::model::NewBinding {

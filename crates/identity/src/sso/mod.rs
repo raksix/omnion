@@ -27,6 +27,7 @@ pub mod attributes;
 pub mod challenges;
 pub mod claims;
 pub mod directory;
+pub mod group_context;
 pub mod mappings;
 pub mod oidc;
 pub mod protocol_steps;

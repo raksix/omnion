@@ -21,6 +21,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_identity::sso::claims::Identity;
+use omnion_identity::sso::group_context::GroupContext;
 use omnion_identity::sso::providers;
 use omnion_identity::sso::role_rule_store;
 use omnion_identity::sso::role_rules::{Resolution, RoleRules, ScopeType, WhenKind, WhenOperator};
@@ -129,6 +130,22 @@ pub struct DryRunBody {
     /// kind reduces to, so one shape serves all five provider kinds.
     #[serde(default)]
     pub sample: Value,
+    /// An account in this organization whose **stored** group membership should be folded into the
+    /// run alongside the sample's claim.
+    ///
+    /// This is what makes the preview able to rehearse a *provisioned* sign-in. A pasted sample
+    /// is a claims document and a claims document is what an interactive IdP produces; the whole
+    /// class of problems this endpoint has to answer — "does my group rule fire for the person the
+    /// connector created?" — is about an account whose groups exist only in the database. Naming
+    /// the subject is what lets the operator rehearse that case instead of rehearsing a token that
+    /// will never arrive.
+    ///
+    /// Optional and never required: without it the run is exactly what it was before, and a
+    /// sample that carries groups still works. A subject in another organization is refused rather
+    /// than silently ignored — a cross-tenant answer here would tell an operator their rule fires
+    /// when it would not, which is the one thing a preview must never do.
+    #[serde(default)]
+    pub subject: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -270,8 +287,35 @@ pub async fn preview_role_rules(
         .map_err(internal)?;
     let identity = identity_from_sample(&body.sample, &provider);
 
-    // The same call the callback makes, on the same rows. This is the entire point.
-    let resolution = rules.resolve(&identity, default_role(&provider));
+    // A named subject folds its **stored** membership into the run, so the preview can rehearse
+    // the sign-in a SCIM-provisioned account actually makes: a token with no group claim and a
+    // group the connector wrote. Without this the preview is only ever able to rehearse the
+    // interactive case, which is the case where group rules already worked.
+    let (groups, membership_source) = match body.subject {
+        None => (GroupContext::from_claim(identity.groups.clone()), None),
+        Some(subject) => {
+            let membership = subject_membership(&state, &provider, subject).await?;
+            let mut context = GroupContext::from_claim(identity.groups.clone());
+            let mut values = Vec::new();
+            for group in &membership {
+                values.push(group.slug.clone());
+                if !group.name.eq_ignore_ascii_case(&group.slug) {
+                    values.push(group.name.clone());
+                }
+            }
+            context.push_membership(values);
+            // Read *after* the push: the summary is a description of what the evaluator was
+            // given, and taking it before the membership exists would describe the run that was
+            // not performed.
+            let source = context.summary();
+            (context, Some(source))
+        }
+    };
+
+    // The same call the callback makes, on the same rows, with the same group sources. This is the
+    // entire point: a preview that evaluated a different context than the sign-in would be a
+    // preview of nothing.
+    let resolution = rules.resolve_with(&identity, &groups, default_role(&provider));
     let matched_position = match &resolution {
         Resolution::Matched { rule_position, .. } => Some(*rule_position),
         Resolution::Default { .. } => None,
@@ -292,7 +336,14 @@ pub async fn preview_role_rules(
             // written once, here, because a `usize` index compared against an `i32` is a compile
             // error at best and an off-by-one in a truncation cast at worst.
             let index = i32::try_from(index).unwrap_or(i32::MAX);
-            let read = rule.read(&identity);
+            let read = rule.read_with(&identity, &groups);
+            // Which source supplied the value that matched. A group rule that fired on the
+            // stored row and one that fired on the token are the same `Matched`, and an operator
+            // debugging "why does this person have this role" needs to know which clock revokes
+            // it — the next sign-in, or the next SCIM sync.
+            let group_source = (rule.when_kind == WhenKind::Group)
+                .then(|| groups.source_of(rule.when_value.trim()))
+                .flatten();
             json!({
                 "index": index,
                 "position": rule.position,
@@ -307,6 +358,7 @@ pub async fn preview_role_rules(
                 "stop": rule.stop,
                 "enabled": rule.enabled,
                 "read": read,
+                "group_source": group_source.map(|source| source.as_str()),
                 "matched": matched_position == Some(index),
                 // Why a rule did not decide, in one word the panel can render as a chip. `disabled`
                 // is separated from `no_match` because turning a rule off and having it not match
@@ -333,9 +385,73 @@ pub async fn preview_role_rules(
         "matched_rule_index": matched_position,
         "sample_email": identity.email,
         "sample_groups": identity.groups,
+        // What the group rules were actually given, in the panel's vocabulary. Without it a
+        // rule that did not fire is only observable as "no match", and the operator's next move
+        // is to edit a rule that was correct all along.
+        "group_source": groups.summary(),
+        "group_source_detail": groups.summary().sentence(),
+        "group_claim": groups.claim_values(),
+        "group_membership": groups.membership_values(),
+        "subject": body.subject,
+        "membership_consulted": membership_source.map(|source| source.as_str()),
         "trace": trace,
         "problems": rules.validate(),
     })))
+}
+
+/// The stored groups of the subject a dry run was asked to rehearse.
+///
+/// Two refusals, both deliberate and both about the preview rather than the data:
+///
+/// * **The subject must belong to the provider's organization.** A cross-tenant subject would
+///   produce a trace saying a rule fires when it will not on the real sign-in, which is the one
+///   answer a preview must never give.
+/// * **A read failure is an error, not an empty list.** The whole point of naming a subject is to
+///   see its membership; answering "no groups" when the read failed sends the operator to fix a
+///   rule, and the rule is fine.
+async fn subject_membership(
+    state: &AppState,
+    provider: &providers::AuthProvider,
+    subject: Uuid,
+) -> Result<Vec<omnion_permissions::groups::MembershipGroup>, ApiError> {
+    let organization_id = provider.organization_id;
+
+    // `internal` above takes an `IdentityError`, not a `sqlx::Error`, so the database error is
+    // mapped by hand and kept in the log rather than in the body.
+    let owner: Option<Option<Uuid>> =
+        sqlx::query_scalar("select organization_id from users where id = $1")
+            .bind(subject)
+            .fetch_optional(state.db().pool())
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, %subject, "the dry run could not read the subject");
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "subject_unreadable",
+                    "the account could not be read",
+                )
+            })?;
+
+    // A missing account and an account in another tenant are answered the same way, deliberately:
+    // the difference would let an administrator of one tenant probe which ids exist in another.
+    if owner.flatten() != Some(organization_id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "subject_not_in_organization",
+            "no such account in this organization",
+        ));
+    }
+
+    omnion_permissions::groups::membership_groups(state.db().pool(), subject, Some(organization_id))
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, %subject, "the dry run could not read stored membership");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "membership_unavailable",
+                "the account's groups could not be read",
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------------------------

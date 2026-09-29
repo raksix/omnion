@@ -32,6 +32,7 @@ use serde_json::Value;
 
 use crate::error::{IdentityError, Result};
 use crate::sso::claims::Identity;
+use crate::sso::group_context::{GroupContext, GroupSource, GroupSummary};
 
 /// What a rule reads out of the identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,14 +428,32 @@ impl RoleRule {
     /// match, which is different from erroring.
     #[must_use]
     pub fn read(&self, identity: &Identity) -> Vec<String> {
+        self.read_with(identity, &GroupContext::from_claim(identity.groups.clone()))
+    }
+
+    /// The values this rule compares against, given the caller's group sources.
+    ///
+    /// This takes the identity **as well as** the context because the two answer different arms: a
+    /// `when_group` rule reads the context, and a `when_claim` / `when_department` / `when_title`
+    /// rule reads the assertion. Bundling the identity into the context would have made one
+    /// parameter where the honest shape is two — the context is a *set of group strings*, not a
+    /// stand-in for the document.
+    ///
+    /// [`Self::read`] is the claim-only shorthand, kept so a caller with no database in hand does
+    /// not have to know the second source exists.
+    #[must_use]
+    pub fn read_with(&self, identity: &Identity, groups: &GroupContext) -> Vec<String> {
         match self.when_kind {
             WhenKind::Always => vec![String::new()],
             // The key is the group *claim* the provider was configured with, and the values were
             // already extracted from it into the identity, so the key selects nothing here — it is
             // kept because the editor has to show it and because a provider that names a different
-            // claim must not read as a different rule. Reading `identity.groups` either way is
-            // what keeps the editor's vocabulary and the evaluator's data from drifting apart.
-            WhenKind::Group => identity.groups.clone(),
+            // claim must not read as a different rule. Reading the context either way is what
+            // keeps the editor's vocabulary and the evaluator's data from drifting apart: for an
+            // interactive sign-in the context *is* the claim, and for a provisioned account it is
+            // the claim plus the connector's stored membership, which is the only place a group
+            // rule could ever see a group the IdP never sent.
+            WhenKind::Group => groups.values(),
             WhenKind::Claim => {
                 let key = self.when_key.trim();
                 if key.is_empty() {
@@ -459,6 +478,12 @@ impl RoleRule {
     /// truth table without a database and what stops the dry run from disagreeing with sign-in.
     #[must_use]
     pub fn matches(&self, identity: &Identity) -> bool {
+        self.matches_with(identity, &GroupContext::from_claim(identity.groups.clone()))
+    }
+
+    /// Whether this rule matches, given the caller's group sources.
+    #[must_use]
+    pub fn matches_with(&self, identity: &Identity, groups: &GroupContext) -> bool {
         if self.when_kind == WhenKind::Always {
             return true;
         }
@@ -466,7 +491,7 @@ impl RoleRule {
         if expected.is_empty() {
             return false;
         }
-        self.read(identity)
+        self.read_with(identity, groups)
             .iter()
             .any(|actual| compare(self.when_operator, actual, expected))
     }
@@ -728,8 +753,30 @@ impl RoleRules {
     /// this, which is the whole reason a dry run is evidence.
     #[must_use]
     pub fn resolve(&self, identity: &Identity, default_role_id: Option<uuid::Uuid>) -> Resolution {
+        self.resolve_with(
+            identity,
+            &GroupContext::from_claim(identity.groups.clone()),
+            default_role_id,
+        )
+    }
+
+    /// Resolve against the caller's group sources.
+    ///
+    /// This is the entry point the sign-in path uses, and the reason it takes a
+    /// [`GroupContext`] rather than reading the identity is the provisioned case: a SCIM
+    /// connector writes membership into `group_members` and the next sign-in's token carries no
+    /// group claim, so a rule evaluated on the claim alone cannot see the group it was written
+    /// for. The dry run calls this same function with the same context, which is what keeps the
+    /// preview honest about a provisioned account rather than only about an interactive one.
+    #[must_use]
+    pub fn resolve_with(
+        &self,
+        identity: &Identity,
+        groups: &GroupContext,
+        default_role_id: Option<uuid::Uuid>,
+    ) -> Resolution {
         for (index, rule) in self.rules.iter().enumerate() {
-            if !rule.enabled || !rule.matches(identity) {
+            if !rule.enabled || !rule.matches_with(identity, groups) {
                 continue;
             }
             return Resolution::Matched {
@@ -1227,5 +1274,191 @@ mod tests {
                 .rules
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The stored-membership source (slice 4 part 6)
+    //
+    // Each of these is written so that it fails if the membership source is removed from the
+    // evaluator — which is the whole regression this slice exists to prevent. They are not
+    // "tests of the new feature": a test that passes both before and after the change is a test
+    // that proves nothing about it.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_group_rule_matches_a_stored_membership_the_token_never_mentioned() {
+        // The provisioned identity is an IdP that asserts nothing about groups, which is what
+        // almost every SCIM deployment looks like on the wire: the account exists because a
+        // connector created it, the membership exists because a connector wrote it, and the token
+        // carries no groups because the IdP and the connector are separate systems. Before the
+        // membership source existed, this rule could never match and nothing said why.
+        let rules = RoleRules::new(vec![group_rule(0, "engineering", ROLE)]);
+        let identity = Identity {
+            subject: "u-99".to_owned(),
+            email: "grace@example.com".to_owned(),
+            display_name: Some("Grace".to_owned()),
+            groups: Vec::new(),
+            attributes: serde_json::Map::new(),
+        };
+        assert!(
+            rules.resolve(&identity, None).role_id().is_none(),
+            "with no membership there is nothing to match, and the test would prove nothing"
+        );
+
+        let groups = GroupContext::new(Vec::new(), vec!["engineering".to_owned()]);
+        let resolution = rules.resolve_with(&provisioned_identity(), &groups, None);
+        assert!(
+            matches!(&resolution, Resolution::Matched { role_id, .. } if *role_id == ROLE),
+            "a connector that put the account in a group must decide the next sign-in's role: {resolution:?}"
+        );
+    }
+
+    #[test]
+    fn the_claim_alone_still_decides_an_interactive_sign_in() {
+        // The regression guard in the other direction. Reading the membership is an *addition*;
+        // a change that quietly made the claim stop mattering would pass the test above.
+        let rules = RoleRules::new(vec![group_rule(0, "engineering", ROLE)]);
+        let identity = identity();
+        assert!(matches!(
+            rules.resolve(&identity, None),
+            Resolution::Matched { .. }
+        ));
+    }
+
+    #[test]
+    fn a_group_the_account_is_not_in_matches_nothing_from_either_source() {
+        // The union must not widen into a match. "Engineering" is in the membership, "sales" is
+        // not, and a rule for sales must not fire because the two strings are both group names.
+        let rules = RoleRules::new(vec![group_rule(0, "sales", OTHER_ROLE)]);
+        let groups = GroupContext::new(vec!["engineering".to_owned()], vec!["oncall".to_owned()]);
+        assert!(matches!(
+            rules.resolve_with(&provisioned_identity(), &groups, None),
+            Resolution::Default { .. }
+        ));
+    }
+
+    #[test]
+    fn first_match_wins_across_both_sources() {
+        // The order is the semantics, and it must not depend on which source the value came from:
+        // a rule that fires on the claim still pre-empts a later one that would fire on stored
+        // membership, and a claim rule is not "preferred" the way it would be under a precedence
+        // rule. Both orders are asserted because both are plausible designs and only one of them
+        // is what "first match wins" says.
+        let rules = RoleRules::new(vec![
+            group_rule(0, "engineering", ROLE),
+            group_rule(1, "oncall", OTHER_ROLE),
+        ]);
+        let from_claim =
+            GroupContext::new(vec!["engineering".to_owned()], vec!["oncall".to_owned()]);
+        let from_membership =
+            GroupContext::new(vec!["oncall".to_owned()], vec!["engineering".to_owned()]);
+
+        assert!(matches!(
+            rules.resolve_with(&provisioned_identity(), &from_claim, None),
+            Resolution::Matched { role_id, .. } if role_id == ROLE
+        ));
+        assert!(matches!(
+            rules.resolve_with(&provisioned_identity(), &from_membership, None),
+            Resolution::Matched { role_id, .. } if role_id == ROLE
+        ));
+    }
+
+    #[test]
+    fn a_read_says_which_source_supplied_the_value_that_matched() {
+        // The panel has to be able to answer "where did this group come from", and a boolean
+        // match cannot: both sources produce an identical `Matched`.
+        let rules = RoleRules::new(vec![group_rule(0, "engineering", ROLE)]);
+
+        let from_membership = GroupContext::new(Vec::new(), vec!["engineering".to_owned()]);
+        let resolution = rules.resolve_with(&provisioned_identity(), &from_membership, None);
+        let Resolution::Matched { rule, .. } = &resolution else {
+            panic!("expected a match, got {resolution:?}");
+        };
+        assert_eq!(
+            from_membership.source_of(rule.when_value.trim()),
+            Some(GroupSource::Membership),
+            "a rule that fired on the stored row must not read as a claim match"
+        );
+    }
+
+    #[test]
+    fn a_non_group_rule_never_reports_a_group_source() {
+        // A claim or department rule that fires while the account is in five groups must not
+        // claim a group source — the value that matched came from somewhere else entirely, and
+        // `source_of` would otherwise return a plausible wrong answer.
+        //
+        // The identity is the full one, because the rule reads `title` and the provisioned
+        // fixture deliberately has no attributes. Passing that one would have failed the match
+        // for a reason that has nothing to do with the source under test.
+        let rules = RoleRules::new(vec![RoleRule::equals(
+            0,
+            WhenKind::Title,
+            "title",
+            "staff engineer",
+            ROLE,
+        )]);
+        let identity = identity();
+        let groups = GroupContext::from_claim(identity.groups.clone());
+        assert!(matches!(
+            rules.resolve_with(&identity, &groups, None),
+            Resolution::Matched { .. }
+        ));
+        assert_eq!(groups.source_of("staff engineer"), None);
+    }
+
+    #[test]
+    fn an_unreadable_membership_still_lets_a_claim_rule_fire() {
+        // A database blip must not disable a provider whose tokens do carry group claims. The
+        // failure is reported, not enforced, and the claim path is untouched by it.
+        let rules = RoleRules::new(vec![group_rule(0, "engineering", ROLE)]);
+        let groups =
+            GroupContext::from_claim(vec!["engineering".to_owned()]).with_membership_unavailable();
+        assert!(matches!(
+            rules.resolve_with(&provisioned_identity(), &groups, None),
+            Resolution::Matched { .. }
+        ));
+    }
+
+    #[test]
+    fn a_membership_read_failure_is_visible_to_the_caller_rather_than_silent() {
+        // The evaluator cannot act on this by itself — withholding a grant is a policy decision
+        // that belongs to the sign-in path — but it must be *sayable*, or the sign-in path would
+        // report `no rule matched` and send an operator to edit a correct rule.
+        let groups = GroupContext::from_claim(Vec::new()).with_membership_unavailable();
+        assert!(groups.membership_unavailable());
+        assert_eq!(groups.summary(), GroupSummary::MembershipUnavailable);
+    }
+
+    #[test]
+    fn the_dry_run_trace_is_what_the_evaluator_compared() {
+        // The single-implementation property, restated for the new source. A dry run that rendered
+        // `identity.groups` while the sign-in evaluated the context would show an operator an
+        // empty trace for a rule that fires — the precise confusion this slice removes. So the
+        // trace is asserted to carry the *membership* value, and the claim-only reader is asserted
+        // not to, which is what makes the two a real pair rather than a restatement.
+        let rules = RoleRules::new(vec![group_rule(0, "engineering", ROLE)]);
+        let groups = GroupContext::new(Vec::new(), vec!["engineering".to_owned()]);
+        let rule = &rules.rules[0];
+
+        assert_eq!(
+            rule.read_with(&provisioned_identity(), &groups),
+            vec!["engineering".to_owned()],
+            "the trace a dry run shows must be the list the evaluator compared"
+        );
+        assert!(
+            rule.read(&provisioned_identity()).is_empty(),
+            "and it must not fall back to the token's empty claim, which is the old behaviour"
+        );
+    }
+
+    /// The provisioned identity: an IdP that asserts nothing about groups.
+    fn provisioned_identity() -> Identity {
+        Identity {
+            subject: "u-99".to_owned(),
+            email: "grace@example.com".to_owned(),
+            display_name: Some("Grace".to_owned()),
+            groups: Vec::new(),
+            attributes: serde_json::Map::new(),
+        }
     }
 }
