@@ -543,6 +543,101 @@ async fn cancellation_is_a_request_the_loop_meets_at_a_step_boundary() {
     store.dispose().await;
 }
 
+/// The column and the running loop are actually connected.
+///
+/// The walk above proves the *request* is recorded. This one proves somebody **listens**: the
+/// runner's persister is the only thing in the process that reads `cancel_requested_at` while a
+/// run is in flight, so if it did not, a person pressing Cancel on a live four-step run would
+/// watch it finish all four steps. A green "the column is set" test next to a button that does
+/// nothing is the shape of that bug, and it is invisible until a real run is watched.
+///
+/// The events are the loop's own — a step, a tool call, a tool result — because the persister is
+/// driven by the event stream rather than by a timer, and a test that skips the first event would
+/// not notice if that skipping were wrong.
+#[tokio::test]
+async fn a_cancelled_run_is_told_to_stop_while_it_is_still_running() {
+    let Some(store) = Store::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let agent = store.agent("reporter").await;
+    let run = create_run(
+        &store.pool,
+        &NewRun {
+            organization_id: store.organization_id,
+            agent_id: agent.id,
+            trigger: "agent".to_owned(),
+            goal: "long job".to_owned(),
+            model_id: None,
+            token_budget: 200_000,
+            deadline_at: None,
+            ..NewRun::default_for(store.organization_id, agent.id)
+        },
+    )
+    .await
+    .expect("the run must be created");
+
+    let cancel = omnion_ai_hub::CancelHandle::new();
+    let persister = omnion_api::ai_agent_runner::persister_for_tests(
+        store.pool.clone(),
+        run.id,
+        cancel.clone(),
+    );
+
+    // Before the request, an event leaves the flag alone.
+    persister(AgentEvent::StepStarted {
+        step_no: 1,
+        kind: StepKind::Message,
+    })
+    .await;
+    assert!(
+        !cancel.is_requested(),
+        "a healthy run must not be cancelled by its own first event"
+    );
+
+    request_cancel(&store.pool, run.id)
+        .await
+        .expect("cancel");
+
+    // The next event is the loop's step boundary in practice: the persister reads the column
+    // before writing the row, and sets the flag the loop reads at the top of its next iteration.
+    persister(AgentEvent::ToolResult {
+        step_no: 1,
+        tool: "page.search".to_owned(),
+        summary: "three pages".to_owned(),
+        failed: false,
+    })
+    .await;
+
+    assert!(
+        cancel.is_requested(),
+        "a cancel written while the run is live must reach the loop"
+    );
+
+    // And the partial trace is still on disk — a stopped run's steps are what the person reads.
+    //
+    // Asserted against what `begin_step` actually writes, not against the shape I assumed: the
+    // persister hands the whole event to `arguments` and leaves the step `running`, because a
+    // cancelled run's steps are closed by the runner's `finish_run` and the trace screen is what
+    // decides how to render them. The tool lives inside the payload; `tool` stays null.
+    let steps = list_steps(&store.pool, run.id)
+        .await
+        .expect("read");
+    assert!(
+        steps
+            .iter()
+            .any(|step| {
+                step.arguments
+                    .as_ref()
+                    .and_then(|value| value.get("tool"))
+                    .and_then(|tool| tool.as_str())
+                    == Some("page.search")
+            }),
+        "the work done before the stop must survive it"
+    );
+    store.dispose().await;
+}
+
 // -------------------------------------------------------------------------------------------
 // Redaction
 // -------------------------------------------------------------------------------------------

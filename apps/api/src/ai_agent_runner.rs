@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use omnion_ai_hub::agent::{AgentEvent, RunLimits, StepKind, StepStatus, StopReason};
-use omnion_ai_hub::loop_engine::{Persist, Runtime, Sink, run as run_agent};
+use omnion_ai_hub::loop_engine::{CancelHandle, Persist, Runtime, Sink, run as run_agent};
 use omnion_ai_hub::provider_model::ProviderModel;
 use omnion_ai_hub::run_store::{self, Run};
 use omnion_ai_hub::tools::{AllowList, ToolRegistry};
@@ -79,21 +79,68 @@ impl TickReport {
     }
 }
 
-/// A `Persist` that writes the loop's events onto the run's step rows.
+/// A `Persist` that writes the loop's events onto the run's step rows, and hears the cancel button.
 ///
-/// One closure per run, holding the pool and the id. It is a closure rather than a function
-/// because the engine's `Persist` is `Fn(AgentEvent) -> Future`, and the run id is the only thing
-/// that distinguishes one run's durable record from another's — a `fn(&PgPool, Uuid, AgentEvent)`
-/// would mean every caller building that same closure by hand.
-fn persister(pool: PgPool, run_id: Uuid) -> Persist {
+/// **This is where a live run learns it was cancelled.** `POST /ai/runs/{id}/cancel` writes
+/// `cancel_requested_at`; nothing else in the process is watching that column while a run is in
+/// flight, so without this the flag would sit there until the run finished on its own and a
+/// person watching a four-step run press stop twice to no effect.
+///
+/// The poll rides on the event stream rather than on a timer, for the same reason the heartbeat
+/// does: the stream *is* the tick. A run that produced an event in the last moment still learns
+/// about the cancel, and a run blocked inside a provider call for ninety seconds will learn at
+/// its next boundary — which is the contract the panel's copy already promises ("the loop stops
+/// at the next step boundary"), so no new promise is needed and no polling interval is invented.
+///
+/// The check is skipped on the very first event of a run. A cancel request that arrives between
+/// `claim_next_run` and the first boundary has already been answered by the pre-flight check in
+/// [`tick`], and asking again there would only add a query to every run for no decision.
+fn persister(pool: PgPool, run_id: Uuid, cancel: CancelHandle) -> Persist {
+    // An atomic counter rather than a `mut` local: the engine's `Persist` is an `Fn` closure, so
+    // the compiler — correctly — refuses to let it own mutable state. `seen` only ever counts up,
+    // and the first event of every run is the one being skipped.
+    let seen = std::sync::atomic::AtomicU32::new(0);
     Box::new(move |event: AgentEvent| {
         let pool = pool.clone();
+        let cancel = cancel.clone();
+        let probe = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
         Box::pin(async move {
+            if probe {
+                match run_store::cancel_requested(&pool, run_id).await {
+                    Ok(true) => cancel.request(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        // A failed read is not a cancellation. Guessing either way is wrong in
+                        // both directions: stopping a healthy run because a read blipped loses
+                        // the work, and ignoring a real cancel loses the reason the person gave.
+                        tracing::warn!(%run_id, %error, "the cancel check for an agent run failed");
+                    }
+                }
+            }
             if let Err(error) = run_store::append_event(&pool, run_id, &event).await {
                 tracing::warn!(%run_id, %error, "an agent run event could not be written");
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     })
+}
+
+/// The runner's persister, as something a walk can drive one event at a time.
+///
+/// A `Persist` is a boxed closure returning a boxed future, which is exactly the wrong shape to
+/// call from a test: `persister(event)` would hand back a `Pin<Box<dyn Future>>` and the walk
+/// would have to `.await` a value it cannot name. Returning `impl Fn(AgentEvent) -> impl Future`
+/// costs one line and makes the same closure callable both ways, so the integration walk that
+/// proves a live run hears its cancellation drives **the same closure** the runner uses rather
+/// than a copy of it that could drift.
+pub fn persister_for_tests(
+    pool: PgPool,
+    run_id: Uuid,
+    cancel: CancelHandle,
+) -> impl Fn(AgentEvent) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send
+       + Sync
+{
+    let record = persister(pool, run_id, cancel);
+    move |event| (record)(event)
 }
 
 /// The step row a run is currently on, heartbeated on every event.
@@ -266,7 +313,10 @@ pub async fn execute_with_sink(
         }
     };
 
-    let persister = persister(pool.clone(), run.id);
+    // The handle the persister flips when somebody presses stop, and the one the route's cancel
+    // endpoint never needs to know about: the column is the contract between them, not a channel.
+    let cancel = runtime.cancel_handle();
+    let persister = persister(pool.clone(), run.id, cancel);
     let outcome = run_agent(&runtime, &run.goal, limits, &sink, &persister).await;
     heartbeat(pool, run.id).await;
 

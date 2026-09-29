@@ -52,8 +52,9 @@ pub use client::{
 pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
 pub use error::{AiHubError, Result};
 pub use loop_engine::{
-    Message as AgentMessage, Model, ModelAnswer, ModelError, Outcome as RunOutcome, Persist,
-    RequestedCall, Runtime, SINK_CAPACITY, ScriptedModel, Sink, run as run_agent,
+    CancelHandle, Message as AgentMessage, Model, ModelAnswer, ModelError, Outcome as RunOutcome,
+    Persist, RequestedCall, RunOptions, Runtime, SINK_CAPACITY, ScriptedModel, Sink,
+    run as run_agent, run_with as run_agent_with,
 };
 pub use tools::{
     AllowList, DenyReason, Execution, FnTool, Tool, ToolOutcome, ToolRegistry, ToolSummary,

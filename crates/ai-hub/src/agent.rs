@@ -672,6 +672,18 @@ impl StepMachine {
         self.tally.cancel_requested = true;
     }
 
+    /// Look at the clock the run is living on.
+    ///
+    /// The point of the seam is the **deadline test**: waiting five real minutes to prove a
+    /// deadline works would make the guard untested, and an untested guard on the one condition
+    /// that stops a run from burning money is the same as no guard. Everything that is not a
+    /// deadline test keeps the real clock, because [`StepMachine::new`] is the only constructor
+    /// that has to be right for production.
+    pub fn with_elapsed(mut self, elapsed: Duration) -> Self {
+        self.started = Instant::now() - elapsed;
+        self
+    }
+
     /// Record a tool call and return how many identical calls in a row it makes.
     pub fn note_tool_call(&mut self, call: &ToolCall) -> usize {
         let signature = call.signature();

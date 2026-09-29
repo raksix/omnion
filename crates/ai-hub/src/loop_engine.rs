@@ -232,6 +232,7 @@ pub struct Runtime {
     tools: ToolRegistry,
     allow: AllowList,
     system_prompt: String,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Runtime {
@@ -248,7 +249,32 @@ impl Runtime {
             tools,
             allow,
             system_prompt: system_prompt.into(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// A handle somebody else can flip to ask the run to stop.
+    ///
+    /// **Why the loop cannot poll the database itself.** The loop is handed a model, a registry
+    /// and a sink; it has no pool, and giving it one would put I/O in the middle of the one code
+    /// path that must be provable without a database. The runner therefore owns the flag: it
+    /// checks `ai_runs.cancel_requested_at` at every step boundary and sets this, and the loop
+    /// stops on the next check. A stop that takes effect one step later is the documented
+    /// contract — "the loop stops at the next step boundary" — and it is the same contract the
+    /// panel's copy already promises.
+    ///
+    /// [`Runtime::cancel_handle`] is cheap to clone and is `Send + Sync`, which is what lets the
+    /// runner's task and the route's handler hold one each.
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            flag: Arc::clone(&self.cancel),
+        }
+    }
+
+    /// Whether somebody asked this run to stop. Read at every step boundary.
+    fn cancel_requested(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The agent's own prompt, plus the rules the model has to be told or none of the guardrails
@@ -310,11 +336,45 @@ impl Outcome {
     }
 }
 
-/// A sink the loop publishes to.
-///
-/// `mpsc::Sender` is the SSE route's; the tests use a bounded one too, so the queue-full path is
-/// exercised by the same code that serves a browser.
+/// The type of a sink the loop publishes to.
 pub type Sink = mpsc::Sender<AgentEvent>;
+
+/// A handle to a run's cancellation flag.
+///
+/// Deliberately not a `tokio::sync::watch` receiver and not a callback: it has to be settable
+/// from a plain synchronous context (the runner's step loop) and readable from inside the loop
+/// without a lock, and it has to outlive whichever of the two constructed it. An `AtomicBool` in
+/// an `Arc` is the whole of that requirement; a channel would add a task the loop does not
+/// otherwise need and a failure mode where a dropped receiver looks like a run nobody cancelled.
+#[derive(Clone, Debug)]
+pub struct CancelHandle {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CancelHandle {
+    /// A handle for a run that nobody has asked to stop.
+    ///
+    /// The constructor [`Runtime::cancel_handle`] uses, exposed so a caller that is not driving a
+    /// loop — a test that wants to assert the flag, or the route that needs a handle before a
+    /// runtime exists — can still make one.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Ask the run to stop at its next step boundary.
+    pub fn request(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether somebody asked.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 /// The durable record, called once per event.
 ///
@@ -336,7 +396,40 @@ pub async fn run(
     sink: &Sink,
     persisted: &Persist,
 ) -> Outcome {
+    run_with(runtime, goal, limits, sink, persisted, RunOptions::default()).await
+}
+
+/// How a run is run — today, one seam; later, whatever the runner needs.
+///
+/// A struct rather than another parameter because this is the seam the **failing-path tests**
+/// need and the one place a sixth positional argument would start to be unreadable. Every field
+/// has a correct default, so production callers cannot get it wrong by omitting something.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// What the run's clock already read when it started.
+    ///
+    /// The deadline is the one stop condition that cannot be produced by anything the loop can
+    /// count — a step cap needs steps, a token budget needs tokens, cancellation needs a flag —
+    /// so without this the only way to test it is to wait out a real `deadline_seconds`, which
+    /// at the 30-second floor makes a unit test take half a minute and at the default makes it
+    /// take five. A seam that exists only to be slow is a seam nobody uses, so the loop reads
+    /// this offset and the test proves the guard itself.
+    pub started_elapsed: Option<std::time::Duration>,
+}
+
+/// [`run`], with the options a test needs.
+pub async fn run_with(
+    runtime: &Runtime,
+    goal: &str,
+    limits: RunLimits,
+    sink: &Sink,
+    persisted: &Persist,
+    options: RunOptions,
+) -> Outcome {
     let mut machine = StepMachine::new(limits);
+    if let Some(elapsed) = options.started_elapsed {
+        machine = machine.with_elapsed(elapsed);
+    }
     let mut history: Vec<Message> = vec![
         Message::system(runtime.system_prompt()),
         Message::user(goal.to_owned()),
@@ -352,6 +445,14 @@ pub async fn run(
     let mut call_handles = 0_u32;
 
     loop {
+        // The loop's own cancellation check, first and before anything else. It sits here rather
+        // than inside `should_continue` because the machine knows only what it was told, while
+        // this is the flag a *different* task sets: the route's handler or the runner's poll.
+        // Same order as the machine's internal list — a person who pressed stop is answered
+        // before any other reason is reported.
+        if runtime.cancel_requested() {
+            machine.request_cancel();
+        }
         if let StopCondition::Stop(reason) = machine.should_continue() {
             return finish(machine, reason, final_text, sink).await;
         }
@@ -998,5 +1099,195 @@ mod tests {
         assert!(runtime
             .system_prompt()
             .contains(crate::agent::UNTRUSTED_FENCE));
+    }
+
+    // -- the three failing-path conditions, through the real loop ------------------------------
+    //
+    // These live here and not in `agent.rs` on purpose. The unit tests there prove
+    // `should_stop` *decides*; these prove the loop *obeys* — that the decision is taken at a
+    // step boundary, before another provider call, and that the trace a person is left reading
+    // describes what actually happened. A guard that is correct in isolation and never consulted
+    // by the loop is the failure mode these three exist to prevent.
+
+    #[tokio::test]
+    async fn the_deadline_stops_a_slow_provider_and_the_trace_says_why() {
+        // A provider that takes longer than the allowance. The clock seam sets how far along the
+        // run already is, so the test proves the guard in microseconds instead of sleeping out
+        // the 30-second floor — and the slow stub stays in the test because "hung provider" is
+        // the case the deadline exists for, and a deadline that only ever fires between fast
+        // steps has not been shown to interrupt anything.
+        let model = ScriptedModel::slow(
+            vec![
+                ModelAnswer::calling(vec![RequestedCall::new(
+                    "page.search",
+                    serde_json::json!({ "n": 1 }),
+                )]),
+                ModelAnswer::text("never reached"),
+            ],
+            40,
+        );
+        let (sink, events) = collect().await;
+        let outcome = run_with(
+            &runtime(model.clone(), AllowList::new(vec!["page.search".into()], Vec::new())),
+            "search slowly",
+            RunLimits {
+                max_steps: 8,
+                deadline_seconds: 300,
+                ..RunLimits::default()
+            },
+            &sink,
+            &no_persist(),
+            RunOptions {
+                // Already past the 300-second allowance when the first boundary is checked.
+                started_elapsed: Some(std::time::Duration::from_secs(301)),
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.stop_reason, StopReason::Deadline);
+        assert_eq!(outcome.status, "failed");
+        // The provider was never asked: the boundary check comes before the call.
+        assert_eq!(model.calls(), 0, "a run past its deadline must not call the model");
+        assert_eq!(outcome.steps, 0);
+
+        let events = events.await.expect("the collector must not panic");
+        // A finished partial trace, and a terminal frame — an SSE consumer waiting on `Done`
+        // would otherwise hold its connection open until the browser gave up.
+        assert!(matches!(events.last(), Some(AgentEvent::Done { stop_reason: StopReason::Deadline, .. })));
+        assert!(
+            events.iter().all(|event| !matches!(event, AgentEvent::StepStarted { .. })),
+            "a run stopped before its first step must not claim a step"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_token_budget_stops_an_overshooting_run_after_the_call_that_took_it_over() {
+        // Each answer costs more than the whole budget, so the first call is the one that goes
+        // over. The budget is checked *before* a step and again afterwards, so the run is
+        // allowed that call and refused the second: the honest bound is "at most one call of
+        // overrun", and asserting `calls() == 1` is what makes that bound visible.
+        let expensive = || ModelAnswer {
+            text: "thinking".to_owned(),
+            calls: vec![RequestedCall::new(
+                "page.search",
+                serde_json::json!({ "q": "expensive" }),
+            )],
+            prompt_tokens: 900,
+            completion_tokens: 300,
+            final_answer: false,
+        };
+        let model = ScriptedModel::new(vec![
+            expensive(),
+            expensive(),
+            ModelAnswer::text("never reached"),
+        ]);
+        let (sink, _events) = collect().await;
+        let outcome = run_with(
+            &runtime(model.clone(), AllowList::new(vec!["page.search".into()], Vec::new())),
+            "spend a lot",
+            RunLimits {
+                max_steps: 8,
+                token_budget: 1_000,
+                ..RunLimits::default()
+            },
+            &sink,
+            &no_persist(),
+            RunOptions::default(),
+        )
+        .await;
+
+        assert_eq!(outcome.stop_reason, StopReason::TokenBudget);
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(model.calls(), 1, "the budget is checked again after the call, not only before it");
+        assert_eq!(outcome.steps, 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_at_the_next_step_boundary_with_a_finished_partial_trace() {
+        // The flag is set by somebody *else*, mid-run: the loop reads it at the boundary, which
+        // is exactly what the panel's Cancel button promises. Three answers are scripted and the
+        // model must be asked only twice — the third call would be the one that runs after the
+        // person pressed stop.
+        let call = || ModelAnswer::calling(vec![RequestedCall::new(
+            "page.search",
+            serde_json::json!({ "q": "again" }),
+        )]);
+        let model = ScriptedModel::new(vec![
+            call(),
+            // Distinct arguments each step, or the loop guard ends the run as `loop_detected`
+            // before cancellation is ever reached and the test proves the wrong thing.
+            {
+                let mut answer = call();
+                answer.calls[0].arguments = serde_json::json!({ "q": "second" });
+                answer
+            },
+            ModelAnswer::text("never reached"),
+        ]);
+        let (sink, events) = collect().await;
+        let rt = runtime(model.clone(), AllowList::new(vec!["page.search".into()], Vec::new()));
+        let cancel = rt.cancel_handle();
+
+        // Set the flag from the durable record rather than from a timer. A timer would make this
+        // test a race against the machine's speed — it passed or failed depending on whether the
+        // loop finished its three steps before the sleep elapsed, which is a test that reports
+        // the wrong thing on a slow CI box. The persist hook fires *after* the loop has published
+        // the first tool result and *before* it checks the boundary again, so the moment the
+        // person presses stop is pinned rather than raced for. The runner sets the same flag
+        // from its own poll loop, against the same column.
+        let persister: Persist = Box::new({
+            let cancel = cancel.clone();
+            move |event| {
+                let cancel = cancel.clone();
+                Box::pin(async move {
+                    if matches!(event, AgentEvent::ToolResult { .. }) {
+                        cancel.request();
+                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            }
+        });
+
+        let outcome = run_with(
+            &rt,
+            "loop until stopped",
+            RunLimits {
+                max_steps: 8,
+                ..RunLimits::default()
+            },
+            &sink,
+            &persister,
+            RunOptions::default(),
+        )
+        .await;
+
+        assert_eq!(outcome.stop_reason, StopReason::Cancelled);
+        // Not a failure: a person pressing stop is not the agent breaking.
+        assert_eq!(outcome.status, "cancelled");
+        assert!(cancel.is_requested());
+
+        let events = events.await.expect("the collector must not panic");
+        assert!(matches!(events.last(), Some(AgentEvent::Done { stop_reason: StopReason::Cancelled, .. })));
+        // The partial trace is finished, not torn off: every step the run began is closed, and
+        // the steps that ran before the flag are still there for the person who pressed stop.
+        let started: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::StepStarted { step_no, .. } => Some(*step_no),
+                _ => None,
+            })
+            .collect();
+        assert!(!started.is_empty(), "the run must have done some work before it was stopped");
+        let results = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolResult { .. }))
+            .count();
+        assert_eq!(
+            started.len(),
+            results,
+            "every started step must have published its result — a cancelled run's trace is finished"
+        );
+        assert!(
+            model.calls() <= started.len(),
+            "the model must not be asked after the boundary that saw the cancellation"
+        );
     }
 }
