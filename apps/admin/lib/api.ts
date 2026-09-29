@@ -6,8 +6,8 @@
  */
 import type {
   CreatedMediaShare,
-  NewMediaGrant,
   Media,
+  MediaActivity,
   MediaBulkResult,
   MediaCrossSiteReport,
   MediaDuplicateReport,
@@ -16,23 +16,12 @@ import type {
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
-  MediaMergeResult,
-  MediaPreset,
   MediaGrant,
   MediaGrantSubject,
   MediaGrantsResponse,
-  MediaShare,
-  MediaActivity,
-  MediaUsage,
-  MediaStorageProbe,
-  MediaStorageSettings,
+  MediaMergeResult,
+  MediaPreset,
   MediaQuarantineList,
-  MediaScanProbe,
-  MediaScanRunList,
-  MediaScanSettings,
-  MediaScanSettingsInput,
-  MediaSweepResult,
-  MediaStorageSettingsInput,
   MediaReplaceResult,
   MediaRetentionList,
   MediaRetentionPolicy,
@@ -40,12 +29,19 @@ import type {
   MediaRetentionRepair,
   MediaRetentionRunList,
   MediaRetentionRunResult,
+  MediaScanProbe,
+  MediaScanRunList,
+  MediaScanSettings,
+  MediaScanSettingsInput,
+  MediaShare,
+  MediaStorageProbe,
+  MediaStorageSettings,
+  MediaStorageSettingsInput,
+  MediaSweepResult,
   MediaTrash,
+  MediaUsage,
   MediaVersionList,
-  OnboardingStatus,
-  Organization,
-  OwnerSetupResult,
-  Page,
+  NewMediaGrant,
   NotificationBulkResult,
   NotificationChannelReadiness,
   NotificationDevice,
@@ -60,6 +56,10 @@ import type {
   NotificationRow,
   NotificationSettingsRow,
   NotificationSummary,
+  OnboardingStatus,
+  Organization,
+  OwnerSetupResult,
+  Page,
   Site,
   User,
 } from "./types";
@@ -5128,6 +5128,14 @@ export function saveObservabilitySettings(
   input: ObservabilitySettingsInput,
 ): Promise<ObservabilitySettings> {
   return request<ObservabilitySettings>("/api/v1/observability/settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function fetchLifecycle(): Promise<LifecycleResponse> {
+  return request<LifecycleResponse>("/api/v1/observability/lifecycle");
+}
 
 /**
  * The caller's own channel configuration (REQ-021, slice 2).
@@ -5160,9 +5168,6 @@ export function saveNotificationPreferences(input: {
     body: JSON.stringify(input),
   });
 }
-
-export function fetchLifecycle(): Promise<LifecycleResponse> {
-  return request<LifecycleResponse>("/api/v1/observability/lifecycle");
 
 // ---------------------------------------------------------------------------------------------
 // Slice 3: the half that leaves the panel
