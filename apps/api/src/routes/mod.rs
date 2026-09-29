@@ -172,6 +172,19 @@ fn automation_projects_surface(state: &AppState) -> Router<AppState> {
             post(automation_projects::restore_project)
                 .layer(guards::require(state, "projects.manage")),
         )
+        // `/workflows/{id}/move` lives under workflows, not projects: the path names what is
+        // being moved and the project is the destination. Declared here beside the other project
+        // routes so the one permission that guards it is visible with the rest of the surface.
+        //
+        // `workflows.manage`, NOT a new `workflows.move`: this surface already names three
+        // workflow permissions and inventing a fourth means a role that could edit a workflow
+        // could not move one, with no word anywhere saying why. Inside the handler the project
+        // capability is checked on both ends, so the workflow permission stays coarse on purpose.
+        .route(
+            "/workflows/{id}/move",
+            post(automation_projects::move_workflow)
+                .layer(guards::require(state, "workflows.manage")),
+        )
         .route(
             "/projects/{id}/members",
             post(automation_projects::upsert_member)

@@ -747,6 +747,133 @@ pub async fn remove_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The move (REQ-133 slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// Body of `POST /api/v1/workflows/{id}/move`.
+///
+/// `dry_run` is a flag rather than a separate endpoint on purpose: the REQ's dialog runs the
+/// dependency check when it opens and the move when the operator confirms, and two endpoints
+/// would be two implementations of the same report. The store runs the *same* detection for both,
+/// so the panel cannot show a report that disagrees with the move.
+#[derive(Debug, Deserialize)]
+pub struct MoveWorkflowInput {
+    /// Organization the workflow belongs to.
+    pub organization_id: Uuid,
+    /// Project to move it into.
+    pub to_project_id: Uuid,
+    /// Report without writing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /api/v1/workflows/{id}/move` — report, or move.
+///
+/// **The route permission is `workflows.manage`; the project capability is checked on BOTH
+/// projects.** A caller who may
+/// edit the source but not administer the target could otherwise drain a project into one they
+/// merely hold `projects.read` in; the REQ says "project management on both ends" and this is
+/// that sentence as code. The source check is `can_edit` rather than `can_administer`, because
+/// moving one workflow is an edit of that workflow, not an administration of the container.
+///
+/// A workflow the caller may not see answers `404` — the store's `workflow_not_found`, which
+/// makes no claim about whether the row exists anywhere — and a *target* they may not see answers
+/// `403`, because naming a project you cannot use is a claim about your own action, not an
+/// existence oracle. The two answers differ on purpose and the difference is asserted below.
+pub async fn move_workflow(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(workflow_id): Path<Uuid>,
+    Json(input): Json<MoveWorkflowInput>,
+) -> Result<Json<omnion_workflows::move_workflow::MoveReport>, ApiError> {
+    let organization_id = resolve_organization(&current, Some(input.organization_id))?;
+
+    // Resolve the workflow's own project first: the source capability check needs it, and the
+    // resolution is the same 404-shaped read every other workflow path in this surface uses.
+    let caller = caller_for(&state, &current, organization_id).await;
+    // One statement, scoped to the organization in the `where` rather than checked in Rust: a
+    // separate `select … where id` followed by an organization comparison is the two-statement
+    // shape that lets a caller read one tenant's workflow through another's session.
+    let source_project_id: Option<Uuid> =
+        sqlx::query_scalar("select project_id from workflows where id = $1 and organization_id = $2")
+            .bind(workflow_id)
+            .bind(organization_id)
+            .fetch_optional(state.db().pool())
+            .await
+            .map_err(sql)?;
+    let source_project_id = source_project_id.ok_or_else(|| {
+        ApiError::not_found("workflow_not_found", "no such workflow in this organization")
+    })?;
+
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        source_project_id,
+        ProjectRole::can_edit,
+        "move a workflow out of the project",
+    )
+    .await?;
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        input.to_project_id,
+        ProjectRole::can_edit,
+        "move a workflow into the project",
+    )
+    .await?;
+
+    let report = omnion_workflows::move_workflow::move_workflow(
+        state.db().pool(),
+        organization_id,
+        workflow_id,
+        input.to_project_id,
+        Some(current.user.id),
+        input.dry_run,
+        caller,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(report))
+}
+
+/// The body shape of a refusal, asserted without a database.
+///
+/// Two sentences the panel depends on, kept as tests because the alternative is a substring
+/// assertion inside a walkthrough, and substring assertions are how a gate starts passing for the
+/// wrong reason.
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    #[test]
+    fn a_dry_run_is_the_default_shape_of_the_body() {
+        // `#[serde(default)]`, so a panel that posts `{organization_id, to_project_id}` gets a
+        // report rather than a 400 — and a dialog that forgets the flag cannot move anything by
+        // accident.
+        let input: MoveWorkflowInput = serde_json::from_value(serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000001",
+            "to_project_id": "00000000-0000-0000-0000-000000000002",
+        }))
+        .expect("a body without dry_run parses");
+        assert!(!input.dry_run, "an absent flag is false, so nothing is written unless asked");
+    }
+
+    #[test]
+    fn an_explicit_dry_run_is_read() {
+        let input: MoveWorkflowInput = serde_json::from_value(serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000001",
+            "to_project_id": "00000000-0000-0000-0000-000000000002",
+            "dry_run": true,
+        }))
+        .expect("an explicit flag parses");
+        assert!(input.dry_run);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

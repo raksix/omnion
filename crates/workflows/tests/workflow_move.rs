@@ -111,10 +111,6 @@ async fn seed(pool: &PgPool, label: &str) -> Org {
     .await
     .expect("the owner is inserted");
 
-    let admin = ProjectCaller {
-        user_id: owner,
-        is_instance_admin: true,
-    };
     let project = projects::default_project(pool, org_id)
         .await
         .expect("the default project");
@@ -586,7 +582,7 @@ async fn a_workflow_that_moved_under_us_is_a_conflict_not_a_success() {
             error.code()
         );
     } else {
-        assert_eq!(result.expect("a report").dry_run, false);
+        assert!(!result.expect("a report").dry_run, "a real move is never a dry run");
     }
     // Whatever happened, the workflow is in exactly one project and it is not `target` by accident:
     // a "successful" move of a workflow somebody else already moved is the bug this test exists for.
