@@ -5419,3 +5419,35 @@ than quietly fixing it.
 pass named a *symptom* (`organization=null`) and the screenshot named the *cause*. Six ticks of
 "the slot is held" would have been one `grep OMNION_CSRF_SECRET scripts/qa/run.sh` away from the
 truth — the cheapest check on this box is still the one nobody runs.
+
+**Then the pass ran, and the fix needed no file edit at all.** `run.sh`'s pm2 block is
+`OMNION_X=… pm2 start`, and `pm2 start` inherits the caller's environment — so exporting
+`OMNION_CSRF_SECRET` in the pass's own shell is exactly what a clean checkout does by exporting it in the
+script. The parallel session's edit was never in the way; the only thing in the way was that nobody had
+checked whether the file was dirty. **A dirty tree is a gate precondition, and the check is one `git status`.**
+
+**Result.** The pass waited ~30 minutes across three holders (w7, w4, w6), walked **145 CRM screenshots /
+201 CRM-related steps**, and the lead inbox shows the row this slice exists for: "No Contact", status
+**Rejected**, Discarded = 2, Open = 3. The lead detail renders fully — payload, attribution, verdicts, the
+edit form, the four-state conversion ladder and the timeline. That is REQ-117 acceptance 5 answered in the
+panel, which no store test can do.
+
+### Two harness bugs, both found by the run that finally had the slot
+
+1. **`qa-slot.sh` reaped only on entry.** A holder that died while a pass was already waiting kept the queue
+   for the rest of that pass's `QA_SLOT_WAIT`. My pass sat 2400 s on a place its owner had abandoned.
+   The fix is one line — `reap` inside the loop — and it reclaimed **three** stale places the moment it ran.
+   The script's own header states the contract ("reclaim a place whose holder is gone"); it just did not keep
+   it while waiting. Committed as `398370f`.
+2. **`walkthrough.cjs`'s roll-up read `p.diagnostics` unguarded.** The roll-up is the only place a `high`
+   finding becomes visible, and it ran *before* `summary.json` was written — so a page that never rendered
+   threw and destroyed every finding the pass had earned. **Both of this branch's runs today ended that
+   way**: the 12:09 pass and tonight's. The 12:09 summary contains a single `fatal` string and nothing else,
+   and tonight's earned 259 screenshots to reach the same place. A pass that walks 201 steps and reports one
+   line is not a failing pass — it is a failing report, and the second is the more dangerous of the two,
+   because it looks like a product verdict. Now an unmeasured page is a `medium` finding that says it was
+   not judged. Committed as `793ce78`.
+
+**Six ticks of "the slot is held" were four different causes wearing one sentence**: a live foreign pass, a
+crashed pass's corpse, a reaper that only ran on entry, and a missing CSRF secret. The cheapest check on this
+box — `git status` before believing a pass failure — is still the one nobody runs.
