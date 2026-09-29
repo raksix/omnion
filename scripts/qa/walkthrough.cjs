@@ -575,7 +575,46 @@ async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(900);
-  const url = page.url();
+  let url = page.url();
+  // A fresh database is NOT the same as "an installation already exists", and telling those two
+  // apart by which URL the panel happened to be on is how this pass has been dying before it
+  // signed in — twice, on a database with zero rows in `users`.
+  //
+  // The reason is a redirect chain with a client hop in the middle. `proxy.ts` sends an
+  // anonymous visitor from `/` to `/login`; `/login` is the only screen that calls
+  // `fetchOnboarding()`, and it does that in a `useEffect` — so `/setup` arrives one navigation
+  // *after* the first one settles. Reading the URL 900 ms after the first `goto` therefore lands
+  // on `/login` on a brand-new installation, the check concludes "already exists", the wizard
+  // never runs, no account is ever created, and `ensureSignedIn` then fails to sign in with an
+  // account that does not exist. The log line said "installation already exists" and the database
+  // was empty: the message was a guess about a state it had not actually observed.
+  //
+  // The authority is the onboarding state itself, which is the same call the sign-in screen
+  // makes, and the URL is only accepted once it says so. Anything else is treated as
+  // "not installed yet" and handed to the wizard — which is the recoverable direction, because
+  // a second request to complete the first-run steps on an installation that already has them is
+  // refused by the API, while skipping the wizard is a dead pass.
+  const onboarding = await page
+    .evaluate(async () => {
+      try {
+        const res = await fetch("/api/v1/onboarding");
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    })
+    .catch(() => null);
+  const needsSetup = onboarding ? onboarding.needs_setup === true : true;
+  log(`wizard: onboarding says needs_setup=${needsSetup} (url=${url})`);
+
+  if (needsSetup) {
+    // The wizard is open to anonymous visitors, so it is reached directly rather than by waiting
+    // for the sign-in screen's client-side hop to land there.
+    await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(900);
+    url = page.url();
+  }
   if (!url.includes("/setup")) {
     log(`wizard: not in setup (${url}) — installation already exists`);
     return { ran: false, url };
@@ -583,14 +622,32 @@ async function runWizard(page, report) {
   report.steps.push({ step: 0, url, action: "reached /setup" });
   await shot(page, "01-setup-step-1");
   for (let i = 1; i <= 10; i++) {
-    const stepKey = await page
-      .evaluate(() => {
-        if (/Your installation is ready/i.test(document.body.innerText)) return "done";
-        const el = document.querySelector('[data-setup-step][data-step-state="current"]');
-        return el ? el.getAttribute("data-setup-step") : null;
-      })
-      .catch(() => null);
-    if (!stepKey) break;
+    // A missing step element is not the end of the wizard, it is a screen that has not painted
+    // yet. The original loop read it once and `break`ed, which ended the wizard on step 1 of 5:
+    // the owner account was created, the organization never was, and every later screen in the
+    // pass then answered `organization_required` — a database with one user and zero
+    // organizations, which reads exactly like a broken CRM and is not one. The step moves because
+    // the previous step's POST resolves and the client re-renders, so a null read is a race to
+    // wait out, not a state to conclude from. Bounded, because a wizard that genuinely has no
+    // current step (it said so) must still terminate.
+    let stepKey = null;
+    for (let probe = 0; probe < 20; probe += 1) {
+      stepKey = await page
+        .evaluate(() => {
+          if (/Your installation is ready/i.test(document.body.innerText)) return "done";
+          const el = document.querySelector('[data-setup-step][data-step-state="current"]');
+          return el ? el.getAttribute("data-setup-step") : null;
+        })
+        .catch(() => null);
+      if (stepKey) break;
+      // Not on the wizard at all: it is done, or it was never entered. Either way, stop reading.
+      if (!page.url().includes("/setup")) break;
+      await page.waitForTimeout(250);
+    }
+    if (!stepKey) {
+      log(`wizard: no current step at iteration ${i} (url=${page.url()}) — stopping`);
+      break;
+    }
     if (stepKey === "done") {
       await page.locator('button:has-text("Open the panel")').first().click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(900);
