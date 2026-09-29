@@ -1,6 +1,19 @@
 # REQ-016 — Webhook + Event Bus
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
+> **Status:** in-progress — **slice 1 is code-complete and verified.** The registry is
+> `crates/events/src/catalogue.rs`: 68 names (67 live, 1 reserved) with their area, a
+> one-sentence description, their payload fields and a required flag, compiled in rather
+> than stored. `GET /api/v1/events/catalogue` serves it; a group subscription (`page.*`)
+> is stored as the wildcard **and** as today's expansion, and the fan-out tests the
+> wildcard, so an event added next release reaches an endpoint nobody edited. Proof:
+> `cargo test -p omnion-events --lib` **41** (24 + 17), `cargo test -p omnion-api --test
+> events` **4/4** against real Postgres and a real loopback receiver, `omnion-api --lib`
+> **188**, `tsc --noEmit` exit 0. **Not yet done in slice 1:** emission calls for the names
+> the modules do not yet record (`page.created|updated|unpublished|deleted|restored`,
+> `user.updated|deleted`, `site.archived`, `domain.*`, `plugin.*`, `theme.activated`,
+> `workflow.run.*`) and the `/events` screen with its Feed and Catalogue tabs — the
+> catalogue's data source exists, its screen does not. Slice 2 (endpoint management UI) is
+> untouched. · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -132,7 +145,12 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
   restoring a page record their own names.
 - [ ] Creating, updating and deleting a user records `user.created|updated|deleted`; the same is true for site, domain, media, plugin, theme and workflow-run
   mutations.
-- [ ] Subscribing an endpoint to `page.*` receives a delivery for a newly added `page.*` event without editing the endpoint.
+- [x] Subscribing an endpoint to `page.*` receives a delivery for a newly added `page.*` event without editing the endpoint.
+      — A `page.*` subscription is stored as the wildcard plus today's eight names, and
+      `enqueue_fanout` matches either; publishing a page delivers to a receiver that named
+      only the group. The *growth* half is covered by the unit test
+      `a_group_covers_events_the_catalogue_has_not_heard_of_yet`; a real second release is
+      not something a test can stage, and the wildcard is what makes it work.
 - [ ] `POST /api/v1/webhooks` returns a generated secret exactly once; the subsequent `GET` body contains no `secret` key (asserted in an integration test).
 - [ ] `POST /api/v1/webhooks/{id}/secret/rotate` returns a new secret, and a delivery signed with the previous secret fails verification afterwards.
 - [ ] The endpoint form rejects: empty name, duplicate name (case-insensitive), URL without a scheme, URL containing whitespace, zero events, more than 32

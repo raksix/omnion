@@ -4033,3 +4033,79 @@ this, so the keyboard leg (`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `
 `notificationSettings.quietSaved` + `digestPersisted`, which the data path can now support.
 The other open item is unchanged: the 74 `/media/*` high findings, which are REQ-010 slice 4's
 remaining gate.
+
+## Tick 51 — REQ-016 slice 1: the event catalogue (the registry the platform never had)
+
+**What.** `crates/events/src/catalogue.rs` — 68 event names (67 live, 1 reserved) with their
+area, a one-sentence description, their payload fields and a required flag. Compiled in, not
+stored. `GET /api/v1/events/catalogue` serves it, a group subscription (`page.*`) is stored as
+the wildcard *and* as today's expansion, and `enqueue_fanout` matches either.
+
+**The gap this closes.** Before this, the only truth about an event name was the string literal
+at the call site. The endpoint form had nothing to build a picker from, `/events` had nothing to
+describe, and a typo in one emitter became a name no receiver could ever subscribe to — silently,
+with the bus recording the fact and the delivery queuing normally. Nothing was broken and nothing
+said so.
+
+**Two decisions, and the reasons are the interesting part.**
+
+*A group is stored twice.* Storing only today's expansion means `page.*` silently stops covering
+an event added next release — the exact surprise a group exists to remove. Storing only the
+wildcard means a receiver can be subscribed to a group whose members do not exist, and cannot
+tell what it is getting. So the wildcard is the subscription and the expansion is the readable
+copy, and the fan-out tests both. The SQL grew one `or $4 = any (w.events)` clause; the clause
+is there for the row written before reconciliation existed, or by an operator's own SQL, which
+would otherwise stop receiving with no error anywhere.
+
+*`order.created` is listed, described and subscribable while commerce is unshipped* — and marked
+`reserved` so the panel can say *which module ships it* rather than implying the platform is
+broken. A reserved name is a name: `order.*` expands today.
+
+**The registry writes itself, and its first two findings were real.** The table is a macro
+(`crates/events/src/catalogue.rs`), one row per event, and `apps/api/tests/events.rs`
+`every_emitted_name_is_in_the_catalogue` walks the source tree for `NewEvent::new("…")` and fails
+with the file and line when an emitter names something the table does not carry. A unit test
+inside `omnion-events` cannot do this — it cannot see the modules. It immediately earned its
+place: it caught that the upload fact is emitted as **`media.created`**, not the `media.uploaded`
+the request imagined. The table was written to match the code rather than the spec, and the
+reason is in the source: renaming the row would make the catalogue agree with the request and
+disagree with every receiver that already subscribed.
+
+**A gate that cannot fail proves nothing**, so the drift test was proved in both directions:
+with a `totally.made_up` emitter injected into `media_settings.rs` it failed with
+`1 emitted name(s) are not in the catalogue … totally.made_up (apps/api/src/routes/media_settings.rs:24)`,
+and green again once restored.
+
+**Also found, by a test I wrote to check a different thing.** `group_members` matches the first
+dotted segment, so a group is `order` while the area is `commerce` — I had written a test
+asserting `commerce.*` would expand. Area and group are different vocabularies and conflating
+them would make `commerce.*` look correct while matching nothing. Pinned by
+`an_area_is_not_a_group`.
+
+**Macro rules, for the fourth time.** A `*` repetition may not be followed by another
+repetition, a field tuple needs its literal parens in the pattern, `req`/`opt` are idents not
+literals, and a `const fn` cannot match on `&str` on this toolchain — so the status and the
+required flag are matched as *tokens* and turned into the values by the macro. The table is now
+stricter than it was designed to be: a row that says `Reserved` in the wrong case is a compile
+error rather than a row that silently reads as `live`.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **41** (24 before, 17 new)
+- `cargo test -p omnion-api --test events -- --test-threads=1` → **4/4**, real Postgres + a real
+  loopback receiver; the group subscription delivers a `page.published` and the signature
+  verifies against the secret the creation response returned
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+
+**Not done, and not claimed.** Slice 1 is not closed. Missing: the emission calls for names the
+modules do not record yet (`page.created|updated|unpublished|deleted|restored`,
+`user.updated|deleted`, `site.archived`, `domain.*`, `plugin.*`, `theme.activated`,
+`workflow.run.*`) — the catalogue names them and the table asserts they are listed, which is the
+honest direction: the registry is the specification the emitters are measured against, and they
+have not caught up. And the `/events` screen with its Feed and Catalogue tabs does not exist; the
+data source does.
+
+**Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
+on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
+turns "did I remember?" into a red line with a file and a line number.

@@ -68,6 +68,10 @@ pub fn validate_event_name(raw: &str) -> Result<String> {
 }
 
 /// Validate a subscription list: every name valid, deduplicated, sorted, bounded.
+///
+/// This is the **shape** check. A list that passes it is legal; whether it expands into
+/// group wildcards is [`crate::catalogue::reconcile`]'s job, and the two are separate so a
+/// caller that only wants a syntax check does not silently get an expanded list back.
 pub fn validate_subscriptions(raw: &[String]) -> Result<Vec<String>> {
     if raw.is_empty() {
         return Err(EventsError::invalid_endpoint(
