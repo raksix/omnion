@@ -1,8 +1,12 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** in-progress (slice 3 of 4 — the promotion API is shipped in `0f6779f…491810c`: migration
-> `0161_promotions.sql`, the frozen change set, the conflict re-check at approve, and the one-transaction apply with six walks
-> green. The **Promotions tab, the promotion dialog and the browser gate are still owed**) · **Captured:** 2026-09-25 ·
+> **Status:** in-progress (slice 3 of 4 — the whole slice is now written: the API (`0f6779f…491810c`) and
+> the panel (`07464d7`…`5c8870d`) — the Changes tab with a checkbox column and a selection-scoped
+> `Promote selection`, the promotion dialog with its frozen summary, conflict list, server-decided
+> typed confirmation and step timeline, and the Promotions tab reading the record back. The
+> **browser gate is still owed**: the four new claims in `runEnvironmentsDepth` have never run,
+> because a sibling writer held the QA slot for the whole tick
+> · **Captured:** 2026-09-25 ·
 > **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
@@ -159,7 +163,7 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 - [x] Self-approval is refused for a requester without the deploy permission, and the same person holding the deploy permission can approve (both paths covered by tests).
   *(walk `self_approval_is_refused_without_the_deploy_key_and_allowed_with_it`. **A decision worth recording:** the refusal fires only when the requester *lacks* `deployment.deploy`. A holder may approve their own, because the deploy key *is* the authority that says "I may decide" — refusing would leave a one-person team unable to ship at all. Two-person approval belongs to REQ-069's policy engine, and a half-built version of it does not belong in the core.)*
 - [x] Promotion keeps a history row with requester, approver, timestamps and the frozen change set, visible in the Promotions tab.
-  *(walk `promotion_history_detail_and_the_gates`: `GET /environments/{id}/promotions` returns the history newest-first with the set's own counts, `GET /promotions/{id}` returns the frozen items, and 403/404 are each proven separately. **The tab itself is not built** — see below.)*
+  *(walk `promotion_history_detail_and_the_gates`: `GET /environments/{id}/promotions` returns the history newest-first with the set's own counts, `GET /promotions/{id}` returns the frozen items, and 403/404 are each proven separately. **The tab is built** (`61c8d1c`): open promotions sort above finished ones, each row carries the frozen counts and a conflict count in the attention tone, and the expand reads the record's own step log. It has not been through the browser pass yet — see the slice note below.)*
 - [ ] `promotion.*` events arrive at an endpoint subscribed to `promotion.*` within the delivery window.
 - [ ] The environment chip appears in the panel header while staging is active, the staging banner cannot be dismissed, and staging hosts answer with `X-Robots-Tag: noindex`.
 - [x] All new routes answer `403` without their permission and `404` for another organization's environment — `the_change_set_is_404_for_another_organization_and_403_without_the_key` proves both on the new route; the existing walks cover the other six.
@@ -167,6 +171,7 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
   *(integration walk `archiving_releases_the_host_and_keeps_the_content`; the browser half is
   still owed by the depth pass below)*
 - [ ] The QA walkthrough visits `/environments`, `/environments/new` and `/environments/[id]` with zero high findings.
+  *(`?tab=changes` and `?tab=promotions` are now visited and clicked by `runEnvironmentsDepth` as well — the tab strip is a real navigation and an untested tab is an untested screen. **This box stays open because none of it has run**: a sibling writer held the QA slot for this whole tick, and the pass had not been executed once when the tick ended.)*
 
 ### QA plan
 
@@ -186,16 +191,17 @@ conflicted item, and no dead buttons or placeholder text.
 *Done line:* editing a page in staging appears in Changes as `updated` with the editor's name, and production is untouched.
 3. **Promotion.** Promotion records, approve endpoint, frozen-change-set apply with conflict detection, Promotions tab, `promotion.*` events. *Done line:* a requested promotion is
 approved, applied atomically, visible in history, and emitted to a subscribed endpoint.
-   **The backend half of this slice is done and green (`0f6779f…491810c`). Still owed, and it is what
-   keeps the slice open:**
-   - the **Promotions tab** on `/environments/[id]` — history rows, status badges, the
-     requester/approver pair and the conflict list;
-   - the **promotion dialog** — the frozen summary, the conflict list, the typed confirmation above
-     25 items, and the step timeline that survives a refresh;
-   - the **bulk action** the Changes tab promises ("select non-conflicting rows → Promote
-     selection"). The API honours `items: []` today, but no screen sends a selection yet;
-   - `promotion.*` reaching a **subscribed webhook endpoint** end to end. The events are emitted and
-     the row is written; the delivery half is REQ-016's runner, and is not yet proven against a
+   **Every screen this slice names is now written (`07464d7`…`5c8870d`):** the Changes tab's
+   checkbox column and its selection-scoped `Promote selection`, the promotion dialog with the
+   frozen summary, the conflict list, the typed confirmation and the step timeline, and the
+   Promotions tab reading the record back. **What keeps the slice open is the gate, and it is
+   two things:**
+   - the **browser pass** — `runEnvironmentsDepth` grew four claims for this slice (the selection
+     names its own scope, the dialog leads with a count, requesting writes a `promotions` row, the
+     tab is re-read after a navigation) and **none of them has run yet**: a sibling writer held
+     the QA slot for the whole tick. A screen nobody has opened is not a screen that works.
+   - `promotion.*` reaching a **subscribed webhook endpoint** end to end. The events are emitted
+     and the row is written; the delivery half is REQ-016's runner, and is not yet proven against a
      real endpoint from here.
 4. **Hardening.** Clone cancel/retry, `noindex` on staging hosts, large-site batching, conflict refresh, error states and the archive path. *Done line:* a cancelled clone leaves no
 partial environment marked active, and a conflicted promotion is refused with item-level detail.
