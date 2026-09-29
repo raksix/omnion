@@ -74,7 +74,8 @@ const FORM_COLUMNS: &str = "id, organization_id, site_id, key, name, status, sub
 
 /// The columns a submission row is read with.
 const SUBMISSION_COLUMNS: &str = "id, form_id, site_id, answers, consent_text, source_path, \
-     ip_hash, user_agent_hash, spam_score, status, created_at";
+     ip_hash, user_agent_hash, spam_score, status, notified_at, notify_status, notify_error, \
+     created_at";
 
 /// A form row.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -259,6 +260,12 @@ pub struct Submission {
     pub spam_score: i32,
     /// `new`, `read`, `spam` or `archived`.
     pub status: String,
+    /// When the notification attempt happened, when one was made.
+    pub notified_at: Option<time::OffsetDateTime>,
+    /// `sent`, `skipped` or `failed` — what became of the notification.
+    pub notify_status: Option<String>,
+    /// Why, for the two states that have a reason.
+    pub notify_error: Option<String>,
     /// When it arrived.
     pub created_at: time::OffsetDateTime,
 }

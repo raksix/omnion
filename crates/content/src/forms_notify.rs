@@ -248,6 +248,11 @@ mod tests {
             user_agent_hash: None,
             spam_score: 0,
             status: "new".to_owned(),
+            // The renderer does not read these: what became of the notification is the
+            // route's business, and a fixture that invented one would be asserting a lie.
+            notified_at: None,
+            notify_status: None,
+            notify_error: None,
             created_at: datetime!(2026-09-29 12:30 UTC),
         }
     }

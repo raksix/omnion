@@ -1452,6 +1452,14 @@ export type Submission = {
   source_path: string | null;
   status: string;
   spam_score: number;
+  /**
+   * What became of the builder's notification. `null` means "no attempt was ever recorded",
+   * which is NOT the same as "not sent" — a row from before the send existed has no record,
+   * and drawing it as a delivery failure would be a lie about history.
+   */
+  notified_at?: string | null;
+  notify_status?: "sent" | "skipped" | "failed" | null;
+  notify_error?: string | null;
   created_at: string;
   summary?: {
     name?: string;

@@ -406,8 +406,21 @@ export function FormInbox() {
                     {submission.summary?.text ?? ""}
                   </td>
                   <td className="py-2 pr-3">
-                    <span data-inbox-row-status={submission.status} className="rounded-full bg-quiet-soft px-2 py-0.5 text-[11px]">
-                      {submission.status}
+                    <span className="inline-flex items-center gap-1.5">
+                      <span data-inbox-row-status={submission.status} className="rounded-full bg-quiet-soft px-2 py-0.5 text-[11px]">
+                        {submission.status}
+                      </span>
+                      {/* Only a row whose notification did not go out is marked. A green tick on
+                          every row is decoration; a mark on the two that need attention is
+                          information, and it is the same distinction the drawer spells out. */}
+                      {submission.notify_status === "sent" ? null : (
+                        <span
+                          data-inbox-row-notified={submission.notify_status ?? "none"}
+                          title={notificationDetail(submission)}
+                          aria-label={notificationHeading(submission.notify_status)}
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500"
+                        />
+                      )}
                     </span>
                   </td>
                   <td className="py-2 text-right">
@@ -444,6 +457,41 @@ export function FormInbox() {
 }
 
 /** What an empty tab says — the draft case is named before anything else. */
+/**
+ * What the notification did, in the owner's own words. The three states are kept apart because
+ * they are three different tickets: nobody was named (the form's settings), the platform is not
+ * sending (the environment), or the server refused (the relay).
+ */
+function notificationHeading(status: string | null | undefined): string {
+  if (status === "sent") return "Notification sent";
+  if (status === "skipped") return "No mail was sent";
+  if (status === "failed") return "The mail server refused it";
+  return "No notification on record";
+}
+
+function notificationDetail(submission: {
+  notify_status?: string | null;
+  notify_error?: string | null;
+  notified_at?: string | null;
+}): string {
+  const when = submission.notified_at
+    ? ` (${formatTimestamp(submission.notified_at)})`
+    : "";
+  const reason = submission.notify_error ? ` — ${submission.notify_error}` : "";
+  if (submission.notify_status === "sent") {
+    return `The form's notification reached every address it names${when}.`;
+  }
+  if (submission.notify_status === "skipped") {
+    return `Nothing left the platform${when}${reason}.`;
+  }
+  if (submission.notify_status === "failed") {
+    return `The submission is safe in this inbox, but the notification did not go out${when}${reason}.`;
+  }
+  // No record at all: this submission arrived before notifications were recorded. Saying
+  // "failed" here would invent a failure nobody observed.
+  return "This submission arrived before the platform recorded notifications, so nothing is known about one.";
+}
+
 function emptyTitle(status: string, search: string, formStatus: string): string {
   if (search) return `No submission matches “${search}”`;
   if (formStatus !== "published") return "This form is a draft, so nothing can arrive yet";
@@ -531,6 +579,16 @@ function SubmissionDrawer({
         <p className="mt-3 text-[11.5px] text-muted">
           From {submission.source_path ?? "an unknown path"} · spam score {submission.spam_score}/100
         </p>
+
+        {/* The notification's fate, in the drawer rather than behind a log file. An owner who
+            cannot see it here has no other way to find out, and the two "skipped" reasons need
+            different people to fix them. */}
+        <div className="mt-3" data-inbox-notification={submission.notify_status ?? "none"}>
+          <p className="text-[11.5px] font-medium text-muted">
+            {notificationHeading(submission.notify_status)}
+          </p>
+          <p className="mt-1 text-[12.5px]">{notificationDetail(submission)}</p>
+        </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
           <button

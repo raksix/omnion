@@ -368,6 +368,17 @@ pub struct SubmissionBody {
     pub status: String,
     /// Heuristic score, 0–100.
     pub spam_score: i32,
+    /// When the notification attempt happened. `null` on a row that predates the send, and
+    /// `null` is NOT "did not send" — it is "nobody recorded an attempt", and the inbox has to
+    /// say which, or a message from before this feature existed reads as a delivery failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notified_at: Option<OffsetDateTime>,
+    /// `sent`, `skipped` or `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_status: Option<String>,
+    /// Why, for the two states that have a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_error: Option<String>,
     /// When it arrived.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -387,6 +398,9 @@ impl From<&Submission> for SubmissionBody {
             source_path: submission.source_path.clone(),
             status: submission.status.clone(),
             spam_score: submission.spam_score,
+            notified_at: submission.notified_at,
+            notify_status: submission.notify_status.clone(),
+            notify_error: submission.notify_error.clone(),
             created_at: submission.created_at,
             summary: None,
         }
