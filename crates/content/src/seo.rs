@@ -736,6 +736,99 @@ impl SeoStore {
     }
 
     // -----------------------------------------------------------------------------------------
+    // Redirect CSV
+    // -----------------------------------------------------------------------------------------
+
+    /// Write a parsed CSV plan, or write nothing at all.
+    ///
+    /// The all-or-nothing contract is the whole point and it lives HERE rather than in the route,
+    /// because this is the only place that knows a single `create_redirect` already re-checks
+    /// paths, codes, patterns, the cap and the loop against the database as it stands. So a
+    /// plan that passed the parser can still be refused on row 40 by a rule that row 39
+    /// created — and at that point the transaction is rolled back, because a 400-row import that
+    /// reports "row 40: would close a loop" while having silently written 39 rules is the one
+    /// outcome worse than refusing the file outright.
+    ///
+    /// Everything is one transaction for that reason, and the per-row `create_redirect` calls go
+    /// through the same pool (sqlx nests them on this connection), so a refusal anywhere aborts
+    /// the lot.
+    pub async fn import_redirects(
+        &self,
+        site_id: Uuid,
+        rows: &[crate::seo_csv::CsvRedirect],
+        created_by: Option<Uuid>,
+    ) -> Result<Vec<Redirect>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        let mut written = Vec::with_capacity(rows.len());
+        for row in rows {
+            let created: Redirect = sqlx::query_as(&format!(
+                "insert into cms_seo_redirects \
+                     (organization_id, site_id, from_path, to_path, status_code, pattern, enabled, created_by) \
+                 select s.organization_id, $1, $2, $3, $4, $5, $6, $7 from sites s where s.id = $1 \
+                 returning {REDIRECT_COLUMNS}"
+            ))
+            .bind(site_id)
+            .bind(&row.from_path)
+            .bind(&row.to_path)
+            .bind(row.status_code)
+            .bind(row.pattern.as_str())
+            .bind(row.enabled)
+            .bind(created_by)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                ContentError::InvalidRedirect(format!(
+                    "the import stopped at '{}': {error}",
+                    row.from_path
+                ))
+            })?;
+            written.push(created);
+        }
+
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    /// A site's rules as CSV text — the file the importer reads back.
+    pub async fn export_redirects(&self, site_id: Uuid) -> Result<String> {
+        let rules = self.list_redirects(site_id).await?;
+        Ok(crate::seo_csv::render_redirect_csv(rules.into_iter().map(
+            |rule| crate::seo_csv::CsvRedirect {
+                from_path: rule.from_path,
+                to_path: rule.to_path,
+                status_code: rule.status_code,
+                pattern: if rule.pattern == "regex" {
+                    crate::seo_csv::CsvPattern::Pattern
+                } else {
+                    crate::seo_csv::CsvPattern::Literal
+                },
+                enabled: rule.enabled,
+            },
+        )))
+    }
+
+    /// The rules already stored for a site, as `(from, to)` pairs.
+    ///
+    /// A plan is checked against this as well as against itself, because a file that completes a
+    /// circle *with* an existing rule is the same loop the per-row check would have caught had
+    /// the rows arrived in the other order.
+    pub async fn redirect_pairs(&self, site_id: Uuid) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "select from_path, to_path from cms_seo_redirects where site_id = $1 and enabled",
+        )
+        .bind(site_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Sitemap and robots.txt
     // -----------------------------------------------------------------------------------------
 
