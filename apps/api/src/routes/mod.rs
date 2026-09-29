@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod cdn;
 pub mod cdn_cache;
+pub mod cdn_purge;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -925,6 +926,31 @@ pub fn router(state: AppState) -> Router {
     let cdn_rule_reorder = post(cdn::reorder_rules).layer(guards::require(&state, "cdn.manage"));
     let cdn_rule_toggle = post(cdn::toggle_rule).layer(guards::require(&state, "cdn.manage"));
 
+    // The purge surface (REQ-011, slice 2). Three keys, deliberately: reading what the
+    // cache did is `cdn.read`, asking for an invalidation is `cdn.purge`, and making a
+    // failed one run again is `cdn.manage`. Merging them would let anyone who can fix a
+    // typo in a cache rule also flush an entire production zone.
+    let cdn_status = get(cdn_purge::status).layer(guards::require(&state, "cdn.read"));
+    let cdn_purges = get(cdn_purge::list_purges)
+        .layer(guards::require(&state, "cdn.read"))
+        .merge(
+            post(cdn_purge::create_purge).layer(guards::require(&state, "cdn.purge")),
+        );
+    let cdn_purge_one = get(cdn_purge::get_purge).layer(guards::require(&state, "cdn.read"));
+    let cdn_purge_retry =
+        post(cdn_purge::retry_purge).layer(guards::require(&state, "cdn.manage"));
+    // Settings and the adapter catalogue. These are read by the provider screen that
+    // shipped with slice 1, so leaving them unregistered would have made two of its three
+    // fetches 404 — a screen that loads, renders an error and has no way to say so.
+    let cdn_settings = get(cdn_purge::get_settings)
+        .layer(guards::require(&state, "cdn.read"))
+        .merge(
+            put(cdn_purge::put_settings).layer(guards::require(&state, "cdn.manage")),
+        );
+    let cdn_settings_test =
+        post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
+    let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
+
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
@@ -1383,6 +1409,13 @@ pub fn router(state: AppState) -> Router {
         .route("/cdn/rules/reorder", cdn_rule_reorder)
         .route("/cdn/rules/{id}", cdn_rule)
         .route("/cdn/rules/{id}/toggle", cdn_rule_toggle)
+        .route("/cdn/status", cdn_status)
+        .route("/cdn/purges", cdn_purges)
+        .route("/cdn/purges/{id}", cdn_purge_one)
+        .route("/cdn/purges/{id}/retry", cdn_purge_retry)
+        .route("/cdn/settings", cdn_settings)
+        .route("/cdn/settings/test", cdn_settings_test)
+        .route("/cdn/adapters", cdn_adapters)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)

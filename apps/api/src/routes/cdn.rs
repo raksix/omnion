@@ -435,7 +435,7 @@ fn duplicate_name(error: CdnError) -> ApiError {
 }
 
 /// Check the site belongs to the caller's organization.
-async fn site_in_scope(
+pub(crate) async fn site_in_scope(
     state: &AppState,
     current: &CurrentSession,
     site_id: Uuid,
