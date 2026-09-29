@@ -21,7 +21,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::expression::paths_of;
+use crate::expression::{Namespaces, paths_of};
 use crate::graph::Graph;
 
 /// How many candidates one namespace may contribute.
@@ -110,7 +110,12 @@ pub struct Completion {
 /// bottom of a twenty-item list has learned nothing about their own graph, and the list is
 /// sorted alphabetically anyway.
 #[must_use]
-pub fn complete(graph: &Graph, node_key: &str, prefix: &str, namespaces: &Value) -> Completion {
+pub fn complete(
+    graph: &Graph,
+    node_key: &str,
+    prefix: &str,
+    namespaces: &Namespaces,
+) -> Completion {
     let prefix = prefix.trim();
     let prefix = &prefix[..prefix.len().min(MAX_PREFIX)];
     // Strip the leading `{{` if the caller sent the expression rather than the path inside
@@ -134,8 +139,8 @@ pub fn complete(graph: &Graph, node_key: &str, prefix: &str, namespaces: &Value)
     // Only object namespaces, and only paths the sample actually carries: the preview refuses
     // a path it does not have, so offering one here would be a completion that previews as an
     // error on the very next keystroke.
-    if let Some(map) = namespaces.as_object() {
-        for (namespace, value) in map {
+    if !namespaces.is_empty() {
+        for (namespace, value) in namespaces {
             for path in paths_of(value).into_iter().take(MAX_PATHS_PER_NAMESPACE) {
                 push_if(
                     &mut candidates,
@@ -237,7 +242,16 @@ fn matches_prefix(label: &str, prefix: &str) -> bool {
 mod tests {
     use super::*;
     use crate::graph::{Connection, Graph, GraphNode, Position};
-    use serde_json::json;
+    use serde_json::{Map, Value, json};
+
+    /// A JSON object as the namespace map the route's body deserializes into.
+    ///
+    /// The tests build their samples as `json!` because that reads better than nested `Map`
+    /// constructors, and converting here is the honest seam: the route receives exactly this
+    /// shape, so a test that built a `Map` by hand would be testing a different input.
+    fn sample_object(value: &Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
 
     fn node(key: &str) -> GraphNode {
         GraphNode::new(key, "http_request", 0.0, 0.0)
@@ -265,7 +279,7 @@ mod tests {
     #[test]
     fn runtime_namespaces_are_offered_even_with_no_upstream() {
         let empty = Graph::new();
-        let answer = complete(&empty, "lonely", "", &json!({}));
+        let answer = complete(&empty, "lonely", "", &Map::new());
         let labels: Vec<&str> = answer
             .candidates
             .iter()
@@ -276,12 +290,12 @@ mod tests {
 
     #[test]
     fn upstream_of_a_node_is_direct_only() {
-        let answer = complete(&graph(), "if_1", "", &json!({}));
+        let answer = complete(&graph(), "if_1", "", &Map::new());
         assert_eq!(answer.upstream_nodes, vec!["http_1".to_owned()]);
 
         // The trigger feeds http_1, so it is not offered while editing if_1. Offering it
         // would suggest an expression the step cannot read today.
-        let first = complete(&graph(), "http_1", "", &json!({}));
+        let first = complete(&graph(), "http_1", "", &Map::new());
         assert_eq!(first.upstream_nodes, vec!["trigger_1".to_owned()]);
     }
 
@@ -291,14 +305,14 @@ mod tests {
         looping
             .connections
             .push(Connection::new("http_1", "main", "http_1", "in"));
-        let answer = complete(&looping, "http_1", "", &json!({}));
+        let answer = complete(&looping, "http_1", "", &Map::new());
         assert!(!answer.upstream_nodes.contains(&"http_1".to_owned()));
     }
 
     #[test]
     fn sample_paths_become_candidates_only_where_the_sample_has_them() {
         let sample = json!({ "event": { "title": "Hello", "meta": { "author": "ada" } } });
-        let answer = complete(&graph(), "http_1", "event.", &sample);
+        let answer = complete(&graph(), "http_1", "event.", &sample_object(&sample));
         let labels: Vec<&str> = answer
             .candidates
             .iter()
@@ -320,7 +334,7 @@ mod tests {
     #[test]
     fn an_array_index_is_a_candidate_because_the_evaluator_indexes_it() {
         let sample = json!({ "event": { "items": [ { "title": "First" } ] } });
-        let answer = complete(&graph(), "http_1", "event.items", &sample);
+        let answer = complete(&graph(), "http_1", "event.items", &sample_object(&sample));
         let labels: Vec<&str> = answer
             .candidates
             .iter()
@@ -337,21 +351,21 @@ mod tests {
     fn a_prefix_inside_a_segment_still_matches() {
         let sample = json!({ "event": { "title": "Hello" } });
         // The person typed `$it` three characters into a namespace they had not chosen yet.
-        let answer = complete(&graph(), "http_1", "$it", &sample);
+        let answer = complete(&graph(), "http_1", "$it", &sample_object(&sample));
         assert_eq!(answer.candidates.len(), 1);
         assert_eq!(answer.candidates[0].label, "$item");
     }
 
     #[test]
     fn a_prefix_written_as_a_whole_expression_is_accepted() {
-        let answer = complete(&graph(), "http_1", "{{$va", &json!({}));
+        let answer = complete(&graph(), "http_1", "{{$va", &Map::new());
         assert_eq!(answer.candidates.len(), 1);
         assert_eq!(answer.candidates[0].label, "$vars");
     }
 
     #[test]
     fn a_prefix_matching_nothing_is_an_empty_success_not_a_refusal() {
-        let answer = complete(&graph(), "http_1", "zzzz", &json!({}));
+        let answer = complete(&graph(), "http_1", "zzzz", &Map::new());
         assert!(answer.candidates.is_empty());
         assert_eq!(answer.candidate_count, 0);
     }
@@ -359,7 +373,7 @@ mod tests {
     #[test]
     fn sources_are_distinguishable() {
         let sample = json!({ "event": { "title": "Hello" } });
-        let answer = complete(&graph(), "if_1", "", &sample);
+        let answer = complete(&graph(), "if_1", "", &sample_object(&sample));
         let source_of = |label: &str| {
             answer
                 .candidates
@@ -375,7 +389,7 @@ mod tests {
     #[test]
     fn runtime_comes_first_so_an_unwired_graph_still_offers_something() {
         let sample = json!({ "event": { "title": "Hello" } });
-        let answer = complete(&graph(), "if_1", "", &sample);
+        let answer = complete(&graph(), "if_1", "", &sample_object(&sample));
         assert_eq!(answer.candidates[0].source, Source::Runtime);
     }
 
@@ -390,7 +404,7 @@ mod tests {
         }
         wide.nodes.push(node("sink"));
 
-        let answer = complete(&wide, "sink", "", &json!({}));
+        let answer = complete(&wide, "sink", "", &Map::new());
         assert_eq!(answer.upstream_nodes.len(), MAX_NAMESPACES);
         assert_eq!(answer.truncated_namespaces, 4);
     }
@@ -398,7 +412,7 @@ mod tests {
     #[test]
     fn a_long_prefix_is_cut_rather_than_refused() {
         let long = "a".repeat(MAX_PREFIX * 3);
-        let answer = complete(&graph(), "http_1", &long, &json!({}));
+        let answer = complete(&graph(), "http_1", &long, &Map::new());
         assert!(answer.candidates.is_empty());
     }
 }

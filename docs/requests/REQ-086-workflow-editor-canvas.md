@@ -1,6 +1,6 @@
 # REQ-086 — Workflow Editor Canvas
 
-> **Status:** in-progress (slices 1–2 done — `11bd40a`…`73f0297`; slice 3's expression preview built — `6eb9b71` evaluator, `8f3b8c8` the endpoint, `c636757` the inspector row, 19/19 live) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
+> **Status:** in-progress (slices 1–2 done — `11bd40a`…`73f0297`; slice 3's preview AND autocomplete built — `6eb9b71` evaluator, `8f3b8c8` the preview endpoint, `c636757` the inspector row, `b5f5de9` completions, `8a67adc` the completion endpoint, `962098a`+`aafb02e` the CodeMirror 6 and expression editors) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -153,8 +153,9 @@ Consumed: `workflows.execution.state_changed`, `workflows.execution.finished` (o
 - [ ] The palette searches, groups by category, opens on `/`, and disables nodes with the missing cause named.
       *(every disabled row carries its reason on the button, asserted in the walkthrough pass)*
 - [ ] The code node highlights javascript and python, shows validator diagnostics, and never runs code in the browser (network trace checked).
+      *(built — `962098a` CodeMirror 6 with line numbers, bracket matching, close-brackets and in-editor search; the language is read from the parameter's placeholder and an unrecognised one falls back to plain text rather than to a wrong grammar. Diagnostics ride CodeMirror's own linter pipeline so the gutter marks are navigable, fed by a **new** `Issue.param` field added in `8a67adc` — scraping the parameter name out of the message sentence would be a convention, not a contract. Every line is line 0, and that is deliberate and honest: the server validates a parameter's *value*, not its contents, so inventing a line number would mark a line nobody got wrong. NOT TICKED: the browser pass has never run, and "never runs code in the browser" is a network-trace claim only a real pass can make.)*
 - [ ] Expression autocomplete lists upstream outputs, variables and the current item; preview returns real pinned values or a positional error.
-      *(the preview half is proved and does NOT tick this box: `6eb9b71` (16 unit), `8f3b8c8` (5 integration), `c636757`; `scripts/qa/graph-expressions.cjs` 19/19 live — pinned values returned, a lone expression keeps its type, and a bad path returns a 422 whose message names the field and lists what the sample carries. Autocomplete is not built.)*
+      *(both halves are now built and proved. The preview: `6eb9b71` (16 unit), `8f3b8c8` (5 integration), `c636757`, `scripts/qa/graph-expressions.cjs` 19/19 live. The autocomplete: `b5f5de9` (`omnion_workflows::completion`, 13 unit — the candidate list is the **server's** grammar, so a client cannot offer `{{node.count + 1}}` which previews as a refusal), `8a67adc` (`POST …/graph/expressions/complete` on `workflows.read` — the graph travels in the body because "upstream outputs" is a fact about the graph as it is on screen, wires unsaved included), `962098a` (`ExpressionField` with ↑↓/Enter/Tab/Esc, grouped by source). Upstream is **direct** only: a grandparent is not in the step's namespace today, so offering it suggests an expression that stops resolving the day the middle wire is deleted. The tick is held back by the browser pass — `runGraphCanvasDepth` still has never run.)*
 - [x] Sticky notes and comments persist, do not appear as steps and never execute.
 - [ ] A real completed run colours nodes with status, duration and item counts; failed and skipped look distinct.
 - [ ] `⌘S` and the autosave debounce both persist; a blocked save keeps state and offers retry with no loss.
@@ -181,11 +182,13 @@ visible selection and focus, legible badges, working minimap, overlay colours ma
    written (`runGraphCanvasDepth`) and has not yet run — the QA slot was held by a live sibling
    pass for this whole tick.*
 3. **Connections and editors** — type-aware connects with labels, CodeMirror, expression field with preview.
-   *Built so far: the expression field and its preview — `omnion_workflows::expression` (server-side
-   only, pinned sample data, typed refusals), `POST …/graph/expressions/preview`, and the inspector row
-   with the sample on screen and editable. Still owed: CodeMirror 6 for code nodes, and the autocomplete
-   that lists upstream outputs — which is why the acceptance box below stays unticked even though its
-   preview half passes.*
+   *Built: `omnion_workflows::expression` (server-side only, pinned sample data, typed refusals) and
+   `omnion_workflows::completion` (the candidate grammar, also server-owned), `POST …/graph/expressions/preview`
+   and `POST …/graph/expressions/complete`, and in the inspector `ExpressionField` plus a real CodeMirror 6
+   editor for `ui:"code"` parameters. Still owed: the type-aware half of connects (`connection_type_mismatch`
+   belongs to REQ-088, which owes the ports their kinds) and the browser pass for all of it — `runGraphCanvasDepth`
+   has been written for several ticks and has never once run, because the single QA slot was held by a live
+   sibling pass in every one of them.*
 4. **Run overlay and polish** — per-node states, run bar, partial-run entry points, responsive and a11y pass.
    Done: a real run colours the canvas correctly and the accessibility checklist passes.
 

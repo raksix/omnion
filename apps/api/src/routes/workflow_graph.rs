@@ -415,6 +415,10 @@ pub async fn complete_expressions(
         &body.graph,
         &body.node_key,
         &body.prefix,
+        // The namespaces arrive as a map — the route's contract is "keyed by namespace", not
+        // "any JSON value" — so the crate takes the map rather than a `Value` it would have
+        // to re-check. A caller that sent an array gets the deserializer's refusal, not a
+        // completion list built from a shape nobody asked for.
         &body.namespaces,
     )))
 }
