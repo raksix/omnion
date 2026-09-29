@@ -11,9 +11,9 @@
  * The list's state lives in the **URL**, for the same reason the CRM lists put it there: a filtered
  * list is a link, so the back button, a bookmark and a shared URL all land on the same rows.
  *
- * The tab bar lists only what slice 1 actually ships. `Quotes`, `Orders` and `Reports` are absent
- * rather than disabled, because a tab that leads nowhere is a dead button, and the requests
- * describe them (slices 2 and 4) rather than this one.
+ * The tab bar lists only what the shipped slices provide. `Reports` is still absent rather than
+ * disabled, because a tab that leads nowhere is a dead button, and the request describes it rather
+ * than the code.
  */
 import {
   createContext,
@@ -36,13 +36,15 @@ import { fetchSalesVocabulary, type SalesVocabulary } from "@/lib/sales";
 /**
  * The screens the shipped slices provide. The rest arrive with their own slices, not as dead tabs.
  *
- * `Quotes` is first because it is where a seller spends the day; the catalog and the price lists
- * are the two screens it draws its lines from, and the settings row is what every one of them
- * reads. `Orders`, `Reports` and the rest are absent on purpose: a nav entry that leads nowhere is
- * worse than no entry, and slice 4 is what adds them.
+ * `Quotes` is first because it is where a seller spends the day, and `Orders` second because it is
+ * where a quote ends up; the catalog and the price lists are the two screens both draw their lines
+ * from, and the settings row is what every one of them reads. `Reports` is still absent on
+ * purpose: a nav entry that leads nowhere is worse than no entry, and it arrives with the rest of
+ * slice 4.
  */
 export const SALES_NAV = [
   { href: "/sales/quotes", label: "Quotes", shortcut: "q" },
+  { href: "/sales/orders", label: "Orders", shortcut: "o" },
   { href: "/sales/approvals", label: "Approvals", shortcut: "a" },
   { href: "/sales/catalog", label: "Catalog", shortcut: "c" },
   { href: "/sales/pricelists", label: "Price lists", shortcut: "p" },
@@ -60,6 +62,7 @@ const SHORTCUTS: Shortcut[] = [
   { keys: "e", what: "Edit the selected row" },
   { keys: "n", what: "New record" },
   { keys: "g then q", what: "Go to the quotes" },
+  { keys: "g then o", what: "Go to the orders" },
   { keys: "g then a", what: "Go to the approvals" },
   { keys: "g then c", what: "Go to the catalog" },
   { keys: "g then p", what: "Go to the price lists" },
