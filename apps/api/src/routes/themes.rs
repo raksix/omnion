@@ -263,7 +263,12 @@ async fn emit_theme_event(
 }
 
 /// Resolve a site through the caller's organization.
-async fn site_in_scope(
+///
+/// `pub(crate)` rather than private because the settings routes resolve the site the same way,
+/// and a second copy of this function is how the two surfaces end up disagreeing about what
+/// "in scope" means — the settings screen must refuse a cross-tenant site exactly where the
+/// gallery refuses it.
+pub(crate) async fn site_in_scope(
     state: &AppState,
     current: &CurrentSession,
     site_id: Uuid,

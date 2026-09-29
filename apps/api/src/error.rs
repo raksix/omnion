@@ -638,6 +638,49 @@ impl From<ContentError> for ApiError {
                 "this site does not require verification — turn it on in membership settings first",
             ),
             ContentError::WeakPassword(message) => Self::bad_request("weak_password", message),
+            // Theme settings (REQ-062 slice 2). Four separate arms, and each status is a
+            // different next step for the operator: a missing revision is a stale link (404),
+            // "no draft" means the Publish button was the wrong button (409 — it is not a
+            // malformed request, and a 400 would send the panel into a retry loop), a stale
+            // draft is a race between two tabs (409, with both numbers in the message), and a
+            // contrast failure is a legal payload the product wants acknowledged (422 — the
+            // request is well-formed and the answer is "yes, but confirm first").
+            ContentError::ThemeNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "theme_not_found",
+                format!("no installed theme has the key '{key}'"),
+            ),
+            ContentError::RollbackUnavailable => Self::new(
+                StatusCode::CONFLICT,
+                "theme_rollback_unavailable",
+                "this site has no theme activation to roll back from",
+            ),
+            ContentError::ThemeSettingsRevisionNotFound(revision_no) => Self::new(
+                StatusCode::NOT_FOUND,
+                "theme_settings_revision_not_found",
+                format!("this site has no settings revision numbered {revision_no}"),
+            ),
+            ContentError::ThemeSettingsNothingToPublish => Self::new(
+                StatusCode::CONFLICT,
+                "theme_settings_nothing_to_publish",
+                "this site has no saved draft to publish — save one first",
+            ),
+            ContentError::ThemeSettingsDraftStale {
+                draft_no,
+                published_no,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "theme_settings_draft_stale",
+                format!(
+                    "the draft is revision {draft_no} but revision {published_no} is the one that \
+                     is live; reload before publishing"
+                ),
+            ),
+            ContentError::ThemeSettingsContrastRefused(message) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "theme_settings_contrast_required",
+                message,
+            ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

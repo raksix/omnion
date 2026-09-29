@@ -69,6 +69,7 @@
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
+pub mod theme_settings;
 pub mod themes;
 pub mod ai;
 pub mod analytics;
@@ -1113,6 +1114,23 @@ pub fn router(state: AppState) -> Router {
         post(themes::activate_theme).layer(guards::require(&state, "themes.activate"));
     let theme_rollback =
         post(themes::rollback_theme).layer(guards::require(&state, "themes.activate"));
+    // Theme settings (REQ-062 slice 2). Read is `themes.read` because the history screen is a
+    // reading; every write is `themes.customize`, which is deliberately NOT implied by
+    // `themes.activate`. The save and the publish are different powers too — a designer who
+    // may stage a palette but not put it in front of visitors is a real setup, so the split
+    // is by *what the write does*, not by which table it touches.
+    let theme_settings_read =
+        get(theme_settings::read_settings).layer(guards::require(&state, "themes.read"));
+    let theme_settings_save = put(theme_settings::save_settings)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_settings_publish = post(theme_settings::publish_settings)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_settings_revisions = get(theme_settings::list_revisions)
+        .layer(guards::require(&state, "themes.read"));
+    let theme_settings_revision = get(theme_settings::read_revision)
+        .layer(guards::require(&state, "themes.read"));
+    let theme_settings_restore = post(theme_settings::restore_revision)
+        .layer(guards::require(&state, "themes.customize"));
     let seo_redirect_create =
         post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
     let seo_redirect_write = put(seo::update_redirect)
@@ -1838,6 +1856,24 @@ pub fn router(state: AppState) -> Router {
         .route("/themes/{key}", theme_read)
         .route("/sites/{site_id}/theme", theme_activate)
         .route("/sites/{site_id}/theme/rollback", theme_rollback)
+        .route("/sites/{site_id}/theme-settings", theme_settings_read)
+        .route("/sites/{site_id}/theme-settings", theme_settings_save)
+        .route(
+            "/sites/{site_id}/theme-settings/publish",
+            theme_settings_publish,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/revisions",
+            theme_settings_revisions,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/revisions/{revision_no}",
+            theme_settings_revision,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/revisions/{revision_no}/restore",
+            theme_settings_restore,
+        )
         .route("/public/media/{id}", public_media)
         // The share token route: unauthenticated by nature, because the token is the
         // credential. It is a *static* `shared` segment, so it never collides with the
