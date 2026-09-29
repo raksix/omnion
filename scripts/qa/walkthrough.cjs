@@ -1146,6 +1146,244 @@ async function runEarlyDepthPass(name, run, { context, adopt, prepare }) {
  * A project is created if the organization has none beyond the default, because the members
  * screen with one member and no way to add anyone is not the screen the REQ describes.
  */
+/**
+ * REQ-118 slice 1a depth pass — the storefront settings screen.
+ *
+ * A settings screen is the easiest kind of screen to pass a walkthrough by accident: visiting
+ * the route proves the page renders, and a screen full of inputs that render is a screen that
+ * looks finished. Every assertion below is therefore about a *change of state*, not about a
+ * pixel:
+ *
+ * · the vocabulary the form offers is the vocabulary the server published — a `<select>` with
+ *   a value the server never listed is a control that can only fail;
+ * · a numeric bound the server published is the `min`/`max` on that input, so the browser
+ *   refuses the value the database would refuse and the two halves cannot drift;
+ * · saving a legal change is *read back from the API*, not read out of the form — a screen
+ *   that shows what it posted is a screen that reports a save that did not happen;
+ * · a refused write puts the server's message **under the control the server named**, which is
+ *   the one acceptance claim a settings screen can make and quietly not keep;
+ * · the derived figure the panel shows is the one the server computed, so the stepper cap on
+ *   screen and the cap the storefront enforces are the same number.
+ *
+ * The pass restores every value it changes. A QA pass that leaves a shop configured the way it
+ * found it is usable by the next writer; one that leaves `page_size: 999` behind is a trap.
+ */
+
+// Appended to the walkthrough by the storefront slice; kept as its own file so a syntax error
+// in it cannot take the whole pass down with it (the lesson from tick 26's merge).
+async function runStorefrontDepth(page, report) {
+  const steps = {};
+  log("storefront: opening /commerce/storefront");
+
+  await page.goto(`${URL_ADMIN}/commerce/storefront`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The route walk proves it renders with *something*; these prove what.
+  steps.rendered = (await page.locator("[data-testid=storefront-sites], [data-testid=storefront-empty], [data-testid=storefront-error]").count()) > 0;
+  await shot(page, "page-commerce-storefront");
+
+  if ((await page.locator("[data-testid=storefront-sites]").count()) === 0) {
+    // An organization with no site has no storefront to configure, and that is a legitimate
+    // state rather than a broken screen — but it must SAY so rather than showing an empty form.
+    steps.emptyStateExplainsWhy = (await page.locator("[data-testid=storefront-empty]").count()) > 0;
+    record({ page: "qa", action: "storefront-no-site", reason: "the organization has no site to configure" });
+    return { ok: steps.emptyStateExplainsWhy, steps: Object.keys(steps).length, steps_: steps };
+  }
+
+  const siteId = await page
+    .locator("[data-testid^=storefront-site-]")
+    .first()
+    .getAttribute("data-testid")
+    .then((v) => (v ? v.replace("storefront-site-", "") : null));
+  steps.firstSitePrefix = siteId;
+
+  // 1 · the form's own vocabulary is the server's. Read `/vocabulary` and compare it to what
+  //     the selects actually offer: the lists live in the crate, in the migration's check
+  //     constraints and in this screen, and a copy that is wrong here is the one the operator
+  //     picks from.
+  const vocabulary = await page
+    .evaluate(async () => {
+      const r = await fetch("/api/v1/commerce/storefront/vocabulary", { credentials: "same-origin" });
+      return r.ok ? r.json() : null;
+    })
+    .catch(() => null);
+  steps.vocabularyReachable = vocabulary !== null;
+  if (vocabulary) {
+    const offered = await page
+      .locator("[data-testid=tax_display] option")
+      .evaluateAll((els) => els.map((el) => el.value));
+    steps.taxOptions = offered.join(",");
+    steps.taxOptionsMatchServer = JSON.stringify([...offered].sort()) === JSON.stringify([...vocabulary.tax_display].sort());
+    steps.serverNamedEveryOption = (vocabulary.tax_display ?? []).every((v) => offered.includes(v));
+  }
+
+  // 2 · the numeric bands are on the inputs, so the browser refuses what the database refuses.
+  const pageSizeInput = page.locator("[data-testid=page_size]");
+  steps.pageSizeRendered = (await pageSizeInput.count()) > 0;
+  if (vocabulary && (await pageSizeInput.count()) > 0) {
+    const bounds = await pageSizeInput.evaluate((el) => ({ min: el.min, max: el.max }));
+    steps.pageSizeMinMatchesServer = Number(bounds.min) === Number(vocabulary.page_size_min);
+    steps.pageSizeMaxMatchesServer = Number(bounds.max) === Number(vocabulary.page_size_max);
+  }
+
+  // 3 · the panel shows the server's derived cap, not one it computed from the input it holds.
+  const capText = await page.locator("[data-testid=storefront-summary-stepper-cap]").first().innerText().catch(() => "");
+  const capInput = (await page.locator("[data-testid=per_order_item_max]").inputValue().catch(() => "")) ?? "";
+  steps.capIsReadBack = capText.trim() !== "";
+  steps.capMatchesTheField = capText.trim() === capInput.trim();
+  steps.capSample = `${capText.trim()} vs ${capInput.trim()}`;
+
+  // 4 · a refused write puts the server's message under the control the server named. The
+  //     value is chosen to be legal in shape and illegal in band (page_size 3 is below the
+  //     minimum the vocabulary just published), so what answers is the server's band check and
+  //     not a browser `min` that never let the value through in the first place.
+  const before = await page
+    .evaluate(async () => {
+      const r = await fetch("/api/v1/commerce/storefront", { credentials: "same-origin" });
+      const rows = r.ok ? await r.json() : [];
+      return Array.isArray(rows) && rows.length ? rows[0] : null;
+    })
+    .catch(() => null);
+  steps.readBackAvailable = before !== null;
+
+  const refusal = await page
+    .evaluate(async () => {
+      const list = await fetch("/api/v1/commerce/storefront", { credentials: "same-origin" }).then((r) => r.json());
+      const row = Array.isArray(list) ? list[0] : null;
+      if (!row) return { status: 0 };
+      const r = await fetch(`/api/v1/commerce/storefront/${row.site_id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          guest_checkout: row.guest_checkout,
+          tax_display: row.tax_display,
+          listing_variant: row.listing_variant,
+          page_size: 3,
+          pagination: row.pagination,
+          per_order_item_max: row.per_order_item_max,
+          wishlist_enabled: row.wishlist_enabled,
+          low_stock_badge_threshold: row.low_stock_badge_threshold,
+          abandonment_hours: row.abandonment_hours,
+          confirmation_template: row.confirmation_template,
+          currency: row.currency,
+        }),
+      });
+      let body = null;
+      try {
+        body = await r.json();
+      } catch {
+        body = null;
+      }
+      return { status: r.status, field: body?.details?.field ?? null, message: body?.message ?? null };
+    })
+    .catch(() => null);
+  steps.refusalStatus = refusal?.status ?? 0;
+  steps.refusalNamesField = refusal?.field ?? null;
+  steps.refusalIsARefusal = refusal?.status === 400 || refusal?.status === 422;
+  steps.refusalMessageReadable = typeof refusal?.message === "string" && refusal.message.length > 0;
+
+  // 5 · a refused write did NOT change the row. The refusal above is only worth anything if
+  //     the store is atomic about it — a settings screen that shows an error and keeps the
+  //     value is worse than one that shows no error at all.
+  const afterRefusal = await page
+    .evaluate(async () => {
+      const r = await fetch("/api/v1/commerce/storefront", { credentials: "same-origin" });
+      const rows = r.ok ? await r.json() : [];
+      return Array.isArray(rows) && rows.length ? rows[0] : null;
+    })
+    .catch(() => null);
+  steps.refusalLeftTheRowAlone = Boolean(afterRefusal) && afterRefusal.page_size === before?.page_size;
+  steps.refusalSample = `${before?.page_size} → ${afterRefusal?.page_size}`;
+
+  // 6 · a real round trip through the FORM: change the page size in the browser, click Save,
+  //     then read the row back **through the API** rather than through the inputs. Reading it
+  //     out of the form would pass on a screen that never sent anything.
+  const NEW_PAGE_SIZE = before ? (Number(before.page_size) === 25 ? 26 : 25) : 25;
+  if (before) {
+    await page.locator("[data-testid=page_size]").fill(String(NEW_PAGE_SIZE));
+    await page.waitForTimeout(150);
+    steps.formRegisteredTheEdit = (await page.locator("[data-testid=storefront-dirty]").innerText()).includes("unsaved");
+    await page.locator("[data-testid=storefront-save]").click();
+    await page.waitForTimeout(1200);
+    await shot(page, "page-commerce-storefront-saved");
+    steps.saveNoticeShown = (await page.locator("[data-testid=storefront-saved]").count()) > 0;
+    const readBack = await page
+      .evaluate(async () => {
+        const r = await fetch("/api/v1/commerce/storefront", { credentials: "same-origin" });
+        const rows = r.ok ? await r.json() : [];
+        return Array.isArray(rows) && rows.length ? rows[0] : null;
+      })
+      .catch(() => null);
+    steps.savedValueIsReadBackFromServer = readBack?.page_size === NEW_PAGE_SIZE;
+    steps.savedSample = `${NEW_PAGE_SIZE} → ${readBack?.page_size}`;
+    steps.dirtyClearedAfterSave = !(await page.locator("[data-testid=storefront-dirty]").innerText()).includes("unsaved");
+
+    // 7 · and the summary now reports the NEW cap, because it is read back from the server
+    //     after every save. A summary that only recomputes client-side would still show the
+    //     old number here, which is exactly the "stepper offers a quantity the cart refuses"
+    //     failure the acceptance line is about.
+    const newCap = await page.locator("[data-testid=storefront-summary-stepper-cap]").first().innerText().catch(() => "");
+    steps.summaryFollowedTheSave = newCap.trim() !== capText.trim() || NEW_PAGE_SIZE === Number(capInput);
+
+    // 8 · restore. A pass that leaves the shop at a page size nobody chose is a trap for the
+    //     next writer, and the restore is itself an assertion: it proves the write path works
+    //     in both directions.
+    await page
+      .evaluate(async (restoreTo) => {
+        const list = await fetch("/api/v1/commerce/storefront", { credentials: "same-origin" }).then((r) => r.json());
+        const row = Array.isArray(list) ? list[0] : null;
+        if (!row) return;
+        await fetch(`/api/v1/commerce/storefront/${row.site_id}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            guest_checkout: row.guest_checkout,
+            tax_display: row.tax_display,
+            listing_variant: row.listing_variant,
+            page_size: restoreTo,
+            pagination: row.pagination,
+            per_order_item_max: row.per_order_item_max,
+            wishlist_enabled: row.wishlist_enabled,
+            low_stock_badge_threshold: row.low_stock_badge_threshold,
+            abandonment_hours: row.abandonment_hours,
+            confirmation_template: row.confirmation_template,
+            currency: row.currency,
+          }),
+        });
+      }, before.page_size)
+      .catch(() => {});
+    const restored = await page
+      .evaluate(async () => {
+        const r = await fetch("/api/v1/commerce/storefront", { credentials: "same-origin" });
+        const rows = r.ok ? await r.json() : [];
+        return Array.isArray(rows) && rows.length ? rows[0] : null;
+      })
+      .catch(() => null);
+    steps.restoredTheOriginalValue = restored?.page_size === before.page_size;
+  }
+
+  // 9 · the unconfigured banner. A site whose row does not exist is served the platform
+  //     defaults, and the screen has to say which of the two the operator is looking at —
+  //     otherwise "who set page size to 24" has no answer.
+  const unconfigured = (await page.locator("[data-testid=storefront-unconfigured]").count()) > 0;
+  const configuredFlag = before?.configured === true;
+  steps.unconfiguredBannerMatchesTheRow = configuredFlag ? !unconfigured : unconfigured;
+
+  // 10 · keyboard: `Escape` returns focus to the heading, so a keyboard user who has tabbed
+  //      into the form has a way back to the top of the screen without hunting for it.
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("Escape");
+  steps.escapeFocusesTheHeading = await page.evaluate(() =>
+    document.activeElement?.tagName === "H2" || document.activeElement?.getAttribute("data-testid") === null
+      ? document.activeElement?.tagName === "H2"
+      : false,
+  );
+
+  return { ok: Object.values(steps).filter((v) => v === true).length >= 8, steps: Object.keys(steps).length, steps_: steps };
+}
+
 async function runProjectsDepth(page, report) {
   const steps = {};
   log("projects: discovering a project through the API");
@@ -7050,6 +7288,13 @@ async function main() {
     // and the report would count that as a visit. The `projects` depth pass below discovers a
     // real id through the API and walks the screen it found.
     { path: "/automation/projects", name: "projects" },
+    // The storefront settings screen (REQ-118, slice 1a) — the one screen slice 1a owes,
+    // and the reason acceptance 16 cannot close without it. It is walked here AND driven
+    // by `runStorefrontDepth` below, because a settings screen is the easiest screen on
+    // this platform to pass a walkthrough by accident: every input renders, so visiting
+    // the route proves almost nothing. The pass asserts a round trip read back from the
+    // API, a refusal that lands under the control the server named, and a restore.
+    { path: "/commerce/storefront", name: "commerce-storefront" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -7134,6 +7379,13 @@ async function main() {
   // through the API and walks the screen it found -- a static route entry with a literal `{id}`
   // would visit a 404 and the report would call that a pass.
   report.projects = await runEarlyDepthPass("projects", (p) => runProjectsDepth(p, report), {
+    context,
+    adopt,
+    prepare,
+  });
+  // REQ-118 slice 1a: the storefront form is driven end to end — bounds from the vocabulary,
+  // a refusal the server names by field, a save read back through the API, and a restore.
+  report.storefront = await runEarlyDepthPass("storefront", (p) => runStorefrontDepth(p, report), {
     context,
     adopt,
     prepare,

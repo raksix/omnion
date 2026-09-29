@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, GitBranch, Globe, HardDriveDownload, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, GitBranch, Globe, HardDriveDownload, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, ShoppingBag, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -44,6 +44,11 @@ const NAV = [
   { href: "/crm/settings/intake", label: "Intake sources", icon: KeyRound },
   { href: "/crm/settings/assignment", label: "Assignment rules", icon: GitBranch },
   { href: "/crm/settings/sla", label: "Response targets", icon: Timer },
+  // The shop's own configuration (REQ-118, slice 1a). It sits after the CRM entries rather
+  // than next to Sites because it is not a site editor: it is the set of numbers the public
+  // storefront reads on every request, and an operator changing the stepper cap is doing
+  // something to their customers' baskets, not to their site record.
+  { href: "/commerce/storefront", label: "Storefront", icon: ShoppingBag },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
