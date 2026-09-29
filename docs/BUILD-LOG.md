@@ -2657,16 +2657,12 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
-
 ## omnion-w10 · REQ-087 slice 1 — the node library's registry, discovery API and screens
-
 **What.** The node and credential registry in code (`crates/workflows/src/registry.rs`), a lint
 that refuses a definition nobody could use, seven read-only discovery endpoints
 (`apps/api/src/routes/node_types.rs`), the `/workflows/nodes` library and `/workflows/nodes/<key>`
 detail, and a `runNodeLibraryDepth` walkthrough pass.
-
 **Proof.**
-
 - `cargo test -p omnion-workflows --lib` → **52 passed** (9 new registry tests).
 - `cargo test -p omnion-api --lib node_types` → **7 passed**.
 - `pnpm typecheck` → 2 successful, 0 errors.
@@ -2675,10 +2671,8 @@ detail, and a `runNodeLibraryDepth` walkthrough pass.
   filter that does not narrow is a finding. The registry's own lint is read off the running
   server through `/api/v1/node-types/lint`, so a registry that would fail it is visible without
   a test.
-
 **The lint earned its place on the first run.** Four of the eight bundled definitions were
 refused, and every refusal was a real defect rather than a style opinion:
-
 - `send_email` declared the `smtp` credential type but had no `credential_key` parameter, so the
   palette had no way to let a person pick one. Fixed in the data, not by relaxing the rule.
 - The `data`, `helper` and `error_handler` categories had no node at all, which would have
@@ -2688,33 +2682,26 @@ refused, and every refusal was a real defect rather than a style opinion:
   The rule now carves that case out explicitly (`node_no_main_output` applies unless the node is
   an error handler whose only open port is the error port) rather than forcing a port nothing can
   connect to.
-
 **A compile error that was not in the code it named.** `ParamHint` was the one registry enum
 without `Copy`, so reading `param.ui` by value out of a `&NodeDefinition` moved out of a shared
 reference. `Copy` is the correct derive for a fieldless enum used that way and is what the other
 six enums already had; the API is unchanged in shape.
-
 **Next.** REQ-087 slice 2: the `workflow_credentials` and `workflow_node_packages` tables, the
 secret-store link, CRUD with the usage guard and the masked detail screen. Slice 1 stays open on
 one clause — "the palette renders from it with no hard-coded list" — because the canvas is
 REQ-086 slice 2 and still reads w3's own list; that is a wiring step, not a registry change.
-
 ## omnion-w10 · REQ-087 slice 2 — credential instances, and a table with no secret column in it
-
 **What.** The credential entity end to end: `0053_workflow_credentials.sql` (two tables),
 `crates/workflows/src/credentials.rs` and `credential_store.rs`, nine endpoints under
 `/api/v1/credentials` and `/api/v1/node-packages`, two new permission keys, three admin
 screens, and a walkthrough pass whose fixture secret has to survive the round trip without
 appearing anywhere.
-
 **Proof.**
-
 - `cargo test -p omnion-workflows --lib` → **72 passed** (20 new).
 - `cargo test -p omnion-api --lib` → **176 passed** (10 new).
 - `cargo test -p omnion-permissions --lib` → **62 passed**.
 - `pnpm typecheck` → 2 successful, 0 errors.
 - `bash scripts/qa/run.sh` on the private w10 stack → see the counters below.
-
 **The table has no secret column, and that is the design rather than an omission.** The REQ
 says the payload lives in the encrypted store (REQ-125) and this takes it literally: what a
 credential row carries is `secret_ref`, an opaque handle, plus `settings`, which
@@ -2722,7 +2709,6 @@ credential row carries is `secret_ref`, an opaque handle, plus `settings`, which
 The invariant "no plaintext secret is stored in the workflows schema" is therefore not a review
 checklist item — there is no function in the store that takes a secret as a parameter, and a
 test asserts the row's serialised form has no field a secret could hide in.
-
 **Two of my own tests caught two real defects in the same commit.** `Health::parse` was
 case-sensitive although it only ever runs on values read back out of the column, so a
 hand-edited row would have turned a whole list into an error. And the required-field check
@@ -2730,14 +2716,12 @@ accepted a whitespace-only value — which is the shape a browser actually submi
 opens an input and leaves it alone. The second one had a test *asserting the wrong thing*
 beside it; the test was deleted rather than the rule relaxed, because the rule is the one that
 matches what a form does.
-
 **Usage is derived, and the guard lives inside the transaction it guards.** The usage probe is
 a `jsonb_array_elements(workflows.graph -> 'nodes')` match on `params ->> 'credential_key'`,
 taken in the *same* transaction as the delete with the credential row locked `for update`.
 Checking usage and then deleting in two round trips is a race a canvas save can win, and the
 result is a graph pointing at nothing with no error anywhere. A counter column would have been
 the obvious implementation and is wrong the moment somebody drags a node.
-
 **The test hook cannot report a pass it did not earn.** No bundled credential type can reach a
 provider from the API process, so `POST /credentials/{id}/test` answers from what it actually
 knows: no secret attached → `credential_secret_missing`, row stays `untested`; a required field
@@ -2745,12 +2729,10 @@ missing → named; a secret attached but no hook that can use it → the connect
 `ok: true` is the one answer it cannot give, because a green chip nobody earned moves the
 failure off the test screen and into the middle of somebody's production run. The walkthrough
 asserts that negative directly (`testDidNotFakeSuccess`).
-
 **The secret write path returns 503 `secret_store_unavailable` until REQ-125 is wired**, rather
 than inventing a local scheme. The REQ's own risk line asks for exactly this: "if that slips,
 refuse credential writes rather than inventing a local scheme." A credential that saves with no
 secret is a state the panel already knows how to show.
-
 **The walkthrough's load-bearing step is a grep.** A fixture string is typed into the create
 form, and then the pass searches the resulting screen, the whole DOM and every read the API
 offers for it. "No response returns a secret" is otherwise an architectural claim; this is a
@@ -2758,21 +2740,17 @@ grep that fails the build if it stops being true. The pass also asserts the thre
 wrong answers — a secret re-sent on a `PATCH` is refused by name, a test reports a result, and
 the delete guard *allows* an unreferenced credential (a guard that refuses forever is as broken
 as no guard).
-
 **Migration number.** The REQ reserved `0031`/`0032`; those are taken on other branches, and
 the ledger is append-only, so this is `0053` with the REQ's own table and column names.
-
 **Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider, the single-flight
 refresh, and `needs_reauth` reaching the canvas. Then slice 4 — the package ledger's installer
 pipeline and the SDK validator. The palette wiring (REQ-086 slice 2) stays the one clause slice
 1 could not close.
-
 **The browser pass was queued behind three other stacks, and that turned out to be the most
 useful thing that happened to this slice.** Rather than wait, I wrote
 `scripts/qa/credential-contract.sh` to drive the same endpoints directly against the same
 private stack — and it found a `500` on `/usage` and on the delete that guards with it, which
 every unit test had missed because none of them touch a database.
-
 The cause is a lesson about *parallel branches*, not about SQL. A workflow's nodes live in
 `graph` once REQ-086's builder migration (`0051`) is merged, and in `steps` before it — and
 those two migrations live in different worktrees. My probe named `w.graph` directly, which the
@@ -2780,44 +2758,36 @@ planner rejects **before the query runs**, so it was a `500` on every install th
 merged the builder yet. A `coalesce` around it cannot rescue a statement that does not parse;
 only projecting the row can. `to_jsonb(w) -> 'graph' -> 'nodes'` compiles whether or not the
 column exists, and a missing key is null rather than a syntax error.
-
 The same probe then revealed the second half of that bug: the two representations disagree
 about names. A `steps` node calls its name `name` and its type `action`; a `graph` node calls
 them `label` and `type`. So on exactly the installs the first bug broke, every usage row was
 also blank — the guard fired correctly and the screen had nothing to show. Both spellings are
 read now.
-
 **And a second copy of that query is a second query that can disagree.** The guard's
 in-transaction copy and the public usage view now run one shared `SQL_USAGE` constant. A guard
 that disagrees with the screen that explains it is the worst pair on this surface: the reader is
 told a credential is unused, presses delete, and is refused for a reason neither of them can
 see.
-
 **Three probes, all against the live private w10 stack:**
-
 | Probe | Result | What it is |
 |---|---|---|
 | `credential-contract.sh` | **43/43** | The whole surface, plus a structural check that the table has no `api_key`/`token`/`password` column at all — read from `information_schema`, not from the migration text, so a future migration adding one is caught here |
 | `delete-guard.sh` | **20/20** | The refusal direction: `409 credential_in_use` with the workflow, node label and node type in `details`, the row surviving, then a forced delete that reports what it broke and leaves the workflow's dangling reference alone |
 | `usage-probe.sh` | **5/5** | The expression parsed and run on a schema with **no `graph` column at all**, and a `steps`-only row read exactly once rather than twice by the coalesce |
-
 **A probe will lock itself out.** The security policy refuses an address after a run of failed
 sign-ins, and a contract probe logs in on every run — after a handful of iterations every
 request answered `address_blocked`, which reads exactly like an authorization bug.
 `scripts/qa/unblock-w10.sh` clears it and *proves* it with a real login rather than trusting
 its own row count, because the first version of that script used the wrong column name
 (`address` instead of `ip_address`), deleted nothing, and cheerfully printed `after: 0`.
-
 **Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider (state + PKCE), the
 single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The browser pass
 itself is still queued; the three probes above are what this slice is closed on, and the pass
 will confirm the three screens when it gets a slot.
-
 **The screen probe found a bug the API probe could not, and it was the worst kind: the create
 form could not save at all.** `scripts/qa/credential-screens.cjs` drives the three screens in a
 real browser, and the first thing it did was paste a key and press Save — which is what a person
 does — and got nothing, because the whole create was refused with `503 secret_store_unavailable`.
-
 That refusal was written for the wrong endpoint. On `POST /credentials/{id}/secret` — the
 deliberate replace path — refusing is right: the caller asked for one specific thing, it did not
 happen, and a 503 that says so is the honest answer. On a *create* it is not. The credential is a
@@ -2829,15 +2799,12 @@ did not happen in `secret_write_warning`, and the panel shows that **on the row 
 a reader who pasted a key and was redirected to a detail screen that never mentions it will
 assume the key is there, and then debug a node that cannot authenticate for want of a key they
 are certain they pasted.
-
 **And a probe that counts "this situation did not arise" as a pass inflates its own
 denominator.** The screen probe reported "17 of 19" while two of those were notes, not claims —
 it looked like it was failing two things when it had asserted less than it said. Claims and notes
 are now distinct outcomes and the totals only count claims. A number that overstates the
 assurance you gave is worse than a lower one.
-
 **Final state of the slice, all against the live private w10 stack:**
-
 | Gate | Result |
 |---|---|
 | `cargo test -p omnion-workflows --lib` | **75 passed** |
@@ -2848,12 +2815,152 @@ assurance you gave is worse than a lower one.
 | `scripts/qa/delete-guard.sh` | **20/20** |
 | `scripts/qa/usage-probe.sh` | **5/5** |
 | `scripts/qa/credential-screens.cjs` | **19/19 claims**, 2 notes |
-
 The full `scripts/qa/run.sh` browser pass is still working through the other stacks' screens
 behind me; `credential-screens.cjs` renders and measures the same three routes directly, so the
 screens are confirmed either way.
-
 **Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider (state + PKCE), the
 single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The one clause left
 on slice 2 is "disables the dependent nodes", which needs the canvas (REQ-086 slice 2) to have
 somewhere to disable them.
+---
+## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
+**What.** The half of the notification centre that decides **how** a record reaches somebody.
+`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
+`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
+`runNotificationSettingsDepth` in the walkthrough.
+**Three decisions, each a shortcut that produces a plausible wrong answer.**
+1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
+   user per channel and would make a channel added in slice 3 a backfill instead of a
+   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
+   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
+   valid form, not an empty one.
+2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
+   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
+   guarantee, and the panel's own form is a client like any other.
+3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
+   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
+   of them is either never quiet or always quiet, and both are silent. A window that leaves no
+   waking hours is refused by name rather than stored as "e-mail is on".
+**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
+`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
+legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
+`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
+```text
+invalid type: string "approval", expected a sequence
+```
+for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
+priority filter on this surface had never worked, and every filtered list fell through to the
+error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
+the list read now takes `RawQuery` and parses the string itself.
+**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
+`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
+bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
+its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
+error element, which that call cannot affect: the assertion could only ever have passed by
+accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
+shortcut into the drawer. All three are the class of defect this harness exists to catch —
+in itself — and none of them is visible from the report, which only says `false`.
+**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
+gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
+takes an explicit id list, so it does not require a selection the reader never made — and rows
+carry `data-read` so the state is assertable rather than a shade of grey.
+**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
+**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
+Browser pass: **running**.
+**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
+`report.notificationSettings` to be green and **zero high findings** from this change — in
+particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
+signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
+behind `notifications.admin`, the event router turning existing bus events into notifications,
+and the per-channel delivery rows in the drawer.
+## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
+**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
+`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
+endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
+with their guards travelling with each group.
+**The decision the whole slice rests on: a `permission:` recipient rule resolves through
+`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
+one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
+expired grants and explicit denials, and a notification that reaches somebody who lost the key
+is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
+`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
+cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
+that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
+zero for and the crate's resolution answers one.
+**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
+no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
+nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
+is asserted by serialising the body and searching the JSON for the secret.
+**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
+`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
+button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
+list used `filter_map`, which would answer with four channels and render a settings matrix whose
+missing column is indistinguishable from one the reader switched off. And the outbox check
+constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
+**The live gate found three of its own assertions were wrong**, which is the more useful half:
+the role fixture expected a survivor where the honest answer is zero; the outbox projection check
+counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
+`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
+now assertions that would fail if the code regressed.
+**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
+`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
+`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
+and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
+moves the failed row while the delivered one stays at 1 → 1.
+**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
+gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
+rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
+**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
+assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
+and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
+before running the pass again — the no-untested-screen rule applies to a screen that does not yet
+exist as much as to one that does.
+## Tick 48 — the pass that had been running for an hour, and what it actually said
+**What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
+question the last tick left open. `report.notifications` is **green on the bell, the badge, the
+grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
+`false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
+answered with status 400."*
+**The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
+push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
+swallowing the static segments, which is exactly what the comment above the mount says it
+prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is from **20:39**;
+slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
+filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
+disposable by design, so the lesson is to read the binary's mtime before reading the router.
+**What this tick fixed instead.** Two real defects, both found by hand against the live stack
+because no existing gate could reach them:
+1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
+   `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
+   itself: a `500` whose body quotes `violates foreign key constraint
+   "notifications_user_id_fkey"`. Four good recipients lost to one stale one, and a constraint
+   name shipped to whoever held the response. `0707141` checks recipients before the loop
+   through a new `store::existing_users` and refuses in a sentence that names *which* id is wrong.
+2. `Escape` was documented in the file header, the REQ's QA plan and the walkthrough, and it was
+   **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
+   exactly when the list had content — and the open drawer held the focus, which is why `e`,
+   `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
+**And the gate that had been lying.** `run-notifications-http.sh` decided its build by
+`cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
+status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
+crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
+twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
+compiler's exit status and only reads the log when that status says something went wrong.
+**Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
+`-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
+`node --check scripts/qa/walkthrough.cjs` → clean.
+`scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
+*a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
+with one bad id writes none of the good ones*.
+**Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
+typechecked, but no pass has run against them — the pass that found them ran against the 20:39
+binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
+this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
+**in-progress**.
+**Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
+newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
+and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
+`slashFocusedFilter` to recover behind them, `report.notificationSettings.loaded` to be true, and
+`report.notificationOutbox` to be **present** — that last one is the first pass that can close
+slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
+after that.

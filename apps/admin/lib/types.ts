@@ -931,11 +931,9 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
-
 // ------------------------------------------------------------------------------------------
 // Node library and credential catalogue (REQ-087 slice 1)
 // ------------------------------------------------------------------------------------------
-
 /** The filters the node library takes. */
 export type NodeTypeFilters = {
   search?: string;
@@ -944,7 +942,6 @@ export type NodeTypeFilters = {
   include_deprecated?: boolean;
   credential?: boolean;
 };
-
 /** One port of a node, as the palette draws it. */
 export type NodePort = {
   name: string;
@@ -953,10 +950,8 @@ export type NodePort = {
   accepts: string[];
   open: boolean;
 };
-
 /** How the inspector renders one parameter. */
 export type ParamUi = "text" | "textarea" | "code" | "select" | "number" | "boolean";
-
 /** One parameter of a node's inspector form. */
 export type NodeParam = {
   name: string;
@@ -973,10 +968,8 @@ export type NodeParam = {
   /** Whether this field holds a credential *key* rather than a value. */
   secret_field: boolean;
 };
-
 /** What a library row shows as its state. */
 export type NodeLibraryState = "available" | "deprecated" | "node_package_missing";
-
 /** One node in the library. */
 export type NodeType = {
   key: string;
@@ -999,7 +992,6 @@ export type NodeType = {
   /** Why the node is in that state, in words the row can show next to the chip. */
   state_reason: string | null;
 };
-
 /** The node filters, as the server applied them. */
 export type AppliedNodeFilters = {
   search: string | null;
@@ -1010,7 +1002,6 @@ export type AppliedNodeFilters = {
   /** How many nodes ship with the release. */
   bundled_count: number;
 };
-
 /** The library list payload. */
 export type NodeTypePage = {
   nodes: NodeType[];
@@ -1018,7 +1009,6 @@ export type NodeTypePage = {
   total: number;
   filters: AppliedNodeFilters;
 };
-
 /** One field of a credential type's form. */
 export type CredentialTypeField = {
   name: string;
@@ -1031,7 +1021,6 @@ export type CredentialTypeField = {
   /** `true` when the API will never return a value for this field. */
   write_only: boolean;
 };
-
 /** One credential type in the catalogue. */
 export type CredentialType = {
   key: string;
@@ -1048,13 +1037,11 @@ export type CredentialType = {
   oauth_scopes: string | null;
   test_timeout_seconds: number;
 };
-
 /** The credential catalogue payload. */
 export type CredentialTypePage = {
   types: CredentialType[];
   total: number;
 };
-
 /** One group of the palette's category tree. */
 export type NodeCategory = {
   key: string;
@@ -1062,7 +1049,6 @@ export type NodeCategory = {
   count: number;
   node_keys: string[];
 };
-
 /** The registry's own lint, as the running server sees it. */
 export type RegistryLint = {
   ok: boolean;
@@ -1070,17 +1056,14 @@ export type RegistryLint = {
   node_count: number;
   credential_type_count: number;
 };
-
 /** The three port kinds and what each means. */
 export type PortKindCatalogue = {
   kinds: string[];
   descriptions: Record<string, string>;
 };
-
 /* ------------------------------------------------------------------ *
  * Credential instances (REQ-087, slice 2)
  * ------------------------------------------------------------------ */
-
 /**
  * One credential, as the API reads it.
  *
@@ -1120,7 +1103,6 @@ export type Credential = {
    */
   secret_write_warning?: string | null;
 };
-
 /** The credential list filters. */
 export type CredentialFilters = {
   search?: string;
@@ -1129,7 +1111,6 @@ export type CredentialFilters = {
   health?: string;
   sharing?: string;
 };
-
 /** The credential list payload. */
 export type CredentialPage = {
   credentials: Credential[];
@@ -1143,7 +1124,6 @@ export type CredentialPage = {
     sharing: string | null;
   };
 };
-
 /** One reference from a workflow graph to a credential. */
 export type CredentialUsageRef = {
   workflow_id: string;
@@ -1152,7 +1132,6 @@ export type CredentialUsageRef = {
   node_label: string | null;
   node_type: string | null;
 };
-
 /** The usage view of one credential. */
 export type CredentialUsage = {
   references: CredentialUsageRef[];
@@ -1161,14 +1140,12 @@ export type CredentialUsage = {
   in_use: boolean;
   key: string;
 };
-
 /** What a delete did, and what it broke. */
 export type CredentialDeleteResult = {
   deleted: boolean;
   references: CredentialUsageRef[];
   workflow_count: number;
 };
-
 /** The result of a test hook run. */
 export type CredentialTestResult = {
   ok: boolean;
@@ -1177,7 +1154,6 @@ export type CredentialTestResult = {
   health: string;
   credential: Credential;
 };
-
 /** One installed node package. */
 export type NodePackage = {
   key: string;
@@ -1188,13 +1164,11 @@ export type NodePackage = {
   enabled: boolean;
   installed_at: string;
 };
-
 /** The package ledger payload. */
 export type NodePackagePage = {
   packages: NodePackage[];
   total: number;
 };
-
 /** The body of a create. Secrets ride in `secrets[]`, never in `settings`. */
 export type NewCredential = {
   key?: string;
@@ -1205,4 +1179,184 @@ export type NewCredential = {
   settings?: Record<string, unknown>;
   secrets?: { field: string; value: string }[];
 };
-
+// ---------------------------------------------------------------------------------------------
+// Slice 2: the reader's own channel configuration
+// ---------------------------------------------------------------------------------------------
+/**
+ * One cell of the matrix: "does category *C* reach me over *channel*?".
+ *
+ * The form never invents a cell — the server sends all thirty and the form renders what it is
+ * given, so a channel added in a later slice appears here with no change to this file.
+ */
+export type NotificationPreferenceCell = {
+  category: string;
+  channel: string;
+  enabled: boolean;
+};
+/** Quiet hours, the timezone and the digest cadence. */
+export type NotificationSettingsRow = {
+  /** `HH:MM` in the reader's own timezone, or `null` for no window. */
+  quiet_hours_start: string | null;
+  quiet_hours_end: string | null;
+  /** IANA zone name; an unknown one is read as UTC by the server. */
+  timezone: string;
+  /** `off`, `daily` or `weekly`. */
+  digest_cadence: string;
+  /** Which weekday a weekly digest goes out on, 0 = Monday. */
+  digest_weekday: number | null;
+  /** Which hour a digest goes out in. */
+  digest_hour: number;
+};
+/**
+ * The whole preferences answer.
+ *
+ * `locked_channel` comes from the server rather than being hard-coded here: the rule that
+ * in-app cannot be switched off is a server rule, and a form that hard-codes the name while
+ * the server owns the rule is one rename away from a checkbox that lies.
+ */
+export type NotificationPreferences = {
+  cells: NotificationPreferenceCell[];
+  settings: NotificationSettingsRow;
+  locked_channel: string;
+};
+/** What a save changed, and the authoritative state to render from. */
+export type NotificationPreferencesSaved = {
+  /** How many cells actually changed value — zero is a legitimate answer. */
+  changed: number;
+  cells: NotificationPreferenceCell[];
+  settings: NotificationSettingsRow;
+  locked_channel: string;
+};
+export const DIGEST_CADENCES = ["off", "daily", "weekly"] as const;
+/** 0 = Monday, which is the numbering the server's `extract(dow) - 1` uses. */
+export const DIGEST_WEEKDAYS = [
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+  "Sunday",
+] as const;
+/**
+ * The zones the form offers.
+ *
+ * A choice list, not the IANA database: the server reads anything else as UTC, and a select
+ * with 400 entries is a select nobody scrolls.
+ */
+export const NOTIFICATION_TIMEZONES = [
+  "UTC",
+  "Europe/Istanbul",
+  "Europe/Berlin",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Madrid",
+  "Europe/Rome",
+  "Europe/Amsterdam",
+  "America/New_York",
+  "America/Los_Angeles",
+  "America/Sao_Paulo",
+  "Asia/Dubai",
+  "Asia/Kolkata",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+] as const;
+// ---------------------------------------------------------------------------------------------
+// Slice 3: the half that leaves the panel
+// ---------------------------------------------------------------------------------------------
+/** The four states a delivery can be in. A closed list, so the filter chips are exhaustive. */
+export const NOTIFICATION_DELIVERY_STATUSES = [
+  "pending",
+  "sent",
+  "failed",
+  "skipped",
+] as const;
+export type NotificationDeliveryStatus = (typeof NOTIFICATION_DELIVERY_STATUSES)[number];
+/**
+ * One row of the organization's delivery log.
+ *
+ * **There is no `title` and no `body` here, and that is the design.** An administrator opening
+ * the outbox during an incident needs to know *that* a delivery failed and *whose* it was — the
+ * content is a customer record, and this is the screen with the widest audience in the panel.
+ * The server's type cannot express it either, so adding a field is a visible review event rather
+ * than a "let's just show it" at the end of a feature.
+ */
+export type NotificationOutboxRow = {
+  id: string;
+  notification_id: string;
+  category: string;
+  priority: string;
+  user_id: string;
+  channel: string;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  max_attempts: number;
+  response_status: number | null;
+  error: string | null;
+  sent_at: string | null;
+  created_at: string;
+};
+/** The counts behind the filter chips, plus the total so a chip need not add them up itself. */
+export type NotificationOutboxCounts = {
+  pending: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  total: number;
+};
+/** The outbox answer: a page, the counts, and how far back the log reaches. */
+export type NotificationOutbox = {
+  rows: NotificationOutboxRow[];
+  counts: NotificationOutboxCounts;
+  retention_days: number;
+};
+/**
+ * One registered browser, as the devices list shows it.
+ *
+ * `endpoint_hint` is `…abcdef01` — enough for a reader to recognise their own phone, useless to
+ * somebody who screenshots the screen. The full endpoint is a capability key and the server
+ * never sends it back.
+ */
+export type NotificationDevice = {
+  id: string;
+  endpoint_hint: string;
+  user_agent: string | null;
+  created_at: string;
+  last_seen_at: string;
+};
+/** What registering a browser did — the four outcomes, not a boolean. */
+export type NotificationPushOutcome = "created" | "refreshed" | "reassigned" | "re-keyed";
+/** What a channel can do on this installation, and why. */
+export type NotificationChannelReadiness = {
+  channel: string;
+  available: boolean;
+  locked: boolean;
+  detail: string;
+};
+/** The four shapes a routing rule can address. Kept as data for the form's select. */
+export const NOTIFICATION_RECIPIENT_SHAPES = [
+  { value: "actor", label: "The actor who caused it", needsTarget: false },
+  { value: "permission:", label: "Everybody holding a permission", needsTarget: true },
+  { value: "role:", label: "Everybody with a role", needsTarget: true },
+  { value: "payload_user:", label: "The user named in the payload", needsTarget: true },
+] as const;
+/** One rule of the router: an event name, a category, and who hears about it. */
+export type NotificationRouteRule = {
+  id: string;
+  event_name: string;
+  category: string;
+  priority: string;
+  recipient: string;
+  title_template: string;
+  url_template: string | null;
+  enabled: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+/** What one routing pass did — the counts are the whole point of the answer. */
+export type NotificationRouteReport = {
+  created: number;
+  deduped: number;
+  unmatched_rules: number;
+  unknown_event: boolean;
+};

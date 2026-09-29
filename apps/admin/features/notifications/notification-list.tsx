@@ -21,6 +21,7 @@
  *    than no shortcut.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Archive,
@@ -29,6 +30,7 @@ import {
   Inbox,
   RefreshCw,
   Search,
+  Settings2,
   Square,
   SquareCheckBig,
   Trash2,
@@ -147,17 +149,34 @@ export function NotificationList() {
 
   const runBulk = async (action: "read" | "unread" | "archive" | "delete") => {
     if (selected.size === 0) return;
-    if (action === "delete" && !confirm(`Delete ${selected.size} notifications? This cannot be undone.`)) {
+    await applyBulk(action, [...selected], selected.size);
+  };
+
+  /**
+   * Run one bulk action over an explicit id list.
+   *
+   * Split out of `runBulk` so the keyboard's `Shift+E` can act on *what is on screen* rather
+   * than on a selection the reader did not make. The notice still says "N of M", because the
+   * reader's question after a bulk action is always "did that do what I asked" and a bare "5"
+   * cannot answer it — some of those five were already read, and the honest number is lower.
+   */
+  const applyBulk = async (
+    action: "read" | "unread" | "archive" | "delete",
+    ids: string[],
+    of: number,
+  ) => {
+    if (ids.length === 0) return;
+    if (action === "delete" && !confirm(`Delete ${of} notifications? This cannot be undone.`)) {
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const result = await bulkNotifications(action, [...selected]);
+      const result = await bulkNotifications(action, ids);
       setNotice(
         action === "delete"
-          ? `Deleted ${result.changed} of ${selected.size} selected.`
-          : `${result.changed} of ${selected.size} marked ${action === "read" ? "read" : action === "unread" ? "unread" : "archived"}.`,
+          ? `Deleted ${result.changed} of ${of} selected.`
+          : `${result.changed} of ${of} marked ${action === "read" ? "read" : action === "unread" ? "unread" : "archived"}.`,
       );
       setSelected(new Set());
       await load(false);
@@ -166,6 +185,15 @@ export function NotificationList() {
     } finally {
       setBusy(false);
     }
+  };
+
+  /** `Shift+E` — mark every row currently on screen read, without selecting it first. */
+  const markVisibleRead = async () => {
+    await applyBulk(
+      "read",
+      rows.map((row) => row.id),
+      rows.length,
+    );
   };
 
   const toggleRead = async (row: NotificationRow) => {
@@ -204,6 +232,16 @@ export function NotificationList() {
       filterInput.current.focus();
       return;
     }
+    // `Shift+E` is checked *before* `e`, because the two share a key and the shift is what
+    // separates them — testing `event.key === "e"` first would make the upper case one
+    // unreachable on keyboards that report a shifted letter as "E" and unreachable on the
+    // ones that report it as "e", depending on the platform. `event.key` is compared
+    // case-insensitively here rather than trusting the platform to pick a convention.
+    if (event.key.toLowerCase() === "e" && event.shiftKey) {
+      event.preventDefault();
+      void markVisibleRead();
+      return;
+    }
     if (event.key === "j" || event.key === "ArrowDown") {
       event.preventDefault();
       setCursorIndex((index) => Math.min(index + 1, rows.length - 1));
@@ -212,6 +250,20 @@ export function NotificationList() {
     if (event.key === "k" || event.key === "ArrowUp") {
       event.preventDefault();
       setCursorIndex((index) => Math.max(index - 1, 0));
+      return;
+    }
+    if (event.key === "Escape") {
+      // `Escape` is answered *before* the cursor is read. The drawer is a panel over the
+      // list, and the list is where this handler lives, so a reader who opens a row and
+      // presses Escape is asking the drawer to go — whether or not a row happens to be under
+      // the cursor at that moment. Reading the cursor first would mean Escape works on an
+      // empty list and silently does nothing on a list that has rows, which is the one
+      // combination in which a shortcut is worse than no shortcut: it looks broken, and it
+      // is broken *only* in the case people notice.
+      if (drawer) {
+        event.preventDefault();
+        setDrawer(null);
+      }
       return;
     }
     const row = rows[cursorIndex];
@@ -346,6 +398,18 @@ export function NotificationList() {
             Reset filters
           </button>
         ) : null}
+
+        {/* The link to the settings screen lives here rather than behind the bell, because
+            the reader who has just worked out that they want fewer notifications is standing
+            on this page, not looking at the header. */}
+        <Link
+          href="/notifications/settings"
+          data-notification-settings-link
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12.5px] text-muted transition hover:text-ink"
+        >
+          <Settings2 className="size-3.5" aria-hidden />
+          Settings
+        </Link>
       </section>
 
       {notice ? (
@@ -500,6 +564,11 @@ export function NotificationList() {
                       key={row.id}
                       data-notification-row={row.id}
                       data-cursor={isCursor ? "true" : undefined}
+                      // The read state is on the row as a data attribute rather than only as
+                      // a visual difference, so the QA pass can assert what the reader sees
+                      // and a row that looks identical to another for a colour reason is not
+                      // mistaken for one that is.
+                      data-read={row.read_at ? "true" : "false"}
                       onClick={() => void openDetail(row)}
                       className={`cursor-pointer border-b border-line/60 transition last:border-0 hover:bg-quiet-soft ${
                         isCursor ? "bg-accent-soft" : ""

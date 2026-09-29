@@ -98,6 +98,7 @@ pub mod media_usage;
 pub mod media_versions;
 pub mod node_types;
 pub mod notifications;
+pub mod notifications_admin;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -515,6 +516,10 @@ pub fn router(state: AppState) -> Router {
         get(media_settings::read).layer(guards::require(&state, "media.read"));
     let media_settings_write: MethodRouter<AppState, Infallible> =
         put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> = put(media_settings::write)
+        .layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -558,6 +563,14 @@ pub fn router(state: AppState) -> Router {
         put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_run: MethodRouter<AppState, Infallible> =
         post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> = put(media_scan::write)
+        .layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> = post(media_scan::run_now)
+        .layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
@@ -566,6 +579,10 @@ pub fn router(state: AppState) -> Router {
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_test: MethodRouter<AppState, Infallible> =
         post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> = post(media_scan::test_scanner)
+        .layer(guards::require(&state, "media.scan.manage"));
 
     // Folder and file grants (REQ-010, slice 4). Reading a grant table and asking what the
     // platform decided for you are both `media.read` — the file browser shows who can see a
@@ -577,10 +594,18 @@ pub fn router(state: AppState) -> Router {
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
     let media_folder_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_folder_grant)
+        .layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
     let media_file_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> = put(media_grants::put_file_grant)
+        .layer(guards::require(&state, "media.manage"));
     // A grant is removed by its own id alone — the row knows the node it was written on, so
     // putting the node in the URL as well would make a two-parameter path with a one-parameter
     // handler, which axum rejects with a bare `500` and no body. `grant-subjects` and this are
@@ -659,7 +684,6 @@ pub fn router(state: AppState) -> Router {
 
     let workflow_execution_cancel =
         post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
-
     // The node library and the credential catalogue (docs/requests/REQ-087, slice 1). Both are
     // pure reads of the registry in `omnion_workflows::registry` — code, not rows — so they
     // carry the workflow *read* power and nothing more: a palette is not an edit surface, and
@@ -678,7 +702,6 @@ pub fn router(state: AppState) -> Router {
         get(node_types::list_credential_types).layer(guards::require(&state, "workflows.read"));
     let credential_type =
         get(node_types::get_credential_type).layer(guards::require(&state, "workflows.read"));
-
     // Credential *instances* (REQ-087, slice 2). Two powers, not one: reading which
     // integrations an installation has is not the same permission as being able to replace a
     // secret, and a role that may build a workflow should not thereby gain every credential
@@ -709,7 +732,6 @@ pub fn router(state: AppState) -> Router {
     // "a credential changed".
     let credential_secret = post(credentials::replace_secret)
         .layer(guards::require(&state, "workflows.credentials.manage"));
-
     // The node-package ledger (REQ-087 slices 2 and 4). The list is a read of a table that
     // holds no secrets, so it carries the credential *read* power; installing one changes what
     // the canvas can place, so it carries the credential *manage* power.
@@ -862,6 +884,67 @@ pub fn router(state: AppState) -> Router {
         .merge(delete(notifications::delete).layer(guards::require(&state, "notifications.read")));
     let notifications_read =
         post(notifications::set_read).layer(guards::require(&state, "notifications.read"));
+    // Slice 2's own surface: the reader's own channel configuration, which is a *different*
+    // power from reading one's own inbox. `notifications.read` is granted to every role
+    // because it grants nothing about anybody else; `notifications.manage` changes what the
+    // organization will send this person and how, so it is deliberately absent from the base
+    // role and belongs to a person who has been given it on purpose.
+    let notifications_preferences = get(notifications::get_preferences)
+        .layer(guards::require(&state, "notifications.manage"))
+        .merge(
+            put(notifications::put_preferences)
+                .layer(guards::require(&state, "notifications.manage")),
+        );
+    // Slice 3 splits by *scope* rather than by action, and the split is the whole point of the
+    // slice:
+    //
+    // * a person's own devices are `notifications.manage` — the same key as their preferences,
+    //   because registering a phone is the browser half of "tell me how to reach me";
+    // * channel readiness is `notifications.manage` too, for the same reason: it is about the
+    //   reader's own matrix;
+    // * the outbox and the router's rules are `notifications.admin`, the one key that reads
+    //   *anybody's* activity. The outbox shows who was told what and whether it arrived, so
+    //   granting it "because somebody can manage notifications" would be the quiet widening
+    //   this platform cannot audit later.
+    //
+    // The static segments are declared before `/notifications/{id}` so axum ranks them ahead of
+    // the parameter route — the same reason `/media/settings` is spelled as a literal.
+    let notifications_push = Router::new()
+        .route(
+            "/notifications/push-subscriptions",
+            post(notifications_admin::register_push).merge(get(notifications_admin::list_push)),
+        )
+        .route(
+            "/notifications/push-subscriptions/{id}",
+            delete(notifications_admin::remove_push),
+        )
+        .route_layer(guards::require(&state, "notifications.manage"));
+    let notifications_channels =
+        get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
+    let notifications_outbox = Router::new()
+        .route(
+            "/notifications/outbox",
+            get(notifications_admin::list_outbox),
+        )
+        .route(
+            "/notifications/outbox/{id}/retry",
+            post(notifications_admin::retry_outbox),
+        )
+        .route_layer(guards::require(&state, "notifications.admin"));
+    let notifications_routes = Router::new()
+        .route(
+            "/notifications/routes",
+            get(notifications_admin::list_routes).merge(post(notifications_admin::create_route)),
+        )
+        .route(
+            "/notifications/routes/{id}",
+            delete(notifications_admin::delete_route),
+        )
+        // Running one event through the router is an administrator's *proof*, not a feature:
+        // the claim of slice 3 is that a bus fact becomes a notification with no direct call
+        // between the two modules, and this is the only way to show that from a browser.
+        .route("/notifications/route", post(notifications_admin::run_route))
+        .route_layer(guards::require(&state, "notifications.admin"));
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -980,6 +1063,19 @@ pub fn router(state: AppState) -> Router {
         .route("/notifications/bulk", notifications_bulk)
         .route("/notifications/mark-all-read", notifications_mark_all)
         .route("/notifications/emit", notifications_emit)
+        // Slice 2. `preferences` is a *literal* segment and is declared before the `{id}`
+        // routes for exactly the reason `summary` is above: axum ranks a static segment ahead
+        // of a parameter one, and `PUT /notifications/preferences` would otherwise be parsed
+        // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
+        // as "the settings screen is broken".
+        .route("/notifications/preferences", notifications_preferences)
+        // Slice 3's four sub-routers, merged rather than spelled out route by route. Each is a
+        // `Router` with its own `route_layer`, so the guard travels with the group and a future
+        // fifth endpoint joins the right one by being added inside its block.
+        .merge(notifications_push)
+        .route("/notifications/channels", notifications_channels)
+        .merge(notifications_outbox)
+        .merge(notifications_routes)
         .route("/notifications/{id}", notifications_entry)
         .route("/notifications/{id}/read", notifications_read)
         .route(
@@ -1145,6 +1241,7 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
+        
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
         .route("/media/grants/{grant_id}", media_grant_delete)

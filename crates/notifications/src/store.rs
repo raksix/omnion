@@ -98,20 +98,18 @@ pub async fn record_many(
 /// `limit + 1` rows are read and the extra one is dropped, which is what makes
 /// [`NotificationPage::has_more`] an answer rather than a guess: a second query to count
 /// "is there more" is a query that can disagree with the page it is asking about.
-pub async fn list(
-    pool: &PgPool,
-    user_id: Uuid,
-    query: &ListQuery,
-) -> Result<NotificationPage> {
+pub async fn list(pool: &PgPool, user_id: Uuid, query: &ListQuery) -> Result<NotificationPage> {
     let limit = query.limit.clamp(1, MAX_PAGE);
-    let mut builder = QueryBuilder::<Postgres>::new(format!(
-        "select {COLUMNS} from notifications where "
-    ));
+    let mut builder =
+        QueryBuilder::<Postgres>::new(format!("select {COLUMNS} from notifications where "));
     push_filters(&mut builder, user_id, query);
     builder.push(" order by created_at desc, id desc limit ");
     builder.push_bind(limit + 1);
 
-    let mut rows = builder.build_query_as::<Notification>().fetch_all(pool).await?;
+    let mut rows = builder
+        .build_query_as::<Notification>()
+        .fetch_all(pool)
+        .await?;
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     Ok(NotificationPage {
@@ -152,7 +150,10 @@ pub async fn summary(pool: &PgPool, user_id: Uuid) -> Result<crate::model::Summa
         .collect();
 
     let unread = rows.iter().map(|(_, count)| *count).sum();
-    Ok(crate::model::Summary { unread, by_category })
+    Ok(crate::model::Summary {
+        unread,
+        by_category,
+    })
 }
 
 /// One notification, and only if that person owns it.
@@ -160,9 +161,7 @@ pub async fn summary(pool: &PgPool, user_id: Uuid) -> Result<crate::model::Summa
 /// `None` for somebody else's row is the whole point: the detail route turns it into a `404`,
 /// so a caller can never learn that an id exists.
 pub async fn find(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<Option<Notification>> {
-    let query = format!(
-        "select {COLUMNS} from notifications where id = $1 and user_id = $2"
-    );
+    let query = format!("select {COLUMNS} from notifications where id = $1 and user_id = $2");
     Ok(sqlx::query_as::<_, Notification>(&query)
         .bind(id)
         .bind(user_id)
@@ -311,13 +310,12 @@ pub async fn delete(pool: &PgPool, user_id: Uuid, ids: &[Uuid]) -> Result<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let result: PgQueryResult = sqlx::query(
-        "delete from notifications where id = any($1) and user_id = $2",
-    )
-    .bind(ids)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    let result: PgQueryResult =
+        sqlx::query("delete from notifications where id = any($1) and user_id = $2")
+            .bind(ids)
+            .bind(user_id)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected())
 }
 
@@ -353,7 +351,27 @@ pub async fn emits_in_the_last_minute(pool: &PgPool, emitted_by: Uuid) -> Result
 /// The comparison is `>=` against the cap, so a module that has spent exactly the cap is
 /// refused the next one: a budget of 60 a minute means 60, not 61.
 pub async fn within_emit_budget(pool: &PgPool, emitted_by: Uuid) -> Result<bool> {
-    Ok(emits_in_the_last_minute(pool, emitted_by).await? < crate::vocabulary::EMIT_BUDGET_PER_MINUTE)
+    Ok(emits_in_the_last_minute(pool, emitted_by).await?
+        < crate::vocabulary::EMIT_BUDGET_PER_MINUTE)
+}
+
+/// The subset of `user_ids` that names a real account.
+///
+/// The `notifications_user_id_fkey` is the honest authority on who may be addressed, but it
+/// answers by refusing the *whole insert*, so a caller that sends four good ids and one
+/// stale one loses all four and is handed a 500 carrying a Postgres constraint name. This
+/// turns the same fact into a list the caller can answer, before anything is written.
+pub async fn existing_users(pool: &PgPool, user_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known: Vec<Uuid> = sqlx::query_scalar(
+        "select id from users where id = any($1::uuid[])",
+    )
+    .bind(user_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(known)
 }
 
 /// Check a payload's category and channel names before the store ever sees them.

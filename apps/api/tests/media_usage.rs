@@ -198,7 +198,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db, storage) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let org = sqlx::query_scalar::<_, Uuid>(
             "insert into organizations (name, slug) values ($1, $2) returning id",
@@ -223,19 +225,14 @@ impl Fixture {
             .await
             .expect("the owner binding must be created");
 
-        let (editor_id, editor_email) = bind_role(
-            &db,
-            org,
-            platform_id,
-            "Usage Editor",
-            &EDITOR_PERMISSIONS,
-        )
-        .await;
+        let (editor_id, editor_email) =
+            bind_role(&db, org, platform_id, "Usage Editor", &EDITOR_PERMISSIONS).await;
 
         // A reader: `media.read` and nothing else. Both of these screens are reads, so the
         // reader must be able to open both — and the editor has no key the reader lacks that
         // either screen needs, which is what makes that a claim rather than a coincidence.
-        let (reader_id, reader_email) = bind_role(&db, org, platform_id, "Usage Reader", &["media.read"]).await;
+        let (reader_id, reader_email) =
+            bind_role(&db, org, platform_id, "Usage Reader", &["media.read"]).await;
 
         Some(Self {
             state,
@@ -409,7 +406,9 @@ async fn bind_role(
         NewBinding {
             role_id: role.id,
             user_id: id,
-            scope: Scope::Organization { organization_id: org },
+            scope: Scope::Organization {
+                organization_id: org,
+            },
             granted_by: Some(granted_by),
             expires_at: None,
         },
@@ -431,7 +430,12 @@ async fn login(state: &AppState, email: &str) -> String {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "login body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "login body: {}",
+        response.body
+    );
     response
         .set_cookie
         .clone()
@@ -472,7 +476,11 @@ async fn usage_and_activity_are_reads_and_a_file_of_another_tenant_is_refused() 
     let editor = fixture.editor_token().await;
 
     for uri in [references_uri(media), activity_uri(media)] {
-        let response = call(&fixture.state, request(Method::GET, &uri, Some(&reader), None)).await;
+        let response = call(
+            &fixture.state,
+            request(Method::GET, &uri, Some(&reader), None),
+        )
+        .await;
         assert_eq!(
             response.status,
             StatusCode::OK,
@@ -502,7 +510,11 @@ async fn usage_and_activity_are_reads_and_a_file_of_another_tenant_is_refused() 
     let other_file = fixture.upload(other_site, "foreign.txt").await;
 
     for uri in [references_uri(other_file), activity_uri(other_file)] {
-        let response = call(&fixture.state, request(Method::GET, &uri, Some(&editor), None)).await;
+        let response = call(
+            &fixture.state,
+            request(Method::GET, &uri, Some(&editor), None),
+        )
+        .await;
         assert_eq!(
             response.status,
             StatusCode::FORBIDDEN,
@@ -563,7 +575,9 @@ async fn the_summary_distinguishes_records_from_fields() {
 
     // One page, three fields.
     let used = fixture.upload(site, "three-fields.txt").await;
-    let page = fixture.page(site, "hero-everywhere", "Hero everywhere").await;
+    let page = fixture
+        .page(site, "hero-everywhere", "Hero everywhere")
+        .await;
     for field in ["hero_image_id", "social_image_id", "og_image_id"] {
         fixture.reference(used, "page", page, field).await;
     }
@@ -604,9 +618,15 @@ async fn a_usage_row_is_labelled_with_its_published_title() {
     let token = fixture.editor_token().await;
     let media = fixture.upload(site, "titles.txt").await;
 
-    let published = fixture.page(site, "published-page", "The published title").await;
-    fixture.draft_revision(published, "An unpublished draft title").await;
-    fixture.reference(media, "page", published, "hero_image_id").await;
+    let published = fixture
+        .page(site, "published-page", "The published title")
+        .await;
+    fixture
+        .draft_revision(published, "An unpublished draft title")
+        .await;
+    fixture
+        .reference(media, "page", published, "hero_image_id")
+        .await;
 
     let response = call(
         &fixture.state,
@@ -617,13 +637,17 @@ async fn a_usage_row_is_labelled_with_its_published_title() {
     let rows = response.body["usage"].as_array().expect("an array");
     assert_eq!(rows.len(), 1, "one reference: {rows:?}");
     assert_eq!(
-        rows[0]["label"], json!("The published title"),
+        rows[0]["label"],
+        json!("The published title"),
         "the draft's title is not what a reader of this list is asking for: {rows:?}"
     );
     assert_eq!(rows[0]["status"], json!("published"));
     assert_eq!(rows[0]["resolved"], json!(true));
     assert!(
-        rows[0]["path"].as_str().unwrap_or_default().contains(&published.to_string()),
+        rows[0]["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&published.to_string()),
         "a resolved row is clickable: {rows:?}"
     );
 
@@ -646,8 +670,12 @@ async fn a_stale_reference_is_reported_and_counted_apart() {
 
     let alive = fixture.page(site, "alive-page", "Still here").await;
     let doomed = fixture.page(site, "doomed-page", "About to vanish").await;
-    fixture.reference(media, "page", alive, "hero_image_id").await;
-    fixture.reference(media, "page", doomed, "hero_image_id").await;
+    fixture
+        .reference(media, "page", alive, "hero_image_id")
+        .await;
+    fixture
+        .reference(media, "page", doomed, "hero_image_id")
+        .await;
 
     sqlx::query("delete from pages where id = $1")
         .bind(doomed)
@@ -661,7 +689,11 @@ async fn a_stale_reference_is_reported_and_counted_apart() {
     )
     .await;
     assert_eq!(response.status, StatusCode::OK, "{}", response.body);
-    assert_eq!(response.body["records"], json!(2), "the stale row still counts");
+    assert_eq!(
+        response.body["records"],
+        json!(2),
+        "the stale row still counts"
+    );
     assert_eq!(
         response.body["resolved"],
         json!(1),
@@ -669,7 +701,11 @@ async fn a_stale_reference_is_reported_and_counted_apart() {
     );
 
     let rows = response.body["usage"].as_array().expect("an array");
-    assert_eq!(rows.len(), 2, "a stale row is reported, not dropped: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "a stale row is reported, not dropped: {rows:?}"
+    );
     let stale = rows
         .iter()
         .find(|row| row["resolved"] == json!(false))
@@ -699,7 +735,10 @@ async fn a_stale_reference_is_reported_and_counted_apart() {
     .await;
     assert_eq!(repaired.status, StatusCode::OK, "{}", repaired.body);
     assert!(
-        repaired.body["references_removed"].as_i64().unwrap_or_default() >= 1,
+        repaired.body["references_removed"]
+            .as_i64()
+            .unwrap_or_default()
+            >= 1,
         "the sentence promised a repair that does this: {}",
         repaired.body
     );
@@ -749,12 +788,9 @@ async fn a_files_story_includes_its_access_changes() {
     // One audited action against the file's *bytes*…
     omnion_audit::record(
         fixture.db.pool(),
-        omnion_audit::NewAuditEntry::by_user(
-            fixture.accounts[1],
-            "media.share_created",
-        )
-        .target("media", media.to_string())
-        .metadata(json!({ "site_id": site, "filename": "story.txt" })),
+        omnion_audit::NewAuditEntry::by_user(fixture.accounts[1], "media.share_created")
+            .target("media", media.to_string())
+            .metadata(json!({ "site_id": site, "filename": "story.txt" })),
     )
     .await
     .expect("the entry must be recorded");
@@ -762,12 +798,9 @@ async fn a_files_story_includes_its_access_changes() {
     // …and one against its *access*, under the other target name.
     omnion_audit::record(
         fixture.db.pool(),
-        omnion_audit::NewAuditEntry::by_user(
-            fixture.accounts[1],
-            "media.grant_changed",
-        )
-        .target("media_file", media.to_string())
-        .metadata(json!({ "site_id": site, "effect": "allow", "capabilities": ["read"] })),
+        omnion_audit::NewAuditEntry::by_user(fixture.accounts[1], "media.grant_changed")
+            .target("media_file", media.to_string())
+            .metadata(json!({ "site_id": site, "effect": "allow", "capabilities": ["read"] })),
     )
     .await
     .expect("the entry must be recorded");
@@ -818,7 +851,10 @@ async fn a_files_story_includes_its_access_changes() {
         .collect();
     let mut sorted = ids.clone();
     sorted.sort_by(|a, b| b.cmp(a));
-    assert_eq!(ids, sorted, "newest first, which is what a trail is read as");
+    assert_eq!(
+        ids, sorted,
+        "newest first, which is what a trail is read as"
+    );
 
     // And every row reads as a sentence, never as its token.
     for row in response.body["activity"].as_array().expect("an array") {
@@ -845,8 +881,12 @@ async fn a_trashed_file_still_answers_both_reads() {
     let site = fixture.sites[0];
     let token = fixture.editor_token().await;
     let media = fixture.upload(site, "trashed.txt").await;
-    let page = fixture.page(site, "still-points", "Points at a deleted file").await;
-    fixture.reference(media, "page", page, "hero_image_id").await;
+    let page = fixture
+        .page(site, "still-points", "Points at a deleted file")
+        .await;
+    fixture
+        .reference(media, "page", page, "hero_image_id")
+        .await;
 
     // The **soft** delete, and the distinction matters to this walk: `/media/{id}` is the hard
     // one (it removes the row), while `/media/files/{id}` moves the file to the trash and leaves

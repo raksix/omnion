@@ -27,9 +27,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
-use omnion_media::{
-    NewRetentionPolicy, PurgeRefusal, RetentionPolicy, RetentionRun, RunTotals,
-};
+use omnion_media::{NewRetentionPolicy, PurgeRefusal, RetentionPolicy, RetentionRun, RunTotals};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -149,8 +147,11 @@ impl PolicyInput {
     /// opposite values on this one, so the raw body is the only place that difference exists.
     fn decode(body: &serde_json::Value) -> Result<Self, ApiError> {
         let raw: RawPolicy = serde_json::from_value(body.clone()).map_err(|error| {
-            ApiError::bad_request("invalid_retention_setting", format!("the request is not a policy: {error}"))
-                .with_details(json!({ "field": "body" }))
+            ApiError::bad_request(
+                "invalid_retention_setting",
+                format!("the request is not a policy: {error}"),
+            )
+            .with_details(json!({ "field": "body" }))
         })?;
 
         // The scope is read from the **key's presence**, not from a deserialised value, and
@@ -357,7 +358,10 @@ pub async fn read(
 
     let policies = omnion_media::list_policies(pool, site.id).await?;
     let paths: std::collections::HashMap<Uuid, String> =
-        omnion_media::policy_scope_paths(pool, site.id).await?.into_iter().collect();
+        omnion_media::policy_scope_paths(pool, site.id)
+            .await?
+            .into_iter()
+            .collect();
 
     // The header's numbers come from the *site-wide* rule, because a site has exactly one
     // fallback. A folder with its own policy is counted against that policy's window, and the
@@ -523,9 +527,7 @@ pub async fn set_file_hold(
     let pool = state.db().pool();
     let file = omnion_media::find_file_any_state(pool, file_id)
         .await?
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::NOT_FOUND, "media_not_found", "no such file")
-        })?;
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media_not_found", "no such file"))?;
     let site = site_in_scope(&state, &current, file.site_id).await?;
 
     let reason = input.reason.trim();
@@ -552,16 +554,20 @@ pub async fn set_file_hold(
 
     bus::emit(
         pool,
-        NewEvent::new(if input.hold { "media.hold_placed" } else { "media.hold_released" })
-            .organization(site.organization_id)
-            .site(site.id)
-            .actor(current.user.id)
-            .payload(json!({
-                "media_id": file_id,
-                "site_id": site.id,
-                "filename": file.filename,
-                "reason": reason,
-            })),
+        NewEvent::new(if input.hold {
+            "media.hold_placed"
+        } else {
+            "media.hold_released"
+        })
+        .organization(site.organization_id)
+        .site(site.id)
+        .actor(current.user.id)
+        .payload(json!({
+            "media_id": file_id,
+            "site_id": site.id,
+            "filename": file.filename,
+            "reason": reason,
+        })),
     )
     .await?;
 
@@ -570,14 +576,20 @@ pub async fn set_file_hold(
         current.user.id,
         &site,
         address.as_text().as_deref().unwrap_or_default(),
-        if input.hold { "media.hold_placed" } else { "media.hold_released" },
+        if input.hold {
+            "media.hold_placed"
+        } else {
+            "media.hold_released"
+        },
         "media",
         file_id,
         json!({ "site_id": site.id, "filename": file.filename, "reason": reason }),
     )
     .await?;
 
-    Ok(Json(json!({ "media_id": file_id, "legal_hold": input.hold, "changed": true })))
+    Ok(Json(
+        json!({ "media_id": file_id, "legal_hold": input.hold, "changed": true }),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -696,8 +708,14 @@ pub async fn run_once(
         purge_after_days: window_row.purge_after_days,
     };
 
-    let run_id = omnion_media::begin_retention_run(pool, Some(site_id), Some(window_row.id), "manual", actor)
-        .await?;
+    let run_id = omnion_media::begin_retention_run(
+        pool,
+        Some(site_id),
+        Some(window_row.id),
+        "manual",
+        actor,
+    )
+    .await?;
     let mut totals = RunTotals::default();
 
     let versions =
@@ -721,7 +739,11 @@ pub async fn run_once(
     // `purge_eligible`, so this loop is the *storage* half. A store that refuses is a warning
     // and not an error: the row is gone either way, and an operator who retries cannot find
     // the key to retry with, so failing the whole run would be a lie about what happened.
-    for key in versions.storage_keys.iter().chain(purge.storage_keys.iter()) {
+    for key in versions
+        .storage_keys
+        .iter()
+        .chain(purge.storage_keys.iter())
+    {
         if let Err(error) = state.storage().delete(key).await {
             tracing::warn!(error = %error, key, "a retention-removed object could not be deleted");
         }
@@ -783,7 +805,10 @@ pub async fn run_once(
 // ---------------------------------------------------------------------------------------------
 
 /// The path of a folder, for the screen's scope column.
-async fn scope_path(state: &AppState, folder_id: Option<Uuid>) -> std::result::Result<Option<String>, ApiError> {
+async fn scope_path(
+    state: &AppState,
+    folder_id: Option<Uuid>,
+) -> std::result::Result<Option<String>, ApiError> {
     let Some(folder_id) = folder_id else {
         return Ok(None);
     };
@@ -808,7 +833,11 @@ async fn audit(
         NewAuditEntry::by_user(user_id, action)
             .target(target_kind, target_id.to_string())
             .metadata(metadata)
-            .ip_address(if ip.is_empty() { None } else { Some(ip.to_string()) })
+            .ip_address(if ip.is_empty() {
+                None
+            } else {
+                Some(ip.to_string())
+            })
             .organization(site.organization_id),
     )
     .await?;
@@ -851,7 +880,8 @@ mod tests {
             "an explicit null clears the scope"
         );
 
-        let body: serde_json::Value = serde_json::from_str(r#"{"name":"Campaign"}"#).expect("valid body");
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"name":"Campaign"}"#).expect("valid body");
         assert_eq!(
             PolicyInput::decode(&body).expect("valid").folder_id,
             None,
@@ -864,7 +894,9 @@ mod tests {
         .expect("valid body");
         assert_eq!(
             PolicyInput::decode(&body).expect("valid").folder_id,
-            Some(Some(Uuid::parse_str("0d3f0000-0000-0000-0000-000000000001").expect("a uuid"))),
+            Some(Some(
+                Uuid::parse_str("0d3f0000-0000-0000-0000-000000000001").expect("a uuid")
+            )),
             "a uuid names a folder"
         );
     }
@@ -890,7 +922,8 @@ mod tests {
     /// An absent window is "leave it alone" on every field, not "set it to zero".
     #[test]
     fn an_absent_window_does_not_become_a_zero() {
-        let body: serde_json::Value = serde_json::from_str(r#"{"name":"Campaign"}"#).expect("valid body");
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"name":"Campaign"}"#).expect("valid body");
         let new = PolicyInput::decode(&body).expect("valid").into_new();
         assert_eq!(new.keep_versions_days, None);
         assert_eq!(new.trash_days, None);
@@ -937,7 +970,11 @@ mod tests {
             finished_at: Some(OffsetDateTime::UNIX_EPOCH),
         };
         let body = RunBody::build(&run);
-        assert!(body.summary.contains("still referenced"), "{}", body.summary);
+        assert!(
+            body.summary.contains("still referenced"),
+            "{}",
+            body.summary
+        );
         assert_eq!(body.bytes_reclaimed, 0);
         // `finished_at` has to survive into the wire, because "the last run is still going"
         // and "the last run finished and found nothing" are different states on a screen.

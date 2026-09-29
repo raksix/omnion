@@ -31,12 +31,12 @@ use omnion_events::{NewEvent, bus};
 // The scanner client. A per-request `Client` rather than a shared one, because its timeout is
 // the *site's* configured timeout: a shared client would carry whichever timeout was built
 // first, so a site that raised its ceiling to 120 s would still be cut off at 30.
-use reqwest::Client as HttpClient;
 use omnion_media::{
-    NewSiteScan, PendingScan, Quarantine, ScanRun, SiteScan,
-    SweepCounts, Verdict, close_quarantine, list_quarantines, list_runs, quarantine_totals,
-    read_scan_settings, write_scan_settings,
+    NewSiteScan, PendingScan, Quarantine, ScanRun, SiteScan, SweepCounts, Verdict,
+    close_quarantine, list_quarantines, list_runs, quarantine_totals, read_scan_settings,
+    write_scan_settings,
 };
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -114,7 +114,10 @@ impl ScanSettingsBody {
         // Same reasoning as the storage settings: `updated_at` against `created_at` is the only
         // column that distinguishes a site that was configured from one that was never
         // touched, and "every column equals the default" cannot answer that question.
-        let configured = (settings.updated_at - settings.created_at).whole_seconds().abs() >= 1;
+        let configured = (settings.updated_at - settings.created_at)
+            .whole_seconds()
+            .abs()
+            >= 1;
         Self {
             site_id: settings.site_id,
             enabled: settings.enabled,
@@ -391,11 +394,21 @@ pub async fn run_now(
         ));
     }
 
-    let claimed = omnion_media::claim_pending(state.db().pool(), site.id, omnion_media::scanning::SWEEP_BATCH)
-        .await?;
-    let run_id =
-        omnion_media::begin_run(state.db().pool(), site.id, "manual", &settings.endpoint, "", Some(current.user.id))
-            .await?;
+    let claimed = omnion_media::claim_pending(
+        state.db().pool(),
+        site.id,
+        omnion_media::scanning::SWEEP_BATCH,
+    )
+    .await?;
+    let run_id = omnion_media::begin_run(
+        state.db().pool(),
+        site.id,
+        "manual",
+        &settings.endpoint,
+        "",
+        Some(current.user.id),
+    )
+    .await?;
 
     let mut counts = SweepCounts::default();
     let mut engine = String::new();
@@ -410,9 +423,15 @@ pub async fn run_now(
         // the first version of this counted both, and a run over a single file whose write
         // failed reported `errors = 2` — a number with no reading an operator can act on,
         // because "two scans failed" is not what happened.
-        let written =
-            omnion_media::apply_verdict(state.db().pool(), site.id, file, &verdict, Some(run_id), Some(current.user.id))
-                .await;
+        let written = omnion_media::apply_verdict(
+            state.db().pool(),
+            site.id,
+            file,
+            &verdict,
+            Some(run_id),
+            Some(current.user.id),
+        )
+        .await;
         if let Err(error) = &written {
             // One file that cannot be written its status must not abandon the rest of the
             // batch: the run is logged with what did happen, and the failure is named rather
@@ -455,7 +474,9 @@ pub async fn run_now(
             &state,
             NewAuditEntry::by_user(current.user.id, "media.scan_flagged")
                 .target("site", site.id.to_string())
-                .metadata(json!({ "site_id": site.id, "flagged": counts.flagged, "run_id": run_id }))
+                .metadata(
+                    json!({ "site_id": site.id, "flagged": counts.flagged, "run_id": run_id }),
+                )
                 .ip_address(address.as_text())
                 .organization(site.organization_id),
         )
@@ -575,7 +596,9 @@ pub async fn release(
     )
     .await?;
 
-    Ok(Json(json!({ "released": true, "reason": closed.release_reason })))
+    Ok(Json(
+        json!({ "released": true, "reason": closed.release_reason }),
+    ))
 }
 
 /// `POST /api/v1/media/scan/test` — prove a scanner answers, against the posted candidate.
@@ -916,7 +939,11 @@ mod tests {
             "badx-injected: 1",
             "the CRLF is gone, the rest of the name is not"
         );
-        assert_eq!(sanitize_header("Q3 report.pdf"), "Q3 report.pdf", "a space survives");
+        assert_eq!(
+            sanitize_header("Q3 report.pdf"),
+            "Q3 report.pdf",
+            "a space survives"
+        );
         assert_eq!(sanitize_header("with\"quote.png"), "withquote.png");
         assert_eq!(sanitize_header(""), "upload");
         // A name that is *only* characters the filter drops falls back rather than sending
