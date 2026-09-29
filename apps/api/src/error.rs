@@ -859,6 +859,17 @@ impl From<StorageError> for ApiError {
                 "storage_error",
                 format!("the object store refused the request (status {status}): {message}"),
             ),
+            // A `409`, not a `503`: nothing is unavailable and retrying will not help, because
+            // the object and the row disagree about its length and only a repair fixes that. A
+            // retryable status here would have a client — or a media player — asking for ever.
+            StorageError::RangeNotSatisfiable { key, requested } => Self::new(
+                StatusCode::CONFLICT,
+                "object_range_not_satisfiable",
+                format!(
+                    "the stored object is shorter than the range that was asked for \
+                     ({requested} of {key:?})"
+                ),
+            ),
         }
     }
 }
