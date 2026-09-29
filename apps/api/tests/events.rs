@@ -1218,6 +1218,257 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
 // The catalogue and group wildcards, over HTTP (REQ-016 slice 1)
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// The feed's filters, keyset pagination and refusals, over HTTP (REQ-016 slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/// The event feed narrows to what the operator asked for, pages without repeating a row, and
+/// says so when the platform cannot serve the request.
+///
+/// This is the walk behind the `/events` screen (REQ-016, slice 1). The feed existed with a
+/// limit and an organization scope; what it did not have was the set of filters the screen
+/// offers, which means the screen's filter bar would have been a decoration — every control
+/// wired to nothing, which is the failure the build plan names as "no dead buttons".
+#[tokio::test]
+async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    // A platform account, used only as the `actor_user_id` on the seeded rows — a fact with
+    // an actor that happens inside one tenant while the reader is a member of another is
+    // exactly the row a broken actor filter would leak, so the two ids differ on purpose.
+    let (actor_id, _actor_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), actor_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "feed", "Feed Filter Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Feed Site").await;
+    let other_site = create_site_row(&harness.db, organization, "second", "Second Site").await;
+
+    // Five facts to narrow: three page events on one site, one on another, and one that
+    // belongs to a different organization entirely. The last one is the row a tenancy filter
+    // that quietly stopped working would leak, so it is seeded deliberately.
+    let other_organization =
+        create_organization_row(&harness.db, "other", "Someone Else").await;
+    for (name, site_id, owner) in [
+        ("page.created", site, organization),
+        ("page.updated", site, organization),
+        ("page.deleted", site, organization),
+        ("page.created", other_site, organization),
+        ("user.updated", site, other_organization),
+    ] {
+        sqlx::query("insert into events (name, organization_id, site_id, actor_user_id, payload) \
+                     values ($1, $2, $3, $4, '{}'::jsonb)")
+            .bind(name)
+            .bind(owner)
+            .bind(site_id)
+            .bind(actor_id)
+            .execute(harness.db.pool())
+            .await
+            .expect("the seeded event must be inserted");
+    }
+
+    // ---- Scoping: an organization account sees its own and nothing else -------------------------
+    // The reader is an *organization* account, not the platform owner. That distinction is the
+    // whole point of the assertion and it is worth spelling out, because the owner's session
+    // carries `organization_id = None` and the store's `($1::uuid is null or …)` clause reads
+    // "no organization" as *every* organization. A tenancy test written against the owner
+    // would therefore pass for the wrong reason — it would be asserting that the platform
+    // superuser sees everything, which is correct and is not what a tenant may see.
+    let (reader_id, reader_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        reader_id,
+        organization,
+        &["events.read", "content.pages.read"],
+    )
+    .await;
+
+    let feed = harness
+        .call(get("/api/v1/events?limit=50", Some(&reader_token)))
+        .await;
+    assert_eq!(feed.status, StatusCode::OK, "{:?}", feed.body);
+    let names: Vec<String> = feed.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        names.len(),
+        4,
+        "the reader's own organization and nothing else: {names:?}"
+    );
+    assert!(
+        !names.contains(&"user.updated".to_owned()),
+        "another organization's event never reaches this feed: {names:?}"
+    );
+
+    // ---- A name list ----------------------------------------------------------------------------
+    // Repeated `?name=` means "any of these", which is the only reading a multi-select can
+    // have. Reading one of the two would make the second click look like it did nothing.
+    let filtered = harness
+        .call(get(
+            "/api/v1/events?name=page.created&name=page.deleted&limit=50",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(filtered.status, StatusCode::OK, "{:?}", filtered.body);
+    let filtered_names: Vec<String> = filtered.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        filtered_names.len(),
+        3,
+        "two page.created rows and one page.deleted: {filtered_names:?}"
+    );
+    assert!(
+        filtered_names.iter().all(|name| name != "page.updated"),
+        "a name that was not asked for is not returned: {filtered_names:?}"
+    );
+
+    // ---- A site ---------------------------------------------------------------------------------
+    let by_site = harness
+        .call(get(
+            &format!("/api/v1/events?site_id={site}&limit=50"),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(by_site.status, StatusCode::OK, "{:?}", by_site.body);
+    assert_eq!(
+        by_site.body["events"]
+            .as_array()
+            .expect("events")
+            .as_slice()
+            .len(),
+        3,
+        "the site's three facts and not the other site's one"
+    );
+
+    // ---- A window -------------------------------------------------------------------------------
+    // A window in the future is empty, and it is empty *because it says so* rather than because
+    // the filter was dropped — a silently ignored filter is indistinguishable from a bus that
+    // stopped recording.
+    let windowed = harness
+        .call(get(
+            "/api/v1/events?from=2999-01-01T00:00:00Z&limit=50",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(windowed.status, StatusCode::OK, "{:?}", windowed.body);
+    assert!(
+        windowed.body["events"].as_array().expect("events").is_empty(),
+        "a future window is honoured, not ignored: {:?}",
+        windowed.body
+    );
+    assert_eq!(
+        windowed.body["has_more"],
+        json!(false),
+        "and an empty page says there is no further page"
+    );
+
+    // ---- A malformed request is refused by name ---------------------------------------------------
+    let bad_window = harness
+        .call(get("/api/v1/events?from=yesterday", Some(&reader_token)))
+        .await;
+    assert_eq!(
+        bad_window.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        bad_window.body
+    );
+    assert_eq!(bad_window.body["error"]["code"], json!("invalid_event_window"));
+    assert!(
+        bad_window.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("from"),
+        "the refusal names the parameter the operator mistyped: {:?}",
+        bad_window.body
+    );
+
+    // A name that cannot exist is refused too, and so is every repetition of it — a filter
+    // that validated only the first `?name=` would quietly return the unfiltered feed. The
+    // value is percent-encoded, which makes the assertion two things at once: the name is
+    // refused *and* the parser decoded it on the way (an undecoded `%20` would pass the
+    // validator's character check and reach the store as a name nothing has ever emitted).
+    let bad_name = harness
+        .call(get(
+            "/api/v1/events?name=page.created&name=NOT%20A%20NAME",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(bad_name.status, StatusCode::BAD_REQUEST, "{:?}", bad_name.body);
+
+    // ---- Keyset pagination -----------------------------------------------------------------------
+    let first = harness
+        .call(get("/api/v1/events?limit=2", Some(&reader_token)))
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    let first_ids: Vec<i64> = first.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["id"].as_i64().expect("an id"))
+        .collect();
+    assert_eq!(first_ids.len(), 2, "the page is the page size");
+    assert_eq!(
+        first.body["has_more"],
+        json!(true),
+        "three rows are left behind a two-row page"
+    );
+
+    let cursor = first.body["next_cursor"].as_i64().expect("a cursor");
+    assert_eq!(
+        cursor,
+        *first_ids.last().expect("a last row"),
+        "the cursor is the last row of the page, so the next page cannot repeat it"
+    );
+
+    let second = harness
+        .call(get(
+            &format!("/api/v1/events?limit=2&cursor={cursor}"),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+    let second_ids: Vec<i64> = second.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["id"].as_i64().expect("an id"))
+        .collect();
+    assert_eq!(second_ids.len(), 2);
+    assert_eq!(
+        second.body["has_more"],
+        json!(false),
+        "the last page says so, so the panel can stop offering 'Load older'"
+    );
+    assert_eq!(
+        second.body["next_cursor"],
+        json!(null),
+        "and carries no cursor to follow"
+    );
+
+    let overlap: Vec<&i64> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    assert!(
+        overlap.is_empty(),
+        "no row is served twice across the page boundary: {first_ids:?} then {second_ids:?}"
+    );
+    assert!(
+        first_ids[0] > first_ids[1] && first_ids[1] > second_ids[0],
+        "the feed is newest-first across the boundary, not per page: \
+         {first_ids:?} then {second_ids:?}"
+    );
+
+    harness.dispose().await;
+}
+
 /// The catalogue is readable, complete, and a group subscription really does expand.
 ///
 /// The unit tests in `omnion_events::catalogue` prove the table's shape; this proves the two

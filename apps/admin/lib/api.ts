@@ -6,6 +6,9 @@
  */
 import type {
   CreatedMediaShare,
+  EventCatalogue,
+  EventFilters,
+  EventPage,
   NewMediaGrant,
   Media,
   MediaBulkResult,
@@ -4209,4 +4212,47 @@ export function runNotificationRoute(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The event feed and the catalogue (REQ-016, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build the feed's query string from its filters.
+ *
+ * `name` is repeated rather than joined: `?name=a&name=b` is the only shape that survives a
+ * value containing a comma, and an event name is a controlled vocabulary that will never
+ * contain one — but a filter that quietly mis-splits on a comma the day somebody registers a
+ * plugin's own name is a filter that will be debugged from the wrong end.
+ */
+function eventQuery(filters: EventFilters = {}): string {
+  const search = new URLSearchParams();
+  for (const name of filters.name ?? []) {
+    if (name) search.append("name", name);
+  }
+  if (filters.site_id) search.set("site_id", filters.site_id);
+  if (filters.actor_user_id) search.set("actor_user_id", filters.actor_user_id);
+  if (filters.from) search.set("from", filters.from);
+  if (filters.to) search.set("to", filters.to);
+  if (filters.cursor && filters.cursor > 0) search.set("cursor", String(filters.cursor));
+  if (filters.limit) search.set("limit", String(filters.limit));
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+/** One page of the platform's recent events, newest first. */
+export function fetchEvents(filters: EventFilters = {}): Promise<EventPage> {
+  return request<EventPage>(`/api/v1/events${eventQuery(filters)}`);
+}
+
+/**
+ * Every event name the platform knows, with its area, description and payload fields.
+ *
+ * The counts (`live_count`, `reserved_count`, `max_subscriptions`) are part of the answer
+ * rather than something the screen recomputes: they are the registry's own totals, and a
+ * screen that counted the rows it happened to receive would report a number that changes with
+ * a filter the user cannot see.
+ */
+export function fetchEventCatalogue(): Promise<EventCatalogue> {
+  return request<EventCatalogue>("/api/v1/events/catalogue");
 }
