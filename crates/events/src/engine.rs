@@ -144,6 +144,42 @@ async fn deliver_one(
                 store::mark_failed(pool, job.delivery_id, status.map(i32::from), &message).await?;
                 report.failed += 1;
 
+                // Giving up is the one delivery outcome an operator cannot see anywhere else:
+                // the delivery row shows `failed`, the endpoint stays enabled, and nothing says
+                // out loud that a fact the organization subscribed to never arrived. An event
+                // subscribed to nothing else (there is no delivery of this event that can carry
+                // it \u2014 the endpoint that failed is the one that would have received it) is
+                // the honest way to surface it, and it reaches any *other* endpoint of the
+                // organization watching its own bus.
+                //
+                // The failure is recorded after the delivery is marked failed rather than in the
+                // same transaction: this one must not be able to take down the runner, or a
+                // receiver that stays broken stops the whole queue from draining.
+                if let Err(error) = crate::bus::emit(
+                    pool,
+                    crate::NewEvent::new("webhook.delivery.failed")
+                        .organization(job.organization_id)
+                        .site(job.site_id)
+                        .actor(job.actor_user_id)
+                        .payload(serde_json::json!({
+                            "delivery_id": job.delivery_id,
+                            "endpoint_id": job.endpoint_id,
+                            "endpoint_name": job.endpoint_name,
+                            "event_name": job.event_name,
+                            "attempts": job.attempts,
+                            "status": status.map(i32::from),
+                            "reason": message,
+                        })),
+                )
+                .await
+                {
+                    tracing::error!(
+                        delivery_id = %job.delivery_id,
+                        error = %error,
+                        "the delivery-failed event could not be recorded"
+                    );
+                }
+
                 tracing::warn!(
                     delivery_id = %job.delivery_id,
                     endpoint = %job.endpoint_name,
