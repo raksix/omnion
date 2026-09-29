@@ -60,6 +60,13 @@ reap
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  # Reap again on every turn, not just once at entry. A pass queued behind another one whose
+  # owner then died holds the place forever otherwise: the place was younger than the grace
+  # period when this script started, so the single entry sweep left it alone and the wait
+  # loop then counted it on every turn without ever asking whether it was still alive. That
+  # is how a crashed pass costs a live one its entire slot wait — this writer's own pass
+  # queued on a place whose owner and holder were both already dead.
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
