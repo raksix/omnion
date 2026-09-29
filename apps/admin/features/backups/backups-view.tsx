@@ -24,6 +24,13 @@
  *   feature the product has.
  * - **Delete asks, and the confirmation names the backup.** A restore point that disappears
  *   without a word is indistinguishable from one that was never taken.
+ * - **Delete takes the bytes, and the result says how many.** The confirmation states that
+ *   the artifacts come off the destination with the row, because the alternative — a green
+ *   list over a directory still full of the media library — is a backup root that costs
+ *   money per byte forever. After the call the notice carries the *actual* counts from the
+ *   server: an entry that could not be removed is named with the operating system's own
+ *   words rather than hidden behind a cheerful "removed". A row whose directory was never
+ *   there says so; that is a different fact from "twelve files were deleted".
  */
 import { useCallback, useEffect, useState } from "react";
 
@@ -252,8 +259,30 @@ export function BackupsOverviewScreen() {
     setError(null);
     setNotice(null);
     try {
-      await deleteBackup(id);
-      setNotice("Backup removed. Its artifacts are still on the destination until the next prune.");
+      // The server reports what it actually removed, and the notice is built from that
+      // rather than from a template. The three answers are genuinely different facts and
+      // collapsing them into "Backup removed" is what made the old behaviour survivable:
+      // the row was gone, the archive was not, and the screen said nothing either way.
+      const purge = await deleteBackup(id);
+      const target = purge.root || "the destination";
+      if (purge.failures.length > 0) {
+        setNotice(
+          `Backup removed, and ${purge.removed_entries} of ${
+            purge.removed_entries + purge.failed_entries
+          } entries came off ${target}. ${purge.failed_entries} could not be removed and are ` +
+            `still there: ${purge.failures
+              .map((failure) => `${failure.path} (${failure.reason})`)
+              .join("; ")}`,
+        );
+      } else if (!purge.existed) {
+        setNotice(`Backup removed. Nothing was on the destination at ${target}.`);
+      } else {
+        setNotice(
+          `Backup removed with its artifacts — ${purge.removed_entries} ${
+            purge.removed_entries === 1 ? "entry" : "entries"
+          } deleted from ${target}.`,
+        );
+      }
       setConfirming(null);
       setDetail(null);
       reload();
@@ -505,9 +534,12 @@ export function BackupsOverviewScreen() {
                           onClick={() => remove(run.id)}
                           disabled={busy}
                           data-testid="backup-delete-confirm"
+                          title={
+                            "Removes this run and its artifacts from the destination. This cannot be undone."
+                          }
                           className="rounded-lg bg-danger px-2 py-1 text-[11.5px] font-medium text-white disabled:opacity-60"
                         >
-                          Remove “{run.title}”
+                          Remove “{run.title}” and its artifacts
                         </button>
                         <button
                           type="button"

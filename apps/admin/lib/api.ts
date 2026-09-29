@@ -78,6 +78,8 @@ import type {
   BackupSchedule,
   BackupSettings,
   BackupStatus,
+  BackupPurge,
+  BackupPurgeFailure,
   BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
@@ -4856,9 +4858,17 @@ export function verifyBackup(id: string): Promise<BackupVerification> {
   return request<BackupVerification>(`/api/v1/backups/${id}/verify`, { method: "POST" });
 }
 
-/** Remove a run. The artifacts on the destination are not removed by this call. */
-export function deleteBackup(id: string): Promise<void> {
-  return request<void>(`/api/v1/backups/${id}`, { method: "DELETE" });
+/**
+ * Remove a run **and the artifacts it left on the destination**.
+ *
+ * The returned report is the point of this call: "the row is gone" and "the bytes are gone"
+ * are two facts, and a `204` collapsed them. A partial removal comes back with
+ * `failed_entries > 0` and the paths that are still on disk, so the screen can say which
+ * files an operator has to clear by hand instead of rendering "removed" over a directory
+ * that is still full of the media library.
+ */
+export function deleteBackup(id: string): Promise<BackupPurge> {
+  return request<BackupPurge>(`/api/v1/backups/${id}`, { method: "DELETE" });
 }
 
 /** The schedules table. Slice 3 adds the writes. */
