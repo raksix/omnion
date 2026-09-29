@@ -38,14 +38,49 @@ at 0135–0140, so the ledger's high-water mark is 0140 and these two went to **
 number is not renumbered, and the only way both copies can survive is if neither number is
 taken. The QA database was dropped and recreated, because a suite database holds every applied
 checksum and renumbering cannot be tested any other way.
-**Proof.** `cargo build -p omnion-api` green in 3m31s (20 warnings, all pre-existing, in other
-waves' files). `cargo test -p omnion-api --lib` **251 passed, 0 failed** — the suite was 249,
-and the two new tests are named in the REQ. `pnpm typecheck` 5 packages, 0 errors, 31.6s. QA
-pass on the private stack (`QA_STACK=w10`, ports 18089/3109/3209, database `omnion_qa_w10`):
-the API boots, `/healthz` 200, and the credential depth pass drives the three screens.
-**Next.** The credential screens' remaining open clause is the usage view measured against a
-manual count of fixture workflows (needs a graph, which is REQ-086 slice 2), and REQ-086 is
-the head of this queue.
+**Proof, and the part that took four passes.** `cargo build -p omnion-api` green in 3m31s (20
+warnings, all pre-existing, in other waves' files). `cargo test -p omnion-api --lib` **251
+passed, 0 failed** — the suite was 249, and the two new tests are named in the REQ.
+`pnpm typecheck` 5 packages, 0 errors, 31.6s. `scripts/qa/credential-scope.cjs` **19 of 19**
+against a live platform account on `:18089`.
+
+That probe is the *proof*, and it is a live API round trip rather than a browser walk because
+it can assert the thing the browser cannot: that the unnamed read is **still**
+`organization_required`. A fix that made the requirement disappear would be a fix that deleted
+the tenancy rule, and only a probe that deliberately makes the unnamed call can see that. It
+also checks the scope did not widen into a permission — the row is in the named tenant and in
+no other.
+
+**Four passes, one cause, and it was not the database.** The pass kept dying in seconds with
+`migration 19 was previously applied but is missing in the resolved migrations`, which reads as
+a schema fault. It is a build-graph one. sqlx embeds `database/migrations` at the compile of
+`omnion-core` — the crate that *declares* `migrate!` — so renaming a migration never reaches
+the binary through `cargo build -p omnion-api`: cargo sees the api crate as current, prints
+`Finished` in forty-two seconds, and ships the old set. `touch`ing the api crate does nothing;
+`cargo clean -p omnion-core` is the only thing that re-embeds, and then the build takes six
+minutes instead of one. The diagnosis that settled it was the *repetition*: four passes, one
+binary, one identical sentence. A database fault varies with the data; a stale build repeats
+exactly. The harness now cleans that crate on its rebuild path, and nothing else.
+
+**The false reading, recorded because it nearly cost the tick.** The repository's migration
+ledger has genuine gaps — 0019, 0020 and 0022-0024 are absent in *every* worktree, inherited
+from main — so a freshly created database can produce a similar complaint. The only thing that
+tells a stale embed from a real gap apart is `select count(*) from _sqlx_migrations` on the
+database in question, and on a fresh database that count is zero. I also spent two passes
+reading a pm2 error line from a run I had killed: pm2 appends to its logs and never truncates,
+so a killed pass's last words outlive it by minutes. `rm -f ~/.pm2/logs/<name>-*.log` before a
+pass you intend to read.
+
+**The browser pass is queued, not failed.** The box is running ten writers and `QA_SLOTS=1`,
+so this tick's `run.sh` has been waiting on a slot for eighteen minutes; the API boots clean
+against a dropped database and answers `/healthz` 200, and the three credential screens are in
+the walkthrough's route list, but the pass has not yet produced its report. The API round trip
+above is the evidence this tick stands on, and it is evidence about the same routes the browser
+would have driven.
+
+**Next.** REQ-086, the workflow editor canvas — the head of this queue, and the thing three
+REQ-087 clauses are waiting on (the usage view needs a graph, the palette needs to read the
+installer ledger, and `needs_reauth` needs somewhere to disable a node).
 
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
