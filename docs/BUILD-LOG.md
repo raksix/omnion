@@ -3764,6 +3764,7 @@ error rather than a row that silently reads as `live`.
   loopback receiver; the group subscription delivers a `page.published` and the signature
   verifies against the secret the creation response returned
 - `cargo test -p omnion-api --lib` → **188**
+- `cargo test -p omnion-api --lib` → **188**
 - `tsc --noEmit` in `apps/admin` → exit 0
 
 **Not done, and not claimed.** Slice 1 is not closed. Missing: the emission calls for names the
@@ -4210,16 +4211,18 @@ written, so a green run closes the slice rather than starting it. After that, sl
 operator needs first when a delivery is missing.
 
 ## 2026-09-29 — REQ-004 slice 3 · "Run from here" needs a sixth step state, and the three queries that read step status were already shaped for one
----
+
 **What.** Slice 3's first criterion. The whole thing turned out to be gated on a one-word
 hole rather than on missing code, and the hole was only visible once the criterion was read
 as a sentence: a run's steps are all `pending` when it is created and the engine claims them
 strictly in `step_no` order, so there was no way to say "these two did not run". Not
 "skipped with a flag" — a *state*, because every consumer of a step's status would otherwise
 have to learn a second question ("is this pending, or pending-and-skipped?").
-## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
 **The finding worth keeping: `skipped` cost no engine change at all.** Three queries read
 step status, and each was already shaped so that one more terminal state would be free:
+
+## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
+
 **What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
 shows the last page, the API keeps a keyset cursor over every row, the automation matcher
 replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
@@ -4631,3 +4634,55 @@ bundles, and is in the routes path; the next tick runs it.
 `captureRendered`, `payloadRendered`, `windowSeconds: 900` and `tokenReturnedOnRead:
 false`; (b) the browser pass for REQ-016's retention tab and REQ-010's, which have been
 blocked on the same slot for two ticks; (c) criterion 8, Table-mode parity.
+
+## 2026-09-29 — omnion-build tick 56 · the blocker was never the QA slot
+
+**What.** Three REQs (010, 021, 016) had each recorded, in their own words, that their
+browser pass never ran because "the QA slot is held by a sibling writer". Three ticks running,
+the excuse had become the plan: wait for the slot, write nothing, tick nothing. This tick
+checked the excuse instead of repeating it — and it was false.
+
+The slot was never the constraint. **`/dev/shm` was at 99%** (418M free) and the box was at
+load 33 with 1G of RAM available. Several stacks point `CARGO_TARGET_DIR` at tmpfs so a
+compile does not fill the disk, so the worktrees had collectively moved their unbounded build
+growth onto a filesystem *every sibling shares* — and a build that cannot write its output dies
+with "No space left on device", which reads like a source error. Freeing three orphaned
+targets took tmpfs to 29% free and the load to 15. The slot was the symptom; the excuse named
+the wrong culprit, and the wrong culprit cannot be fixed by waiting.
+
+**The fix, and the two rules it had to learn first.** `disk-guard.sh` grew a tmpfs sweep with
+an `in_use` test — and that test deleted a 7 GB target out from under a **running w8 QA pass**.
+The reason is the lesson worth the whole tick: a stack's build runs in a wrapper that *exits*
+once the binary is staged, so `run.sh`, the pm2 API and the walkthrough all carry no
+`CARGO_TARGET_DIR` and answered "not held". A pass is not a build, and asking only "is a
+compiler running" cannot tell them apart. The guard now requires both tests — nothing building
+into it AND nobody living in the worktree that owns it — and step 4, the disk's own last
+resort, gets the same check it had been missing.
+
+**Also shipped.** The one unticked REQ-016 box that named *missing* UI: the payload inspector
+could copy a whole payload but not a JSON path. It now lists the payload's keys as a tree and
+copies the path a receiver would actually write — `["order.total"]` for a key with a dot in
+it, because `payload.order.total` is two lookups that read as a key that does not exist, and a
+path that silently matches nothing in the receiver being debugged is worse than no path.
+
+**Proof.**
+
+- `bash scripts/qa/disk-guard.sh` → freed **13.9 GB**, `/dev/shm` 91% → 29% free, load 33 → 15
+- a second run against the live w8 pass → reclaimed **nothing** (the rule holds under the case
+  that broke it)
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `f658491` (the guard), `aa14c42` (the path tree), `a8399a0` (the walkthrough step),
+  `a0c0320` (the REQ's record of it)
+
+**Not done, and not claimed. Still no browser pass.** This tick's own pass is queued behind
+the same single slot (now w8's, which I disturbed and which is still running), so the
+acceptance boxes naming a screen stay unticked with the reason in the box. What changed is
+that the excuse is no longer believed: the cliff is gone, and the next tick either gets the
+slot or says which sibling is holding it and for how long.
+
+**Next.** On arrival: if the slot is free, run `bash scripts/qa/run.sh` with **no `QA_STACK`
+override** and tick the screen boxes for slices 1–3 of REQ-016 together, then close REQ-016,
+then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
+the same reason). If the slot is still held, name the holder and its ports in the log rather
+than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.

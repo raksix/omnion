@@ -282,6 +282,21 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       deliberate — a read-only auditor must not be able to make the platform POST to a third
       party by pressing a button.
 - [ ] The event feed's payload inspector copies a JSON path and a copy-as-cURL snippet for a delivery.
+      — **Both halves are now built; the box stays unticked, for the browser pass.** The
+      cURL half was already there and is the reason this box was not closed earlier — it was
+      written, and the JSON-path half was not: the inspector's only copy button handed over the
+      whole payload, which is a wall of JSON that leaves the reader to find the one key they
+      wanted *and* work out how their own receiver spells it. The panel now lists the payload's
+      keys as a tree and gives each one the path they are about to type into their code, with
+      two details the naive version gets wrong: a key that is not a bare identifier is copied
+      as `["order.total"]` rather than `payload.order.total` (which is two lookups and reads
+      as a key that does not exist, so the path silently matches nothing in the receiver being
+      debugged), and a branch past the depth cap says so with an ellipsis instead of rendering
+      as an empty row. The tree is rooted at `payload` because that is the name a receiver
+      unmarshals into. The walkthrough step (`4b`) asserts the clipboard *contents* rather than
+      the button's presence, because a button copying the key's display name would pass a click
+      test and fail the reader. **Unrun, and unticked** — this pass is queued behind a sibling
+      that still holds the single QA slot.
 - [x] Retention sweep deletes events outside the window and their deliveries, and is proven by an integration test with a shortened window.
       — `the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest` against real
       PostgreSQL, on a **one-day** window set through the same `PATCH` an operator uses. It
