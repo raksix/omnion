@@ -4746,6 +4746,159 @@ export function syncMetricCatalog(): Promise<MetricCatalogResponse> {
   return request<MetricCatalogResponse>("/api/v1/observability/metrics/sync", { method: "POST" });
 }
 
+/* ── the log explorer (REQ-126 slice 1) ────────────────────────────────────────────────── */
+
+/**
+ * One stored line, in the panel's shape.
+ *
+ * Every field here is a **column** of `obs_log_entries` except `fields`, which was redacted at
+ * write time — this client never receives a value to mask, so there is no second rule here to
+ * keep in sync with the one in `crates/telemetry::redact`. A screen that wanted to "show the raw
+ * message" would find nothing to show, which is the point.
+ */
+export type LogEntry = {
+  id: number;
+  /** RFC 3339 instant the line was emitted. */
+  ts: string;
+  /** `trace`, `debug`, `info`, `warn` or `error` — the set is closed and the API rejects anything else. */
+  level: string;
+  /** The Rust module path, so a line can be narrowed to one module. */
+  target: string;
+  /** The message. Redacted before it was ever stored. */
+  message: string;
+  request_id: string | null;
+  trace_id: string | null;
+  user_id: string | null;
+  organization_id: string | null;
+  /** The route TEMPLATE (`/api/v1/secrets/{id}`), never a raw path. */
+  route: string | null;
+  method: string | null;
+  status: number | null;
+  duration_ms: number | null;
+  /** Which process emitted it: `api`, `worker` or `cli`. */
+  source: string;
+  host: string | null;
+  version: string | null;
+  /** Structured detail, already redacted. */
+  fields: unknown;
+};
+
+/**
+ * The explorer's query string.
+ *
+ * `level` is an array because the screen's control is a multi-select, and `?level=info` also
+ * works for a hand-typed link — the API takes both forms. `requestId` is a separate field rather
+ * than a text search because it routes to `/logs/requests/{id}`, which returns the lines in the
+ * opposite order (a timeline, not a list) and covers the workers as well as the API.
+ */
+export type LogFilters = {
+  levels?: string[];
+  target?: string;
+  requestId?: string;
+  traceId?: string;
+  /** RFC 3339 lower bound. */
+  since?: string;
+  /** RFC 3339 upper bound. */
+  until?: string;
+  /** `api`, `worker` or `cli`. */
+  source?: string;
+  /** Substring of the message. */
+  text?: string;
+  limit?: number;
+};
+
+/**
+ * The explorer response.
+ *
+ * `levels` and `targets` come from the store rather than from a constant, so the filter's chips
+ * are the values this instance has actually recorded — a hard-coded level list offers an option
+ * that can never return a row, which is how a filter becomes a guessing game.
+ */
+export type LogListResponse = {
+  /** The rows, newest first — except through `fetchRequestLines`, which is oldest first. */
+  entries: LogEntry[];
+  levels: string[];
+  targets: string[];
+  /** How many lines the store holds in total, so an empty page is not an empty store. */
+  stored_total: number;
+  /** The window the store will answer, in days. */
+  max_window_days: number;
+  /** The cap on one search, in rows. */
+  max_rows: number;
+};
+
+/**
+ * `GET /api/v1/observability/logs` — the bounded explorer.
+ *
+ * An empty parameter is dropped rather than sent blank: `?target=` is a filter for the empty
+ * string, and the difference between "no target filter" and "the target is ''" is one the store
+ * answers differently.
+ */
+export function fetchLogs(filters: LogFilters = {}): Promise<LogListResponse> {
+  const query = new URLSearchParams();
+  for (const level of filters.levels ?? []) query.append("level", level);
+  if (filters.target) query.set("target", filters.target);
+  if (filters.traceId) query.set("trace_id", filters.traceId);
+  if (filters.since) query.set("since", filters.since);
+  if (filters.until) query.set("until", filters.until);
+  if (filters.source) query.set("source", filters.source);
+  if (filters.text) query.set("text", filters.text);
+  if (filters.limit) query.set("limit", String(filters.limit));
+
+  // A request id takes the dedicated route rather than this one: the ordering is the opposite and
+  // a caller who has to remember `&order=asc` to read a timeline will eventually get it wrong.
+  if (filters.requestId) return fetchRequestLines(filters.requestId);
+
+  const suffix = query.toString();
+  return request<LogListResponse>(`/api/v1/observability/logs${suffix ? `?${suffix}` : ""}`);
+}
+
+/**
+ * `GET /api/v1/observability/logs/requests/{id}` — **one request's lines, oldest first**.
+ *
+ * This is the route an error banner is for: every line the request produced, across the API and
+ * the workers, in the order it happened. The same response type is returned deliberately — the
+ * shape of a line does not change with the direction of the list.
+ */
+export function fetchRequestLines(requestId: string): Promise<LogListResponse> {
+  return request<LogListResponse>(
+    `/api/v1/observability/logs/requests/${encodeURIComponent(requestId)}`,
+  );
+}
+
+/**
+ * The one log settings row, as the explorer reads it.
+ *
+ * `max_retention_days` is carried so the screen can say WHY a number is refused rather than only
+ * that it was — "must be 14 or less" without the cap in hand is a validation message that reads
+ * as an arbitrary rule, and an operator who cannot see the cap will not know whether to argue
+ * with the value or the operator.
+ */
+export type LogSettingsView = {
+  /** The level a module logs at unless it is raised. */
+  log_level_default: string;
+  /** Per-module raises, including the ones that have already expired. */
+  log_level_overrides: Record<string, unknown>;
+  /** How many days are kept. */
+  logs_retention_days: number;
+  /** When the row was last written, RFC 3339. */
+  updated_at: string;
+  /** The cap retention is allowed to reach. */
+  max_retention_days: number;
+};
+
+/**
+ * `GET /api/v1/observability/logs/settings` — the one settings row, read-only from here.
+ *
+ * `PUT /logs/settings` is a separate route under `observability.manage` and is the whole settings
+ * screen's job; this client deliberately does not wrap it, so a log explorer cannot silently
+ * change retention. The screen shows the retention window so "the store only goes back N days"
+ * is visible next to the results it is limiting.
+ */
+export function fetchLogSettings(): Promise<LogSettingsView> {
+  return request<LogSettingsView>("/api/v1/observability/logs/settings");
+}
+
 /* ── traces and exporters (REQ-126 slice 3) ───────────────────────────────────────────────── */
 
 /** The trace list's filter. `undefined` means "no filter on this column", never "match nothing". */

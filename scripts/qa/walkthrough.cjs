@@ -5506,6 +5506,11 @@ async function main() {
     // depth pass below, which selects a second family, changes the range, copies the PromQL and
     // asserts the cap is shown as a cap rather than as a number with no meaning.
     { path: "/observability/metrics", name: "observability-metrics" },
+    // The log explorer (REQ-126, slice 1) — walked here and driven by the depth pass below,
+    // which filters by level, searches free text, pastes a NON-uuid request id to prove the
+    // component refuses it before the request leaves the browser, and pastes a real one to
+    // prove the screen switches to the API's oldest-first timeline for that request.
+    { path: "/observability/logs", name: "observability-logs" },
     // The trace search and the exporter centre (REQ-126, slice 3) — walked here and driven by the
     // depth pass below, which searches by a request id, opens a waterfall, creates an exporter,
     // points it at a deliberately wrong endpoint and asserts `Test` renders a degraded REPORT
@@ -5658,6 +5663,9 @@ async function main() {
   // bytes are pending rather than reclaimed.
   report.observabilityTraces = await runDepthPass("observability-traces", () =>
     runObservabilityTracesDepth(page, report),
+  );
+  report.observabilityLogs = await runDepthPass("observability-logs", () =>
+    runObservabilityLogsDepth(page, report),
   );
   report.observabilityExporters = await runDepthPass("observability-exporters", () =>
     runObservabilityExportersDepth(page, report),
@@ -6418,6 +6426,116 @@ async function runObservabilityTracesDepth(page, report) {
 
   report.observabilityTraces = { steps };
   return steps;
+}
+
+/**
+ * The REQ-126 log explorer depth pass.
+ *
+ * A log screen is only useful if it can be wrong in a way the operator can see, so the assertions
+ * here are the three ways this one used to be silently wrong:
+ *
+ * 1. **A typo must not become an API error page.** The traces screen had this defect once —
+ *    `Number("12x")` → `NaN` → `URLSearchParams` wrote the literal `NaN` into the query and the
+ *    `400` came back as "the trace index could not be read", the worst thing a debug screen can
+ *    say to the person debugging. So a NON-uuid request id is pasted here and the pass requires a
+ *    FIELD-level message next to the box. Requiring only "an error appears" would pass on the
+ *    broken version too, since the broken version also shows an error — the assertion is that the
+ *    complaint is attached to the input and that the result list underneath is untouched.
+ * 2. **An empty store and an over-narrow filter are different sentences.** Both arrive as an
+ *    empty `entries` array, so the pass reads the empty state's title: an idle stack says "no
+ *    telemetry", and a stack that does have lines must NOT say that when a filter excluded them.
+ * 3. **A real request id switches the ordering and the screen says so.** The explorer reads
+ *    newest-first and the request timeline oldest-first; that inversion is the API's contract, and
+ *    a screen that reversed it silently would look broken rather than different.
+ */
+async function runObservabilityLogsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-logs-depth", action: "observability", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/observability/logs`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-logs"]', { timeout: 20000 })
+    .catch(() => {});
+  const root = page.locator('[data-view="observability-logs"]');
+  await root.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  // (1) the screen renders its own controls — a pass that cannot find the filters proves nothing
+  //     about them, and every assertion below is scoped to them.
+  const controls = await page.locator("[data-logs-text], [data-logs-request-id], [data-logs-level]").count();
+  note({ check: "controls-present", count: controls });
+  if (controls < 3) return { steps };
+
+  // (2) the level chips are a multi-select: pressing one marks it, pressing it again clears it.
+  //     A chip that cannot be un-pressed is a filter the operator has to reload the page to drop.
+  const errorChip = page.locator('[data-logs-level="error"]');
+  await errorChip.click().catch(() => {});
+  await page.waitForTimeout(900);
+  const pressed = await errorChip.getAttribute("aria-pressed").catch(() => null);
+  note({ check: "level-chip-pressed", value: pressed });
+  await errorChip.click().catch(() => {});
+  await page.waitForTimeout(700);
+  const released = await errorChip.getAttribute("aria-pressed").catch(() => null);
+  note({ check: "level-chip-released", value: released });
+
+  // (3) the assertion that matters: a malformed id is refused IN THE COMPONENT. The pass requires
+  //     the field-level message AND that the list underneath still shows the unfiltered store —
+  //     a screen that blanks its results while complaining is worse than one that keeps them.
+  const rowsBeforeTypo = await page.locator("[data-log-row]").count();
+  await page.locator("[data-logs-request-id]").fill("not-a-uuid");
+  await page.waitForTimeout(900);
+  const fieldError = await page
+    .locator("[data-logs-request-error]")
+    .innerText()
+    .catch(() => "");
+  const rowsAfterTypo = await page.locator("[data-log-row]").count();
+  const markedInvalid = await page
+    .locator("[data-logs-request-id]")
+    .getAttribute("aria-invalid")
+    .catch(() => null);
+  note({
+    check: "malformed-id-refused-in-component",
+    message: fieldError.slice(0, 200),
+    ariaInvalid: markedInvalid,
+    rowsBeforeTypo,
+    rowsAfterTypo,
+    resultsPreserved: rowsAfterTypo === rowsBeforeTypo,
+  });
+
+  // (4) a VALID id for a request that exists takes the timeline route, and the screen announces
+  //     the ordering change rather than leaving the operator to wonder why the rows reversed.
+  await page.locator("[data-logs-request-id]").fill("11111111-2222-3333-4444-555555555555");
+  await page.waitForTimeout(1100);
+  const orderingNote = (await root.innerText().catch(() => "")) || "";
+  const announcesOrder = /oldest first/i.test(orderingNote);
+  note({ check: "request-view-announces-ordering", announced: announcesOrder });
+
+  // (5) an id that is well-formed but matches nothing must read as "no match", never as "the
+  //     store is empty" — the sentence that would convince an operator logging had stopped.
+  const missText = (await root.innerText().catch(() => "")) || "";
+  const saysEmptyStore = /no telemetry yet/i.test(missText);
+  const saysNoMatch = /no line matches|no lines match|does not match/i.test(missText);
+  note({ check: "miss-not-mistaken-for-empty-store", saysEmptyStore, saysNoMatch });
+
+  // (6) Escape clears the filters — the recovery from a dead end an operator painted themselves.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(900);
+  const clearedId = await page.locator("[data-logs-request-id]").inputValue().catch(() => "unread");
+  const clearedError = await page.locator("[data-logs-request-error]").count();
+  note({ check: "escape-clears", requestIdValue: clearedId, staleFieldError: clearedError });
+
+  // (7) retention is shown beside the results it limits: a window that silently hides older lines
+  //     is indistinguishable from a platform that never recorded them.
+  const body = (await root.innerText().catch(() => "")) || "";
+  const showsWindow = /keeps\s+\d+\s+days/i.test(body);
+  note({ check: "retention-window-shown", shown: showsWindow });
+
+  return { steps };
 }
 
 /**
