@@ -3067,3 +3067,50 @@ linked from the intake screen's footer, then add both to `scripts/qa/walkthrough
 open the browser gate (`bash scripts/qa/run.sh`) has been queued for a QA slot for the whole
 tick — six other writers are waiting on the same single slot — so slice 1's four screens
 still have no browser pass. That is the one open item on them.
+
+## wave 4b · REQ-117 slice 3 · conversion, the flow probe, the retention sweep
+
+what The documented flow's third step, end to end. `modules/crm-intake/src/convert.rs` is
+the pure half: the amount a converted deal starts at, the title it carries on the board, and
+the state of each of the four documented steps — with a `Blocked` variant, because "the sales
+module is not installed" and "nobody pressed the button yet" are different sentences and a
+stepper that renders them identically is a bug report against a working platform.
+`convert_store.rs` is the write: create-or-link the contact, open the opportunity in the
+source's own pipeline, promote the lead through its deal when a quotation is accepted
+(idempotently), and archive expired payloads while keeping the rows.
+
+`POST /crm/leads/{id}/convert` is a **separate permission** (`crm.leads.convert`), not part
+of `crm.leads.manage`: turning a lead into a contact and an opportunity is a promise to the
+person who wrote in. `GET /crm/leads/flow` answers what this deployment can do, read from
+`to_regclass` rather than asserted, and the stepper's notes are generated from it.
+`POST /crm/leads/retention/sweep` archives payloads past the window (default 730 days) and
+keeps the lead, the routing and the trail.
+
+proof `scripts/qa/run-crm-convert.sh` PASS: 5/5 against a real database — the band midpoint
+through the real insert ("10k-50k" → 30 000), a second press reusing the contact (one press,
+one contact, counted), two `sales.quote.accepted` deliveries producing one trail line and one
+`converted_at`, a cross-tenant id answering `None` and writing nothing, and a sweep that
+clears a 900-day payload while keeping a 1-day one. `cargo test -p omnion-module-crm-intake`
+123 passed · `cargo test -p omnion-api` 194 · `cargo test -p omnion-permissions` 62 ·
+`cargo clippy --all-targets` 0 · `scripts/qa/run-crm-intake.sh` PASS (slice 1 unaffected) ·
+`pnpm typecheck` 2/2.
+
+Three defects the gate found on its first run, all of them invisible to a unit test because
+they only exist on a path that sends SQL:
+
+* `make_interval(days => bigint)` — the function takes an integer, so the retention sweep
+  was a 42883 in production. No unit test notices, because no unit test sends SQL.
+* The dedupe candidate read named `crm_contacts.company_name`, a column that has never
+  existed (the company lives in `crm_companies`). It is now a left join. This broke dedupe
+  matching on every installation that *has* the CRM — precisely the half a CRM-less run
+  skips, which is why slice 1's own gate never saw it.
+* The conversion created its contact *outside* the module-absence guard, so the very
+  installation the degradation was written for got a `500`. A contact is a CRM row: without
+  the CRM there is none, and the honest answer is a lead that is still a lead plus a
+  `conversion_skipped` line on its trail.
+
+next the browser gate. `bash scripts/qa/run.sh` has been queued for a QA slot for three ticks
+now (nine writers share one slot on this box) and has not run since 28 Sep, so all six
+screens still have no browser pass. The depth pass already drives the conversion end to end —
+`stepperBefore`/`stepperAfter`, `convertOutcomeHonest`, `stepperAgreesWithFlow` — and is
+waiting for the slot like everything else.
