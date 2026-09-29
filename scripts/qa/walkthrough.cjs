@@ -4348,8 +4348,14 @@ async function runMenusDepth(page, report) {
   // A members-only item, saved through the screen, then read back from the *public* endpoint.
   const memberId = await page.evaluate(async (id) => {
     const detail = await fetch(`/api/v1/menus/${id}`, { credentials: "same-origin" }).then((r) => r.json());
-    const items = detail.items.map((item) => ({ ...item }));
+    const items = (detail.items ?? []).map((item) => ({ ...item }));
     const target = items.find((item) => item.label === "QA first") ?? items[0];
+    // No item to make members-only is a FAILURE of an earlier step, not a reason to throw: the
+    // exception unwinds `main()` past every step recorded so far, and a pass that dies here
+    // reports one line — "Cannot set properties of undefined" — for a menu editor that has
+    // already told us what is wrong in `steps.savedItems` and `steps.threeTopLevel`. Record the
+    // fact and let the rest of the pass keep proving what it can.
+    if (!target) return { status: 0, itemId: null, reason: `the menu held ${items.length} items` };
     target.visibility = "members";
     const response = await fetch(`/api/v1/menus/${id}/items`, {
       method: "PUT",
@@ -4360,6 +4366,7 @@ async function runMenusDepth(page, report) {
     return { status: response.status, itemId: target.id };
   }, menuId);
   steps.memberItemSaved = memberId.status === 200;
+  steps.memberItemReason = memberId.reason ?? null;
 
   await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(2200);
@@ -5130,6 +5137,60 @@ async function main() {
     console.log(`BLOCK_EDITOR_CREATED=${be.created === true} PUBLIC_RENDERED=${be.publicRendered === true}`);
     await browser.close();
     process.exit(0);
+  }
+
+  // `--only=menus` runs the navigation and queue depth pass alone.
+  //
+  // Same argument as `--only=block-editor`: the depth pass is written, and a full pass is the only
+  // thing that currently reaches it — forty-five minutes on a box five writers share, of which
+  // the queue lives at the very end. A screen that can only be proved by a pass that usually dies
+  // before reaching it is a screen that is effectively untested, so the pass gets its own entry
+  // point. It runs the SAME function the full pass calls, so a green run here means the full pass
+  // would agree; what it does not do is reset the database (run.sh does that) or report a
+  // `summary.json` with the whole pass's counts, and the report below says so.
+  if (process.argv.includes("--only=menus")) {
+    report.menus = await runMenusDepth(page, report);
+    log(`menus: ${JSON.stringify(report.menus)}`);
+    // The names are the pass's own `steps.*` keys, read off the function rather than guessed: a
+    // checklist written from the REQ's prose asks for `rescheduled` when the pass says
+    // `rescheduleMoved`, and the mode then reports every check missing forever — which reads as a
+    // broken screen and is really a typo. The list below is the pass's own `steps.*` vocabulary.
+    const required = [
+      // the list and the form
+      "listReady", "formOpened", "keyFollowsName", "rowLanded", "rowOnScreen",
+      // the tree
+      "editorReady", "threeTopLevel", "nestedUnderSecond", "treeRendered", "treeHasChildren",
+      "savedItems", "parentsAreStored", "depthLabel",
+      "fourthLevelRefused", "fourthLevelStatus", "refusalLeftTheTreeAlone",
+      // Add pages…
+      "pickerOpened", "pickerOnlyOffersPublished", "pageItems", "labelComesFromTheTitle",
+      // audience
+      "audienceToggleChangesThePayload", "visitorItems", "memberItems",
+      "membersItemHiddenFromVisitor", "memberItemSaved",
+      // locations
+      "claimedHeader", "rivalClaimRefused", "rivalClaimStatus", "rivalRefusalNamesTheHolder",
+      "firstHolderKeptIt",
+      // the queue (same flat `steps` object — see below)
+      "queueReady", "entryOnScreen", "rescheduleFormOpened", "rescheduleStored",
+      "rescheduleIsLater", "rescheduleMoved", "cancelledInSql", "cancelButtonGone",
+      "retryRefusesASentRow", "scheduleStatus",
+    ];
+    // The queue half writes into the SAME flat `steps` object — there is no nested `queue`
+    // key, and reading one into existence would have demanded eleven checks that can never be
+    // satisfied.
+    const menuSteps = report.menus || {};
+    const missing = required.filter((f) => menuSteps[f] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ mode: "menus-only", netFailures, menus: menuSteps, missing }, null, 2),
+    );
+    console.log(`MENUS_JSON=${JSON.stringify(menuSteps)}`);
+    console.log(`MENUS_MISSING=${missing.length === 0 ? "none" : missing.join(",")}`);
+    console.log(
+      `MENUS_CONSOLE_ERRORS=${(report.consoleErrors || []).length} NET_FAILURES=${netFailures.length}`,
+    );
+    await browser.close();
+    process.exit(missing.length === 0 ? 0 : 1);
   }
 
   // The analytics batch goes in before the routes are walked: the report screens read it, and the

@@ -74,7 +74,13 @@ function newItem(parentId: string | null, position: number, label = "New item"):
     label,
     item_type: "url",
     page_id: null,
-    url: "",
+    // A placeholder URL, not an empty one. The store refuses a `url` item with no URL by name
+    // (`item "New item" is a link with no URL`) and it refuses the WHOLE submission, so an empty
+    // string here meant "Add item" produced a row that made the entire next save fail — the author
+    // saw three rows in the canvas, pressed Save, got one refusal naming the first of them, and
+    // every item was gone. A placeholder keeps the tree saveable while the author types over it,
+    // and it is site-relative, which the store accepts unchanged.
+    url: "/",
     target: "_self",
     rel: "",
     css_class: "",
