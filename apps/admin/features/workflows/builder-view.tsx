@@ -1696,8 +1696,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                 : `Paste ${clipboardCount} copied node${clipboardCount === 1 ? "" : "s"}`
             }
           />
+          {/* Table mode is a SIBLING view of the same graph, not REQ-003's linear step editor.
+              The old link pointed at /automations/{id}, which reads a different projection —
+              so nothing could satisfy "consistent with the canvas after a save in either
+              mode" because the two views were never the same definition. */}
           <Link
-            href={`/automations/${workflowId}`}
+            href={`/workflows/${workflowId}/table`}
             className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1.5 text-[12.5px] hover:bg-quiet-soft"
             data-builder-table-mode
           >
