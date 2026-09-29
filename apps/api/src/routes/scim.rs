@@ -578,6 +578,11 @@ struct SyncLine<'a> {
     entity_id: Option<Uuid>,
     /// One readable line.
     detail: String,
+    /// Live sessions this line ended (`0126`).
+    ///
+    /// `None` is the default for every other write path, and `None` means the row records zero
+    /// rather than "unknown" — see `NewSyncEntry::revoked_sessions`.
+    revoked_sessions: Option<u64>,
 }
 
 /// Write one line of the sync log, ignoring a log failure (the operation itself already landed).
@@ -604,6 +609,7 @@ async fn log(state: &AppState, organization_id: Uuid, line: SyncLine<'_>) {
         action: line.action.to_owned(),
         outcome: line.outcome.to_owned(),
         detail: line.detail.clone(),
+        revoked_sessions: line.revoked_sessions,
     };
 
     if let Err(error) = provisioning::log_sync(state.db().pool(), organization_id, &entry).await {
@@ -819,6 +825,7 @@ pub async fn create_user(
                     external_id: payload.external_id.as_deref(),
                     entity_id: Some(existing.id),
                     detail: format!("{} already exists in this organization", existing.email),
+                    revoked_sessions: None,
                 },
             )
             .await;
@@ -890,6 +897,7 @@ pub async fn create_user(
             external_id: payload.external_id.as_deref(),
             entity_id: Some(user.id),
             detail: format!("{} was provisioned", user.email),
+            revoked_sessions: None,
         },
     )
     .await;
@@ -1041,6 +1049,10 @@ async fn apply_user_changes(
             } else {
                 format!("{} now reads {}", updated.email, updated.status)
             },
+            // The sentence below is for a reader; this is the same number as a value, so the
+            // panel can sum a run, sort the log, or badge the row instead of every consumer
+            // re-parsing English to find out how many sessions an offboarding ended.
+            revoked_sessions: Some(revoked_sessions),
         },
     )
     .await;
@@ -1225,14 +1237,20 @@ pub async fn delete_user(
     .await
     .map_err(internal)?;
 
-    users::set_status_and_end_sessions(
+    // The `?` and the `.ok_or_else` are the same handling the PATCH path above uses, and for the
+    // same reason: the account was read a few lines ago, so a row that has since disappeared is
+    // not a client error to be reported as "no such user" on a DELETE that already found one —
+    // but it is not a 500 either, and silently logging "deactivated" for an account this call
+    // never touched would be a log line about nothing.
+    let deactivate = users::set_status_and_end_sessions(
         state.db().pool(),
         user.id,
         "disabled",
         "scim_deactivated",
     )
     .await
-    .map_err(internal)?;
+    .map_err(internal)?
+    .ok_or_else(|| ScimError::not_found(format!("no account {}", user.id)))?;
 
     log(
         &state,
@@ -1251,6 +1269,12 @@ pub async fn delete_user(
                 "{} was deactivated (the SCIM default — the account stays, its sessions do not)",
                 user.email
             ),
+            // The count is reported as a number here because `detail` is prose: this line
+            // is the only record of how many live tokens went with a departed colleague, and
+            // "the account is disabled" does not say whether the tokens in their browser
+            // still work. An offboarding that disabled the account without this figure is the
+            // failure the number exists to make visible.
+            revoked_sessions: Some(deactivate.1.revoked_sessions),
         },
     )
     .await;
@@ -1386,6 +1410,7 @@ pub async fn create_group(
             external_id: None,
             entity_id: Some(group.id),
             detail: format!("{} now has {} member(s)", group.name, members.len()),
+            revoked_sessions: None,
         },
     )
     .await;
@@ -1571,6 +1596,7 @@ pub async fn patch_group(
             external_id: None,
             entity_id: Some(group.id),
             detail: format!("{} now has {} member(s)", group.name, members.len()),
+            revoked_sessions: None,
         },
     )
     .await;
@@ -1602,6 +1628,7 @@ pub async fn delete_group(
             external_id: None,
             entity_id: Some(group.id),
             detail: format!("{} was removed", group.name),
+            revoked_sessions: None,
         },
     )
     .await;

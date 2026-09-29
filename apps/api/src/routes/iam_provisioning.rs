@@ -90,6 +90,12 @@ fn log_json(entry: &provisioning::SyncLogEntry) -> Value {
         "action": entry.action,
         "outcome": entry.outcome,
         "detail": entry.detail,
+        // A number, not a sentence. `detail` above says "3 session(s) ended" in English, and a
+        // panel that wants the figure has to either show the prose or re-parse it — so a second
+        // consumer re-parses it *differently*, and the offboarding review that needs the number
+        // is the one surface that cannot have it. The column is `not null`, so this is always a
+        // value: 0 means this line revoked nothing, which is the true answer for a create.
+        "revoked_sessions": entry.revoked_sessions,
         "created_at": entry.created_at.format(&Rfc3339).unwrap_or_default(),
     })
 }
