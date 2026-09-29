@@ -34,6 +34,8 @@
 
 pub mod assignment;
 pub mod assignment_store;
+pub mod convert;
+pub mod convert_store;
 pub mod dedupe;
 pub mod error;
 pub mod keys;
@@ -53,6 +55,9 @@ pub use assignment::{
     due_at, next_position, renumber, simulate, validate_policy, validate_rule,
 };
 pub use dedupe::{Candidate, DedupePolicy, Match, MatchKey, Verdict, evaluate as dedupe_evaluate};
+pub use convert::{
+    Availability, Conversion, Step, StepState, STEPS, deal_title, initial_amount, step_plan,
+};
 pub use error::{CrmIntakeError, Result};
 pub use keys::{hash_key, hint_for, issue_key, verify_key};
 pub use mapping::{MappedValues, MappingEntry, apply, health, validate_required_targets};

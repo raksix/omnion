@@ -34,7 +34,7 @@ const SOURCE_COLUMNS: &str = "id, organization_id, site_id, name, kind, form_key
      rate_limit_per_hour, last_received_at, last_error, broken_mappings, created_by, \
      created_at, updated_at";
 
-const LEAD_COLUMNS: &str = "id, organization_id, site_id, source_id, status, contact_id, \
+pub const LEAD_COLUMNS: &str = "id, organization_id, site_id, source_id, status, contact_id, \
      company_id, deal_id, quote_id, owner_user_id, first_name, last_name, email, phone, \
      company_name, job_title, product_interest, message, consent_text, consent_given, \
      utm_source, utm_medium, utm_campaign, utm_term, utm_content, click_id, referrer_host, \
