@@ -121,6 +121,31 @@ const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
 /// source configured to answer after ten minutes must not be waiting for a nightly sweep.
 pub const DEFAULT_CRM_AUTORESPONDER_POLL_MS: u64 = 60_000;
 
+/// How often the CRM SLA worker escalates breached leads and reminds owners (REQ-117,
+/// slice 3).
+///
+/// **The same reasoning as the autoresponder, and for the same reason.** A first-response
+/// target is a promise measured in minutes — a 60-minute policy that escalates on a nightly
+/// sweep is a policy nobody believes after the first overnight lead. A tick that finds nothing
+/// is one indexed read against a partial index (`crm_leads_sla_idx`, which holds only live
+/// clocks), so a broken worker shows up within the tick rather than the next morning.
+pub const DEFAULT_CRM_SLA_POLL_MS: u64 = 60_000;
+
+/// How many organizations the CRM SLA worker walks in one pass. Ten thousand tenants at a few
+/// statements each is a maintenance window, and the organizations that wait for the next tick
+/// are the ones whose deadlines are oldest — so the bound is a real cost, not a formality, which
+/// is why the read is ordered rather than arbitrary.
+pub const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS: i64 = 100;
+
+/// [`DEFAULT_CRM_SLA_MAX_ORGANIZATIONS`] as the unsigned value the env reader hands back.
+///
+/// The environment gives strings and the reader returns `u64`, so a signed constant needs a
+/// twin — the same pairing `DEFAULT_RETENTION_MAX_SITES_U64` already exists for, and the
+/// reason it is a `const` rather than a literal `100` at the call site is that the two numbers
+/// must not drift: a default of 100 in one place and 10 in the other is a worker that reads
+/// ten times slower than its own documentation says.
+const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64: u64 = 100;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -528,6 +553,40 @@ impl Default for CrmAutoresponderConfig {
     }
 }
 
+/// Knobs of the CRM SLA worker (REQ-117, slice 3).
+///
+/// The SLA worker is a *separate* process-level switch from the autoresponder's rather than a
+/// second field on it. They answer two different promises — "somebody answers the visitor" and
+/// "somebody answers the lead" — and an installation that wants to stop emailing acknowledgements
+/// while keeping its escalation timer running is a configuration mistake, not a reason to couple
+/// the two flags. (The same reasoning already separates the retention, search and analytics
+/// workers, each of which has its own `runner_enabled`.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrmSlaConfig {
+    /// Whether this process escalates breaches and sends reminders
+    /// (`OMNION_CRM_SLA_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two passes (`OMNION_CRM_SLA_POLL_MS`).
+    pub poll_ms: u64,
+    /// How many organizations one pass walks (`OMNION_CRM_SLA_MAX_ORGANIZATIONS`).
+    ///
+    /// Bounded because a pass is several statements per organization: an installation with
+    /// thousands of tenants must not hold thousands of them open in one tick, and the bound is
+    /// on the *query* so the truncation is visible in the log as a count rather than as a
+    /// silent slice.
+    pub max_organizations: i64,
+}
+
+impl Default for CrmSlaConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_CRM_SLA_POLL_MS,
+            max_organizations: DEFAULT_CRM_SLA_MAX_ORGANIZATIONS,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -693,6 +752,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// CRM autoresponder worker knobs (REQ-117, slice 3).
     pub crm_autoresponder: CrmAutoresponderConfig,
+    /// CRM SLA worker knobs (REQ-117, slice 3).
+    pub crm_sla: CrmSlaConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// The secret CSRF tokens are derived from (REQ-012, slice 2).
@@ -887,6 +948,17 @@ impl Config {
             )?,
         };
 
+        let crm_sla = CrmSlaConfig {
+            runner_enabled: read_flag(&read, "OMNION_CRM_SLA_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_CRM_SLA_POLL_MS", DEFAULT_CRM_SLA_POLL_MS)?,
+            max_organizations: i64::try_from(read_positive(
+                &read,
+                "OMNION_CRM_SLA_MAX_ORGANIZATIONS",
+                DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64,
+            )?)
+            .unwrap_or(DEFAULT_CRM_SLA_MAX_ORGANIZATIONS),
+        };
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -926,6 +998,7 @@ impl Config {
             analytics,
             retention,
             crm_autoresponder,
+            crm_sla,
             mail,
             csrf,
             log,
@@ -967,6 +1040,7 @@ impl Default for Config {
             analytics: AnalyticsConfig::default(),
             retention: RetentionConfig::default(),
             crm_autoresponder: CrmAutoresponderConfig::default(),
+            crm_sla: CrmSlaConfig::default(),
             mail: MailConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
             // every deployment shares, and a shared CSRF secret is no CSRF secret.
@@ -1098,6 +1172,68 @@ mod tests {
         .expect("flags are valid");
         assert!(!config.crm_autoresponder.runner_enabled);
         assert!(config.retention.runner_enabled);
+    }
+
+    #[test]
+    fn the_sla_worker_ticks_in_minutes_because_a_first_response_target_is_measured_in_them() {
+        // The SLA worker's promise is the same *kind* of promise as the autoresponder's, and it
+        // fails the same way if the default is wrong: a 60-minute target escalated by a daily
+        // sweep is a target that has already been missed by the time anybody hears about it,
+        // and the screen keeps saying "on track" the whole time. The assertion is the bound,
+        // not the value — a future reader who wants 5 minutes should be able to without
+        // having to argue with this test.
+        let config = config_from(&[]).expect("defaults are valid");
+        assert_eq!(config.crm_sla.poll_ms, DEFAULT_CRM_SLA_POLL_MS);
+        assert!(
+            config.crm_sla.poll_ms <= 5 * 60_000,
+            "an escalation must arrive inside the window it is escalating about, got {}ms",
+            config.crm_sla.poll_ms
+        );
+        assert!(config.crm_sla.runner_enabled);
+    }
+
+    #[test]
+    fn the_sla_worker_is_a_separate_switch_from_the_autoresponder() {
+        // The trap this pins: the two workers look like one feature ("the CRM sends things on a
+        // timer"), so a later reader folds them into one flag. An installation that stops
+        // emailing acknowledgements and silently stops escalating its own overdue leads is a
+        // failure with no log line, and it is exactly what a shared flag would produce.
+        let config = config_from(&[
+            ("OMNION_CRM_AUTORESPONDER_RUNNER", "false"),
+            ("OMNION_CRM_SLA_RUNNER", "true"),
+        ])
+        .expect("flags are valid");
+        assert!(!config.crm_autoresponder.runner_enabled);
+        assert!(config.crm_sla.runner_enabled);
+
+        let swapped = config_from(&[
+            ("OMNION_CRM_AUTORESPONDER_RUNNER", "true"),
+            ("OMNION_CRM_SLA_RUNNER", "false"),
+        ])
+        .expect("flags are valid");
+        assert!(swapped.crm_autoresponder.runner_enabled);
+        assert!(!swapped.crm_sla.runner_enabled);
+    }
+
+    #[test]
+    fn a_malformed_sla_knob_is_a_boot_error_not_a_silent_default() {
+        // Same treatment as every other knob: told to tick every millisecond and quietly
+        // keeping a default means a worker hammering the database for ever with nothing in the
+        // log to say so.
+        let zero = config_from(&[("OMNION_CRM_SLA_POLL_MS", "0")])
+            .expect_err("a zero tick must be refused");
+        assert_eq!(zero.key, "OMNION_CRM_SLA_POLL_MS");
+
+        let orgs = config_from(&[("OMNION_CRM_SLA_MAX_ORGANIZATIONS", "0")])
+            .expect_err("walking zero organizations is a worker that never walks");
+        assert_eq!(orgs.key, "OMNION_CRM_SLA_MAX_ORGANIZATIONS");
+
+        // And the unsigned/signed twin of the bound must agree, or the documented default is
+        // a different number from the one the process runs with.
+        assert_eq!(
+            u64::try_from(DEFAULT_CRM_SLA_MAX_ORGANIZATIONS).unwrap(),
+            DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64
+        );
     }
 
     #[test]
