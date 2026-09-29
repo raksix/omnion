@@ -54,7 +54,7 @@ pub const MAX_URL_LENGTH: usize = 2_048;
 
 /// The theme slots a menu can be assigned to.
 ///
-/// Closed in code and repeated as a `check` constraint in `0051_cms_menus_publishing.sql`: a
+/// Closed in code and repeated as a `check` constraint in `0052_cms_menus_publishing.sql`: a
 /// location no renderer reads is a menu an editor assigned to a slot that never appears, and it
 /// is invisible from the panel.
 pub const LOCATIONS: [&str; 4] = ["header", "footer", "sidebar", "mobile"];
@@ -1046,10 +1046,10 @@ mod tests {
         // itself drift out of date.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../database/migrations/0051_cms_menus_publishing.sql"
+            "/../../database/migrations/0052_cms_menus_publishing.sql"
         );
         let sql = std::fs::read_to_string(path).unwrap_or_else(|error| {
-            panic!("cannot read 0051_cms_menus_publishing.sql ({error}); the closed lists are duplicated in it")
+            panic!("cannot read 0052_cms_menus_publishing.sql ({error}); the closed lists are duplicated in it")
         });
 
         for value in LOCATIONS {

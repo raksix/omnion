@@ -1,4 +1,4 @@
--- Omnion · 0051 · content: site menus and the scheduled publishing queue (REQ-064, slice 1)
+-- Omnion · 0052 · content: site menus and the scheduled publishing queue (REQ-064, slice 1)
 --
 -- Navigation and scheduling are the two halves of "when does this content appear, and how does a
 -- visitor get to it". They ship together because a scheduled post almost always has a navigation
