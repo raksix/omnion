@@ -101,6 +101,17 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
+    /// `404` — the addressed thing does not exist.
+    ///
+    /// The one caller that reaches for this on purpose is a read of a resource the caller may not
+    /// see (REQ-133's project scoping): the message must then say nothing about permissions,
+    /// because a `404` that reads "you are not allowed" tells the caller the row exists. Build it
+    /// from a phrase about the resource, never from the reason for the refusal.
+    #[must_use]
+    pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, code, message)
+    }
+
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an

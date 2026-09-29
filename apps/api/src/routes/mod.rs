@@ -73,6 +73,7 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
+pub mod automation_projects;
 pub mod backups;
 pub mod commands;
 pub mod content;
@@ -123,6 +124,64 @@ use std::convert::Infallible;
 
 use crate::guards;
 use crate::state::AppState;
+
+/// The automation project surface (REQ-133, slice 1).
+///
+/// The powers are split by what they are over, not by which screen lives on them:
+///
+/// * `projects.read` — the list, the detail, the switcher. A member reads their projects; an
+///   instance administrator reads the organization's.
+/// * `projects.manage` — creating, renaming and archiving a project. `projects.members.manage`
+///   is deliberately *not* folded into it: on a delegated team the person who may rename the
+///   project is very often not the person who may add its colleagues, and one key would let
+///   either of them do the other's job.
+/// * `projects.admin` — the instance-wide power the guard does not grant on its own: it is what
+///   makes an administrator see every project rather than only their memberships. It is absent
+///   from the base roles, so an installation that never grants it has fully delegated projects.
+///
+/// Reads answer `404` for a project the caller may not see, inside the handler
+/// (`automation_projects::find_visible`): the guard proves the caller holds `projects.read` in
+/// their own organization, and the store decides which projects inside it they may see.
+fn automation_projects_surface(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/projects",
+            get(automation_projects::list_projects)
+                .layer(guards::require(state, "projects.read"))
+                .merge(post(automation_projects::create_project)),
+        )
+        .route(
+            "/projects/{id}",
+            get(automation_projects::get_project)
+                .layer(guards::require(state, "projects.read"))
+                .merge(
+                    put(automation_projects::update_project)
+                        .layer(guards::require(state, "projects.manage")),
+                ),
+        )
+        // `/archive` and `/restore` are literal segments under `/projects/{id}/…`, and axum ranks
+        // a static segment ahead of the parameter route above it.
+        .route(
+            "/projects/{id}/archive",
+            post(automation_projects::archive_project)
+                .layer(guards::require(state, "projects.manage")),
+        )
+        .route(
+            "/projects/{id}/restore",
+            post(automation_projects::restore_project)
+                .layer(guards::require(state, "projects.manage")),
+        )
+        .route(
+            "/projects/{id}/members",
+            post(automation_projects::upsert_member)
+                .layer(guards::require(state, "projects.members.manage")),
+        )
+        .route(
+            "/projects/{id}/members/{user_id}",
+            delete(automation_projects::remove_member)
+                .layer(guards::require(state, "projects.members.manage")),
+        )
+}
 
 /// Build the application router around the shared [`AppState`].
 /// The CRM assignment and SLA surface.
@@ -1611,6 +1670,9 @@ pub fn router(state: AppState) -> Router {
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
         .route("/automations/{id}", automation_entry)
+        // Automation projects (REQ-133). Declared before `/automations/{id}`'s neighbours by
+        // being its own literal root — `/projects` cannot be read as an automation id.
+        .merge(automation_projects_surface(&state))
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
             page_revision_comments,
