@@ -477,6 +477,45 @@ catalogue! {
     "Somebody changed how or whether they are notified.",
     [("user_id", Uuid, req), ("field", String, opt)];
 
+    // ---- CRM intake (REQ-117) -------------------------------------------------------------------
+    // These five are recorded by `apps/api/src/routes/crm_intake.rs` today. They were absent
+    // from this table for six slices, which is the exact drift the walker test exists to catch:
+    // the bus wrote the fact, the delivery was queued, and the endpoint form's picker never
+    // offered the name — so "new quote request → notify Slack" was undeliverable by
+    // construction while looking like a configuration problem. A module that emits is a module
+    // whose names belong here the day it emits, not the day its own REQ is closed.
+    "crm.lead.received", "crm", Live,
+    "A submission was stored as a lead, or stored as a rejection so the inbox can show it.",
+    [("lead_id", Uuid, req), ("source_id", Uuid, opt), ("form_key", String, opt),
+     ("status", String, req), ("decision", String, opt), ("product_interest", String, opt)];
+    "crm.lead.assigned", "crm", Live,
+    "A lead got an owner, or changed hands.",
+    [("lead_id", Uuid, req), ("owner_user_id", Uuid, opt),
+     ("previous_owner_user_id", Uuid, opt), ("rule_id", Uuid, opt), ("reason", String, opt)];
+    "crm.lead.responded", "crm", Live,
+    "The first response against a lead was recorded and its SLA clock stopped.",
+    [("lead_id", Uuid, req), ("minutes_to_response", Integer, opt), ("sla_state", String, opt)];
+    "crm.lead.converted", "crm", Live,
+    "A lead became a contact and an opportunity, with a quotation draft when sales is installed.",
+    [("lead_id", Uuid, req), ("contact_id", Uuid, opt), ("deal_id", Uuid, opt),
+     ("quote_id", Uuid, opt)];
+    "crm.intake.source.updated", "crm", Live,
+    "An intake source, its mapping or its endpoint key changed. A rotation is a change.",
+    [("source_id", Uuid, req), ("changed_keys", String, opt)];
+    // Emitted by `apps/api/src/crm_sla_runner.rs`, which ships in the same slice as these two
+    // rows — so `Live`, not `Reserved`. The lifecycle flag is the table's promise about who
+    // records a name, and a name whose recorder is in the same commit as the row is live the
+    // moment that commit lands. Marking it reserved would have been the optimistic version of
+    // the drift the five rows above describe: the picker says "planned", an operator wires an
+    // automation to it, and nothing is ever recorded.
+    "crm.lead.sla_breached", "crm", Live,
+    "A lead's first-response deadline passed unanswered and the escalation target was told.",
+    [("lead_id", Uuid, req), ("due_at", Timestamp, opt), ("owner_user_id", Uuid, opt),
+     ("escalated_to", Uuid, opt)];
+    "crm.lead.sla_reminder", "crm", Live,
+    "A lead's first-response deadline is close enough that its owner was reminded.",
+    [("lead_id", Uuid, req), ("due_at", Timestamp, req), ("owner_user_id", Uuid, opt)];
+
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
     "An order was placed. Listed now; the commerce module records it when it ships.",
