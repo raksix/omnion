@@ -55,7 +55,6 @@ use omnion_workflows::oauth_store::{self, FlowClaim, NewOAuthFlow};
 use omnion_workflows::registry::{CredentialDefinition, OAuthConfig, find_credential_type};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -153,10 +152,7 @@ fn local_box() -> LocalBox {
 /// as `credential_oauth_state`, a sentence about CSRF for what is really a key that never
 /// matched. The test that names the organization a state was minted for is what found it.
 fn state_key() -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(SEAL_LABEL_FOR_SIGNING);
-    hasher.update(installation_material());
-    hasher.finalize().to_vec()
+    oauth::derive_state_key(&installation_material(), SEAL_LABEL_FOR_SIGNING)
 }
 
 /// The domain-separation label for [`state_key`], so the seal and the signature keys differ.
@@ -368,6 +364,13 @@ pub struct OAuthStartResponse {
     pub authorize_url: String,
     /// The callback this installation registered with the provider.
     pub redirect_uri: String,
+    /// The signed `state`, echoed so the panel can show what is outstanding.
+    ///
+    /// Not a secret, and returning it costs nothing: a state is single-use, dies in ten
+    /// minutes, and the panel cannot learn it any other way once the browser has navigated
+    /// to the provider. It is exactly the string the provider is about to echo back, so the
+    /// caller already holds it.
+    pub state: String,
     /// The scopes asked for.
     pub scopes: String,
     /// Whether the flow carries a PKCE challenge.
@@ -518,6 +521,7 @@ pub async fn start_oauth(
         credential_key: credential.key,
         authorize_url,
         redirect_uri: flow.redirect_uri,
+        state: signed_state,
         scopes,
         pkce: pkce.is_some(),
         expires_at: flow.expires_at,
