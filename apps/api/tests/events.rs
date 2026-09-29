@@ -815,18 +815,37 @@ async fn the_bus_records_events_and_delivers_signed_webhooks() {
         .call(get("/api/v1/events?limit=50", Some(&owner_token)))
         .await;
     let events = feed.body["events"].as_array().expect("events").clone();
-    assert_eq!(events.len(), 4, "{:?}", feed.body);
+    // The feed holds every recorded event, and since REQ-016 slice 2 that is the whole
+    // lifecycle, not just the publications: creating the endpoint, testing it, creating the
+    // page, editing it, publishing, and the delivery that gave up. Counting exact rows would
+    // make every new emission a breaking test, so this asserts the facts that matter instead —
+    // what is present, and that the ordering is newest first.
+    let names: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    for expected in [
+        "webhook.endpoint.created",
+        "webhook.test",
+        "webhook.endpoint.tested",
+        "page.created",
+        "page.updated",
+        "page.published",
+        "webhook.delivery.failed",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "the feed must carry {expected}; it has {names:?}"
+        );
+    }
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["name"] == json!("page.published"))
-            .count(),
+        names.iter().filter(|name| **name == "page.published").count(),
         3,
         "three publications were recorded: {:?}",
         feed.body
     );
-    assert_eq!(events[0]["name"], json!("page.published"), "newest first");
-    assert_eq!(events[3]["name"], json!("webhook.test"), "oldest last");
+    assert_eq!(events[0]["name"], json!("webhook.delivery.failed"), "newest first");
+    assert_eq!(names.last(), Some(&"webhook.endpoint.created"), "oldest last");
 
     let audit = harness
         .call(get("/api/v1/iam/audit", Some(&owner_token)))
@@ -1054,11 +1073,37 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
         deliveries_b.body
     );
 
-    // The event feed is tenant-scoped too.
+    // The event feed is tenant-scoped too — and the scoping is now worth stating precisely,
+    // because connecting an endpoint records an event *about that endpoint*. Tenant B's feed is
+    // no longer empty, and that is correct rather than a leak: the row is B's own, created by
+    // B's own operator, and it says nothing about tenant A. What must never appear in B's feed
+    // is anything of A's, which is the assertion that carries the isolation rule.
     let feed_b = harness.call(get("/api/v1/events", Some(&token_b))).await;
-    assert_eq!(feed_b.body["events"], json!([]));
+    let names_b: Vec<&str> = feed_b.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert_eq!(
+        names_b,
+        vec!["webhook.endpoint.created"],
+        "tenant B sees only its own endpoint, and nothing of tenant A: {:?}",
+        feed_b.body
+    );
     let feed_a = harness.call(get("/api/v1/events", Some(&token_a))).await;
-    assert_eq!(feed_a.body["events"].as_array().expect("events").len(), 1);
+    let names_a: Vec<&str> = feed_a.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert_eq!(
+        names_a,
+        vec!["page.published", "page.created", "webhook.endpoint.created"],
+        "tenant A sees its own endpoint and its own page, and nothing of tenant B: {:?}",
+        feed_a.body
+    );
 
     // An endpoint switched off while its queue waits: the queued delivery settles as failed
     // instead of sitting pending forever.
@@ -1351,15 +1396,25 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         .await;
     assert_eq!(published.status, StatusCode::OK, "{:?}", published.body);
 
+    // A `page.*` subscription is no longer publish-only: the group now carries the whole page
+    // lifecycle, so the page that was just created is delivered alongside its publication. That
+    // is the point of the group — one subscription, every page fact — and the count is 2
+    // because the walk creates the page before publishing it.
     let report = tick(&harness).await;
     assert_eq!(
-        report.delivered, 1,
-        "a page.* subscription delivers a page.published: {report:?}"
+        report.delivered, 2,
+        "a page.* subscription delivers page.created and page.published: {report:?}"
     );
 
     let captured = receiver.captured();
-    assert_eq!(captured.len(), 1, "the receiver took the delivery");
-    let delivered = &captured[0];
+    assert_eq!(captured.len(), 2, "the receiver took both deliveries");
+    let delivered_names: Vec<&str> = captured.iter().map(|hit| hit.event.as_str()).collect();
+    assert_eq!(
+        delivered_names,
+        vec!["page.created", "page.published"],
+        "the group delivers its members oldest first: {delivered_names:?}"
+    );
+    let delivered = &captured[1];
     assert_eq!(delivered.event, "page.published");
 
     // A name the receiver never named still arrives signed and verifiable.
@@ -1519,6 +1574,65 @@ fn walk_rust(
             ));
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The registry vs the emitters, the other direction: a name the catalogue calls *live* must
+// have an emitter
+// ---------------------------------------------------------------------------------------------
+
+/// Every name marked `Live` in the catalogue is emitted by some module.
+///
+/// The gate above walks one direction, and one direction is not enough. It proves an emitter
+/// never names a row that is missing — but it says nothing about a row that exists with
+/// nothing behind it, and that is the failure that actually shipped: twenty-seven rows carried
+/// `Live`, which the type documents as "emitted by the platform today", while the platform
+/// emitted nothing of the sort. In the panel's picker they read exactly like a working event;
+/// an operator subscribes, the delivery never comes, and there is nothing to show for the
+/// subscription at all.
+///
+/// A registry is a promise about what other software will receive, so the promise has to be
+/// checked. Two options, and only one of them is honest:
+///
+/// * emit the fact, if the write path exists — this tick added `page.created|updated|deleted|
+///   restored`, `translation.updated`, `domain.added|removed`, `site.archived`, `user.updated`,
+///   `user.deleted` and `theme.activated` for exactly this reason; or
+/// * mark it `Reserved`, which the panel renders as "a module ships this" instead of implying
+///   the platform is broken.
+///
+/// So the leftover rows are `Reserved` rather than `Live`. That is not demotion for its own
+/// sake: `order.created` is `Reserved` for the same reason, and the status column exists to
+/// carry it. Naming them honestly is what lets the picker say something true.
+#[test]
+fn every_live_name_has_an_emitter() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("the workspace root is two levels above apps/api")
+        .to_path_buf();
+
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut files = 0_usize;
+    for area in ["apps", "crates", "modules"] {
+        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+    }
+
+    let mut unbacked: Vec<String> = Vec::new();
+    for name in omnion_events::catalogue::live_names() {
+        if !emitted.iter().any(|(emitted_name, _)| emitted_name == name) {
+            unbacked.push(name.to_owned());
+        }
+    }
+
+    assert!(
+        unbacked.is_empty(),
+        "{} name(s) are marked Live but no module emits them — `Live` means the platform \
+         records them today, and the picker shows an operator a name that will never fire. \
+         Emit the fact, or change the row to Reserved and say which module ships it:\n{}\
+         (the emitters this test can see are in {files} files)",
+        unbacked.len(),
+        unbacked.join("\n"),
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
