@@ -17,6 +17,7 @@ pub mod guards;
 pub mod intent_resolver;
 pub mod routes;
 pub mod scope;
+pub mod publishing_runner;
 pub mod retention_runner;
 pub mod search_runner;
 pub mod state;

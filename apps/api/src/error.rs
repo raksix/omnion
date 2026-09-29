@@ -386,6 +386,47 @@ impl From<ContentError> for ApiError {
                 "template_is_system",
                 "this template ships with the platform and cannot be deleted",
             ),
+            // Menus and scheduled publishing (REQ-064 slice 1). A location another menu holds
+            // is a 409 rather than a 400: nothing about the request is malformed, the location
+            // is simply taken — the same answer a taken slug gets, because it is the same
+            // situation. The holder travels in the message so the editor can be pointed at the
+            // menu to move rather than left guessing which of the site's menus it was.
+            ContentError::MenuNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "menu_not_found", "no such menu")
+            }
+            ContentError::MenuKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "menu_key_taken",
+                format!("this site already has a menu with the key {key:?}"),
+            ),
+            ContentError::MenuLocationTaken { location, .. } => Self::new(
+                StatusCode::CONFLICT,
+                "menu_location_taken",
+                format!(
+                    "the {location} location is already held by another menu; move it there first"
+                ),
+            ),
+            ContentError::PublishingEntryNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "publishing_entry_not_found",
+                "no such publishing entry",
+            ),
+            ContentError::InvalidLocation(message) => {
+                Self::bad_request("invalid_location", message)
+            }
+            ContentError::InvalidVisibility(message) => {
+                Self::bad_request("invalid_visibility", message)
+            }
+            ContentError::InvalidMenuItem(message) => {
+                Self::bad_request("invalid_menu_item", message)
+            }
+            ContentError::TooDeep(message) => Self::bad_request("menu_too_deep", message),
+            ContentError::InvalidPublishAction(message) => {
+                Self::bad_request("invalid_publish_action", message)
+            }
+            ContentError::InvalidSchedule(message) => {
+                Self::bad_request("invalid_schedule", message)
+            }
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

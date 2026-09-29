@@ -96,6 +96,7 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod menus;
 pub mod notifications;
 pub mod onboarding;
 pub mod patterns;
@@ -857,6 +858,44 @@ pub fn router(state: AppState) -> Router {
     let notifications_read = post(notifications::set_read)
         .layer(guards::require(&state, "notifications.read"));
 
+    // Menus (REQ-064, slice 1). Reading a menu is `menus.read` — an editor needs to see the
+    // navigation before deciding anything about it — and every write is `menus.manage`, which
+    // is a genuinely separate power: an account that may publish a page should not thereby
+    // rewrite the site's header. The public payload carries no guard at all, because a theme
+    // that needs a session to draw its navigation cannot be rendered by anything.
+    let menus_list =
+        get(menus::list_menus).layer(guards::require(&state, "menus.read"));
+    let menus_create =
+        post(menus::create_menu).layer(guards::require(&state, "menus.manage"));
+    let menu_read = get(menus::get_menu).layer(guards::require(&state, "menus.read"));
+    let menu_write = put(menus::update_menu)
+        .layer(guards::require(&state, "menus.manage"))
+        .merge(delete(menus::delete_menu).layer(guards::require(&state, "menus.manage")));
+    let menu_items_write =
+        put(menus::save_menu_items).layer(guards::require(&state, "menus.manage"));
+    let menu_items_from_pages =
+        post(menus::add_pages_to_menu).layer(guards::require(&state, "menus.manage"));
+    // The rendered menu a theme draws. Unauthenticated by nature, and audience-filtered by
+    // query — see `menus::public_menu`.
+    let public_menu = get(menus::public_menu);
+
+    // Scheduled publishing (REQ-064, slice 1). One key for the whole queue: reading it, moving
+    // an entry and cancelling one are the same power a publisher already has
+    // (`content.pages.schedule`), and a second key would only answer "who may look at the
+    // queue" separately from "who may change it" without making either safer.
+    let publishing_queue =
+        get(menus::list_queue).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry = put(menus::reschedule_entry)
+        .layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry_cancel =
+        post(menus::cancel_entry).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry_now =
+        post(menus::publish_now).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry_retry =
+        post(menus::retry_entry).layer(guards::require(&state, "content.pages.schedule"));
+    let page_schedule =
+        post(menus::schedule_page).layer(guards::require(&state, "content.pages.schedule"));
+
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
     // resolve the site through the caller's own organization. The collection endpoint is the
@@ -1079,6 +1118,21 @@ pub fn router(state: AppState) -> Router {
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)
+        // Menus and the publishing queue (REQ-064, slice 1). The static segments are declared
+        // before the parameter ones so axum ranks them ahead of `{id}`.
+        .route("/menus", menus_list)
+        .route("/menus", menus_create)
+        .route("/menus/{id}", menu_read.merge(menu_write))
+        .route("/menus/{id}/items", menu_items_write)
+        .route("/menus/{id}/items/from-pages", menu_items_from_pages)
+        .route("/publishing/queue", publishing_queue)
+        .route("/publishing/queue/{id}", publishing_entry)
+        .route("/publishing/queue/{id}/cancel", publishing_entry_cancel)
+        .route("/publishing/queue/{id}/publish-now", publishing_entry_now)
+        .route("/publishing/queue/{id}/retry", publishing_entry_retry)
+        .route("/pages/{id}/schedule", page_schedule)
+        .route("/public/menus/{location}", public_menu)
+
         .route("/pages/{id}/preview", page_preview)
         .route("/pages/{id}/restore", page_restore)
         .route("/pages/{id}/revisions", page_revisions)

@@ -11,7 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+    analytics_runner, automation_runner, event_runner, publishing_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -128,6 +129,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
     }
+
+    // The scheduled publishing worker runs due entries from the CMS queue (REQ-064, slice 1).
+    // It ticks every thirty seconds so a scheduled publish lands within the minute the
+    // acceptance criterion names, and it claims its rows before touching a page, so a second
+    // worker cannot publish the same revision twice.
+    let _publishing = publishing_runner::spawn(state.clone());
 
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());
