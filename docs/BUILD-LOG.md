@@ -5784,3 +5784,72 @@ visually reviewed**, so the REQ stays `in-progress`.
 correctly). `stocktake_variance` is already a reason code in slice 1 and the reconciliation
 report is already a list of disagreements with both numbers — the shape a variance report
 reuses. Slice 5 is the sales-order reservation, which the `reserve`/`release` kinds exist for.
+
+
+## 2026-09-29 · w4 · REQ-053 slice 4 — the stocktake
+
+**What.** The stocktake session, its counting sheet, the close that posts the variances, and the
+variance report. `stocktake_variance` has been a reason code since slice 1 and the reconciliation
+report has been a list of disagreements with both numbers since slice 1; both were a shape with
+nothing behind it. Five commits: `2064bab` (module + `0143` + the permission), `798cb7d` (the
+seven routes), `7642713` (the walks and the 409 they forced), `16268df` (the screen), `b02db0d`
+(the QA depth pass).
+
+**Proof.**
+
+* `cargo test -p omnion-module-inventory --lib` — **78/78** (71 before, 7 new).
+* `cargo test -p omnion-api --test inventory_stocktake -- --test-threads=1` — **7/7** walks
+  against `omnion_qa_w4` with `OMNION_REQUIRE_DB=1`, so a green tick cannot be a quiet skip.
+* `pnpm typecheck` — **2/2**.
+* `bash scripts/qa/run.sh` on `QA_STACK=w4` — **queued, not yet run** (see below).
+
+**Three decisions, and what each one costs if it is wrong.**
+
+*The expectation is frozen onto the line when the sheet is opened, not re-read at close.* A count
+writes to stock, so an expectation computed at close time can already contain the variance the
+close is about to post — the deviation reports itself as zero, and a count that finds nothing
+always finds nothing. The walk proves it by **moving stock underneath an open sheet** and
+requiring the frozen number to be the frozen one. This is slice 3's "put the threshold on the
+alert row" arriving in a second form, which is the argument for writing down *why* a column
+exists rather than leaving the schema to imply it.
+
+*An uncounted line blocks the close rather than being read as zero.* `null` is "nobody looked",
+`0` is "there is nothing here". A close that treated the first as the second would post an
+adjustment of `−expected` for every unvisited shelf: the module would **destroy the stock it
+claims to have measured** and report a clean success. That is the most expensive kind of
+agreement between a screen and a database, and it looks like a win. The refusal carries the
+count (`1 line(s) nobody has counted yet`), and the walk asserts on the sentence *and* on the
+ledger being untouched afterwards.
+
+*A count that agrees everywhere closes with zero movements.* The cheap version refuses a clean
+count, which teaches a warehouse that a good shelf is a failure — and the fastest way to get
+sheets falsified. A clean count is a successful count.
+
+**What the four failing walks were, which is the part worth keeping.**
+
+Three were the walks' fault and one was the module's, and the split is not 50/50 by accident:
+
+* The report walk stocked its "unrelated" bystander at the **counted** location, so the sheet
+  legitimately had two lines and the close was right to refuse. A sheet of everything at the
+  shelf is what a stocktake *is*; the test had to move the bystander to prove that unrelated
+  stock moves are unrelated.
+* A receipt of **500** came back `202` rather than `201` — the over-threshold rule from slice 2
+  governs *every* movement, not only adjustments. Correct, and not what that walk was about. A
+  walk that trips a second feature's guard is testing two things at once and fails for a reason
+  its name does not mention.
+* Two message assertions read `body["message"]`; errors nest under `error.message`. The
+  transfer suite's own reads are the reference, and reading them first would have saved the
+  cycle.
+* **The module's.** Closing a sheet with an uncounted line was a `400`, which told the person
+  filling the sheet they had typed the request wrong. They had not — they had a shelf left to
+  walk. It is now `InvalidStatusChange` (409), the same refusal a transfer gives when dispatched
+  after receipt, and the sentence leads with how many are left.
+
+**The QA pass has not run.** The slot (`max 1 concurrent`) is held by another writer and rotates
+between them; `run.sh` is queued on `QA_SLOT_WAIT` rather than being killed, and the walkthrough
+route is extended either way. Per the tick's own rule the stocktake screens are therefore
+**built, typechecked and walked by the API suite, but not yet visually reviewed** — which is the
+same sentence slice 3 ended on, and the reason this entry does not claim a QA result.
+
+**Next.** Slice 5 — the sales-order reservation, for which `reserve`/`release` exist with no
+route — then the reports screen and the sales integration, then the QA pass above.
