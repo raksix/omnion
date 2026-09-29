@@ -1871,6 +1871,138 @@ export interface BackupVerification {
   summary: string;
 }
 
+/** One destination entry a delete could not remove. */
+export interface BackupPurgeFailure {
+  /** The path as the operating system named it. */
+  path: string;
+  /** The operating system's own words — `permission denied (os error 13)`. */
+  reason: string;
+}
+
+/**
+ * What removing a run actually did on the destination.
+ *
+ * The row being gone and the bytes being gone are two separate facts, and the screen says so
+ * rather than collapsing them: a `204` would render "removed" over a directory that is still
+ * full of the platform's media library.
+ */
+export interface BackupPurge {
+  /** The directory that was targeted, in full. */
+  root: string;
+  /** Whether the run's directory existed at all before the delete. */
+  existed: boolean;
+  /** How many filesystem entries were removed, at any depth. */
+  removed_entries: number;
+  /** How many could not be removed and are still on the destination. */
+  failed_entries: number;
+  /** The first few failures, with the operating system's own words. */
+  failures: BackupPurgeFailure[];
+}
+
+/**
+ * One artifact the retention sweep could not remove.
+ *
+ * Its own type rather than a formatted string because the screen shows the path and the
+ * operating system's reason in two different places, and a string that gets split back into
+ * two is a string that will be split wrong.
+ */
+export interface BackupStrandedArtifact {
+  /** The run whose bytes are still on the destination. */
+  backup_id: string;
+  /** Where the run's directory is. */
+  path: string;
+  /** The operating system's own words. */
+  reason: string;
+}
+
+/** How loudly a restore warning is. `danger` is drawn as a refusal, not a decoration. */
+export type RestoreWarningSeverity = "notice" | "caution" | "danger";
+
+/** The machine-readable warning kinds, so the UI can react to one and the audit can query it. */
+export type RestoreWarningCode =
+  | "stale_archive"
+  | "not_the_newest"
+  | "data_loss"
+  | "part_unavailable"
+  | "run_incomplete"
+  | "manifest_version"
+  | "passphrase_required";
+
+/** One thing an operator must know before restoring. */
+export interface RestoreWarning {
+  severity: RestoreWarningSeverity;
+  code: RestoreWarningCode;
+  message: string;
+}
+
+/** What one archived part does to live data when it is restored. */
+export type RestoreMode = "replace" | "merge" | "advisory";
+
+/** One part of an archive, as the wizard renders it. */
+export interface RestorablePart {
+  part: string;
+  /** Whether the artifact was re-read and agrees with the manifest. */
+  available: boolean;
+  /** Why it is not available, in the store's words, when it is not. */
+  reason: string | null;
+  item_count: number;
+  size_bytes: number;
+  checksum: string | null;
+  /** Live rows or objects this part would overwrite. */
+  live_matches: number;
+  /** Live rows or objects this part would drop, because they are not in the archive. */
+  live_dropped: number;
+  mode: RestoreMode;
+}
+
+/**
+ * What a restore of one run would do.
+ *
+ * `total_live_dropped` is the number the whole screen exists to show: how much the operator
+ * loses by choosing this restore point. It is not derivable from the manifest, which is why
+ * the preview re-reads the destination and counts the live side rather than rendering the
+ * archive's own numbers.
+ */
+export interface RestorePreview {
+  backup_id: string;
+  label: string;
+  finished_at: string | null;
+  age_days: number;
+  parts: RestorablePart[];
+  warnings: RestoreWarning[];
+  restorable_bytes: number;
+  total_live_dropped: number;
+  total_live_matches: number;
+  /** The phrase the operator must type; empty when nothing is restorable. */
+  confirm_phrase: string;
+  restorable: boolean;
+}
+
+/**
+ * What one retention sweep did.
+ *
+ * `removed`, `partial` and `stranded` are three different facts and the screen says all
+ * three: "pruned 4" and "3 of those 4 had a stuck file" are not the same sentence, and a
+ * screen that renders only the first one is the sentence the delete route stopped saying a
+ * tick ago — over a destination nobody is watching.
+ */
+export interface BackupSweepReport {
+  /** Tenants the sweep walked. */
+  walked: number;
+  /** Runs the exemptions offered to the sweep. */
+  candidates: number;
+  /** Runs whose artifacts were completely removed. */
+  removed: number;
+  /** Runs whose row is gone but whose artifacts could not all be removed. */
+  partial: number;
+  /** Tenants whose sweep failed outright. */
+  failed: number;
+  /** Every artifact the sweep could not take, in the store's own words. */
+  stranded: BackupStrandedArtifact[];
+  /** When the sweep ran, in UTC. */
+  at: string;
+}
+
 /** The result of taking a backup. */
 export interface BackupCreateResult {
   /** The finished run. */

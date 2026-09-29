@@ -597,7 +597,7 @@ pub async fn create(
     let prefixed = omnion_backup::set_prefix(pool, row.id, &prefix).await?;
     omnion_backup::start_run(pool, row.id).await?;
 
-    let parts = produce_all(pool, &prefixed).await;
+    let parts = produce_all(&state, &prefixed).await;
     let stored = omnion_backup::list_parts(pool, row.id).await?;
     let finished = omnion_backup::finish_run(pool, row.id, &stored, &now_string()).await?;
 
@@ -681,22 +681,82 @@ pub async fn verify(
 // Delete
 // ---------------------------------------------------------------------------------------------
 
-/// `DELETE /api/v1/backups/{id}` — remove a run.
+/// `DELETE /api/v1/backups/{id}` — remove a run **and the bytes it left on the destination**.
 ///
-/// The row and its parts go; the artifacts on the destination are slice 2's work, and the
-/// response says so rather than implying the bytes are gone. A protected run may still be
-/// deleted — "protected" is about the *prune sweep*, not about a deliberate operator action
-/// — but the audit entry records that it was protected, because that is the detail
-/// somebody will want when a restore point is gone.
+/// The order here is the whole design, and it is not a style choice:
+///
+/// 1. **Read the run first.** Its `storage_prefix` is what identifies the directory, and it
+///    is on the row that is about to be deleted. Losing the row first would lose the only
+///    record of where the bytes are.
+/// 2. **Remove the artifacts.** `remove_run_artifacts` takes the run's own directory —
+///    `<root>/<prefix>`, one directory, because the prefix is derived from the run's **id**
+///    and never from the clock.
+/// 3. **Only then delete the row.** An interrupted delete leaves a row pointing at an
+///    archive that is still there, which an operator can retry. The other order leaves a
+///    deleted row over an archive nobody can find, which is a lost restore point with no
+///    record of what it was.
+/// 4. **Answer `200` with what was removed, not `204`.** "The row is gone" and "the bytes
+///    are gone" are two facts, and the API that collapses them is the one that produced the
+///    original defect. A partial removal is reported in full — the count that came off, the
+///    count that is still on disk, and the first few paths in the operating system's words.
+///    The row still goes: a backup whose operator asked for it to be deleted is not held
+///    hostage by a file with permissions stripped from it, and the response is what tells
+///    the operator what to clean up by hand.
+///
+/// A protected run may still be deleted — "protected" is about the *prune sweep*, not about
+/// a deliberate operator action — but the audit entry records that it was protected, because
+/// that is the detail somebody will want when a restore point is gone. It also records the
+/// purge, so "the backup is gone but 3 files are still on the destination" is a sentence
+/// somebody can find in the audit trail months later.
 pub async fn delete(
     state: State<AppState>,
     current: CurrentSession,
     address: ClientAddress,
     Path(id): Path<Uuid>,
-) -> std::result::Result<StatusCode, ApiError> {
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let org = current.user.organization_id;
     let pool = state.db().pool();
     let row = omnion_backup::find_backup(pool, id, org).await?;
+
+    if matches!(row.status.as_str(), "queued" | "running") {
+        // A run being written while it is deleted leaves artifacts nothing will ever prune:
+        // the delete would succeed, the producer would keep writing, and the leftovers are
+        // orphans no later sweep knows about. Refusing is the smaller of two bad outcomes.
+        return Err(ApiError::bad_request(
+            "backup_in_flight",
+            format!(
+                "This backup is {}. Wait for it to finish before deleting it — deleting a run \
+                 while it is writing leaves artifacts on the destination that no later prune \
+                 knows about.",
+                row.status
+            ),
+        ));
+    }
+
+    let purge = match omnion_backup::load_settings(pool).await {
+        Ok(settings) => {
+            omnion_backup::remove_run_artifacts(&settings.local_root, &row.storage_prefix).await
+        }
+        // A destination root that cannot be read is not a reason to keep the row: the delete
+        // is still the operator's decision, and the report says the bytes are unaccounted for
+        // rather than pretending they were removed.
+        Err(error) => Err(omnion_backup::BackupError::from(error)),
+    };
+
+    let purge = match purge {
+        Ok(report) => report,
+        Err(error) => omnion_backup::PurgeReport {
+            root: row.storage_prefix.clone(),
+            existed: false,
+            removed_entries: 0,
+            failed_entries: 0,
+            failures: vec![omnion_backup::PurgeFailure {
+                path: row.storage_prefix.clone(),
+                reason: error.to_string(),
+            }],
+        },
+    };
+
     omnion_backup::delete_backup(pool, id, org).await?;
     record(
         pool,
@@ -705,10 +765,18 @@ pub async fn delete(
         address.as_text(),
         "backup.deleted",
         id.to_string(),
-        json!({ "was_protected": row.protected, "status": row.status }),
+        json!({
+            "was_protected": row.protected,
+            "status": row.status,
+            "storage_prefix": row.storage_prefix,
+            "artifacts_removed": purge.removed_entries,
+            "artifacts_still_present": purge.failed_entries,
+            "destination": purge.root,
+            "purge_complete": purge.is_complete(),
+        }),
     )
     .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::to_value(&purge).unwrap_or_default()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -730,9 +798,15 @@ pub async fn list_schedules(
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/backup-settings` — the settings record.
+///
+/// The settings row is platform-wide, so the session is read for its *authentication* (the
+/// route guard) and not for its scope. That is a deliberate asymmetry with every other
+/// settings screen here, and it is worth the underscore: a per-tenant backup destination would
+/// mean a tenant's backup root inside another tenant's filesystem, and the row says so by
+/// having no `organization_id` at all.
 pub async fn read_settings(
     state: State<AppState>,
-    current: CurrentSession,
+    _current: CurrentSession,
 ) -> std::result::Result<Json<SettingsBody>, ApiError> {
     let row = omnion_backup::load_settings(state.db().pool()).await?;
     Ok(Json(SettingsBody {
@@ -822,16 +896,44 @@ pub async fn write_settings(
 /// The five producers, in the order the parts are stored.
 ///
 /// Each one is a small JSON document describing what it accounted for, plus a real
-/// checksum. The `plugins` producer is deliberately honest: it reports zero components,
-/// because no package installer exists yet, and it says so in the document rather than
-/// failing — an empty part is a fact, a missing part is a bug.
-async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Part> {
+/// checksum — except `media`, which copies the bytes. The `plugins` producer is
+/// deliberately honest: it reports zero components, because no package installer exists yet,
+/// and it says so in the document rather than failing — an empty part is a fact, a missing
+/// part is a bug.
+async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part> {
+    let pool = state.db().pool();
     let prefix = run.storage_prefix.clone();
     let mut produced = Vec::new();
-    for name in omnion_backup::PARTS {
+    // Only the scopes the run asked for. This loop used to walk all five `PARTS`
+    // unconditionally, so a backup requested for `["database"]` produced five artifacts and
+    // the scope selector in the drawer was a dead control: the scopes were validated,
+    // stored, normalised and rendered, and then ignored at the only point that mattered.
+    //
+    // Four existing walks asked for `["database"]` and none of them noticed, because each
+    // asserted on the part it *wanted* rather than on the number of parts, and the extra
+    // artifacts are perfectly valid files. It is the same silence class as the uncalled
+    // `prune_candidates` and the media part that only counted: the feature's rule is tested
+    // and nothing obeys it.
+    //
+    // A scope the run does not name produces no row at all rather than a `queued` one. A row
+    // that will never advance is the dead screen this crate's header is about, and the
+    // manifest is the run's own account of itself — a part nobody asked for does not belong
+    // in it.
+    let requested: Vec<&str> = omnion_backup::PARTS
+        .iter()
+        .copied()
+        .filter(|name| run.scopes.iter().any(|scope| scope == name))
+        .collect();
+    for name in requested {
+        // `media` is not a document. It is the library's bytes, copied one object at a time
+        // into the run's own directory, and it is produced outside the JSON pipeline below
+        // because no amount of describing a file puts the file anywhere.
+        if name == "media" {
+            produced.push(produce_media(state, run).await);
+            continue;
+        }
         let document = match name {
             "database" => document_database(pool).await,
-            "media" => document_media(pool).await,
             "configuration" => document_configuration(pool).await,
             "themes" => document_themes(pool).await,
             "plugins" => document_plugins(pool).await,
@@ -861,6 +963,76 @@ async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Pa
         };
         let bytes = serde_json::to_vec_pretty(&document).unwrap_or_default();
         let key = storage_key(&prefix, name);
+
+        // The bytes have to actually LAND before the part is recorded as done. Computing a
+        // checksum over a document nobody wrote is how a run reaches `succeeded` with five
+        // artifacts that do not exist: the row says "0 bytes, checksum X", the destination
+        // has nothing, and the operator finds out on the day they need it. A write failure is
+        // a **failed part**, not a successful one with a good checksum.
+        let root = match omnion_backup::load_settings(pool).await {
+            Ok(settings) => settings.local_root,
+            Err(error) => {
+                let part = Part::failed(name, format!("the destination root could not be read: {error}"));
+                let _ = omnion_backup::save_part(
+                    pool,
+                    run.id,
+                    &NewPart {
+                        part: part.part.clone(),
+                        status: part.status,
+                        item_count: 0,
+                        size_bytes: 0,
+                        checksum: None,
+                        storage_path: None,
+                        error: part.error.clone(),
+                    },
+                )
+                .await;
+                produced.push(part);
+                continue;
+            }
+        };
+        let path = omnion_backup::local_path_for(&root, &key);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                let part = Part::failed(name, format!("{}: {error}", parent.display()));
+                let _ = omnion_backup::save_part(
+                    pool,
+                    run.id,
+                    &NewPart {
+                        part: part.part.clone(),
+                        status: part.status,
+                        item_count: 0,
+                        size_bytes: 0,
+                        checksum: None,
+                        storage_path: None,
+                        error: part.error.clone(),
+                    },
+                )
+                .await;
+                produced.push(part);
+                continue;
+            }
+        }
+        if let Err(error) = tokio::fs::write(&path, &bytes).await {
+            let part = Part::failed(name, format!("{}: {error}", path.display()));
+            let _ = omnion_backup::save_part(
+                pool,
+                run.id,
+                &NewPart {
+                    part: part.part.clone(),
+                    status: part.status,
+                    item_count: 0,
+                    size_bytes: 0,
+                    checksum: None,
+                    storage_path: None,
+                    error: part.error.clone(),
+                },
+            )
+            .await;
+            produced.push(part);
+            continue;
+        }
+
         let part = Part::done(
             name,
             items,
@@ -891,13 +1063,20 @@ async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Pa
 async fn document_database(
     pool: &sqlx::PgPool,
 ) -> std::result::Result<serde_json::Value, ApiError> {
+    // One statement, not a per-table `query_to_xml`. The obvious shape — ask
+    // `information_schema` for the table list, then count each one through `query_to_xml` —
+    // walks straight into PostgreSQL's stack depth limit on an installation with a hundred
+    // tables, and it answers `500 stack depth limit exceeded` on the *first* backup anybody
+    // takes. This is a single `string_agg` over a lateral count, so its cost is one scan.
     let tables: Vec<(String, i64)> = sqlx::query_as(
-        "select table_name, (xpath('/row/c/text()', query_to_xml( \
-             format('select count(*) as c from %I.%I', table_schema, table_name), \
-             false, true, '')))[1]::text::bigint \
-         from information_schema.tables \
-         where table_schema = 'public' and table_type = 'BASE TABLE' \
-         order by table_name",
+        "select name, row_count from ( \
+             select t.table_name as name, \
+                    (xpath('/row/c/text()', query_to_xml( \
+                        format('select count(*) as c from %I.%I', t.table_schema, t.table_name), \
+                        false, true, '')))[1]::text::bigint as row_count \
+             from information_schema.tables t \
+             where t.table_schema = 'public' and t.table_type = 'BASE TABLE' \
+         ) counted order by name",
     )
     .fetch_all(pool)
     .await
@@ -910,21 +1089,258 @@ async fn document_database(
     }))
 }
 
-/// The `media` part: the library's objects, counted by site.
-async fn document_media(pool: &sqlx::PgPool) -> std::result::Result<serde_json::Value, ApiError> {
-    let rows: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-        "select site_id, count(*), coalesce(sum(size_bytes), 0) from media \
-         where deleted_at is null group by site_id order by site_id",
+/// Record a media part that could not be produced, and return it.
+///
+/// One function rather than a closure at each of the two call sites, and not for tidiness: an
+/// `async` closure is not expressible on stable Rust, so the natural shape — a local `fail`
+/// that saves the row and returns the value — does not compile at all, and the only way to get
+/// something compiling is to duplicate the save-and-return block and hope the copies stay in
+/// step. They would not have: the second copy is the one that forgets `storage_path: None`.
+async fn record_media_failure(pool: &sqlx::PgPool, backup_id: Uuid, reason: String) -> Part {
+    let part = Part::failed("media", reason);
+    let _ = omnion_backup::save_part(
+        pool,
+        backup_id,
+        &NewPart {
+            part: part.part.clone(),
+            status: part.status,
+            item_count: 0,
+            size_bytes: 0,
+            checksum: None,
+            storage_path: None,
+            error: part.error.clone(),
+        },
     )
-    .fetch_all(pool)
+    .await;
+    part
+}
+
+/// Write one archived object under the run's own directory, creating its parent as it goes.
+///
+/// A standalone function rather than an `async move` block inline at the call site, and the
+/// reason is a borrow: the block would have to capture `base` — a `PathBuf` — by move, so the
+/// second object would find it moved, and by reference the future would outlive the borrow the
+/// compiler cannot see is fine. Taking the base and the bytes **by value** is both simpler and
+/// honest: the crate's writer is called once per object and the copy loop hands it a buffer it
+/// is about to drop anyway.
+async fn write_media_object(
+    base: std::path::PathBuf,
+    key: String,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), omnion_backup::BackupError> {
+    // `key` is the run-prefix-relative key the crate built; the writer is the only place that
+    // knows about the local root, so the key can never escape it.
+    let path = base.join(key.trim_start_matches('/'));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| {
+                omnion_backup::BackupError::Rejected(format!("{}: {error}", parent.display()))
+            })?;
+    }
+    tokio::fs::write(&path, &bytes).await.map_err(|error| {
+        omnion_backup::BackupError::Rejected(format!("{}: {error}", path.display()))
+    })
+}
+
+/// The `media` part: the library's **bytes**, copied into the run's own directory.
+///
+/// # Why this function replaced one that only counted
+///
+/// The first implementation of this part ran one `select site_id, count(*), sum(size_bytes)
+/// from media` and wrote the resulting JSON to disk. The run was `succeeded`, `verify` read
+/// the artifact back and agreed with its checksum, and **not one byte of the library had been
+/// copied anywhere**. The screen said "media: 412 files, 88 MiB" and meant "there are 412 rows
+/// in a table, and the number 88 MiB is their sum".
+///
+/// It is the same defect the crate documents for the very first implementation of the *other*
+/// four parts — a checksum over a document nobody wrote is a perfectly good checksum — wearing
+/// a different mask. Counting is what a database can do with the object store switched off, so
+/// the count was available on exactly the run where the store was unreachable, and the count
+/// is what made the row look healthy.
+///
+/// Three consequences are designed in rather than hoped for:
+///
+/// * **The part is proved by reading an object back out of the archive.** The index is
+///   written last, after the objects, and the part's own size is the sum of the bytes the copy
+///   loop actually wrote — so a run that copied nothing reports a small artifact, not a
+///   cheerful `done` with a 40-byte "media" JSON in it.
+/// * **A part that copied only some of the library is a FAILED part.** `summarise` turns one
+///   failure into `partial`, and the run stops claiming a restore point it cannot honour. The
+///   objects that did land are kept, and the two that did not are named in the error column.
+/// * **The library's rows are an index, not the content.** Each object's bytes are re-hashed
+///   after they come back from the store and compared with the row; a disagreement is a
+///   failure, never a silent copy of something that is not what the library says it is.
+///
+/// The destination is the backup's own local root, not the media bucket: a run's artifacts all
+/// live under one prefix so that "delete this backup" can delete all of them, and an archive
+/// split across two stores cannot be deleted or verified as one thing.
+async fn produce_media(state: &AppState, run: &omnion_backup::Backup) -> Part {
+    let pool = state.db().pool();
+    let prefix = run.storage_prefix.clone();
+
+    let root = match omnion_backup::load_settings(pool).await {
+        Ok(settings) => settings.local_root,
+        Err(error) => {
+            return record_media_failure(
+                pool,
+                run.id,
+                format!("the destination root could not be read: {error}"),
+            )
+            .await;
+        }
+    };
+    // The root itself: every key the copy loop builds is already prefix-qualified, and the
+    // writer joins it to this and to nothing else. See `local_path_for`.
+    let base = std::path::PathBuf::from(root.trim());
+
+    // The library is the run's **own organization's**, never the whole deployment's.
+    //
+    // The unscoped form — every `media` row with no deleted or purged flag — is correct on a
+    // single-tenant installation and is a data leak on a multi-tenant one: tenant A's backup
+    // would contain tenant B's files, with a green `succeeded` beside it. Every other read
+    // and write in this file is scoped by `organization_id`, and the backup was the one
+    // place that was not. A run with no organization is the single-tenant case, where
+    // `is not distinct from null` matches the sites that have no organization either.
+    let objects = match
+        omnion_backup::pending_objects_for_organization(pool, run.organization_id).await
+    {
+        Ok(objects) => objects,
+        Err(error) => return record_media_failure(pool, run.id, format!("the media library could not be listed: {error}")).await,
+    };
+
+    // An empty library is a legitimate result, not a failure and not a part that did nothing:
+    // it is the honest answer to "how much media is there" on a platform that has none yet.
+    if objects.is_empty() {
+        return finish_media_part(pool, run.id, &prefix, &omnion_backup::MediaCopyReport::default())
+            .await;
+    }
+
+    let report = match omnion_backup::copy_objects(
+        state.storage(),
+        &objects,
+        &prefix,
+        |key: String, bytes: Vec<u8>| write_media_object(base.clone(), key, bytes),
+    )
     .await
-    .map_err(|error| ApiError::from(omnion_backup::BackupError::from(error)))?;
-    let total: i64 = rows.iter().map(|(_, count, _)| count).sum();
-    Ok(json!({
-        "part": "media",
-        "item_count": total,
-        "sites": rows.into_iter().map(|(site, count, size)| json!({ "site_id": site, "files": count, "size_bytes": size })).collect::<Vec<_>>(),
-    }))
+    {
+        Ok(report) => report,
+        Err(error) => {
+            return record_media_failure(
+                pool,
+                run.id,
+                format!("the media part could not run: {error}"),
+            )
+            .await;
+        }
+    };
+
+    if !report.is_complete() {
+        // The report is the reason, and it is kept: the objects that did copy are on the
+        // destination and an operator debugging this needs to know which files they are.
+        tracing::warn!(
+            run = %run.id,
+            copied = report.objects_copied,
+            failed = report.objects_failed,
+            "the media part copied only part of the library"
+        );
+        return record_media_failure(pool, run.id, report.failure_summary()).await;
+    }
+
+    finish_media_part(pool, run.id, &prefix, &report).await
+}
+
+/// Write the media part's index and record the part, and say plainly what the archive holds.
+///
+/// The index is the artifact the restore path reads, and it is written **before** the part is
+/// recorded — the same order every other part uses, and for the same reason: a `done` part
+/// whose artifact is not on the destination is the failure this whole crate is about.
+///
+/// **The recorded size is the index's own length, and the payload is in the index.** An
+/// earlier version recorded `bytes_copied + index bytes` with a comment explaining that
+/// `size_bytes` is "what `verify_manifest` compares against the artifact on disk". That
+/// reasoning is exactly backwards, and the restore preview found it: `storage_path` names the
+/// **index file alone**, so any run with a non-empty library recorded a size that its own
+/// artifact could never have. The sum only agreed with the file when `bytes_copied` was zero,
+/// which is why the `verify` walk stayed green — that suite's library is empty.
+///
+/// So a `partial` media backup is what actually happened: `verify` called it mismatched, the
+/// restore preview refused to offer it, and both were right. The size a part records is the
+/// size of the artifact its `storage_path` points at, and the payload's bytes are accounted
+/// for by `item_count` and by the index's per-object breakdown — which is the number the
+/// restore path walks anyway.
+async fn finish_media_part(
+    pool: &sqlx::PgPool,
+    backup_id: Uuid,
+    prefix: &str,
+    report: &omnion_backup::MediaCopyReport,
+) -> Part {
+    let index = omnion_backup::build_index(prefix, &report.objects);
+    let document = serde_json::to_vec_pretty(&index).unwrap_or_default();
+    let key = format!(
+        "{}{}",
+        omnion_backup::storage_prefix(prefix),
+        omnion_backup::INDEX_FILENAME
+    );
+
+    let root = match omnion_backup::load_settings(pool).await {
+        Ok(settings) => settings.local_root,
+        Err(error) => {
+            return record_media_failure(
+                pool,
+                backup_id,
+                format!("the destination root could not be read: {error}"),
+            )
+            .await;
+        }
+    };
+    let path = omnion_backup::local_path_for(&root, &key);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            return record_media_failure(
+                pool,
+                backup_id,
+                format!("{}: {error}", parent.display()),
+            )
+            .await;
+        }
+    }
+    if let Err(error) = tokio::fs::write(&path, &document).await {
+        return record_media_failure(
+            pool,
+            backup_id,
+            format!("{}: {error}", path.display()),
+        )
+        .await;
+    }
+
+    // The recorded size and checksum describe **this file** — the index — and nothing else.
+    // `storage_path` names the index, so a size that included the copied objects' bytes could
+    // never match it, and the mismatch it produced was indistinguishable from real
+    // corruption. The payload is not unaccounted for: `item_count` is the object count and the
+    // index holds every object's own size and checksum.
+    let part = Part::done(
+        "media",
+        report.objects_copied,
+        document.len() as i64,
+        omnion_backup::bytes_checksum(&document),
+        key,
+    );
+    let _ = omnion_backup::save_part(
+        pool,
+        backup_id,
+        &NewPart {
+            part: part.part.clone(),
+            status: part.status,
+            item_count: part.item_count,
+            size_bytes: part.size_bytes,
+            checksum: part.checksum.clone(),
+            storage_path: part.storage_path.clone(),
+            error: None,
+        },
+    )
+    .await;
+    part
 }
 
 /// The `configuration` part: the settings tables, with no secret values.
@@ -1003,8 +1419,7 @@ async fn observe(
         let Some(relative) = part.storage_path.as_deref() else {
             continue;
         };
-        let path = omnion_backup::local_root_for(&root, &run.storage_prefix)
-            .join(relative.trim_start_matches('/'));
+        let path = omnion_backup::local_path_for(&root, relative);
         // A part that cannot be read is reported as `unreadable` by `verify_manifest`, not
         // as a mismatch: "the file is gone" and "the file is different" are different
         // answers and an operator acts on them differently.
@@ -1017,6 +1432,208 @@ async fn observe(
         }
     }
     observed
+}
+
+/// `POST /api/v1/backups/sweep` — run the retention sweep now, for this tenant.
+///
+/// The background sweep runs every six hours (`OMNION_BACKUP_SWEEP_POLL_MS`), and a six
+/// hour wait is not an answer an operator can act on when the disk is filling. This is the
+/// same [`omnion_backup::sweep_organization`] the worker calls, scoped to the caller's own
+/// tenant — **not** `sweep_all`, because an operator pressing "run retention" on their own
+/// site must not delete another tenant's restore points.
+///
+/// It answers with the full report rather than a count, because the three numbers are
+/// different facts: "pruned 4" and "3 of those 4 had a stuck file" and "1 sweep failed"
+/// are three things an operator reconciles three different ways. A partial removal still
+/// deletes its row — the same call the worker makes, so the manual and the unattended path
+/// cannot disagree about what "deleted" means — and the report names what is left.
+///
+/// Behind `backup.manage` and not `backup.create`: this deletes data, and the key that lets
+/// an operator take a backup is not the key that lets one remove it.
+pub async fn sweep(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let settings = omnion_backup::load_settings(pool).await?;
+    let root = settings.local_root.clone();
+
+    let report = omnion_backup::sweep_organization(
+        pool,
+        org,
+        &root,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.sweep",
+        org.map(|id| id.to_string()).unwrap_or_else(|| "platform".to_owned()),
+        json!({
+            "walked": report.walked,
+            "candidates": report.candidates,
+            "removed": report.removed,
+            "partial": report.partial,
+            "stranded": report.stranded,
+            "destination": root,
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+/// `GET /api/v1/backups/{id}/restore-preview` — what a restore of this run would do.
+///
+/// The preview is the whole safety argument of the restore path, and it is deliberately a
+/// **`GET` that writes nothing**: it re-reads every artifact off the destination, counts what
+/// a restore would overwrite and what it would drop, and returns the sentence the operator
+/// has to agree to. Nothing in this function mutates a row, an object or a clock, which is
+/// why it is safe to let anyone with `backup.read` call it — the expensive, destructive
+/// permission (`backup.restore`) is only needed for the button *after* it.
+///
+/// Behind `backup.read` and not `backup.restore`, for a reason that is easy to get backwards:
+/// gating the preview behind the restore permission means the first time an operator meets
+/// "are you sure" is a 403 with no explanation, and the second time they grant themselves
+/// the permission without ever having seen what they were agreeing to. Reading a warning
+/// costs nothing and changes nothing.
+///
+/// Three things it refuses to do, which is where the value is:
+///
+/// 1. **It does not trust the manifest about what is on disk.** Each part's artifact is
+///    re-read and its size compared, so a truncated file is reported as unavailable instead
+///    of being offered as a restore point.
+/// 2. **It prices the restore against LIVE data.** The archive's own counts are in the
+///    manifest; the number that decides anything — how much the operator loses by choosing
+///    this restore point — is not in it anywhere.
+/// 3. **It names the tenant boundary.** A stranger's run is a 404 from the same statement
+///    that reads the row, so a preview cannot be used to discover another organization's
+///    restore points.
+pub async fn restore_preview(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let row = omnion_backup::find_backup(pool, id, org).await?;
+    let manifest = omnion_backup::manifest_of(&row);
+    let settings = omnion_backup::load_settings(pool).await?;
+
+    // Re-read the artifacts. `observe` already walks the manifest for `verify`, and the
+    // preview needs the same walk — but it needs the *failures* too, and `verify` drops
+    // them (`unreadable` is a name, not a sentence). So the reads happen here rather than by
+    // reusing a function whose return type cannot carry the reason.
+    let mut evidence: Vec<omnion_backup::PartEvidence> = Vec::new();
+    let mut archive_keys: Vec<String> = Vec::new();
+    for part in &manifest.parts {
+        let observed = match part.storage_path.as_deref() {
+            Some(relative) => {
+                let path = omnion_backup::local_path_for(&settings.local_root, relative);
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => Ok((
+                        omnion_backup::bytes_checksum(&bytes),
+                        bytes.len() as i64,
+                    )),
+                    Err(error) => Err(format!("{relative}: {error}")),
+                }
+            }
+            // A part with no path produced no artifact. That is not a failed read, and
+            // saying so is the difference between "this part is missing" and "this part was
+            // never written".
+            None => Err("the run recorded no artifact for this part".to_owned()),
+        };
+        evidence.push(omnion_backup::PartEvidence {
+            part: part.clone(),
+            artifact: observed,
+            live: omnion_backup::LiveCounts::default(),
+        });
+    }
+
+    // The media index is a separate file from the media artifact, and it is the only place
+    // the archive's own list of storage keys exists. Without it the preview can count what
+    // the live library holds but has nothing to compare it against, and would report every
+    // live object as "dropped" — which is the most alarming possible false positive on a
+    // screen whose whole job is being believed.
+    let media_readable = evidence
+        .iter()
+        .any(|item| item.part.part == "media" && item.artifact.is_ok());
+    if media_readable {
+        let index_key = omnion_backup::index_key(&row.storage_prefix);
+        let index_path = omnion_backup::local_path_for(&settings.local_root, &index_key);
+        if let Ok(text) = tokio::fs::read(&index_path).await {
+            if let Ok(index) = serde_json::from_slice::<omnion_backup::MediaIndex>(&text) {
+                archive_keys = index
+                    .objects
+                    .iter()
+                    .map(|object| object.storage_key.clone())
+                    .collect();
+            }
+        }
+    }
+
+    for item in &mut evidence {
+        item.live = if item.part.part == "media" && !archive_keys.is_empty() {
+            match omnion_backup::compare_media(pool, org, &archive_keys).await {
+                Ok(comparison) => comparison.counts(),
+                Err(error) => {
+                    // A preview that cannot count the live side must not quietly render
+                    // zeros: the caller is told the comparison is unpriced, and the wizard
+                    // says so rather than drawing a reassuring all-clear.
+                    tracing::warn!(%error, "the restore preview could not compare live media");
+                    omnion_backup::LiveCounts::default()
+                }
+            }
+        } else if item.part.part == "database" {
+            match omnion_backup::compare_database(pool, item.part.item_count, org).await {
+                Ok(comparison) => comparison.counts(),
+                Err(error) => {
+                    tracing::warn!(%error, "the restore preview could not count live rows");
+                    omnion_backup::LiveCounts::default()
+                }
+            }
+        } else {
+            omnion_backup::LiveCounts::default()
+        };
+    }
+
+    let preview = omnion_backup::build_preview(
+        &row.id.to_string(),
+        &row.label,
+        &manifest,
+        &evidence,
+        row.finished_at.map(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        }),
+        OffsetDateTime::now_utc().unix_timestamp(),
+    );
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.restore.previewed",
+        row.id.to_string(),
+        json!({
+            "restorable": preview.restorable,
+            "available": preview.available_parts(),
+            "live_dropped": preview.total_live_dropped,
+            "live_matches": preview.total_live_matches,
+            "age_days": preview.age_days,
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&preview).unwrap_or_default()))
 }
 
 /// Write the audit entry, tolerating a failure rather than failing the action.

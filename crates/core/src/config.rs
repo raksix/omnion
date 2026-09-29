@@ -131,6 +131,23 @@ pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
 /// parses into a `u64` and refuses a negative or zero value.
 const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
 
+/// How often the backup retention sweep runs (REQ-013, slice 3).
+///
+/// Six hours, and the number is chosen from the feature rather than from taste: the sweep
+/// only removes runs whose own `retain_until` has passed, the shortest window the panel
+/// allows is a day, and the *newest successful* run is exempt whatever the window. So an
+/// hourly sweep would find the same set as a six-hourly one almost every time — six times
+/// the statements for an identical answer — and a nightly sweep would leave a run whose day
+/// ended at 04:00 sitting on the destination for twenty hours. Six hours sits between the two
+/// and keeps the unattended deletes to one a few hours per site.
+pub const DEFAULT_BACKUP_SWEEP_POLL_MS: u64 = 21_600_000;
+
+/// Tenants one backup sweep walks before the rest waits for the next tick.
+pub const DEFAULT_BACKUP_SWEEP_MAX_TENANTS: i64 = 50;
+
+/// The same bound as a `u64`, for the same reason as [`DEFAULT_RETENTION_MAX_SITES_U64`].
+const DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64: u64 = 50;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -501,6 +518,25 @@ pub struct RetentionConfig {
     pub poll_ms: u64,
     /// How many sites one tick may walk (`OMNION_RETENTION_MAX_SITES`).
     pub max_sites: i64,
+    /// Whether this process sweeps expired backups off the destination (`OMNION_BACKUP_SWEEP`).
+    ///
+    /// A **separate** flag from `runner_enabled` on purpose. The media sweeper removes
+    /// library files and the backup sweeper removes restore points, and an installation
+    /// that wants to keep every backup for ever — an air-gapped archive, a compliance
+    /// deployment that manages retention itself — must be able to stop the second without
+    /// stopping the first. One flag for both would make "never delete my backups" mean "never
+    /// purge my trash" as well, and the only way out would be to turn the whole worker off.
+    pub backup_sweep_enabled: bool,
+    /// Delay between two backup sweeps (`OMNION_BACKUP_SWEEP_POLL_MS`).
+    ///
+    /// The default is long on purpose and it is a **conservative** one: the sweep is
+    /// unattended and its deletes are the only ones in this feature no operator asked for.
+    /// A tick that finds nothing costs one grouped query, so the interval can be hours
+    /// without cost — and an installation that has just restored something and wants the
+    /// space back does not have to wait for a manual sweep to be offered in the panel.
+    pub backup_sweep_poll_ms: u64,
+    /// How many tenants one backup sweep may walk (`OMNION_BACKUP_SWEEP_MAX_TENANTS`).
+    pub backup_sweep_max_tenants: i64,
 }
 
 impl Default for RetentionConfig {
@@ -509,6 +545,9 @@ impl Default for RetentionConfig {
             runner_enabled: true,
             poll_ms: DEFAULT_RETENTION_POLL_MS,
             max_sites: DEFAULT_RETENTION_MAX_SITES,
+            backup_sweep_enabled: true,
+            backup_sweep_poll_ms: DEFAULT_BACKUP_SWEEP_POLL_MS,
+            backup_sweep_max_tenants: DEFAULT_BACKUP_SWEEP_MAX_TENANTS,
         }
     }
 }
@@ -923,6 +962,21 @@ impl Config {
                 DEFAULT_RETENTION_MAX_SITES_U64,
             )?)
             .unwrap_or(DEFAULT_RETENTION_MAX_SITES),
+            // The backup sweep reads its own root out of `backup_settings` every tick, so a
+            // malformed value here would be a worker that kept its default and a destination
+            // that quietly changed. Both knobs get the boot-time treatment every other one gets.
+            backup_sweep_enabled: read_flag(&read, "OMNION_BACKUP_SWEEP", true)?,
+            backup_sweep_poll_ms: read_positive(
+                &read,
+                "OMNION_BACKUP_SWEEP_POLL_MS",
+                DEFAULT_BACKUP_SWEEP_POLL_MS,
+            )?,
+            backup_sweep_max_tenants: i64::try_from(read_positive(
+                &read,
+                "OMNION_BACKUP_SWEEP_MAX_TENANTS",
+                DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64,
+            )?)
+            .unwrap_or(DEFAULT_BACKUP_SWEEP_MAX_TENANTS),
         };
 
         let analytics = AnalyticsConfig {
@@ -1498,6 +1552,47 @@ mod tests {
         // answer is that the platform starts and refuses cookie-authenticated mutations.
         let config = config_from(&[]).expect("the platform boots without a CSRF secret");
         assert!(!config.csrf.is_usable());
+    }
+
+    /// The backup sweep is gated by its OWN flag, and that is the property worth pinning: an
+    /// installation that wants to keep every backup for ever must be able to stop the sweep
+    /// without stopping the media sweeper, and the reverse must hold too. If these two ever
+    /// share a flag again, this test is the one that notices.
+    #[test]
+    fn the_backup_sweep_has_its_own_switch() {
+        let on = config_from(&[]).expect("the platform boots");
+        assert!(on.retention.backup_sweep_enabled);
+        assert!(on.retention.runner_enabled);
+
+        let media_only = config_from(&[("OMNION_BACKUP_SWEEP", "false")])
+            .expect("stopping the backup sweep is a valid configuration");
+        assert!(!media_only.retention.backup_sweep_enabled);
+        assert!(
+            media_only.retention.runner_enabled,
+            "stopping the backup sweep must not stop the media sweeper"
+        );
+
+        let backups_only = config_from(&[("OMNION_RETENTION_RUNNER", "false")])
+            .expect("stopping the media sweeper is a valid configuration");
+        assert!(!backups_only.retention.runner_enabled);
+        assert!(
+            backups_only.retention.backup_sweep_enabled,
+            "stopping the media sweeper must not stop the backup sweep"
+        );
+    }
+
+    /// A malformed sweep interval is a boot failure, not a worker that quietly kept its
+    /// default — the same treatment every other interval gets, and the reason it matters most
+    /// here is that the interval is how often unattended deletes happen.
+    #[test]
+    fn a_broken_backup_sweep_interval_fails_at_boot() {
+        let error = config_from(&[("OMNION_BACKUP_SWEEP_POLL_MS", "0")])
+            .expect_err("a zero interval is refused");
+        assert_eq!(error.key, "OMNION_BACKUP_SWEEP_POLL_MS");
+
+        let error = config_from(&[("OMNION_BACKUP_SWEEP_MAX_TENANTS", "plenty")])
+            .expect_err("a non-numeric bound is refused");
+        assert_eq!(error.key, "OMNION_BACKUP_SWEEP_MAX_TENANTS");
     }
 
     #[test]

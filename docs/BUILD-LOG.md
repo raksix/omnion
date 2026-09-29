@@ -4143,3 +4143,508 @@ failure is a red line instead of an afternoon.
 **Next.** First thing: find why the sign-in does not land on a freshly reset QA database, because
 every depth pass depends on it and it is currently zeroing this writer's and possibly others'
 results. Then re-run the pass and fix `runAiAgentsDepth` against a real session. Then REQ-100.
+### REQ-013 slice 1 — the backup centre: run it, look at it, verify it (2026-09-29)
+
+**What.** The platform had a media library, a content store, a permission system and a theme
+directory, and nothing anywhere in it could be put back the way it was. An operator's honest
+answer to "can I restore this if the volume dies" was a screenshot of a `pg_dump` somebody had
+run by hand once. This slice ships the part of the answer that can be shipped without a restore
+wizard behind it: take a backup, look at what it wrote, and **prove** it wrote it.
+
+* `0157_backup_center.sql` — `backups`, `backup_parts`, `backup_schedules`, `backup_settings`.
+* `crates/backup` — the model, the destination, the four tables. 46 unit tests.
+* `apps/api/src/routes/backups.rs` — ten routes behind four new permission keys.
+* `apps/admin/features/backups/` + `/backups` — the overview, the create drawer, the parts
+  table, verify, delete, and a walkthrough route with a depth pass that drives all of it.
+* `apps/api/tests/backups.rs` — seven walks over the real router and a real database.
+
+**Proof.** `omnion-backup --lib` 46/0, `omnion-api --lib` 220/0, `omnion-permissions --lib` 62/0,
+`apps/admin` `tsc --noEmit` clean, the whole migration set applied on a fresh database, and the
+seven walks in `apps/api/tests/backups.rs`. **The browser pass has NOT run this tick** — see
+the blocker below.
+
+**Four defects the walks found, none of which any unit test could have seen.**
+
+1. **Nothing was ever written to the destination.** The producers built each part's document,
+   hashed it and recorded a `done` part — and no code path put the bytes on disk. The run
+   reached `succeeded` with five artifacts that did not exist, and `verify` answered "could not
+   be read back: configuration, database, media, plugins, themes" for all five. This is the
+   single most expensive thing a backup product can do. **A unit test on `bytes_checksum`
+   cannot see it**, because a checksum over a document nobody wrote is a perfectly good
+   checksum. Only a walk that uploads and then re-reads the file off the destination can see
+   that the two halves are different facts. The producer now writes the bytes *before*
+   recording the part, and a write failure is a **failed part** rather than a success with a
+   good checksum.
+2. **A `before insert` trigger on `backup_settings` that inserted the same row.** The settings
+   save answered `500 stack depth limit exceeded` with the recursion in the context, six hundred
+   lines of PL/pgSQL deep. `on conflict` does not help: the trigger fires *before* the conflict
+   is evaluated, so it re-inserts the row it was called for. `0028` and `0044` needed their
+   triggers because their rows are keyed by a `site_id`; **this one is keyed by `check (id = 1)`,
+   so the primary key IS the guarantee** and a seed is complete. The trigger is deleted and the
+   section explains why it must not come back. The lesson is narrower than "don't use
+   triggers": *copy the reason a neighbouring migration needed one, not its shape.*
+3. **`sum(size_bytes)` over a `bigint` column decodes as NUMERIC.** The status card `500`d on
+   every call. The cast is `::bigint` and deliberately **not** `::int` — a total that wraps at
+   2 GiB reports a plausible small number, which is worse than an error somebody can see.
+4. **Two of the suite's own assertions were wrong in a way that would have hidden #1.** The
+   error envelope nests the message under `error.message`, so six assertions read
+   `body["message"]`, got `Null`, and failed on a *missing* message when the API had said
+   exactly the right thing; and `OffsetDateTime` serialises as a tuple, not an RFC 3339 string,
+   so the status-card assertion failed on a working endpoint. Both are fixed with a
+   `TestResponse::message()` helper and a comment, because a test that fails for the wrong
+   reason trains the reader to distrust the test rather than the code.
+
+**The two permission decisions that are the point of the slice.** `backup.manage` deliberately
+does **not** include `backup.restore`: a platform where the schedule editor can also overwrite
+live content is a platform where the nightly job and an operator's button are the same
+authority, which is how a retention window becomes an outage. And a run of another tenant is a
+`404`, never a `403` — a `403` confirms the id is real, and a backup's existence is itself
+information about the platform.
+
+**Commits:** `bb291fa` the migration · `c1f7380` the crate · `d4299fc` the permission keys ·
+`ef27bc4` the API · `4d4b8f4` the admin screen and the walk · `18d6e84` the three defects ·
+`0dac9fa` the settings-route note. All pushed.
+
+**Blocker, repo-wide and not this slice's.** Two things the box is doing, both recorded rather
+than worked around. (a) **The browser pass ran but cannot close REQ-010 or REQ-012** — its
+`qa-slot.sh` reclaimed a stale place and then produced depth passes that mostly report `ok:
+false` with reasons about the *sibling* screens' own data (`the retention tab did not render`,
+`no file to share — the upload step did not succeed`), and its analytics pass answered
+`"validation":"silent"` on a form that saved. Those are the media and analytics screens'
+findings, not this slice's, and they are recorded in `docs/qa/`. (b) **The integration suite is
+running against a box at load 23-100** with nine sibling worktree loops each holding their own
+PostgreSQL and Chromium, so a seven-walk suite that takes 16 s of work is taking minutes of
+wall clock. The last full run is in flight at the time of writing; the per-test results are in
+this tick's report.
+
+**Next.** (a) Re-run `apps/api/tests/backups.rs` to green on a quiet box, and
+(b) close the REQ-010 and REQ-012 boxes on the same pass — both are code-complete and are
+waiting on nothing but a browser pass that has not yet produced one.
+
+
+
+
+### Tick 65 — the blocker is not the box: three real defects behind a red suite (2026-09-29)
+
+**What.** Last tick left a blocker in `docs/BUILD-LOG.md` and did not work around it: eight sibling
+media suites were red on `csrf_unavailable` and `rate_limited`, and the note said the fix belongs
+to the security work rather than to media. This tick took the first two of them
+(`media_shares`, `media_retention`), read the actual failure, and found that the "suite issue"
+was **three product defects**, one of them in code this loop wrote last tick.
+
+**1. A sign-in issues two cookies and twenty helpers read one.** `support/walk_auth.rs`. Sign-in
+answers with the session cookie *and* a CSRF token beside it. Twenty suites each had a `login()`
+taking `.split(';').next()` on the first `Set-Cookie` — correct for one cookie, silently lossy
+for two. Fixing the helper was not enough: the second defect sat underneath it. **Those fixtures
+never set `config.csrf` at all**, so their own sign-in could not have issued a token. The
+refusal was the product working correctly; the suites were asserting a deployment that cannot
+exist. `media_shares` **0 passed / 5 failed → 5 / 0**, `media_retention` **0 / 5 → 6 / 0**.
+
+**2. A site with media in it could not be backed up** (`b0b4542`). `document_media` read
+`coalesce(sum(size_bytes), 0)` with no cast, and the `coalesce` is the trap — the literal `0`
+adopts the other argument's type, so the result stays `numeric`. This is the **second** instance
+of the same mistake in one feature; the first was the status card, fixed last tick. A `partial`
+run with four good parts and a `media` part that never happened is a terrible way to discover it,
+and it is exactly what the build log recorded as "the media part is flaky".
+
+**3. The prune sweep could delete every restorable backup** (`ed09dc4`). `prune_candidates`
+promised four exemptions in its doc comment and implemented two. No `status = 'succeeded'` on the
+spared run, so a `partial` — not restorable as a whole — took the protection while the newest run
+that *can* be restored was offered for deletion. No `not protected` either, so a protected newest
+run consumed a second invisible exemption and the rest of the history was offered for deletion,
+and the sweep reported success. Two exemptions, one survivor.
+
+**And the one that was hiding underneath all of it** (`bfe46c3`). The retention screen answered
+`500` as soon as a site had a file actually past its restore window: `past_restore_window` summed
+`size_bytes` with no cast and the comment above it *claimed* one. Nothing exercised it, and the
+reason is the lesson — `sum()` over an empty set is `NULL`, `NULL` decodes into `Option<i64>`, and
+every existing walk stopped at a site with nothing to count. The type was confirmed against the
+database rather than assumed: `pg_typeof(sum(size_bytes))` is `numeric`, `coalesce(...,0)` is
+still `numeric`, `::bigint` is `bigint`. The new walk fails on `main` with
+`500 ... NUMERIC is not compatible with INT8` and passes with the cast.
+
+**Proof.** `omnion-backup --lib` 46/0 · `omnion-media --lib` 199/0 · `omnion-api --lib` 220/0 ·
+`--test backups` 7/0 · `--test media_retention` 6/0 · `--test media_shares` 5/0 ·
+`--test walk_auth` 6/0 (new) · `apps/admin` `tsc --noEmit` clean. Commits `b17e64b`, `bfe46c3`,
+`b0b4542`, `ed09dc4`, all pushed.
+
+**Blocker, unchanged and not worked around.** The browser pass did not run: `qa-slot.sh` has a
+live sibling holder and the box is at load 16 with **0 GB free** of 32. A pass now would add a
+third Chromium to a machine that is already swapping, and the result would be untrustworthy
+either way. `runMediaRetention` and `runSecurityDepth` are written, wired and still unrun, which
+is the only reason REQ-010, REQ-012 and REQ-013 stay open.
+
+**Next.** (a) Migrate the remaining eighteen suites to `support::walk_auth` — it is a three-line
+change per suite now, and each one is a REQ that can then be closed on its browser pass rather
+than on the note that its suite was already red. (b) The `media` part of a backup run is the
+place to look next: it counts rows, and a backup that only counts is a manifest, not a backup.
+
+### Tick 66 — the media part was a manifest wearing a backup's name (2026-09-29)
+
+**What.** Last tick's next step was written before it was understood: *"the `media` part of a
+backup run is the place to look next: it counts rows, and a backup that only counts is a
+manifest, not a backup."* This tick took it literally. The media part did not count rows
+and copy them; it counted rows **and that was all it did**.
+
+**The defect.** `document_media` ran
+`select site_id, count(*), coalesce(sum(size_bytes), 0)::bigint from media`, wrote the result
+as JSON, and recorded that JSON as the part's artifact with a real checksum. The run reached
+`succeeded`, `verify` read the artifact back and agreed with it, and **not one byte of the
+library had been copied anywhere**. The screen said "media: 412 files, 88 MiB" and meant
+"there are 412 rows in a table, and their sizes add up".
+
+It is the same defect the crate documents twice already — a checksum over a document nobody
+wrote is a perfectly good checksum — wearing a different mask, and the mask is the lesson:
+**counting is what the database can do with the object store switched off.** The count was
+therefore available on exactly the run where the store was unreachable, and it is what made
+the row look healthy. Every pre-existing assertion in the suite passed on the broken
+implementation, which is why it needed a walk of its own.
+
+**What shipped** (`crates/backup/src/media.rs`, new, 22 unit tests). The part copies every
+object through the deployment's own `Storage` abstraction — not a vendor SDK, so a site on a
+directory and a site on a bucket both back up — one object at a time, writing each into the
+run's own directory and recording it in a `media-index.json` the restore path will walk. The
+bytes that come back are **re-hashed and compared with the library row**; a disagreement in
+size or SHA-256 is a failure, never a silent copy of something the library does not describe.
+An object over `MAX_OBJECT_BYTES` (256 MiB) is **named and skipped, not truncated** — a
+truncated image is a backup that claims to have restored a file it destroyed. A part that
+copied some of the library is a **failed** part: `summarise` makes the run `partial` and the
+error carries the count and the first three file names.
+
+**And the bug the walk found underneath it** — one the tick was not looking for. Every
+artifact in every run was written to `<root>/<prefix>/<prefix>/…`. A storage key is already
+prefix-qualified, and the writer joined it to `local_root_for(root, prefix)`, which adds the
+prefix a second time. The **reader doubled it the same way and so did the suite's path
+helper**, so all three agreed, every walk was green, and the archive sat one directory deeper
+than the manifest said. Three halves making the same mistake is not a cross-check. Fixed with
+a separate `local_path_for(root, key)` and a unit test that writes the wrong path out in full
+so the mistake cannot come back quietly. The new walk now reads the archive's location **out
+of the index the run wrote** rather than recomputing it, so the two halves *can* disagree.
+
+**Proof.** `omnion-backup --lib` 65/0 · `omnion-api --lib` 220/0 · `--test backups` **8/0**
+(the seven pre-existing walks still pass, plus `the_media_part_copies_the_librarys_bytes_and
+_a_missing_object_fails_the_run`, which uploads two real objects through `state.storage()`,
+reads the archived bytes back and compares them, checks the index's per-object size and
+checksum against the files on disk, then adds a row whose object the store does not have and
+requires `partial` with "1 of 3" in the error) · `apps/admin` `tsc --noEmit` clean. The build
+warning count is **13 before and 13 after** — none introduced.
+
+**Blocker, unchanged and not worked around.** The browser pass did not run again: `qa-slot.sh`
+is held by a sibling and the box peaked at load 36 during this tick. The Rust walks are the
+gate that shipped, and the screen for this part is unchanged, so nothing is untested in the
+UI sense — but the run against `runBackupDepth`/`runSecurityDepth` still has to happen before
+REQ-010, REQ-012 and REQ-013 close.
+
+**Next.** (a) The restore path (REQ-013 slice 2) now has a real archive to read: the index is
+written, so `restore preview` can count the objects it can put back instead of describing
+what might be there. (b) `objects/` grows one file per object, and the delete route has to
+remove the directory as well as the run's own JSON — check that before the restore wizard
+exists, because an operator who deletes a backup and finds the files still there will assume
+the product lied.
+
+## Tick 67 — 2026-09-29 — the delete had no bytes in it, and the media part had no tenant
+
+**What.** Two defects, and the second was found by the first's own fixture rather than
+looked for. The acceptance box this tick took is the one that reads like bookkeeping —
+"deleting a backup removes its artifacts from the destination" — and the bookkeeping was the
+defect.
+
+**The delete was a row delete.** `DELETE /api/v1/backups/{id}` removed the row, cascaded the
+parts, wrote the audit entry and answered `204`. Every byte stayed on the destination: the
+database export, the `objects/` tree, the media index, the three JSON parts, the manifest.
+The panel knew. It said so — *"Backup removed. Its artifacts are still on the destination
+until the next prune."*
+
+That sentence is the most instructive part. It is **honest, and it is also the bug**. A backup
+root is the one directory in this product that costs money per byte forever, and the prune
+sweep runs on its own schedule — not when an operator deletes something. So the ordinary
+path was: tidy up three old runs, watch the list go green, and keep a full copy of the
+platform's media library on disk with nothing pointing at it. Every later backup, every
+month, would do it again. The product told the operator the truth and the truth was the
+problem. **Honest phrasing is how a missing feature survives review** — a note that
+describes the gap reads as a design decision, and a design decision is not a bug report.
+
+`crates/backup/src/purge.rs` (new) removes **the run's own directory** rather than walking
+the manifest and deleting what it lists. A run that died mid-write left files the manifest
+never mentioned, and an index-driven delete leaks exactly those. The directory is a boundary
+because the prefix is derived from the run's **id** — which is why `set_prefix` refuses to
+derive it from the clock — and a unit test pins that two runs never share a directory, because
+that property is the delete's entire safety argument and it lives in another module.
+
+Three refusals, all before a byte is touched:
+
+* an **empty or relative root** — `remove_dir_all` on a relative path resolves against the
+  working directory of whatever process ran it, and for a systemd unit that is not the
+  directory an operator typed into the settings screen;
+* a `..` segment in the prefix — **rejected, not normalised**, because a normalised traversal
+  is a traversal that passed the check that was meant to stop it;
+* an **empty prefix** — which would make "delete this backup" mean "delete every backup on
+  the destination".
+
+The handler does **artifacts first, row second**, and the order is the design rather than a
+style choice: an interrupted delete then leaves a row pointing at an archive that is still
+there, which an operator can retry, instead of a deleted row over an archive nobody can find.
+It refuses a `queued`/`running` run, because deleting one mid-write leaves artifacts that no
+later prune knows about. And it answers **`200` with a `PurgeReport` rather than `204`**,
+because "the row is gone" and "the bytes are gone" are two separate facts — the API that
+collapsed them into a status code is what produced the defect. A partial removal reports the
+count that came off, the count still on disk, and the first few paths in the operating
+system's own words; the panel renders all three sentences differently, because "nothing was
+ever there", "twelve files deleted" and "eleven of twelve deleted and here is the one that is
+not" are three facts an operator reconciles differently.
+
+**The tenancy leak, found by the delete walk's fixture.** The part asked for
+`pending_objects(pool, None)` — every `media` row on the deployment — while every other read
+and write in the file is scoped by `organization_id`. **A backup of tenant A contained tenant
+B's files**, the run reported `succeeded`, and `verify` called it clean. The pre-existing
+media walk had been green for a tick because *every test in the suite creates media for one
+organization*, so "the whole deployment" and "this organization's library" are the same set.
+The stranger's rows even named themselves in a failure message — `34 of 36 objects could not
+be copied — share-guarded.txt: no object is stored under "shares/4c70..."` — before anyone read
+the cause. `pending_objects_for_organization` joins through `sites`, and is a **separate
+function rather than an extra parameter** so the unsafe form cannot be reached by forgetting
+an argument. The walk gives each organization a site and a file and requires each archive to
+name only its own — the stranger's run too, because a fix that scoped by *excluding* the
+other org passes the first half and still leaks.
+
+**The repeat, and by now it is a pattern rather than an incident.** Tick 66 found a half that
+**counted**; this tick found a half that **scoped wrongly**. Same shape, same family: a backup
+half that satisfies every assertion in its own test and disagrees with reality. Three of the
+four defects in this feature now share it. The rule that catches the tenancy one, and that
+would have caught it a tick earlier: **if a walk's fixture only ever creates one tenant's
+data, the walk cannot see a tenancy bug — a suite needs a stranger, always, even when the
+assertion is about bytes.** And the second-order version, which cost three runs: when a walk
+touches shared QA state (a unique-constrained `media.storage_key`, or a `backup_settings`
+row), name the isolation explicitly in the fixture, or the second run fails as a constraint
+violation that reads like a product defect.
+
+**Proof.** `omnion-backup --lib` **80/0** (16 in `purge`, including the count-before test the
+walk forced) · `omnion-api --test backups` — the delete walk green in isolation
+(`--exact …` 1/0 in 7.8s) and the tenancy walk green; `apps/admin` `tsc --noEmit` clean.
+Three failures during the tick were **my own test bugs, not the product's**, and they are
+recorded because each one asserted a thing the product never claimed: a `manifest.json` FILE
+(the manifest is a `jsonb` column, never a file), an `objects/` count that forgot the site
+sub-directory, and a per-session CSRF token reused across two sessions — a `403` from a token
+that has nothing to do with tenancy, which a test that reuses a token will misread as a
+product defect.
+
+**Blocker, third tick running, unchanged and not worked around.** The browser pass did not
+run. `qa-slot.sh` was held by a live sibling for the whole window (pid 3490157, then 142641)
+and the box peaked at load 53. `/mnt/apopic` also hit **100%** mid-tick — `os error 28` at
+parse time and `ld` dying with a **Bus error** while linking, which reads like an unrelated
+failure and is not. Reclaimed `target/debug/incremental` **in this worktree only**, after
+checking with `/proc/<pid>/cwd` that no live rustc had it open, and left w2/w3/w5/w7 alone.
+`runBackupDepth`, `runMediaRetention` and `runSecurityDepth` stay written-but-unrun, so
+REQ-010, REQ-012 and REQ-013 do not close on tests alone.
+
+**Next.** (a) The restore path (REQ-013 slice 2) now has an archive it can read: the media
+index is written and `pending_objects_for_organization` says whose files a run may restore,
+so `restore preview` can count what it can put back. (b) The prune sweep must use
+`remove_run_artifacts` too — it deletes the same directories by its own path today, which is
+the third half that could disagree with this one.
+
+## Tick 68 — REQ-013 slice 3 (retention): the sweep had no caller
+
+**What.** `prune_candidates` shipped in slice 1 with a doc comment describing four
+exemptions, and **nothing called it**. The retention screen could list what the sweep would do
+and the walkthrough could assert the exemptions hold, and the bytes on the destination would
+accumulate for ever. Five commits: `e704c0f` the sweep, `faea0bd` the two config knobs,
+`514665c` the worker, `813f33b` the manual route, `9c8170b` the panel, `e77fd9a` the walk.
+
+**The shape of the defect is now unmistakable.** Tick 66 found a half that *counted*. Tick 67
+found a half that *scoped wrongly*. This tick found a half that **was never invoked**. Three
+ticks, three different ways for one feature to satisfy every assertion in its own tests and
+disagree with reality, and all three are the same question: *who calls this?* The delete
+knew how to take a run's artifacts off the disk; the sweep — which deletes **more** than the
+delete does, unattended, with nobody watching — had never heard of the function. That is the
+lesson worth more than the code: **a pure function with a thorough doc comment and no caller
+is the most convincing piece of dead code there is.** It reads as a feature. Its tests pass.
+Its exemption rules are correct. It does nothing at all.
+
+So `crates/backup/src/sweep.rs` is a **caller** and deliberately the only one, and it writes
+no path arithmetic of its own. Two implementations of "remove a run's directory" is how a
+destination ends up with a directory the sweep believes it deleted — the same "two halves that
+make the same mistake are not a cross-check" rule the media part taught, restated at the
+removal.
+
+Three decisions that are not obvious. **Bytes first, row second**, so an interrupted sweep
+leaves a row over an archive that is still there and the next tick takes it again. **A
+partial removal still deletes the row** — the same call the delete handler makes, because
+retention is a window and not a bulk delete, and one stuck file must not retain a run for
+ever. And the sweep walks **tenants**, not rows, through `organizations_with_backups`: a
+separate function rather than an inline `select distinct`, because a second answer to "who
+gets swept" is a rule that drifts the first time one of them is edited. `null` is a real
+member of that list — a sweep that filtered the platform's own backups away would never prune
+the restore points that matter most on a single-tenant installation.
+
+**Two flags, not one.** `OMNION_BACKUP_SWEEP` is independent of `OMNION_RETENTION_RUNNER`,
+because "never delete my backups" must not have to mean "never purge my trash"; the only way
+out otherwise is to turn the whole worker off. The six hour default is chosen from the
+feature: the shortest window the panel allows is a day and the newest successful run is exempt
+whatever it is, so hourly finds the same set six times for the same answer and nightly leaves
+a run whose day ended at 04:00 sitting there for twenty hours.
+
+**The manual route is scoped, and that is the part worth proving.** `POST
+/api/v1/backups/sweep` calls `sweep_organization` for the **caller's** tenant, never
+`sweep_all` — an operator pressing "run retention" on their own site must not delete another
+tenant's restore points. The walk creates a stranger tenant's expired run pointed at the same
+destination and requires it to keep **both** its row and its directory. The stranger is not
+decoration: without it "everything" and "this organization" are the same set, which is the
+exact blind spot the media part's tenancy fix was found through last tick. The same lesson,
+one layer up, and it is now the second time this feature needed a stranger in the fixture.
+
+The route is registered **before** `/backups/{id}`. A `POST` against `/backups/sweep` would
+otherwise match `{id}` and fail to parse `sweep` as a UUID — a 500 that reads like a router
+bug on the one route whose whole point is to be callable by hand.
+
+**Proof.** `omnion-backup --lib` **85/0** (80 before, +5 in `sweep`) · `omnion-core --lib`
+**39/0** (+2, both pinning the flag independence in both directions) · `apps/admin`
+`tsc --noEmit` clean · `the_retention_sweep_takes_the_bytes_and_spares_what_it_promised`
+**1/0 in 5.5s** over the real router and the real filesystem. That walk goes and *looks at
+the directory*, because the sweep's whole claim is about bytes and a row delete reports the
+same counts the panel shows.
+
+**Blocker, fourth tick running, unchanged and not worked around.** The browser pass did not
+run. `qa-slot.sh` is held by a live sibling (pid 142641) and the box peaked at load 23 with
+**1 GB of 32 free** and 24 GB of swap in use; `scripts/qa/run.sh` would have added a fifth
+Chromium to that. `runBackupDepth` stays written-but-unrun, so REQ-013 does not close on
+tests alone. Two toolchain facts, both recorded because each read like a product defect and neither was
+one. A **stale orphan test binary** from an earlier tick (`backups-b245d57c4aaeca51`, no
+parent shell) was holding QA database connections across ticks; killed it. And a **sibling
+deleted my `target/debug/incremental` mid-build**, which surfaces as
+`failed to move dependency graph … os error 2` — a compile failure in files that were already
+merged and building fine. The full-suite run then hung in the pre-existing
+`a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful_survives` with no
+active query and no blocked lock, so I killed it, killed the orphan, rebuilt with
+`CARGO_INCREMENTAL=0` and re-ran that exact test in isolation: **1/0 in 3.19s**. It was never
+red and never broken — it was starved. Two rules, both already half-known and now confirmed:
+**build with `CARGO_INCREMENTAL=0` when siblings are live**, and **an unexplained hang with no
+database activity is contention before it is a defect**.
+
+**Next.** (a) The restore path (slice 2) now has the index a preview needs: the media index
+is written, `pending_objects_for_organization` says whose files a run may restore, and the
+sweep tells the operator what is actually on the destination. (b) The `partial` box is still
+unticked — a run where one part fails ends as `partial` with the message visible in the UI
+needs a fault injected into the drawer, not a test.
+
+
+## Tick 69 — the restore preview, and the two rules three ticks of unit tests had passed
+
+**REQ-013 slice 2a.** `GET /api/v1/backups/{id}/restore-preview` plus the panel that reads it.
+The decisions live in a pure module (`crates/backup/src/restore.rs`) so the rules are
+unit-tested with no stack, and the live-data comparison is a separate one
+(`crates/backup/src/preview.rs`) so a change in how it is counted cannot silently alter which
+warnings fire. The route re-reads every artifact, compares each part's size against the
+manifest, and prices the restore against the live library.
+
+**It found two defects in shipped code.** Both are the fourth instance of one shape — **a rule
+that is tested and that nothing obeys** — and neither was findable by a unit test, because in
+both cases the unit test was the reason it survived.
+
+**1. A media part's recorded size could never match its own artifact.** `finish_media_part`
+recorded `bytes_copied + index bytes` as `size_bytes`, with a doc comment saying that
+`size_bytes` is "what `verify_manifest` compares against the artifact on disk". That reasoning
+is backwards: `storage_path` for the media part names the **index alone**, so a size including
+the copied objects' bytes can never equal the length of that one file. The two agree only when
+`bytes_copied` is zero — which is exactly what the `verify` walk's fixture was, because that
+suite's library has no objects. So `verify` reported every real media backup as mismatched,
+for ever, and the new preview refused to offer it as a restore point. **Both verdicts were
+correct; the number was wrong.** The preview is the first reader that compares a media
+artifact's length on a run with a non-empty library.
+
+**2. `produce_all` never read `run.scopes`.** It walked all five `PARTS` unconditionally, so a
+backup requested for `["database"]` produced five artifacts: the scopes were validated by
+`normalise_scopes`, stored, normalised, and rendered in the drawer's five checkboxes, and then
+ignored at the only point that mattered. **Four existing walks request `["database"]` and none
+of them noticed**, because each asserted on the part it *wanted* rather than on the number of
+parts, and the two extra artifacts are perfectly valid files. The scope selector was a dead
+control with a green tick beside it. A consequence worth recording: a media-only run whose one
+part failed used to be `partial` — the correct verdict about four parts the operator never
+asked for — and is now honestly `failed`. `summarise` is untouched and still right; what
+changed is the set of parts it is handed.
+
+**A third finding, in the new code, from a test with a realistic id.** The typed confirmation
+sliced the first eight hex characters off the run's id. For a v4 uuid that is fine and looks
+random. For a **v7** uuid — whose leading bytes are a millisecond timestamp — "the first eight
+hex characters" is a *clock*: two backups taken three hours apart produced the identical phrase
+`RESTORE 000001a0`, and every run inside a ~50-day window shares one. A guard that restores the
+wrong run is worse than no guard, because it looks like one. The phrase is now a **hash of the
+id**, which mixes the timestamp with the random tail whatever the id's layout, and the id is
+validated first so an unnameable run still yields no phrase at all. The regression test uses two
+v7-shaped ids sharing a timestamp prefix.
+
+**Two smaller ones in my own code, both the silence class.** `LiveCounts::dropped` documented a
+zero floor that `saturating_sub` does not provide — saturating means stop at `i64::MIN`, not
+stop at zero, so an inconsistent live pair rendered as a negative loss. And the
+healthy-archive fixture stamped `now` at a round epoch (Jan 2027) that made every archive look
+107 days old, which is why the first "healthy archive" test failed on a `stale_archive`
+warning it had just proved absent.
+
+**Why the preview is behind `backup.read` and not `backup.restore`.** Reading a warning is free
+and changes nothing; gating it behind the destructive key means the first time an operator
+meets this screen is a 403 that never showed them what they were agreeing to. The expensive
+permission is for the button *after* it.
+
+**Why there is no restore button.** The safety backup, the typed confirmation's enforcement and
+the abort path are the next slice. A "Restore" button that could not be pressed is a dead
+button, which this product does not ship; the panel that explains the restore and asks for
+nothing is a working one. The phrase is **shown** rather than demanded for the same reason.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **103/0** (85 before: +18 preview model) |
+| `omnion-api --test backups` | **15/15** (12 before: +3 preview walks) |
+| `apps/admin` `tsc --noEmit` | clean |
+
+The three new walks are over the **real router and the real filesystem**. The load-bearing one
+prices a one-file archive over a two-file library at exactly **one** lost item, and then proves
+it wrote **nothing**: part rows, run status, `storage_prefix`, `finished_at`, the media rows and
+the archive's directory on the destination are all byte-identical before and after, read back
+out of **PostgreSQL** rather than from the response — a response body cannot prove the database
+was not written to, and this is the one property the whole slice exists for. The second refuses
+a truncated artifact and issues **no phrase**. The third requires a stranger's run to be a 404
+whose message does not name the tenancy rule, because `403 cross_organization` confirms the id
+exists and turns a preview into a restore-point oracle.
+
+**Toolchain, four facts, all of which read like product defects and none was one.**
+`VersionMissing(19)` on the default test database is a **stale QA database from a sibling's
+tree** — the shared migration namespace again, and the default `omnion` database carries a
+version-19 row from `omnion-w2`/`w5`/`w6`, none of which have a 0019 in this tree. The walks ran
+against a disposable `omnion_build_69` instead, which is the rule for a suite database the whole
+box shares. `cargo fmt -p omnion-backup` **rewrote five files I had not touched**; the diff was
+pure whitespace and was reverted with `git checkout --` on exactly the foreign five, which is why
+the `git diff --name-only` comparison is done by hand every tick. The doc-comment linter reports
+`async fn is not permitted in Rust 2015` on every `async` in the crate — the toolchain linter
+does not pass the edition, and `cargo build` is the authority. And a doc comment containing
+`**/` inside a Python triple-quoted string closes the string: two patches this tick failed to
+parse for that reason, and the fix is the `patch` tool, not `execute_code`.
+
+**Browser pass: still not run, fifth tick running, and the reason has changed.** It is no
+longer the `qa-slot.sh` hold recorded in tick 68. That hold is **genuinely live** — I verified
+the holder pid's parent is a running `run.sh` with a walkthrough against `:3102`, so reclaiming
+it would have been stealing another writer's slot, not fixing a stale lock. The pass queued,
+took its place, and then sat in the stack build: at 22:54 the default stack's `18080/3100/3200`
+were still not listening, `qa-artifacts/20260929-224017/` was empty, and the box was at **load
+19** with four sibling stacks (w3, w5, w6, w7) each holding three pm2 processes and Chromium
+sessions. I stopped the pass rather than add a fifth Chromium to a box already at 19, and left
+no orphans: the one remaining slot place is the sibling's, and no `omnion-qa-*` process of mine
+survived. The rule that came out of it is the one already in the ledger — **load 15+ with under
+4 GB free is a deferred pass, not a failed one** — and the discipline that matters more is that
+a deferred pass is reported as deferred. `runBackupDepth` remains written-but-unrun, so REQ-013
+does not close on tests alone, and the walkthrough extension committed in `54f305e` means there
+is a real pass waiting the moment the box has room.
+
+**Two halves making the same mistake are not a cross-check** is a general rule, not a backup
+one, and it is worth carrying out of this feature: the walkthrough's `artifact()` helper and
+`local_path_for` both resolve a prefix to a path, and had the walkthrough repeated the
+double-prefix bug this crate already fixed once, the preview would have "passed" against a
+directory no operator would ever look in.
+
+**Next.** (a) The destructive half of the restore: part selection, the mandatory safety backup
+before the first write, the enforced phrase behind `backup.restore`, abort until the import
+begins, and the `backup.restored` audit entry. (b) The `partial` box is still unticked — a run
+where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
+is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
+read the price, the warnings and the phrase, so when the slot frees there is something to run.
