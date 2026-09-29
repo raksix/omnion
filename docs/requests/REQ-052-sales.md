@@ -146,7 +146,7 @@ Webhook relevance: all eight names are subscribable; `sales.quote.accepted` and 
 
 ### Acceptance criteria
 
-- [x] Migration `0012_sales.sql` applies cleanly on a populated database; `cargo test -p omnion-module-sales` is green. *(Proved as `0051_sales.sql` — the number was the next free slot at build time. 87/87.)*
+- [x] Migration `0012_sales.sql` applies cleanly on a populated database; `cargo test -p omnion-module-sales` is green. *(Proved as `0053_sales.sql` — the number is the next free slot in the shared namespace, which moved twice: main took 0051 for the notification routes and wave9 took 0052. 102/102.)*
 - [x] Every `/api/v1/sales/*` route is permission-guarded (401 / 403 / 200 verified per key); cross-organization ids answer 404. *(Product and price-list routes so far; the quote and order routes come with their slices. Also proved: a platform account may name its tenant on a single record, which it could not before `634c453`.)*
 - [ ] Quote, order, product, price-list and approval mutations write audit entries with before/after diffs. *(Product and price-list mutations: yes, with the changed field names. Quotes, orders and approvals come with their slices.)*
 - [ ] Totals are computed in SQL: changing a line's qty/price/discount/tax updates subtotal, discount, tax and grand total on the persisted row (a hand-computed test fixture matches to the cent).

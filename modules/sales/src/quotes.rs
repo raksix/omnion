@@ -1178,9 +1178,8 @@ pub async fn get_quote(pool: &PgPool, organization_id: Uuid, quote_id: Uuid) -> 
         "select public_token_hash is not null, public_token_expires_at from sales_quotes where id = $1",
     )
     .bind(quote_id)
-    .fetch_one(pool)
-    .await
-    .map(|(hash, expiry)| (hash, expiry))
+    .fetch_optional(pool)
+    .await?
     .unwrap_or((false, None));
 
     let extra: (Option<OffsetDateTime>, Option<String>, Option<String>, String, String, Option<OffsetDateTime>) = sqlx::query_as(
