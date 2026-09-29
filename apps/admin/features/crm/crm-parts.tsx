@@ -77,12 +77,23 @@ function crmRowCursor(selected: boolean): {
 export function CrmRow({
   index,
   className,
+  onClick,
   children,
 }: {
   /** The row's position in the list, which is what `j`/`k` count in. */
   index: number;
   /** The screen's own classes, merged after the cursor's. */
   className?: string;
+  /**
+   * What a click on the row does.
+   *
+   * A row component that hard-codes its own click would have to know what a row *is*, which is
+   * the one thing the frame does not know — so the screen says, and the row still owns the cursor.
+   * Clicking and pressing `j` are the same act, so both end in `setSelectedIndex`; without this
+   * the click moved the cursor and the screen's own handler did something else entirely, which is
+   * how a list ends up selecting one row and opening another.
+   */
+  onClick?: () => void;
   /** The cells. */
   children: ReactNode;
 }) {
@@ -91,7 +102,10 @@ export function CrmRow({
   return (
     <tr
       {...cursor}
-      onClick={() => list.setSelectedIndex(index)}
+      onClick={() => {
+        list.setSelectedIndex(index);
+        onClick?.();
+      }}
       className={[cursor.className, className].filter(Boolean).join(" ")}
     >
       {children}
@@ -174,14 +188,8 @@ export type CrmListState = {
   requestCreate: () => void;
   /** Open the edit form for a row. */
   requestEdit: (id: string) => void;
-  /** Open a row. */
-  requestOpen: (id: string) => void;
   /** A ref for the search field, so `/` and the palette can both focus it. */
   searchRef: React.RefObject<HTMLInputElement | null>;
-  /** The create/edit request the screen above is carrying out. */
-  formRequest: { kind: "create" | "edit"; id: string | null } | null;
-  /** Answer a form request from the screen. */
-  clearFormRequest: () => void;
   /** The row count the API reported, and the cursor of the next page. */
   total: number;
   nextCursor: string | null;
@@ -240,10 +248,17 @@ type CrmShellProps = {
   children: ReactNode;
   /** What the toolbar offers beyond the shared controls. */
   toolbarExtra?: ReactNode;
-  /** What the keyboard actions do — supplied by the screen, which owns the rows. */
+  /** What the keyboard actions do — supplied by the screen, which owns the rows.
+   *
+   *  `onOpen` and `onEdit` are both required and are answered by the same function on every screen
+   *  that has rows: a deal on the board has no separate view route, so opening a row and editing it
+   *  are one action. They are kept as two names because the *sheet* promises two keys, and a key
+   *  that has no argument to call is a binding nobody listens for. `onCreate` is here rather than
+   *  being the frame's own `onCreate` prop so that `n` and the "New" button take one path. */
   keyboard: {
     onEdit: (id: string) => void;
     onOpen: (id: string) => void;
+    onCreate: () => void;
   };
   /** The rows the keyboard may land on. */
   rowIds: string[];
@@ -274,7 +289,6 @@ export function CrmShell(props: CrmShellProps) {
   const searchRef = useRef<HTMLInputElement | null>(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [formRequest, setFormRequest] = useState<CrmListState["formRequest"]>(null);
   const [columnMenuOpen, setColumnMenuOpen] = useState(false);
 
   const search = searchParams.get("search") ?? "";
@@ -310,13 +324,22 @@ export function CrmShell(props: CrmShellProps) {
     [pathname, router, searchParams],
   );
 
+  // The keyboard contract is answered by the **screen**, through the `keyboard` prop it already
+  // passes: a contact list and a deals board open their editors in different ways, and the frame
+  // is the only place that does not know what a row's id *is* on either of them.
+  //
+  // An earlier version published a second channel — `formRequest` in this context, read by nobody
+  // — and had to answer a type error with `as never` when it wanted an `"open"` kind that the type
+  // did not carry. That is the shape of a dead control: it is declared, it is typed, it is put on
+  // the context where a reader would look for it, and nothing ever reads it. `n` used to set it
+  // *and* call `onCreate`, so the create form opened twice over on any screen that also read it.
   const requestCreate = useCallback(() => {
-    setFormRequest({ kind: "create", id: null });
-    onCreate();
-  }, [onCreate]);
+    keyboard.onCreate();
+  }, [keyboard]);
 
-  const requestEdit = useCallback((id: string) => setFormRequest({ kind: "edit", id }), []);
-  const requestOpen = useCallback((id: string) => setFormRequest({ kind: "open", id } as never), []);
+  // `Enter` and `e` are the same call: a deal on a board has no separate view route, so opening a
+  // row and editing it are one action, and a contacts list routes both to its own editor.
+  const requestEdit = useCallback((id: string) => keyboard.onEdit(id), [keyboard]);
 
   const toggleColumn = useCallback(
     (column: string) => {
@@ -483,10 +506,7 @@ export function CrmShell(props: CrmShellProps) {
     setSelectedIndex,
     requestCreate,
     requestEdit,
-    requestOpen,
     searchRef,
-    formRequest,
-    clearFormRequest: () => setFormRequest(null),
     total,
     nextCursor,
     loadMore,

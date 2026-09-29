@@ -43,7 +43,7 @@ import {
   type CrmPipeline,
 } from "@/lib/crm";
 
-import { CrmAvatar, CrmShell, CrmTag } from "./crm-parts";
+import { CrmAvatar, CrmRow, CrmShell, CrmTag, useCrmList } from "./crm-parts";
 import { useCrmTenant } from "./crm-tenant";
 
 /** What the deal form holds while it is open. */
@@ -358,6 +358,24 @@ export function DealsView() {
     return () => window.removeEventListener("keydown", onKey);
   }, [board, focusedCard, requestMove, stages]);
 
+  // `j`/`k` and `Tab` are the same act, so the board keeps one notion of "the card I am on".
+  //
+  // Before this, the board screen had **two** cursors: the frame's `selectedIndex` (a number in a
+  // context no board element read) and `focusedCard` (which the card drew). So `j` moved a number
+  // the page never showed, and `Enter` after it opened whatever the *frame's* `rowIds` held —
+  // which, on the board, was the same deals, so it mostly worked and was never obviously wrong.
+  // It is the same defect the `CrmRow` comment describes, in the one screen that had no rows to
+  // hang it on, and it is why `rowIds` is still passed for the board: the frame's `e` and `Enter`
+  // need an id list to name, and pointing them at the focused card is what makes the two agree.
+  const [cursorSynced, setCursorSynced] = useState(false);
+  useEffect(() => {
+    if (cursorSynced) return;
+    // Runs after the first paint so the server and the client agree on the first frame.
+    if (!board || board.deals.length === 0) return;
+    setFocusedCard((current) => current ?? board.deals[0].id);
+    setCursorSynced(true);
+  }, [board, cursorSynced]);
+
   // `/crm/deals?focus=<id>` — a search hit (or a shared link) marks that card and brings it into
   // view. The board is the one CRM screen where opening a *form* would be wrong: the card itself
   // is the record, and marking it is what the board's own keyboard path acts on. The applied id
@@ -389,6 +407,47 @@ export function DealsView() {
     setForm({ ...EMPTY_FORM, stage_id: stages[0]?.id ?? "" });
     setFieldError(null);
   }, [stages]);
+
+  /**
+   * Open a deal in the editor, from whatever holds the deal.
+   *
+   * The board card's own `Enter` built the same object inline, and the list row's `e` was wired to
+   * `() => {}` — so the shortcut sheet, which every CRM screen shares, advertised two bindings the
+   * **deals** screen did not implement. That is the exact failure the sheet's own comment is
+   * written against ("a row that promises a binding nobody listens for is a control the screen
+   * offers and cannot deliver"), and it was invisible for as long as the sheet and the handler
+   * lived in different files and no pass pressed `e` on this screen.
+   *
+   * So there is one builder and three callers: the card, the list row and the keyboard. A deal is
+   * in `board.deals` and in `list` at the same time — the two are the same records read through
+   * two shapes — so both are searched, and a deal that is in neither is reported rather than
+   * silently opening an empty editor that would save a *new* deal with the old one's name.
+   */
+  const openEdit = useCallback(
+    (id: string) => {
+      const deal = board?.deals.find((entry) => entry.id === id) ?? list?.find((entry) => entry.id === id) ?? null;
+      if (!deal) {
+        setError("That deal is no longer in the list — reload and try again.");
+        return;
+      }
+      setForm({
+        ...EMPTY_FORM,
+        id: deal.id,
+        title: deal.title,
+        stage_id: deal.stage_id,
+        company_id: deal.company_id ?? "",
+        contact_id: deal.contact_id ?? "",
+        amount: deal.amount,
+        currency: deal.currency,
+        probability: deal.probability === null ? "" : String(deal.probability),
+        expected_close_on: deal.expected_close_on ?? "",
+        source: deal.source ?? "",
+      });
+      setFieldError(null);
+      setError(null);
+    },
+    [board, list],
+  );
 
   const saveForm = useCallback(async () => {
     if (!form) return;
@@ -433,6 +492,24 @@ export function DealsView() {
   const openTotal = board?.open_total ?? "0";
   const forecast = board?.weighted_forecast ?? "0";
 
+  // The ids the keyboard walks, in the order the rows are drawn. It is the same list the frame is
+  // given as `rowIds`, and it is spelled out here rather than read back out of the frame so the two
+  // cannot end up counting different things — `j` answers with an index, and an index is only
+  // meaningful in the list it was counted against.
+  const dealIds = useMemo(() => deals.map((deal) => deal.id), [deals]);
+
+  // The other direction of the cursor sync: the frame owns `selectedIndex` and moves it on `j`/`k`,
+  // so the board's ring follows it. A one-way sync would leave the two disagreeing the moment
+  // either side moved first, and `Enter` would open one deal while the ring sat on another.
+  //
+  // `useCrmList` answers null outside the frame, and the board is also rendered as a bare body in
+  // the deals depth pass, so the guard is real rather than theoretical.
+  const frame = useCrmList();
+  useEffect(() => {
+    const id = frame ? dealIds[frame.selectedIndex] : null;
+    if (id) setFocusedCard(id);
+  }, [dealIds, frame]);
+
   return (
     <CrmShell
       title="Deals"
@@ -455,7 +532,7 @@ export function DealsView() {
       loadMore={() => {}}
       onCreate={openCreate}
       rowIds={deals.map((deal) => deal.id)}
-      keyboard={{ onEdit: () => {}, onOpen: () => {} }}
+      keyboard={{ onEdit: openEdit, onOpen: openEdit, onCreate: openCreate }}
       toolbarExtra={
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex items-center gap-1.5">
@@ -656,6 +733,11 @@ export function DealsView() {
                         draggable
                         data-qa-card={deal.id}
                         data-qa-stage-of={deal.stage_id}
+                        // The keyboard cursor, on the board's own row shape. `j`/`k` move the
+                        // frame's `selectedIndex`; without this attribute the board moved a number
+                        // the page never drew, which is the "a shortcut you cannot see is
+                        // indistinguishable from a broken one" defect the list rows already avoid.
+                        data-qa-crm-cursor={focusedCard === deal.id ? "true" : "false"}
                         tabIndex={0}
                         onDragStart={(event) => {
                           setDragId(deal.id);
@@ -671,19 +753,7 @@ export function DealsView() {
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
-                            setForm({
-                              ...EMPTY_FORM,
-                              id: deal.id,
-                              title: deal.title,
-                              stage_id: deal.stage_id,
-                              company_id: deal.company_id ?? "",
-                              contact_id: deal.contact_id ?? "",
-                              amount: deal.amount,
-                              currency: deal.currency,
-                              probability: deal.probability === null ? "" : String(deal.probability),
-                              expected_close_on: deal.expected_close_on ?? "",
-                              source: deal.source ?? "",
-                            });
+                            openEdit(deal.id);
                           }
                           if (event.key === "Delete" || event.key === "Backspace") {
                             event.preventDefault();
@@ -826,23 +896,11 @@ export function DealsView() {
               </tr>
             </thead>
             <tbody>
-              {list.map((deal) => (
-                <tr
+              {list.map((deal, index) => (
+                <CrmRow
                   key={deal.id}
-                  data-qa-row={deal.id}
-                  onClick={() => setForm({
-                    ...EMPTY_FORM,
-                    id: deal.id,
-                    title: deal.title,
-                    stage_id: deal.stage_id,
-                    company_id: deal.company_id ?? "",
-                    contact_id: deal.contact_id ?? "",
-                    amount: deal.amount,
-                    currency: deal.currency,
-                    probability: deal.probability === null ? "" : String(deal.probability),
-                    expected_close_on: deal.expected_close_on ?? "",
-                    source: deal.source ?? "",
-                  })}
+                  index={index}
+                  onClick={() => openEdit(deal.id)}
                   className="cursor-pointer border-b border-line text-[12.5px] transition odd:bg-canvas/40 hover:bg-canvas"
                 >
                   <td className="px-4 py-2.5 font-medium">{deal.title}</td>
@@ -856,7 +914,7 @@ export function DealsView() {
                   <td className="px-4 py-2.5 text-muted">
                     <span className={deal.stale ? "text-warning" : undefined}>{age(deal.days_in_stage)}</span>
                   </td>
-                </tr>
+                </CrmRow>
               ))}
             </tbody>
           </table>
@@ -1313,7 +1371,29 @@ export function PipelinesSettingsView() {
         ])
       }
       rowIds={rows.map((stage) => stage.id)}
-      keyboard={{ onEdit: () => {}, onOpen: () => {} }}
+      // A stage row has no editor of its own — its editor is its name field, in place. So `e` and
+      // `Enter` put the caret in that field and select what is there, which is the one action a
+      // person renaming a stage wants, and the two keys are no longer the empty callbacks the
+      // shared sheet has been advertising on this screen since the sheet shipped.
+      keyboard={{
+        onEdit: (id: string) => {
+          const index = rows.findIndex((stage) => stage.id === id);
+          if (index < 0) return;
+          const field = document.getElementById(`crm-stage-name-${index}`) as HTMLInputElement | null;
+          field?.focus();
+          field?.select();
+        },
+        onOpen: (id: string) => {
+          const index = rows.findIndex((stage) => stage.id === id);
+          if (index < 0) return;
+          const field = document.getElementById(`crm-stage-name-${index}`) as HTMLInputElement | null;
+          field?.focus();
+          field?.select();
+        },
+        onCreate: () => {
+          document.getElementById("crm-stage-add")?.click();
+        },
+      }}
       toolbarExtra={
         <button
           type="button"

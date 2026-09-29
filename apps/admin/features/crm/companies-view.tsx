@@ -484,7 +484,7 @@ export function CompaniesView() {
       loadMore={loadMore}
       onCreate={openCreate}
       rowIds={rowIds}
-      keyboard={{ onEdit: openEdit, onOpen: openEdit }}
+      keyboard={{ onEdit: openEdit, onOpen: openEdit, onCreate: openCreate }}
       toolbarExtra={
         <button
           type="button"
