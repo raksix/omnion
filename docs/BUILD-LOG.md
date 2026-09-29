@@ -2933,3 +2933,67 @@ certificate — but that is written, not yet observed.
 **Next.** Read `discovery-test` and `saml-test-ladder` out of the pass. Then slice 2's last piece:
 SAML assertion validation against a posted document, and the local-sign-in invariant's
 password half.
+
+## Tick 5 — the password half of the sign-in invariant was broken, not unproven
+
+Slice 2's last named piece was to write the *password* half of "a provider failure never locks
+local accounts out" — the provider-shaped half (`sso_attribute_map.rs`) was already proven, and
+this was the half that was still a sentence in a spec. It took a walk to find, and what the walk
+found was not a missing proof but a live defect.
+
+A JIT account stores the literal `!jit:no-password` in `password_hash`. That is the whole point
+of the marker: the row cannot be turned into a credential by a database dump, and it is a
+constant the reader recognises. `sign_in` handed that string to the Argon2 verifier as if it were
+a hash. It is not one — `PasswordHash::new` wants PHC's `$argon2id$v=19$m=…,t=…,p=…` and the
+marker has none of that — so the verifier returned a *parse error*, not `false`. `IdentityError::
+PasswordHash` has no arm in `apps/api/src/error.rs`, so it fell into the catch-all `other =>`:
+
+    500 internal_error  "password hashing failed: password hash string missing field"
+
+against a `401 invalid_credentials` that a typo against a local account gets.
+
+**The status code was the actual finding.** A person is told the server is broken, which is
+bad; but `401` means "a local account exists here" and `500` means "this is an SSO account",
+which means the password form was a directory enumerator — the precise thing the
+`dummy_verify` branch two steps above exists to prevent, undone by an error mapping. The
+`is_jit_account` helper that prevents it was written, documented, used by the JIT walk's own
+assertions, and called from **nowhere** in the sign-in path.
+
+The fix is four lines of decision and a comment that has to exist, because the *placement* is
+the design: after the unknown-address branch (so the two answer identically, in the response and
+in the work done), **before** the lockout check (so it can never answer `account_locked` either),
+and it registers no failure — a password-less account cannot be brute-forced, so counting guesses
+against it would have exactly one effect, which is letting anyone lock a colleague out of the only
+sign-in that still works for them.
+
+**The walk's own bug was worth as much as the fix.** The first RED run failed on the 500 above
+and left its account behind, in its own organization, which the *sibling* walk's scoped cleanup
+never touches. The second run found the row, `provision()` returned `Existing` instead of
+`Created`, and the walk failed on an assertion that had nothing to do with what it tests. A
+fixture that cannot be re-run after a failure is a fixture that hides failures — so the address
+carries a `Uuid` now, and the note says why, in the place somebody adding a third walk will read
+it. This is the second time this suite has produced that lesson (`sso_live.rs` raced on a shared
+host with a blanket cleanup) and the first time the walk was the one at fault.
+
+The walk also asserts the part that is easy to skip: that the refusal is **byte-identical** to a
+local account's — status, code and message, all three. Asserting the status alone would pass
+against a fix that returned a different code, and a different code is still a tell.
+
+**Proof.** Red before: `500`, `assertion left == right failed`, `left: 500, right: 401`. Green
+after:
+
+- `cargo test -p omnion-api --test sso` → **2 passed**
+- `cargo test -p omnion-identity --lib` → **166 passed**
+- `cargo test -p omnion-api --lib` → **165 passed**
+- `sso_live` → **2 passed** (OIDC and SAML end to end, real crypto, real stub IdP)
+- `sso_attribute_map` → **1 passed**
+- `pnpm --filter @omnion/admin typecheck` → clean
+
+**Not claimed.** The browser pass has not yet reached `/settings/iam/authentication` — it has been
+queued behind a sibling writer for three ticks now, and `fa6cda5` fixed the slot that was holding
+it, but the full-suite walkthrough is 30+ minutes and the queue is deep. Nothing in this tick is
+UI, so the pass is not a gate for it; the REQ is not closed and slice 2 stays open until the
+`discovery-test` and `saml-test-ladder` steps are observed rather than merely written.
+
+**Next.** Slice 3: ordered role rules with operators and scope targets, the dry-run endpoint and
+panel, the `role via rule #N` audit reason, and the `iam.role_rule_matched` event.
