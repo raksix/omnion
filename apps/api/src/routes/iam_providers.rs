@@ -27,7 +27,7 @@ use omnion_identity::sso::oidc::{self, Discovery, HttpClient, Jwk};
 use omnion_identity::sso::providers::{
     self, AuthProvider, NewProvider, ProviderChanges, ProviderKind, default_scopes,
 };
-use omnion_identity::sso::{directory, protocol_steps, provisioning};
+use omnion_identity::sso::{connection, directory, protocol_steps, provisioning};
 use omnion_identity::error::IdentityError;
 use omnion_identity::provenance;
 use serde::{Deserialize, Serialize};
@@ -964,18 +964,38 @@ pub async fn test_provider(
     if provider.kind.is_directory() {
         let config = directory::DirectoryConfig::from_value(&provider.config)
             .map_err(|error| ApiError::bad_request("invalid_request", error.to_string()))?;
-        let outcome = directory::test_steps(&config);
-
         // A directory's secret is the *bind* password, named by its own reference in the config
         // rather than by the provider's `secret_ref` — the two are different credentials and
         // conflating them is how a directory ends up authenticating with a client secret.
-        let bind_present = std::env::var(config.bind_secret_ref.trim()).is_ok();
+        //
+        // Resolved to its value here and handed to the ladder as an argument. The value never
+        // reaches the response, and a directory whose reference names nothing runs the reachable
+        // half of the ladder and stops at `bind` with the sentence saying why — which is a
+        // result, and a better one than the previous behaviour of reporting the whole
+        // configuration as sound.
+        let bind_secret = std::env::var(config.bind_secret_ref.trim()).ok();
+        let bind_present = bind_secret.is_some();
+        // The ladder is live. It was `test_steps` — the decidable half, which never opened a
+        // socket and so could never report `ok` — until this slice, which means every directory
+        // an operator had ever added read "incomplete" however well configured it was, and the
+        // enable gate, which requires a passing test, refused to switch on a directory that
+        // worked. The criterion that described a bind and a search had no implementation at all.
+        let report = connection::run_test(&config, bind_secret.as_deref()).await;
+        let outcome = connection::outcome_from(&report);
         let endpoints = Some(json!({
             "host": config.hostname(),
             "port": config.port(),
             "encrypted": config.is_secure(),
             "login_attribute": config.login_attribute(),
             "bind_within_base": config.bind_within_base(),
+            // What the ladder actually read, so the panel can show the operator what the server
+            // returned rather than only what was configured. Naming contexts in particular are
+            // how a wrong base DN becomes obvious: the operator can see what the server does
+            // publish.
+            "naming_contexts": report.naming_contexts,
+            "attributes": report.sample_attributes,
+            "entries_read": report.entries_read,
+            "pages_read": report.pages_read,
         }));
 
         // Recorded on the row either way: a failed test is a result, and the enable gate reads
@@ -1016,7 +1036,7 @@ pub async fn test_provider(
             slug: provider.slug.clone(),
             kind: provider.kind.as_str(),
             status: outcome.status,
-            detail: directory_detail(&outcome, bind_present),
+            detail: directory_detail(&outcome, &report, bind_present),
             endpoints,
             secret_present: bind_present,
             steps: Some(outcome.steps.iter().map(StepRow::from).collect()),
@@ -1099,26 +1119,74 @@ pub async fn test_provider(
 /// say the *same* thing the ladder says. `incomplete` gets its own sentence rather than being
 /// folded into "failed", because "not tested yet" and "tested and broken" call for different
 /// actions and a screen that conflates them sends the operator to the wrong one.
-fn directory_detail(outcome: &directory::TestOutcome, bind_present: bool) -> String {
-    let mut sentence = match outcome.status {
-        "failed" => {
-            let count = outcome.problems.len();
-            return format!(
-                "{} configuration {} to fix before this directory can be tested: {}",
-                count,
-                if count == 1 { "problem" } else { "problems" },
-                outcome
-                    .problems
-                    .iter()
-                    .map(|problem| problem.field)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+fn directory_detail(
+    outcome: &directory::TestOutcome,
+    report: &connection::ConnectionReport,
+    bind_present: bool,
+) -> String {
+    // A configuration that was refused locally is a *form* answer, and it says so with the field
+    // names — which is what the wizard underlines.
+    if !outcome.problems.is_empty() {
+        let count = outcome.problems.len();
+        return format!(
+            "{count} configuration {} to fix before this directory can be tested: {}",
+            if count == 1 { "problem" } else { "problems" },
+            outcome
+                .problems
+                .iter()
+                .map(|problem| problem.field)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // A live failure is named by its step, because "connection failed" is what an operator cannot
+    // act on and "the bind step was refused" is what they can. The sentence on the step itself
+    // carries the detail; this one says which step and what it means.
+    //
+    // **A step that never ran is not a step that failed**, and saying so is what tells the
+    // operator which of the two they are looking at. A configuration with no bind secret reaches
+    // the host, gets a green DNS/TCP/TLS ladder, and then has nothing to authenticate with — the
+    // ladder is `pending` at `bind` and the sentence has to say that, because "the bind step did
+    // not pass" reads as "your bind DN is wrong" and sends somebody to edit a DN that is fine.
+    if let Some(step) = report.failing_step {
+        let ran = report
+            .steps
+            .iter()
+            .find(|row| row.step == step && row.status == "failed");
+        let mut sentence = match ran {
+            Some(detail) => {
+                let mut sentence = format!("the {} step did not pass — ", step.as_str());
+                sentence.push_str(detail.detail.trim());
+                sentence
+            }
+            None => format!(
+                "the {} step could not be attempted",
+                step.as_str()
+            ),
+        };
+        // The missing secret is the operator's next action and belongs in the sentence wherever
+        // the ladder stopped, not only on the path that reaches the end.
+        if !bind_present {
+            sentence.push_str(
+                " — the bind password is not defined in this installation, so the bind step \
+                 cannot succeed until it is",
             );
         }
+        return sentence;
+    }
+
+    let mut sentence = match outcome.status {
         "incomplete" => "the configuration is sound; the directory itself has not been reached \
                          yet, so this is not a passing test"
             .to_owned(),
-        _ => "every step passed".to_owned(),
+        _ => format!(
+            "every step passed — {} entr{} read across {} page{}",
+            report.entries_read,
+            if report.entries_read == 1 { "y" } else { "ies" },
+            report.pages_read,
+            if report.pages_read == 1 { "" } else { "s" },
+        ),
     };
     if !bind_present {
         sentence.push_str(
@@ -1858,24 +1926,177 @@ mod tests {
             }],
             reached_server: None,
         };
-        let sentence = directory_detail(&broken, true);
+        let sentence = directory_detail(&broken, &no_report(), true);
         assert!(sentence.contains("1 configuration problem"), "{sentence}");
         assert!(sentence.contains("host"), "it names the field: {sentence}");
 
-        let untested = directory::TestOutcome {
-            status: "incomplete",
+        // A configuration problem short-circuits the summary even when a report is present: the
+        // two cannot happen together, and a summary that preferred the report would name a
+        // network step for a form that was never filled in.
+        let both = connection::ConnectionReport {
             steps: vec![],
-            problems: vec![],
-            reached_server: None,
+            failing_step: Some(directory::TestStep::Bind),
+            sample_attributes: vec![],
+            problems: broken.problems.clone(),
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
         };
         assert!(
-            directory_detail(&untested, true).contains("not a passing test"),
-            "an untested directory must not read like a broken one"
+            directory_detail(&broken, &both, true).contains("configuration problem"),
+            "a form problem outranks a transport step: {}",
+            directory_detail(&broken, &both, true)
+        );
+    }
+
+    /// A live failure names its **step**, and a passing ladder reports what it read.
+    ///
+    /// This is the sentence the whole ladder exists for, and the first version of this test
+    /// could not exist: `directory_detail` took no report, so there was no way to ask what it
+    /// would say about a bind that was refused on a live directory.
+    #[test]
+    fn a_live_failure_names_its_step_and_its_sentence() {
+        let refused = connection::ConnectionReport {
+            steps: vec![
+                directory::StepReport {
+                    step: directory::TestStep::Dns,
+                    status: "ok",
+                    detail: "the host name resolved".into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Tcp,
+                    status: "ok",
+                    detail: "connected to dir.example.com:636".into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Tls,
+                    status: "ok",
+                    detail: "TLS negotiated".into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Bind,
+                    status: "failed",
+                    detail: "the server refused this service account — check the bind DN and the \
+                              password behind its reference, since it reports both the same way"
+                        .into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Search,
+                    status: "pending",
+                    detail: String::new(),
+                },
+            ],
+            failing_step: Some(directory::TestStep::Bind),
+            sample_attributes: vec![],
+            problems: vec![],
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        };
+        let outcome = connection::outcome_from(&refused);
+        let sentence = directory_detail(&outcome, &refused, true);
+        assert!(sentence.contains("bind step"), "it names the step: {sentence}");
+        assert!(
+            sentence.contains("bind DN"),
+            "it carries the step's own sentence, which is the fix: {sentence}"
         );
         assert!(
-            directory_detail(&untested, false).contains("bind password"),
-            "a missing bind secret is the operator's next action, so it belongs in the sentence"
+            !sentence.contains("every step passed"),
+            "a refused bind must never read as a pass: {sentence}"
         );
+    }
+
+    /// A green ladder reports the figures, because "it works" and "it read 4,000 people in 8
+    /// pages" are different confidences and an operator configuring a directory wants the second.
+    #[test]
+    fn a_passing_ladder_reports_what_it_actually_read() {
+        let passed = connection::ConnectionReport {
+            steps: vec![directory::StepReport {
+                step: directory::TestStep::Dns,
+                status: "ok",
+                detail: "resolved".into(),
+            }],
+            failing_step: None,
+            sample_attributes: vec!["uid".into()],
+            problems: vec![],
+            entries_read: 1,
+            pages_read: 1,
+            groups: None,
+            naming_contexts: vec!["dc=example,dc=com".into()],
+        };
+        let outcome = connection::outcome_from(&passed);
+        let sentence = directory_detail(&outcome, &passed, true);
+        assert!(sentence.contains("1 entry read"), "{sentence}");
+        assert!(sentence.contains("1 page"), "{sentence}");
+
+        // Pluralisation is asserted because a summary that says "1 entries" is the kind of
+        // sentence that makes an operator stop reading the rest of it.
+        let plural = connection::ConnectionReport {
+            entries_read: 4_000,
+            pages_read: 8,
+            ..passed.clone()
+        };
+        let sentence = directory_detail(&outcome, &plural, true);
+        assert!(sentence.contains("4000 entries read"), "{sentence}");
+        assert!(sentence.contains("8 pages"), "{sentence}");
+    }
+
+    /// A report with no bind secret stops at `bind` and says why, rather than claiming a pass on
+    /// the strength of a reachable host. This is the state an operator lands in after typing a
+    /// configuration and before the platform has been given the secret, and it is the one that
+    /// used to read as sound.
+    #[test]
+    fn a_missing_bind_secret_is_its_own_state() {
+        let without = connection::ConnectionReport {
+            steps: vec![directory::StepReport {
+                step: directory::TestStep::Bind,
+                status: "pending",
+                detail: String::new(),
+            }],
+            failing_step: Some(directory::TestStep::Bind),
+            sample_attributes: vec![],
+            problems: vec![],
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        };
+        let outcome = connection::outcome_from(&without);
+        assert!(
+            !outcome.passed(),
+            "a directory whose bind step never ran has NOT passed"
+        );
+        assert_eq!(outcome.reached_server, Some(true), "a host was reached");
+        let sentence = directory_detail(&outcome, &without, false);
+        assert!(sentence.contains("bind password"), "{sentence}");
+        // And the distinction that matters: a step that never ran is not reported as a step that
+        // failed, because the two send an operator to different fields.
+        assert!(
+            sentence.contains("could not be attempted"),
+            "a pending step must not read as a failed one: {sentence}"
+        );
+        assert!(
+            !sentence.contains("did not pass"),
+            "nothing was tried, so nothing failed: {sentence}"
+        );
+    }
+
+    /// A helper so the tests that only care about a *form* answer do not have to spell out an
+    /// empty report. A report with no steps and no failing step is the shape `outcome_from` is
+    /// never handed in production, which is exactly why it is confined to the test module.
+    fn no_report() -> connection::ConnectionReport {
+        connection::ConnectionReport {
+            steps: vec![],
+            failing_step: None,
+            sample_attributes: vec![],
+            problems: vec![],
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        }
     }
 
     /// A directory has no OAuth scopes. Offering them would write values into a column the

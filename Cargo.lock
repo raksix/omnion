@@ -1493,6 +1493,8 @@ dependencies = [
  "regex",
  "reqwest",
  "rsa",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha1",
@@ -1502,9 +1504,11 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
  "xmltree",
 ]
 

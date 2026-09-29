@@ -576,6 +576,14 @@ pub struct StepReport {
 }
 
 impl StepReport {
+    /// A `pending` row, for the steps after the one that failed. Public because the live ladder
+    /// builds the same shape: a report that is not `ok` is not `pending` by accident, it is
+    /// pending because nothing has been asked of the server yet.
+    #[must_use]
+    pub fn pending_for(step: TestStep) -> Self {
+        Self::pending(step)
+    }
+
     fn pending(step: TestStep) -> Self {
         Self {
             step,
