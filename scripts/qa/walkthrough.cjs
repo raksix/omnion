@@ -8565,6 +8565,224 @@ note({
     }
   }
 
+  // ---- Listen for a real event (REQ-004 slice 3, criterion 5) ----------------------------
+  // The criterion has two clauses and the probe is shaped so each one FAILS if it stops
+  // being true:
+  //
+  //   * "captures a real bus event into the inspector **within one matcher tick**" — so the
+  //     reading is the PANEL's own text, not the API's. A probe that fetched
+  //     `/listeners` and printed `payload.slug` would pass against a panel that renders
+  //     nothing at all, which is the failure this control is most likely to have.
+  //   * "expires after 15 minutes **leaving no stray token**" — the window is read off the
+  //     two timestamps the server sends, because `expires_in_seconds` is 899 by the time a
+  //     response lands and pinning it to 900 asserts a rounding rule rather than the
+  //     window. The "no stray token" half is a server-side claim (the expired row is not in
+  //     a live-listener query) and is NOT readable from a browser, so it is proved by the
+  //     integration walk and only the *sentence* is read here.
+  {
+    // The trigger node, so the control is pressable: a listener waits for the event that
+    // starts a run, and a non-trigger node is refused with a reason.
+    const triggerCard = page
+      .locator('[data-node-type^="trigger."]')
+      .first();
+    const triggerCount = await triggerCard.count();
+    if (triggerCount > 0) {
+      await triggerCard.click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(700);
+    }
+
+    // **Retarget the graph node's own event before arming.** A listener is armed for the
+    // `params.event` of the *node* the author selected, not for the rule row's trigger
+    // column — that is the whole reason the builder's listener is node-scoped. The pass
+    // above created this rule listening for `user.created`, which a browser session cannot
+    // produce, so the node is pointed at `page.published` through the real graph route.
+    //
+    // The order is load-bearing: arming first and retargeting second would capture nothing,
+    // and "no capture" is exactly what a broken listener looks like. The reload matters for
+    // the same reason — the panel reads the node from the store the canvas was opened with,
+    // so arming without one would press a listener against the OLD event name.
+    const retargeted = await page.evaluate(async (workflowId) => {
+      const EVENT = "page.published";
+      const current = await fetch(`/api/v1/workflows/${workflowId}/graph`, {
+        credentials: "same-origin",
+      });
+      if (!current.ok) return { ok: false, reason: `read ${current.status}` };
+      const body = await current.json();
+      const nodes = body?.graph?.nodes ?? [];
+      const trigger = nodes.find((node) => String(node.type).startsWith("trigger."));
+      if (!trigger) return { ok: false, reason: "no trigger node on the canvas" };
+      if (trigger?.params?.event === EVENT) return { ok: true, alreadyThere: true, event: EVENT };
+
+      const next = nodes.map((node) =>
+        node.id === trigger.id
+          ? { ...node, params: { ...(node.params ?? {}), event: EVENT } }
+          : node,
+      );
+      const saved = await fetch(`/api/v1/workflows/${workflowId}/graph`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          graph: { nodes: next, edges: body?.graph?.edges ?? [] },
+          graph_version: body.graph_version,
+        }),
+      });
+      if (!saved.ok) return { ok: false, reason: `save ${saved.status}` };
+      return { ok: true, event: EVENT, nodeId: trigger.id };
+    }, workflowId ?? null).catch(() => null);
+
+    if (retargeted?.ok && !retargeted.alreadyThere) {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1800);
+      // Re-select the trigger: a reload clears the selection, and the control is
+      // unpressable with nothing selected — which is its own refusal, and the wrong one
+      // to be measuring here.
+      await page
+        .locator('[data-node-type^="trigger."]')
+        .first()
+        .click({ timeout: 8000 })
+        .catch(() => {});
+      await page.waitForTimeout(600);
+    }
+
+    // The refusal state first, because it is the one that costs an author fifteen minutes.
+    const armedControl = page.locator("[data-listener-arm]");
+    const armCount = await armedControl.count();
+    const armDisabled = armCount > 0
+      ? await armedControl.first().isDisabled().catch(() => true)
+      : null;
+    const armReason = (await page
+      .locator("[data-listener-reason]")
+      .first()
+      .innerText()
+      .catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+
+    let armed = null;
+    if (armCount > 0 && !armDisabled) {
+      await armedControl.first().click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+
+      // **A real bus event**, through a real API route rather than an insert into `events`:
+      // an insert would prove the SQL and not the route the matcher reads from. The node
+      // was already retargeted above, so this only has to produce the event.
+      //
+      // A probe that fired the wrong event would report "no capture" and be
+      // indistinguishable from a broken listener — which is why the name comes from the
+      // retarget that just ran rather than being written out a second time.
+      const eventFired = await page.evaluate(async () => {
+        const EVENT = "page.published";
+        const created = await fetch("/api/v1/pages", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ slug: "listen-probe", title: "Listen probe" }),
+        });
+        if (!created.ok) return { published: false, reason: `create ${created.status}`, event: EVENT };
+        const pageId = (await created.json())?.id;
+        if (!pageId) return { published: false, reason: "no page id", event: EVENT };
+        const published = await fetch(`/api/v1/pages/${pageId}/publish`, {
+          method: "POST",
+          credentials: "same-origin",
+        });
+        return { published: published.ok, event: EVENT };
+      }).catch(() => null);
+
+      // The matcher runs in the API process, so the capture needs a tick of wall clock.
+      // The panel polls every two seconds; give it three and a margin.
+      await page.waitForTimeout(7000);
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(2000);
+
+      armed = await page.evaluate(() => {
+        const panel = document.querySelector("[data-builder-listener]");
+        if (!panel) return null;
+        const capture = panel.querySelector("[data-listener-capture-status]");
+        const payload = panel.querySelector("[data-listener-payload]");
+        return {
+          panelFound: true,
+          summary: panel.querySelector("[data-listener-summary]")?.textContent?.trim() ?? null,
+          // The panel's own sentence, which is the reading that matters.
+          captureText: capture?.textContent?.replace(/\s+/g, " ").trim() ?? null,
+          payloadRendered: payload !== null,
+          payloadLength: payload?.textContent?.length ?? 0,
+          countdown: panel.querySelector("[data-listener-countdown]")?.textContent?.trim() ?? null,
+          tokenShown: panel.querySelector("[data-listener-token]")?.textContent?.trim() ?? null,
+          live: panel.querySelector("[data-listener-live]") !== null,
+        };
+      });
+      armed = { ...(armed ?? {}), eventFired: eventFired ?? null };
+    }
+
+    // The wire, read from the browser's own session: the panel proves it renders, this
+    // proves the server sent a real payload and that the window is fifteen minutes.
+    const onTheWire = await page.evaluate(async (workflowId) => {
+      if (!workflowId) return null;
+      const res = await fetch(`/api/v1/workflows/${workflowId}/listeners`, {
+        credentials: "same-origin",
+      });
+      if (!res.ok) return { status: res.status };
+      const body = await res.json();
+      const captured = body.captured ?? null;
+      let windowSeconds = null;
+      if (captured) {
+        const armed0 = Date.parse(captured.armed_at);
+        const expires = Date.parse(captured.expires_at);
+        if (Number.isFinite(armed0) && Number.isFinite(expires)) {
+          windowSeconds = Math.round((expires - armed0) / 1000);
+        }
+      }
+      return {
+        status: res.status,
+        armed: body.armed ?? null,
+        rows: Array.isArray(body.listeners) ? body.listeners.length : null,
+        capturedStatus: captured?.status ?? null,
+        capturedEvent: captured?.event_name ?? null,
+        capturedPayloadKeys: captured?.payload ? Object.keys(captured.payload) : null,
+        windowSeconds,
+        // The token must never be what the server sends back on a read — it is returned
+        // once by the arming and never again.
+        tokenInRead: Object.values(captured ?? {}).some((value) =>
+          typeof value === "string" && value.length === 32 && /^[A-Za-z0-9]+$/.test(value),
+        ),
+      };
+    }, workflowId ?? null).catch(() => null);
+
+    note({
+      step: "listener",
+      panelFound: (await page.locator("[data-builder-listener]").count()) > 0,
+      controlFound: armCount > 0,
+      // The retarget is a precondition, not part of the criterion — but a probe that
+      // skipped it would report "no capture" and be read as a broken listener.
+      retargeted: retargeted ?? null,
+      // A disabled control must say why. A greyed button with no reason is a dead button
+      // wearing a disabled attribute.
+      armDisabled,
+      armReason: armReason ? armReason.slice(0, 160) : null,
+      triggerNodeFound: triggerCount > 0,
+      // The panel's own rendering.
+      captureRendered: (armed?.captureText ?? null) !== null,
+      captureText: armed?.captureText ?? null,
+      payloadRendered: armed?.payloadRendered ?? null,
+      payloadLength: armed?.payloadLength ?? null,
+      countdown: armed?.countdown ?? null,
+      summary: armed?.summary ?? null,
+      eventPublished: armed?.eventFired?.published ?? null,
+      eventName: armed?.eventFired?.event ?? null,
+      // The server's half.
+      armedOnTheWire: onTheWire?.armed ?? null,
+      listenerRows: onTheWire?.rows ?? null,
+      capturedStatus: onTheWire?.capturedStatus ?? null,
+      capturedEvent: onTheWire?.capturedEvent ?? null,
+      capturedPayloadKeys: onTheWire?.capturedPayloadKeys ?? null,
+      // REQ-004 names fifteen minutes; asserted as the gap between the two timestamps.
+      windowSeconds: onTheWire?.windowSeconds ?? null,
+      tokenReturnedOnRead: onTheWire?.tokenInRead ?? null,
+    });
+    await shot(page, "page-workflow-builder-listener");
+  }
+
   // ---- Cleanup: this pass owns the rule it made --------------------------------------------
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);
