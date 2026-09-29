@@ -21,11 +21,27 @@
 > `/webhooks`, `/webhooks/new`, `/webhooks/[id]` (Overview / Deliveries / Stats) and the edit
 > form.
 >
-> **Proof: `omnion-events --lib` 45** (42 + 3), **`omnion-api --test events` 9/9** (6 + 3)
-> against real Postgres, **`tsc --noEmit` exit 0**. **Not done, and not claimed: no browser
-> pass yet** — the walkthrough now visits `/webhooks` and `/webhooks/new` and has a depth pass
-> written (`runWebhooksDepth`, driving a real receiver) but **unrun**, so the acceptance boxes
-> that name the screens stay unticked. Slice 3's retention sweeper is untouched · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
+> **Slice 3 (retention) is now built, and the predicate is the feature.** Migration
+> `0123_event_retention.sql` puts the window on the **organization**
+> (`organizations.event_retention_days`, `between 1 and 3650`, never null — `null` would mean
+> "keep for ever", a decision nobody made deliberately), so changing your own window changes
+> what your *next* tick deletes. A `pending` delivery **pins** its event: the obvious sweep
+> ("delete old events, let `on delete cascade` take the deliveries") deletes a fact a receiver
+> is still owed, and the receiver's only symptom is a delivery that never arrives with nothing
+> in the platform saying why. An event nobody was ever queued for is the bulk of the bus,
+> which is the part worth deleting. A run that removes nothing is **still logged** — a table
+> that only records activity cannot answer "the last sweep was at 03:00 and it found nothing"
+> on the day somebody asks why a March event is still in the feed. The worker walks
+> organizations oldest-first in bounded batches; `POST /events/retention/sweep` runs one on
+> demand. The `/events` **Retention** tab is the third tab beside Feed and Catalogue.
+>
+> **Proof: `omnion-events --lib` 47** (45 + 2), **`omnion-api --test event_retention` 1/1**
+> against real PostgreSQL, **`omnion-api --test events` 9/9** (no regression), **`omnion-api
+> --lib` 188**, **`tsc --noEmit` exit 0**. **Still not done, and still not claimed: no browser
+> pass** — `runRetentionDepth` and `runWebhooksDepth` are written and **unrun** (the QA slot is
+> held by a sibling writer for the whole window), so every acceptance box naming a screen
+> stays unticked with the reason in the box.
+> **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -245,7 +261,18 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       parameters are refused **by name** — a typo'd `?status=flaky` answers
       `invalid_delivery_query` naming the field, because a filter that silently matches
       nothing is indistinguishable from an endpoint that has had no failures.
-- [ ] Disabling an endpoint stops new deliveries but keeps its history readable.
+- [x] Disabling an endpoint stops new deliveries but keeps its history readable.
+      — `a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did`: a receiver hears a
+      published page, the endpoint is `PATCH`ed to `enabled: false`, a second page publishes and
+      is **never queued** (asserted by reading `webhook_deliveries` out of PostgreSQL, not out of
+      a response body — queue-then-skip would show the operator a growing list of `pending` rows
+      for an endpoint they switched off), and the deliveries made before the switch are still on
+      the screen and still `delivered`. The last step switches it back on and publishes a third
+      page, so the assertion is that re-enabling *resumes* rather than that disabling is
+      destructive: the subscription was muted, never destroyed. A disabled endpoint whose history
+      is unreadable is a switch that deletes the answer to "what was this receiver doing last
+      Tuesday", and the log is the reason an operator pauses an integration instead of deleting
+      it.
 - [x] `403` is returned (not `404`) when a caller without `webhooks.manage` posts to a management route, and `404` when an endpoint belongs to another
       organization.
       — The cross-organization half was already proven in `webhooks_are_scoped_per_organization_and_permission_guarded`.
@@ -255,13 +282,36 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       deliberate — a read-only auditor must not be able to make the platform POST to a third
       party by pressing a button.
 - [ ] The event feed's payload inspector copies a JSON path and a copy-as-cURL snippet for a delivery.
-- [ ] Retention sweep deletes events outside the window and their deliveries, and is proven by an integration test with a shortened window.
+- [x] Retention sweep deletes events outside the window and their deliveries, and is proven by an integration test with a shortened window.
+      — `the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest` against real
+      PostgreSQL, on a **one-day** window set through the same `PATCH` an operator uses. It
+      proves the four claims the obvious one-statement delete gets wrong: a `pending`
+      delivery **pins** its event (aged, queued, swept — both rows still there); a settled
+      delivery pins nothing (the same sweep removes both); the window is **per
+      organization** (a two-day tenant's sweep does not touch a thirty-day-old row belonging
+      to another); and a sweep that removes nothing is **still logged**, because "the last
+      sweep was at 03:00 and it found nothing" is the sentence an operator needs on the day
+      they ask why a March event is still in the feed. Every count is read back out of the
+      database, never from the response body — a response that omits a field is
+      indistinguishable from one that stored it and chose not to say so.
+      The window is a column on `organizations` (migration `0123`, `between 1 and 3650`, never
+      null, default 30) rather than a column on the event, so an organization that changes
+      its own window changes what its *next* tick deletes; the background worker
+      (`OMNION_EVENT_RETENTION_RUNNER`, on by default) walks organizations oldest-first in
+      bounded batches, and `POST /events/retention/sweep` runs one on demand for both
+      `webhooks.manage` holders and the `/events` Retention tab.
 - [ ] The QA walkthrough inventory contains `/webhooks`, `/webhooks/new`, `/webhooks/[id]` and `/events`, all with zero high findings.
-      — `/webhooks` and `/webhooks/new` are now in the routes list and `runWebhooksDepth` is
-      written (it opens a *real* endpoint rather than a placeholder id, which is why
-      `/webhooks/[id]` is deliberately not in the list: a route walked with a dummy id proves
-      only that the not-found state renders). **Unrun, and unticked** — the pass is queued
-      behind a sibling writer's slot and the box will be closed on its result, not before.
+      — `/webhooks` and `/webhooks/new` are now in the routes list, `/events?tab=retention`
+      joins them, and `runWebhooksDepth` + `runRetentionDepth` are written (`runRetentionDepth`
+      checks the tab, the server-supplied bounds, that a value outside the range disables
+      Save rather than offering a `400`, that the save is audited with **both** window values,
+      that a sweep answers with a sentence including "found nothing", that the run log grew,
+      and it restores the window in a `finally` so a mid-run throw cannot leave the QA
+      organization's bus narrowed for every pass after it). `/webhooks/[id]` is deliberately
+      not in the list: a route walked with a dummy id proves only that the not-found state
+      renders, and `runWebhooksDepth` opens a *real* endpoint instead.
+      **Unrun, and unticked** — the QA slot is held by a sibling writer for the whole window
+      and the box will be closed on the pass's result, not before.
 
 ### QA plan
 

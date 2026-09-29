@@ -788,6 +788,29 @@ pub fn router(state: AppState) -> Router {
     let event_catalogue =
         get(webhooks::list_catalogue).layer(guards::require(&state, "events.read"));
 
+    // The event bus's own retention (REQ-016 slice 3). Reading the window, the counts and the
+    // last sweep is reading the bus, so it rides `events.read`; **changing** the window and
+    // running a sweep are `webhooks.manage`, because shortening a window destroys an audit
+    // trail and a read-only auditor must not be able to trigger that from a link.
+    //
+    // Declared before `/events/{id}` for the same reason `/events/catalogue` is: `retention`
+    // is a literal segment, and a parameterised sibling registered first would read it as an
+    // event id and answer `404 no such event` for a request that is perfectly valid.
+    let event_retention = get(webhooks::retention_status)
+        .layer(guards::require(&state, "events.read"))
+        // The PATCH rides the same router as the GET because the two are one read/write pair on
+        // one path; a separate `patch(...)` bound to `/events/retention` would need a second
+        // `.route()` line and axum panics at boot when a path carries two `MethodRouter`s from
+        // different calls. The guards differ, and that is fine: the GET's layer answers the
+        // GET and the PATCH's layer answers the PATCH, and a caller holding only `events.read`
+        // reaches the GET and is refused on the PATCH — which is exactly the split the two
+        // powers are for.
+        .merge(
+            patch(webhooks::set_retention).layer(guards::require(&state, "webhooks.manage")),
+        );
+    let event_retention_sweep =
+        post(webhooks::sweep_retention).layer(guards::require(&state, "webhooks.manage"));
+
     // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
     // read and write powers are the workflow keys the engine already defines — being allowed to
     // define an automation and being allowed to run it are the same two powers a workflow
@@ -1316,6 +1339,8 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/{id}/test", webhook_test)
         .route("/events", events)
         .route("/events/catalogue", event_catalogue)
+        .route("/events/retention", event_retention)
+        .route("/events/retention/sweep", event_retention_sweep)
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
         .route("/automations/{id}", automation_entry)
