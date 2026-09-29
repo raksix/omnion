@@ -931,3 +931,204 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
+
+// ---------------------------------------------------------------------------------------------
+// Slice 2: the reader's own channel configuration
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One cell of the matrix: "does category *C* reach me over *channel*?".
+ *
+ * The form never invents a cell — the server sends all thirty and the form renders what it is
+ * given, so a channel added in a later slice appears here with no change to this file.
+ */
+export type NotificationPreferenceCell = {
+  category: string;
+  channel: string;
+  enabled: boolean;
+};
+
+/** Quiet hours, the timezone and the digest cadence. */
+export type NotificationSettingsRow = {
+  /** `HH:MM` in the reader's own timezone, or `null` for no window. */
+  quiet_hours_start: string | null;
+  quiet_hours_end: string | null;
+  /** IANA zone name; an unknown one is read as UTC by the server. */
+  timezone: string;
+  /** `off`, `daily` or `weekly`. */
+  digest_cadence: string;
+  /** Which weekday a weekly digest goes out on, 0 = Monday. */
+  digest_weekday: number | null;
+  /** Which hour a digest goes out in. */
+  digest_hour: number;
+};
+
+/**
+ * The whole preferences answer.
+ *
+ * `locked_channel` comes from the server rather than being hard-coded here: the rule that
+ * in-app cannot be switched off is a server rule, and a form that hard-codes the name while
+ * the server owns the rule is one rename away from a checkbox that lies.
+ */
+export type NotificationPreferences = {
+  cells: NotificationPreferenceCell[];
+  settings: NotificationSettingsRow;
+  locked_channel: string;
+};
+
+/** What a save changed, and the authoritative state to render from. */
+export type NotificationPreferencesSaved = {
+  /** How many cells actually changed value — zero is a legitimate answer. */
+  changed: number;
+  cells: NotificationPreferenceCell[];
+  settings: NotificationSettingsRow;
+  locked_channel: string;
+};
+
+export const DIGEST_CADENCES = ["off", "daily", "weekly"] as const;
+
+/** 0 = Monday, which is the numbering the server's `extract(dow) - 1` uses. */
+export const DIGEST_WEEKDAYS = [
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+  "Sunday",
+] as const;
+
+/**
+ * The zones the form offers.
+ *
+ * A choice list, not the IANA database: the server reads anything else as UTC, and a select
+ * with 400 entries is a select nobody scrolls.
+ */
+export const NOTIFICATION_TIMEZONES = [
+  "UTC",
+  "Europe/Istanbul",
+  "Europe/Berlin",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Madrid",
+  "Europe/Rome",
+  "Europe/Amsterdam",
+  "America/New_York",
+  "America/Los_Angeles",
+  "America/Sao_Paulo",
+  "Asia/Dubai",
+  "Asia/Kolkata",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+] as const;
+
+// ---------------------------------------------------------------------------------------------
+// Slice 3: the half that leaves the panel
+// ---------------------------------------------------------------------------------------------
+
+/** The four states a delivery can be in. A closed list, so the filter chips are exhaustive. */
+export const NOTIFICATION_DELIVERY_STATUSES = [
+  "pending",
+  "sent",
+  "failed",
+  "skipped",
+] as const;
+
+export type NotificationDeliveryStatus = (typeof NOTIFICATION_DELIVERY_STATUSES)[number];
+
+/**
+ * One row of the organization's delivery log.
+ *
+ * **There is no `title` and no `body` here, and that is the design.** An administrator opening
+ * the outbox during an incident needs to know *that* a delivery failed and *whose* it was — the
+ * content is a customer record, and this is the screen with the widest audience in the panel.
+ * The server's type cannot express it either, so adding a field is a visible review event rather
+ * than a "let's just show it" at the end of a feature.
+ */
+export type NotificationOutboxRow = {
+  id: string;
+  notification_id: string;
+  category: string;
+  priority: string;
+  user_id: string;
+  channel: string;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  max_attempts: number;
+  response_status: number | null;
+  error: string | null;
+  sent_at: string | null;
+  created_at: string;
+};
+
+/** The counts behind the filter chips, plus the total so a chip need not add them up itself. */
+export type NotificationOutboxCounts = {
+  pending: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  total: number;
+};
+
+/** The outbox answer: a page, the counts, and how far back the log reaches. */
+export type NotificationOutbox = {
+  rows: NotificationOutboxRow[];
+  counts: NotificationOutboxCounts;
+  retention_days: number;
+};
+
+/**
+ * One registered browser, as the devices list shows it.
+ *
+ * `endpoint_hint` is `…abcdef01` — enough for a reader to recognise their own phone, useless to
+ * somebody who screenshots the screen. The full endpoint is a capability key and the server
+ * never sends it back.
+ */
+export type NotificationDevice = {
+  id: string;
+  endpoint_hint: string;
+  user_agent: string | null;
+  created_at: string;
+  last_seen_at: string;
+};
+
+/** What registering a browser did — the four outcomes, not a boolean. */
+export type NotificationPushOutcome = "created" | "refreshed" | "reassigned" | "re-keyed";
+
+/** What a channel can do on this installation, and why. */
+export type NotificationChannelReadiness = {
+  channel: string;
+  available: boolean;
+  locked: boolean;
+  detail: string;
+};
+
+/** The four shapes a routing rule can address. Kept as data for the form's select. */
+export const NOTIFICATION_RECIPIENT_SHAPES = [
+  { value: "actor", label: "The actor who caused it", needsTarget: false },
+  { value: "permission:", label: "Everybody holding a permission", needsTarget: true },
+  { value: "role:", label: "Everybody with a role", needsTarget: true },
+  { value: "payload_user:", label: "The user named in the payload", needsTarget: true },
+] as const;
+
+/** One rule of the router: an event name, a category, and who hears about it. */
+export type NotificationRouteRule = {
+  id: string;
+  event_name: string;
+  category: string;
+  priority: string;
+  recipient: string;
+  title_template: string;
+  url_template: string | null;
+  enabled: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+
+/** What one routing pass did — the counts are the whole point of the answer. */
+export type NotificationRouteReport = {
+  created: number;
+  deduped: number;
+  unmatched_rules: number;
+  unknown_event: boolean;
+};

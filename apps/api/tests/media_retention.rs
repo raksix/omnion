@@ -99,7 +99,12 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         _ => Value::Null,
     };
 
-    TestResponse { status, set_cookie, body, raw }
+    TestResponse {
+        status,
+        set_cookie,
+        body,
+        raw,
+    }
 }
 
 /// Build a JSON request; `token` becomes the session cookie.
@@ -243,7 +248,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db, storage) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let org = sqlx::query_scalar::<_, Uuid>(
             "insert into organizations (name, slug) values ($1, $2) returning id",
@@ -402,7 +409,9 @@ async fn bind_role(
         NewBinding {
             role_id: role.id,
             user_id: id,
-            scope: Scope::Organization { organization_id: org },
+            scope: Scope::Organization {
+                organization_id: org,
+            },
             granted_by: Some(granted_by),
             expires_at: None,
         },
@@ -424,7 +433,12 @@ async fn login(state: &AppState, email: &str) -> String {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "login body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "login body: {}",
+        response.body
+    );
     response
         .set_cookie
         .and_then(|value| {
@@ -475,7 +489,9 @@ async fn version_numbers(db: &Db, file: Uuid) -> Vec<i32> {
 /// and purged. The run log records both halves and the response names what it did.
 #[tokio::test]
 async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
-    let Some(fixture) = Fixture::new().await else { return; };
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
     let site = fixture.sites[0];
     let token = fixture.editor_token().await;
 
@@ -497,17 +513,12 @@ async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
     // Tighten the windows so a walk does not have to age a file by three months.
     let site_policy: Value = call(
         &fixture.state,
-        request(
-            Method::GET,
-            &retention_uri(site),
-            Some(&token),
-            None,
-        ),
+        request(Method::GET, &retention_uri(site), Some(&token), None),
     )
     .await
     .body;
-    let policy_id = Uuid::parse_str(site_policy["policies"][0]["id"].as_str().expect("an id"))
-        .expect("a uuid");
+    let policy_id =
+        Uuid::parse_str(site_policy["policies"][0]["id"].as_str().expect("an id")).expect("a uuid");
     let tightened = call(
         &fixture.state,
         request(
@@ -571,13 +582,15 @@ async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
     .execute(fixture.db.pool())
     .await
     .expect("version 2 must be inserted");
-    sqlx::query("update media set storage_key = $2, checksum = $3, version_count = 2 where id = $1")
-        .bind(media)
-        .bind(&second_key)
-        .bind("2222222222222222222222222222222222222222222222222222222222222222")
-        .execute(fixture.db.pool())
-        .await
-        .expect("the row must point at version 2");
+    sqlx::query(
+        "update media set storage_key = $2, checksum = $3, version_count = 2 where id = $1",
+    )
+    .bind(media)
+    .bind(&second_key)
+    .bind("2222222222222222222222222222222222222222222222222222222222222222")
+    .execute(fixture.db.pool())
+    .await
+    .expect("the row must point at version 2");
     assert_eq!(newest_version(&fixture.db, media).await, 2);
 
     // Age **both** versions past the one-day window. This is the case that breaks the obvious
@@ -591,12 +604,7 @@ async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
     let doomed = upload(&fixture.state, &token, site, "doomed.txt", b"goodbye").await;
     let deleted = call(
         &fixture.state,
-        request(
-            Method::DELETE,
-            &file_uri(site, doomed),
-            Some(&token),
-            None,
-        ),
+        request(Method::DELETE, &file_uri(site, doomed), Some(&token), None),
     )
     .await;
     assert_eq!(deleted.status, StatusCode::OK, "{}", deleted.body);
@@ -609,9 +617,17 @@ async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
     )
     .await;
     assert_eq!(run.status, StatusCode::OK, "{}", run.body);
-    assert_eq!(run.body["run"]["versions_removed"], json!(1), "only version 1 goes");
+    assert_eq!(
+        run.body["run"]["versions_removed"],
+        json!(1),
+        "only version 1 goes"
+    );
     assert_eq!(run.body["run"]["purged"], json!(1), "the trashed file goes");
-    assert_eq!(run.body["run"]["purged_bytes"], json!(7), "its own bytes, not the total");
+    assert_eq!(
+        run.body["run"]["purged_bytes"],
+        json!(7),
+        "its own bytes, not the total"
+    );
     assert_eq!(run.body["remaining_files"], json!(0));
 
     // The current version survived, and the row still names an object that exists.
@@ -646,12 +662,18 @@ async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
     assert_eq!(first["versions_removed"], json!(1));
     assert_eq!(first["purged"], json!(1));
     assert!(
-        first["summary"].as_str().expect("a sentence").contains("1 old version(s) removed"),
+        first["summary"]
+            .as_str()
+            .expect("a sentence")
+            .contains("1 old version(s) removed"),
         "{}",
         first["summary"]
     );
     assert!(
-        first["summary"].as_str().expect("a sentence").contains("1 file(s) purged"),
+        first["summary"]
+            .as_str()
+            .expect("a sentence")
+            .contains("1 file(s) purged"),
         "{}",
         first["summary"]
     );
@@ -688,7 +710,9 @@ async fn a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window() {
 /// A hold beats every window, and the run log says *that* rather than reporting a zero.
 #[tokio::test]
 async fn a_legal_hold_beats_every_window_and_the_log_says_so() {
-    let Some(fixture) = Fixture::new().await else { return; };
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
     let site = fixture.sites[0];
     let token = fixture.editor_token().await;
 
@@ -713,8 +737,16 @@ async fn a_legal_hold_beats_every_window_and_the_log_says_so() {
         ),
     )
     .await;
-    assert_eq!(no_reason.status, StatusCode::BAD_REQUEST, "{}", no_reason.body);
-    assert_eq!(no_reason.body["error"]["code"], json!("hold_reason_required"));
+    assert_eq!(
+        no_reason.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        no_reason.body
+    );
+    assert_eq!(
+        no_reason.body["error"]["code"],
+        json!("hold_reason_required")
+    );
     let after_refusal: (bool,) = sqlx::query_as("select legal_hold from media where id = $1")
         .bind(file)
         .fetch_one(fixture.db.pool())
@@ -754,8 +786,13 @@ async fn a_legal_hold_beats_every_window_and_the_log_says_so() {
     .await
     .expect("the audit log must read");
     assert!(
-        audit.iter().any(|(action, meta)| action == "media.hold_placed"
-            && meta["reason"].as_str().unwrap_or_default().contains("2026-114")),
+        audit
+            .iter()
+            .any(|(action, meta)| action == "media.hold_placed"
+                && meta["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("2026-114")),
         "a hold has to carry its reason into the audit log: {audit:?}"
     );
 
@@ -766,7 +803,11 @@ async fn a_legal_hold_beats_every_window_and_the_log_says_so() {
     )
     .await;
     assert_eq!(run.status, StatusCode::OK, "{}", run.body);
-    assert_eq!(run.body["run"]["purged"], json!(0), "a hold outranks the window");
+    assert_eq!(
+        run.body["run"]["purged"],
+        json!(0),
+        "a hold outranks the window"
+    );
     assert_eq!(run.body["run"]["held_back"], json!(1));
     assert!(
         run.body["run"]["summary"]
@@ -808,14 +849,22 @@ async fn a_legal_hold_beats_every_window_and_the_log_says_so() {
         ),
     )
     .await;
-    assert_eq!(again.body["changed"], json!(false), "nothing moved, so nothing is logged");
+    assert_eq!(
+        again.body["changed"],
+        json!(false),
+        "nothing moved, so nothing is logged"
+    );
 
     let after = call(
         &fixture.state,
         request(Method::POST, &run_uri(site), Some(&token), None),
     )
     .await;
-    assert_eq!(after.body["run"]["purged"], json!(1), "the release is effective at once");
+    assert_eq!(
+        after.body["run"]["purged"],
+        json!(1),
+        "the release is effective at once"
+    );
 
     fixture.cleanup().await;
 }
@@ -824,7 +873,9 @@ async fn a_legal_hold_beats_every_window_and_the_log_says_so() {
 /// very next purge go through.
 #[tokio::test]
 async fn a_purge_refuses_a_referenced_file_and_the_repair_scan_unblocks_it() {
-    let Some(fixture) = Fixture::new().await else { return; };
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
     let site = fixture.sites[0];
     let token = fixture.editor_token().await;
 
@@ -868,13 +919,20 @@ async fn a_purge_refuses_a_referenced_file_and_the_repair_scan_unblocks_it() {
         json!(0),
         "a file a live page resolves to is not purged"
     );
-    assert_eq!(run.body["run"]["refused"], json!(1), "one file, however many fields");
+    assert_eq!(
+        run.body["run"]["refused"],
+        json!(1),
+        "one file, however many fields"
+    );
     let refusal = &run.body["refused"][0];
     assert_eq!(refusal["media_id"], json!(file.to_string()));
     assert_eq!(refusal["resource_kind"], json!("page"));
     assert_eq!(refusal["field"], json!("hero_image_id"));
     assert!(
-        refusal["describe"].as_str().expect("a sentence").contains("hero_image_id"),
+        refusal["describe"]
+            .as_str()
+            .expect("a sentence")
+            .contains("hero_image_id"),
         "the refusal names the record, not a count: {refusal}"
     );
     assert!(
@@ -934,7 +992,12 @@ async fn a_purge_refuses_a_referenced_file_and_the_repair_scan_unblocks_it() {
         request(Method::POST, &run_uri(site), Some(&token), None),
     )
     .await;
-    assert_eq!(unblocked.body["run"]["purged"], json!(1), "{}", unblocked.body);
+    assert_eq!(
+        unblocked.body["run"]["purged"],
+        json!(1),
+        "{}",
+        unblocked.body
+    );
 
     // A second repair is a no-op that says so, rather than a silent zero.
     let noop = call(
@@ -944,7 +1007,10 @@ async fn a_purge_refuses_a_referenced_file_and_the_repair_scan_unblocks_it() {
     .await;
     assert_eq!(noop.body["references_removed"], json!(0));
     assert!(
-        noop.body["summary"].as_str().expect("a sentence").contains("No reference rows"),
+        noop.body["summary"]
+            .as_str()
+            .expect("a sentence")
+            .contains("No reference rows"),
         "{}",
         noop.body["summary"]
     );
@@ -956,7 +1022,9 @@ async fn a_purge_refuses_a_referenced_file_and_the_repair_scan_unblocks_it() {
 /// the one edit `Option<Option<Uuid>>` cannot carry.
 #[tokio::test]
 async fn a_folder_policy_wins_and_an_explicit_null_clears_the_scope() {
-    let Some(fixture) = Fixture::new().await else { return; };
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
     let site = fixture.sites[0];
     let token = fixture.editor_token().await;
 
@@ -991,7 +1059,10 @@ async fn a_folder_policy_wins_and_an_explicit_null_clears_the_scope() {
     assert_eq!(created.body["folder_id"], json!(folder.to_string()));
     assert_eq!(created.body["folder_path"], json!("Campaign"));
     assert!(
-        created.body["scope"].as_str().expect("words").contains("Campaign"),
+        created.body["scope"]
+            .as_str()
+            .expect("words")
+            .contains("Campaign"),
         "the screen says *which* folder rather than printing a uuid: {}",
         created.body["scope"]
     );
@@ -1000,12 +1071,18 @@ async fn a_folder_policy_wins_and_an_explicit_null_clears_the_scope() {
     let window = omnion_media::governing_window(fixture.db.pool(), site, Some(folder))
         .await
         .expect("the window must resolve");
-    assert_eq!(window.trash_days, 7, "the folder rule wins over the site's 30");
+    assert_eq!(
+        window.trash_days, 7,
+        "the folder rule wins over the site's 30"
+    );
     assert_eq!(window.purge_after_days, 14);
     let fallback = omnion_media::governing_window(fixture.db.pool(), site, None)
         .await
         .expect("the fallback must resolve");
-    assert_eq!(fallback.trash_days, 30, "the site rule still answers for everything else");
+    assert_eq!(
+        fallback.trash_days, 30,
+        "the site rule still answers for everything else"
+    );
 
     // A duplicate name is a `409` naming the field, not a `500` with a constraint name.
     let duplicate = call(
@@ -1064,7 +1141,11 @@ async fn a_folder_policy_wins_and_an_explicit_null_clears_the_scope() {
     )
     .await;
     assert_eq!(named.status, StatusCode::OK, "{}", named.body);
-    assert_eq!(named.body["folder_id"], Value::Null, "untouched by a body that omits it");
+    assert_eq!(
+        named.body["folder_id"],
+        Value::Null,
+        "untouched by a body that omits it"
+    );
     assert_eq!(named.body["trash_days"], json!(21));
 
     // Every window error names its own field, on the *save* and on the create.
@@ -1079,7 +1160,10 @@ async fn a_folder_policy_wins_and_an_explicit_null_clears_the_scope() {
     )
     .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
-    assert_eq!(bad.body["error"]["code"], json!("invalid_retention_setting"));
+    assert_eq!(
+        bad.body["error"]["code"],
+        json!("invalid_retention_setting")
+    );
     assert_eq!(bad.body["error"]["details"]["field"], json!("trash_days"));
 
     // A purge window inside the restore window is refused, against the *stored* row rather
@@ -1137,7 +1221,9 @@ async fn a_folder_policy_wins_and_an_explicit_null_clears_the_scope() {
 /// set a hold.
 #[tokio::test]
 async fn a_reader_may_read_the_policy_and_may_not_change_it() {
-    let Some(fixture) = Fixture::new().await else { return; };
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
     let site = fixture.sites[0];
     let editor = fixture.editor_token().await;
     let reader = fixture.reader_token().await;
@@ -1165,7 +1251,12 @@ async fn a_reader_may_read_the_policy_and_may_not_change_it() {
     assert_eq!(runs.status, StatusCode::OK);
 
     for (label, method, uri, body) in [
-        ("create", Method::POST, retention_uri(site), Some(json!({ "name": "Nope" }))),
+        (
+            "create",
+            Method::POST,
+            retention_uri(site),
+            Some(json!({ "name": "Nope" })),
+        ),
         (
             "update",
             Method::PUT,
@@ -1191,7 +1282,11 @@ async fn a_reader_may_read_the_policy_and_may_not_change_it() {
     }
 
     // And anonymous is refused on the read too.
-    let anonymous = call(&fixture.state, request(Method::GET, &retention_uri(site), None, None)).await;
+    let anonymous = call(
+        &fixture.state,
+        request(Method::GET, &retention_uri(site), None, None),
+    )
+    .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 
     fixture.cleanup().await;

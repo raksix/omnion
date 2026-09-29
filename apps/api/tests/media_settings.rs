@@ -381,7 +381,10 @@ async fn storage_settings_round_trip_and_refuse() {
         seeded.expect("a site created now must have a storage settings row");
     assert_eq!(driver, "s3", "the seeded driver is the platform's own");
     assert!(!bucket.is_empty());
-    assert_eq!(max_upload_mb, 25, "the seeded ceiling is the platform default");
+    assert_eq!(
+        max_upload_mb, 25,
+        "the seeded ceiling is the platform default"
+    );
 
     // Reading it answers the platform defaults and says it has never been configured.
     let read = call(
@@ -398,13 +401,7 @@ async fn storage_settings_round_trip_and_refuse() {
     // A response that carried a credential would be a settings screen rendering one. The check
     // is over the *raw bytes*, not over a list of fields somebody remembered to check.
     let raw = String::from_utf8_lossy(&read.raw).to_lowercase();
-    for forbidden in [
-        "secret",
-        "access_key",
-        "password",
-        "credential",
-        "session",
-    ] {
+    for forbidden in ["secret", "access_key", "password", "credential", "session"] {
         assert!(
             !raw.contains(forbidden),
             "the settings response must never carry a `{forbidden}` field, got: {raw}"
@@ -431,7 +428,10 @@ async fn storage_settings_round_trip_and_refuse() {
     assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
     // The trailing slash is dropped on the way in, because the URL is built by joining a path
     // onto it and a doubled slash is a 404 on somebody else's CDN.
-    assert_eq!(saved.body["public_base_url"], json!("https://cdn.example.com/media"));
+    assert_eq!(
+        saved.body["public_base_url"],
+        json!("https://cdn.example.com/media")
+    );
     assert_eq!(saved.body["path_prefix"], json!("tenant-a"));
     assert_eq!(saved.body["signed_url_ttl_seconds"], json!(1800));
     assert_eq!(saved.body["max_upload_mb"], json!(64));
@@ -461,7 +461,10 @@ async fn storage_settings_round_trip_and_refuse() {
     // Every out-of-range value names its own field, and a save and a connection test of the
     // same bad value agree about which field is wrong.
     let cases: [(Value, &str); 5] = [
-        (json!({ "signed_url_ttl_seconds": 30 }), "signed_url_ttl_seconds"),
+        (
+            json!({ "signed_url_ttl_seconds": 30 }),
+            "signed_url_ttl_seconds",
+        ),
         (json!({ "max_upload_mb": 0 }), "max_upload_mb"),
         (json!({ "max_upload_mb": 2000 }), "max_upload_mb"),
         (json!({ "bucket": "UPPERCASE" }), "bucket"),
@@ -473,7 +476,12 @@ async fn storage_settings_round_trip_and_refuse() {
     for (payload, field) in cases {
         let save = call(
             &fixture.state,
-            request(Method::PUT, &settings_uri(site), Some(&token), Some(payload.clone())),
+            request(
+                Method::PUT,
+                &settings_uri(site),
+                Some(&token),
+                Some(payload.clone()),
+            ),
         )
         .await;
         assert_eq!(
@@ -536,8 +544,12 @@ async fn storage_settings_round_trip_and_refuse() {
     )
     .await;
     assert_eq!(probe.status, StatusCode::OK, "body: {}", probe.body);
-    let ok = probe.body["ok"].as_bool().expect("the probe answers a boolean");
-    let detail = probe.body["detail"].as_str().expect("the probe says what it proved");
+    let ok = probe.body["ok"]
+        .as_bool()
+        .expect("the probe answers a boolean");
+    let detail = probe.body["detail"]
+        .as_str()
+        .expect("the probe says what it proved");
     if ok {
         assert!(
             detail.contains("wrote"),
@@ -651,7 +663,10 @@ async fn a_site_created_after_the_migration_is_editable() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the existence check must read");
-    assert!(exists, "a site created after the migration must have a settings row");
+    assert!(
+        exists,
+        "a site created after the migration must have a settings row"
+    );
 
     let saved = call(
         &fixture.state,

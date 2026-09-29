@@ -138,9 +138,8 @@ impl UsageResponse {
     fn build(media_id: Uuid, entries: &[UsageEntry], counts: UsageCounts) -> Self {
         let stale = counts.records - counts.resolved;
         let summary = match (counts.records, stale) {
-            (0, _) => {
-                "Nothing points at this file, so deleting it breaks nothing on this site.".to_string()
-            }
+            (0, _) => "Nothing points at this file, so deleting it breaks nothing on this site."
+                .to_string(),
             (_, 0) => match (counts.records, counts.rows) {
                 (1, 1) => "One record uses this file.".to_string(),
                 (1, rows) => format!(
@@ -293,9 +292,7 @@ async fn file_or_trashed(
 ) -> std::result::Result<omnion_media::MediaFile, ApiError> {
     let file = omnion_media::find_file_any_state(state.db().pool(), media_id)
         .await?
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::NOT_FOUND, "media_not_found", "no such file")
-        })?;
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media_not_found", "no such file"))?;
     let site = site_of(state, file.site_id).await?;
     site_in_scope(state, current, site.id).await?;
     Ok(file)
@@ -325,17 +322,18 @@ async fn actor_names(
         email: String,
     }
 
-    let rows: Vec<NameRow> = sqlx::query_as("select id, display_name, email from users where id = any($1)")
-        .bind(&wanted)
-        .fetch_all(pool)
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "actor_lookup_failed",
-                format!("the actors could not be read back: {error}"),
-            )
-        })?;
+    let rows: Vec<NameRow> =
+        sqlx::query_as("select id, display_name, email from users where id = any($1)")
+            .bind(&wanted)
+            .fetch_all(pool)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "actor_lookup_failed",
+                    format!("the actors could not be read back: {error}"),
+                )
+            })?;
 
     let names: std::collections::HashMap<Uuid, String> = rows
         .into_iter()
@@ -511,7 +509,9 @@ mod tests {
             },
         );
         assert!(
-            one_record_three_fields.summary.contains("not 3 different ones"),
+            one_record_three_fields
+                .summary
+                .contains("not 3 different ones"),
             "three fields of one page is one record: {}",
             one_record_three_fields.summary
         );
