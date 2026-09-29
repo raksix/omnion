@@ -3869,3 +3869,28 @@ unit test.
 `edge-delete.removed`, `edge-delete-undo.restored`, `two-tab-conflict.refused` /
 `reloadOffered` / `localNodesKept`, and `two-tab-keep-mine.resolved`. Only then tick. After
 that: undo/redo depth, run-from-here, and Table mode.
+
+
+## 2026-09-29 (cont.) — the pass found a migration collision, and it was a merge scar
+
+The pass got its place at 03:30 and failed at boot:
+
+```
+migration 51 was previously applied but has been modified
+```
+
+on a database `reset-db.sh` had just dropped and recreated thirty seconds earlier. That pairing
+is the tell: a *fresh* database cannot have a previously-applied migration, so the fault is not
+stale state, it is the migration set itself. `database/migrations/` held two `0051`s — this
+branch's `0051_workflow_graph.sql` and `0051_notification_routes.sql`, which arrived with a
+merge from main (`9acd8ca`). sqlx keys its ledger on the *version*, not the filename, so one
+silently displaces the other and the API refuses to start.
+
+Renumbered to **0056**, clear of every branch's high-water (main 0051, w2 0052, w7 and w10
+0055), and dropped the stale `omnion_qa_w3` (`107bcfb`). `cargo test -p omnion-workflows` 84/84
+again afterwards, and the doc reference to the old filename was updated with it.
+
+**The rule this tick re-learned the expensive way:** a migration number is a *shared* namespace
+across every worktree, and "the next free number in my branch" is how two writers collide. Read
+the high-water off `origin/*`, not off your own tree — and when a pass dies on a *just-reset*
+database, suspect the migration set before anything you have been debugging for two days.
