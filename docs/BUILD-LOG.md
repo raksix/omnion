@@ -4861,3 +4861,59 @@ mode still saving), plus the eleven older ones — `workflow-table`, `escape-cle
 `two-tab-conflict`, `run-from-here`, `pillsPainted`, `step-trace`, `listener`. If the box is
 still short of the gate, the honest move is again to say so rather than to start an
 unwinnable pass.
+
+### Wave 3 / REQ-004 slice 3 — the projection asks a second function the same question, and gets a different answer (2026-09-29)
+
+**What.** The save path is now one registry, end to end. `replace_graph` validated the
+incoming graph with the organization's plugin registry — the same one the palette was drawn
+from — and then handed it to a store that projected with the **core** registry. So a graph
+the route accepted was refused one function later, and the two sentences were exactly
+backwards:
+
+* the route said "that node type is fine" (it resolved through the plugin registry), and
+* the store said `"plugin.mailer.send" does not project onto a step`, which reads as *you
+  configured a node type that does not exist* rather than *the core does not run plugin
+  nodes*.
+
+The author had done nothing wrong. The message sent them to fix a typo they never made,
+through a problems panel that had just told them their working rule was nonsense — which is
+how a panel gets ignored.
+
+`project_with_plugins` / `project_walk_with_plugins` now take the registry the caller
+validated with, and a plugin node is refused with `plugin_node_not_executable` and a
+sentence that names the actual reason. The core-only wrappers stay: a *stored* graph is
+core-only by construction, so the attribution and run-from-here walks are correct with
+them. `None` at the store means *no plugins* explicitly, not "caller forgot".
+
+**The test I wrote was wrong, and the run said so.** The first assertion for this was
+`!(clean && !projects)` — "validation must not accept a graph the projection refuses". It
+failed, and the assertion was the defect, not the code: an enabled plugin node **is** a
+known type, so the findings are empty, and the projection then refuses it because the core
+has no runner. *Valid but unprojectable* is the intended shape, and freezing that away
+would have deleted the product decision one commit earlier. The property that was actually
+broken is narrower and is what the test now holds: the two must never disagree about
+**existence**. Enabled plugin is known to both; disabled plugin is unknown to both, with the
+same code and the same sentence carried through the walk.
+
+A second run failed differently and it was worth the run: I built the "disabled" registry by
+registering the provider and then never using it. `register` is what makes a plugin
+*enabled*, so "the same registry but smaller" is not a way to express disabled. The disabled
+state is the *absence* of the registration. A registry that has been asked to forget is a
+registry that still resolves.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **139 passed, 0 failed** (was 135).
+`cargo build -p omnion-api` → clean, no warning from any file I touched. `apps/admin`
+`node --test` → **167 passed, 0 failed** across 9 suites. `pnpm typecheck` → exit 0 (web +
+admin). `node --check scripts/qa/walkthrough.cjs` → clean. Two compile errors fixed in the
+tick, both mine and both the same class: reading a `WorkflowError` variant's fields through
+the enum (`error.code`) rather than through the accessors the HTTP layer uses (`error.code()`
+and `Display`).
+
+**Not ticked, and the reason is the box, not the code.** No browser pass ran. Checked
+*before* attempting, as the last tick's lesson says: `free -g` → 7 available (my gate is
+>8) and `/proc/loadavg` → 14.84 (gate <10), with another writer's walkthrough live. Fourteen
+boxes still need a pass and none of them got closer. The three walkthrough notes this pass
+carries are in the tree now (`e7d9c54`) so the pass, whenever the box allows it, measures all
+three at once instead of discovering them.
+
+**Next.** One pass on the w3 stack, gates checked first, carrying the fourteen notes.
