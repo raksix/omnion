@@ -3367,3 +3367,81 @@ two halves of the settings box are honestly unproven despite the box being ticke
 `digestPersisted` — and extend the settings pass to change those two fields rather than merely render
 them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
 REQ-010 slice 4's remaining gate.
+
+---
+
+## 2026-09-29 · REQ-065 slice 6 · `f0b0fe3` · the rules decide on the sign-in path
+
+**What.** The evaluator had existed for two ticks and the dry run called it, but a real
+callback did not. `apply_mapped_roles` read the legacy claim mapping out of `provider.config`
+and granted from that, so the preview was a *picture* of the ordered rules rather than a
+prediction of what the sign-in would do — which is the one thing it was built to be.
+`finish_sign_in` now resolves through `role_rule_store::load_rules` and `RoleRules::resolve`:
+the same reader and the same evaluator the preview uses, so there is nothing left for the two
+to disagree about.
+
+The decision worth writing down is that **a rule set is authoritative when it exists.** A
+provider carrying both some rules and a leftover claim mapping would otherwise grant the union,
+and the panel's dry run — which shows the rules alone — would then be a lie about the sign-in
+it exists to predict. The person who eventually notices is a security administrator asking why
+somebody holds a role no rule grants. So a set that matches nothing falls through to the
+provider's default role, and the audit says `no rule matched → default role` in those words
+rather than being silent.
+
+Three boundaries, each a decision rather than an implementation detail. A **site-scoped** rule
+grants a `Scope::Site` binding, and a site belonging to another organization attaches *nothing*
+rather than falling back to organization-wide — a wider grant than the operator wrote is the one
+substitution that must never happen quietly. The audit carries `role via rule #N` and the roles
+it produced, and the walk asserts the rule's `when_value` is **absent**: that value is usually a
+group name, and a rule diff in a log nobody audits is a second copy of the directory.
+`iam.role_rule_matched` fires only on `Matched` — emitting it for a default role would make the
+event's *name* false, and a security centre subscribes to it.
+
+**The walk is arranged so it can only pass one way.** The provider carries BOTH a legacy
+`analytics → editor` claim mapping and a two-rule set that says something different. If the rules
+were consulted in addition, the person would hold two roles and the dry run would be a lie.
+Asserting that `editor` is absent is therefore not a detail — it is the proof that
+first-match-wins means *first*.
+
+**A second bug, found by refusing to accept the first one.** `--test sso` went red at
+`501 organization_required` expecting `404 provider_not_found`. Before changing anything I ran
+the test twice on a fresh database with the previous tick's work stashed and applied: **the same
+line failed both times**, which is what established it was not a regression. The cause was in the
+test, not the product: the refusal only exists on a *multi-organization* installation, the
+fixture creates exactly one, and so the request fell through the single-organization arm. It had
+been passing on any machine that happened to hold a second tenant — a test whose truth is a
+property of the database rather than of the program. `2512e7e` has the walk create the second
+tenant, assert the count it needed, and delete it before cleanup; the database is left with zero
+organizations.
+
+**Two mistakes of my own, both worth more than the feature.**
+
+* I set `DATABASE_URL` for an integration run. The platform reads `OMNION_DATABASE_URL`, so the
+  walk silently ran against the **shared** `omnion` database and died with `VersionMissing(19)`
+  — a real gap in the migration sequence that only the shared database has. A test that quietly
+  aims at a shared database is not isolated, whatever the URL in the command says.
+* A passing suite in `0.00s` is a suite that skipped. `sso_live` reported `3 passed` in 0.01s
+  after a fresh `create database`, which is the fixture skipping because PostgreSQL was not
+  reachable in that process. Re-run with `--nocapture` and the same three took 10.5s. A green
+  integration number with no time behind it is the single most reusable thing to distrust.
+
+**Proof.**
+
+- `cargo test -p omnion-api --lib` → **194 passed**
+- `cargo test -p omnion-identity --lib` → **191 passed**
+- `cargo test -p omnion-api --test sso_live -- --nocapture --test-threads=1` → **3 passed**
+  (including the new `a_real_sign_in_resolves_the_rules_and_says_which_one_decided`), no SKIP
+- `cargo test -p omnion-api --test sso -- --test-threads=1` → **2 passed**, 0 organizations left
+- `cargo test -p omnion-api --test sso_attribute_map` → **1 passed** · `--test iam_role_rules` → **1 passed**
+- `bash scripts/qa/run-iam-role-rules.sh` → **PASS 18/18**
+- `pnpm --filter @omnion/admin typecheck` → clean
+
+**Not claimed.** The browser pass has not yet observed the wizard and the dry run end to end; it
+is queued behind a sibling writer's pass for the fifth tick running, so slice 3 stays open and
+this REQ is not closed. The `always` catch-all and the site-scope path are exercised by the
+unit tests and the walk respectively, but a *site-scoped* rule is not yet driven through a real
+callback.
+
+**Next.** Wait out the queue and run `QA_STACK=w9 QA_API_PORT=18088 QA_ADMIN_PORT=3108
+QA_WEB_PORT=3208 bash scripts/qa/run.sh`, then close slice 3 only when the wizard and the dry run
+are *observed* in it. Then start slice 4 — SCIM and sync surfacing — which needs `0119`.
