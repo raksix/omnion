@@ -183,17 +183,23 @@ pub fn catalogue() -> CatalogueResponse {
 // ---------------------------------------------------------------------------------------------
 
 /// Query of a rule list.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct AutomationListQuery {
-    /// Organization to read; a platform account must name one to narrow the list.
+    /// Organization to list (platform accounts only; organization accounts always see their own).
     pub organization_id: Option<Uuid>,
-    /// Site to narrow the list to.
+    /// Site to filter on.
     pub site_id: Option<Uuid>,
+    /// Project to filter on (REQ-133). `None` means the projects the caller is in.
+    pub project_id: Option<Uuid>,
 }
 
 /// A rule to create or replace.
 #[derive(Debug, Deserialize)]
 pub struct AutomationInput {
+    /// Project to create the rule in; the organization's default when omitted (REQ-133).
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+
     /// Organization that owns the rule.
     pub organization_id: Option<Uuid>,
     /// Site the rule is bound to.
@@ -273,8 +279,48 @@ pub async fn list_automations(
         None => query.organization_id,
     };
 
-    let workflows =
-        store::list_event_workflows(state.db().pool(), organization_id, query.site_id).await?;
+    // Project-scoped (REQ-133, slice 2). An event rule in another project is not a rule this
+    // caller may run, so it is never fetched — and asking for a project they are not in returns
+    // an empty list rather than a `403`, because a refusal there would confirm the project exists.
+    let workflows = match organization_id {
+        Some(organization_id) => {
+            let caller = omnion_workflows::projects::ProjectCaller {
+                user_id: current.user.id,
+                is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+                    &state, &current, organization_id,
+                )
+                .await,
+            };
+            let visible =
+                omnion_workflows::projects::visible_project_ids(state.db().pool(), organization_id, caller)
+                    .await
+                    .map_err(ApiError::from)?;
+            let scoped: Vec<Uuid> = match query.project_id {
+                Some(id) if visible.contains(&id) => vec![id],
+                Some(_) => Vec::new(),
+                None => visible,
+            };
+            let mut out = Vec::new();
+            for project in &scoped {
+                out.extend(
+                    store::list_event_workflows(
+                        state.db().pool(),
+                        Some(organization_id),
+                        query.site_id,
+                        Some(*project),
+                    )
+                    .await?,
+                );
+            }
+            out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            out
+        }
+        // A platform account that named no organization has no project scope to apply.
+        None => {
+            store::list_event_workflows(state.db().pool(), None, query.site_id, query.project_id)
+                .await?
+        }
+    };
 
     let mut automations = Vec::with_capacity(workflows.len());
     for workflow in &workflows {
@@ -302,10 +348,25 @@ pub async fn create_automation(
     let rule = input.rule(organization_id)?;
     let definition = rule.definition()?;
 
+    // A rule created without a project lands in the organization's default (REQ-133) — decided by
+    // `resolve_target`, the same one function the workflows surface uses.
+    let caller = omnion_workflows::projects::ProjectCaller {
+        user_id: current.user.id,
+        is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+            &state, &current, organization_id,
+        )
+        .await,
+    };
+    let target =
+        omnion_workflows::projects::resolve_target(state.db().pool(), organization_id, input.project_id, caller)
+            .await
+            .map_err(ApiError::from)?;
+
     let workflow = store::insert_workflow(
         state.db().pool(),
         NewWorkflow {
             organization_id,
+            project_id: target.id,
             site_id: rule.site_id,
             name: rule.name.clone(),
             description: rule.description.clone(),
@@ -560,6 +621,7 @@ mod tests {
     #[test]
     fn a_request_becomes_a_checked_rule() {
         let input = AutomationInput {
+            project_id: None,
             organization_id: None,
             site_id: None,
             name: "  Welcome the editor  ".to_owned(),
@@ -594,6 +656,7 @@ mod tests {
     fn a_rule_the_matcher_could_not_run_is_refused_when_it_is_written() {
         let base = |event: &str, conditions: Vec<Condition>, actions: Vec<StepDefinition>| {
             AutomationInput {
+                project_id: None,
                 organization_id: None,
                 site_id: None,
                 name: "rule".to_owned(),
