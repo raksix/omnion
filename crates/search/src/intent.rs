@@ -345,6 +345,27 @@ const DOMAINS: &[(&str, &str)] = &[
     ("locales", "translations"),
     ("language", "translations"),
     ("languages", "translations"),
+    // The business registers (REQ-051, REQ-052). These were indexed from the day the modules
+    // shipped and were never words: `domain_of` filters against the provider registry, so a
+    // word mapped to a key that existed would have worked — the words themselves were simply
+    // never written down, and a phrase like "deals for Northwind" narrowed to nothing instead
+    // of to the board.
+    ("contact", "contacts"),
+    ("contacts", "contacts"),
+    ("company", "companies"),
+    ("companies", "companies"),
+    ("account", "companies"),
+    ("deal", "deals"),
+    ("deals", "deals"),
+    ("pipeline", "deals"),
+    ("quote", "quotes"),
+    ("quotes", "quotes"),
+    ("quotation", "quotes"),
+    ("offer", "quotes"),
+    ("order", "orders"),
+    ("orders", "orders"),
+    ("crm", "contacts"),
+    ("sales", "quotes"),
 ];
 
 /// The provider one domain word names, when the index answers for it.

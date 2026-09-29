@@ -2924,6 +2924,33 @@ async function runPalette(page, report) {
     .catch(() => []);
   note({ step: "groups", groups: groupStates.join(", ") });
 
+  // The business registers (REQ-051 CRM, REQ-052 sales) are the two providers a **second**
+  // registration can silently swallow: `crates/search/src/providers.rs` indexes them while
+  // `apps/admin/lib/search-palette.ts` decides whether a section renders at all, and a provider
+  // missing from the second list answers "ready, zero rows" without a single error. The CRM
+  // shipped in exactly that state. The sales walkthrough creates a quote and an order, so a
+  // section that is present but empty is distinguishable from one that is absent — and a section
+  // that answers with a number the reader cannot open is caught by the URL assertion below.
+  const businessSections = await page
+    .evaluate(() =>
+      Object.fromEntries(
+        [...document.querySelectorAll("[data-palette-section]")].map((node) => [
+          node.getAttribute("data-palette-section"),
+          node.getAttribute("data-palette-section-state"),
+        ]),
+      ),
+    )
+    .catch(() => ({}));
+  const businessMissing = ["contacts", "companies", "deals", "quotes", "orders"].filter(
+    (key) => !(key in businessSections),
+  );
+  note({
+    step: "business-sections",
+    present: Object.keys(businessSections).join(","),
+    missing: businessMissing.join(","),
+    ok: businessMissing.length === 0,
+  });
+
   // The arrow keys move the highlight: the row the input points at changes without the mouse.
   const active = () =>
     page.evaluate(

@@ -488,6 +488,22 @@ async fn prune(transaction: &mut Transaction<'_, Postgres>, spec: &ProviderSpec)
              and not exists (select 1 from crm_deals dl \
                              where dl.id::text = d.entity_id and dl.archived_at is null)"
         }
+        // The two sales documents drop with their row. An archived quote or order stops
+        // answering for the reason the CRM's do: the lists hide archived rows by default, so a
+        // document that outlived the archive would answer a search with a record the panel will
+        // not show when the same person opens the list its hit points at. A **cancelled** or
+        // **expired** quote is *not* archived and stays indexed — those are states somebody
+        // legitimately searches for, and the badge says which one it is.
+        "quotes" => {
+            "delete from search_documents d where d.provider = 'quotes' \
+             and not exists (select 1 from sales_quotes q \
+                             where q.id::text = d.entity_id and q.archived_at is null)"
+        }
+        "orders" => {
+            "delete from search_documents d where d.provider = 'orders' \
+             and not exists (select 1 from sales_orders o \
+                             where o.id::text = d.entity_id and o.archived_at is null)"
+        }
         other => {
             debug_assert!(false, "provider {other} has no prune");
             return Ok(0);
@@ -844,6 +860,82 @@ left join crm_contacts ct on ct.id = d.contact_id \
 where d.archived_at is null {filter} \
 ";
 
+/// Upsert of the sales quote provider: one document per live quote.
+///
+/// The **number** is the title and the customer's name is not. That is the inversion the CRM
+/// provider deliberately does not make, and the reason is what a person actually types: a seller
+/// with a printed `Q-2026-0007` in front of them wants that one row, and "Northwind" is the word
+/// they reach for when they have forgotten the number entirely — which is the second-ranked
+/// question, so the customer sits at weight D rather than A and a match on it never outranks the
+/// document the reader named.
+///
+/// The grand total rides the subtitle in the currency's own digits, the way a deal's amount
+/// does, because the line under a title is what a search hit is read for. `valid_until` is a
+/// **tag** (`expires-2026-10-14`), not vector text: a date pasted into a search box is either a
+/// mistake or a filter, and a filter reads a tag.
+///
+/// `notes`, `payment_terms`, `reference` and `decline_reason` are all deliberately absent. The
+/// CRM keeps a contact's notes out for the same reason, and a decline reason is stronger still:
+/// "too expensive" is the seller's most valuable sentence and the one a competitor's account
+/// should never be able to search their way into. The index cannot answer a per-role question
+/// about a vector, so the rule the module states is the rule the index keeps.
+const QUOTES_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select q.organization_id, null, 'quotes', 'quote', q.id::text, \
+       q.number, \
+       concat_ws(' · ', coalesce(nullif(q.title, ''), q.customer_name), q.status, \
+                 to_char(q.grand_total, 'FM9,999,999,999.00') || ' ' || q.currency), \
+       '/sales/quotes/' || q.id::text, \
+       q.owner_user_id, \
+       array_remove(array[q.status, 'expires-' || to_char(q.valid_until, 'YYYY-MM-DD')]::text[], null), \
+       coalesce(q.title, '') || ' ' || coalesce(q.customer_name, ''), \
+       q.updated_at, \
+       setweight(to_tsvector('simple', q.number), 'A') || \
+       setweight(to_tsvector('simple', q.status), 'B') || \
+       setweight(to_tsvector('simple', concat_ws(' ', coalesce(q.title, ''), \
+                                                 coalesce(q.customer_name, ''))), 'C') || \
+       setweight(to_tsvector('simple', coalesce(q.customer_name, '')), 'D') \
+from sales_quotes q \
+where q.archived_at is null {filter} \
+";
+
+/// Upsert of the sales order provider: one document per live order.
+///
+/// Same shape as the quote's, and the difference between them is the **quote's number**: an
+/// order knows which quote it came from, and somebody chasing "what happened to Q-2026-0007"
+/// types the quote number, not the order's. Carrying it at weight C is what makes that search
+/// land on the order instead of on the frozen quote beside it — the two documents have the same
+/// customer, the same lines and a different state, and answering with the wrong one sends the
+/// reader to a document that can no longer change.
+///
+/// The reservation and invoice states are **tags**, not words. `holds-stock` and
+/// `invoice-drafted` are filters, and putting them in the vector would make a hit match on a
+/// bookkeeping state the reader never typed.
+const ORDERS_UPSERT: &str = "\
+insert into search_documents \
+    (organization_id, site_id, provider, entity_type, entity_id, title, subtitle, url, \
+     owner_user_id, tags, body, entity_updated_at, document) \
+select o.organization_id, null, 'orders', 'order', o.id::text, \
+       o.number, \
+       concat_ws(' · ', o.customer_name, o.status, \
+                 to_char(o.grand_total, 'FM9,999,999,999.00') || ' ' || o.currency), \
+       '/sales/orders/' || o.id::text, \
+       o.owner_user_id, \
+       array_remove(array[o.status, o.reservation_state, o.invoice_state]::text[], null), \
+       coalesce(q.number, '') || ' ' || coalesce(o.customer_name, ''), \
+       o.updated_at, \
+       setweight(to_tsvector('simple', o.number), 'A') || \
+       setweight(to_tsvector('simple', o.status), 'B') || \
+       setweight(to_tsvector('simple', concat_ws(' ', coalesce(q.number, ''), \
+                                                 coalesce(o.customer_name, ''))), 'C') || \
+       setweight(to_tsvector('simple', coalesce(o.customer_name, '')), 'D') \
+from sales_orders o \
+left join sales_quotes q on q.id = o.quote_id \
+where o.archived_at is null {filter} \
+";
+
 /// Build a provider's upsert statement: the SQL above, the optional single-entity filter and the
 /// shared conflict tail.
 #[must_use]
@@ -858,6 +950,8 @@ pub fn upsert_statement(provider_key: &str, entity_id: Option<Uuid>) -> Option<S
         "contacts" => (CONTACTS_UPSERT, "c.id"),
         "companies" => (COMPANIES_UPSERT, "c.id"),
         "deals" => (DEALS_UPSERT, "d.id"),
+        "quotes" => (QUOTES_UPSERT, "q.id"),
+        "orders" => (ORDERS_UPSERT, "o.id"),
         // Activity rows are two sources behind one entity id (`audit-12` / `event-9`), and nothing
         // addresses one of them by uuid: the only way in is a full pass, so a single-entity upsert
         // writes nothing rather than guessing at a row. That also keeps `index_entity` harmless

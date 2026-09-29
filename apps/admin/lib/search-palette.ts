@@ -26,6 +26,19 @@ export const PALETTE_PROVIDERS = {
   logs: { label: "Activity", route: "/search" },
   translations: { label: "Translations", route: "/pages" },
   settings: { label: "Settings", route: "/settings/search" },
+  // The two sales documents (REQ-052). A hit's own url is what a row opens, so the route here is
+  // the section's "see all" destination rather than a per-row one — the same relationship the
+  // pages and media entries have.
+  // The CRM's three registers (REQ-051) were indexed from the day the module shipped and had **no
+  // entry here**, so every one of their sections rendered nothing: `paletteProvider` answers
+  // `null`, and a group with no screen contributes no rows, no error and no dead end. The index
+  // was doing the work and the palette was swallowing it — a defect only a two-place registration
+  // can have, which is why the registry lives in this file at all.
+  contacts: { label: "Contacts", route: "/crm/contacts" },
+  companies: { label: "Companies", route: "/crm/companies" },
+  deals: { label: "Deals", route: "/crm/deals" },
+  quotes: { label: "Quotes", route: "/sales/quotes" },
+  orders: { label: "Orders", route: "/sales/orders" },
 } as const;
 
 /** One of the provider keys the palette knows. */
@@ -44,6 +57,15 @@ export const PALETTE_PROVIDER_ORDER: readonly PaletteProviderKey[] = [
   "logs",
   "translations",
   "settings",
+  // The business registers come last, in one block: contacts and companies sit together because
+  // they are the same read decision, then deals, then the two sales documents. A seller typing a
+  // customer name should find the account and the offer in one pass, and the order is the order
+  // somebody reads down.
+  "contacts",
+  "companies",
+  "deals",
+  "quotes",
+  "orders",
 ];
 
 /** How many rows a section shows before it offers "see all". */
