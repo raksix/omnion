@@ -25,6 +25,7 @@ pub mod engine;
 pub mod error;
 pub mod handler;
 pub mod model;
+pub mod projects;
 pub mod store;
 
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
