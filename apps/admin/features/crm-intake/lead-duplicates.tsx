@@ -23,7 +23,7 @@ import { ApiError } from "@/lib/api";
 import { contactLabel, relativeInstant } from "@/lib/crm-intake";
 import {
   fetchLeadDuplicates,
-  patchLead,
+  resolveLeadDuplicate,
   type Lead,
 } from "@/lib/crm-intake-api";
 
@@ -52,16 +52,31 @@ export function LeadDuplicates() {
   }, [load]);
 
   /**
-   * Reverse the verdict. `status: "new"` is "keep separate" — the row leaves the queue
-   * because it is no longer a duplicate claim, and the timeline keeps the line saying it was
-   * filed as one.
+   * Reverse the verdict.
+   *
+   * A named endpoint rather than a `patchLead` here, and the difference is the whole point of
+   * this screen: the panel does not know which contact the dedupe matched — the store does, and
+   * only the store can attach it. The `Link` button used to send `PATCH { status: "assigned" }`,
+   * which changed the status and nothing else; the row left the queue, the notice below said it
+   * was "linked to the contact it matched", and no contact had been touched. The panel named an
+   * outcome it could not produce.
+   *
+   * A refusal is a *saying*, not an error: the request was fine and the answer is "not this
+   * row", so it reads as the reason rather than as a failure banner.
    */
   const decide = async (lead: Lead, keepSeparate: boolean) => {
     setBusy(lead.id);
     setError(null);
     setNotice(null);
     try {
-      await patchLead(lead.id, { status: keepSeparate ? "new" : "assigned" });
+      const answer = await resolveLeadDuplicate(
+        lead.id,
+        keepSeparate ? "keep_separate" : "link",
+      );
+      if (!answer.applied) {
+        setError(answer.reason ?? "This duplicate verdict could not be reversed.");
+        return;
+      }
       setNotice(
         keepSeparate
           ? `${contactLabel(lead)} is kept as its own lead.`
@@ -170,12 +185,44 @@ export function LeadDuplicates() {
                       ) : null}
                     </td>
                     <td className="px-3 py-2.5">
+                      {/*
+                        The key AND the score, and the reason a refusal shows one and the other
+                        hides: "duplicate of somebody" is not a decision an operator can check,
+                        while "`ayse@company.com` already exists, matched on e-mail at 0.95" is.
+                        A score with no key beside it is a number nobody can argue with, and a key
+                        with no score is a claim. The score was not stored at all before this
+                        tick, so a duplicate filed last month could not be re-examined today.
+                      */}
                       <span className="block max-w-48 truncate font-mono text-[11.5px] text-muted">
                         {lead.dedupe_key ?? "—"}
+                        {lead.dedupe_score !== null ? (
+                          <span
+                            data-duplicate-score={lead.id}
+                            className="ml-1.5 text-muted/70"
+                            title={`matched with confidence ${lead.dedupe_score.toFixed(2)}`}
+                          >
+                            {lead.dedupe_score.toFixed(2)}
+                          </span>
+                        ) : null}
                       </span>
                       {lead.rejection_reason ? (
                         <span className="block max-w-48 truncate text-[11.5px] text-muted">
                           {lead.rejection_reason}
+                        </span>
+                      ) : null}
+                      {/*
+                        A row with no recorded contact cannot be linked, and the button that
+                        would fail is replaced by a sentence that says so. "Link" on such a row
+                        is the ambiguous verdict (several contacts matched) — the detail screen
+                        lists them, and a disabled control without a reason is the one thing
+                        this REQ forbids.
+                      */}
+                      {lead.dedupe_contact_id === null ? (
+                        <span
+                          data-duplicate-nomatch={lead.id}
+                          className="mt-0.5 block max-w-56 text-[11px] text-muted"
+                        >
+                          No single contact was recorded for this match — open the lead to choose one.
                         </span>
                       ) : null}
                     </td>
@@ -186,7 +233,11 @@ export function LeadDuplicates() {
                           type="button"
                           data-duplicate-link={lead.id}
                           data-qa-guard="crm-intake-depth"
-                          disabled={busy === lead.id}
+                          // Two reasons it cannot be pressed, and neither is "the network is
+                          // slow": a decision in flight, and a match with no single contact.
+                          // The second is explained in the cell above, so the disabled state is
+                          // never a shrug.
+                          disabled={busy === lead.id || lead.dedupe_contact_id === null}
                           onClick={() => void decide(lead, false)}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-line px-2 py-1 text-[11.5px] transition hover:text-ink disabled:opacity-50"
                         >

@@ -59,6 +59,21 @@ export type Lead = {
   decision: string | null;
   dedupe_key: string | null;
   duplicate_of: string | null;
+  /**
+   * The contact the dedupe verdict matched.
+   *
+   * Separate from `duplicate_of` (a LEAD) because one column holding both meanings made a
+   * `reject_duplicate` source fail every submission wherever the CRM is installed: a contact id
+   * cannot satisfy a foreign key to `crm_leads`. See migration `0144`.
+   */
+  dedupe_contact_id: string | null;
+  /**
+   * The confidence the verdict was made on, 0-1.
+   *
+   * Shown beside the key because "duplicate of somebody" is not a decision an operator can
+   * check — "`ayse@company.com` already exists, matched on e-mail at 0.95" is.
+   */
+  dedupe_score: number | null;
   rejection_reason: string | null;
   spam_score: number;
   first_response_due_at: string | null;
@@ -248,6 +263,36 @@ export function fetchLead(id: string): Promise<LeadDetail> {
 /** The duplicate queue: rows kept separate because something already matched them. */
 export function fetchLeadDuplicates(): Promise<Lead[]> {
   return request<Lead[]>("/api/v1/crm/leads/duplicates");
+}
+
+/**
+ * Reverse a filed duplicate verdict.
+ *
+ * `link` attaches the lead to the contact its own dedupe pass recorded; `keep_separate` files it
+ * as a lead in its own right. A named endpoint rather than a `patchLead` call at the call site,
+ * because the defect this replaces was exactly that: the screen sent `{ status: "assigned" }`,
+ * `patch_lead` takes `contact_id` from the patch or else from the existing row, a duplicate row
+ * has none — so the row left the queue, the notice said it was "linked to the contact it
+ * matched", and no contact had been touched. **The panel cannot know the matched contact**; only
+ * the store does, so the decision belongs there. A screen that names an outcome must reach an
+ * endpoint that produces it, or the two drift apart exactly as they did.
+ */
+export type DuplicateDecisionAnswer = {
+  lead: Lead;
+  contact_id: string | null;
+  /** Whether the decision was carried out. "Unchanged" is ambiguous without it. */
+  applied: boolean;
+  reason: string | null;
+};
+
+export function resolveLeadDuplicate(
+  id: string,
+  decision: "link" | "keep_separate",
+): Promise<DuplicateDecisionAnswer> {
+  return request<DuplicateDecisionAnswer>(
+    `/api/v1/crm/leads/${encodeURIComponent(id)}/duplicate-decision`,
+    { method: "POST", body: JSON.stringify({ decision }) },
+  );
 }
 
 /** Edit the fields a human sees on the row. */
