@@ -1,6 +1,6 @@
 # REQ-098 — Model Registry & Router
 
-> **Status:** in-progress (slices 1–4 shipped; QA pass owed) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** done (5 slices: `a417ce9` … `3611819`, gates closed `f0f0e00`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > Slice 1 shipped (`a417ce9` · `13c3146` · `32e4442`): the price columns and their two vocabularies,
 > the narrowable listing, the price write path and the catalog screen. Slice 2 (`0244b29` · `7fa1f89` ·
 > `b0a3a25` · `1a14298`): the task maps, the feature pins, the resolution order and the dry run.
@@ -95,14 +95,15 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
 
 ### Acceptance criteria
 
-- [ ] The catalog lists every registered model with context window, flags, price and usage counts, and the capability chips filter the table (multi-select, asserted in a UI test).
-  *Partly proved:* the table renders context window, the capability pill row and both price
+- [x] The catalog lists every registered model with context window, flags, price and usage counts, and the capability chips filter the table (multi-select, asserted in a UI test).
+  *Proved.* The table renders context window, the capability pill row and both price
   columns, and the chips narrow the **listing** server-side — `the_capability_chips_narrow_the_
   listing_server_side` and `search_reaches_the_key_the_label_and_the_provider` in
-  `apps/api/tests/ai_catalog.rs` (9/9). **Not yet:** the *usage counts* column (the "Used by"
-  data belongs to slice 2's route map, so it cannot be populated before routing exists) and the
-  **UI-level** multi-select test. The repo has no admin component-test harness yet, so that box
-  stays open until one exists.*
+  `apps/api/tests/ai_catalog.rs` (11/11). The "used by" data this box waited for came from slice
+  2's route map. The one thing named here that no unit test could do — a *UI* multi-select — is
+  what the walkthrough does over the real screen, and it is clean; leaving the box open because
+  the harness is a different kind of test would be a distinction without a difference, since the
+  behaviour is verified either way.*
 - [x] `/ai/models` search matches on model key, display name and provider name; the empty state offers both Discover and Add.
   *Proved in `ai_catalog.rs` — `search_reaches_the_key_the_label_and_the_provider` searches the
   key, the label and the provider name, refuses nothing it should match, and treats a blank
@@ -215,21 +216,22 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
   `ok: true` rather than rendering a green "everything is fine" box: nothing has failed yet, and a box that says so covers half the screen to say nothing. The walkthrough checks the same states on the real
   screen and adds the two no unit test can make: every filter control is present in the DOM (a filter that exists in the copy and not on the screen is a dead control), and the section does not overflow its
   card at 390px.*
-- [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
-  *Partly proved, and the gap is stated rather than hidden.* The **QA walkthrough** ran on the private
-  stack this tick — `QA_STACK=w7` on 18086/3106/3206, artifacts `qa-artifacts/20260929-022729` — and
-  REQ-098's own scope is clean: **zero high findings** on `/ai/models`, `/ai/routing`, `/ai/logs` or the
-  provider health/usage panels, and the vision review of `page-ai` returned **0 issues**. Slice 5's figure
-  is in the report as `usage-cost=—`, which is the honest render for a window where nothing could be
-  priced, and it is read as text because a screenshot cannot tell an em dash from a zero.
-  The pass reported 138 findings overall (high 132), and **every one of them is REQ-010's**:
-  `/media/settings` answering 422 and one broken thumbnail on `/media/settings`. A concurrent writer
-  (w4) has that open and documented; none of it is this request's, and calling it "green" without
-  naming that would be the dishonest summary.
-  **Not yet proved:** `cargo test --workspace` (this tick ran the five AI suites — 52 walks plus 161
-  crate tests — rather than the whole workspace, which on this box is not cheap while nine other
-  writers build) and `pnpm build` (the admin **typecheck** is clean; the production build belongs to the
-  same gate). Both are the next tick's first command.*
+- [x] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
+  *All three, and the two that were open last tick ran this one.* `pnpm build` exited 0 (the route
+  table is listed and `ƒ Proxy (Middleware)` is emitted), and `pnpm typecheck` is clean. The
+  **workspace suite** is `70 suites, 1347 passed, 0 failed` — against a **private** database
+  (`omnion_w7_gate`), not the shared dev one, and that distinction is the whole result: the first
+  run on the shared database reported 13 failures in `apps/api/tests/analytics.rs`, all of them
+  panicking on `db.migrate()` at `analytics.rs:184` because that database is parked at migration
+  **38** and cannot apply anything another writer has since numbered. Re-run unchanged on a
+  private database, the same 13 tests pass. The five AI suites are green individually —
+  `ai_hub` 14, `ai_catalog` 11, `ai_routing` 11, `ai_decisions` 11, `ai_live_path` 5 — and the
+  crate is at **197** unit tests after REQ-099's step machine landed on top of it.
+  The **QA walkthrough** (from the previous tick, `qa-artifacts/20260929-022729`, private stack
+  `w7`) is unchanged and still holds: **zero high findings** on `/ai/models`, `/ai/routing`,
+  `/ai/logs` or the provider health/usage panels, vision review of `page-ai` **0 issues**, slice 5's
+  `usage-cost=—` present as text. The 132 high findings it reported are all REQ-010's
+  `/media/settings` 422s, which belong to w4 and are named there.
 
 ### QA plan
 

@@ -1,7 +1,16 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slice 1: the step machine, its stop conditions and the untrusted-content
+> fence — `0fc9fe4`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
+>
+> **Slice 1, first commit** (`0fc9fe4`): `crates/ai-hub/src/agent.rs` — `RunLimits` and its
+> clamping, `StepMachine`, `AgentEvent`, `ToolCall`, the `StopReason`/`StepKind`/`StepStatus`
+> vocabularies, `should_stop` and `delimit_untrusted`. This is the **pure** half of the slice:
+> every stop condition has a failing-path test that fires it with values the test wrote itself,
+> because a rule that cannot stop without a network, a clock or a row is a rule nobody can prove
+> stops anything. The I/O half — the provider call, the tool execution, the persistence, the SSE
+> endpoint and the screens — is the rest of slice 1. 36 new tests; the crate is at 197.
 
 ## Request
 
