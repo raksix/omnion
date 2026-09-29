@@ -5306,3 +5306,231 @@ box left unticked for the mobile criterion stays unticked until a pass measures 
 
 **Migrations.** `0126_inventory.sql` — taken above the shared high-water, which now reads main
 0123, wave3 0125, wave9 0125. Mine are 0053, 0054, 0055, 0057, 0125 and now 0126.
+
+
+---
+
+## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
+
+**What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
+shows the last page, the API keeps a keyset cursor over every row, the automation matcher
+replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
+`/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
+question (what will be forgotten and when) rather than a fourth card inside the Feed.
+
+Migration `0123_event_retention.sql` puts the window on the **organization**
+(`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
+decisions carry it, and each is a place the obvious shortcut is wrong:
+
+* **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
+  and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
+  The receiver's only symptom is a delivery that never arrives with nothing in the platform
+  saying why. The store's predicate selects events with **no delivery at all** or with **only
+  settled** ones; a `pending` row pins its event for ever. An event nobody was ever queued
+  for is the bulk of the bus, which is exactly the part worth deleting.
+* **The window is a column on the organization, not on the event.** "30 days" is a policy an
+  operator sets once and then changes; storing it per event would mean a sweeper that has to
+  *compare* the two to decide what is old. The cutoff is computed per organization inside the
+  same statement, and an organization that has never set one falls back to the platform
+  default rather than to `null` — because `null` would mean "keep for ever", which is a
+  decision nobody made deliberately.
+* **A run that deletes nothing is still written to the log.** "The last sweep was at 03:00 and
+  it found nothing" is the sentence an operator needs on the day they ask why a March event is
+  still in the feed, and a table that only records activity cannot answer it on the day
+  nothing happened.
+
+**A window on the organization is also a permission split.** Reading the window, the counts and
+the last sweep rides `events.read` — describing what will be removed is reading the bus.
+**Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
+destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
+
+**`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
+literal segment registered after a parameterised sibling is read as an event id, and a request
+that is perfectly valid answers `404 no such event`.
+
+**A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
+comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
+in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
+would be quoting a number nobody can reconcile with the run log.
+
+**The panel refuses the range before the server does, because the bounds are the server's.**
+`min_days`/`max_days` arrive in the read rather than being written into the component, because
+a range written in two places is a range that will disagree, and the input that disagrees with
+the server is the one that gets a `400` nobody can act on. Out of range *disables* Save rather
+than offering a failure. And when the server does refuse, its own sentence is shown — it names
+the field and the range, and replacing that with "invalid value" throws away the only sentence
+that says which bound was crossed.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **47** (45 + 2)
+- `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
+  one-day window set through the same `PATCH` an operator uses
+- `cargo test -p omnion-api --test events` → **9/9** (the sweep must not disturb the existing
+  delivery history)
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
+  `runRetentionDepth`)
+
+**Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
+PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
+$2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
+a named argument has to land on `int`, and the error names a function that plainly exists, so
+it reads like a migration fault rather than an argument type. The second is an **assertion
+written in the same breath as the code that broke it**: the walk set the window through a
+`PATCH`, that `PATCH` recorded `webhook.retention.changed` on the same bus, and the count
+assertion still said "two aged events" while the bus honestly held three. It had passed for
+the wrong reason only because nobody had run it since the audit event was added. Counting is
+not "count the rows I set up" — a number an operator reads is a number the platform has to be
+able to explain, including the parts nobody staged.
+
+**Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
+whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
+mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
+**unrun**, so every acceptance box naming a screen stays unticked with the reason written into
+the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
+a probe that selects a hook the screen does not carry is a probe that cannot fail.
+
+**Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
+slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
+(REQ-012/013/014 — the security, backup and system-health centres).
+
+## 2026-09-29 — omnion-build tick 56 · the blocker was never the QA slot
+
+**What.** Three REQs (010, 021, 016) had each recorded, in their own words, that their
+browser pass never ran because "the QA slot is held by a sibling writer". Three ticks running,
+the excuse had become the plan: wait for the slot, write nothing, tick nothing. This tick
+checked the excuse instead of repeating it — and it was false.
+
+The slot was never the constraint. **`/dev/shm` was at 99%** (418M free) and the box was at
+load 33 with 1G of RAM available. Several stacks point `CARGO_TARGET_DIR` at tmpfs so a
+compile does not fill the disk, so the worktrees had collectively moved their unbounded build
+growth onto a filesystem *every sibling shares* — and a build that cannot write its output dies
+with "No space left on device", which reads like a source error. Freeing three orphaned
+targets took tmpfs to 29% free and the load to 15. The slot was the symptom; the excuse named
+the wrong culprit, and the wrong culprit cannot be fixed by waiting.
+
+**The fix, and the two rules it had to learn first.** `disk-guard.sh` grew a tmpfs sweep with
+an `in_use` test — and that test deleted a 7 GB target out from under a **running w8 QA pass**.
+The reason is the lesson worth the whole tick: a stack's build runs in a wrapper that *exits*
+once the binary is staged, so `run.sh`, the pm2 API and the walkthrough all carry no
+`CARGO_TARGET_DIR` and answered "not held". A pass is not a build, and asking only "is a
+compiler running" cannot tell them apart. The guard now requires both tests — nothing building
+into it AND nobody living in the worktree that owns it — and step 4, the disk's own last
+resort, gets the same check it had been missing.
+
+**Also shipped.** The one unticked REQ-016 box that named *missing* UI: the payload inspector
+could copy a whole payload but not a JSON path. It now lists the payload's keys as a tree and
+copies the path a receiver would actually write — `["order.total"]` for a key with a dot in
+it, because `payload.order.total` is two lookups that read as a key that does not exist, and a
+path that silently matches nothing in the receiver being debugged is worse than no path.
+
+**Proof.**
+
+- `bash scripts/qa/disk-guard.sh` → freed **13.9 GB**, `/dev/shm` 91% → 29% free, load 33 → 15
+- a second run against the live w8 pass → reclaimed **nothing** (the rule holds under the case
+  that broke it)
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `f658491` (the guard), `aa14c42` (the path tree), `a8399a0` (the walkthrough step),
+  `a0c0320` (the REQ's record of it)
+
+**Not done, and not claimed. Still no browser pass.** This tick's own pass is queued behind
+the same single slot (now w8's, which I disturbed and which is still running), so the
+acceptance boxes naming a screen stay unticked with the reason in the box. What changed is
+that the excuse is no longer believed: the cliff is gone, and the next tick either gets the
+slot or says which sibling is holding it and for how long.
+
+**Next.** On arrival: if the slot is free, run `bash scripts/qa/run.sh` with **no `QA_STACK`
+override** and tick the screen boxes for slices 1–3 of REQ-016 together, then close REQ-016,
+then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
+the same reason). If the slot is still held, name the holder and its ports in the log rather
+than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
+
+## 2026-09-29 — omnion-build tick 57 · REQ-012 slice 1, and a screen that says "I don't know"
+
+**What.** Started REQ-012, the security centre — the first not-done REQ in wave 1. The whole
+slice turns on one rule, and it is the only screen in the panel where a plausible default is
+a lie: **a check that could not verify something must not report `pass`.** So the rule is
+written into the design rather than left to each check's judgement —
+
+* a check is a pure function of an `Environment` it is handed, so it cannot look anything up
+  and cannot conclude anything from an empty result set;
+* a probe that could not read answers `Probe::Unknown`, and `unknown` is one of the four states
+  rather than a null the panel has to guess at;
+* the overview renders **every** registered check including one that has never run, so a
+  missing row can never read as "nothing to report here".
+
+The vocabulary (four states, four sources, five severities, four finding statuses) is
+duplicated in `0054_security_posture.sql`, which cannot import Rust. A test reads that
+migration and fails if a word exists in one list and not the other, so the two can drift only
+visibly — a red test rather than a filter that silently returns nothing.
+
+**Two asymmetries worth naming, because both were the wrong answer at first.**
+
+*A missing backup is `fail`; a missing dependency scan is `unknown`.* They look like the same
+case and they are not: "there is no backup" is a fact we can state without having read
+anything, while "we have never run a scan" is a fact about us. Collapsing them would let a
+platform with no backups read as merely unverified. The first version of the test asserted
+"unknown for everything with an empty world" and it caught this — the test was wrong, the
+asymmetry was the design, so the test now states the full expected map instead of a blanket
+rule, which means changing either default is a failure that names the check that moved.
+
+*The score weights `unknown` at 40, not 0 and not 100.* Zero punishes the platform for what
+it does not know, which is how a number stops being trusted; 100 is the over-claim the crate
+exists to avoid. The middle says "a question", which is what it is.
+
+**Also shipped.** The API behind three separate powers — `security.read` sees, `security.scan`
+re-runs and ingests, `security.manage` dismisses. `scan` is deliberately *below* `manage`:
+re-running the checks changes no configuration, while an ignore is a decision somebody will be
+asked to justify later, and granting both lets an account that can only look also dismiss what
+it saw. An uploaded report carrying a key shaped like a credential is refused **whole**,
+because this table is read by people and exported to CSV — a token in a description would move
+a secret from a CI log onto a screen designed to be shared.
+
+**Proof.**
+
+- `cargo test -p omnion-security -p omnion-permissions --lib` → **39 + 62 passed, 0 failed**
+- `cargo build -p omnion-api` → clean
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `60b45d9` (crate), `b2d82aa` (API + permissions), `7210ca3` (panel), `4208a7e` (QA)
+
+**Not done, and not claimed. No browser pass.** The single QA slot is held by a live w10 pass
+(holder pid 2521941, cwd `/mnt/apopic/omnion-w10`, still writing screenshots at the time of
+writing) — this time the blocker is named with its holder and its ports rather than written off
+as "the slot is held". `runSecurityDepth` is written and wired in; it is unrun, so the boxes
+naming a screen stay unticked. It asserts the one thing a fresh QA database makes falsifiable:
+with no MFA rows, no backup history and no header policy, the screen must say "Not checked
+yet" rather than "Verified".
+
+**Then, in the same tick, slice 1's last item: the CSV export.** An export is the one screen
+output that *leaves* the platform, so `crates/security/src/csv.rs` is written as though every
+row will be pasted into a ticket, an email and an auditor's spreadsheet. Three decisions, and
+one of them is the actual security fix:
+
+* **The export is the filter, not the page.** It ignores the page size on purpose. An operator
+  who filters to "critical", exports 50 of 300 rows and hands that to an auditor has produced
+  a document that reads as a complete list and is not one. A 50k-row cap applies instead, and
+  its refusal names the count and says "narrow the filter".
+* **A cell starting with `=`, `+`, `-` or `@` is prefixed with a tab.** Correctly quoting
+  `"=1+1"` does not help: a findings title can be a hostile package name, and a findings export
+  is exactly the document a person opens in a spreadsheet. This is the CSV injection the
+  security-export literature is actually about, and it is the reason this module is hand-written
+  rather than delegated to a helper nobody can check.
+* **The evidence blob is not exported.** Evidence is the raw report entry and this file leaves
+  the building. The ingest already refuses a document carrying something shaped like a
+  credential, but "the ingest checked" is not a reason to put the raw blob in a spreadsheet.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **51 passed** (39 + 12 CSV)
+- `cargo build -p omnion-api` → clean; `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `2585d72` (the CSV), `0d5a72e` (the endpoint and the button), `ab157fd` (this record)
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with **no `QA_STACK` override** and
+tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
+referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
+real to report, which is why those two rows are the most useful thing this tick left behind.

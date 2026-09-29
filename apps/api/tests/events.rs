@@ -2501,6 +2501,177 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
     harness.dispose().await;
 }
 
+/// An endpoint switched off stops receiving **and keeps its past**.
+///
+/// The obvious reading of "disable" is a switch that turns the whole screen off: a disabled
+/// endpoint whose history is unreadable is a switch that deletes the answer to "what was this
+/// receiver doing last Tuesday, and what did it cost me?". An operator who is pausing a
+/// misbehaving integration needs the delivery log of the behaviour they are pausing *because*
+/// of it — the log is the evidence, and hiding it removes the only reason to trust the switch.
+///
+/// So the two halves are asserted separately, and the second half is the one that would have
+/// been quietly dropped: `enqueue_fanout` filters on `w.enabled`, so the new delivery is
+/// refused by the bus, and the history read touches neither the flag nor the row.
+#[tokio::test]
+async fn a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, _owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "mute", "Mute Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Mute Site").await;
+
+    let (editor, editor_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        editor,
+        organization,
+        &[
+            "webhooks.read",
+            "webhooks.manage",
+            "events.read",
+            "content.pages.read",
+            "content.pages.create",
+            "content.pages.publish",
+        ],
+    )
+    .await;
+
+    let created = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Mute receiver",
+                "url": receiver.url,
+                "events": ["page.published"],
+            }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let endpoint_id = created.body["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        created.body["enabled"], json!(true),
+        "a new endpoint is on until somebody says otherwise"
+    );
+
+    // ---- 1. While enabled, a published page reaches the receiver -------------------------------
+    assert_eq!(
+        publish_page(&harness, &editor_token, site, "before-mute").await,
+        StatusCode::OK,
+        "the first page publishes"
+    );
+    tick(&harness).await;
+    let heard_before = receiver.captured().len();
+    assert!(heard_before >= 1, "an enabled endpoint hears the bus");
+
+    // ---- 2. Switched off, the same page is not delivered -----------------------------------------
+    let muted = harness
+        .call(patch(
+            &format!("/api/v1/webhooks/{endpoint_id}"),
+            json!({ "enabled": false }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(muted.status, StatusCode::OK, "{:?}", muted.body);
+    assert_eq!(muted.body["enabled"], json!(false));
+
+    assert_eq!(
+        publish_page(&harness, &editor_token, site, "after-mute").await,
+        StatusCode::OK,
+        "the second page publishes too — the bus does not care who is listening"
+    );
+
+    // The delivery is not merely *not sent*: it is never **queued**. An implementation that
+    // queued it and skipped the send would show the operator a growing list of `pending` rows
+    // for an endpoint they switched off, and the queue would drain or not depending on a
+    // worker that has no reason to look at a disabled endpoint.
+    let queued: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where d.endpoint_id = $1 \
+           and e.payload ->> 'slug' = 'after-mute'",
+    )
+    .bind(Uuid::parse_str(&endpoint_id).expect("uuid"))
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the delivery count must be readable");
+    assert_eq!(
+        queued, 0,
+        "a disabled endpoint is skipped by the fan-out, not queued and dropped"
+    );
+
+    tick(&harness).await;
+    assert_eq!(
+        receiver.captured().len(),
+        heard_before,
+        "nothing new arrived at the receiver while the endpoint was off"
+    );
+
+    // ---- 3. The past is still readable, in full ------------------------------------------------
+    let history = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(history.status, StatusCode::OK, "{:?}", history.body);
+    let rows = history.body["deliveries"].as_array().expect("deliveries");
+    assert!(
+        !rows.is_empty(),
+        "the deliveries made before the switch are still on the screen — that history is why \
+         an operator pauses an integration instead of deleting it"
+    );
+    assert!(
+        rows.iter().all(|row| row["status"] == "delivered"),
+        "and they are intact, not reset: {:?}",
+        rows.iter().map(|row| &row["status"]).collect::<Vec<_>>()
+    );
+
+    // The endpoint row itself reads back with the flag off — the list screen's status dot has
+    // something to draw.
+    let listed = harness
+        .call(get("/api/v1/webhooks", Some(&editor_token)))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.body);
+    let mine = listed.body["webhooks"]
+        .as_array()
+        .expect("webhooks")
+        .iter()
+        .find(|row| row["id"] == endpoint_id.as_str())
+        .expect("the endpoint is still listed");
+    assert_eq!(mine["enabled"], json!(false), "the status dot has something to draw");
+
+    // ---- 4. Switching back on resumes the stream, without a re-subscribe -------------------------
+    let resumed = harness
+        .call(patch(
+            &format!("/api/v1/webhooks/{endpoint_id}"),
+            json!({ "enabled": true }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+
+    assert_eq!(
+        publish_page(&harness, &editor_token, site, "after-unmute").await,
+        StatusCode::OK,
+        "the third page publishes"
+    );
+    tick(&harness).await;
+    assert!(
+        receiver.captured().len() > heard_before,
+        "re-enabling resumes the stream — the subscription was never destroyed, only muted"
+    );
+
+    harness.dispose().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The registry vs the emitters: no `NewEvent::new("…")` may name an event the catalogue
 // does not carry

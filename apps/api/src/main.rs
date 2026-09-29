@@ -11,7 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, lead_runner, search_runner,
+    analytics_runner, automation_runner, event_retention_runner, event_runner, lead_runner,
+    search_runner,
     workflow_runner,
 };
 use omnion_core::config::Config;
@@ -97,6 +98,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     } else {
         tracing::info!("the webhook delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
+    }
+
+    // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own
+    // flag: it deletes history rather than sending it, so an installation that drains the
+    // queue from a dedicated worker and not at all from the web nodes still wants retention
+    // where it is — and vice versa. The window is each organization's own, read inside the
+    // delete, so one tenant's compliance policy never shortens another's history.
+    if state.config().events.retention_enabled {
+        let _sweeper = event_retention_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the event retention sweeper is disabled (OMNION_EVENT_RETENTION_RUNNER=false)");
     }
 
     // The automation matcher reads the bus in this process (docs/BUILD-BACKLOG.md P13): each
