@@ -3556,3 +3556,49 @@ removed → green, by design.
 **Next.** The one remaining acceptance line: a shipped rule firing through a **real dependency
 outage** and resolving when the dependency returns. Then the REQ close gate — `cargo test
 --workspace`, `pnpm build`, and the private-stack walkthrough.
+
+## Wave 6 · tick 15 · REQ-126 slice 5 — the alert cannot resolve, and the outage walk that
+## proved it
+
+**What.** The last acceptance line of REQ-126 ("a shipped alert rule fires in the QA stack,
+creates a `firing` event, notifies once, and resolves when the dependency returns") turned up a
+defect several slices older than itself: **the evaluator compared a rule against a series'
+CUMULATIVE value.** For a gauge that is right. For a counter and a histogram it is a monotonic
+number, so `omnion_exporter_dropped_total > 0` breached the first time it breached and stayed
+breached for the life of the process — the incident never closes, the rule sits on `firing`
+forever, and `ExporterDroppingTelemetry` is a permanent alert on any instance that ever lost a
+sample. Three of the four bundled rules were affected, and every existing test asserted the
+counter MOVED, which is the one direction that keeps working while the bug is present.
+
+Rules now read a WINDOW, per kind — the counter sums the minute deltas, the gauge reads its
+level, the histogram takes the mean — which is what the shipped `infra/observability/alerts.yml`
+already does with `rate()` and `increase()`. The file and the panel are now the same rule rather
+than two rules that look alike. **Three further defects surfaced inside the history ring the
+window reads:** `apply` closed a minute AFTER applying the new value (so a `for: 0` rule read an
+always-zero open minute and the rule that exists to page the moment telemetry starts being lost
+could not fire); closing a minute pushed its bucket twice (three minutes plotted as five, and
+every counter window double-counted); and the window cut at `minute - N` instead of
+`minute - N + 1`. A fourth came out of the walk itself: `exporter_flush::persist` bound an RFC
+3339 String into the `timestamptz` column `last_flush_at`, so PostgreSQL refused the statement on
+every sweep for every exporter the moment a backend answered and a real timestamp had to be
+written — a healthy backend that never accepted a batch never reached the path.
+
+**Proof.** `cargo test -p omnion-telemetry` → **177 passed** (168 before);
+`-p omnion-api --lib` → **185 passed**; `-p omnion-core --lib` → **35 passed**;
+`pnpm typecheck` → 2 successful. Walks against `omnion_w6_dev`: `observability_alert_outage` **1/1**,
+`exporter_flush` **5/5**, `observability_alerts` **8/8**, `observability_events` **6/6**,
+`observability_retention` **7/7**, `observability_metrics` **11/11**, `observability_traces`
+**8/8**, `observability_logs` **3/3**. Mutations: **seven** applied and reverted, each failing
+on its own — counter→total, gauge→window sum, histogram→running sum, window one bucket too
+wide, ring duplication, ring plotting no silence for a skipped minute, and apply-before-close.
+The outage walk itself was mutated back to the running total and **passed twice** before it was
+made to discriminate; see below.
+
+**Next.** The REQ close gate — `cargo test --workspace`, `pnpm build`, and the private-stack
+walkthrough (`QA_STACK=w6 QA_API_PORT=18085 QA_ADMIN_PORT=3105 QA_WEB_PORT=3205 bash
+scripts/qa/run.sh`). `apps/api/tests/observability_permissions.rs` is a known open item: it aborts
+mid-run with exit 101 and no panic message, at `4e997ba` as well as at this tick's HEAD, so it is
+pre-existing on this box and not caused by this slice — logged rather than claimed.
+
+**Commits.** `cb1fd21` (the fix and its nine tests), `10d55eb` (the outage walk and the
+`exporter_flush` cast).
