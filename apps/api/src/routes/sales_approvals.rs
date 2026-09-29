@@ -358,7 +358,6 @@ async fn owner_of_quote(state: &AppState, organization_id: Uuid, quote_id: Uuid)
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use omnion_module_sales::ApprovalStatus;
 
     #[test]
