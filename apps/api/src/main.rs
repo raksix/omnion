@@ -150,6 +150,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
     }
 
+<<<<<<< HEAD
     // The AI health probe runner samples every enabled provider on its own cadence (REQ-097,
     // slice 3). It calls the same `probe_now` the "Probe now" button calls, so the background
     // sample and the manual one are the same measurement rather than two implementations of it.
@@ -179,6 +180,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::info!("the AI decision pruner is disabled (OMNION_AI_LOG_RUNNER=false)");
     }
+=======
+    // The rate-limit document is read here, once, and handed to the layer the router is about to
+    // install (REQ-012, slice 3). Reading it per request would make every request's cost depend on
+    // the database, which is how a settings screen turns into an outage; reading it here and
+    // failing open on the shipped defaults means a platform whose database is briefly unreachable
+    // still limits, instead of answering every caller in the world.
+    let limiter = omnion_api::rate_limit_middleware::RateLimiter::from_store(&state).await;
+    let _ = omnion_api::rate_limit_middleware::install(limiter);
+>>>>>>> origin/main
 
     let app = routes::router(state);
     axum::serve(

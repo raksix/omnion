@@ -99,6 +99,35 @@
 > - *The re-attach is a replay of the step rows, not a subscription.* That is what makes "replay
 >   matches SSE" measurable rather than asserted: the same rows produce both.
 >
+> **Slice 2, second commit — the run's named inputs** (migration `0154_ai_run_inputs.sql`,
+> `workspace::{RunInput, set_run_inputs, resolve}`, the run detail's inputs panel, the Run sheet's
+> picker, `apps/api/tests/ai_run_inputs.rs`). The sheet could name a file and the choice landed in
+> an audit row as `"files": 3`; three is not a record. Four decisions, each a way the record lies:
+> `file_id` is `set null` so a reference outlives the file it named and reads as *missing* rather
+> than vanishing; `file_id` is nullable so "write the summary to `summary.md`" is an instruction
+> rather than a malformed request; the write **replaces** rather than appends, because the sheet
+> can be pressed twice and two lists on one run is a trace that changes depending on which attempt
+> the reader happened to see; and `(run_id, path)` is unique because a stale picker produces the
+> same path twice. Seven walks, and the one that mattered most found a **gap**: the database
+> accepted `C:\notes.md`, because a path with no forward slash, no leading slash and no `..` clears
+> every clause of the constraint. `0153`'s workspace constraint had the same hole, and both now
+> carry the drive-letter rule with a walk that notices if a later edit drops it again.
+>
+> **Executing the slice-1/2 walks for the first time found two more defects**, committed last tick
+> having never been run: `sum(bigint)` returns **numeric** in PostgreSQL, so the quota query
+> decoded it as `Option<i64>` and six walks failed with a `ColumnDecode` on a perfectly good row;
+> and `re_uploading_a_path` asserted that a replacement is a *new* row, which is backwards —
+> `put_file` upserts, and a row whose id changed would orphan every run input pointing at it. The
+> assertion now pins the identity as stable *and* the storage key as moved.
+>
+> **The SDK** (slice 4's last box, `crates/ai-hub/src/agent_sdk.rs`): a builder over the five
+> things the loop needs and a callback instead of a channel the caller must drain. It persists
+> nothing, resolves no model and knows nothing about approvals — each of those belongs to the
+> store, the router and REQ-101 respectively, and a builder that grew them would be claiming a
+> half. The doc comment at the top of the module **is** the example and
+> `the_documented_example_runs` executes it, because a README example nobody runs is prose that
+> rots.
+>
 > **Slice 2, first commit — the workspace** (`crates/ai-hub/src/workspace.rs`, migration
 > `0153_ai_agent_files.sql`, `routes/ai_agent_workspace.rs`, the Workspace tab, the walkthrough's
 > `runAiAgentsDepth` extension). The agent's scratch area: the inputs a run is told to read and
@@ -120,12 +149,12 @@
 >   never be steered into another file's address; the checksum makes a re-upload of identical
 >   bytes reuse one object instead of leaving an orphan.
 >
-> Still open in slice 2: the goal's workspace references (a run naming its inputs) and the SDK.
-> The **Skills tab and the Runs tab** are slice 3, and the tab bar renders only the two that
-> exist — a tab that opens onto nothing is a tab that lies.
+> Still open in slice 2: nothing declared — the goal's workspace references and the SDK both
+> landed this round. The **Skills tab and the Runs tab** are slice 3, and the tab bar renders only
+> the two that exist — a tab that opens onto nothing is a tab that lies.
 >
-> Still open in slice 1: the output-verification helper, the guardrail bus events, the SDK
-> example and the QA pass over the new screens. REQ-099 is not closeable: the approval decision
+> Still open in slice 1: the output-verification helper and the guardrail bus events. The SDK
+> example is no longer open (the module above). REQ-099 is not closeable: the approval decision
 > and resume are REQ-101's, and the skills are slice 3.
 
 ## Request
@@ -248,10 +277,15 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 - [ ] A skill attaching an unknown tool key fails validation with the key named, and a disabled skill is absent from the assembled prompt (test asserts the prompt).
 - [ ] A skill with a mismatched checksum is refused at run start with the reason shown on the Skills tab.
 - [x] Workspace paths with `..`, an absolute path or a control character are refused; per-file and per-agent caps are enforced with stable codes. *(proved on both sides of the boundary, because a rule the code enforces and the schema does not is a rule a restore or a migration sails past. Twelve unit tests call `validate_path` with values the test wrote — `../secrets.txt`, `/etc/passwd`, `C:\notes.md`, `notes\n.md`, `notes.md/`, `..hidden.md` — and four walks prove the *database* refuses the same shapes by constraint name. The caps are arithmetic: `sum(size_bytes) where agent_id = $1`, so a deleted file releases its bytes and a replacement refunds the old size. The walk that fills a workspace to exactly 100 MB asserts the asymmetry that matters: a replacement at the same size goes through, a *new* file at the same size is refused with "100 MB … already stored in 10 file(s)", and deleting one file makes room. Both limits are `MAX_FILE_BYTES` / `MAX_AGENT_BYTES` in the crate, quoted by the panel rather than retyped.)*
-- [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both). *(both halves are now proved at the store: `get_file` by path, `get_file_by_id` by row id, `list_files` and `delete_file` all answer `None`/`false` for another organization, and the file is still there afterwards — a single un-scoped query is a cross-tenant read and there are four of them. Two agents in *one* organization also do not share a namespace, which is the half the unique index on `(agent_id, path)` gives for free. The route's 404 is REQ-101's remaining wiring.)*
+- [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both). *(both halves are now proved at the store: `get_file` by path, `get_file_by_id` by row id, `list_files` and `delete_file` all answer `None`/`false` for another organization, and the file is still there afterwards — a single un-scoped query is a cross-tenant read and there are four of them. Two agents in *one* organization also do not share a namespace, which is the half the unique index on `(agent_id, path)` gives for free. The route's 404 is REQ-101's remaining wiring. **This tick executed the walks for the first
+  time** — they had been committed unrun because the box had no free RAM — and 6 of 16 failed on a
+  real defect (`sum(bigint)` decodes as `numeric`, not `int8`; the quota query therefore never
+  worked, which means the cap the panel's usage bar shows has been reading an error, not a
+  number). Fixed in `acd2683`; 17 pass. A twelfth walk now pins the drive-letter clause that the
+  constraint was missing entirely.)*
 - [x] A run's cost equals the sum of its `ai_usage` rows for the same window, asserted against SQL in the test. *(proved against the step rows, which is the recomputable half; the `ai_usage` join needs the provider call in slice 1's remaining half)*
 - [ ] Run telemetry (steps, tools used, tokens, cost) is visible per run and rolled up per agent for 30 days, and equals the underlying rows.
-- [ ] The SDK example runs a two-tool agent against a stub provider inside the workspace test suite without the API layer.
+- [x] The SDK example runs a two-tool agent against a stub provider inside the workspace test suite without the API layer. *(`agent_sdk.rs`'s doc comment is the example and `the_documented_example_runs` executes it — two tools would need a second `one_tool` registry, and one is what proves the callback sees the steps rather than only the final frame. `the_documented_example_runs` asserts the answer text *and* that the callback was invoked at least four times, because a run that completes while its listener never fires is the failure a callback-based API hides. Six unit tests in all.)*
 - [x] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text. *(the five screens this slice ships all carry the three states: `LoadingTable` while the fetch is in flight, an `EmptyState` that names what is missing and offers the action that gets past it — "No agent yet" with Create agent, "No run yet" with a link to the agents table — and a banner carrying the API's own message with a real Retry. A filtered list that matched nothing says "No agent matches these filters" rather than showing the empty state's "nothing exists", because those are different facts. The type-to-confirm delete, the duplicate, the bulk bar and the Run sheet are all wired to real calls; the walkthrough drives each of them.)*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 

@@ -345,6 +345,38 @@ catalogue! {
     "An access request was approved or refused.",
     [("subject", String, req), ("permission", String, opt), ("approved", Boolean, opt)];
 
+    // ---- Security (REQ-012) -------------------------------------------------------------------
+    //
+    // Four names, and the reason they are all here rather than one is that they answer four
+    // different questions an operator subscribes to separately: *did the platform check itself*,
+    // *what does it now send on the wire*, *what does it refuse* and *somebody released a lock*.
+    //
+    // The payloads deliberately carry no policy **values**. `security.headers.updated` names the
+    // CSP directive *names* and the mode; it does not carry the origins, because a header
+    // policy travels to every webhook receiver and is still configuration somebody considers
+    // sensitive. `security.rate_limits.updated` carries the *count* of scopes, not the numbers —
+    // the numbers are in the audit entry and in the panel, and a bus event is the wrong place to
+    // publish a limit to.
+    "security.scan.completed", "security", Live,
+    "The posture checks were re-run and a fresh result set was recorded.",
+    [("run_id", Uuid, req), ("checks", Integer, req)];
+    "security.headers.updated", "security", Live,
+    "The response-header policy was saved; the next response already carries it.",
+    [("csp_mode", String, req), ("directives", String, opt)];
+    "security.rate_limits.updated", "security", Live,
+    "The rate-limit document was saved, so the limiter is deciding by the new numbers.",
+    [("scopes", Integer, req)];
+    // `user_id` is the account that was locked, NOT the actor: the release is the unlock, and an
+    // operator subscribing to it wants to know which account was let back in. The actor already
+    // rides the envelope, so repeating it here would be a second place for the two to disagree.
+    "security.lockout.released", "security", Live,
+    "An operator released an account's brute-force lockout before it expired.",
+    [("user_id", Uuid, req)];
+    // `security.lockout.triggered` is NOT here, and the absence is deliberate: the lockout is
+    // applied by `crates/identity`'s own sign-in path, which has no bus handle, and naming a
+    // fact the platform does not record would put it back in the picker as a name that never
+    // fires. It joins the catalogue in the commit that gives the sign-in route an emitter.
+
     // ---- Tenancy -------------------------------------------------------------------------------
     "site.created", "tenancy", Live,
     "A site was created.",
