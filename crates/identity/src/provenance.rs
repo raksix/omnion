@@ -294,12 +294,53 @@ pub async fn reassign(pool: &PgPool, user_ids: &[Uuid]) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// Mark an account as one a connector pushed, without naming which connector.
+///
+/// This is the write `0127` was designed around and the SCIM path never performed, so the whole
+/// provenance story was **half real**: the migration's backfill stamped `scim` on rows that
+/// already carried a `scim_external_id`, which is correct for the upgrade, and then every account
+/// a connector created *afterwards* stayed `local` forever. The delete guard reads
+/// `identity_source`, so the criterion it exists to satisfy — "deleting a provider that
+/// provisioned users is blocked with the affected count listed" — counted a directory that
+/// created eight people as **zero**, and the provider went away with all eight accounts keeping
+/// their sessions and their role grants. The unit tests could not see it because their fixture
+/// inserted the column by hand, which is the shape of a test that proves the query rather than
+/// the code that feeds it.
+///
+/// Deliberately keeps the provider and external id untouched. A SCIM token names no provider —
+/// it is an organization-scoped bearer — so a pushed account is legitimately unattributable, and
+/// `users_provenance_paired_check` refuses the alternative. `IdentitySource::Scim` with a null
+/// provider is exactly the state `0127` documents for pre-`0127` rows, which is why the guard's
+/// query has to accept it rather than key on the provider id.
+///
+/// Returns whether the row changed, so a caller can tell "this push claimed an account" from
+/// "this push re-sent an account the connector already owned" without a second read. A no-op is
+/// still an answer: a connector re-sends whole user sets on a timer, and an idempotent write is
+/// what stops a sync log from claiming a change on every sweep.
+pub async fn mark_scim_provisioned(pool: &PgPool, user_id: Uuid) -> Result<bool> {
+    let result = sqlx::query(
+        "update users \
+            set identity_source = 'scim' \
+          where id = $1 and identity_source is distinct from 'scim'",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Point an account at the provider that owns it.
 ///
 /// Refuses a half-written pair by name rather than letting the pairing check raise a constraint
 /// error: the caller is a connector, and "the directory id arrived without a provider" is a
 /// configuration mistake it can be told about, while a 23514 from a background sweep is a line
 /// in a log nobody reads.
+///
+/// **No caller in the workspace.** Kept because it is the only way to write the attributed form
+/// of the pairing, and `attribute` is what a provider-kind sign-in path (an LDAP/AD account that
+/// keeps its provider) will need. It is not the SCIM path: a connector names no provider, and the
+/// tests that do call it build the row by hand, which is precisely the gap
+/// [`mark_scim_provisioned`] exists to close.
 pub async fn attribute(
     pool: &PgPool,
     user_id: Uuid,
