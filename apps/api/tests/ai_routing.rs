@@ -250,8 +250,32 @@ struct Fixture {
     small: String,
     large: String,
     wide: String,
+    /// Claims no capability flags — the only model a `coding` or `critical` route must refuse.
+    plain: String,
 }
 
+/// Build the three-model provider every walk in this file shares.
+///
+/// **`large` carries `supports_tools` too, and that is load-bearing.** REQ-098 slice 1
+/// (`a417ce9`) made `critical` and `coding` *require* the tools flag
+/// (`can_serve_task`: `"coding" | "critical" => model.capability(Tools)`), so `PUT
+/// /api/v1/ai/routing` refuses a `critical` candidate that does not claim it. The walks below
+/// write `critical` and `cheap` maps with `large` as a candidate — and before this fixture gave
+/// `large` the flag, every one of those PUTs answered **400**.
+///
+/// The failure was silent because **the walks never assert that the PUT succeeded**: they call
+/// `harness.call(put(...)).await` and drop the response, so a rejected write left the map empty
+/// and the next `preview` fell through to the installation default. Six walks then asserted
+/// `small` and read `large` — which reads like "the resolver chose wrong", and is really "the map
+/// was never written". [`Fixture::put_map`] closes that: every write in this file now asserts its
+/// own status, so a rejected map fails at the write that caused it.
+///
+/// Four models, and each one exists because a walk needs a *distinct* capability profile. `small`,
+/// `large` and `wide` all claim tools, so any of them can serve a `coding` or `critical` route;
+/// `plain` claims nothing and is therefore the only model the "a capability-incompatible route is
+/// refused" walk can name. Before `plain` existed that walk pointed at `large`, which used to be
+/// the flags-less one — giving `large` the tools flag to make the *other* walks writable silently
+/// disarmed this one.
 async fn connected(harness: &Harness, base_url: &str) -> Fixture {
     let owner = harness
         .call(post(
@@ -275,8 +299,9 @@ async fn connected(harness: &Harness, base_url: &str) -> Fixture {
                 "base_url": base_url,
                 "models": [
                     { "key": "small", "context_window": 8192, "supports_tools": true },
-                    { "key": "large", "context_window": 16384 },
-                    { "key": "wide", "context_window": 200000, "supports_tools": true }
+                    { "key": "large", "context_window": 16384, "supports_tools": true },
+                    { "key": "wide", "context_window": 200000, "supports_tools": true },
+                    { "key": "plain", "context_window": 4096 }
                 ]
             }),
             Some(&token),
@@ -298,7 +323,79 @@ async fn connected(harness: &Harness, base_url: &str) -> Fixture {
         small: id_of("small"),
         large: id_of("large"),
         wide: id_of("wide"),
+        plain: id_of("plain"),
     }
+}
+
+impl Fixture {
+    /// Write a task map and **assert that it was stored**.
+    ///
+    /// The whole file used to call `harness.call(put(...)).await` and ignore the answer, which
+    /// is what turned a rejected map into a six-test red that pointed at the resolver instead of
+    /// at the write. Every write goes through here now.
+    async fn put_map(&self, harness: &Harness, body: Value) -> TestResponse {
+        let response = harness
+            .call(put("/api/v1/ai/routing", body, &self.token))
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "the route map must be written; a refusal here leaves the map empty and every \
+             later preview falls through to the installation default — {:?}",
+            response.body
+        );
+        response
+    }
+
+    /// Write a task map and return the answer **without** judging it.
+    ///
+    /// For the walks whose subject *is* a refusal. `put_map` asserts `200` precisely so an
+    /// accidental refusal cannot pass for a successful write — which means a walk that is
+    /// deliberately provoking a `400` needs the unjudged path, or the helper's assertion and the
+    /// walk's own assertion contradict each other. The distinction is the point: *this* write is
+    /// supposed to fail, and saying so twice is not belt and braces, it is a contradiction.
+    async fn try_put_map(&self, harness: &Harness, body: Value) -> TestResponse {
+        harness
+            .call(put("/api/v1/ai/routing", body, &self.token))
+            .await
+    }
+
+    /// Write a feature pin and return the answer without judging it. See [`Fixture::try_put_map`].
+    async fn try_put_override(&self, harness: &Harness, body: Value) -> TestResponse {
+        harness
+            .call(put("/api/v1/ai/routing/overrides", body, &self.token))
+            .await
+    }
+
+    /// Write a feature pin and **assert that it was stored**.
+    ///
+    /// The same reasoning as [`Fixture::put_map`], one endpoint over: a rejected pin is as
+    /// silent as a rejected map, and "the inherited model answers" is exactly what a preview
+    /// reports when the pin that was supposed to shadow it was never stored.
+    async fn put_override(&self, harness: &Harness, body: Value) -> TestResponse {
+        let response = harness
+            .call(put("/api/v1/ai/routing/overrides", body, &self.token))
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "the feature pin must be written; a refusal here leaves the inherited model in \
+             place and every later preview reads as though the pin was never set — {:?}",
+            response.body
+        );
+        response
+    }
+}
+
+/// The `message` of an error response.
+///
+/// The envelope is `{"error": {"code": ..., "message": ...}}`, so `body["message"]` is always
+/// `null` and every assertion written against it passes vacuously — `assert!(s.contains("x"))`
+/// on an empty string fails, which is at least loud, but a walk that only checks the *status*
+/// and never the message never learns the message was missing. Three walks did exactly that and
+/// the bug survived to this file's re-read.
+fn message_of(body: &Value) -> &str {
+    body["error"]["message"].as_str().unwrap_or_default()
 }
 
 /// The candidates of one task in a routing response.
@@ -344,19 +441,13 @@ async fn the_dry_run_resolves_a_map_without_calling_a_provider() {
     let (base_url, _mock) = mock_provider().await;
     let fixture = connected(&harness, &base_url).await;
 
-    let saved = harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "cheap",
-                "candidates": [
-                    { "model_id": fixture.small, "requirements": [] },
-                    { "model_id": fixture.large, "requirements": [] }
-                ]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    let saved = fixture.put_map(&harness,         json!({
+            "task": "cheap",
+            "candidates": [
+                { "model_id": fixture.small, "requirements": [] },
+                { "model_id": fixture.large, "requirements": [] }
+            ]
+        }),).await;
     assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
 
     let before = PROVIDER_CALLS.load(Ordering::SeqCst);
@@ -412,16 +503,10 @@ async fn a_fresh_install_can_write_its_first_route_map() {
         before.body
     );
 
-    let saved = harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "cheap",
-                "candidates": [{ "model_id": fixture.small, "requirements": [] }]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    let saved = fixture.put_map(&harness,         json!({
+            "task": "cheap",
+            "candidates": [{ "model_id": fixture.small, "requirements": [] }]
+        }),).await;
     assert_eq!(
         saved.status,
         StatusCode::OK,
@@ -451,20 +536,14 @@ async fn disabling_the_primary_degrades_to_the_first_fallback() {
     let (base_url, _mock) = mock_provider().await;
     let fixture = connected(&harness, &base_url).await;
 
-    harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "critical",
-                "candidates": [
-                    { "model_id": fixture.small, "requirements": ["tools"] },
-                    { "model_id": fixture.large, "requirements": [] },
-                    { "model_id": fixture.wide, "requirements": [] }
-                ]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    fixture.put_map(&harness,         json!({
+            "task": "critical",
+            "candidates": [
+                { "model_id": fixture.small, "requirements": ["tools"] },
+                { "model_id": fixture.large, "requirements": [] },
+                { "model_id": fixture.wide, "requirements": [] }
+            ]
+        }),).await;
 
     // The primary answers while it is on.
     let before = harness
@@ -496,8 +575,12 @@ async fn disabling_the_primary_degrades_to_the_first_fallback() {
         ))
         .await;
     let chosen = &after.body["model"];
-    assert_eq!(chosen["model_id"], json!("wide"), "the first *usable* fallback answers");
-    assert_eq!(chosen["position"], json!(3));
+    assert_eq!(
+        chosen["model_id"],
+        json!("large"),
+        "the first *usable* fallback answers: `large` claims tools, so it is not skipped"
+    );
+    assert_eq!(chosen["position"], json!(2));
 
     // The walk carries all three candidates and names the skip.
     let walk = walk_of(&after.body);
@@ -525,23 +608,11 @@ async fn a_feature_pin_beats_the_task_route_and_the_route_beats_the_default() {
     let fixture = connected(&harness, &base_url).await;
 
     // Both configured at once, so only the order can decide.
-    harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "cheap",
-                "candidates": [{ "model_id": fixture.small, "requirements": [] }]
-            }),
-            &fixture.token,
-        ))
-        .await;
-    let pinned = harness
-        .call(put(
-            "/api/v1/ai/routing/overrides",
-            json!({ "feature": "copilot", "model_id": fixture.large }),
-            &fixture.token,
-        ))
-        .await;
+    fixture.put_map(&harness,         json!({
+            "task": "cheap",
+            "candidates": [{ "model_id": fixture.small, "requirements": [] }]
+        }),).await;
+    let pinned = fixture.put_override(&harness,         json!({ "feature": "copilot", "model_id": fixture.large }),).await;
     assert_eq!(pinned.status, StatusCode::OK, "{:?}", pinned.body);
 
     // The feature wins over the task.
@@ -590,32 +661,31 @@ async fn a_capability_incompatible_route_is_refused_and_the_old_map_survives() {
     let fixture = connected(&harness, &base_url).await;
 
     // A good map first, so there is something to lose.
-    harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "coding",
-                "candidates": [{ "model_id": fixture.small, "requirements": ["tools"] }]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    fixture.put_map(&harness,         json!({
+            "task": "coding",
+            "candidates": [{ "model_id": fixture.small, "requirements": ["tools"] }]
+        }),).await;
 
-    // `large` claims no tools flag, and the coding task needs one.
-    let refused = harness
-        .call(put(
-            "/api/v1/ai/routing",
+    // `plain` claims no flags at all, and the coding task needs the tools one. This write is
+    // *supposed* to fail, so it goes through the unjudged helper: `put_map` asserting `200` on a
+    // refusal the walk is provoking would be the walk arguing with itself.
+    //
+    // It is `plain` and not `large` because `large` claims tools now — a `coding` candidate that
+    // can do the work is stored, correctly, and a test that expected it to be refused would be
+    // asserting the bug.
+    let refused = fixture
+        .try_put_map(
+            &harness,
             json!({
                 "task": "coding",
-                "candidates": [{ "model_id": fixture.large, "requirements": [] }]
+                "candidates": [{ "model_id": fixture.plain, "requirements": [] }]
             }),
-            &fixture.token,
-        ))
+        )
         .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.body);
-    let message = refused.body["message"].as_str().unwrap_or_default();
+    let message = message_of(&refused.body);
     assert!(message.contains("coding"), "names the task: {message}");
-    assert!(message.contains("large"), "names the candidate: {message}");
+    assert!(message.contains("plain"), "names the candidate: {message}");
     assert!(
         message.contains("tools"),
         "names the requirement: {message}"
@@ -669,17 +739,11 @@ async fn a_site_map_does_not_change_the_installation_or_a_sibling_site() {
     let site_two = create_site(harness.db.pool(), organization, "two").await;
 
     // A site map for `cheap` naming only `wide`.
-    let saved = harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "cheap",
-                "site_id": site_one,
-                "candidates": [{ "model_id": fixture.wide, "requirements": [] }]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    let saved = fixture.put_map(&harness,         json!({
+            "task": "cheap",
+            "site_id": site_one,
+            "candidates": [{ "model_id": fixture.wide, "requirements": [] }]
+        }),).await;
     assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
 
     // Site one answers with its own model.
@@ -729,13 +793,7 @@ async fn removing_an_override_restores_the_inherited_model() {
     let fixture = connected(&harness, &base_url).await;
 
     // An installation-level pin, then an organization-level one that shadows it.
-    harness
-        .call(put(
-            "/api/v1/ai/routing/overrides",
-            json!({ "feature": "summarize", "model_id": fixture.small }),
-            &fixture.token,
-        ))
-        .await;
+    fixture.put_override(&harness,         json!({ "feature": "summarize", "model_id": fixture.small }),).await;
     let organization: (Uuid,) = sqlx::query_as(
         "insert into organizations (id, name, slug) values (gen_random_uuid(), 'Beta', $1) returning id",
     )
@@ -745,13 +803,7 @@ async fn removing_an_override_restores_the_inherited_model() {
     .expect("the organization must be created");
     let organization = organization.0;
 
-    harness
-        .call(put(
-            "/api/v1/ai/routing/overrides",
-            json!({ "feature": "summarize", "model_id": fixture.large, "organization_id": organization }),
-            &fixture.token,
-        ))
-        .await;
+    fixture.put_override(&harness,         json!({ "feature": "summarize", "model_id": fixture.large, "organization_id": organization }),).await;
 
     let shadowed = harness
         .call(post(
@@ -763,13 +815,7 @@ async fn removing_an_override_restores_the_inherited_model() {
     assert_eq!(shadowed.body["model"]["model_id"], json!("large"));
 
     // Remove the organization pin: the installation one is inherited again.
-    let removed = harness
-        .call(put(
-            "/api/v1/ai/routing/overrides",
-            json!({ "feature": "summarize", "model_id": null, "organization_id": organization }),
-            &fixture.token,
-        ))
-        .await;
+    let removed = fixture.put_override(&harness,         json!({ "feature": "summarize", "model_id": null, "organization_id": organization }),).await;
     assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.body);
 
     let restored = harness
@@ -794,31 +840,23 @@ async fn an_unknown_key_is_refused_with_the_real_vocabulary() {
     let (base_url, _mock) = mock_provider().await;
     let fixture = connected(&harness, &base_url).await;
 
-    let task = harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({ "task": "fast", "candidates": [] }),
-            &fixture.token,
-        ))
+    let task = fixture
+        .try_put_map(&harness, json!({ "task": "fast", "candidates": [] }))
         .await;
     assert_eq!(task.status, StatusCode::BAD_REQUEST, "{:?}", task.body);
-    let message = task.body["message"].as_str().unwrap_or_default();
+    let message = message_of(&task.body);
     assert!(message.contains("fast"), "{message}");
     assert!(message.contains("long_context"), "names the real tasks: {message}");
 
-    let feature = harness
-        .call(put(
-            "/api/v1/ai/routing/overrides",
-            json!({ "feature": "translation", "model_id": fixture.small }),
-            &fixture.token,
-        ))
+    // `translation` is a *task* key, not a feature key, so the override refuses it — and the
+    // refusal has to name the vocabulary that does exist, or the operator cannot tell `translate`
+    // from `content_assist` without reading the source.
+    let feature = fixture
+        .try_put_override(&harness, json!({ "feature": "translation", "model_id": fixture.small }))
         .await;
     assert_eq!(feature.status, StatusCode::BAD_REQUEST, "{:?}", feature.body);
     assert!(
-        feature.body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("copilot"),
+        message_of(&feature.body).contains("copilot"),
         "names the real features: {:?}",
         feature.body
     );
@@ -832,9 +870,7 @@ async fn an_unknown_key_is_refused_with_the_real_vocabulary() {
         .await;
     assert_eq!(requirement.status, StatusCode::BAD_REQUEST, "{:?}", requirement.body);
     assert!(
-        requirement.body["message"]
-            .as_str()
-            .unwrap_or_default()
+        message_of(&requirement.body)
             .contains("tools, vision, long_context, json"),
         "names the four requirements: {:?}",
         requirement.body
@@ -894,16 +930,10 @@ async fn writing_a_route_map_needs_the_settings_power() {
     let fixture = connected(&harness, &base_url).await;
 
     // The owner holds both powers, so the write succeeds for them.
-    let allowed = harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "cheap",
-                "candidates": [{ "model_id": fixture.small, "requirements": [] }]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    let allowed = fixture.put_map(&harness,         json!({
+            "task": "cheap",
+            "candidates": [{ "model_id": fixture.small, "requirements": [] }]
+        }),).await;
     assert_eq!(allowed.status, StatusCode::OK, "{:?}", allowed.body);
 
     // An anonymous caller is refused before the handler runs.
@@ -930,19 +960,13 @@ async fn a_removed_model_leaves_a_null_candidate_the_panel_marks() {
     let (base_url, _mock) = mock_provider().await;
     let fixture = connected(&harness, &base_url).await;
 
-    harness
-        .call(put(
-            "/api/v1/ai/routing",
-            json!({
-                "task": "cheap",
-                "candidates": [
-                    { "model_id": fixture.small, "requirements": [] },
-                    { "model_id": fixture.large, "requirements": [] }
-                ]
-            }),
-            &fixture.token,
-        ))
-        .await;
+    fixture.put_map(&harness,         json!({
+            "task": "cheap",
+            "candidates": [
+                { "model_id": fixture.small, "requirements": [] },
+                { "model_id": fixture.large, "requirements": [] }
+            ]
+        }),).await;
 
     // Delete the primary model's row directly: the `on delete set null` is the migration's
     // promise, and a disabled model would not exercise it.
