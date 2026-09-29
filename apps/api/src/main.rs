@@ -11,9 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, crm_autoresponder_runner, event_retention_runner,
-    event_runner, search_runner,
-    workflow_runner,
+    analytics_runner, automation_runner, crm_autoresponder_runner, crm_sla_runner,
+    event_retention_runner, event_runner, search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -161,6 +160,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!(
             "the crm autoresponder worker is disabled (OMNION_CRM_AUTORESPONDER_RUNNER=false)"
         );
+    }
+
+    // The SLA worker (REQ-117, slice 3) escalates the leads whose first-response deadline has
+    // passed and reminds the owners of the ones about to. Until this existed, the store read
+    // `due_breaches` and nothing called it: the panel computed a `breached` state that no
+    // timer ever acted on, so a policy with a 60-minute target was a number in a column rather
+    // than an escalation. The reminder is the half that had *no* reader at all — the column
+    // existed and the editor rendered it, which is exactly what makes a missing worker hard to
+    // notice: every screen said the reminder was configured and nothing said it was not running.
+    if state.config().crm_sla.runner_enabled {
+        let _sla = crm_sla_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the crm sla worker is disabled (OMNION_CRM_SLA_RUNNER=false)");
     }
 
     // The rate-limit document is read here, once, and handed to the layer the router is about to
