@@ -36,6 +36,7 @@ import {
   ShieldAlert,
   Trash2,
   TriangleAlert,
+  UserRoundCheck,
 } from "lucide-react";
 
 import { LoadingTable } from "@/components/loading-table";
@@ -64,6 +65,7 @@ import {
   type LeadConversion,
   type LeadDetail as LeadDetailBody,
   type LeadStep,
+  assignLead,
 } from "@/lib/crm-intake-api";
 
 type Draft = {
@@ -104,6 +106,12 @@ export function LeadDetail() {
   const [showRaw, setShowRaw] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
+  // The hand-over panel is *closed* until asked for, because the reason is a required field
+  // and an always-open pair of inputs sitting above the other actions makes the panel read as
+  // an assignment form when it is mostly not.
+  const [assigning, setAssigning] = useState(false);
+  const [assignOwner, setAssignOwner] = useState("");
+  const [assignReason, setAssignReason] = useState("");
   // What the last `Convert` actually produced, kept apart from `notice` because the
   // interesting half is the `deal_skipped` sentence — "the CRM module is not installed" is
   // information the operator needs after the toast has gone.
@@ -537,6 +545,97 @@ export function LeadDetail() {
           <div className="rounded-xl border border-line bg-surface">
             <h3 className="border-b border-line px-4 py-2.5 text-[12.5px] font-semibold">Work this lead</h3>
             <div className="flex flex-col gap-2.5 px-4 py-3">
+              {/* The hand-over. `crm.leads.assign` is a different power from `crm.leads.manage`,
+                  which is why this is its own call and not an edit of the draft above — an
+                  operator who may correct a lead's fields is not automatically the person who
+                  decides whose work it is. */}
+              {!assigning ? (
+                <button
+                  type="button"
+                  data-lead-assign-open
+                  data-qa-guard="crm-intake-depth"
+                  disabled={busy || lead.status === "converted"}
+                  onClick={() => {
+                    // Pre-fill with the current owner so "hand it to the same person" is visible
+                    // as what it is, and so pressing save without changing anything is a no-op
+                    // the server can record honestly rather than a blank assignment.
+                    setAssignOwner(lead.owner_user_id ?? "");
+                    setAssignReason("");
+                    setAssigning(true);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-[12.5px] transition hover:text-ink disabled:opacity-50"
+                >
+                  <UserRoundCheck className="size-3.5" aria-hidden />
+                  {lead.owner_user_id ? "Change owner" : "Assign an owner"}
+                </button>
+              ) : (
+                <div
+                  data-lead-assign
+                  className="flex flex-col gap-2 rounded-lg border border-line bg-canvas p-2.5"
+                >
+                  <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+                    <span className="font-medium">Owner</span>
+                    <input
+                      data-lead-assign-owner
+                      className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] text-ink"
+                      placeholder="Unassigned queue (leave empty)"
+                      value={assignOwner}
+                      onChange={(event) => setAssignOwner(event.target.value.trim())}
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+                    <span className="font-medium">Why</span>
+                    <input
+                      data-lead-assign-reason
+                      className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] text-ink"
+                      placeholder="Wrong region · asked for it"
+                      value={assignReason}
+                      onChange={(event) => setAssignReason(event.target.value)}
+                    />
+                  </label>
+                  <p className="text-[11.5px] text-muted">
+                    Empty means the unassigned queue, and the reason is recorded either way. The
+                    first-response deadline does not move: handing a lead to the right person is
+                    not a new promise to the person who wrote in.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      data-lead-assign-save
+                      disabled={busy || assignReason.trim() === ""}
+                      onClick={() =>
+                        void run(
+                          () =>
+                            assignLead(
+                              lead.id,
+                              assignOwner === "" ? null : assignOwner,
+                              assignReason.trim(),
+                            ),
+                          "The lead has a new owner.",
+                        ).then(() => setAssigning(false))
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-accent bg-accent-soft px-3 py-1.5 text-[12.5px] text-accent-strong disabled:opacity-50"
+                    >
+                      {busy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : <Check className="size-3.5" aria-hidden />}
+                      Save owner
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAssigning(false)}
+                      className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-muted"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {assignReason.trim() === "" ? (
+                    <p className="text-[11.5px] text-muted">
+                      A reason is required — a lead that changed hands with no explanation cannot
+                      be explained to the person who had it.
+                    </p>
+                  ) : null}
+                </div>
+              )}
+
               <button
                 type="button"
                 data-lead-respond

@@ -212,6 +212,22 @@ pub struct RejectBody {
     pub reason: String,
 }
 
+/// A hand-assignment: who takes the lead, and why.
+///
+/// `owner_user_id` is `Option<Option<Uuid>>` for the reason named in `assign`: `Some(Some(id))`
+/// is "give it to this person", `Some(None)` is "put it back in the unassigned queue", and a
+/// missing field is refused. `Option<Uuid>` would collapse the last two into one, and the second
+/// of those is a destructive act nobody should trigger by forgetting a key.
+#[derive(Debug, Default, Deserialize)]
+pub struct AssignBody {
+    /// The new owner, or `null` to return the lead to the queue.
+    #[serde(default)]
+    pub owner_user_id: Option<Option<uuid::Uuid>>,
+    /// Why it moved. Required.
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// A spam marker's body: the reason is optional, because the score is already recorded.
 #[derive(Debug, Default, Deserialize)]
 pub struct MarkSpamBody {
@@ -997,6 +1013,79 @@ pub async fn patch_lead(
         }),
     )
     .await;
+
+    Ok(Json(LeadBody::from(updated)))
+}
+
+/// `POST /api/v1/crm/leads/{id}/assign` — hand a lead to a person, or put it back in the queue.
+///
+/// The rules answer "who should get this one" and a human answers "who actually should", so the
+/// hand exists. What it must not be is silent: the reason is required, the trail keeps the
+/// previous owner, and the SLA clock keeps running (see `store::assign_owner` for why each of
+/// those is a decision rather than an omission).
+pub async fn assign(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AssignBody>,
+) -> Result<Json<LeadBody>, ApiError> {
+    let organization_id = organization_of(&session)?;
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(ApiError::bad_request(
+            "reason_required",
+            "an assignment says why — a lead that moved hands with no explanation cannot be \
+             explained to the person who had it",
+        ));
+    }
+
+    // The owner is an *optional* owner, not an optional field. `Some(None)` is "send it back to
+    // the unassigned queue" and `None` is "the request never said", which must be refused rather
+    // than read as the first: a client that forgets the field would otherwise empty every
+    // assignee's queue with one press.
+    let Some(owner) = body.owner_user_id else {
+        return Err(ApiError::bad_request(
+            "owner_required",
+            "say who the lead goes to, or send it to \"unassigned\" explicitly",
+        ));
+    };
+
+    let updated = store::assign_owner(
+        state.db().pool(),
+        organization_id,
+        id,
+        owner,
+        reason,
+        Some(session.user.id),
+    )
+    .await
+    .map_err(map_store)?
+    .ok_or_else(|| not_found("lead"))?;
+
+    audit(
+        state.db().pool(),
+        session.user.id,
+        organization_id,
+        "crm.lead.assigned",
+        id,
+        json!({ "owner_user_id": owner.map(|o| o.to_string()), "reason": reason }),
+    )
+    .await;
+
+    if let Err(error) = bus::emit(
+        state.db().pool(),
+        NewEvent::new("crm.lead.assigned")
+            .organization(organization_id)
+            .payload(json!({
+                "lead_id": id,
+                "owner_user_id": owner.map(|o| o.to_string()),
+                "reason": reason,
+            })),
+    )
+    .await
+    {
+        tracing::warn!(error = %error, "crm.lead.assigned could not be recorded");
+    }
 
     Ok(Json(LeadBody::from(updated)))
 }

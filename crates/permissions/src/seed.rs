@@ -157,6 +157,11 @@ const BASE_ROLES: &[BaseRole] = &[
             // moderator who works the queue is not the person who decides that.
             "crm.leads.read",
             "crm.leads.manage",
+            // Handing a lead over IS the queue moderator's job — the rules route by country and
+            // by product, and a person in a region the rules do not cover is exactly when a
+            // human decides. Unlike `convert` this promise is to the team rather than to the
+            // person who wrote in, so it belongs with working the queue.
+            "crm.leads.assign",
             // The bell is on every route, so every role that can open the panel needs to read
             // its own inbox. `notifications.manage` is deliberately NOT here: it is the
             // channel-configuration power slice 2 introduces, and a role that may read an

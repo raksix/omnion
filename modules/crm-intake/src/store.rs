@@ -1249,6 +1249,28 @@ pub async fn append_event(
     actor_user_id: Option<Uuid>,
     detail: serde_json::Value,
 ) -> Result<()> {
+    append_event_on(pool, lead_id, kind, actor_user_id, detail).await
+}
+
+/// `append_event` over any executor, so a caller inside a transaction writes its trail line
+/// atomically with the change it describes.
+///
+/// The two-argument version above exists because most trail writes are single statements that do
+/// not need to be atomic with anything — and those call sites should not have to open a
+/// transaction to append a line. The ones that *do* need it are exactly the writes where the
+/// trail is the only record of what happened (assignment, conversion, a response): if the
+/// transaction commits without the line, the panel shows a lead in a state its own history
+/// contradicts, and no later read can detect the gap because both halves look valid on their own.
+pub async fn append_event_on<'e, E>(
+    executor: E,
+    lead_id: Uuid,
+    kind: &str,
+    actor_user_id: Option<Uuid>,
+    detail: serde_json::Value,
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query(
         "insert into crm_lead_events (lead_id, kind, actor_user_id, detail) \
                  values ($1, $2, $3, $4)",
@@ -1257,7 +1279,7 @@ pub async fn append_event(
     .bind(kind)
     .bind(actor_user_id)
     .bind(detail)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -1441,6 +1463,113 @@ pub async fn patch_lead(
             .await?;
         }
     }
+    Ok(updated)
+}
+
+/// Assign or reassign a lead by hand, keeping the whole history.
+///
+/// The automatic rules answer "who should get this one", and they are wrong in the cases a human
+/// is right about: the country rule sends a lead about a competitor's country to the wrong
+/// region, the pool is round-robin and this person asked for it, the person the rule picked has
+/// left. So the inbox needs a hand, and the hand has to leave a trace — a reassignment that
+/// silently overwrites `owner_user_id` leaves nobody able to answer "who had this at 3pm".
+///
+/// Three decisions worth naming, each of which is a way the obvious version is wrong:
+///
+/// * **An unassign is a real instruction.** `owner_user_id: null` is not "clear the field", it
+///   is "put it back in the unassigned queue", and it is a different act from assigning. So the
+///   request carries the owner as an `Option<Option<Uuid>>` — three states, not two — and the
+///   omitted case is a *refusal*, not a silent unassign. A request that forgets the field must
+///   not empty somebody's queue by accident.
+/// * **The reason is required, and the rule is not cleared.** `assignment_rule_id` is left as it
+///   was: the rule that *would* have matched is a fact about the routing, and overwriting it
+///   with `null` would make a later "why did this skip the pool" unanswerable. The reason
+///   records the human decision; the rule records the machine one, and both are needed.
+/// * **A terminal lead is not reassigned.** `spam`, `rejected` and `duplicate` are verdicts,
+///   not stages; assigning one of them back to a person is how a discarded submission comes
+///   back as somebody's work. The refusal names the status so the caller can un-reject first.
+///
+/// The SLA clock is deliberately *not* restarted. A manual assignment is a routing decision, not
+/// a new promise to the person who wrote in: the deadline was set from when the lead arrived,
+/// and moving the owner does not buy the submitter more time. Recomputing it here would make a
+/// reassignment a way to reset a breach that has already happened.
+pub async fn assign_owner(
+    pool: &PgPool,
+    organization_id: Uuid,
+    id: Uuid,
+    owner: Option<Uuid>,
+    reason: &str,
+    actor_user_id: Option<Uuid>,
+) -> Result<Option<Lead>> {
+    // The write, the trail line and the read-back are one transaction. They have to be: a lead
+    // that changed hands with no `crm_lead_events` row is a reassignment nobody can audit, and
+    // the panel's timeline is the only place that history exists. A commit that wrote the owner
+    // and then failed to write the line would leave the screen asserting a new owner with a
+    // timeline that says the lead was never touched.
+    let mut tx = pool.begin().await?;
+
+    // `for update` is what makes "who had it before" true rather than probably true. Two
+    // operators reassigning the same lead at the same moment must not both record themselves
+    // as having taken it from the same person, and without the lock the second one's read races
+    // the first one's write. The read and the update are separate statements *inside* the
+    // transaction on purpose: a `returning` clause cannot see the pre-update value, so a single
+    // statement would have recorded the new owner as the previous one on every reassignment.
+    let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
+        "select status, owner_user_id from crm_leads \
+         where organization_id = $1 and id = $2 for update",
+    )
+    .bind(organization_id)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((status, previous_owner)) = row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    // A verdict is not a piece of work. `spam`, `rejected` and `duplicate` are the answers the
+    // platform gave a submission; handing one to a person is how a discarded enquiry comes back
+    // as somebody's work, and the message names the status so the caller can undo the verdict
+    // first rather than guessing which button to press.
+    if matches!(status.as_str(), "spam" | "rejected" | "duplicate") {
+        tx.rollback().await?;
+        return Err(CrmIntakeError::invalid(format!(
+            "this lead is '{status}' — a verdict, not work. Take it out of that state first."
+        )));
+    }
+
+    let updated: Option<Lead> = sqlx::query_as(&format!(
+        "update crm_leads set owner_user_id = $3, \
+             status = case when status = 'new' and $3 is not null then 'assigned' else status end, \
+             assignment_reason = $4, updated_at = now() \
+         where organization_id = $1 and id = $2 returning {LEAD_COLUMNS}"
+    ))
+    .bind(organization_id)
+    .bind(id)
+    .bind(owner)
+    .bind(reason)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // `assigned` vs `reassigned` is decided by what the row *was*, not by whether the new owner
+    // differs from the old one: assigning a lead to the person who already has it is a no-op
+    // press, and writing "reassigned" for it would put a line on the timeline that implies
+    // something happened.
+    append_event_on(
+        &mut *tx,
+        id,
+        if previous_owner.is_some() { "reassigned" } else { "assigned" },
+        actor_user_id,
+        serde_json::json!({
+            "owner_user_id": owner.map(|o| o.to_string()),
+            "previous_owner_user_id": previous_owner.map(|o| o.to_string()),
+            "reason": reason,
+        }),
+    )
+    .await?;
+
+    tx.commit().await?;
     Ok(updated)
 }
 

@@ -272,6 +272,24 @@ export function markLeadResponded(id: string): Promise<Lead> {
 }
 
 /**
+ * Hand a lead to a person, or put it back in the unassigned queue.
+ *
+ * `ownerUserId` is `null` for the queue and a user id for a person — the two are *sent*, never
+ * omitted, because the API refuses a request that does not say. That refusal is deliberate
+ * (an `Option<Option<Uuid>>` on the wire) and a client that dropped the key on a `null` would
+ * turn "put it back" into a 400 rather than the act it asked for.
+ *
+ * `reason` is required by the server and the UI makes it required before the call, because a
+ * hand-over with no explanation is the one thing the trail cannot be useful without.
+ */
+export function assignLead(id: string, ownerUserId: string | null, reason: string): Promise<Lead> {
+  return request<Lead>(`/api/v1/crm/leads/${encodeURIComponent(id)}/assign`, {
+    method: "POST",
+    body: JSON.stringify({ owner_user_id: ownerUserId, reason }),
+  });
+}
+
+/**
  * Turn a lead into a contact and an opportunity.
  *
  * Pressing it twice is safe by construction — the store reuses the contact the dedupe pass

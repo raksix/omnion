@@ -495,6 +495,16 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Convert a lead into a contact, an opportunity and a quotation",
     },
+    // * `crm.leads.assign` is handing a lead to a person, and it is deliberately NOT part of
+    //   `crm.leads.manage`. The two look like the same act from outside and are not: `manage` is
+    //   what the lead *says* (its fields, its status, whether it is spam), `assign` is who is
+    //   answerable for it. Merging them means a moderator working the queue — the person who
+    //   most often needs to hand a lead over — could not do the one thing the queue exists for.
+    PermissionDef {
+        key: "crm.leads.assign",
+        category: "crm",
+        description: "Assign or reassign a lead to an owner, with a reason",
+    },
     PermissionDef {
         key: "crm.intake.manage",
         category: "crm",

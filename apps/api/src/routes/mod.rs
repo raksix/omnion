@@ -1207,6 +1207,13 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/{id}/respond",
             post(crm_intake::respond).layer(guards::require(&state, "crm.leads.manage")),
         )
+        // Assignment is its own key, not a wing of `crm.leads.manage`: what a lead *says* and
+        // who is answerable for it are different decisions, and the person who most often needs
+        // to hand a lead over is usually the one who may edit it.
+        .route(
+            "/crm/leads/{id}/assign",
+            post(crm_intake::assign).layer(guards::require(&state, "crm.leads.assign")),
+        )
         // Conversion is its own key, not `crm.leads.manage`: turning a lead into a contact,
         // an opportunity and eventually a customer is a promise to somebody outside the
         // panel, and a support agent who may edit a lead row has no business making that
