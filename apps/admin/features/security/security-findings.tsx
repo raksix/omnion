@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { SecurityTabs } from "@/features/security/security-tabs";
 import {
   bulkSecurityFindingStatus,
   fetchSecurityFindings,
@@ -517,6 +518,7 @@ export function SecurityFindingsScreen() {
 
   return (
     <div className="space-y-4" data-security-findings>
+      <SecurityTabs current="findings" />
       <header className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-[12px] text-muted">
           {/* The count is the server's, for the current filter. */}

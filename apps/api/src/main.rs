@@ -108,7 +108,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if state.config().events.retention_enabled {
         let _sweeper = event_retention_runner::spawn(state.clone());
     } else {
-        tracing::info!("the event retention sweeper is disabled (OMNION_EVENT_RETENTION_RUNNER=false)");
+        tracing::info!(
+            "the event retention sweeper is disabled (OMNION_EVENT_RETENTION_RUNNER=false)"
+        );
     }
 
     // The automation matcher reads the bus in this process (docs/BUILD-BACKLOG.md P13): each
