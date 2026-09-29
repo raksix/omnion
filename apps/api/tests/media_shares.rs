@@ -8,6 +8,8 @@
 //! Every assertion is against observable state — the response bytes, the row, the object store —
 //! because a unit test on `servable` cannot see whether the route calls it.
 
+mod support;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
@@ -47,6 +49,13 @@ const FILE_BYTES: &[u8] = b"omnion share link walkthrough bytes";
 struct TestResponse {
     status: StatusCode,
     set_cookie: Option<String>,
+    /// **Every** `Set-Cookie` on the response, in order.
+    ///
+    /// `set_cookie` above is the first one, which is all the read-only assertions need. Sign-in
+    /// is the exception: it answers with the session *and* the CSRF token beside it, so reading
+    /// only the first is how a walk ends up holding a session with no token. `get_all` is the
+    /// difference between "the deployment issued no CSRF cookie" and "the helper discarded it".
+    set_cookies: Vec<String>,
     headers: Vec<(String, String)>,
     body: Value,
     raw: Vec<u8>,
@@ -65,6 +74,13 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .get(header::SET_COOKIE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
     let headers: Vec<(String, String)> = response
         .headers()
         .iter()
@@ -98,6 +114,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookie,
+        set_cookies,
         headers,
         body,
         raw,
@@ -107,8 +124,10 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 /// Build a JSON request; `token` becomes the session cookie.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
+    // A write presents the CSRF token in a header *and* carries it in a cookie; unpacking here
+    // means a suite cannot send one without the other.
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => crate::support::walk_auth::apply_credential(token, builder),
         None => builder,
     };
     match body {
@@ -147,7 +166,13 @@ async fn live_db(config: &Config) -> Option<Db> {
 
 /// A state whose database has all migrations applied and the object store open.
 async fn live_state() -> Option<(AppState, Db, Storage)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // The suite gets its own CSRF secret, so sign-in issues a token at all. Without one the
+    // deployment is doing exactly what it was told — refusing cookie-authenticated writes,
+    // because the double-submit check has nothing to compare against — and a test process has no
+    // `OMNION_CSRF_SECRET`, so every write in this file was guaranteed to be refused before it
+    // was even sent. The refusal is correct; the fixture that provoked it was the defect.
+    support::walk_auth::with_csrf_secret(&mut config);
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
     let storage = live_storage().await?;
@@ -377,17 +402,13 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+    // Every `Set-Cookie` is read, not the first. Sign-in issues the session and the CSRF token
+    // together, and this helper used to take `.split(';').next()` on the first header — correct
+    // for one cookie, silently lossy for two. The walk then held a session with no token and
+    // every write came back `csrf_unavailable`, a code whose message blames the *deployment's*
+    // configuration. The fix lives in `support::walk_auth` so the next twenty suites cannot each
+    // re-derive it.
+    crate::support::walk_auth::Session::from_set_cookies(&response.set_cookies).pack()
 }
 
 /// The public URL of a token, as a caller would reach it.

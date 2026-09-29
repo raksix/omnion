@@ -39,6 +39,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -93,10 +94,12 @@ step "API on :$API_PORT (database omnion_qa)"
 # tick is simply not there — which reads as a broken screen rather than as a stale build. That is
 # not hypothetical: this file's `if [ ! -x … ]` once made a REQ-close pass report "green" against
 # a binary that predated the migration under test. A newer mtime is the only signal available
-# without asking cargo, and it is exactly the one that matters (source or migration edited ->
-# rebuild). The migration directory belongs in the list because sqlx embeds the SQL at COMPILE
-# time: an edited migration with an older binary replays the old statement, and the failure
-# ("column does not exist") reads like a missing `alter` rather than like a stale build.
+# without asking cargo, and it is exactly the one that matters. `database/migrations` is in the
+# list because sqlx embeds the SQL at COMPILE time — an edited migration with an older binary
+# replays the old statement, and the failure ("column does not exist" / "duplicate table")
+# reads like a missing `alter` or a re-run rather than like a stale build. Sources are in it
+# too, which is the half a migration-only check misses: a route added this tick compiles into
+# nothing until the next full build.
 NEEDS_BUILD=0
 if [ ! -x target/debug/omnion-api ]; then
   NEEDS_BUILD=1
@@ -106,7 +109,9 @@ elif [ -n "$(find apps/api crates database/migrations Cargo.toml -newer target/d
   step "building the API (sources or migrations are newer than the binary)"
 fi
 if [ "$NEEDS_BUILD" = "1" ]; then
-  cargo build -p omnion-api
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 # The CSRF secret is the one variable the platform refuses to invent: a deployment that sets
 # none still boots, and every cookie-authenticated mutation then answers 403

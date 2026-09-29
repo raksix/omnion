@@ -1,6 +1,8 @@
 //! Shared fixtures for the API integration walks.
 //!
-//! Today this is one module — the identity provider the enterprise sign-in walk runs against —
-//! but it is a module and not an inline block so the next walk that needs a directory, a mail
-//! catcher or a queue can share the same place rather than growing its own copy.
+//! `stub_idp` is the identity provider the enterprise sign-in walk runs against; `walk_auth` is
+//! the sign-in half every cookie-authenticated walk needs. Both live here rather than as inline
+//! blocks so the next walk that needs a directory, a mail catcher or a queue can share the same
+//! place — and so a security change is made in one file instead of twenty.
 pub mod stub_idp;
+pub mod walk_auth;
