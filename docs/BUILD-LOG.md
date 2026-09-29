@@ -5251,3 +5251,43 @@ clone is followed by a new one, which is what makes "re-clone" possible at all �
 queued behind another writer's live pass (slot holder alive, correctly serialised). While it
 waited, REQ-017 slice 1 was built and verified. Next: the environment store and the routes, then
 `/environments`.
+
+## Tick 28 — REQ-017 slice 2: the environment store, the routes, the clone worker, and four defects the walks found
+
+**What.** `crates/environment` gained `store.rs` (list/find/create/clone-job/archive) and
+`runner.rs` (the copy itself). `apps/api` gained `routes/environments.rs` (list, create, detail,
+re-clone, job history, cancel, archive) and `environment_clone_runner.rs`, wired into `main.rs`.
+Migrations 0147 (resolution triggers) and 0148 (environment-scoped content keys).
+
+**Proof.**
+- `cargo test -p omnion-api --test environments` — **25 passed, 0 failed** (120 s).
+- `cargo test -p omnion-environment` — **29 passed**.
+- `cargo test -p omnion-api --lib` — **255 passed**.
+- `pnpm typecheck` — 2/2.
+- `scripts/qa/environment-default-proof.sql` and `environment-key-proof.sql`, each run twice
+  against a fresh 105-table database (self-cleaning, so they are gates rather than demos).
+
+**What the walks found, all of it in code written earlier in this request.**
+1. Migration 0145 made `environment_id` NOT NULL and nothing supplied one — the first page
+   created after it would have failed platform-wide. Fixed by 0147's resolution triggers.
+2. 0145's backfill covered only existing organizations, so every *new* tenant had no
+   production environment and no first page. 0147's after-insert trigger fixes the lifetime of
+   the invariant, not just the migration's moment.
+3. A staging page could not coexist with a production page of the same slug, because the
+   natural key ignored the environment. 0148 adds it, and the copy mints fresh ids.
+4. `organization_settings` is keyed by `organization_id` alone, so that area cannot hold a
+   second row per environment. It copies nothing and counts zero rather than promising rows
+   that never arrive.
+5. Catching the `clone_already_running` violation and then reading the running job in the same
+   transaction returned 500 (an aborted transaction), not 409.
+6. The runner refused any environment that was not `active`, but `create_staging` creates it as
+   `cloning` — so every new environment refused its own first clone.
+
+**Next.** Slice 3: the changes diff (`GET /environments/{id}/changes`) and the environment chip
+and banner, so the panel can scope content screens and show what staging has changed. The
+`/environments` list screen, the create wizard and the detail screen are still to be built —
+the API is done, the screens are not, and a REQ does not close on an API alone.
+
+**Gate still owed.** The scoped QA pass got the slot this tick and exited 3 at
+`could not sign in after wizard` — the API came up on :3104 but the walkthrough could not sign
+in. That is the harness, not this change, and it is the first thing to diagnose next tick.

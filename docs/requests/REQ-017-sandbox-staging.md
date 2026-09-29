@@ -1,6 +1,6 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** platform
+> **Status:** in-progress (slice 2 of 4, `71a32ca`) · **Captured:** 2026-09-25 · **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -138,14 +138,14 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 
 ### Acceptance criteria
 
-- [ ] A new organization gets exactly one `production` environment; a second production insert fails at the database (partial unique index proven in a test).
-- [ ] `POST /api/v1/environments` creates a staging environment with status `cloning` and returns immediately; the clone job reaches `done` and per-area counts match the production
+- [x] A new organization gets exactly one `production` environment; a second production insert fails at the database (partial unique index proven in a test).
+- [x] `POST /api/v1/environments` creates a staging environment with status `cloning` and returns immediately; the clone job reaches `done` and per-area counts match the production
   counts.
 - [ ] Clone copies pages, revisions, translations, menus, site settings, theme selection and workflow definitions, and copies **no** media blobs (verified by storage object count before
   and after).
-- [ ] Clone is idempotent: re-cloning an unchanged environment produces the same counts and no duplicate rows (natural keys are unique per environment).
-- [ ] Staging nesting is refused with `staging_nesting_refused` for a staging source.
-- [ ] Editing a page in staging leaves the production row byte-identical (asserted by comparing `updated_at` and revision hashes).
+- [x] Clone is idempotent: re-cloning an unchanged environment produces the same counts and no duplicate rows (natural keys are unique per environment).
+- [x] Staging nesting is refused with `staging_nesting_refused` for a staging source.
+- [x] Editing a page in staging leaves the production row byte-identical (asserted by comparing `updated_at` and revision hashes).
 - [ ] `GET /api/v1/environments/{id}/changes` lists the edited page as `updated`, a new page as `added`, a deleted page as `deleted`, each with author and timestamp.
 - [ ] A production edit made after the clone marks the item `Conflict`, and promoting a change set that contains conflicts is refused with `promotion_conflict` listing item ids.
 - [ ] Promotion of a clean change set applies every item in one transaction: production pages match staging content afterwards, and `promotion.completed` carries the same item count.
