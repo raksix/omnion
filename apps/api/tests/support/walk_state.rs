@@ -46,6 +46,85 @@ use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_permissions::seed;
 use omnion_storage::{Storage, StorageConfig};
+use std::sync::OnceLock;
+
+/// Take exclusive ownership of the **whole-database** evaluator, for a walk that needs it.
+///
+/// ## Why a walk needs this
+///
+/// The alert evaluator is not scoped. `evaluate` walks *every* enabled rule in
+/// `obs_alert_rules`, applies the current window to each, and reports what each one did. There is
+/// no rule id parameter, and there cannot be one without changing what an alert rule means: the
+/// point of the sweep is that it sees the whole set, so a second operator's rule is evaluated
+/// alongside yours.
+///
+/// That is correct for production and hostile to a test binary. `observability_alerts.rs` holds
+/// eight walks, libtest runs them in parallel, and every one of them creates a rule and then calls
+/// the sweep. So each walk's assertions were computed over the union of all eight rule sets:
+/// `evaluated: 9` where the walk expected `1`, `silenced: 2` where it expected `1`, and a rule with
+/// no samples at all opening an event because a *sibling's* rule was breaching.
+///
+/// The failure is nastier than a flaky count, because the number is not random — it grows with the
+/// number of tests, so a suite that passes on one machine and fails on another depending on the
+/// thread count is a suite that reports product defects that do not exist.
+///
+/// ## Why a mutex over one walk per binary
+///
+/// Cargo already runs test *binaries* one at a time, so the process boundary is not available as
+/// isolation: the eight walks here are eight tests in one binary, and they were never going to be
+/// separated by a build flag without giving up the parallelism the other files rely on. A process
+/// mutex held for the duration of a walk is the smallest unit that actually contains the sweep.
+///
+/// The guard is a `tokio::sync::Mutex` in a `OnceLock`, so a walk holds it across `.await` points
+/// and the runtime can still use every thread it has. It is poisoned rather than recovered: a walk
+/// that panicked mid-sweep leaves the database in a state the next walk cannot reason about, and
+/// silently continuing would turn a loud failure into a wrong count.
+///
+/// Acquire it with [`exclusive_evaluator`], and drop it when the walk ends.
+static EVALUATOR_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+/// The guard type returned by [`exclusive_evaluator`].
+pub type EvaluatorGuard = tokio::sync::MutexGuard<'static, ()>;
+
+/// Wait for exclusive use of the database-wide evaluator. See [`EVALUATOR_LOCK`] for why.
+pub async fn exclusive_evaluator() -> EvaluatorGuard {
+    EVALUATOR_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// Clear every alert row, so a walk starts from a known-empty evaluator.
+///
+/// Separate from the lock on purpose: the lock says "nobody else is sweeping", this says "there is
+/// nothing in the table". A walk that only takes the lock still sees whatever a *previous* walk in
+/// the same binary left behind, and a leftover rule is exactly the thing that made the counts wrong.
+/// So this is called with the lock held, by every walk that sweeps.
+///
+/// The process-wide **metric** registry is cleared in the same breath, and for the same reason
+/// with one extra step. `evaluate_pass` reads `global()` — an alert that evaluated a private
+/// registry would never fire on real traffic — so a rule over `omnion_queue_depth` is being
+/// evaluated against whatever the last walk recorded. A walk whose premise is "nothing recorded
+/// yet, so no data never breaches" cannot set that premise while a sibling's `queue_depth 7.0` is
+/// still inside the window, and rolling the clock forward does not help: the sample is still there.
+///
+/// The settings row is deliberately left alone: `obs_log_settings` is a single shared row that
+/// walks read and write, and truncating it would turn one walk's teardown into another's failure.
+pub async fn clear_alert_state(pool: &sqlx::PgPool) {
+    sqlx::query("delete from obs_alert_events")
+        .execute(pool)
+        .await
+        .expect("the alert events are deletable");
+    sqlx::query("delete from obs_silences")
+        .execute(pool)
+        .await
+        .expect("the silences are deletable");
+    sqlx::query("delete from obs_alert_rules")
+        .execute(pool)
+        .await
+        .expect("the alert rules are deletable");
+    omnion_telemetry::metrics::clear_global_samples();
+}
 
 /// Build the state for a walk, or fail.
 ///
