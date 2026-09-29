@@ -4420,3 +4420,59 @@ unwritten; `sales.orders.confirm` and `sales.orders.create` are already in the p
 catalogue. Check the shared migration namespace again before writing 0056 — wave7 and wave10 both
 sit on 0053.
 
+
+## Slice 4a — the order chain (2026-09-29)
+
+**What.** Migration `0053` created `sales_orders`, `sales_order_lines` and
+`sales_status_history`, and nothing had ever written them — so the chain a quote promises stopped
+at *accepted*. This adds the middle: convert, confirm (which holds stock), cancel (which gives it
+back), and the invoice draft that leaves for accounting. `0057` adds the two tables 0053
+deliberately left out, because both are another module's to adopt later.
+
+**The two tables, and why they exist even though REQ-053 and REQ-054 are not installed.**
+`sales_order_reservations` holds **one row per line**, so `partial` is a countable fact rather
+than a guess and a release can be audited line by line. The unique index on
+`(order_id, line_id)` is what makes a second confirm a no-op *as a property of the data* rather
+than of a handler's read-then-write. The table exists without inventory because a state column
+that can only ever say `none` cannot honour the spec's "a visible note rather than a silent
+failure". `sales_invoice_handoffs` mirrors `0055_quote_approvals` exactly: subject-shaped, money
+frozen into columns, so REQ-054 adopts the rows rather than migrating them.
+
+**Proof.**
+
+- `cargo test -p omnion-module-sales --lib` → **128 passed** (110 before, +18).
+- `cargo test -p omnion-api --lib` → **243 passed** (unchanged; the order rules are in the module).
+- `cargo test -p omnion-api --test sales_orders -- --test-threads=1` → **11 passed**.
+- `apps/admin` `tsc --noEmit` → clean. `node --check scripts/qa/walkthrough.cjs` → clean.
+- clippy `result_large_err` → **0** (the baseline in an untouched sibling module, crm, is 0).
+
+**The four defects the walks found** — none of which a typecheck or a unit test would have:
+
+1. **A second confirm wrote a second "confirmed" line in the order's timeline.** The criteria ask
+   for a no-op; a person who pressed the button after a slow response must not find their order's
+   history rewritten. The history row is now written only when rows were *actually* held, and the
+   walk asserts the no-op three ways — same order, same hold rows, same history length.
+2. **The list and the detail both answered 500.** The order query joined `sales_quotes` and
+   selected `q.number` against a struct field named `quote_number`; the line query joined the
+   reservation and selected `l.id` *and* `r.id`, so a draft order's line decoded the hold's NULL
+   as its own id, and then decoded the hold's `held_at` NULL the same way. All three are duplicate
+   column names, and all three are invisible in the query text — the alias is the only fix.
+3. **The invoice draft's insert used a bare `on conflict do nothing`**, which covers *every*
+   violation, so a bad currency or a missing order would have been reported as "a draft already
+   exists" instead of raising. It now names the partial index it means.
+4. **A test that measured the wrong count.** The no-op-history assertion compared the post-confirm
+   timeline to the count from *before* the confirm, so it was measuring the confirmation itself.
+   The lesson generalises: capture the baseline **after** the first call, not before it.
+
+**Not proven, and not claimed.** The browser pass is **queued** behind the other writers on the
+single QA slot (`/tmp/w4-qa-slice3.log`); until it lands, the order list's rendering, its
+confirmation button, the cancellation dialog and the 390 px overflow are unverified. The
+**invoice-handoff box stays unticked** even though half of it is proved, because the criterion is
+a hand-off to REQ-054 and that module does not exist — `external_id`/`external_url` are columns
+this module writes nobody into.
+
+**Next.** The second half of slice 4: **reports** (won/lost, conversion %, average deal size,
+per owner, with a CSV containing the same rows), global search over quotes and orders, and the
+PDF export. `sales_order` rows now exist, so the won/lost and conversion figures have something
+to count. `MIGRATIONS`: 0053/0054/0055/0057 are mine; the shared high-water is 0056 (wave8) —
+re-read `git ls-tree origin/<branch> database/migrations/` for every sibling at commit time.
