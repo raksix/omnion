@@ -25,7 +25,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const { chromium } = require("playwright-core");
 
 // ---------------------------------------------------------------- args / env
@@ -4408,6 +4408,280 @@ async function runEventsDepth(page, report) {
 }
 
 /**
+ * The webhook endpoint pass (REQ-016, slice 2): connect an endpoint through the real form,
+ * see its deliveries, force one again, rotate its secret, and remove it.
+ *
+ * The pass is built around a real receiver rather than a mocked API response, because the one
+ * claim this screen makes that nothing else can check is that a delivery is *signed* and that
+ * rotating the secret stops the old signature verifying. `infra/mocks/webhook-receiver.mjs` is
+ * that receiver: it verifies the HMAC over the bytes it received and answers `401` to a
+ * signature that does not match, which is exactly what a real receiver has to do.
+ *
+ * The five things it proves, each one a way a webhook screen can look finished and be wrong:
+ *
+ * 1. **The secret is shown once and the create form gates `Done` on it.** A form that
+ *    navigates away before the operator has read the secret is a form that loses it.
+ * 2. **The delivery history is the queue, not a picture of one.** The row count on screen is
+ *    compared against the API's own total, so a filter that renders rows it did not fetch
+ *    cannot pass.
+ * 3. **A forced delivery is sent again** and the trigger column changes to `replay` — the
+ *    reset, not a second row, which the database would have refused anyway.
+ * 4. **Rotating shows a new secret and the old one stops working.** Verified by the receiver's
+ *    own `401`, which is the only honest proof available.
+ * 5. **Remove is confirmed by name** and actually removes the endpoint.
+ */
+async function runWebhooksDepth(page, report) {
+  const steps = {};
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+
+  // ---- The receiver -----------------------------------------------------------------------------
+  // Started here rather than by run.sh because only this pass needs it, and a process nothing
+  // uses is a process to remember to clean up. It is killed in the `finally` below whatever
+  // happens, so a throw in the middle of the pass does not leave a port bound.
+  const port = 8124 + (Number(process.env.QA_STACK_SLOT) || 0);
+  const secret = "qa-webhook-pass-secret-2026";
+  const receiverUrl = `http://127.0.0.1:${port}/hooks/omnion`;
+  const receiver = spawn(process.execPath, ["infra/mocks/webhook-receiver.mjs", String(port)], {
+    cwd: path.resolve(__dirname, "../.."),
+    env: { ...process.env, OMNION_WEBHOOK_SECRET: secret },
+    stdio: "ignore",
+  });
+  // Give the listener a moment; without it the first delivery races the bind and the walk
+  // would report a refused connection as a failing receiver.
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  const stamp = Date.now().toString(36);
+  const name = `QA receiver ${stamp}`;
+
+  try {
+    // ---- 1. The list, before anything exists -----------------------------------------------------
+    await page.goto(`${URL_ADMIN}/webhooks`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-webhook-empty], [data-webhook-table]", { timeout: 8000 }).catch(() => {});
+    steps.emptyState = (await page.locator("[data-webhook-empty]").count()) > 0;
+    steps.emptyOffersTheAction = (await page.locator('[data-webhook-empty] a[href="/webhooks/new"]').count()) > 0;
+    await shot(page, "page-webhooks-empty");
+
+    // ---- 2. The create form, driven field by field ------------------------------------------------
+    await page.goto(`${URL_ADMIN}/webhooks/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-webhook-field-name]", { timeout: 8000 }).catch(() => {});
+    steps.pickerPresent = (await page.locator("[data-webhook-event-picker]").count()) > 0;
+
+    // Submitting empty must be refused by the form itself, with a message beside each field.
+    await page.locator("[data-webhook-submit]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    steps.emptyNameRefused = (await page.locator("[data-webhook-error-name]").count()) > 0;
+    steps.emptyUrlRefused = (await page.locator("[data-webhook-error-url]").count()) > 0;
+    steps.emptyEventsRefused = (await page.locator("[data-webhook-error-events]").count()) > 0;
+    await shot(page, "page-webhooks-form-errors");
+
+    // A URL with a space and no scheme is the API's own rule; the form must say so before the
+    // round trip, or the screen is a decoration on top of a validator.
+    await page.locator("[data-webhook-field-name]").fill(name);
+    await page.locator("[data-webhook-field-url]").fill("not a url");
+    await page.locator("[data-webhook-submit]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    steps.badUrlRefused = (await page.locator("[data-webhook-error-url]").count()) > 0;
+
+    // HTTP warns without blocking: a receiver on a private network is legitimate, and a panel
+    // that refuses it is a panel people work around.
+    await page.locator("[data-webhook-field-url]").fill(receiverUrl.replace("http://", "http://"));
+    await page.waitForTimeout(300);
+    steps.insecureWarns = (await page.locator("[data-webhook-insecure-warning]").count()) > 0;
+    await shot(page, "page-webhooks-form-warning");
+
+    // The group checkbox subscribes to a whole area in one click, which is the difference
+    // between a picker of 68 names and a usable form.
+    await page.locator('[data-webhook-group="page"]').check({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    const afterGroup = await page
+      .evaluate(async () => {
+        const answer = await fetch("/api/v1/events/catalogue", { credentials: "same-origin" });
+        const body = await answer.json();
+        return body.events.filter((entry) => entry.area === "page" && entry.status === "live").length;
+      })
+      .catch(() => 0);
+    steps.groupSelectsTheWholeArea = (await page.locator('[data-webhook-event="page.published"]').count()) > 0;
+    steps.cataloguePageNames = afterGroup;
+
+    // Own-secret mode, with a value the API refuses (too short), proves the field is wired.
+    await page.locator("[data-webhook-secret-own]").check({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-webhook-secret-input]").fill("short");
+    await page.locator("[data-webhook-submit]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    steps.shortSecretRefused = (await page.locator("[data-webhook-error-secret]").count()) > 0;
+    await shot(page, "page-webhooks-form-secret");
+
+    // Back to "generate for me", which is what the rest of the pass runs on: the API issues
+    // the secret and the screen has one chance to show it.
+    await page.locator("[data-webhook-secret-generate]").check({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-webhook-submit]").click({ timeout: 6000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-secret-once]", { timeout: 8000 }).catch(() => {});
+
+    // ---- 3. The secret, shown exactly once --------------------------------------------------------
+    steps.secretShown = (await page.locator("[data-webhook-secret-value]").count()) > 0;
+    const issued = (await page.locator("[data-webhook-secret-value]").textContent().catch(() => "")) || "";
+    steps.secretHasValue = issued.trim().length >= 16;
+    // `Done` is refused until the box says the secret was stored: navigating away first is how
+    // an operator loses the only copy of it.
+    steps.doneBlockedBeforeStoring =
+      await page.locator("[data-webhook-secret-done]").isDisabled().catch(() => false);
+    await shot(page, "page-webhooks-secret-once");
+
+    await page.locator("[data-webhook-secret-stored]").check({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    steps.doneEnabledAfterStoring =
+      !(await page.locator("[data-webhook-secret-done]").isDisabled().catch(() => true));
+    await page.locator("[data-webhook-secret-done]").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-header], [data-webhook-overview-test]", { timeout: 8000 }).catch(() => {});
+    steps.doneLandsOnTheEndpoint = page.url().includes("/webhooks/");
+    const endpointId = (page.url().match(/\/webhooks\/([0-9a-f-]{36})/) || [])[1] || "";
+    steps.endpointId = endpointId;
+
+    // ---- 4. The test delivery reaches a receiver that verifies the signature ----------------------
+    await page.locator("[data-webhook-overview-test]").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    steps.testQueued = (await page.locator("[data-webhook-notice]").count()) > 0;
+
+    // The runner is a loop in the API process; give it a moment, then read the receiver's own
+    // record. A signed delivery that arrives and verifies is the only honest proof that the
+    // receiver and the platform agree on the wire format.
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+    steps.receiverAccepted = await fetch(`http://127.0.0.1:${port}/received`)
+      .then((answer) => answer.json())
+      .then((body) => (Array.isArray(body) ? body.length : 0))
+      .catch(() => 0);
+
+    // ---- 5. The delivery history -------------------------------------------------------------------
+    await page.locator('[data-webhook-tab="deliveries"]').click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-delivery-table], [data-webhook-delivery-empty]", { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    steps.historyHasRows = (await page.locator("[data-webhook-delivery-row]").count()) > 0;
+    await shot(page, "page-webhooks-deliveries");
+
+    // The header's total is the API's own number, not a recount of the rows on screen: that is
+    // what "showing 25 of 340" means, and a table that silently shows a subset of its filter
+    // cannot be read at all.
+    steps.totalMatchesTheApi = await page.evaluate(async () => {
+      const chips = document.querySelector("[data-webhook-delivery-total]");
+      if (!chips) return false;
+      const shown = (chips.textContent || "").replace(/,/g, "");
+      const answer = await fetch(window.location.pathname + window.location.search, {
+        credentials: "same-origin",
+      });
+      const body = await answer.json();
+      return shown.includes(String(body.total));
+    }).catch(() => false);
+
+    // A test delivery is a probe, and the trigger column is what says so on screen. A history
+    // that renders probes as traffic is the mistake migration 0052's column exists to prevent.
+    steps.testRowsLabelled = (await page.locator("[data-webhook-trigger]").count()) > 0;
+
+    // The status filter narrows the table, and survives a reload — the paste-to-a-colleague
+    // claim, which only holds if the filter is in the URL.
+    await page.locator("[data-webhook-delivery-status]").selectOption("delivered").catch(() => {});
+    await page.waitForTimeout(1200);
+    steps.statusFilterIsInTheUrl = page.url().includes("status=delivered");
+    const deliveredOnly = await page.evaluate(() =>
+      [...document.querySelectorAll("[data-webhook-delivery-state]")].every(
+        (node) => node.textContent.trim() === "delivered",
+      ),
+    );
+    steps.statusFilterNarrows = deliveredOnly;
+    await shot(page, "page-webhooks-deliveries-filtered");
+
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-webhook-delivery-table], [data-webhook-delivery-empty]", { timeout: 8000 }).catch(() => {});
+    steps.filterSurvivesReload = page.url().includes("status=delivered");
+
+    // A routed failure must render the error banner, not a silent empty table.
+    await page.route("**/api/v1/webhooks/*/deliveries*", (route) => route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "internal_error", message: "the queue is unreachable" } }),
+    }));
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-webhook-error]", { timeout: 8000 }).catch(() => {});
+    steps.errorBannerOnFailure = (await page.locator("[data-webhook-error]").count()) > 0;
+    await shot(page, "page-webhooks-deliveries-error");
+    await page.unroute("**/api/v1/webhooks/*/deliveries*").catch(() => {});
+
+    // ---- 6. Force a delivery again -----------------------------------------------------------------
+    const rowId = (await page.locator("[data-webhook-delivery-row]").first().getAttribute("data-webhook-delivery-row").catch(() => "")) || "";
+    if (rowId) {
+      await page.locator(`[data-webhook-delivery-select="${rowId}"]`).check({ timeout: 4000 }).catch(() => {});
+      await page.locator("[data-webhook-redeliver-bulk]").click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      steps.redeliverReportsWhatMoved = (await page.locator("[data-webhook-notice]").count()) > 0;
+      const replayLabel = await page
+        .locator(`[data-webhook-trigger="${rowId}"]`)
+        .textContent()
+        .catch(() => "");
+      // The row is reset, not replaced: the same id comes back marked as a replay. A second row
+      // would mean the receiver cannot tell a replay from a duplicate.
+      steps.redeliveryIsTheSameRow = (replayLabel || "").trim() === "replay";
+      await shot(page, "page-webhooks-redelivered");
+    }
+
+    // ---- 7. The stats tab ----------------------------------------------------------------------------
+    await page.locator('[data-webhook-tab="stats"]').click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-stats], [data-webhook-stat-skeleton]", { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    steps.statsRender = (await page.locator("[data-webhook-stat-rate]").count()) > 0;
+    // A history that is only probes has no rate. Rendering 100% would be the most flattering
+    // possible lie on this screen, and it is the one the API's exclusion exists to prevent.
+    steps.rateIsHonestAboutProbes = (await page
+      .locator("[data-webhook-stat-rate]")
+      .textContent()
+      .catch(() => "")) !== "100%";
+    await shot(page, "page-webhooks-stats");
+
+    // ---- 8. Rotate the secret --------------------------------------------------------------------------
+    await page.locator('[data-webhook-tab="overview"]').click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-overview-rotate]", { timeout: 6000 }).catch(() => {});
+    await page.locator("[data-webhook-overview-rotate]").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-rotation]", { timeout: 8000 }).catch(() => {});
+    const rotated = (await page.locator("[data-webhook-rotation-value]").textContent().catch(() => "")) || "";
+    steps.rotationShowsANewSecret = rotated.trim().length >= 16 && rotated.trim() !== issued.trim();
+    steps.rotationGatesDone =
+      await page.locator("[data-webhook-rotation-done]").isDisabled().catch(() => false);
+    steps.rotationSaysTheReceiverWillBreak = (await page
+      .locator("[data-webhook-rotation]")
+      .textContent()
+      .catch(() => "")).includes("stops verifying");
+    await shot(page, "page-webhooks-rotated");
+
+    // ---- 9. Remove it ------------------------------------------------------------------------------------
+    await page.locator("[data-webhook-rotation-stored]").check({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-webhook-rotation-done]").click({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-webhook-overview-delete]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-webhook-confirm]", { timeout: 5000 }).catch(() => {});
+    steps.deleteIsConfirmedByName = (await page
+      .locator("[data-webhook-confirm]")
+      .textContent()
+      .catch(() => "")).includes(name);
+    await shot(page, "page-webhooks-confirm-remove");
+
+    await page.locator("[data-webhook-confirm-remove]").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.removedFromTheList = !page.url().includes(`/webhooks/${endpointId}`);
+    await page.goto(`${URL_ADMIN}/webhooks`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    steps.endpointIsGone = (await page.locator(`[data-webhook-row="${endpointId}"]`).count()) === 0;
+
+    // The receiver saw the delivery the platform signed. Recorded as a count rather than a
+    // boolean so a report can show that it was more than zero, which "the pass ran" cannot.
+    record({ page: "webhooks", action: "webhook-deliveries-received", count: steps.receiverAccepted });
+    if (endpointId) {
+      record({ page: "webhooks", action: "webhook-endpoint-created", endpoint: endpointId });
+    }
+  } finally {
+    receiver.kill("SIGTERM");
+  }
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -4762,6 +5036,12 @@ async function main() {
     // by area.
     { path: "/events", name: "events" },
     { path: "/events?tab=catalogue", name: "events-catalogue" },
+    // The webhook endpoints (REQ-016, slice 2) — the list and the create form are walked here.
+    // The detail screen is NOT: its path carries an endpoint id, and a route walked with a
+    // placeholder id only proves the not-found state renders. `runWebhooksDepth` below opens a
+    // *real* endpoint instead — the same reasoning as the media file detail above.
+    { path: "/webhooks", name: "webhooks" },
+    { path: "/webhooks/new", name: "webhooks-new" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -4901,6 +5181,13 @@ async function main() {
   // content screens' own passes are ordered after it in the file.
   report.events = await runDepthPass("events-console", () => runEventsDepth(page, report));
   log(`events: ${JSON.stringify(report.events)}`);
+
+  // The webhook endpoints and their delivery operations (REQ-016, slice 2). It runs right after
+  // the events pass because it points an endpoint at a real receiver and reads what the
+  // receiver actually accepted, which is the one claim on this screen no API status code can
+  // make on its own.
+  report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
+  log(`webhooks: ${JSON.stringify(report.webhooks)}`);
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather

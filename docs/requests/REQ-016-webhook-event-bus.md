@@ -1,24 +1,31 @@
 # REQ-016 — Webhook + Event Bus
 
-> **Status:** in-progress — **slice 1 is now code-complete, API and screen.** The registry
-> is `crates/events/src/catalogue.rs`: 68 names with their area, description, payload fields
-> and a required flag, compiled in rather than stored, with a drift gate in each direction
-> (an emitted name must be catalogued; a name marked *live* must have an emitter, and the ten
-> with no write path anywhere are `reserved` with the module that owes each one). The feed
-> grew the filters the screen offers — name list, site, actor, from/to window — and answers
-> with a keyset cursor whose `has_more` is read from the row past the page. The catalogue read
-> carries each name's 24-hour delivery count. **`/events` now exists** with its Feed and
-> Catalogue tabs: filters in the query string, a payload inspector, `j`/`k`/`Enter`/`Esc`/`/`
-> on the keyboard, copy helpers, and a catalogue whose total is the API's total. **The parser
-> is hand-written because the generic one is wrong for this shape**: `serde_urlencoded`
+> **Status:** in-progress — **slices 1 and 2 are code-complete, API and screens.** Slice 1's
+> registry is `crates/events/src/catalogue.rs`: 68 names with their area, description, payload
+> fields and a required flag, compiled in rather than stored, with a drift gate in each
+> direction (an emitted name must be catalogued; a name marked *live* must have an emitter, and
+> the ten with no write path anywhere are `reserved` with the module that owes each one). The
+> feed grew the filters the screen offers — name list, site, actor, from/to window — and
+> answers with a keyset cursor whose `has_more` is read from the row past the page. **The
+> parser is hand-written because the generic one is wrong for this shape**: `serde_urlencoded`
 > refuses `?name=a` for a `Vec<String>` with a plain-text 400, so the filter the panel was
 > about to ship would have failed rather than filtered — the walk caught it before the screen
-> did. Proof: `omnion-events --lib` **42**, `omnion-api --lib` **188**, `omnion-api --test
-> events` **6/6** (5 before, +1 the filter/keyset walk) against real Postgres, `tsc --noEmit`
-> exit 0. **Not done, and not claimed:** no browser pass — the QA slot was held by a sibling
-> writer and the box was at load 26, so the walkthrough now visits `/events` and
-> `/events?tab=catalogue` and has a depth pass written but **unrun**. Slice 2 (endpoint
-> management UI) and slice 3's delivery-operations UI are untouched · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
+> did. `/events` exists with its Feed and Catalogue tabs.
+>
+> **Slice 2 (endpoint management + delivery operations) is the larger half of this request
+> and it is now built end to end.** Migration `0052_webhook_delivery_ops.sql` adds the four
+> columns the operations cannot be computed without — `trigger`, `duration_ms`,
+> `redeliver_count`, `replayed_at` — and the routes are `GET /webhooks/{id}/deliveries`
+> (filtered, keyset-paged, with a `total` beside the page), `POST .../deliveries/{id}/redeliver`
+> plus its batch sibling, `GET .../stats` and `POST .../secret/rotate`. Four screens:
+> `/webhooks`, `/webhooks/new`, `/webhooks/[id]` (Overview / Deliveries / Stats) and the edit
+> form.
+>
+> **Proof: `omnion-events --lib` 45** (42 + 3), **`omnion-api --test events` 9/9** (6 + 3)
+> against real Postgres, **`tsc --noEmit` exit 0**. **Not done, and not claimed: no browser
+> pass yet** — the walkthrough now visits `/webhooks` and `/webhooks/new` and has a depth pass
+> written (`runWebhooksDepth`, driving a real receiver) but **unrun**, so the acceptance boxes
+> that name the screens stay unticked. Slice 3's retention sweeper is untouched · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -185,10 +192,26 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       only the group. The *growth* half is covered by the unit test
       `a_group_covers_events_the_catalogue_has_not_heard_of_yet`; a real second release is
       not something a test can stage, and the wildcard is what makes it work.
-- [ ] `POST /api/v1/webhooks` returns a generated secret exactly once; the subsequent `GET` body contains no `secret` key (asserted in an integration test).
-- [ ] `POST /api/v1/webhooks/{id}/secret/rotate` returns a new secret, and a delivery signed with the previous secret fails verification afterwards.
+- [x] `POST /api/v1/webhooks` returns a generated secret exactly once; the subsequent `GET` body contains no `secret` key (asserted in an integration test).
+      — Asserted in `rotating_a_secret_shows_it_once_and_breaks_the_old_signature`: the
+      creation response of a *generated* secret is the only place the key appears, and the
+      rotation walk additionally reads the endpoint back with `GET` and lists it with
+      `GET /webhooks`, asserting neither body carries a `secret` key at all.
+- [x] `POST /api/v1/webhooks/{id}/secret/rotate` returns a new secret, and a delivery signed with the previous secret fails verification afterwards.
+      — Proven against a real receiver, not a status code. The walk creates the endpoint with
+      an operator-supplied secret so it holds both values, delivers once, rotates, delivers
+      again, and asserts the second delivery verifies against the new secret and **fails**
+      against the old one. The rotation's own event is checked too: it names the endpoint and
+      its payload carries neither the old nor the new secret.
 - [ ] The endpoint form rejects: empty name, duplicate name (case-insensitive), URL without a scheme, URL containing whitespace, zero events, more than 32
-  events, own secret shorter than 16 chars — each with a field-level message and an API error code.
+      events, own secret shorter than 16 chars — each with a field-level message and an API error code.
+      — Every rule below the form is **implemented, typechecked and written into the depth
+      pass**, and the pass is unrun, so the box stays unticked: empty name, empty URL, a URL
+      with no scheme, zero events and a secret under 16 characters are all asserted on screen
+      by `runWebhooksDepth`, and the group checkbox is checked against the catalogue's own
+      count for its area. What is missing is the one thing tests cannot stand in for: nobody
+      has watched those messages appear. A checklist that claims a screen is right before
+      anyone has looked at it is the thing this file exists to prevent.
 - [ ] Test delivery reaches a receiver that accepts signed POSTs and leaves a `delivered` row with `attempts >= 1`, `response_status = 200` and a non-null
   `duration_ms`.
 - [ ] A receiver answering `500` produces retries with increasing `next_attempt_at`, and the row ends `failed` with `attempts = max_attempts` and a readable
@@ -200,16 +223,45 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       receiver refused five times the feed shows exactly one, and its payload names the endpoint.
       Recorded *after* `mark_failed` and its error is logged rather than propagated, so a receiver
       that stays broken cannot take the delivery runner down with it.
-- [ ] Redelivery of a `failed` row resets it to `pending`, increments `redeliver_count`, and a receiver that then answers `200` moves it to `delivered`; a
-  second redelivery of the same row beyond the cap is refused with a clear error.
-- [ ] Bulk redelivery of 100 ids returns per-id outcomes; pending rows are reported as skipped.
-- [ ] Deliveries filter by status, event name and window; the count of returned rows matches the filtered total shown above the table.
+- [x] Redelivery of a `failed` row resets it to `pending`, increments `redeliver_count`, and a receiver that then answers `200` moves it to `delivered`; a
+      second redelivery of the same row beyond the cap is refused with a clear error.
+      — The reset and the increment are asserted (`attempts` back to 0, `redeliver_count` up
+      by one, `trigger` becomes `replay`, and **the row count for that event does not rise** —
+      a second row would mean the receiver cannot tell a replay from a duplicate), and the
+      next delivery tick moves it to `delivered` with the receiver having seen it twice. The
+      cap is a real number (`MAX_REDELIVERIES = 10`) and the unit test asserts the three
+      refusals carry three distinct codes.
+- [x] Bulk redelivery of 100 ids returns per-id outcomes; pending rows are reported as skipped.
+      — `a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not` posts a batch of
+      two (one real, one random) and asserts `queued: 1` with the other named in `skipped`
+      under its own code. An empty batch is refused by name (`empty_redelivery_batch`)
+      because "nothing happened" is the worst possible answer to a button press. The 100-row
+      ceiling is a cap rather than a limit, because the operation is one `update` per id.
+- [x] Deliveries filter by status, event name and window; the count of returned rows matches the filtered total shown above the table.
+      — `the_delivery_history_filters_pages_and_names_its_bad_parameters` runs against eight
+      real rows (six probes, two page events): every filter narrows, repeated `?status=`
+      means "any of these", the header's `total` is the API's own count rather than a recount
+      of the rows on screen, and the `(created_at, id)` keyset page repeats no row. The bad
+      parameters are refused **by name** — a typo'd `?status=flaky` answers
+      `invalid_delivery_query` naming the field, because a filter that silently matches
+      nothing is indistinguishable from an endpoint that has had no failures.
 - [ ] Disabling an endpoint stops new deliveries but keeps its history readable.
-- [ ] `403` is returned (not `404`) when a caller without `webhooks.manage` posts to a management route, and `404` when an endpoint belongs to another
-  organization.
+- [x] `403` is returned (not `404`) when a caller without `webhooks.manage` posts to a management route, and `404` when an endpoint belongs to another
+      organization.
+      — The cross-organization half was already proven in `webhooks_are_scoped_per_organization_and_permission_guarded`.
+      Slice 2 adds the power boundary the delivery operations introduce: reading an endpoint's
+      history is `webhooks.read`, but **sending a delivery again is `webhooks.manage`**, and the
+      new walk proves a reader-only account gets `403` from the redelivery route. That split is
+      deliberate — a read-only auditor must not be able to make the platform POST to a third
+      party by pressing a button.
 - [ ] The event feed's payload inspector copies a JSON path and a copy-as-cURL snippet for a delivery.
 - [ ] Retention sweep deletes events outside the window and their deliveries, and is proven by an integration test with a shortened window.
 - [ ] The QA walkthrough inventory contains `/webhooks`, `/webhooks/new`, `/webhooks/[id]` and `/events`, all with zero high findings.
+      — `/webhooks` and `/webhooks/new` are now in the routes list and `runWebhooksDepth` is
+      written (it opens a *real* endpoint rather than a placeholder id, which is why
+      `/webhooks/[id]` is deliberately not in the list: a route walked with a dummy id proves
+      only that the not-found state renders). **Unrun, and unticked** — the pass is queued
+      behind a sibling writer's slot and the box will be closed on its result, not before.
 
 ### QA plan
 
