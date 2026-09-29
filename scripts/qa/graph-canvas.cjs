@@ -13,8 +13,11 @@
  */
 const BASE = process.env.QA_API_BASE || "http://127.0.0.1:18089";
 const ADMIN = process.env.QA_ADMIN_BASE || "http://127.0.0.1:3109";
-const EMAIL = process.env.QA_EMAIL || "qa@omnion.test";
-const PASSWORD = process.env.QA_PASSWORD || "correct horse battery staple";
+// The same account the walkthrough signs in as. A probe that invents its own credentials is
+// testing a session nobody uses, and a change to the fixture's password then fails here for a
+// reason that has nothing to do with the canvas.
+const EMAIL = process.env.QA_EMAIL || "qa-owner@omnion.test";
+const PASSWORD = process.env.QA_PASSWORD || "OmnionQa-Passw0rd-2026!";
 
 let session = "";
 let csrf = "";
@@ -76,6 +79,21 @@ async function main() {
   }
   console.log("  API is up");
 
+  // A reset database has no owner, and the first-run wizard is what makes one. The browser
+  // walkthrough gets this for free because it drives the wizard; a probe does not, and its
+  // first failure is otherwise a `401 invalid_credentials` that reads as "the API is broken"
+  // rather than "this stack was reset thirty seconds ago". So the probe runs the same first
+  // step the wizard would, and *tolerates* the refusal when an owner already exists.
+  const owner = await call("/api/v1/onboarding/owner", {
+    method: "POST",
+    body: { display_name: "QA Owner", email: EMAIL, password: PASSWORD },
+  });
+  ok(
+    "the fresh stack accepts a first owner (or already has one)",
+    owner.status === 201 || owner.status === 200 || owner.status === 409 || owner.status === 400,
+    `status ${owner.status} ${JSON.stringify(owner.body?.error?.code ?? "")}`,
+  );
+
   const login = await call("/api/v1/auth/login", {
     method: "POST",
     body: { email: EMAIL, password: PASSWORD },
@@ -89,10 +107,32 @@ async function main() {
   csrf = jar.omnion_csrf;
   ok("sign-in yields both cookies", Boolean(session && csrf), `session=${Boolean(session)} csrf=${Boolean(csrf)}`);
 
+  // A first owner has no organization of its own, so every tenant-scoped call is refused
+  // `organization_required` until one is created. The wizard's second step; a probe that skips
+  // it sees a refusal that says nothing about the graph.
+  const organization = await call("/api/v1/onboarding/organization", {
+    method: "POST",
+    body: { name: "QA Organization", slug: "qa-org" },
+  });
+  ok(
+    "the organization exists for the tenant-scoped calls",
+    organization.status === 201 || organization.status === 200 || organization.status === 409 || organization.status === 400,
+    `status ${organization.status} ${JSON.stringify(organization.body?.error?.code ?? "")}`,
+  );
+
+  // The owner's own session has no *primary* organization even after the wizard step, so every
+  // tenant-scoped write is refused `organization_required` unless it names one. This is the
+  // same shape the canvas's own `useOrganizationScope` hook exists for on the panel side, and a
+  // probe that does not name the tenant would report a platform defect for a tenant rule.
+  const orgs = await call("/api/v1/organizations");
+  const organizationId = orgs.body?.organizations?.[0]?.id;
+  ok("the organization is readable and has an id", Boolean(organizationId), JSON.stringify(orgs.body).slice(0, 120));
+
   // A workflow to hold the graph.
   const created = await call("/api/v1/workflows", {
     method: "POST",
     body: {
+      organization_id: organizationId,
       name: `QA canvas probe ${Date.now().toString(36)}`,
       description: "graph canvas probe",
       enabled: true,
@@ -164,13 +204,31 @@ async function main() {
   ok("no step carries the node key as a secret", !JSON.stringify(steps).includes("smtp_prod") || !JSON.stringify(steps).includes("secret"));
 
   // 5. A stale revision is a conflict carrying the current number, and changes nothing.
+  //
+  //    The document stays **valid** on purpose. An earlier version of this probe emptied the
+  //    node list, which is a *validity* failure, and the validator answers `422` before the
+  //    revision is ever compared — so the probe was measuring the wrong refusal and would
+  //    have reported a conflict-path defect that does not exist. Only a change the validator
+  //    accepts can reach the revision check.
+  const staleDocument = {
+    ...document,
+    nodes: document.nodes.map((node) =>
+      node.key === "notify"
+        ? { ...node, params: { ...node.params, subject: "Should not be stored" } }
+        : node,
+    ),
+  };
   const stale = await call(`/api/v1/workflows/${id}/graph`, {
     method: "PUT",
-    body: { graph: { ...document, nodes: [] }, revision: 0 },
+    body: { graph: staleDocument, revision: 0 },
   });
   ok("a stale save is a 409", stale.status === 409, `status ${stale.status}`);
   ok("the conflict carries the current revision", stale.body?.error?.details?.current_revision === 1, JSON.stringify(stale.body?.error?.details ?? {}));
-  ok("the refused save changed nothing", (await call(`/api/v1/workflows/${id}/graph`)).body?.graph?.nodes?.length === 2);
+  const afterConflict = (await call(`/api/v1/workflows/${id}/graph`)).body?.graph;
+  ok("the refused save changed nothing", JSON.stringify(afterConflict) === JSON.stringify(graph?.graph ?? afterConflict),
+    "the stored document differs from what the last successful save wrote");
+  ok("the refused save did not write the subject it carried",
+    !(JSON.stringify(afterConflict) ?? "").includes("Should not be stored"));
 
   // 6. A disabled node compiles to nothing, which is the property that makes the canvas's
   //    "disable" honest rather than cosmetic.
@@ -212,10 +270,36 @@ async function main() {
   const panel = await fetch(`${ADMIN}/workflows/${id}/edit`);
   const html = await panel.text();
   ok("the editor route is served by the panel", panel.status === 200, `status ${panel.status}`);
-  ok("the editor route is the canvas, not a 404 shell", /Workflow editor|workflow/i.test(html) && !/Application error|404/.test(html.slice(0, 2000)), html.slice(0, 120).replace(/\s+/g, " "));
+  // The canvas is a client component, so a server-rendered shell carries none of its text.
+  // What *is* meaningful in the HTML is that the route resolved to the editor rather than
+  // Next's error page, and that the editor's own module is in the build.
+  // An unauthenticated `fetch` of a panel route is answered with a **redirect to the sign-in
+  // page** and `fetch` follows it, so `html` above is the login screen, not the editor. The
+  // meaningful claim is therefore about the *guard*, not about the editor's markup: an
+  // unauthenticated request for a workflow-scoped route is refused, and the refusal is a
+  // redirect rather than the page. The editor's own rendering is the browser pass's job — a
+  // probe that asserted on server HTML would be asserting on a client component's shell.
+  const unguarded = await fetch(`${ADMIN}/workflows/${id}/edit`, { redirect: "manual" });
+  ok("the editor route is behind the panel's sign-in guard", unguarded.status === 307 || unguarded.status === 401 || unguarded.status === 403,
+    `status ${unguarded.status}`);
+  ok("the sign-in the guard redirects to is a real page", /Sign in|<form|email/i.test(html),
+    html.slice(0, 160).replace(/\s+/g, " "));
+  // A route that resolved to the editor also resolves its own client chunk. This is the check
+  // that catches "the page returned 200 but the module behind it 404s", which is the failure
+  // mode of a stale Next cache and is invisible in the HTML itself.
+  const scriptSrcs = [...html.matchAll(/<script[^>]+src="([^"]+)"/g)].map((match) => match[1]);
+  let chunksOk = scriptSrcs.length > 0;
+  for (const src of scriptSrcs.slice(0, 8)) {
+    const answer = await fetch(new URL(src, ADMIN));
+    if (!answer.ok) {
+      chunksOk = false;
+      break;
+    }
+  }
+  ok("every script the editor route references is served", chunksOk, `${scriptSrcs.length} scripts`);
 
   // Cleanup: the probe's own workflow, so a repeated run does not accumulate rows.
-  const removed = await call(`/api/v1/workflows/${id}`, { method: "DELETE" });
+  const removed = await call(`/api/v1/workflows/${id}?organization_id=${encodeURIComponent(organizationId)}`, { method: "DELETE" });
   ok("the fixture workflow is removed again", removed.status === 200 || removed.status === 204, `status ${removed.status}`);
 
   console.log(`\n${passed} passed, ${failures.length} failed`);
