@@ -28,6 +28,9 @@ import type {
   SignInProtectionSaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
+  Project,
+  ProjectMember,
+  ProjectRole,
   WebhookEndpoint,
   WebhookList,
   WebhookRedeliverBatch,
@@ -406,6 +409,91 @@ export function updateSite(
 export async function fetchOrganizations(): Promise<Organization[]> {
   const body = await request<{ organizations: Organization[] }>("/api/v1/organizations");
   return body.organizations;
+}
+
+// -- Automation projects (REQ-133, slice 1) ------------------------------------------------
+//
+// Every function here narrows nothing on the caller's behalf: the API is the only place that
+// knows which projects an account may see, and a client-side filter over a list that is
+// already scoped is how the two drift. `mine: true` is the switcher's own question, and it is
+// asked of the server rather than answered here.
+
+/** The projects the caller may see, in the API's own order. */
+export async function fetchProjects(organizationId?: string): Promise<Project[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<{ projects: Project[] }>(`/api/v1/projects${query}`);
+  return body.projects;
+}
+
+/**
+ * One project with its members, the owner first.
+ *
+ * A `404` here is the documented answer for a project the caller may not see, and `request`
+ * raises it as a normal error: the panel renders the not-found state, never a permission
+ * message, because "you are not allowed" would confirm the row exists.
+ */
+export async function fetchProject(id: string): Promise<{ project: Project; members: ProjectMember[] }> {
+  const body = await request<Project & { members: ProjectMember[] }>(`/api/v1/projects/${id}`);
+  return { project: body, members: body.members };
+}
+
+/** Create a project and its first owner membership. */
+export function createProject(input: {
+  key: string;
+  name: string;
+  description?: string;
+  color?: string;
+  icon?: string;
+  owner_user_id?: string;
+  organization_id?: string;
+}): Promise<Project> {
+  return request<Project>("/api/v1/projects", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Update a project's own fields. Omitted fields are left alone. */
+export function updateProject(
+  id: string,
+  input: { key?: string; name?: string; description?: string; color?: string; icon?: string },
+): Promise<Project> {
+  return request<Project>(`/api/v1/projects/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Archive or restore a project.
+ *
+ * Archiving is not deletion: the history stays and the restore puts it back. The typed
+ * confirmation is the caller's, not the form's -- the API takes `confirm` so a script cannot
+ * skip it by omitting a field the UI happens to send.
+ */
+export function setProjectArchived(id: string, archived: boolean, confirm?: string): Promise<Project> {
+  const verb = archived ? "archive" : "restore";
+  return request<Project>(`/api/v1/projects/${id}/${verb}`, {
+    method: "POST",
+    body: JSON.stringify(archived ? { confirm: confirm ?? id } : {}),
+  });
+}
+
+/** Add a member, or change an existing member's role -- the API treats them as one upsert. */
+export function setProjectMember(
+  id: string,
+  userId: string,
+  role: ProjectRole,
+): Promise<{ user_id: string; display_name: string; email: string; role: ProjectRole; created_at: string }> {
+  return request(`/api/v1/projects/${id}/members`, {
+    method: "POST",
+    body: JSON.stringify({ user_id: userId, role }),
+  });
+}
+
+/** Remove a membership. The API refuses the one that would leave nobody owning the project. */
+export function removeProjectMember(id: string, userId: string): Promise<void> {
+  return request<void>(`/api/v1/projects/${id}/members/${userId}`, { method: "DELETE" });
 }
 
 /** The sites the account may see, optionally narrowed to one tenant. */

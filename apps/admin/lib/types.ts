@@ -1934,3 +1934,65 @@ export interface BackupSchedule {
   /** What the screen says the frequency means, in one sentence. */
   cadence: string;
 }
+
+/**
+ * An automation project — the container every automation resource lives in
+ * (docs/requests/REQ-133, slice 1).
+ *
+ * The counts travel with the row because the list screen draws a column per
+ * count and a detail screen that had to ask for each of them separately would
+ * be three round trips for one header.
+ */
+export interface Project {
+  /** The project's own id. */
+  id: string;
+  /** The tenant it lives in. A project never spans organizations. */
+  organization_id: string;
+  /** Short uppercase key, 2 to 8 letters or digits. */
+  key: string;
+  /** Display name. */
+  name: string;
+  /** Free-form description. */
+  description: string;
+  /** Hex colour for the switcher and the avatar. */
+  color: string;
+  /** Icon name from the theme's icon set. */
+  icon: string;
+  /** Whether this is the organization's default project. */
+  is_default: boolean;
+  /** `active` or `archived`. An archived project is read-only. */
+  status: string;
+  /** The account that owns it, for delegated administration. */
+  owner_user_id: string | null;
+  /** When it was created. */
+  created_at: string;
+  /** Last write. */
+  updated_at: string;
+  /** How many people are in it. */
+  member_count: number;
+  /** How many workflows it holds. */
+  workflow_count: number;
+  /**
+   * The signed-in account's own role, or `null` for an instance administrator
+   * who is not a member. `null` is not "no power" — it is "no membership", and
+   * the store answers `projects.admin` separately.
+   */
+  caller_role: ProjectRole | null;
+}
+
+/** What a member may do inside a project. */
+export type ProjectRole = "owner" | "editor" | "operator" | "viewer";
+
+/** One row of the membership table, with the person's name resolved. */
+export interface ProjectMember {
+  /** The member's account. */
+  user_id: string;
+  /** Display name; never blank, because a person is not an id. */
+  display_name: string;
+  /** Their address. */
+  email: string;
+  /** Their role. */
+  role: ProjectRole;
+  /** When they joined. */
+  created_at: string;
+}
