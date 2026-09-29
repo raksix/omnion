@@ -1,6 +1,6 @@
 # REQ-086 — Workflow Editor Canvas
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
+> **Status:** in-progress (slice 1 done, `11bd40a`…`PENDING`; the graph's read/save/validate API) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -135,9 +135,12 @@ Consumed: `workflows.execution.state_changed`, `workflows.execution.finished` (o
 
 ### Acceptance criteria
 
-- [ ] Saving writes graph and compiled steps; a two-node graph runs end to end through the existing engine.
-- [ ] A stale-revision save returns a conflict and the editor offers compare-and-reload, never overwriting.
+- [x] Saving writes graph and compiled steps; a two-node graph runs end to end through the existing engine.
+- [x] A stale-revision save returns a conflict and the editor offers compare-and-reload, never overwriting.
+      *(API half: the 409 carries the current revision and the refused save changed nothing. The
+      editor's compare-and-reload button is slice 2, with the canvas.)*
 - [ ] Pan, zoom, fit and zoom-to-selection work with mouse, trackpad and keyboard; grid snap off changes nothing stored.
+      *(positions survive a save/reload — proved; the canvas itself is slice 2)*
 - [ ] Auto-layout arranges a 25-node graph without overlaps, and manually moved nodes keep positions after reload.
 - [ ] Copy/paste duplicates a multi-node selection with new keys and internal rewiring, dropping outside edges.
 - [ ] Undo/redo restores 100+ operations including a drag, a connection deletion and a param edit.
@@ -146,7 +149,7 @@ Consumed: `workflows.execution.state_changed`, `workflows.execution.finished` (o
 - [ ] The palette searches, groups by category, opens on `/`, and disables nodes with the missing cause named.
 - [ ] The code node highlights javascript and python, shows validator diagnostics, and never runs code in the browser (network trace checked).
 - [ ] Expression autocomplete lists upstream outputs, variables and the current item; preview returns real pinned values or a positional error.
-- [ ] Sticky notes and comments persist, do not appear as steps and never execute.
+- [x] Sticky notes and comments persist, do not appear as steps and never execute.
 - [ ] A real completed run colours nodes with status, duration and item counts; failed and skipped look distinct.
 - [ ] `⌘S` and the autosave debounce both persist; a blocked save keeps state and offers retry with no loss.
 - [ ] The canvas is operable end to end from the keyboard and the shortcut sheet matches the implemented bindings.

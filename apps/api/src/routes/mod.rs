@@ -112,6 +112,7 @@ pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
+pub mod workflow_graph;
 pub mod workflows;
 
 use axum::Router;
@@ -679,6 +680,22 @@ pub fn router(state: AppState) -> Router {
 
     let workflow_run =
         post(workflows::run_workflow).layer(guards::require(&state, "workflows.run"));
+
+    // The visual graph (docs/requests/REQ-086, slice 1). Reading a graph is a read of the
+    // workflow, so it carries `workflows.read` — the canvas is not an edit surface and the
+    // document holds no secret. Writing one carries `workflows.manage` like any other change to
+    // the definition, because a graph save rewrites the compiled steps the engine runs. The
+    // validate call sits on the *read* power on purpose: a person typing a node parameter must
+    // be able to find out it is wrong without holding the power to save a wrong one, and it
+    // stores nothing.
+    let workflow_graph = get(workflow_graph::get_graph)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(
+            put(workflow_graph::save_graph).layer(guards::require(&state, "workflows.manage")),
+        );
+
+    let workflow_graph_validate = post(workflow_graph::validate_graph)
+        .layer(guards::require(&state, "workflows.read"));
 
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
@@ -1405,6 +1422,8 @@ pub fn router(state: AppState) -> Router {
         .route("/workflows", workflows)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)
+        .route("/workflows/{id}/graph", workflow_graph)
+        .route("/workflows/{id}/graph/validate", workflow_graph_validate)
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)
         .route(
