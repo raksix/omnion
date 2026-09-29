@@ -60,6 +60,20 @@ pub struct Resolved {
     /// The requirement set the decision was taken under, in the spelling the row stores. The
     /// caller needs it to answer the next request the same way.
     pub requirements: Vec<String>,
+    /// Whether the walk had **any candidate to consider** when it failed.
+    ///
+    /// This is the difference between two failures that a caller must not be told about
+    /// identically. A `false` here means the maps hold nothing at all for this request — the
+    /// installation has no default model, the provider list is empty, nothing has ever been
+    /// configured — which is a **setup** problem and a `409`. A `true` means a candidate existed
+    /// and was refused for a stated reason (a missing capability, a pin naming a model that is
+    /// switched off), which is a **routing** problem and a `422` with the walk to show.
+    ///
+    /// Collapsing the two into one status is the mistake this field exists to prevent: the first
+    /// asks an operator to go and set a default model, the second asks them to look at a
+    /// specific row. A caller told "unresolved" for an empty installation is sent to a log
+    /// screen that is empty for the same reason the answer was.
+    pub had_candidates: bool,
 }
 
 /// Resolve one request, record the decision, and return what answered.
@@ -91,6 +105,9 @@ pub async fn resolve_and_record(
         &maps,
         &ResolveRequest {
             explicit: explicit.as_ref(),
+            // The caller's own spelling, so the walk records something `load_pair` can read
+            // back to the *same* pair rather than to whatever a bare key happens to resolve to.
+            explicit_identifier: requested.map(str::trim).filter(|v| !v.is_empty()),
             feature: context.feature,
             task: context.task,
             requires: requirements.clone(),
@@ -141,34 +158,73 @@ pub async fn resolve_and_record(
     }
     let decision_id = record(pool, &new).await?;
 
+    // Whether the maps held **any row** for this request — a task route, a feature pin, or an
+    // installation default.
+    //
+    // Not "the walk names a model", which was the first attempt and is wrong in the case that
+    // matters: the maps filter out a disabled model *before* the walk sees it, so a request
+    // whose only default was switched off produces a walk with nothing in it and would be
+    // reported as "nothing was ever configured" — sending the operator to set a default model
+    // they had already set, and had already switched off on purpose.
+    //
+    // The three questions are genuinely different, and the caller answers a different one for
+    // each: "you have configured nothing" (set a default), "the row you configured cannot
+    // answer" (fix that row), "the model is switched off" (switch it back on). Collapsing them
+    // into one status is the mistake this field exists to prevent.
+    // Deliberately a question about the **database**, not about the filtered maps. Every other
+    // signal here is the same problem: a model that was deliberately switched off is already
+    // gone from `maps`, so an installation whose only model an operator turned off looks exactly
+    // like one that was never set up. They are not the same problem and the caller answers them
+    // differently — one is "switch it back on", the other is "go and set a default". Any row at
+    // all is the honest threshold. See `store::any_model_registered`.
+    let had_candidates = crate::store::any_model_registered(pool).await?;
+
     Ok(Resolved {
         model: if unresolved { None } else { model },
         decision_id,
         rule: new.rule.clone(),
         unresolved,
         requirements,
+        had_candidates,
     })
 }
 
 /// The stored row for one `provider/model` identifier, or `None` when the name no longer exists.
 ///
-/// The split on `/` is the only way back, because the walk speaks in identifiers (it is a
-/// human-facing explanation) while the tables speak in ids. A name whose provider is gone, or
-/// whose model is not on that provider, resolves to `None` — and the caller downgrades the
-/// decision, which is the honest answer.
+/// The split is on the **first** `/`, and that only works because the prefix is a provider name
+/// this platform assigned. A model key may itself contain a slash — a llama.cpp endpoint
+/// publishes `models/<file>.gguf`, Ollama publishes namespaced ids — so a bare key of
+/// `models/x` must not be read as "provider `models`, model `x`". The prefix is therefore
+/// resolved first and the whole string is tried as a key when no provider carries that name.
+///
+/// A name whose provider is gone, or whose model is not on that provider, resolves to `None` —
+/// and the caller downgrades the decision, which is the honest answer.
 async fn load_pair(pool: &PgPool, identifier: &str) -> Result<Option<ResolvedModel>> {
-    let (provider_name, model_key) = match identifier.split_once('/') {
-        Some(parts) => parts,
-        // A bare key is a legal request shape; the router's own answer for it is the pair.
-        None => return crate::router::resolve(pool, Some(identifier)).await.map(Some),
-    };
+    // Resolve the provider prefix **first**, and commit to it. The tempting version — "try the
+    // prefix, and if that does not work try the whole string as a key" — is wrong in the one
+    // case that matters: a prefixed name whose model is disabled would fall through to the bare
+    // lookup, find *another* provider serving the same key, and answer with it. A request that
+    // said `Standby/mock-small` would be served by `Preferred/mock-small`, which is not a
+    // fallback (an explicit pin has none) but a substitution, and the operator's pin silently
+    // addressed a different machine.
+    if let Some((provider_name, rest)) = identifier.split_once('/')
+        && let Some(provider) = crate::store::find_provider_by_name(pool, provider_name).await?
+    {
+        // The provider is named, so the model is looked up on **that** provider and nowhere
+        // else. `None` here means "this provider does not serve an enabled model by that name",
+        // which is an answer, not a reason to keep looking.
+        let model = crate::store::find_model_by_key(pool, provider.id, rest)
+            .await?
+            .filter(|model| model.enabled);
 
-    let Some(provider) = crate::store::find_provider_by_name(pool, provider_name).await? else {
-        return Ok(None);
-    };
-    let model = crate::store::find_model_by_key(pool, provider.id, model_key)
-        .await?
-        .filter(|model| model.enabled);
+        return Ok(model.map(|model| ResolvedModel { provider, model }));
+    }
 
-    Ok(model.map(|model| ResolvedModel { provider, model }))
+    // No prefix, or the prefix is not a provider here — both are the same question, and
+    // `router::resolve` answers it with the same lookup the request itself would have used. This
+    // is also the branch that makes a model key *containing* a slash reachable: a llama.cpp
+    // endpoint publishes `models/<file>.gguf`, so `models/x` names a model, not a provider
+    // called `models`. Without it, every pinned request to a local runtime came back `None` and
+    // was downgraded to `unresolved` with an empty walk to explain it.
+    Ok(crate::router::resolve(pool, Some(identifier)).await.ok())
 }

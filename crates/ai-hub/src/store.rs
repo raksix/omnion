@@ -328,6 +328,24 @@ pub async fn find_default_model(pool: &PgPool) -> Result<Option<AiModel>> {
     Ok(model)
 }
 
+/// Whether **any** model has ever been registered, switched off or not.
+///
+/// A separate question from [`find_default_model`], and the answer to a different one. That
+/// function answers "is there a model that can serve right now"; this one answers "has an
+/// operator configured this installation at all". The gap between them is the whole reason a
+/// refusal needs two statuses: an installation with one model that was deliberately switched off
+/// is not the same problem as one that was never set up, and only the second one is answered by
+/// "go and set a default model".
+///
+/// Deliberately unfiltered. A query that added `and enabled` here would be indistinguishable
+/// from the empty case for exactly the operator who needs the distinction most.
+pub async fn any_model_registered(pool: &PgPool) -> Result<bool> {
+    let registered: (bool,) = sqlx::query_as("select exists(select 1 from ai_models)")
+        .fetch_one(pool)
+        .await?;
+    Ok(registered.0)
+}
+
 /// Make a provider's model set agree with a list.
 ///
 /// Keys that are not in the list are removed, keys that are keep their metadata unless the list

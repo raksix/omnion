@@ -620,3 +620,111 @@ async fn the_unresolved_event_carries_the_requesting_organization() {
 
     harness.dispose().await;
 }
+
+/// **An installation with nothing configured is a setup problem, not a routing problem.** The
+/// refusal is `409 no_default_model` — the code callers have branched on since the route
+/// existed — and it does **not** emit `ai.route.unresolved`.
+///
+/// This is the counterpart to `a_request_nothing_can_answer_is_refused_and_announced`, and the
+/// two walks are only worth having together because they differ. That one connects a provider
+/// and switches its model *off*, so a candidate existed and was refused: `422`, the walk, the
+/// event. This one never connects anything, so there was nothing to consider at all: `409`, a
+/// sentence about setting a default, and silence on the webhook bus.
+///
+/// The regression this guards is real and was introduced by slice 4: it answered *every*
+/// unresolvable request with `422 ai.route.unresolved`, which sent an operator who had not
+/// finished the setup to a routing screen and a log screen that were both empty **for the same
+/// reason the answer was** — neither screen could contradict the refusal, because neither had
+/// anything to show. And the event fired once per request, so an unfinished installation was
+/// also the noisiest one on the bus.
+#[tokio::test]
+async fn an_installation_with_no_provider_asks_for_a_default_model() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    // Deliberately no `mock_provider()`: this walk's subject is an installation where nobody
+    // has connected anything yet, which is the state every deployment passes through.
+    let member = harness
+        .call(post(
+            "/api/v1/onboarding/owner",
+            json!({
+                "display_name": "Katherine Johnson",
+                "email": format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
+                "password": PASSWORD,
+            }),
+            None,
+        ))
+        .await;
+    assert_eq!(member.status, StatusCode::CREATED, "{:?}", member.body);
+    let token = member
+        .set_cookie
+        .as_deref()
+        .and_then(|cookie| cookie.split(';').next())
+        .map(|pair| pair.split_once('=').map(|(_, value)| value.to_owned()))
+        .flatten()
+        .expect("the onboarding call sets a session cookie");
+
+    let providers = harness
+        .call(get("/api/v1/ai/providers", Some(&token)))
+        .await;
+    assert_eq!(providers.status, StatusCode::OK, "{:?}", providers.body);
+    assert_eq!(
+        providers.body["providers"],
+        json!([]),
+        "this walk is about an installation with nothing: {:?}",
+        providers.body
+    );
+
+    let chat = harness
+        .call(post("/api/v1/ai/chat", chat_body(None, None), Some(&token)))
+        .await;
+    assert_eq!(
+        chat.status,
+        StatusCode::CONFLICT,
+        "nothing is configured: this is setup, not routing — {:?}",
+        chat.body
+    );
+    assert_eq!(
+        chat.body["error"]["code"],
+        json!("no_default_model"),
+        "the code a caller has always branched on, not a routing one: {:?}",
+        chat.body
+    );
+    let message = chat.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.to_lowercase().contains("default model"),
+        "the message names the thing to go and set: {message}"
+    );
+    assert!(
+        !message.contains("decision #"),
+        "a setup refusal must not send the operator to a log row that explains nothing: {message}"
+    );
+
+    // The webhook stays quiet. An unfinished installation is the one case where an alert on
+    // every request is pure noise, and the assertion is a count rather than an absence.
+    let events: (i64,) =
+        sqlx::query_as("select count(*)::bigint from events where name = 'ai.route.unresolved'")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the event count must be readable");
+    assert_eq!(
+        events.0, 0,
+        "nothing was configured, so there is no routing to report: {} events fired",
+        events.0
+    );
+
+    // The walk is still recorded — the promise that a decision row exists before the provider is
+    // dialled does not have a carve-out for refusals, and an operator who does look later
+    // should see what was considered (which is nothing).
+    let log = harness
+        .call(get("/api/v1/ai/logs/decisions", Some(&token)))
+        .await;
+    assert_eq!(
+        log.body["total"],
+        json!(1),
+        "the refusal is still a decision, and the log still holds it: {:?}",
+        log.body
+    );
+
+    harness.dispose().await;
+}

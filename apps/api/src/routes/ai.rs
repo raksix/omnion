@@ -1588,24 +1588,52 @@ pub async fn chat(
     // model and no map could supply one. The row is already written with the reasons, so the
     // panel can show the walk — and the event fires here, which is the moment it is about.
     let Some(resolved) = decision.model.clone() else {
-        announce_unresolved(
-            state.db().pool(),
-            &decision,
-            "chat",
-            body.feature.as_deref(),
-            body.model.as_deref(),
-            current.user.id,
-            organization_id,
-        )
-        .await;
-        // `422`, not `500`: nothing failed *here* — the routing maps simply hold nothing that can
-        // answer. A 500 would tell the caller the platform is broken and tell the operator to
-        // look at the server, when the fix is one row on the routing screen.
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "ai.route.unresolved",
-            decision_reason(&decision),
-        ));
+        // The event is about routing, and an installation with nothing configured has no
+        // routing to report: the alert would fire once per request against an operator who has
+        // not finished the setup, which is a webhook that is noise by construction. The walk is
+        // still written and the decision still carries its reasons — only the announcement is
+        // withheld, and only for the case where there was nothing to consider.
+        if decision.had_candidates {
+            announce_unresolved(
+                state.db().pool(),
+                &decision,
+                "chat",
+                body.feature.as_deref(),
+                body.model.as_deref(),
+                current.user.id,
+                organization_id,
+            )
+            .await;
+        }
+        // Two different failures, and the status is the only thing telling them apart.
+        //
+        // **Nothing was ever configured** — no default model, no map, an empty installation.
+        // That is a setup problem: `409 Conflict` with `no_default_model`, the code callers
+        // have handled since the route existed, and a message that names the thing to go and
+        // set. Slice 4 answered this case with `422 ai.route.unresolved`, which sent an
+        // operator with nothing configured to a routing screen and a log screen that were both
+        // empty *for the same reason* the answer was — the two screens could not disagree
+        // because neither had anything to show.
+        //
+        // **A candidate existed and was refused** — a missing capability, a pin naming a model
+        // that is switched off. That is a routing problem: `422`, the walk's reasons, and the
+        // event, because something *is* wrong and it is visible in a specific row.
+        let (status, code) = if decision.had_candidates {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ai.route.unresolved",
+            )
+        } else {
+            (StatusCode::CONFLICT, "no_default_model")
+        };
+        let reason = if decision.had_candidates {
+            decision_reason(&decision)
+        } else {
+            "no model is configured for this request. Set a default model, or give the \
+             feature a route, before sending one."
+                .to_owned()
+        };
+        return Err(ApiError::new(status, code, reason));
     };
 
     // The capabilities the chosen model still has to claim, checked inside the process with the
@@ -1895,6 +1923,15 @@ async fn record_usage(
     elapsed: std::time::Duration,
 ) {
     let latency_ms = i32::try_from(elapsed.as_millis()).unwrap_or(i32::MAX);
+    // REQ-098 slice 5: the price is read ONCE, here, before the first insert — the catalog's
+    // price at the instant of the call. Every row below carries the same snapshot, including the
+    // failed attempts, because a failed call consumed nothing but its token counts are part of
+    // what the operator is reconciling. Reading the price per row inside `record_usage` would
+    // make a concurrent price edit produce a call whose attempts disagree about what it cost.
+    let price = omnion_ai_hub::cost::price_for(
+        &std::sync::Arc::new(load_model_prices(pool).await),
+        model_key,
+    );
     for (index, attempt) in attempts.iter().enumerate() {
         // The last attempt is the one whose row carries the substitution; the earlier ones are
         // the failures that led to it.
@@ -1934,11 +1971,69 @@ async fn record_usage(
             latency_ms,
             substituted_from,
             first_byte_at: None,
+            // REQ-098 slice 5: the snapshot, computed from the price read above and written once.
+            // `record_usage` never updates these columns, so a price edit tomorrow cannot restate
+            // this row — the promise 0043 made in prose and nothing enforced until now.
+            cost: omnion_ai_hub::cost::call_cost(
+                price,
+                if served {
+                    reported.and_then(|usage| token_count(usage.prompt_tokens))
+                } else {
+                    None
+                },
+                if served {
+                    reported.and_then(|usage| token_count(usage.completion_tokens))
+                } else {
+                    None
+                },
+            ),
         };
         if let Err(error) = omnion_ai_hub::health_store::record_usage(pool, row).await {
             tracing::warn!(%error, "a provider usage row could not be written");
         }
     }
+}
+
+/// Every model's key and price, as the catalog holds them right now (REQ-098 slice 5).
+///
+/// Read as a `Vec` of pairs rather than a map because the call site needs a *snapshot*, not a
+/// live view: the cost is bound into the insert as values, so by the time a second attempt's row
+/// is written the catalog may already say something else. A `HashMap` here would hide that —
+/// it would look like a lookup, and a lookup re-reads the future.
+///
+/// A model with no price is returned as [`ModelPrice::unpriced`] rather than omitted, so a key
+/// that *is* in the catalog and a key that is not are told apart by the cost function instead of
+/// both collapsing into "no price".
+async fn load_model_prices(
+    pool: &sqlx::PgPool,
+) -> Vec<(String, omnion_ai_hub::cost::ModelPrice)> {
+    sqlx::query(
+        "select model_key, input_cost_micros_per_mtok, output_cost_micros_per_mtok \
+         from ai_models where enabled",
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        use sqlx::Row as _;
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("model_key"),
+                    omnion_ai_hub::cost::ModelPrice {
+                        input_micros_per_mtok: row.get("input_cost_micros_per_mtok"),
+                        output_micros_per_mtok: row.get("output_cost_micros_per_mtok"),
+                    },
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_else(|error| {
+        // A catalog that cannot be read prices nothing, which stores `null` on every row. That
+        // is the safe direction to fail: the alternative — guessing — writes a number nobody can
+        // reconcile. The warn keeps it visible.
+        tracing::warn!(%error, "model prices could not be read; this call will record no cost");
+        Vec::new()
+    })
 }
 
 /// A reported token count as the `int` the column stores.
