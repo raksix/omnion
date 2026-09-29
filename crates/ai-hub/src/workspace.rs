@@ -202,6 +202,24 @@ pub fn validate_path(path: &str) -> Result<String> {
     Ok(path.to_owned())
 }
 
+/// Hex SHA-256 of a file's bytes.
+///
+/// The workspace's own checksum, computed over the *stored* bytes rather than trusting a
+/// header, and it lives here rather than in the route because it is half of
+/// [`storage_key`]: a client that could name the key would be able to address another file's
+/// bytes, so the key is derived from a digest nobody outside this module computes.
+#[must_use]
+pub fn checksum_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().iter().fold(String::with_capacity(64), |mut acc, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    })
+}
+
 /// The opaque object-storage key for one file.
 ///
 /// Derived from the agent id, a *fixed* prefix and the bytes' own checksum, so:
@@ -416,9 +434,259 @@ pub async fn mark_used(pool: &PgPool, agent_id: Uuid, id: Uuid, run_id: Uuid) ->
     Ok(())
 }
 
+// -------------------------------------------------------------------------------------------
+// Run inputs
+// -------------------------------------------------------------------------------------------
+
+/// One row of [`ai_run_inputs`] — what a run was told to read.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RunInput {
+    /// Row identity.
+    pub id: Uuid,
+    /// The run that named it.
+    pub run_id: Uuid,
+    /// The agent whose workspace the path is resolved in.
+    pub agent_id: Uuid,
+    /// The path, exactly as it was named.
+    pub path: String,
+    /// The file, when one existed at the moment the reference was written.
+    ///
+    /// `None` is a normal state, not an error: the sheet can hand a run an **output** path, and
+    /// a reference that resolves to a missing file renders as "missing" rather than vanishing —
+    /// which is the sentence that explains a run that failed on an input somebody deleted.
+    pub file_id: Option<Uuid>,
+    /// When the reference was written.
+    pub created_at: OffsetDateTime,
+}
+
+/// How many workspace files a run may be told to read.
+///
+/// Ten, which is the same order as the per-file cap makes useful: a goal that names thirty
+/// inputs is not a goal a model can hold in a step, and the honest failure is a refusal at the
+/// sheet rather than a run that silently ignores twenty of them.
+pub const MAX_RUN_INPUTS: usize = 10;
+
+/// Write a run's input references, replacing anything a previous attempt named.
+///
+/// A *replace* rather than an append because the sheet can be re-submitted — a 409, a retry
+/// after a cancelled run, a double-click — and an append would give one run two different input
+/// lists depending on which attempt the trace reader happened to see last. The caller's list is
+/// what the run is told, and there is exactly one of it.
+///
+/// Paths are validated through [`validate_path`] before they are written, so the row and the
+/// prompt agree: a traversal is refused here with the rule's own message rather than by the
+/// database's constraint name three layers down.
+pub async fn set_run_inputs(
+    pool: &PgPool,
+    run_id: Uuid,
+    agent_id: Uuid,
+    user_id: Option<Uuid>,
+    paths: &[String],
+) -> Result<Vec<RunInput>> {
+    if paths.len() > MAX_RUN_INPUTS {
+        return Err(AiHubError::InvalidAgent(format!(
+            "a run may be told to read at most {MAX_RUN_INPUTS} workspace files; {} were named",
+            paths.len()
+        )));
+    }
+
+    // Validate every path *before* deleting the old list, so a refused request leaves the run's
+    // existing inputs in place rather than clearing them on its way to the error.
+    let mut cleaned = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let path = validate_path(raw)?;
+        // Duplicates are the sheet's own picker being stale, not an error: the unique index
+        // would refuse the second insert, and a 409 on a run start is the wrong answer for
+        // "you picked the same file twice".
+        if !cleaned.iter().any(|seen| seen == &path) {
+            cleaned.push(path);
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from ai_run_inputs where run_id = $1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    for path in &cleaned {
+        // The file id is resolved *now*, from the agent's own workspace, and only as a
+        // convenience: a path with no file behind it is still a valid instruction.
+        let file_id: Option<Uuid> = sqlx::query_scalar(
+            "select id from ai_agent_files where agent_id = $1 and path = $2",
+        )
+        .bind(agent_id)
+        .bind(path)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into ai_run_inputs (run_id, agent_id, path, file_id, attached_by) \
+             values ($1, $2, $3, $4, $5)",
+        )
+        .bind(run_id)
+        .bind(agent_id)
+        .bind(path)
+        .bind(file_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    list_run_inputs(pool, run_id).await
+}
+
+/// A run's input references, in the order they were written.
+///
+/// The read is scoped by `run_id` alone — a run id is already tenant-bound, because a run row
+/// carries its organization — and `list_run_inputs` therefore returns nothing for a run that does
+/// not exist rather than erroring on a foreign one.
+pub async fn list_run_inputs(pool: &PgPool, run_id: Uuid) -> Result<Vec<RunInput>> {
+    let rows = sqlx::query_as::<_, RunInput>(
+        "select id, run_id, agent_id, path, file_id, created_at from ai_run_inputs \
+         where run_id = $1 order by created_at, path",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// How many of a run's named inputs still exist, and how many bytes they are.
+///
+/// The number the run detail renders as "3 of 3 inputs available", and the number that decides
+/// whether a resumed run can start: a run whose inputs vanished between the sheet and the
+/// runner has to be told, not discovered by a tool call failing halfway through.
+#[must_use]
+pub fn resolve(inputs: &[RunInput], present: &[(Uuid, u64)]) -> InputResolution {
+    let mut resolution = InputResolution::default();
+    for input in inputs {
+        match present
+            .iter()
+            .find(|(id, _)| Some(*id) == input.file_id)
+        {
+            Some((_, bytes)) => {
+                resolution.available.push(input.clone());
+                resolution.present_bytes += *bytes;
+            }
+            None => resolution.missing.push(input.clone()),
+        }
+    }
+    resolution
+}
+
+/// What [`resolve`] found: the references that resolve, and the ones that do not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputResolution {
+    /// References whose file exists.
+    pub available: Vec<RunInput>,
+    /// References with no file behind them — an output path, or a deleted input.
+    pub missing: Vec<RunInput>,
+    /// Total size of the available files, in bytes.
+    pub present_bytes: u64,
+}
+
+impl InputResolution {
+    /// Whether every named input is present.
+    ///
+    /// The runner's pre-flight check. It is a `bool` on a value the caller already holds rather
+    /// than another database read, because the answer cannot change between two statements a
+    /// microsecond apart — and a check that re-read would be free to disagree with itself.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.missing.is_empty()
+    }
+
+    /// The sentence the run detail and the panel put under the list.
+    ///
+    /// Says *which* paths, because "some inputs are missing" sends a person to the workspace tab
+    /// to look at every file, and the file that is gone is the one they cannot see is gone.
+    #[must_use]
+    pub fn message(&self) -> Option<String> {
+        if self.missing.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self.missing.iter().map(|input| input.path.as_str()).collect();
+        Some(format!(
+            "{} of {} named input(s) cannot be resolved: {}",
+            self.missing.len(),
+            self.available.len() + self.missing.len(),
+            names.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reference the caller wrote by hand, so no walk fixture is needed for a pure function.
+    fn input(path: &str, file_id: Option<Uuid>) -> RunInput {
+        RunInput {
+            id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            path: path.to_owned(),
+            file_id,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn a_reference_with_no_file_id_is_missing_and_says_so() {
+        // An output path — "write the summary to summary.md" — has no file yet, and must read as
+        // unresolved rather than being silently dropped from the run's input list.
+        let resolution = resolve(&[input("summary.md", None)], &[]);
+        assert!(!resolution.is_complete());
+        assert_eq!(resolution.available.len(), 0);
+        assert_eq!(resolution.missing.len(), 1);
+        let message = resolution.message().expect("a missing input has a message");
+        assert!(message.contains("summary.md"), "{message}");
+    }
+
+    #[test]
+    fn a_resolved_reference_counts_its_bytes() {
+        let file = Uuid::new_v4();
+        let resolution = resolve(&[input("q3.csv", Some(file))], &[(file, 2048)]);
+        assert!(resolution.is_complete());
+        assert!(resolution.message().is_none());
+        assert_eq!(resolution.present_bytes, 2048);
+    }
+
+    #[test]
+    fn the_message_names_every_missing_path() {
+        // The failure this catches: a summary that says "1 of 2 missing" and sends the operator
+        // to the workspace tab to find which one — the one they cannot see is gone.
+        let a = Uuid::new_v4();
+        let resolution = resolve(
+            &[input("present.csv", Some(a)), input("gone.csv", None), input("also.csv", None)],
+            &[(a, 10)],
+        );
+        assert_eq!(resolution.available.len(), 1);
+        let message = resolution.message().expect("message");
+        assert!(message.contains("2 of 3"), "{message}");
+        assert!(message.contains("gone.csv"), "{message}");
+        assert!(message.contains("also.csv"), "{message}");
+        assert!(!message.contains("present.csv"), "{message}");
+    }
+
+    #[test]
+    fn a_run_with_no_inputs_is_complete() {
+        // Vacuously true: a run that names nothing has nothing missing. The alternative — a
+        // run with zero inputs reported as broken — would make the common case an alert.
+        let resolution = resolve(&[], &[]);
+        assert!(resolution.is_complete());
+        assert!(resolution.message().is_none());
+    }
+
+    #[test]
+    fn a_file_belonging_to_another_reference_does_not_resolve_this_one() {
+        // `present` is the agent's file list; two references can name the same file, and one
+        // reference pointing at a file the agent does not hold must not borrow another's row.
+        let held = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let resolution = resolve(&[input("held.csv", Some(held))], &[(foreign, 5)]);
+        assert!(!resolution.is_complete());
+        assert_eq!(resolution.present_bytes, 0);
+    }
 
     #[test]
     fn an_ordinary_path_is_kept_as_written() {
@@ -486,6 +754,27 @@ mod tests {
         let long = "a".repeat(MAX_PATH_CHARS + 1);
         let message = validate_path(&long).unwrap_err().to_string();
         assert!(message.contains(&MAX_PATH_CHARS.to_string()), "{message}");
+    }
+
+    #[test]
+    fn the_checksum_is_the_sha256_of_the_bytes() {
+        // The empty string's digest, so the key derivation is pinned against a wrong algorithm
+        // rather than against a value somebody has to compute by hand. The function used to
+        // live in the route, which meant the crate could not test it — and the half of the key
+        // pair that decides *which object* a file is cannot be tested from the outside.
+        assert_eq!(
+            checksum_of(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(checksum_of(b"abc").len(), 64);
+    }
+
+    #[test]
+    fn two_different_files_do_not_share_a_key() {
+        let agent = Uuid::new_v4();
+        let one = storage_key(agent, &checksum_of(b"one"));
+        let two = storage_key(agent, &checksum_of(b"two"));
+        assert_ne!(one, two);
     }
 
     #[test]

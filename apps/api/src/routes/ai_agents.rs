@@ -43,6 +43,7 @@ use omnion_ai_hub::run_store::{
     validate_goal,
 };
 use omnion_ai_hub::tools::AllowList;
+use omnion_ai_hub::workspace::{self as agent_workspace, RunInput};
 use omnion_audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -359,6 +360,24 @@ impl StepView {
     }
 }
 
+/// One workspace reference as the run detail renders it.
+#[derive(Debug, Serialize)]
+pub struct RunInputView {
+    /// Row id.
+    pub id: Uuid,
+    /// The path, exactly as the sheet named it.
+    pub path: String,
+    /// Whether a file is behind it right now.
+    ///
+    /// `false` is the state that explains a failed run: the sheet named `q3.csv`, and somebody
+    /// deleted it before the runner claimed the run. The row survives the delete on purpose —
+    /// see migration `0154` — so the trace can say *which* input went missing instead of
+    /// silently showing a run that had none.
+    pub resolved: bool,
+    /// The file's size when it resolves, in bytes.
+    pub size_bytes: u64,
+}
+
 /// One run with its steps — the detail screen's whole payload.
 #[derive(Debug, Serialize)]
 pub struct RunDetail {
@@ -367,6 +386,8 @@ pub struct RunDetail {
     pub run: RunView,
     /// The trace.
     pub steps: Vec<StepView>,
+    /// What the run was told to read.
+    pub inputs: Vec<RunInputView>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -851,9 +872,39 @@ pub async fn get_run_route(
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "run.not_found", "no such run"))?;
     let steps = list_steps(state.db().pool(), run.id).await?;
+    let inputs = agent_workspace::list_run_inputs(state.db().pool(), run.id).await?;
+    // The agent may be gone (a run outlives its definition on purpose), and a reference is still
+    // worth rendering: "your input went missing" is the explanation a person needs, so the
+    // detail reads the run's references rather than the agent's files.
+    let files = match run.agent_id {
+        Some(agent_id) => agent_workspace::list_files(state.db().pool(), agent_id).await?,
+        None => Vec::new(),
+    };
+    let present: Vec<(Uuid, u64)> = files
+        .iter()
+        .map(|file| (file.id, file.bytes()))
+        .collect();
+    let resolution = agent_workspace::resolve(&inputs, &present);
     Ok(Json(RunDetail {
         run: RunView::build(&run),
         steps: steps.iter().map(StepView::build).collect(),
+        // In the order the sheet named them, not "resolved first": the goal quotes them in that
+        // order and a trace that silently reorders them is a trace the reader has to re-derive.
+        inputs: inputs
+            .iter()
+            .map(|input| {
+                let size = present
+                    .iter()
+                    .find(|(id, _)| Some(*id) == input.file_id)
+                    .map_or(0, |(_, bytes)| *bytes);
+                RunInputView {
+                    id: input.id,
+                    path: input.path.clone(),
+                    resolved: !resolution.missing.iter().any(|m| m.id == input.id),
+                    size_bytes: size,
+                }
+            })
+            .collect(),
     }))
 }
 
@@ -966,6 +1017,19 @@ pub async fn start_run(
         Err(error) => return Err(error.into()),
     };
 
+    // The run exists; its named inputs go on the row now rather than being resolved by a tool
+    // later. Two reasons, both about the failure an operator has to explain: the trace can say
+    // *which* paths the sheet named, and a reference that has no file behind it reads as missing
+    // instead of silently disappearing from the record.
+    let inputs = agent_workspace::set_run_inputs(
+        state.db().pool(),
+        run.id,
+        agent.id,
+        Some(current.user.id),
+        &body.files,
+    )
+    .await?;
+
     let entry = NewAuditEntry::by_user(current.user.id, "ai.run.started")
         .organization(organization)
         .target("ai_run", run.id)
@@ -973,7 +1037,7 @@ pub async fn start_run(
             "agent": agent.key,
             "model_id": agent.model_id,
             "goal": run.goal,
-            "files": body.files.len(),
+            "files": inputs.len(),
         }))
         .ip_address(address.as_text());
     if let Err(error) = omnion_audit::record(state.db().pool(), entry).await {

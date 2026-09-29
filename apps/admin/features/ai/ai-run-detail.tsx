@@ -21,7 +21,17 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Ban, Check, ChevronDown, Copy, Loader2, Play, RotateCw } from "lucide-react";
+import {
+  Ban,
+  Check,
+  ChevronDown,
+  Copy,
+  FileCheck,
+  FileWarning,
+  Loader2,
+  Play,
+  RotateCw,
+} from "lucide-react";
 import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
@@ -36,6 +46,7 @@ import {
   resumeAiRun,
   type AiAgent,
 } from "@/lib/api";
+import { formatBytes } from "@/lib/format";
 import { useSession } from "@/lib/session";
 
 /** How a step kind reads, because `tool_result` is not a sentence. */
@@ -204,6 +215,11 @@ export function AiRunDetailView({ runId }: { runId: string }) {
   }, [run, runId, organizationId, load]);
 
   const steps = run?.steps ?? [];
+  // The run's named workspace references, in the order the sheet wrote them. A run created before
+  // this column existed (or by a trigger that named nothing) carries an empty list, not `undefined`
+  // — the route always sends the key, so the screen never has to guard for a missing field.
+  const inputs = run?.inputs ?? [];
+  const missing = inputs.filter((input) => !input.resolved);
   const running = run?.status === "running" || run?.status === "queued";
   // Resume is offered for the states the API actually accepts. A run whose steps all completed
   // is finished, one that is still going does not need it, and one with a step left `running`
@@ -380,6 +396,40 @@ export function AiRunDetailView({ runId }: { runId: string }) {
         <section data-run-detail-answer className="rounded-xl border border-line bg-surface p-3.5">
           <h3 className="text-[12px] font-medium text-muted">The answer</h3>
           <p className="mt-1 whitespace-pre-wrap text-[13px]">{summary}</p>
+        </section>
+      ) : null}
+
+      {inputs.length > 0 ? (
+        <section data-run-detail-inputs className="rounded-xl border border-line bg-surface p-3.5">
+          <h3 className="text-[12px] font-medium text-muted">Named workspace inputs</h3>
+          <ul className="mt-2 space-y-1">
+            {inputs.map((input) => (
+              <li
+                key={input.id}
+                data-run-input={input.path}
+                data-run-input-resolved={input.resolved}
+                className="flex flex-wrap items-center gap-2 text-[12.5px]"
+              >
+                {input.resolved ? (
+                  <FileCheck className="size-3.5 shrink-0 text-positive" aria-hidden />
+                ) : (
+                  <FileWarning className="size-3.5 shrink-0 text-danger" aria-hidden />
+                )}
+                <span className="font-mono">{input.path}</span>
+                <span className="text-muted">
+                  {input.resolved ? formatBytes(input.size_bytes) : "missing"}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {missing.length > 0 ? (
+            // Named, not counted: "one input is missing" sends a person to the workspace tab to
+            // look at every file, and the file that is gone is the one they cannot see is gone.
+            <p data-run-detail-inputs-missing className="mt-2 text-[12px] text-danger">
+              {missing.length} of {inputs.length} named input(s) cannot be resolved:{" "}
+              {missing.map((input) => input.path).join(", ")}
+            </p>
+          ) : null}
         </section>
       ) : null}
 

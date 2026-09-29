@@ -6489,7 +6489,89 @@ async function runAiAgentsDepth(page, report) {
   steps.downloadHrefEncodesPath =
     typeof steps.downloadHref === "string" && steps.downloadHref.includes("qa/input.csv");
 
+  // The Run sheet's picker, and the run detail's rendering of what it named (REQ-099 slice 2).
+  // The file is deliberately NOT deleted before this: a reference that resolves is the happy
+  // half, and the row it writes is what makes the reference worth having at all.
+  await page.goto(`${URL_ADMIN}/ai/agents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await page
+    .locator(`[data-agent-row="${agentId}"] button:has-text("Run")`)
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.sheetInputPicker = (await page.locator("[data-run-inputs]").count()) > 0;
+  steps.sheetNamesRealPath =
+    (await page.locator(`[data-run-input="${workspacePath}"]`).count()) > 0;
+  await page.locator(`[data-run-input="${workspacePath}"]`).first().click().catch(() => {});
+  await page.waitForTimeout(400);
+  steps.sheetInputSelected =
+    (await page.locator(`[data-run-input="${workspacePath}"][data-run-input-selected="true"]`)
+      .count()) > 0;
+  await shot(page, "ai-run-sheet-inputs");
+
+  // The API, rather than the stream: a live run's trace is the subject of another pass, and the
+  // question here is whether the *reference* was recorded, which is true before the run ends.
+  //
+  // `POST /runs` answers `text/event-stream` whatever the Accept header says, so the run id is
+  // read out of the first SSE frame's JSON rather than off a response body — a `.json()` here
+  // returns a parse error and the pass would report "no run" for a run that started fine.
+  const started = await page
+    .request.post(api(`/agents/${agentId}/runs`), {
+      failOnStatusCode: false,
+      headers: { "content-type": "application/json" },
+      data: { goal: "Summarise the named input.", files: [workspacePath, "not-uploaded.md"] },
+    })
+    .then(async (response) => ({
+      status: response.status(),
+      text: await response.text().catch(() => ""),
+    }))
+    .catch(() => ({ status: 0, text: "" }));
+  const namedRunId = (started.text.match(/"run_id"\s*:\s*"([0-9a-f-]{36})"/) || [])[1] || "";
+  steps.runInputRecorded = started.status === 200 && namedRunId !== "";
+  if (namedRunId) {
+    const detail = await page
+      .request.get(api(`/runs/${namedRunId}`), { failOnStatusCode: false })
+      .then((response) => response.json())
+      .catch(() => ({}));
+    steps.detailListsInputs = Array.isArray(detail?.inputs) && detail.inputs.length === 2;
+    steps.detailResolvesTheUpload =
+      detail?.inputs?.some?.((input) => input.path === workspacePath && input.resolved === true) ===
+      true;
+    steps.detailFlagsTheMissingOne =
+      detail?.inputs?.some?.((input) => input.path === "not-uploaded.md" && input.resolved === false) ===
+      true;
+    // A traversal in the same field is refused by the *route*, so the run sheet cannot record a
+    // path that would reach outside the workspace — the constraint is not the only guard.
+    const before = qaSql(`select count(*) from ai_run_inputs where run_id = '${namedRunId}'`);
+    const refusal = await page
+      .request.post(api(`/agents/${agentId}/runs`), {
+        failOnStatusCode: false,
+        headers: { "content-type": "application/json", accept: "application/json" },
+        data: { goal: "Escape attempt.", files: ["../escape.csv"] },
+      })
+      .then((response) => response.status())
+      .catch(() => 0);
+    steps.runInputTraversalRefused = refusal === 400 || refusal === 422;
+    steps.runInputTraversalWroteNothing =
+      qaSql(`select count(*) from ai_run_inputs where run_id = '${namedRunId}'`) === before;
+    // The detail renders them: the panel must show a path with no file behind it, in red, by name.
+    await page.goto(`${URL_ADMIN}/ai/runs/${namedRunId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.detailShowsInputs = (await page.locator("[data-run-detail-inputs]").count()) > 0;
+    steps.detailShowsMissingBanner =
+      (await page.locator("[data-run-detail-inputs-missing]").count()) > 0;
+    await shot(page, "ai-run-detail-inputs");
+    await page
+      .request.post(api(`/runs/${namedRunId}/cancel`), { failOnStatusCode: false })
+      .catch(() => {});
+  }
+
   // Clean up the workspace file so the pass does not leave bytes behind for the next one.
+  await page.goto(`${URL_ADMIN}/ai/agents/${agentId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  await page.locator('[data-agent-tab="workspace"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
   await page
     .locator(`tr:has-text("${workspacePath}") button:has-text("Delete")`)
     .first()

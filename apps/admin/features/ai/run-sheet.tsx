@@ -21,14 +21,17 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { CircleAlert, Loader2, Play, X } from "lucide-react";
+import { Check, CircleAlert, Loader2, Play, X } from "lucide-react";
 
 import {
   ApiError,
+  fetchAiAgentWorkspace,
   type AiAgent,
+  type AiAgentFile,
   type AiRunFrame,
   startAiRun,
 } from "@/lib/api";
+import { formatBytes } from "@/lib/format";
 
 /** What the sheet prints as a line; the SSE frames folded into something a person can read. */
 type SheetLine = {
@@ -41,6 +44,15 @@ type SheetLine = {
 
 /** The longest goal the API accepts; the counter quotes the same number the route validates. */
 const MAX_GOAL = 2000;
+
+/**
+ * How many workspace files one run may be told to read.
+ *
+ * The same ceiling the API enforces (`workspace::MAX_RUN_INPUTS`), restated because a picker that
+ * lets a person choose an eleventh file and is then refused by the server is a picker that lies.
+ * The API is still the authority; this only stops the mistake before it costs a round trip.
+ */
+const MAX_INPUTS = 10;
 
 /** What the sheet knows about the run it is watching. */
 type SheetState = "idle" | "starting" | "streaming" | "finished" | "failed";
@@ -122,6 +134,8 @@ export function RunSheet({ agent, organizationId, onClose, onStarted, onOpenRun 
   const [runId, setRunId] = useState<string | null>(null);
   /** The id of a run that is already going, offered as a link instead of an error. */
   const [attached, setAttached] = useState<string | null>(null);
+  const [files, setFiles] = useState<AiAgentFile[]>([]);
+  const [chosen, setChosen] = useState<string[]>([]);
   const seq = useRef(0);
   const logRef = useRef<HTMLDivElement>(null);
   const goalRef = useRef<HTMLTextAreaElement>(null);
@@ -155,7 +169,7 @@ export function RunSheet({ agent, organizationId, onClose, onStarted, onOpenRun 
     try {
       await startAiRun(
         agent.id,
-        { goal: goal.trim(), organizationId },
+        { goal: goal.trim(), files: chosen, organizationId },
         {
           onFrame: (frame) => {
             if (frame.event === "run" && typeof frame.data.run_id === "string") {
@@ -192,6 +206,37 @@ export function RunSheet({ agent, organizationId, onClose, onStarted, onOpenRun 
   };
 
   const running = state === "starting" || state === "streaming";
+
+  // The agent's workspace, loaded when the sheet opens. A failure here is **not** shown as the
+  // sheet's error: the goal is still startable without any input, and a red banner saying "the
+  // workspace could not be read" would stop a run that would have worked. The picker says it
+  // itself instead, and the Run button stays live.
+  useEffect(() => {
+    let cancelled = false;
+    void fetchAiAgentWorkspace(agent.id, organizationId)
+      .then((workspace) => {
+        if (!cancelled) setFiles(workspace.files);
+      })
+      .catch(() => {
+        if (!cancelled) setFiles([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agent.id, organizationId]);
+
+  /** Add or drop a path, refusing the eleventh rather than letting the API say no later. */
+  const toggleFile = (path: string) => {
+    setChosen((previous) => {
+      if (previous.includes(path)) return previous.filter((item) => item !== path);
+      if (previous.length >= MAX_INPUTS) {
+        setError(`A run can be told to read at most ${MAX_INPUTS} workspace files.`);
+        return previous;
+      }
+      setError(null);
+      return [...previous, path];
+    });
+  };
   const text = useMemo(() => lines.filter((line) => line.kind === "text").map((l) => l.text).join(""), [lines]);
 
   return (
@@ -250,6 +295,53 @@ export function RunSheet({ agent, organizationId, onClose, onStarted, onOpenRun 
             <p className="mt-1 text-right text-[11.5px] text-muted">
               {goal.length} / {MAX_GOAL}
             </p>
+          </div>
+
+          <div>
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="block text-[12.5px] font-medium">Workspace files to read</span>
+              <span className="text-[11.5px] text-muted">
+                {chosen.length} / {MAX_INPUTS} chosen
+              </span>
+            </div>
+            {files.length === 0 ? (
+              // Not an error and not a red banner: the run is startable without an input, and the
+              // thing that would make one available (the Workspace tab) is one link away.
+              <p data-run-inputs-empty className="mt-1 text-[12px] text-muted">
+                This agent&apos;s workspace is empty. The run starts without an input — add a file in
+                the agent&apos;s Workspace tab to give it something to read.
+              </p>
+            ) : (
+              <ul data-run-inputs className="mt-1 max-h-32 space-y-0.5 overflow-y-auto rounded-lg border border-line bg-canvas p-1.5">
+                {files.map((file) => {
+                  const on = chosen.includes(file.path);
+                  return (
+                    <li key={file.id}>
+                      <button
+                        type="button"
+                        data-run-input={file.path}
+                        data-run-input-selected={on}
+                        aria-pressed={on}
+                        disabled={running}
+                        onClick={() => toggleFile(file.path)}
+                        className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left text-[12px] hover:bg-quiet-soft disabled:opacity-60"
+                      >
+                        <span
+                          aria-hidden
+                          className={`flex size-3.5 shrink-0 items-center justify-center rounded border ${
+                            on ? "border-accent bg-accent text-white" : "border-line"
+                          }`}
+                        >
+                          {on ? <Check className="size-2.5" /> : null}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate font-mono">{file.path}</span>
+                        <span className="shrink-0 text-muted">{formatBytes(file.size_bytes)}</span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
           </div>
 
           {attached ? (

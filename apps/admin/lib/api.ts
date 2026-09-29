@@ -5437,8 +5437,22 @@ export type AiRunStep = {
   error: string | null;
 };
 
-/** One run with its trace — the run detail screen's whole payload. */
-export type AiRunDetail = AiRun & { steps: AiRunStep[] };
+/**
+ * One workspace reference a run was told to read.
+ *
+ * `resolved: false` is the state that explains a failed run: the sheet named `q3.csv`, and the
+ * file was deleted before the runner claimed the run. The reference survives the delete on
+ * purpose, so the trace can name the path rather than showing a run that had no inputs.
+ */
+export type AiRunInput = {
+  id: string;
+  path: string;
+  resolved: boolean;
+  size_bytes: number;
+};
+
+/** One run with its trace and its named inputs — the run detail screen's whole payload. */
+export type AiRunDetail = AiRun & { steps: AiRunStep[]; inputs: AiRunInput[] };
 
 /** The organization selector the agent and run routes accept. */
 function agentScopeParams(organizationId?: string | null): string {
