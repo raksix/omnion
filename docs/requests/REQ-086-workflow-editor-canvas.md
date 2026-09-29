@@ -1,6 +1,6 @@
 # REQ-086 — Workflow Editor Canvas
 
-> **Status:** in-progress (slices 1–2 done — `11bd40a`…`73f0297`; the graph API, the canvas, and a 36/36 live probe of the round trip) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
+> **Status:** in-progress (slices 1–2 done — `11bd40a`…`73f0297`; slice 3's expression preview built — `6eb9b71` evaluator, `8f3b8c8` the endpoint, `c636757` the inspector row, 19/19 live) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -154,6 +154,7 @@ Consumed: `workflows.execution.state_changed`, `workflows.execution.finished` (o
       *(every disabled row carries its reason on the button, asserted in the walkthrough pass)*
 - [ ] The code node highlights javascript and python, shows validator diagnostics, and never runs code in the browser (network trace checked).
 - [ ] Expression autocomplete lists upstream outputs, variables and the current item; preview returns real pinned values or a positional error.
+      *(the preview half is proved and does NOT tick this box: `6eb9b71` (16 unit), `8f3b8c8` (5 integration), `c636757`; `scripts/qa/graph-expressions.cjs` 19/19 live — pinned values returned, a lone expression keeps its type, and a bad path returns a 422 whose message names the field and lists what the sample carries. Autocomplete is not built.)*
 - [x] Sticky notes and comments persist, do not appear as steps and never execute.
 - [ ] A real completed run colours nodes with status, duration and item counts; failed and skipped look distinct.
 - [ ] `⌘S` and the autosave debounce both persist; a blocked save keeps state and offers retry with no loss.
@@ -180,7 +181,11 @@ visible selection and focus, legible badges, working minimap, overlay colours ma
    written (`runGraphCanvasDepth`) and has not yet run — the QA slot was held by a live sibling
    pass for this whole tick.*
 3. **Connections and editors** — type-aware connects with labels, CodeMirror, expression field with preview.
-   Done: mismatched connects refuse, both languages highlight, preview returns real values.
+   *Built so far: the expression field and its preview — `omnion_workflows::expression` (server-side
+   only, pinned sample data, typed refusals), `POST …/graph/expressions/preview`, and the inspector row
+   with the sample on screen and editable. Still owed: CodeMirror 6 for code nodes, and the autocomplete
+   that lists upstream outputs — which is why the acceptance box below stays unticked even though its
+   preview half passes.*
 4. **Run overlay and polish** — per-node states, run bar, partial-run entry points, responsive and a11y pass.
    Done: a real run colours the canvas correctly and the accessibility checklist passes.
 

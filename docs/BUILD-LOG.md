@@ -4221,3 +4221,47 @@ request path, and prove a scripted burst returns `429` with `Retry-After` over H
 `evaluate_lockout` from the sign-in route so five failures actually lock an account. Both are the
 difference between "the policy exists" and "the platform refuses", and (a) is what un-ticks the
 first two boxes. Then take the browser pass the moment the slot frees.
+
+## omnion-w10 · REQ-086 slice 3 (the first half) — an expression preview, and a merge that was not a union
+
+**What.** `omnion_workflows::expression` evaluates `{{ }}` against caller-supplied sample data
+and nothing else; `POST /api/v1/workflows/{id}/graph/expressions/preview` exposes it; the canvas
+inspector shows a preview row per field and the sample on screen, editable. The route sits on
+`workflows.read` because it stores nothing, and the integration test proves that with a role that
+holds only the read key.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | 170 passed, 0 failed |
+| `cargo test -p omnion-api --lib` | 259 passed, 0 failed |
+| `cargo test -p omnion-api --test workflow_expressions` | 5 passed, 0 failed |
+| `node scripts/qa/graph-expressions.cjs` (live, w10 :18089) | 19 passed, 0 failed |
+| `pnpm typecheck` | clean |
+| `pnpm build` (admin) | green |
+
+**What the tests found.** Six of the evaluator's sixteen unit tests failed on their first run and
+every failure was real: literals and expressions were collected into two lists and concatenated
+("By :  itemsada2" for `By {{…}}: {{…}} items`), an array index resolved through `Value::get` — which
+answers a string key on an array with `None` — and so never resolved, and a lone expression ignored
+its own fallback. The integration test then found a fourth: only the `malformed` refusal carried
+the field it belonged to, so the two lookup refusals — the ones a person meets mid-typing — came
+back with nothing for the inspector to attach the message to.
+
+**Also this tick: the merge from `origin/main`.** Both sides appended to the end of
+`apps/admin/lib/api.ts`, and git's shared region holds the closing `});`/`}` of only *one* of the
+two half-open function bodies per hunk — so the file as git hands it over is unbalanced by
+construction and any hunk-level splice drops or invents a closer. The resolution that works is the
+union of the two whole blocks, each asserted self-contained. Verified: 271 exported functions, 0
+lost against the conflicted file, 0 duplicate declarations, braces balanced; every `## ` section
+from both parents present exactly once in this log, with 0 content lines short of the union.
+
+**The browser pass did not run again.** `runGraphCanvasDepth` is still unwalked for the same
+reason as last tick: a live w3 pass held the single QA slot for the whole window (its artifact
+directory was still being written at 12:31). The gesture acceptance boxes stay unticked. What this
+tick did instead is the thing the slot does not gate — `stack-only.sh` brings the private stack up
+without the slot, and a scripted round trip proved all nineteen claims above.
+
+**Next.** CodeMirror 6 for code nodes, then the expression autocomplete that completes upstream
+outputs — the two halves of slice 3 that make its acceptance box worth ticking.
