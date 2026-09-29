@@ -4267,15 +4267,32 @@ async function runMenusDepth(page, report) {
     steps.nestedParentRowFound =
       (await page.locator(`[data-menu-item="${secondId}"]`).count()) > 0;
     if (nestedChildId) {
-      const nestedId = nestedChildId;
-      await page.locator(`[data-menu-item-label="${nestedId}"]`).click({ timeout: 3000 }).catch(() => {});
-      await page.waitForTimeout(200);
-      await page
-        .locator(`button[aria-label^="Nest "]`)
+      // A third level has to be a CHILD of the second, and "Nest X under the row above" cannot
+      // do that: the row it would nest is already the parent of the selected row, so the click
+      // either refuses or is a no-op and the tree stays two deep. The editor's own affordance
+      // for going deeper is "Add a child under <row>", so the pass drives THAT — and then reads
+      // the depth back from the store rather than counting the rows it drew, because three
+      // visible labels is a two-level tree (a nested row renders inside its parent).
+      const nestedLabel = await page
+        .locator(`[data-menu-item="${nestedChildId}"] [data-menu-item-row] span:first-child`)
+        .first()
+        .innerText()
+        .catch(() => null);
+      steps.nestedRowLabel = nestedLabel;
+      const addChild = page.locator(
+        `button[aria-label="Add a child under ${nestedLabel}"]`,
+      );
+      steps.addChildButtonCount = await addChild.count().catch(() => 0);
+      steps.addChildClicked = await addChild
         .first()
         .click({ timeout: 3000 })
-        .catch(() => {});
-      await page.waitForTimeout(400);
+        .then(() => true)
+        .catch(() => false);
+      await page.waitForTimeout(500);
+      // Type the label, the same way the top-level rows were typed, or the new row is "Untitled
+      // item" and the depth probe's search for the third level finds nothing.
+      const thirdLabel = "QA third level";
+      steps.typedThirdLevel = await labelLastRow(thirdLabel);
     }
     await page.locator("[data-menu-save]").click({ timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(2000);
@@ -4325,6 +4342,7 @@ async function runMenusDepth(page, report) {
     for (const item of detail.items) {
       if (!deepest || depthOf(item, byId) > depthOf(deepest, byId)) deepest = item;
     }
+    const deepestDepth = deepest ? depthOf(deepest, byId) : 0;
     const items = detail.items.map((item) => ({
       id: item.id,
       parent_id: item.parent_id,
@@ -4364,10 +4382,17 @@ async function runMenusDepth(page, report) {
     return {
       status: response.status,
       body: await response.json().catch(() => ({})),
-      builtUnderDepth: deepest ? depthOf(deepest, byId) + 1 : 1,
+      builtUnderDepth: deepestDepth + 1,
+      parentDepth: deepestDepth,
     };
   }, menuId);
   steps.fourthLevelStatus = fourth.status;
+  // Only a probe that actually built a FOURTH level may judge the refusal. A tree that reached
+  // three has nothing to refuse, and reporting `false` beside a `200` for that is a store that
+  // looks broken for honouring the bound it documents. The tree's own deepest depth is recorded
+  // so this is never silently a skip.
+  steps.fourthLevelParentDepth = fourth.parentDepth;
+  steps.fourthLevelReached = fourth.parentDepth === 3;
   steps.fourthLevelRefused = fourth.status === 400;
   steps.fourthLevelCode = fourth.body?.error?.code ?? null;
   steps.fourthLevelBuiltUnder = fourth.builtUnderDepth;
@@ -5717,6 +5742,7 @@ async function main() {
       "editorReady", "threeTopLevel", "nestedUnderSecond", "nestedParentRowFound",
       "treeRendered", "treeHasChildren", "savedItems", "parentsAreStored", "depthLabel",
       "fourthLevelRefused", "fourthLevelStatus", "refusalLeftTheTreeAlone",
+      "fourthLevelReached", "fourthLevelParentDepth", "typedThirdLevel",
       // Add pages…
       "pickerOpened", "pickerOnlyOffersPublished", "pageItems", "labelComesFromTheTitle",
       // audience
