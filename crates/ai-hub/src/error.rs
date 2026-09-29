@@ -72,6 +72,31 @@ pub enum AiHubError {
     /// The message always carries the limit that was broken, so the panel can print it.
     #[error("invalid workspace file: {0}")]
     InvalidFile(String),
+    /// A skill definition or an attachment breaks one of the registry's rules (REQ-099 slice 3).
+    ///
+    /// Its own code, for the same reason `InvalidFile` has one: the refusal belongs under the
+    /// field that caused it on the Skills form or the Skills tab, and a client that maps it
+    /// onto `invalid_agent` prints "the agent is invalid" above a row that is about a skill.
+    /// The message names the offending key, because the spec's own acceptance criterion is
+    /// that a skill attaching an unknown tool fails "with the key named".
+    #[error("invalid skill: {0}")]
+    InvalidSkill(String),
+    /// No skill carries that key, for this organization.
+    ///
+    /// The "for this organization" half is the point: a built-in has no organization, and a
+    /// custom key in another tenant must be indistinguishable from a key nobody wrote.
+    #[error("no skill `{0}` in this registry")]
+    SkillNotFound(String),
+    /// The skill is a built-in and cannot be rewritten.
+    ///
+    /// Separate from `InvalidSkill` because the answer is not "your request was malformed" —
+    /// it is "this row is not yours to change", which is a different thing for a client to
+    /// render and for the panel to keep offering an Edit button for.
+    #[error("{0}")]
+    SkillReadOnly(String),
+    /// The skill key is taken, or the attachment already exists.
+    #[error("{0}")]
+    SkillConflict(String),
     /// The request needs a capability the model does not claim.
     ///
     /// The refusal happens before any call leaves the process, so a caller that asked for a
@@ -137,6 +162,10 @@ impl AiHubError {
             Self::InvalidAgent(_) => "invalid_agent",
             Self::InvalidRun(_) => "invalid_run",
             Self::InvalidFile(_) => "invalid_file",
+            Self::InvalidSkill(_) => "invalid_skill",
+            Self::SkillNotFound(_) => "skill_not_found",
+            Self::SkillReadOnly(_) => "skill_read_only",
+            Self::SkillConflict(_) => "skill_conflict",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",

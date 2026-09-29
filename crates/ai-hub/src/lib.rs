@@ -34,6 +34,7 @@ pub mod router;
 pub mod routing;
 pub mod routing_store;
 pub mod run_store;
+pub mod skills;
 pub mod store;
 pub mod tools;
 pub mod workspace;

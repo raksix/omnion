@@ -74,6 +74,7 @@ pub mod ai_agents;
 pub mod ai_agent_workspace;
 pub mod ai_decisions;
 pub mod ai_routing;
+pub mod ai_skills;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
@@ -785,6 +786,45 @@ pub fn router(state: AppState) -> Router {
         );
     let ai_agent_runs =
         post(ai_agents::start_run).layer(guards::require(&state, "ai.agents.run"));
+    // The skills registry (REQ-099, slice 3). Read and write are separate keys for the same
+    // reason agents have: writing a skill means writing text that lands in every prompt an
+    // attached agent sends, which is a different act from reading a list of them.
+    let ai_skills = get(ai_skills::list_skills_route)
+        .layer(guards::require(&state, "ai.skills.read"))
+        .merge(post(ai_skills::create_skill_route).layer(guards::require(&state, "ai.skills.manage")))
+        .merge(
+            post(ai_skills::validate_skill_route)
+                .layer(guards::require(&state, "ai.skills.manage")),
+        );
+    let ai_skill = get(ai_skills::get_skill_route)
+        .layer(guards::require(&state, "ai.skills.read"))
+        .merge(
+            axum::routing::patch(ai_skills::update_skill_route)
+                .layer(guards::require(&state, "ai.skills.manage")),
+        )
+        .merge(
+            axum::routing::delete(ai_skills::delete_skill_route)
+                .layer(guards::require(&state, "ai.skills.manage")),
+        )
+        .merge(
+            post(ai_skills::validate_skill_route)
+                .layer(guards::require(&state, "ai.skills.manage")),
+        );
+    // Attach/order/detach. Read is enough to *see* an agent's skills, but attaching is a
+    // change to what its next prompt contains, so it takes the manage key.
+    let ai_agent_skills = get(ai_skills::list_agent_skills_route)
+        .layer(guards::require(&state, "ai.skills.read"))
+        .merge(
+            post(ai_skills::attach_skill_route)
+                .layer(guards::require(&state, "ai.skills.manage")),
+        )
+        .merge(
+            axum::routing::put(ai_skills::set_agent_skills_route)
+                .layer(guards::require(&state, "ai.skills.manage")),
+        );
+    let ai_agent_skill =
+        axum::routing::delete(ai_skills::detach_skill_route)
+            .layer(guards::require(&state, "ai.skills.manage"));
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
@@ -1508,11 +1548,21 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/agents", ai_agents)
         .route("/ai/agents/{id}", ai_agent)
         .route("/ai/agents/{id}/runs", ai_agent_runs)
-        // The workspace file path is a wildcard, so `*path` rather than `{path}`: a workspace
+        // The workspace file path is a wildcard, so `{*path}` rather than `{path}`: a workspace
         // holds `data/2026/q3.csv` as readily as `notes.md`, and a single-segment capture would
         // answer 404 for every file in a subdirectory.
+        //
+        // The braces are load-bearing and the version is why. axum 0.8 removed the bare `*name`
+        // syntax outright: a segment that starts with `*` now panics **at router construction**,
+        // so the whole API refused to start rather than this one route 404ing. The panic names
+        // the fix, and the cost of the mistake is a stack of identical restarts in pm2 rather
+        // than a visible error.
         .route("/ai/agents/{id}/files", ai_agent_files)
-        .route("/ai/agents/{id}/files/*path", ai_agent_file)
+        .route("/ai/agents/{id}/files/{*path}", ai_agent_file)
+        .route("/ai/skills", ai_skills)
+        .route("/ai/skills/{key}", ai_skill)
+        .route("/ai/agents/{id}/skills", ai_agent_skills)
+        .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)
         .route("/ai/runs", ai_runs)
         .route("/ai/runs/{id}", ai_run)
         .route("/ai/runs/{id}/steps", ai_run_steps)

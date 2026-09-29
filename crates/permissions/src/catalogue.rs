@@ -161,6 +161,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Start, cancel and resume agent runs",
     },
+    // The skills registry (REQ-099, slice 3). The same read/write split as agents, and the
+    // reason is sharper here: a skill is *text that lands in a prompt*. Reading the registry
+    // shows an operator what guidance exists; writing one changes what every run of every
+    // attached agent is told. `ai.skills.manage` is therefore the key to review when an
+    // installation asks "who can change what the models are told".
+    PermissionDef {
+        key: "ai.skills.read",
+        category: "ai",
+        description: "Read the skills registry and agent attachments",
+    },
+    PermissionDef {
+        key: "ai.skills.manage",
+        category: "ai",
+        description: "Create, edit, enable and attach skills",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {

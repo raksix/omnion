@@ -1054,6 +1054,24 @@ impl From<AiHubError> for ApiError {
             // the reader cannot act on. It is deliberately not an `invalid_agent` — the shape
             // differs and a client that folds them together puts a path error above the name.
             AiHubError::InvalidFile(message) => Self::bad_request("invalid_file", message),
+            // Skills (REQ-099 slice 3). The three codes map to three different screens, which
+            // is why they are three and not one: `invalid_skill` is a field message under the
+            // skill form, `skill_not_found` is a 404 so a stale key in a URL is a stale bookmark
+            // rather than an error, and `skill_conflict` is a 409 the panel resolves by asking
+            // for another key. `skill_read_only` is a 403 — the row exists, it is just not the
+            // caller's to rewrite, and a 400 would tell them to fix a request that was fine.
+            AiHubError::InvalidSkill(message) => Self::bad_request("invalid_skill", message),
+            AiHubError::SkillNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "skill_not_found",
+                format!("no skill `{key}` in this registry"),
+            ),
+            AiHubError::SkillReadOnly(message) => {
+                Self::new(StatusCode::FORBIDDEN, "skill_read_only", message)
+            }
+            AiHubError::SkillConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "skill_conflict", message)
+            }
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code
