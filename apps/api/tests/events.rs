@@ -412,6 +412,37 @@ fn runner_config() -> RunnerConfig {
     }
 }
 
+/// Create and publish one page, which is how a walk puts a real `page.published` on the bus.
+///
+/// A helper rather than four lines repeated in every walk, because a walk that reaches for the
+/// endpoints by hand tends to publish as the platform owner, and the delivery then belongs to
+/// no organization — which makes a tenant-scoped assertion silently vacuous.
+async fn publish_page(
+    harness: &Harness,
+    token: &str,
+    site: Uuid,
+    slug: &str,
+) -> StatusCode {
+    let page = harness
+        .call(post(
+            "/api/v1/pages",
+            json!({ "site_id": site, "slug": slug, "title": slug }),
+            Some(token),
+        ))
+        .await;
+    assert_eq!(page.status, StatusCode::CREATED, "{:?}", page.body);
+    let page_id = page.body["id"].as_str().expect("page id").to_owned();
+
+    harness
+        .call(post(
+            &format!("/api/v1/pages/{page_id}/publish"),
+            json!({}),
+            Some(token),
+        ))
+        .await
+        .status
+}
+
 /// One delivery tick against the throwaway database.
 async fn tick(harness: &Harness) -> RunReport {
     let client = sender::client(StdDuration::from_secs(5)).expect("the delivery client must build");
@@ -815,18 +846,37 @@ async fn the_bus_records_events_and_delivers_signed_webhooks() {
         .call(get("/api/v1/events?limit=50", Some(&owner_token)))
         .await;
     let events = feed.body["events"].as_array().expect("events").clone();
-    assert_eq!(events.len(), 4, "{:?}", feed.body);
+    // The feed holds every recorded event, and since REQ-016 slice 2 that is the whole
+    // lifecycle, not just the publications: creating the endpoint, testing it, creating the
+    // page, editing it, publishing, and the delivery that gave up. Counting exact rows would
+    // make every new emission a breaking test, so this asserts the facts that matter instead —
+    // what is present, and that the ordering is newest first.
+    let names: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    for expected in [
+        "webhook.endpoint.created",
+        "webhook.test",
+        "webhook.endpoint.tested",
+        "page.created",
+        "page.updated",
+        "page.published",
+        "webhook.delivery.failed",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "the feed must carry {expected}; it has {names:?}"
+        );
+    }
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["name"] == json!("page.published"))
-            .count(),
+        names.iter().filter(|name| **name == "page.published").count(),
         3,
         "three publications were recorded: {:?}",
         feed.body
     );
-    assert_eq!(events[0]["name"], json!("page.published"), "newest first");
-    assert_eq!(events[3]["name"], json!("webhook.test"), "oldest last");
+    assert_eq!(events[0]["name"], json!("webhook.delivery.failed"), "newest first");
+    assert_eq!(names.last(), Some(&"webhook.endpoint.created"), "oldest last");
 
     let audit = harness
         .call(get("/api/v1/iam/audit", Some(&owner_token)))
@@ -1054,11 +1104,37 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
         deliveries_b.body
     );
 
-    // The event feed is tenant-scoped too.
+    // The event feed is tenant-scoped too — and the scoping is now worth stating precisely,
+    // because connecting an endpoint records an event *about that endpoint*. Tenant B's feed is
+    // no longer empty, and that is correct rather than a leak: the row is B's own, created by
+    // B's own operator, and it says nothing about tenant A. What must never appear in B's feed
+    // is anything of A's, which is the assertion that carries the isolation rule.
     let feed_b = harness.call(get("/api/v1/events", Some(&token_b))).await;
-    assert_eq!(feed_b.body["events"], json!([]));
+    let names_b: Vec<&str> = feed_b.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert_eq!(
+        names_b,
+        vec!["webhook.endpoint.created"],
+        "tenant B sees only its own endpoint, and nothing of tenant A: {:?}",
+        feed_b.body
+    );
     let feed_a = harness.call(get("/api/v1/events", Some(&token_a))).await;
-    assert_eq!(feed_a.body["events"].as_array().expect("events").len(), 1);
+    let names_a: Vec<&str> = feed_a.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert_eq!(
+        names_a,
+        vec!["page.published", "page.created", "webhook.endpoint.created"],
+        "tenant A sees its own endpoint and its own page, and nothing of tenant B: {:?}",
+        feed_a.body
+    );
 
     // An endpoint switched off while its queue waits: the queued delivery settles as failed
     // instead of sitting pending forever.
@@ -1172,6 +1248,257 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
 // ---------------------------------------------------------------------------------------------
 // The catalogue and group wildcards, over HTTP (REQ-016 slice 1)
 // ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// The feed's filters, keyset pagination and refusals, over HTTP (REQ-016 slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/// The event feed narrows to what the operator asked for, pages without repeating a row, and
+/// says so when the platform cannot serve the request.
+///
+/// This is the walk behind the `/events` screen (REQ-016, slice 1). The feed existed with a
+/// limit and an organization scope; what it did not have was the set of filters the screen
+/// offers, which means the screen's filter bar would have been a decoration — every control
+/// wired to nothing, which is the failure the build plan names as "no dead buttons".
+#[tokio::test]
+async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    // A platform account, used only as the `actor_user_id` on the seeded rows — a fact with
+    // an actor that happens inside one tenant while the reader is a member of another is
+    // exactly the row a broken actor filter would leak, so the two ids differ on purpose.
+    let (actor_id, _actor_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), actor_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "feed", "Feed Filter Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Feed Site").await;
+    let other_site = create_site_row(&harness.db, organization, "second", "Second Site").await;
+
+    // Five facts to narrow: three page events on one site, one on another, and one that
+    // belongs to a different organization entirely. The last one is the row a tenancy filter
+    // that quietly stopped working would leak, so it is seeded deliberately.
+    let other_organization =
+        create_organization_row(&harness.db, "other", "Someone Else").await;
+    for (name, site_id, owner) in [
+        ("page.created", site, organization),
+        ("page.updated", site, organization),
+        ("page.deleted", site, organization),
+        ("page.created", other_site, organization),
+        ("user.updated", site, other_organization),
+    ] {
+        sqlx::query("insert into events (name, organization_id, site_id, actor_user_id, payload) \
+                     values ($1, $2, $3, $4, '{}'::jsonb)")
+            .bind(name)
+            .bind(owner)
+            .bind(site_id)
+            .bind(actor_id)
+            .execute(harness.db.pool())
+            .await
+            .expect("the seeded event must be inserted");
+    }
+
+    // ---- Scoping: an organization account sees its own and nothing else -------------------------
+    // The reader is an *organization* account, not the platform owner. That distinction is the
+    // whole point of the assertion and it is worth spelling out, because the owner's session
+    // carries `organization_id = None` and the store's `($1::uuid is null or …)` clause reads
+    // "no organization" as *every* organization. A tenancy test written against the owner
+    // would therefore pass for the wrong reason — it would be asserting that the platform
+    // superuser sees everything, which is correct and is not what a tenant may see.
+    let (reader_id, reader_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        reader_id,
+        organization,
+        &["events.read", "content.pages.read"],
+    )
+    .await;
+
+    let feed = harness
+        .call(get("/api/v1/events?limit=50", Some(&reader_token)))
+        .await;
+    assert_eq!(feed.status, StatusCode::OK, "{:?}", feed.body);
+    let names: Vec<String> = feed.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        names.len(),
+        4,
+        "the reader's own organization and nothing else: {names:?}"
+    );
+    assert!(
+        !names.contains(&"user.updated".to_owned()),
+        "another organization's event never reaches this feed: {names:?}"
+    );
+
+    // ---- A name list ----------------------------------------------------------------------------
+    // Repeated `?name=` means "any of these", which is the only reading a multi-select can
+    // have. Reading one of the two would make the second click look like it did nothing.
+    let filtered = harness
+        .call(get(
+            "/api/v1/events?name=page.created&name=page.deleted&limit=50",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(filtered.status, StatusCode::OK, "{:?}", filtered.body);
+    let filtered_names: Vec<String> = filtered.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        filtered_names.len(),
+        3,
+        "two page.created rows and one page.deleted: {filtered_names:?}"
+    );
+    assert!(
+        filtered_names.iter().all(|name| name != "page.updated"),
+        "a name that was not asked for is not returned: {filtered_names:?}"
+    );
+
+    // ---- A site ---------------------------------------------------------------------------------
+    let by_site = harness
+        .call(get(
+            &format!("/api/v1/events?site_id={site}&limit=50"),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(by_site.status, StatusCode::OK, "{:?}", by_site.body);
+    assert_eq!(
+        by_site.body["events"]
+            .as_array()
+            .expect("events")
+            .as_slice()
+            .len(),
+        3,
+        "the site's three facts and not the other site's one"
+    );
+
+    // ---- A window -------------------------------------------------------------------------------
+    // A window in the future is empty, and it is empty *because it says so* rather than because
+    // the filter was dropped — a silently ignored filter is indistinguishable from a bus that
+    // stopped recording.
+    let windowed = harness
+        .call(get(
+            "/api/v1/events?from=2999-01-01T00:00:00Z&limit=50",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(windowed.status, StatusCode::OK, "{:?}", windowed.body);
+    assert!(
+        windowed.body["events"].as_array().expect("events").is_empty(),
+        "a future window is honoured, not ignored: {:?}",
+        windowed.body
+    );
+    assert_eq!(
+        windowed.body["has_more"],
+        json!(false),
+        "and an empty page says there is no further page"
+    );
+
+    // ---- A malformed request is refused by name ---------------------------------------------------
+    let bad_window = harness
+        .call(get("/api/v1/events?from=yesterday", Some(&reader_token)))
+        .await;
+    assert_eq!(
+        bad_window.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        bad_window.body
+    );
+    assert_eq!(bad_window.body["error"]["code"], json!("invalid_event_window"));
+    assert!(
+        bad_window.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("from"),
+        "the refusal names the parameter the operator mistyped: {:?}",
+        bad_window.body
+    );
+
+    // A name that cannot exist is refused too, and so is every repetition of it — a filter
+    // that validated only the first `?name=` would quietly return the unfiltered feed. The
+    // value is percent-encoded, which makes the assertion two things at once: the name is
+    // refused *and* the parser decoded it on the way (an undecoded `%20` would pass the
+    // validator's character check and reach the store as a name nothing has ever emitted).
+    let bad_name = harness
+        .call(get(
+            "/api/v1/events?name=page.created&name=NOT%20A%20NAME",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(bad_name.status, StatusCode::BAD_REQUEST, "{:?}", bad_name.body);
+
+    // ---- Keyset pagination -----------------------------------------------------------------------
+    let first = harness
+        .call(get("/api/v1/events?limit=2", Some(&reader_token)))
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    let first_ids: Vec<i64> = first.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["id"].as_i64().expect("an id"))
+        .collect();
+    assert_eq!(first_ids.len(), 2, "the page is the page size");
+    assert_eq!(
+        first.body["has_more"],
+        json!(true),
+        "three rows are left behind a two-row page"
+    );
+
+    let cursor = first.body["next_cursor"].as_i64().expect("a cursor");
+    assert_eq!(
+        cursor,
+        *first_ids.last().expect("a last row"),
+        "the cursor is the last row of the page, so the next page cannot repeat it"
+    );
+
+    let second = harness
+        .call(get(
+            &format!("/api/v1/events?limit=2&cursor={cursor}"),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+    let second_ids: Vec<i64> = second.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["id"].as_i64().expect("an id"))
+        .collect();
+    assert_eq!(second_ids.len(), 2);
+    assert_eq!(
+        second.body["has_more"],
+        json!(false),
+        "the last page says so, so the panel can stop offering 'Load older'"
+    );
+    assert_eq!(
+        second.body["next_cursor"],
+        json!(null),
+        "and carries no cursor to follow"
+    );
+
+    let overlap: Vec<&i64> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    assert!(
+        overlap.is_empty(),
+        "no row is served twice across the page boundary: {first_ids:?} then {second_ids:?}"
+    );
+    assert!(
+        first_ids[0] > first_ids[1] && first_ids[1] > second_ids[0],
+        "the feed is newest-first across the boundary, not per page: \
+         {first_ids:?} then {second_ids:?}"
+    );
+
+    harness.dispose().await;
+}
 
 /// The catalogue is readable, complete, and a group subscription really does expand.
 ///
@@ -1365,15 +1692,25 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         .await;
     assert_eq!(published.status, StatusCode::OK, "{:?}", published.body);
 
+    // A `page.*` subscription is no longer publish-only: the group now carries the whole page
+    // lifecycle, so the page that was just created is delivered alongside its publication. That
+    // is the point of the group — one subscription, every page fact — and the count is 2
+    // because the walk creates the page before publishing it.
     let report = tick(&harness).await;
     assert_eq!(
-        report.delivered, 1,
-        "a page.* subscription delivers a page.published: {report:?}"
+        report.delivered, 2,
+        "a page.* subscription delivers page.created and page.published: {report:?}"
     );
 
     let captured = receiver.captured();
-    assert_eq!(captured.len(), 1, "the receiver took the delivery");
-    let delivered = &captured[0];
+    assert_eq!(captured.len(), 2, "the receiver took both deliveries");
+    let delivered_names: Vec<&str> = captured.iter().map(|hit| hit.event.as_str()).collect();
+    assert_eq!(
+        delivered_names,
+        vec!["page.created", "page.published"],
+        "the group delivers its members oldest first: {delivered_names:?}"
+    );
+    let delivered = &captured[1];
     assert_eq!(delivered.event, "page.published");
 
     // A name the receiver never named still arrives signed and verifiable.
@@ -1414,6 +1751,936 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         future.body["events"],
         json!(["payments.*"]),
         "and it is stored exactly as written, becoming real when the names arrive"
+    );
+
+    harness.dispose().await;
+}
+
+/// The delivery operations: a redelivery that works, the three refusals that stop it, a
+/// rotation that invalidates the old signature, and a stats read that tells the truth.
+///
+/// This is the walk behind the `/webhooks/[id]` screen (REQ-016, slice 2). Everything it
+/// asserts is a claim the panel will make on screen, and each one is a place where the
+/// obvious implementation lies:
+///
+/// * A redelivery that *inserted* a second row would send the same fact twice, and the
+///   receiver could not tell a replay from a duplicate. So the row is reset, and the walk
+///   asserts the count of rows for one event never rises.
+/// * A success rate that counted `pending` rows in its denominator would read 0% for an
+///   endpoint whose every delivery was about to succeed.
+/// * A rotation that did not invalidate the previous secret would leave a receiver
+///   verifying against a value the platform no longer uses, and the walk proves the old
+///   signature now fails.
+#[tokio::test]
+async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, _owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "ops", "Delivery Ops Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Delivery Ops Site").await;
+
+    let (editor, editor_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        editor,
+        organization,
+        &[
+            "webhooks.read",
+            "webhooks.manage",
+            "events.read",
+            "content.pages.read",
+            "content.pages.create",
+            "content.pages.publish",
+        ],
+    )
+    .await;
+
+    // A reader with the read key but no manage key: the panel's "Redeliver" button must be
+    // absent for them, and if it were not, the API must refuse it rather than trusting the
+    // UI. An audit role that can read an endpoint's history must not be able to make the
+    // platform POST to a third party.
+    let (reader, reader_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        reader,
+        organization,
+        &["webhooks.read", "events.read"],
+    )
+    .await;
+
+    let endpoint = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Ops receiver",
+                "url": receiver.url,
+                "events": ["page.published"],
+            }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(endpoint.status, StatusCode::CREATED, "{:?}", endpoint.body);
+    let endpoint_id = endpoint.body["id"].as_str().expect("id").to_owned();
+
+    // ---- 1. A test delivery, delivered, with a duration and a trigger ------------------------
+    let tested = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/test"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(
+        tested.status,
+        StatusCode::ACCEPTED,
+        "a test delivery is queued, not sent inline: {:?}",
+        tested.body
+    );
+    assert_eq!(tested.body["deliveries"], json!(1));
+
+    tick(&harness).await;
+    assert!(
+        receiver.captured().len() >= 1,
+        "the receiver got the test delivery"
+    );
+
+    let history = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(history.status, StatusCode::OK, "{:?}", history.body);
+    let rows = history.body["deliveries"].as_array().expect("deliveries");
+    let first = &rows[0];
+
+    // The four columns migration 0052 added are all present and are numbers, not nulls. A
+    // screen that renders `undefined` in a latency column has no way to say "not yet run",
+    // and an operator reads that as zero.
+    assert_eq!(first["status"], "delivered");
+    assert_eq!(first["trigger"], "test", "a button press is a test, not traffic");
+    assert_eq!(first["redeliver_count"], json!(0));
+    assert!(
+        first["duration_ms"].is_number(),
+        "a delivered row carries a measured duration, got {:?}",
+        first["duration_ms"]
+    );
+    assert!(
+        first["replayed_at"].is_null(),
+        "a row nobody forced again has no replay time"
+    );
+
+    // ---- 2. The stats read, and what it refuses to claim ----------------------------------------
+    let stats = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/stats"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(stats.status, StatusCode::OK, "{:?}", stats.body);
+    // The test delivery is in the history but not in the rate: the operator pressed a button,
+    // the platform delivered nothing, and a rate the operator can raise by pressing a button
+    // is not a measurement of the receiver.
+    assert_eq!(stats.body["total"], json!(1), "the row is in the history");
+    assert_eq!(stats.body["tests"], json!(1), "and it is reported as a test");
+    assert_eq!(
+        stats.body["delivered"],
+        json!(0),
+        "but it is not counted as delivered traffic"
+    );
+    assert_eq!(stats.body["failed"], json!(0));
+    assert_eq!(stats.body["window_hours"], json!(24), "the default is a day");
+    assert_eq!(
+        stats.body["success_rate"],
+        json!(null),
+        "a test row settles, so nothing *traffic* settled: no rate rather than a flattering one"
+    );
+
+    // A real publication makes the rate meaningful, and it must be 1.0 with the test row
+    // still excluded — one test delivery and one real delivery would read 100% either way, so
+    // the control is the delivered count, not the rate.
+    publish_page(&harness, &editor_token, site, "traffic").await;
+    tick(&harness).await;
+    let with_traffic = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/stats"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(with_traffic.body["delivered"], json!(1), "the publication arrived");
+    assert_eq!(with_traffic.body["tests"], json!(1), "and the test is still counted apart");
+    assert_eq!(with_traffic.body["total"], json!(2));
+    assert_eq!(with_traffic.body["success_rate"], json!(1.0));
+    assert!(
+        with_traffic.body["p95_duration_ms"].is_number(),
+        "a delivered row has a percentile: {:?}",
+        with_traffic.body["p95_duration_ms"]
+    );
+
+    // An endpoint with no history at all has no rate, no percentile and no rows. `0.0` and `0`
+    // would both read as measurements of something that was never measured.
+    let empty_endpoint = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({ "name": "Quiet", "url": receiver.url, "events": ["page.published"] }),
+            Some(&editor_token),
+        ))
+        .await;
+    let quiet_id = empty_endpoint.body["id"].as_str().expect("id").to_owned();
+    let quiet = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{quiet_id}/stats"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(
+        quiet.body["success_rate"],
+        json!(null),
+        "nothing settled means no rate, not zero"
+    );
+    assert_eq!(quiet.body["p95_duration_ms"], json!(null));
+    assert_eq!(quiet.body["total"], json!(0));
+
+    // ---- 3. A redelivery that genuinely re-sends, without adding a row ------------------------
+    let delivery_id = first["id"].as_str().expect("id").to_owned();
+    let before = receiver.captured().len();
+
+    let forced = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/{delivery_id}/redeliver"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(forced.status, StatusCode::OK, "{:?}", forced.body);
+    assert_eq!(forced.body["status"], "pending");
+    assert_eq!(
+        forced.body["redeliver_count"],
+        json!(1),
+        "the count comes from the update that just ran, not a second read"
+    );
+
+    // The row was reset, not replaced: the history for this event is still one row, and it
+    // now reads as a replay.
+    let after = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
+            Some(&editor_token),
+        ))
+        .await;
+    let replayed = after.body["deliveries"]
+        .as_array()
+        .expect("deliveries")
+        .iter()
+        .find(|row| row["id"] == json!(delivery_id))
+        .expect("the forced row is still there")
+        .clone();
+    assert_eq!(
+        replayed["trigger"],
+        "replay",
+        "a forced row is a replay, which is why the trigger column exists"
+    );
+    assert_eq!(
+        replayed["redeliver_count"],
+        json!(1),
+        "and the row still exists exactly once: {}",
+        after.body["deliveries"].as_array().expect("d").len()
+    );
+    assert_eq!(replayed["attempts"], json!(0), "a new round starts from zero");
+
+    tick(&harness).await;
+    assert!(
+        receiver.captured().len() > before,
+        "the receiver got the delivery a second time"
+    );
+
+    // ---- 4. The three refusals, each with its own code ------------------------------------------
+    // (a) A reader without `webhooks.manage` is refused before the row is even looked at.
+    let denied = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/{delivery_id}/redeliver"),
+            json!({}),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "reading a history is not the power to make the platform POST"
+    );
+
+    // (b) A row the runner is about to claim is refused. The tick above settled the forced
+    // row, so this call has to *make* the pending case rather than hope for it: force it again
+    // and do not run the runner in between. The runner holds (or is about to hold) that row's
+    // lease, and a reset would hand it to the next claim while the attempt is still in flight —
+    // the one place this operation could double-send.
+    let forced_again = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/{delivery_id}/redeliver"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(
+        forced_again.status,
+        StatusCode::OK,
+        "a settled row is forced again: {:?}",
+        forced_again.body
+    );
+    assert_eq!(forced_again.body["redeliver_count"], json!(2));
+
+    let pending = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/{delivery_id}/redeliver"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(
+        pending.status,
+        StatusCode::CONFLICT,
+        "a queued row is a conflict, not a bad request: {:?}",
+        pending.body
+    );
+    assert_eq!(
+        pending.body["error"]["code"],
+        "delivery_already_pending",
+        "the three refusals must not share one code — the operator's next step differs"
+    );
+
+    // (c) An id that is not on this endpoint. A `404` would be wrong: the endpoint exists and
+    // the caller may manage it, so the answer is about the delivery, not about the endpoint.
+    let unknown = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/{}/redeliver", Uuid::new_v4()),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(unknown.status, StatusCode::CONFLICT);
+    assert_eq!(unknown.body["error"]["code"], "delivery_not_found");
+
+    // The refusal left the row alone: it is still `pending` and still at the count the earlier
+    // call wrote, because a refusal must not have the side effect it refused.
+    let unchanged = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
+            Some(&editor_token),
+        ))
+        .await;
+    let still = unchanged.body["deliveries"]
+        .as_array()
+        .expect("deliveries")
+        .iter()
+        .find(|row| row["id"] == json!(delivery_id))
+        .expect("the row is still there");
+    assert_eq!(still["status"], "pending");
+    assert_eq!(
+        still["redeliver_count"],
+        json!(2),
+        "a refusal must not have the side effect it refused"
+    );
+
+    tick(&harness).await;
+
+    // ---- 5. The bulk redelivery answers per id -------------------------------------------------
+    // The tick first, so the row above is settled and the batch really moves one id. A batch
+    // whose only member is pending would report `queued: 0` and prove nothing about the part
+    // that is supposed to work.
+    tick(&harness).await;
+    let good = delivery_id.clone();
+    let bulk = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/redeliver"),
+            json!({ "delivery_ids": [good, Uuid::new_v4()] }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(bulk.status, StatusCode::OK, "{:?}", bulk.body);
+    assert_eq!(
+        bulk.body["queued"],
+        json!(1),
+        "one id moved and the other did not: {:?}",
+        bulk.body
+    );
+    let skipped = bulk.body["skipped"].as_array().expect("skipped");
+    assert_eq!(skipped.len(), 1, "and the one that did not is named");
+    assert_eq!(skipped[0]["code"], "delivery_not_found");
+
+    // An empty batch and an oversized one are both refused by name, because "nothing happened"
+    // is the worst possible answer to a button press.
+    let empty = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/redeliver"),
+            json!({ "delivery_ids": [] }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(empty.body["error"]["code"], "empty_redelivery_batch");
+
+    tick(&harness).await;
+
+    harness.dispose().await;
+}
+
+/// A rotation replaces the secret, shows it once, and the old signature stops verifying.
+#[tokio::test]
+async fn rotating_a_secret_shows_it_once_and_breaks_the_old_signature() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "rot", "Rotation Test").await;
+
+    let (editor, editor_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        editor,
+        organization,
+        &["webhooks.read", "webhooks.manage", "events.read"],
+    )
+    .await;
+
+    // The endpoint is created with a *provided* secret, so this walk can compare the two
+    // signatures directly: it holds the first secret and then the second, and checks the
+    // delivery verifies against the new one and not the old.
+    let first_secret = "the-first-signing-secret-value";
+    let created = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Rotating receiver",
+                "url": receiver.url,
+                "events": ["page.published"],
+                "secret": first_secret,
+            }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    assert!(
+        created.body.get("secret").is_none(),
+        "a secret the operator supplied is never echoed back: {:?}",
+        created.body
+    );
+    let endpoint_id = created.body["id"].as_str().expect("id").to_owned();
+
+    // Deliver once, signed with the first secret.
+    let _ = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/test"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    tick(&harness).await;
+    let before_rotation = receiver.captured();
+    let delivered_before = before_rotation.last().expect("a delivery");
+    assert!(
+        signature::verify(
+            first_secret,
+            delivered_before.timestamp,
+            &delivered_before.body,
+            &delivered_before.signature
+        ),
+        "the first delivery verifies against the secret the operator supplied"
+    );
+
+    // ---- Rotate -------------------------------------------------------------------------------
+    let rotated = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/secret/rotate"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(rotated.status, StatusCode::OK, "{:?}", rotated.body);
+    let new_secret = rotated.body["secret"].as_str().expect("a new secret");
+    assert_ne!(new_secret, first_secret, "the platform issues a different value");
+    assert!(
+        !new_secret.contains(first_secret),
+        "the new secret is generated, not derived from the old one"
+    );
+
+    // The endpoint's own fields are still readable, and the endpoint itself is unchanged apart
+    // from the secret — a rotation is not an edit.
+    assert_eq!(rotated.body["id"], json!(endpoint_id));
+    assert_eq!(rotated.body["name"], "Rotating receiver");
+    assert_eq!(rotated.body["enabled"], json!(true));
+
+    // The secret is shown exactly once: a plain `GET` never carries it.
+    let reread = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(reread.status, StatusCode::OK);
+    assert!(
+        reread.body.get("secret").is_none(),
+        "the secret does not come back out: {:?}",
+        reread.body
+    );
+    let listed = harness
+        .call(get("/api/v1/webhooks", Some(&editor_token)))
+        .await;
+    assert!(
+        listed.body["webhooks"]
+            .as_array()
+            .expect("webhooks")
+            .iter()
+            .all(|row| row.get("secret").is_none()),
+        "nor does the list carry one"
+    );
+
+    // The rotation is on the bus, and its payload carries no secret material.
+    let feed = harness
+        .call(get(
+            "/api/v1/events?name=webhook.secret.rotated",
+            Some(&owner_token),
+        ))
+        .await;
+    let rotated_event = feed.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["payload"]["endpoint_id"] == json!(endpoint_id))
+        .expect("the rotation is recorded")
+        .clone();
+    let payload_text = rotated_event["payload"].to_string();
+    assert!(
+        !payload_text.contains(new_secret) && !payload_text.contains(first_secret),
+        "an event that announces a rotation must not carry the value it announces: {payload_text}"
+    );
+
+    // ---- The old signature now fails -----------------------------------------------------------
+    let _ = harness
+        .call(post(
+            &format!("/api/v1/webhooks/{endpoint_id}/test"),
+            json!({}),
+            Some(&editor_token),
+        ))
+        .await;
+    tick(&harness).await;
+    let after_rotation = receiver.captured();
+    let delivered_after = after_rotation.last().expect("a delivery");
+    assert!(
+        signature::verify(
+            new_secret,
+            delivered_after.timestamp,
+            &delivered_after.body,
+            &delivered_after.signature
+        ),
+        "the new delivery verifies against the new secret"
+    );
+    assert!(
+        !signature::verify(
+            first_secret,
+            delivered_after.timestamp,
+            &delivered_after.body,
+            &delivered_after.signature
+        ),
+        "and does NOT verify against the old one — that is what a rotation is for"
+    );
+
+    harness.dispose().await;
+}
+
+/// The delivery history narrows, pages without repeating a row, and refuses a bad filter by name.
+#[tokio::test]
+async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, _owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "hist", "History Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "History Site").await;
+
+    let (editor, editor_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        editor,
+        organization,
+        &[
+            "webhooks.read",
+            "webhooks.manage",
+            "events.read",
+            "content.pages.read",
+            "content.pages.create",
+            "content.pages.publish",
+        ],
+    )
+    .await;
+
+    let endpoint = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "History receiver",
+                "url": receiver.url,
+                "events": ["page.published", "page.created"],
+            }),
+            Some(&editor_token),
+        ))
+        .await;
+    let endpoint_id = endpoint.body["id"].as_str().expect("id").to_owned();
+
+    // Six test deliveries plus one real publication, so the history has enough rows to page
+    // through and carries both triggers for the filters to be tested against.
+    for _ in 0..6 {
+        let _ = harness
+            .call(post(
+                &format!("/api/v1/webhooks/{endpoint_id}/test"),
+                json!({}),
+                Some(&editor_token),
+            ))
+            .await;
+    }
+    publish_page(&harness, &editor_token, site, "named").await;
+    tick(&harness).await;
+
+    let base = format!("/api/v1/webhooks/{endpoint_id}/deliveries");
+
+    // ---- The filters are conjunctions, and the header total agrees with them -------------------
+    // Six probes plus two traffic rows: publishing a page records `page.created` *and*
+    // `page.published`, and this endpoint subscribes to both. Writing "seven" here was the
+    // walk being wrong about the platform rather than the platform being wrong about itself.
+    let all = harness.call(get(&base, Some(&editor_token))).await;
+    assert_eq!(all.body["total"], json!(8), "six probes and two page events");
+    assert_eq!(all.body["has_more"], json!(false));
+
+    let delivered = harness
+        .call(get(&format!("{base}?status=delivered"), Some(&editor_token)))
+        .await;
+    assert_eq!(delivered.body["total"], json!(8), "all eight were accepted");
+
+    // Several statuses mean "any of these", which is the question an operator chasing a
+    // broken receiver actually asks.
+    let broken = harness
+        .call(get(&format!("{base}?status=failed&status=pending"), Some(&editor_token)))
+        .await;
+    assert_eq!(broken.status, StatusCode::OK);
+    assert_eq!(broken.body["total"], json!(0), "nothing failed and nothing waits");
+
+    // One `?status=` must not be a plain-text 400: the parser is by hand for the same reason
+    // the feed's is, and this is the assertion that keeps it that way.
+    assert_eq!(broken.status, StatusCode::OK, "{:?}", broken.body);
+
+    // The name filter narrows to the events the endpoint subscribed to. The six probes above
+    // are `webhook.test`, and a filter that returned them for `name=page.published` would be
+    // filtering on nothing.
+    let by_name = harness
+        .call(get(&format!("{base}?name=page.published"), Some(&editor_token)))
+        .await;
+    assert_eq!(
+        by_name.body["total"],
+        json!(1),
+        "only the publication matches, not its creation: {:?}",
+        by_name.body
+    );
+    assert_eq!(by_name.body["deliveries"][0]["event_name"], "page.published");
+    assert_eq!(
+        by_name.body["deliveries"][0]["trigger"],
+        "event",
+        "and it is traffic, not a probe"
+    );
+
+    let by_tests = harness
+        .call(get(&format!("{base}?name=webhook.test"), Some(&editor_token)))
+        .await;
+    assert_eq!(by_tests.body["total"], json!(6), "the probes are still there");
+
+    // The free-text search reaches the event name as well as the id.
+    let by_text = harness
+        .call(get(&format!("{base}?q=webhook.test"), Some(&editor_token)))
+        .await;
+    assert_eq!(by_text.body["total"], json!(6), "q searches the event name");
+    let by_published_text = harness
+        .call(get(&format!("{base}?q=published"), Some(&editor_token)))
+        .await;
+    assert_eq!(
+        by_published_text.body["total"],
+        json!(1),
+        "and a substring of the name matches too, not just the whole one"
+    );
+    // `page.created` is subscribed to as well, so a filter that ignored the name entirely
+    // would answer 2 here. One is the answer that proves the filter ran.
+    let by_created_text = harness
+        .call(get(&format!("{base}?q=page.created"), Some(&editor_token)))
+        .await;
+    assert_eq!(by_created_text.body["total"], json!(1));
+
+    // ---- The bad parameters are named, not swallowed ------------------------------------------
+    let bad_status = harness
+        .call(get(&format!("{base}?status=flaky"), Some(&editor_token)))
+        .await;
+    assert_eq!(bad_status.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_status.body["error"]["code"], "invalid_delivery_query");
+    assert!(
+        bad_status.body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("status"),
+        "the refusal names the parameter: {:?}",
+        bad_status.body
+    );
+
+    let bad_limit = harness
+        .call(get(&format!("{base}?limit=lots"), Some(&editor_token)))
+        .await;
+    assert_eq!(bad_limit.status, StatusCode::BAD_REQUEST);
+    assert!(bad_limit.body["error"]["message"].as_str().unwrap_or_default().contains("limit"));
+
+    // A cursor needs both halves: `cursor_at` without `cursor_id` would be a row comparison
+    // against a null id, which Postgres refuses — a 500 on a request the panel builds itself.
+    let half_cursor = harness
+        .call(get(&format!("{base}?cursor_at=2026-01-01T00:00:00Z"), Some(&editor_token)))
+        .await;
+    assert_eq!(half_cursor.status, StatusCode::BAD_REQUEST);
+    assert!(
+        half_cursor.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cursor_id"),
+        "the refusal says what is missing: {:?}",
+        half_cursor.body
+    );
+
+    let bad_instant = harness
+        .call(get(&format!("{base}?from=yesterday"), Some(&editor_token)))
+        .await;
+    assert_eq!(bad_instant.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_instant.body["error"]["code"], "invalid_event_window");
+
+    // ---- The keyset page does not repeat a row ------------------------------------------------
+    let first = harness
+        .call(get(&format!("{base}?limit=4"), Some(&editor_token)))
+        .await;
+    assert_eq!(first.body["deliveries"].as_array().expect("d").len(), 4);
+    assert_eq!(first.body["total"], json!(8), "the header still knows the whole set");
+    assert_eq!(first.body["has_more"], json!(true));
+    let cursor = first.body["next_cursor"].as_object().expect("a cursor");
+    let cursor_at = cursor["at"].as_str().expect("at").to_owned();
+    let cursor_id = cursor["id"].as_str().expect("id").to_owned();
+
+    let second = harness
+        .call(
+            get(
+                &format!("{base}?limit=4&cursor_at={cursor_at}&cursor_id={cursor_id}"),
+                Some(&editor_token),
+            ),
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+    let second_rows = second.body["deliveries"].as_array().expect("d");
+    assert_eq!(second_rows.len(), 4, "the rest of the set is on the second page");
+    assert_eq!(second.body["has_more"], json!(false));
+
+    let first_ids: Vec<String> = first.body["deliveries"]
+        .as_array()
+        .expect("d")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id").to_owned())
+        .collect();
+    let second_ids: Vec<String> = second_rows
+        .iter()
+        .map(|row| row["id"].as_str().expect("id").to_owned())
+        .collect();
+    let overlap: Vec<&String> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    assert!(
+        overlap.is_empty(),
+        "the (created_at, id) cursor repeats no row: {first_ids:?} then {second_ids:?}"
+    );
+
+    harness.dispose().await;
+}
+
+/// An endpoint switched off stops receiving **and keeps its past**.
+///
+/// The obvious reading of "disable" is a switch that turns the whole screen off: a disabled
+/// endpoint whose history is unreadable is a switch that deletes the answer to "what was this
+/// receiver doing last Tuesday, and what did it cost me?". An operator who is pausing a
+/// misbehaving integration needs the delivery log of the behaviour they are pausing *because*
+/// of it — the log is the evidence, and hiding it removes the only reason to trust the switch.
+///
+/// So the two halves are asserted separately, and the second half is the one that would have
+/// been quietly dropped: `enqueue_fanout` filters on `w.enabled`, so the new delivery is
+/// refused by the bus, and the history read touches neither the flag nor the row.
+#[tokio::test]
+async fn a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, _owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "mute", "Mute Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Mute Site").await;
+
+    let (editor, editor_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        editor,
+        organization,
+        &[
+            "webhooks.read",
+            "webhooks.manage",
+            "events.read",
+            "content.pages.read",
+            "content.pages.create",
+            "content.pages.publish",
+        ],
+    )
+    .await;
+
+    let created = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Mute receiver",
+                "url": receiver.url,
+                "events": ["page.published"],
+            }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let endpoint_id = created.body["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        created.body["enabled"], json!(true),
+        "a new endpoint is on until somebody says otherwise"
+    );
+
+    // ---- 1. While enabled, a published page reaches the receiver -------------------------------
+    assert_eq!(
+        publish_page(&harness, &editor_token, site, "before-mute").await,
+        StatusCode::OK,
+        "the first page publishes"
+    );
+    tick(&harness).await;
+    let heard_before = receiver.captured().len();
+    assert!(heard_before >= 1, "an enabled endpoint hears the bus");
+
+    // ---- 2. Switched off, the same page is not delivered -----------------------------------------
+    let muted = harness
+        .call(patch(
+            &format!("/api/v1/webhooks/{endpoint_id}"),
+            json!({ "enabled": false }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(muted.status, StatusCode::OK, "{:?}", muted.body);
+    assert_eq!(muted.body["enabled"], json!(false));
+
+    assert_eq!(
+        publish_page(&harness, &editor_token, site, "after-mute").await,
+        StatusCode::OK,
+        "the second page publishes too — the bus does not care who is listening"
+    );
+
+    // The delivery is not merely *not sent*: it is never **queued**. An implementation that
+    // queued it and skipped the send would show the operator a growing list of `pending` rows
+    // for an endpoint they switched off, and the queue would drain or not depending on a
+    // worker that has no reason to look at a disabled endpoint.
+    let queued: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where d.endpoint_id = $1 \
+           and e.payload ->> 'slug' = 'after-mute'",
+    )
+    .bind(Uuid::parse_str(&endpoint_id).expect("uuid"))
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the delivery count must be readable");
+    assert_eq!(
+        queued, 0,
+        "a disabled endpoint is skipped by the fan-out, not queued and dropped"
+    );
+
+    tick(&harness).await;
+    assert_eq!(
+        receiver.captured().len(),
+        heard_before,
+        "nothing new arrived at the receiver while the endpoint was off"
+    );
+
+    // ---- 3. The past is still readable, in full ------------------------------------------------
+    let history = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(history.status, StatusCode::OK, "{:?}", history.body);
+    let rows = history.body["deliveries"].as_array().expect("deliveries");
+    assert!(
+        !rows.is_empty(),
+        "the deliveries made before the switch are still on the screen — that history is why \
+         an operator pauses an integration instead of deleting it"
+    );
+    assert!(
+        rows.iter().all(|row| row["status"] == "delivered"),
+        "and they are intact, not reset: {:?}",
+        rows.iter().map(|row| &row["status"]).collect::<Vec<_>>()
+    );
+
+    // The endpoint row itself reads back with the flag off — the list screen's status dot has
+    // something to draw.
+    let listed = harness
+        .call(get("/api/v1/webhooks", Some(&editor_token)))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.body);
+    let mine = listed.body["webhooks"]
+        .as_array()
+        .expect("webhooks")
+        .iter()
+        .find(|row| row["id"] == endpoint_id.as_str())
+        .expect("the endpoint is still listed");
+    assert_eq!(mine["enabled"], json!(false), "the status dot has something to draw");
+
+    // ---- 4. Switching back on resumes the stream, without a re-subscribe -------------------------
+    let resumed = harness
+        .call(patch(
+            &format!("/api/v1/webhooks/{endpoint_id}"),
+            json!({ "enabled": true }),
+            Some(&editor_token),
+        ))
+        .await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+
+    assert_eq!(
+        publish_page(&harness, &editor_token, site, "after-unmute").await,
+        StatusCode::OK,
+        "the third page publishes"
+    );
+    tick(&harness).await;
+    assert!(
+        receiver.captured().len() > heard_before,
+        "re-enabling resumes the stream — the subscription was never destroyed, only muted"
     );
 
     harness.dispose().await;
@@ -1533,6 +2800,65 @@ fn walk_rust(
             ));
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The registry vs the emitters, the other direction: a name the catalogue calls *live* must
+// have an emitter
+// ---------------------------------------------------------------------------------------------
+
+/// Every name marked `Live` in the catalogue is emitted by some module.
+///
+/// The gate above walks one direction, and one direction is not enough. It proves an emitter
+/// never names a row that is missing — but it says nothing about a row that exists with
+/// nothing behind it, and that is the failure that actually shipped: twenty-seven rows carried
+/// `Live`, which the type documents as "emitted by the platform today", while the platform
+/// emitted nothing of the sort. In the panel's picker they read exactly like a working event;
+/// an operator subscribes, the delivery never comes, and there is nothing to show for the
+/// subscription at all.
+///
+/// A registry is a promise about what other software will receive, so the promise has to be
+/// checked. Two options, and only one of them is honest:
+///
+/// * emit the fact, if the write path exists — this tick added `page.created|updated|deleted|
+///   restored`, `translation.updated`, `domain.added|removed`, `site.archived`, `user.updated`,
+///   `user.deleted` and `theme.activated` for exactly this reason; or
+/// * mark it `Reserved`, which the panel renders as "a module ships this" instead of implying
+///   the platform is broken.
+///
+/// So the leftover rows are `Reserved` rather than `Live`. That is not demotion for its own
+/// sake: `order.created` is `Reserved` for the same reason, and the status column exists to
+/// carry it. Naming them honestly is what lets the picker say something true.
+#[test]
+fn every_live_name_has_an_emitter() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("the workspace root is two levels above apps/api")
+        .to_path_buf();
+
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut files = 0_usize;
+    for area in ["apps", "crates", "modules"] {
+        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+    }
+
+    let mut unbacked: Vec<String> = Vec::new();
+    for name in omnion_events::catalogue::live_names() {
+        if !emitted.iter().any(|(emitted_name, _)| emitted_name == name) {
+            unbacked.push(name.to_owned());
+        }
+    }
+
+    assert!(
+        unbacked.is_empty(),
+        "{} name(s) are marked Live but no module emits them — `Live` means the platform \
+         records them today, and the picker shows an operator a name that will never fire. \
+         Emit the fact, or change the row to Reserved and say which module ships it:\n{}\
+         (the emitters this test can see are in {files} files)",
+        unbacked.len(),
+        unbacked.join("\n"),
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

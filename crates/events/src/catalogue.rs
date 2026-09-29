@@ -221,7 +221,7 @@ catalogue! {
     "A page's draft was published and the public site serves it.",
     [("page_id", Uuid, req), ("site_id", Uuid, req), ("slug", String, req), ("status", String, opt),
      ("revision_id", Uuid, req), ("revision_no", Integer, req), ("title", String, opt)];
-    "page.unpublished", "content", Live,
+    "page.unpublished", "content", Reserved,
     "A published page went back to being a draft.",
     [("page_id", Uuid, req), ("site_id", Uuid, req), ("slug", String, req), ("status", String, opt)];
     "page.deleted", "content", Live,
@@ -233,7 +233,7 @@ catalogue! {
     "translation.updated", "content", Live,
     "A page's translation was edited.",
     [("page_id", Uuid, req), ("site_id", Uuid, req), ("locale", String, req)];
-    "translation.published", "content", Live,
+    "translation.published", "content", Reserved,
     "A page's translation was published.",
     [("page_id", Uuid, req), ("site_id", Uuid, req), ("locale", String, req)];
 
@@ -349,7 +349,7 @@ catalogue! {
     "domain.added", "tenancy", Live,
     "A domain was pointed at a site.",
     [("domain_id", Uuid, req), ("site_id", Uuid, req), ("hostname", String, req)];
-    "domain.verified", "tenancy", Live,
+    "domain.verified", "tenancy", Reserved,
     "A domain answered the platform's ownership check.",
     [("domain_id", Uuid, req), ("site_id", Uuid, req), ("hostname", String, req)];
     "domain.removed", "tenancy", Live,
@@ -357,28 +357,28 @@ catalogue! {
     [("domain_id", Uuid, req), ("site_id", Uuid, opt), ("hostname", String, opt)];
 
     // ---- Plugins, themes, workflows --------------------------------------------------------------
-    "plugin.installed", "plugins", Live,
+    "plugin.installed", "plugins", Reserved,
     "A plugin was installed.",
     [("plugin", String, req), ("version", String, opt)];
-    "plugin.activated", "plugins", Live,
+    "plugin.activated", "plugins", Reserved,
     "An installed plugin was switched on.",
     [("plugin", String, req)];
-    "plugin.deactivated", "plugins", Live,
+    "plugin.deactivated", "plugins", Reserved,
     "An installed plugin was switched off.",
     [("plugin", String, req)];
-    "plugin.uninstalled", "plugins", Live,
+    "plugin.uninstalled", "plugins", Reserved,
     "A plugin was removed from the platform.",
     [("plugin", String, req)];
     "theme.activated", "themes", Live,
     "A theme was made the active one.",
     [("theme", String, req), ("site_id", Uuid, opt)];
-    "workflow.run.started", "workflows", Live,
+    "workflow.run.started", "workflows", Reserved,
     "A workflow run began.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("site_id", Uuid, opt)];
-    "workflow.run.completed", "workflows", Live,
+    "workflow.run.completed", "workflows", Reserved,
     "A workflow run finished every step.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("duration_ms", Integer, opt)];
-    "workflow.run.failed", "workflows", Live,
+    "workflow.run.failed", "workflows", Reserved,
     "A workflow run stopped on a step that failed.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("error", String, opt)];
 
@@ -405,6 +405,19 @@ catalogue! {
     "A delivery ran out of attempts and the receiver never took it.",
     [("delivery_id", Uuid, req), ("endpoint_id", Uuid, req), ("endpoint_name", String, req),
      ("event_name", String, req), ("attempts", Integer, opt), ("response_status", Integer, opt)];
+    // The two retention events (REQ-016 slice 3). `changed` carries the window *before* and
+    // *after*, because "the window is 30 days" on its own is not a record of anything — what an
+    // audit needs is the transition, and a consumer that keeps history longer than the platform
+    // did must be able to see the moment that changed. Neither carries a count of what was
+    // deleted: that number is the run log's, and a payload that duplicates it is a second
+    // place for the two to disagree.
+    "webhook.retention.changed", "webhooks", Live,
+    "An organization changed how long it keeps its event history.",
+    [("previous_window_days", Integer, opt), ("window_days", Integer, req)];
+    "webhook.retention.swept", "webhooks", Live,
+    "A retention sweep removed history from the bus.",
+    [("window_days", Integer, opt), ("events_deleted", Integer, opt),
+     ("deliveries_deleted", Integer, opt)];
 
     // ---- Analytics, search, notifications -------------------------------------------------------
     "analytics.traffic_spike", "analytics", Live,
@@ -669,6 +682,52 @@ mod tests {
              media, identity, tenancy, plugins, themes, workflows and webhooks",
             CATALOGUE.len()
         );
+    }
+
+    #[test]
+    fn a_reserved_name_names_the_module_that_ships_it() {
+        // `Reserved` without a reason is how a row drifts back into looking live. Every
+        // reserved name says which module owes it, so a reader of the panel can be told
+        // "a module ships this" rather than "the platform is broken", and a developer can
+        // find the owner without reading the git history.
+        //
+        // The list here is the claim, and `every_live_name_has_an_emitter` in
+        // `apps/api/tests/events.rs` is what keeps it from becoming a lie: promoting one of
+        // these to `Live` without adding the emitter turns that gate red with the name.
+        let owed_by: &[(&str, &str)] = &[
+            ("page.unpublished", "content"),
+            ("translation.published", "content"),
+            ("domain.verified", "tenancy"),
+            ("plugin.installed", "plugins"),
+            ("plugin.activated", "plugins"),
+            ("plugin.deactivated", "plugins"),
+            ("plugin.uninstalled", "plugins"),
+            // Filed under `workflows`, owed by the automation layer: the engine in
+            // `crates/workflows` starts the runs, but the bus event belongs to the workflow
+            // area, and the picker groups on the area.
+            ("workflow.run.started", "workflows"),
+            ("workflow.run.completed", "workflows"),
+            ("workflow.run.failed", "workflows"),
+            ("order.created", "commerce"),
+        ];
+
+        for (name, module) in owed_by {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must stay listed"));
+            assert_eq!(
+                entry.status,
+                Status::Reserved,
+                "{name} has no emitter, so it is not live; add the emission, then flip this \
+                 row and the gate in apps/api/tests/events.rs will agree"
+            );
+            assert_eq!(
+                entry.area, *module,
+                "{name} is owed by {module}, not by the area it was filed under"
+            );
+            assert!(
+                !entry.description.is_empty(),
+                "{name} still has to say what a receiver would get"
+            );
+        }
     }
 
     #[test]

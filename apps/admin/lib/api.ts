@@ -5,7 +5,20 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  WebhookDeliveryFilters,
+  WebhookDeliveryPage,
+  WebhookEndpoint,
+  WebhookList,
+  WebhookRedeliverBatch,
+  WebhookRotation,
+  WebhookStats,
+  WebhookTestReport,
   CreatedMediaShare,
+  EventCatalogue,
+  EventFilters,
+  EventPage,
+  RetentionStatus,
+  SweepResult,
   NewMediaGrant,
   Media,
   MediaBulkResult,
@@ -4392,4 +4405,214 @@ export function runNotificationRoute(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The event feed and the catalogue (REQ-016, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build the feed's query string from its filters.
+ *
+ * `name` is repeated rather than joined: `?name=a&name=b` is the only shape that survives a
+ * value containing a comma, and an event name is a controlled vocabulary that will never
+ * contain one — but a filter that quietly mis-splits on a comma the day somebody registers a
+ * plugin's own name is a filter that will be debugged from the wrong end.
+ */
+function eventQuery(filters: EventFilters = {}): string {
+  const search = new URLSearchParams();
+  for (const name of filters.name ?? []) {
+    if (name) search.append("name", name);
+  }
+  if (filters.site_id) search.set("site_id", filters.site_id);
+  if (filters.actor_user_id) search.set("actor_user_id", filters.actor_user_id);
+  if (filters.from) search.set("from", filters.from);
+  if (filters.to) search.set("to", filters.to);
+  if (filters.cursor && filters.cursor > 0) search.set("cursor", String(filters.cursor));
+  if (filters.limit) search.set("limit", String(filters.limit));
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+/** One page of the platform's recent events, newest first. */
+export function fetchEvents(filters: EventFilters = {}): Promise<EventPage> {
+  return request<EventPage>(`/api/v1/events${eventQuery(filters)}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The webhook endpoints and their delivery operations (REQ-016, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** Build a delivery history's query string from its filters.
+ *
+ * `status` and `name` repeat rather than joining, for the same reason the feed's `name` does:
+ * a comma is not in either vocabulary, and a filter that quietly mis-splits on one the day a
+ * plugin registers its own name is a filter debugged from the wrong end. The cursor travels as
+ * its two halves (`cursor_at`, `cursor_id`) because the read sorts by both and the API refuses
+ * a half rather than comparing against a null id.
+ */
+function deliveryQuery(filters: WebhookDeliveryFilters = {}): string {
+  const search = new URLSearchParams();
+  for (const status of filters.status ?? []) {
+    if (status) search.append("status", status);
+  }
+  for (const name of filters.name ?? []) {
+    if (name) search.append("name", name);
+  }
+  if (filters.from) search.set("from", filters.from);
+  if (filters.to) search.set("to", filters.to);
+  if (filters.q) search.set("q", filters.q);
+  if (filters.cursor_at && filters.cursor_id) {
+    search.set("cursor_at", filters.cursor_at);
+    search.set("cursor_id", filters.cursor_id);
+  }
+  if (filters.limit) search.set("limit", String(filters.limit));
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+/** Every endpoint this account may see, name order. */
+export function fetchWebhookEndpoints(): Promise<WebhookList> {
+  return request<WebhookList>("/api/v1/webhooks");
+}
+
+/** One endpoint. The secret is never in the answer. */
+export function fetchWebhookEndpoint(id: string): Promise<WebhookEndpoint> {
+  return request<WebhookEndpoint>(`/api/v1/webhooks/${id}`);
+}
+
+/** Connect an endpoint. The answer carries a `secret` when the platform generated one. */
+export function createWebhookEndpoint(input: {
+  name: string;
+  url: string;
+  events: string[];
+  secret?: string;
+}): Promise<WebhookEndpoint> {
+  return request<WebhookEndpoint>("/api/v1/webhooks", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Change an endpoint's name, URL, subscriptions or enabled flag. */
+export function updateWebhookEndpoint(
+  id: string,
+  changes: {
+    name?: string;
+    url?: string;
+    events?: string[];
+    enabled?: boolean;
+  },
+): Promise<WebhookEndpoint> {
+  return request<WebhookEndpoint>(`/api/v1/webhooks/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** Disconnect an endpoint and its queue rows. */
+export function deleteWebhookEndpoint(id: string): Promise<void> {
+  return request<void>(`/api/v1/webhooks/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Replace the signing secret and get the new one.
+ *
+ * A dedicated call rather than `updateWebhookEndpoint`, because a rotation is the one write
+ * whose answer contains the secret: a receiver cannot be reconfigured with a value it never
+ * saw, and folding this into the update would make the secret a field that appears or vanishes
+ * depending on which verb the panel happened to use.
+ */
+export function rotateWebhookSecret(id: string): Promise<WebhookRotation> {
+  return request<WebhookRotation>(`/api/v1/webhooks/${id}/secret/rotate`, { method: "POST" });
+}
+
+/** Queue one signed `webhook.test` delivery, whether or not the endpoint is enabled. */
+export function testWebhookEndpoint(id: string): Promise<WebhookTestReport> {
+  return request<WebhookTestReport>(`/api/v1/webhooks/${id}/test`, { method: "POST" });
+}
+
+/** One page of an endpoint's delivery history, newest first. */
+export function fetchWebhookDeliveries(
+  id: string,
+  filters: WebhookDeliveryFilters = {},
+): Promise<WebhookDeliveryPage> {
+  return request<WebhookDeliveryPage>(
+    `/api/v1/webhooks/${id}/deliveries${deliveryQuery(filters)}`,
+  );
+}
+
+/** Force one delivery again. A `409` names which of the three refusals it was. */
+export function redeliverWebhookDelivery(id: string, deliveryId: string): Promise<void> {
+  return request<void>(`/api/v1/webhooks/${id}/deliveries/${deliveryId}/redeliver`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Force many deliveries again, per id.
+ *
+ * The declared literal route, not the `{delivery_id}` one: axum reads `/deliveries/redeliver`
+ * through the parameterised path if the batch route is registered second, and the panel would
+ * get `delivery_not_found` for a request that is perfectly valid.
+ */
+export function redeliverWebhookDeliveries(
+  id: string,
+  deliveryIds: string[],
+): Promise<WebhookRedeliverBatch> {
+  return request<WebhookRedeliverBatch>(`/api/v1/webhooks/${id}/deliveries/redeliver`, {
+    method: "POST",
+    body: JSON.stringify({ delivery_ids: deliveryIds }),
+  });
+}
+
+/** What this endpoint's receiver has been doing, over `windowHours` (default 24). */
+export function fetchWebhookStats(id: string, windowHours?: number): Promise<WebhookStats> {
+  const query = windowHours ? `?window_hours=${windowHours}` : "";
+  return request<WebhookStats>(`/api/v1/webhooks/${id}/stats${query}`);
+}
+
+/**
+ * Every event name the platform knows, with its area, description and payload fields.
+ *
+ * The counts (`live_count`, `reserved_count`, `max_subscriptions`) are part of the answer
+ * rather than something the screen recomputes: they are the registry's own totals, and a
+ * screen that counted the rows it happened to receive would report a number that changes with
+ * a filter the user cannot see.
+ */
+export function fetchEventCatalogue(): Promise<EventCatalogue> {
+  return request<EventCatalogue>("/api/v1/events/catalogue");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The bus's own retention (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * How much history this organization keeps, and the last sweeps that ran.
+ *
+ * The read carries the bounds the API enforces (`min_days`, `max_days`) rather than the screen
+ * inventing its own: a range written in two places is a range that will disagree, and the input
+ * that disagrees with the server's rule is the one that gets a `400` nobody can act on.
+ */
+export function fetchRetention(): Promise<RetentionStatus> {
+  return request<RetentionStatus>("/api/v1/events/retention");
+}
+
+/**
+ * Set the window, in days.
+ *
+ * The refusal is passed through rather than caught: a window of `0` or `4000` is refused by
+ * name, and a screen that clamped it would answer `200` with a number the operator did not
+ * choose.
+ */
+export function setRetentionWindow(windowDays: number): Promise<RetentionStatus> {
+  return request<RetentionStatus>("/api/v1/events/retention", {
+    method: "PATCH",
+    body: JSON.stringify({ window_days: windowDays }),
+  });
+}
+
+/** Run one sweep now, and answer with what it actually removed. */
+export function sweepRetention(): Promise<SweepResult> {
+  return request<SweepResult>("/api/v1/events/retention/sweep", { method: "POST" });
 }

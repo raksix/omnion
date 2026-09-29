@@ -14,9 +14,14 @@ pub const ENDPOINT_COLUMNS: &str = "id, organization_id, name, url, secret, even
 
 /// Columns of `webhook_deliveries` for one `select`, in [`Delivery`] order. The caller joins
 /// `events` for the name, so both sides of the join carry their alias.
+///
+/// The last four columns are the delivery-operations set added by migration `0052`
+/// (`trigger`, `duration_ms`, `redeliver_count`, `replayed_at`). They are in the shared list
+/// rather than in a second query because every screen that draws a delivery row draws all
+/// four, and a second query is a second thing to forget.
 pub const DELIVERY_COLUMNS: &str = "d.id, d.endpoint_id, d.event_id, e.name as event_name, \
      d.status, d.attempts, d.max_attempts, d.next_attempt_at, d.response_status, d.error, \
-     d.delivered_at, d.created_at";
+     d.delivered_at, d.created_at, d.trigger, d.duration_ms, d.redeliver_count, d.replayed_at";
 
 /// How many attempts a delivery gets when it is queued.
 ///
@@ -240,6 +245,18 @@ pub struct Delivery {
     pub delivered_at: Option<OffsetDateTime>,
     /// When it was queued.
     pub created_at: OffsetDateTime,
+    /// `event`, `test` or `replay` — what asked for this delivery.
+    ///
+    /// A `test` row is a button an operator pressed and says nothing about the organization's
+    /// real traffic, so it is counted separately everywhere it would otherwise flatter a
+    /// success rate. See migration `0052`.
+    pub trigger: String,
+    /// How long the receiver took, in milliseconds; `None` while the row has never run.
+    pub duration_ms: Option<i32>,
+    /// How many times an operator has forced this row again (cap 10).
+    pub redeliver_count: i32,
+    /// When it was last forced again, so a chased delivery reads differently from a late one.
+    pub replayed_at: Option<OffsetDateTime>,
 }
 
 /// One delivery the runner claimed, with the endpoint and the event it needs to send it.
@@ -275,9 +292,108 @@ pub struct DeliveryJob {
     pub max_attempts: i32,
 }
 
+/// The retention window an organization keeps its events for, defaulting to 30 days.
+///
+/// The default is a **constant** rather than a nullable column reading `null`, because `null`
+/// would mean "keep for ever" and nobody decided that: an organization that has never opened
+/// the retention screen is an organization whose history grew quietly until somebody noticed,
+/// which is the failure this whole request exists to prevent. Thirty days is the window the
+/// screen documents and the one every acceptance test assumes when it does not say.
+pub const DEFAULT_EVENT_RETENTION_DAYS: i32 = 30;
+
+/// Shortest window the platform accepts, in days.
+///
+/// The reason there is a floor rather than a clamp is that a clamp is silent: a caller asking
+/// for one day and being given seven would see a `200` and a window it did not ask for. A
+/// refusal names the field and the range.
+pub const MIN_RETENTION_DAYS: i32 = 1;
+
+/// Longest window the platform accepts, in days.
+pub const MAX_RETENTION_DAYS: i32 = 3_650;
+
+/// What one retention sweep removed, and the window it applied.
+///
+/// `deliveries` is its own number because a cascade removes a delivery row the operator may
+/// have been looking at in the endpoint's history, and "3,400 events and their deliveries
+/// went" is a different sentence from "3,400 events went".
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct SweepReport {
+    /// The run's own row id, so a caller can read the log entry back.
+    pub run_id: Uuid,
+    /// The organization whose history was swept.
+    pub organization_id: Option<Uuid>,
+    /// The window that was applied, in days.
+    pub window_days: i32,
+    /// The instant older rows were swept.
+    pub cutoff: OffsetDateTime,
+    /// Events removed.
+    pub events_deleted: i64,
+    /// Delivery rows removed with them.
+    pub deliveries_deleted: i64,
+    /// When the sweep finished.
+    pub finished_at: OffsetDateTime,
+}
+
+/// One row of the retention run log.
+///
+/// The log is written for a run that deleted nothing, which is why `finished_at` and the
+/// counters are ordinary columns rather than something a `where` has to find: "the last sweep
+/// was at 03:00 and it found nothing" is the sentence an operator needs on the day they ask
+/// why an event from March is still in the feed.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RetentionRun {
+    /// Run id.
+    pub id: Uuid,
+    /// The organization swept (`None` = the platform's own events).
+    pub organization_id: Option<Uuid>,
+    /// When the sweep began.
+    pub started_at: OffsetDateTime,
+    /// When it finished, if it did.
+    pub finished_at: Option<OffsetDateTime>,
+    /// The window that was applied.
+    pub window_days: i32,
+    /// The instant older rows were swept.
+    pub cutoff: OffsetDateTime,
+    /// Events removed.
+    pub events_deleted: i32,
+    /// Delivery rows removed with them.
+    pub deliveries_deleted: i32,
+    /// Why the sweep could not finish, if it could not.
+    pub error: Option<String>,
+}
+
+/// How much history this organization keeps, and the last sweep that ran against it.
+///
+/// The two travel together because the screen's question is never "what is the window" on its
+/// own: an operator who just raised the window wants to know that the rows they were worried
+/// about are still there *and* that a sweep ran after the change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionStatus {
+    /// The organization described.
+    pub organization_id: Option<Uuid>,
+    /// The window in force, days.
+    pub window_days: i32,
+    /// The last run's row, if this organization has ever been swept.
+    pub last_run: Option<RetentionRun>,
+    /// Events currently on the bus for this organization.
+    pub events: i64,
+    /// Events old enough to be swept on the next tick.
+    pub due: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_window_is_a_number_rather_than_a_guess() {
+        // The screen documents 30 days, so 30 is what an organization with no setting of its
+        // own must measure against. `assert_eq!` rather than a range check: a *changed*
+        // default is a documented change, and this test is the thing that says so.
+        assert_eq!(DEFAULT_EVENT_RETENTION_DAYS, 30);
+        assert!(MIN_RETENTION_DAYS <= DEFAULT_EVENT_RETENTION_DAYS);
+        assert!(DEFAULT_EVENT_RETENTION_DAYS <= MAX_RETENTION_DAYS);
+    }
 
     #[test]
     fn subscriptions_are_matched_by_exact_name() {
