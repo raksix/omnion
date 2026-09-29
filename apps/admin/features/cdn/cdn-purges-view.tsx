@@ -538,6 +538,26 @@ export function CdnPurgesView() {
                   </span>
                 </div>
 
+                {/*
+                 * Who asked for this. An automatic purge has no author, and the honest
+                 * rendering of that is the event that caused it — not a blank column and
+                 * not the publisher's name, which would read as a person pressing the
+                 * button for something the platform decided on its own.
+                 */}
+                <p
+                  data-cdn-purge-origin
+                  data-cdn-purge-origin-kind={detail.source ? "automatic" : "manual"}
+                  className="text-[12px] text-muted"
+                >
+                  {detail.source ? (
+                    <span className="font-mono">
+                      {`automatic · ${detail.source.trigger} · event ${detail.source.event_id}`}
+                    </span>
+                  ) : (
+                    "requested by an operator"
+                  )}
+                </p>
+
                 {detail.purge.error ? (
                   <p
                     role="status"

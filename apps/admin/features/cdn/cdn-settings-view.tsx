@@ -38,6 +38,15 @@ import type { CdnAdapterInfo, CdnSettings } from "@/lib/types";
  * Written out with their consequences rather than as a list of names: the person turning a
  * switch on is deciding how much invalidation traffic they are signing up for, and an
  * event name alone does not tell them.
+ *
+ * The names are the ones the platform **records**, not the ones REQ-011's own text used.
+ * Two of the request's names — `media.replaced` and `site.domain.changed` — are not
+ * emitted by anything: a file's bytes are replaced by `media.version_created`, and a domain
+ * changing is `domain.added` or `domain.removed`. A switch on a name nothing emits is a
+ * switch an operator can turn on, watch for a week and never see anything happen from, and
+ * the failure is silent — nothing errors, the setting saves, the purge simply never comes.
+ * The seven below are the seven names `crates/cdn`'s trigger table consumes, and the crate's
+ * test asserts they are all in the event catalogue.
  */
 const TRIGGERS: { event: string; consequence: string }[] = [
   {
@@ -53,7 +62,7 @@ const TRIGGERS: { event: string; consequence: string }[] = [
     consequence: "a deleted page is invalidated rather than left cached until its TTL ends",
   },
   {
-    event: "media.replaced",
+    event: "media.version_created",
     consequence: "a replaced file invalidates its own address, not the whole library",
   },
   {
@@ -61,8 +70,13 @@ const TRIGGERS: { event: string; consequence: string }[] = [
     consequence: "a new theme invalidates every page at once — a large purge, once",
   },
   {
-    event: "site.domain.changed",
-    consequence: "a new domain invalidates the old one, which nobody visits any more",
+    event: "domain.added",
+    consequence: "a new domain invalidates every page cached under the old one",
+  },
+  {
+    event: "domain.removed",
+    consequence:
+      "a removed domain invalidates the addresses nobody can reach any more",
   },
 ];
 

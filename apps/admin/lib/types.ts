@@ -1326,6 +1326,19 @@ export type CdnPurgeItem = {
 export type CdnPurgeDetail = {
   purge: CdnPurge;
   items: CdnPurgeItem[];
+  /**
+   * The event behind an automatic purge (REQ-011 slice 3), or `null` for one a person
+   * asked for. The absence is the signal, not a missing field.
+   */
+  source: CdnPurgeSource | null;
+};
+
+/** What the platform raised the purge for. */
+export type CdnPurgeSource = {
+  /** The bus event's id. */
+  event_id: number;
+  /** The event's name, e.g. `page.published`. */
+  trigger: string;
 };
 
 /** A page of history. `total` is the unpaged count so the panel can say "50 of 312". */
