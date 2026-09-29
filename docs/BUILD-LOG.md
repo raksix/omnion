@@ -5688,3 +5688,50 @@ and its keyboard map, and `tsc` is clean — but a screen nobody has opened in a
 screen that is finished. Next tick: acquire `qa-slot.sh` on a box with room, then REQ-127 slice 2
 (idempotency: `decide`, the fingerprint and `StoredResponse::seal` are in; the store, the
 middleware and the screen are not).
+
+## 2026-09-29 · wave6 · REQ-127 slice 1 · the suite, and two assertions that were wrong
+
+**Follow-up to the entry above.** The five product defects and the screen are committed and
+pushed (`8b3ba7d`, `fe474cb`, `7008f9f`, `b67ac6f`, `cbc48cc`). This pass is the walk's own
+gate, which kept failing for reasons that were the harness's and not the platform's.
+
+**What changed.** Three harness properties and two assertions:
+
+- The suite now purges its own leftover policies on entry, keyed on the `w6 %` name so a sibling
+  writer's budgets in this shared database are never touched. A killed run's teardown is skipped,
+  and the next run then decides requests with rows that outrank by being *specific* — which reads
+  as "the save did not take effect".
+- `sign_in` takes a fresh address per call. Eight walks signing in from one literal exhaust the
+  shipped 10/minute `sign-in` budget, and the tenth login of a run fails for a reason unrelated to
+  what it is testing.
+- The counter clearing is loud on every failure (the `if let Ok(..)` form silently left the
+  previous test's counter), and each walk clears **both** scopes it spends immediately before the
+  first request that spends them.
+- The rollup assertion was "exactly one row for this subject" — but the table is keyed
+  `(scope, target, route, window_start)`, so a subject refused in three windows correctly has
+  three rows. It now asserts one row **per window** plus that older windows are retained.
+- The dry-run assertion expected `count: 2` where the third is the tool's own request, counted by
+  the middleware before the handler peeks. The "does not spend the budget" property is now
+  asserted on the **delta** between two tool calls: 2 if the tool consumes, 1 if it is merely
+  counted. An absolute would have asserted the opposite of the property.
+
+**Deleted before committing.** A `SCAN`/`DEL` over `omnion:rlx:*` to clear the suite's counters.
+Redis is shared with seven sibling writers and every production app on the box; wiping their
+budgets is the same class of mistake as touching another writer's `target/`, and the instinct to
+"just clean the state" is exactly where it appears.
+
+**Proof.**
+- `cargo test -p omnion-reliability` — **113/0**.
+- `apps/admin` `tsc --noEmit` — clean.
+- `apps/api/tests/reliability_limits` — **8/8 individually, 6/8 in one sequential run.**
+
+**Not green, and why it is not dressed up.** The two stragglers pass alone and fail only in
+sequence, and the sequential run times out at 700 s: `sign_in` costs ~9 s (organization, user,
+role binding, session) and four walks call it, on a box with seven other writers. That is a
+scheduling cost in the harness, not a platform defect. Next tick splits it — one shared session
+per scope — so a full run fits the tick and the two can be closed honestly.
+
+**Next.** (1) The QA browser pass against `/settings/reliability/limits` still has not run; a
+screen nobody has opened in a browser is not finished. (2) Then the `sign_in` split. (3) Then
+REQ-127 slice 2, idempotency: `decide`, the fingerprint and `StoredResponse::seal` are in; the
+store, the middleware and the screen are not.

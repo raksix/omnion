@@ -1,6 +1,6 @@
 # REQ-127 — Reliability Primitives
 
-> **Status:** in-progress (slice 1 is on the request path AND on the screen: the Redis counter, the store, the middleware, the headers on BOTH the served and the refused response, the `429` with `Retry-After`, the panel's policy CRUD, its dry-run and its refusal rollup at `/settings/reliability/limits`, plus the shipped default budgets — `crates/reliability` at 113 unit tests, `apps/api/tests/reliability_limits` at 8/8 over a live router, migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database, `apps/admin` `tsc --noEmit` clean) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 is on the request path AND on the screen: the Redis counter, the store, the middleware, the headers on BOTH the served and the refused response, the `429` with `Retry-After`, the panel's policy CRUD, its dry-run and its refusal rollup at `/settings/reliability/limits`, plus the shipped default budgets — `crates/reliability` at 113 unit tests, `apps/api/tests/reliability_limits` at 8/8 individually / 6/8 in one sequential run (see the suite status below — the two stragglers are `sign_in` cost against seven sibling writers, not a product defect), migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database, `apps/admin` `tsc --noEmit` clean) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -275,11 +275,36 @@ four distinctions the API's enum exists to keep apart — a stored policy is not
 not a `429` from the gateway — and the dry-run is a server call so it cannot drift from the
 resolver. The walkthrough route is registered.
 
-**Next.** The refusal rollup's chart is on the screen but the QA browser pass still has not run
-against it — the walk is a `qa-slot.sh` acquisition plus a box with room to breathe, and this
-tick's priority was the gate that had never executed. Then REQ-127 slice 2 (idempotency):
-`decide`, the fingerprint and `StoredResponse::seal` are in; the store, the middleware and the
-screen are not.
+**Suite status, stated honestly: 6/8 in one sequential run, 8/8 individually.** The two
+stragglers both pass alone and fail only in sequence, and the run times out at 700 s on a box
+with seven other writers — `sign_in` alone costs ~9 s (an organization, a user, a role binding
+and a session, per call) and four walks call it. That is a scheduling problem in the harness, not
+a product defect, and it is recorded as open rather than dressed up as green. Next tick: one
+shared session per scope so a full sequential run fits the tick's budget, then run it end to end.
+
+**Two more assertions that turned out to be wrong about the product, both corrected toward the
+product.** The rollup walk asserted "exactly one row for this subject", but the rollup is keyed
+`(scope, target, route, window_start)` — a subject refused in three windows correctly has three
+rows, and the assertion only passed on a fresh database. It now asserts one row **per window**,
+scoped to the window the walk just wrote, plus that older windows are retained. And the dry-run
+walk expected `count: 2` after two spending requests, where the third is the dry-run's own
+request: the middleware counts it before the handler peeks, exactly as it counts every other API
+call. That is the platform rate-limiting its own tool, which is right. "Does not spend the
+budget" is now asserted on the DELTA between two tool calls — a tool that consumed what it
+measured would show 2, one that is merely counted as a request shows 1.
+
+**One thing I wrote and then deleted before committing.** A `SCAN`/`DEL` over `omnion:rlx:*` to
+clear the suite's counters, which would have wiped seven sibling writers' budgets and every
+production app's on the shared Redis. It is the same class of mistake as touching another
+writer's `target/`, and the policy purge is keyed on this suite's own `w6 %` name for exactly
+that reason.
+
+**Next.** (1) The refusal rollup's chart is on the screen but the QA browser pass still has not
+run against it — the walk is a `qa-slot.sh` acquisition plus a box with room to breathe, and a
+screen nobody has opened in a browser is not finished. (2) Split the suite's `sign_in` cost so
+a full sequential run fits the tick and close the two stragglers. (3) Then REQ-127 slice 2
+(idempotency): `decide`, the fingerprint and `StoredResponse::seal` are in; the store, the
+middleware and the screen are not.
 
 **The walk did not run, and the reason is worth more than the slice.** `apps/api/tests/
 reliability_limits.rs` reaches the link step and the link dies with
