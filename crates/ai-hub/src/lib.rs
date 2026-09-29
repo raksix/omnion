@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod catalog;
 pub mod client;
 pub mod connection_test;
