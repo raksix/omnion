@@ -548,30 +548,38 @@ pub async fn patch_account(
         }
     }
 
-    let mut builder: QueryBuilder<Postgres> =
-        QueryBuilder::new("update accounting_accounts set active = active where organization_id = ");
-    builder.push_bind(organization_id);
-    builder.push(" and id = ");
-    builder.push_bind(account_id);
-    if let Some(name) = patch.name.as_deref() {
-        builder
-            .push(", name = ")
-            .push_bind(validate_name("account", name)?);
-    }
-    if let Some(active) = patch.active {
-        builder.push(", active = ").push_bind(active);
-    }
-    if let Some(parent_id) = patch.parent_id {
-        builder.push(", parent_id = ").push_bind(parent_id);
-    }
-    builder.push(" returning id");
+    // The whole SET list is built in ONE statement with COALESCE, not with a `QueryBuilder`
+    // that appends `, name = $3` as it goes. The builder version emitted the tenant predicate
+    // FIRST and the assignments after it, producing `update … set active = active where
+    // organization_id = $1 and id = $2, name = $3 returning id` — a syntax error that only shows
+    // up once a caller sends a field to change, because the no-field patch is the one statement
+    // that happens to parse. Dynamic SET and a fixed WHERE are two different jobs.
+    //
+    // `COALESCE($3, name)` is how one statement covers "the caller did not send this field":
+    // a NULL bind leaves the stored value exactly as it was, and a `sets` vector of strings
+    // numbered by hand can no longer drift out of step with the binds.
+    let patched = sqlx::query_as::<_, AccountRow>(
+        "update accounting_accounts \
+            set name = coalesce($3, name), \
+                active = coalesce($4, active), \
+                parent_id = case when $5::boolean then $6 else parent_id end \
+          where organization_id = $1 and id = $2 \
+      returning id, organization_id, code, name, kind, parent_id, active, system, created_at",
+    )
+    .bind(organization_id)
+    .bind(account_id)
+    .bind(patch.name.as_deref().map(|n| validate_name("account", n)).transpose()?)
+    .bind(patch.active)
+    .bind(patch.parent_id.is_some())
+    .bind(patch.parent_id)
+    .fetch_optional(pool)
+    .await?;
 
-    // The row is what proves the write happened: without the tenant predicate matching, a
-    // `PATCH` with a cross-tenant id would update nothing and answer "ok" — the silent-success
-    // bug a row count exists to catch. `pool`, not a transaction, because there is nothing to
-    // keep atomic: one statement, and the `get_account` below re-reads the committed row.
-    let updated = builder.build().fetch_optional(pool).await?;
-    if updated.is_none() {
+    // The returned row is what proves the write happened. Without the tenant predicate matching,
+    // a `PATCH` carrying a cross-tenant id would update nothing and answer "ok" — the silent
+    // success a row exists to catch. `pool`, not a transaction: one statement, and the
+    // `get_account` below re-reads the committed row.
+    if patched.is_none() {
         return Err(AccountingError::NotFound("account"));
     }
 
@@ -587,19 +595,18 @@ pub async fn deactivate_account(
     account_id: Uuid,
     active: bool,
 ) -> Result<AccountView> {
-    // A system account is seeded and re-seeded: deleting one would let the next tenant creation
-    // bring it back as a duplicate, and a chart that grows a row nobody added is a chart nobody
-    // trusts. Deactivating stays available, which is what an organization that does not use
-    // "Cost of Goods Sold" actually wants.
-    if !active {
-        let account = get_account(pool, organization_id, account_id).await?;
-        if account.system {
-            return Err(AccountingError::not_allowed(format!(
-                "{} is one of the seeded accounts — it can be renamed and deactivated, but not removed",
-                account.code
-            )));
-        }
-    }
+    // A system account is seeded and re-seeded, so a **DELETE** would let the next tenant
+    // creation bring it back as a duplicate nobody added, and a chart that grows a row on its
+    // own is a chart nobody trusts. Deactivating a seeded account is a different act and stays
+    // available: an organization that never touches "Cost of Goods Sold" needs exactly that, and
+    // the row has to stay readable because past journal lines name it.
+    //
+    // The guard is on deletion, and there is no delete route — so this function refuses nothing
+    // and says so in its own doc comment. It used to refuse deactivating a seeded account too,
+    // which contradicted the sentence right above it and broke the one behaviour the row exists
+    // for: the code compared "can I close this" with "may I remove this" and answered the first
+    // question with the second.
+    let _ = active;
     patch_account(
         pool,
         organization_id,
@@ -794,35 +801,33 @@ pub async fn patch_tax_rate(
         .await?;
     }
 
-    let mut builder: QueryBuilder<Postgres> =
-        QueryBuilder::new("update accounting_tax_rates set active = active where organization_id = ");
-    builder.push_bind(organization_id);
-    builder.push(" and id = ");
-    builder.push_bind(rate_id);
-    if let Some(name) = patch.name.as_deref() {
-        builder
-            .push(", name = ")
-            .push_bind(validate_name("tax_rate", name)?);
-    }
-    if let Some(percent) = patch.percent.as_deref() {
-        builder
-            .push(", percent = ")
-            .push_bind(validate_percent(percent)?)
-            .push("::numeric");
-    }
-    if let Some(is_default) = patch.is_default {
-        builder.push(", is_default = ").push_bind(is_default);
-    }
-    if let Some(active) = patch.active {
-        builder.push(", active = ").push_bind(active);
-    }
-    builder.push(" returning id");
+    // Same COALESCE shape and the same reason as `patch_account` — one statement, one ordering,
+    // no hand-numbered placeholders. It runs on the TRANSACTION, not the pool: the
+    // `is_default` handover above cleared the previous default, and a statement issued outside
+    // the transaction would leave a window where an organization owns no default rate at all.
+    let patched = sqlx::query_as::<_, TaxRateRow>(
+        "update accounting_tax_rates \
+            set name = coalesce($3, name), \
+                percent = coalesce($4::numeric, percent), \
+                is_default = coalesce($5, is_default), \
+                active = coalesce($6, active) \
+          where organization_id = $1 and id = $2 \
+      returning id, organization_id, name, percent::text as percent, kind, is_default, active, \
+                created_at",
+    )
+    .bind(organization_id)
+    .bind(rate_id)
+    .bind(patch.name.as_deref().map(|n| validate_name("tax_rate", n)).transpose()?)
+    .bind(patch.percent.as_deref().map(|v| validate_percent(v)).transpose()?)
+    .bind(patch.is_default)
+    .bind(patch.active)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    // As with the account patch: the row is what proves the write happened. A builder that
+    // As with the account patch: the row is what proves the write happened. A statement that
     // returns "no row" is a write that matched nothing, and answering `ok` for it is how a
     // cross-tenant id becomes a silent no-op instead of a 404.
-    let updated = builder.build().fetch_optional(&mut *tx).await?;
-    if updated.is_none() {
+    if patched.is_none() {
         return Err(AccountingError::NotFound("tax_rate"));
     }
 

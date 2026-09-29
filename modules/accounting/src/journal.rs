@@ -427,16 +427,31 @@ pub async fn list_entries(
         "select e.id, e.organization_id, e.entry_number, e.entry_date, e.memo, e.source_kind, \
                 e.source_id, e.debit_total::text as debit_total, \
                 e.credit_total::text as credit_total, e.balanced, e.posted_at, e.created_at, \
-                (select count(*) from accounting_journal_lines l where l.entry_id = e.id) as lines \
+                (select count(*) from accounting_journal_lines l where l.entry_id = e.id) as line_count \
          from accounting_journal_entries e where e.organization_id = ",
     );
+    // **No hand-written placeholders, and no always-on nullable predicate.** `QueryBuilder`
+    // renumbers every bind itself, so a literal `$2` in the pushed SQL is not "the second bind" —
+    // it is a dollar-quoted token the parser rejects, and the query dies with
+    // `syntax error at or near "$2"` the first time anybody opens the journal. Two earlier
+    // versions of this filter failed in opposite ways for the same reason: one numbered the
+    // placeholders by hand (which the builder then renumbered out from under it), the other
+    // compared `source_kind` against the organization id because the tenant predicate already
+    // owned `$1`. The shape that survives all of them is the one the sales module already uses:
+    // push the predicate ONLY when the filter is present, and let the builder number the binds.
     builder.push_bind(organization_id);
-    builder.push(" and ($1::text is null or e.source_kind = $1)");
-    builder.push_bind(source.map(|s| s.as_str()));
-    builder.push(" and ($2::date is null or e.entry_date >= $2)");
-    builder.push_bind(from);
-    builder.push(" and ($3::date is null or e.entry_date <= $3)");
-    builder.push_bind(to);
+    if let Some(source) = source {
+        builder.push(" and e.source_kind = ");
+        builder.push_bind(source.as_str());
+    }
+    if let Some(from) = from {
+        builder.push(" and e.entry_date >= ");
+        builder.push_bind(from);
+    }
+    if let Some(to) = to {
+        builder.push(" and e.entry_date <= ");
+        builder.push_bind(to);
+    }
     if let Some(term) = search.map(str::trim).filter(|t| !t.is_empty()) {
         if term.chars().count() > crate::store::MAX_SEARCH_LENGTH {
             return Err(AccountingError::invalid(
@@ -513,7 +528,11 @@ impl JournalEntrySummary {
             credit_total: row.get("credit_total"),
             balanced: row.get("balanced"),
             posted_at: row.get("posted_at"),
-            line_count: row.get("lines"),
+            // The alias must match the name here. `row.get` looks the name up at RUNTIME, so a
+            // mismatch is a request-time 500 — `no column found for name: lines` — and not a
+            // compile error, which is why a column renamed in the SELECT reads as a route that
+            // "sometimes" fails: only the list, and only at runtime.
+            line_count: row.get("line_count"),
             created_at: row.get("created_at"),
         })
     }
