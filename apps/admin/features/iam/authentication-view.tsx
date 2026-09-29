@@ -24,6 +24,7 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronRight,
   CircleSlash,
   KeyRound,
   Link2,
@@ -39,6 +40,7 @@ import {
 import { useSession } from "@/lib/session";
 import { AttributeMapEditor } from "@/features/iam/attribute-map-editor";
 import { RoleRulesEditor } from "@/features/iam/role-rules-editor";
+import { SyncLedger } from "@/features/iam/sync-ledger";
 import {
   ApiError,
   createIamProvider,
@@ -223,6 +225,10 @@ export function AuthenticationView() {
   const [tests, setTests] = useState<Record<string, IamProviderTest>>({});
   const [events, setEvents] = useState<Record<string, IamProviderEvent[]>>({});
   const [showLog, setShowLog] = useState<string | null>(null);
+  // Which provider has its sync ledger open. Separate from `showLog` on purpose: the sign-in
+  // log and the sync history are different questions, and one disclosure closing the other is
+  // how a screen ends up showing neither.
+  const [showSync, setShowSync] = useState<string | null>(null);
 
   // A platform account names the organization it manages providers for; an organization account
   // never sees the picker, because it can only ever work inside its own.
@@ -850,13 +856,48 @@ export function AuthenticationView() {
                     )}
                   </div>
                 ) : null}
+
+                {/* The sync ledger (REQ-065, slice 4 part 2). Its own disclosure rather than a
+                    column: the provider row answers "is it reachable now", the ledger answers
+                    "what did the last sweep do to real people", and putting the second in the
+                    first would bury it under a status chip. Only a directory syncs, so a
+                    protocol provider is not offered a tab with nothing in it. */}
+                {DIRECTORY_KINDS.has(provider.kind) ? (
+                  <>
+                    <button
+                      type="button"
+                      data-sync-toggle={provider.id}
+                      aria-expanded={showSync === provider.id}
+                      onClick={() => setShowSync((current) => (current === provider.id ? null : provider.id))}
+                      className="mt-2 flex w-full items-center gap-1.5 rounded-md border border-line bg-panel px-2.5 py-1.5 text-left text-[12px] text-muted hover:text-ink"
+                    >
+                      <ChevronRight
+                        className={`size-3.5 transition-transform ${showSync === provider.id ? "rotate-90" : ""}`}
+                        aria-hidden
+                      />
+                      Sync history
+                      {provider.last_sync_status === "failed" ? (
+                        <span className="ml-auto rounded-full border border-caution bg-caution/10 px-1.5 py-0.5 text-[10px] text-caution">
+                          last run failed
+                        </span>
+                      ) : null}
+                    </button>
+                    {showSync === provider.id ? (
+                      <div className="mt-2">
+                        <SyncLedger
+                          providerId={provider.id}
+                          providerName={provider.name}
+                          kind={provider.kind}
+                        />
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
               </li>
             );
           })}
         </ul>
       ) : null}
-
-      {selected ? null : null}
 
       {draft ? (
         <div

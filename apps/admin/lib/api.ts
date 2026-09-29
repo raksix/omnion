@@ -3765,6 +3765,117 @@ export function fetchIamProviderEvents(
 }
 
 // ---------------------------------------------------------------------------------------------
+// The sync ledger (REQ-065, slice 4 part 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One sync run, as the ledger lists it.
+ *
+ * `healthy` is carried separately from `status` because the panel must not colour a `partial`
+ * run green: a sweep that created forty accounts and refused three people is the failure this
+ * screen exists to surface, and a boolean derived from the counters would hide exactly that.
+ * `duration_seconds` is `null` while a run is still going — never "time so far", which renders a
+ * slow run as permanently unfinished.
+ */
+export type IamSyncRun = {
+  id: string;
+  provider_id: string;
+  kind: "full" | "delta" | "scim" | "manual";
+  status: "running" | "ok" | "partial" | "failed";
+  healthy: boolean;
+  started_at: string;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  counts: {
+    users_seen: number;
+    users_created: number;
+    users_updated: number;
+    users_deactivated: number;
+    groups_seen: number;
+  };
+  error_count: number;
+  message: string | null;
+  triggered_by: string | null;
+};
+
+/** One subject a run could not process, however many attempts it took. */
+export type IamFailedSubject = {
+  key: string;
+  attempts: number;
+  code: string;
+  message: string;
+  last_failed_at: string;
+};
+
+/** A provider's runs, newest first, with the counts the header shows. */
+export function fetchIamSyncRuns(
+  id: string,
+  input: { limit?: number; problemsOnly?: boolean } = {},
+): Promise<{
+  provider_id: string;
+  sync_interval_minutes: number;
+  summary: { runs: number; problems: number; running: number };
+  runs: IamSyncRun[];
+}> {
+  const params = new URLSearchParams();
+  if (input.limit) params.set("limit", String(input.limit));
+  if (input.problemsOnly) params.set("problems_only", "true");
+  const query = params.toString();
+  return request(`/api/v1/iam/providers/${id}/sync-runs${query ? `?${query}` : ""}`);
+}
+
+/**
+ * One run and the subjects it could not process.
+ *
+ * `attempts` and `subjects` are separate on purpose: three honest failures of one person are
+ * three rows underneath and one row to act on. Collapsing either direction produces a screen
+ * that looks right and is not.
+ */
+export function fetchIamSyncRun(
+  id: string,
+  runId: string,
+): Promise<{
+  run: IamSyncRun;
+  attempts: number;
+  failed_subjects: IamFailedSubject[];
+}> {
+  return request(`/api/v1/iam/providers/${id}/sync-runs/${runId}`);
+}
+
+/**
+ * Re-attempt named subjects. The names are required: an empty list would mean every subject that
+ * ever failed, which is not what the button says.
+ */
+export function retryIamSyncRun(
+  id: string,
+  runId: string,
+  subjects: string[],
+): Promise<{ retry_run_id: string; source_run_id: string; subjects: string[] }> {
+  return request(`/api/v1/iam/providers/${id}/sync-runs/${runId}/retry`, {
+    method: "POST",
+    body: JSON.stringify({ subjects }),
+  });
+}
+
+/** The groups a sync has seen, with the two values that go stale quietly. */
+export function fetchIamSyncGroups(
+  id: string,
+): Promise<{
+  provider_id: string;
+  summary: { groups: number; unsynced: number };
+  groups: {
+    id: string;
+    external_id: string;
+    external_label: string;
+    member_count: number;
+    last_seen_at: string;
+    synced: boolean;
+  }[];
+}> {
+  return request(`/api/v1/iam/providers/${id}/sync-groups`);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The attribute map (REQ-065, slice 2)
 // ---------------------------------------------------------------------------------------------
 
