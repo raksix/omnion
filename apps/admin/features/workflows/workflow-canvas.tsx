@@ -31,6 +31,8 @@ import {
   saveGraph,
   validateGraph,
 } from "@/lib/api";
+
+import { CodeEditor, ExpressionField, languageFor } from "./code-editors";
 import { ApiError } from "@/lib/api";
 import type {
   ExpressionPreview,
@@ -1635,12 +1637,15 @@ export function WorkflowCanvas({ workflowId }: { workflowId: string }) {
             {inspecting ? (
               <NodeInspector
                 nodeKey={inspecting.key}
+                workflowId={workflowId}
                 label={inspecting.label || inspecting.type}
                 params={inspecting.params}
                 disabled={inspecting.disabled}
                 type={inspectingType}
                 issues={issuesByNode.get(inspecting.key) ?? []}
                 readOnly={readOnly}
+                graph={state.document}
+                sample={sample}
                 preview={preview.nodeKey === inspecting.key ? preview : null}
                 sampleText={sampleText}
                 sampleError={sampleError}
@@ -1859,13 +1864,16 @@ function SaveBadge({
 /** One node's parameter form, generated from the registry's own schema. */
 function NodeInspector({
   nodeKey,
+  workflowId,
   label,
   params,
   disabled,
   type,
   issues,
   readOnly,
+  graph,
   preview,
+  sample,
   sampleText,
   sampleError,
   onSample,
@@ -1874,12 +1882,18 @@ function NodeInspector({
   onRename,
 }: {
   nodeKey: string;
+  /** The workflow the editors call back against. */
+  workflowId: string;
   label: string;
   params: Record<string, unknown>;
   disabled: boolean;
   type: NodeType | undefined;
   issues: GraphIssue[];
   readOnly: boolean;
+  /** The graph as the canvas holds it — the completion list is built from this, not the saved one. */
+  graph: GraphDocument;
+  /** The parsed pinned sample, the same namespaces the preview evaluates against. */
+  sample: Record<string, unknown>;
   /** The node's evaluated fields, or null when the node carries no expression. */
   preview: {
     fields: Record<string, ExpressionPreview>;
@@ -1956,7 +1970,11 @@ function NodeInspector({
               value={params[field.name]}
               readOnly={readOnly}
               preview={preview?.fields[field.name] ?? null}
-              previewLoading={preview?.loading ?? false}
+              issues={issues}
+              workflowId={workflowId}
+              nodeKey={nodeKey}
+              graph={graph}
+              sample={sample}
               onChange={(value) => onParam(field.name, value)}
             />
           ))}
@@ -2049,13 +2067,25 @@ function ParamField({
   value,
   readOnly,
   preview,
+  issues,
+  workflowId,
+  nodeKey,
+  graph,
+  sample,
   onChange,
 }: {
   field: NodeParam;
   value: unknown;
   readOnly: boolean;
   preview: ExpressionPreview | null;
-  previewLoading: boolean;
+  /** This node's validation issues, so a code editor can mark the lines they belong to. */
+  issues: GraphIssue[];
+  workflowId: string;
+  nodeKey: string;
+  /** The graph as the canvas holds it, which is what the completion list is built from. */
+  graph: GraphDocument;
+  /** The pinned sample, the same one the preview evaluates against. */
+  sample: Record<string, unknown>;
   onChange: (value: unknown) => void;
 }) {
   const id = `param-${field.name}`;
@@ -2098,7 +2128,20 @@ function ParamField({
           />
           {field.label}
         </label>
-      ) : field.ui === "textarea" || field.ui === "code" ? (
+      ) : field.ui === "code" ? (
+        // A code parameter is a real editor, not a taller textarea. Which language it is
+        // comes from the placeholder rather than a new registry field: a placeholder that
+        // names a language is a signal a person can read too, and an unrecognised one falls
+        // back to plain text rather than to a wrong grammar.
+        <CodeEditor
+          field={field.name}
+          language={languageFor(field.placeholder)}
+          value={current}
+          readOnly={readOnly}
+          issues={issues}
+          onChange={(next) => onChange(next)}
+        />
+      ) : field.ui === "textarea" ? (
         <textarea
           id={id}
           value={current}
@@ -2106,7 +2149,22 @@ function ParamField({
           placeholder={field.placeholder ?? ""}
           onChange={(event) => onChange(event.target.value)}
           className="mt-1 w-full rounded border border-line bg-background px-2 py-1 font-mono text-[11px]"
-          rows={field.ui === "code" ? 6 : 3}
+          rows={3}
+        />
+      ) : carriesExpression(current) ? (
+        // The menu only appears on a field that is *already* an expression. Offering it on
+        // every text field would put a popup over every input in the inspector, which is how
+        // an autocomplete becomes something people close.
+        <ExpressionField
+          field={field.name}
+          value={current}
+          readOnly={readOnly}
+          workflowId={workflowId}
+          nodeKey={nodeKey}
+          graph={graph}
+          namespaces={sample}
+          issues={issues}
+          onChange={(next) => onChange(next)}
         />
       ) : (
         <input
