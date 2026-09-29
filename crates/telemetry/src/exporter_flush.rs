@@ -203,19 +203,43 @@ pub async fn sweep(pool: &PgPool, collector: &Collector) -> Result<usize, crate:
 
         if let Some(after) = collector.status(&row.name) {
             persist(pool, &row, &after).await?;
-            // Once per STATE CHANGE. A backend that is down fails every sweep, and a subscriber
-            // that received `exporter.degraded` every second would learn to ignore the name and
-            // would also bury the `recovered` that follows it in a hundred identical rows. The
-            // request says "notifies holders of `observability.exporters.manage` once per state
-            // change, not per retry" — the notification, and by extension the event it is
-            // derived from.
-            if before != after.health {
+            // Once per STATE CHANGE, and **one event per outage, not one per severity step.**
+            // A backend that is down fails every sweep, and a subscriber that received
+            // `exporter.degraded` every second would learn to ignore the name and would also bury
+            // the `recovered` that follows it in a hundred identical rows. The request says
+            // "notifies holders of `observability.exporters.manage` once per state change, not per
+            // retry" — the notification, and by extension the event it is derived from.
+            //
+            // The check is therefore **"did it cross the OK boundary"**, not "did the string
+            // change". `degraded → down` is the same outage getting worse: the walk that caught it
+            // sweeps three times against a refused backend and counted exactly one event, and it
+            // saw two — because the chip walks unknown → degraded → down and both steps are
+            // string changes. The first `degraded` is the notification; the escalation to `down`
+            // is visible on the row the screen already shows, and emitting it again re-teaches the
+            // subscriber the thing this branch exists to prevent.
+            //
+            // Both directions are boundary crossings and both are needed: entering trouble is the
+            // degradation, leaving it is the recovery, and a one-sided test that only watched the
+            // string differ would fire the recovery twice for a chip that went `ok → degraded →
+            // ok` in two sweeps. A bool per direction is not a pair of `if`s you can get backwards.
+            let crossed_into = !in_trouble(&before) && in_trouble(&after.health);
+            let crossed_out = in_trouble(&before) && after.health == "ok";
+            if before != after.health && (crossed_into || crossed_out) {
                 emit_health_change(pool, &row, &before, &after).await;
             }
         }
         flushed += 1;
     }
     Ok(flushed)
+}
+
+/// Whether a chip is on the far side of the boundary the event is about.
+///
+/// `unknown` is deliberately NOT in trouble: a configured exporter that has never flushed is not
+/// an outage, and the transition INTO `degraded` is the one that matters. Counting it as trouble
+/// would make `unknown → down` a notification about an outage that had already begun silently.
+fn in_trouble(health: &str) -> bool {
+    matches!(health, "degraded" | "down")
 }
 
 /// Record `exporter.degraded` or `exporter.recovered` for one health move.
