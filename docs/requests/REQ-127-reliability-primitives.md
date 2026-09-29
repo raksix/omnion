@@ -1,6 +1,6 @@
 # REQ-127 — Reliability Primitives
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1's decision layer and slice 3's and 4's core are shipped and green: `crates/reliability` at 92 unit tests, migration `0162` applied and reversed on a scratch database — no HTTP surface yet, so no acceptance box is ticked) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -148,3 +148,62 @@ The same pass asserts the counters move in Redis and the rollup rows appear, tha
 - HMAC tolerance is a security dial: too wide invites replay, too narrow breaks clients with clock skew. Rejections name the reason, and the rejection log is the evidence an operator uses to tune it.
 - Sanitisation must stay narrow (control characters, unsupported content types, depth limits) — a "helpful" rewriting guard corrupts real payloads and is worse than no guard.
 - Breaker thresholds need per-deployment tuning; the defaults ship conservative, every threshold is editable on the screen, and `Force open` exists for a maintainer who needs the platform to stop calling a provider *now*.
+
+### Slices — progress
+
+1. **Limits + 429 semantics.** Policy model, Redis token buckets, middleware wiring, headers and
+   error code, refusal rollup and event aggregation, `/settings/reliability/limits` and the
+   dry-run tool. *Done when:* a scripted loop gets a real `429` with correct headers and the
+   screen names the winning policy.
+   — **The decision layer shipped** (`efbae1b`): `crates/reliability::limits` with
+   `LimitPolicy`, `Subject`, `pick` (specificity is the scope list's *order*, so "most specific
+   wins" is a property of the data rather than of the resolver), `decide` (pure; the same
+   function the panel's dry-run calls), `route_matches` and `should_emit` (one event per
+   window, structurally, because the emission is on the rollup's first write). Migration
+   `0162_reliability.sql` with `rate_limit_policies` and `rate_limit_refusals`, both carrying a
+   `unique nulls not distinct` constraint — which is what makes "one policy per scope" and "one
+   refusal row per window" properties of the schema rather than promises. **Verified on a scratch
+   database:** the file applies, a second `null/null` policy row is refused, a second refusal row
+   for the same window is refused, and the reversal drops all nine tables.
+
+   **Not in this slice yet:** the Redis token bucket, the middleware, the `429` headers and the
+   screen. Nothing here is reachable from HTTP, so **no acceptance box is ticked** — the
+   criteria are all about observable wire behaviour, and a box ticked on a passing unit test for
+   a function no request calls is the "documented but unreachable" shape this request's sibling
+   has produced four times.
+2. **Idempotency.** *Core shipped* (`efbae1b`): `decide` (the five-sentence contract in one
+   function), a fingerprint that canonicalises key order recursively so a client that serialises
+   the same object twice replays rather than conflicting, `StoredResponse::seal` with the
+   oversize rule stated (**never truncate** — a truncated replay is a silent corruption), and
+   `release_stale` so a crashed attempt cannot block a key forever. Table in `0162`. Store,
+   middleware and screen to come.
+3. **Retries + breakers.** *Core shipped* (`efbae1b`): `retry::delay_for` takes an explicit
+   draw so full jitter is a distribution test and none is a determinism test; `classify` makes
+   4xx permanent except `408`/`429`; `next_attempt` derives the outcome and the dead-letter flag
+   from the policy rather than taking them, and its budget check is **cumulative**. `breaker` is
+   the state machine with counters that persist across a restart and a `forced_open` flag that
+   no success, cooldown or probe can clear. Tables in `0162`. Store, loop and screens to come.
+4. **Intake guard.** *Core shipped* (`efbae1b`): `evaluate` in the order the request requires
+   (size → content type → signature presence → timestamp → replay → constant-time compare →
+   sanitise), `sanitize` asserted **byte-identical on a real payload** because the request's own
+   risk note says a rewriting guard is worse than none, and `verify_sample` — deliberately the
+   same function the request path uses, since a tester with its own signature check would tell
+   an operator "valid" for a body the platform would refuse. Tables in `0162`. Store and screen
+   to come.
+
+### Six defects the tests caught while writing this
+
+Recorded because each one was a claim a doc comment was already making, and the code was not
+doing: the breaker had **no failure counter at all** (its threshold could never be reached, so
+it never opened, and the success path cleared the window, so only a total outage would have
+opened it); the half-open path **never counted successes**, so `success_threshold: 3` closed on
+the first probe; **event names were emitted by array index** and index 4 was `retry.exhausted`,
+so a breaker that opened announced a dead letter; a **route-scoped budget matched a subject with
+no route**, spending a page-load budget on background work; the sanitiser **walked the input with
+the output's cursor**, so one removed control character silently disabled every later check; and
+the **down script was live statements**, so `Db::migrate` applied the file and then dropped every
+table it had just created.
+
+**Next.** The Redis token bucket and the middleware that turns a refusal into a `429` with
+`Retry-After` and the three `X-RateLimit-*` headers — the first thing on this request that can be
+ticked in the acceptance list, because it is the first thing a request can observe.

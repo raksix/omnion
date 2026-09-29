@@ -5374,3 +5374,71 @@ flight for this tick.
 change per suite now, and each one is a REQ that can then be closed on its browser pass rather
 than on the note that its suite was already red. (b) The `media` part of a backup run is the
 place to look next: it counts rows, and a backup that only counts is a manifest, not a backup.
+
+
+## w6 · tick 21 · REQ-127 reliability primitives — the decision layer
+
+**Merge.** `origin/main` had moved two commits (`9af16bb` docs, `ed09dc4` backup prune). The only
+conflict was `docs/BUILD-LOG.md`, resolved with the SequenceMatcher splice and a **multiset**
+verification — a line-count check would have read `base+ours+theirs = total` and hidden a
+duplicated block. My own merge script had the `delete` opcode backwards and dropped two of my
+entries; the multiset assertion caught it, which is the reason the assertion is a multiset and
+not a total.
+
+**Shipped** (`efbae1b`): `crates/reliability` — `limits`, `retry`, `breaker`, `intake`,
+`idempotency`, `vocabulary`, `error` — 92 unit tests green, plus migration
+`0162_reliability.sql` applied and reversed on a scratch database.
+
+**Proof.**
+- `cargo test -p omnion-reliability --quiet` → **92 passed, 0 failed**.
+- `pnpm typecheck` (apps/admin) → clean, 0 errors.
+- `cargo build -p omnion-api` → finished, 0 errors (the merge's compile break was already fixed
+  in `5e06b04`).
+- Migration: applies with `ON_ERROR_STOP=1` on an empty database; a second `null/null` policy
+  row is refused by `unique nulls not distinct`; a second refusal row for the same window is
+  refused; the reversal drops all nine tables.
+- Box load during the work: load average **51 → 9**, and the private-stack walkthrough reached
+  14 screens without a tab death.
+
+**Six defects the tests caught, each one contradicting a claim the doc comment already made.**
+
+1. **The breaker had no failure counter.** `record` was `pure` and never counted anything, so
+   `failure_threshold` was unreachable — the breaker could not trip. Worse, the success arm
+   cleared the count, so even with a counter only a *total* outage would have opened it.
+2. **Half-open never counted successes.** `success_threshold` was read and then ignored, so a
+   threshold of three closed on the first probe — a half-open state that cannot be half-open.
+3. **Event names by array index.** `EVENT_NAMES[4]` is `reliability.retry.exhausted`, not
+   `breaker.opened`; a breaker that opened announced a dead letter. The unit test caught it
+   because it compared the *name*, which is the only reason a wrong index is not a silent
+   misroute. Named constants now, with a test holding every constant to the table.
+4. **A route-scoped budget matched a subject with no route**, so a policy scoped for page loads
+   was also spent on background work and probes.
+5. **The sanitiser walked the input with the output's cursor.** `body.get(out.len()..)` is the
+   output's position applied to the input — correct until the first control character is
+   dropped, and the strict-escape test failed for exactly that: with a NUL earlier in the body
+   every later `\uXXXX` stopped being detected. It is a byte cursor now, with UTF-8 widths read
+   from the lead byte, because a counting loop would split a two-byte character in half and a
+   sanitiser's job is to keep output valid.
+6. **The down script was live statements.** `Db::migrate` applied the file and then dropped every
+   table it had just created — an instance with no reliability schema and a migration row
+   claiming success. It looked correct in review. Commented out like every other migration here.
+
+**Two more, where the test was the thing that was wrong**, and both are worth naming because the
+first instinct was to "fix" the code:
+
+- The retry budget test asserted exhaustion with `elapsed = 3_599_999 ms` against a 3_600_000 ms
+  budget and a 2 s next delay. That is **inside** the budget. The code was right; the arithmetic
+  in the test was not. Fixed the test and made it assert both sides of the boundary.
+- The clock-skew test wanted `retry_after = 1` for a window that has not started. The honest
+  answer is the window length, because that is when the window rolls; `1` is a lie the client
+  acts on. The **code** was right again. These are the second and third time in two weeks that a
+  red test in this workspace was a wrong test rather than a wrong implementation.
+
+**No acceptance box ticked.** Nothing here is reachable from HTTP: the criteria are all about
+observable wire behaviour, and a box ticked on a passing unit test for a function no request
+calls is the "documented but unreachable" shape REQ-126 produced four times.
+
+**Next.** The Redis token bucket and the middleware that turns a refusal into a `429` carrying
+`Retry-After` and the three `X-RateLimit-*` headers — the first thing on REQ-127 that a request
+can observe, and therefore the first thing that can be ticked in the acceptance list. The
+private-stack walkthrough is still in flight for this tick; its result is reported next.
