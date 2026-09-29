@@ -710,6 +710,26 @@ pub fn router(state: AppState) -> Router {
     let webhook_test =
         post(webhooks::test_webhook).layer(guards::require(&state, "webhooks.manage"));
 
+    // The delivery operations (REQ-016 slice 2). Reading an endpoint's history and its summary
+    // is the same power as reading the endpoint — the history belongs to it — while sending one
+    // again is not: a replay is an outbound request to somebody else's server, so it is
+    // `webhooks.manage` and never `webhooks.read`. A read-only auditor must not be able to make
+    // the platform POST to a third party by pressing a button.
+    let webhook_stats = get(webhooks::endpoint_stats).layer(guards::require(&state, "webhooks.read"));
+
+    let webhook_secret_rotate =
+        post(webhooks::rotate_secret).layer(guards::require(&state, "webhooks.manage"));
+
+    // Declared before the single-delivery path on purpose: `/deliveries/redeliver` is a literal
+    // segment and `/deliveries/{delivery_id}/redeliver` would read `redeliver` as an id if the
+    // two were registered the other way round, answering `404 no such delivery` for a request
+    // that is perfectly valid.
+    let webhook_redeliver_batch =
+        post(webhooks::redeliver_many).layer(guards::require(&state, "webhooks.manage"));
+
+    let webhook_redeliver_one = post(webhooks::redeliver_one)
+        .layer(guards::require(&state, "webhooks.manage"));
+
     let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
     // The catalogue is the platform's own registry of event names (REQ-016 slice 1), read with
@@ -1215,6 +1235,13 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
+        .route("/webhooks/{id}/deliveries/redeliver", webhook_redeliver_batch)
+        .route(
+            "/webhooks/{id}/deliveries/{delivery_id}/redeliver",
+            webhook_redeliver_one,
+        )
+        .route("/webhooks/{id}/stats", webhook_stats)
+        .route("/webhooks/{id}/secret/rotate", webhook_secret_rotate)
         .route("/webhooks/{id}/test", webhook_test)
         .route("/events", events)
         .route("/events/catalogue", event_catalogue)
