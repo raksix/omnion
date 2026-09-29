@@ -31,7 +31,7 @@
  *    for every keystroke. It falls back to a textual token list when the browser is in dark
  *    mode, because a preview that only works in one mode is a preview that lies in the other.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, Eye, Loader2, RotateCcw, Save, Undo2 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
@@ -99,21 +99,22 @@ function section(view: ThemeSettingsView, name: SectionName, from: "draft" | "pu
  *
  * A site that has never saved starts from the PUBLISHED revision, and a site that has never
  * published starts from nothing — the theme's own defaults, which arrive as `defaultTokens`
- * and are shown read-only until the first save. The alternative (always starting from the
- * theme defaults) would silently discard a published revision's values on every visit.
+ * and are shown as read-only reference values until the first save. The alternative (always
+ * starting from the theme defaults) would silently discard a published revision's values on
+ * every visit, which is the whole reason the draft and the published revision are separate
+ * rows.
  */
 function initialSettings(view: ThemeSettingsView): ThemeSettingsInput {
-  const base = emptySettings(view.themeKey);
-  const from: ThemeSettingsInput = {
+  const empty = emptySettings(view.themeKey);
+  return {
     themeKey: view.themeKey,
     tokens: section(view, "tokens", "draft") as ThemeSettingsInput["tokens"],
     typography: section(view, "typography", "draft") as ThemeSettingsInput["typography"],
     layout: section(view, "layout", "draft") as ThemeSettingsInput["layout"],
     branding: section(view, "branding", "draft") as ThemeSettingsInput["branding"],
     headerFooter: section(view, "headerFooter", "draft") as ThemeSettingsInput["headerFooter"],
-    defaultMode: view.draft?.defaultMode ?? view.published?.defaultMode ?? base.defaultMode,
+    defaultMode: view.draft?.defaultMode ?? view.published?.defaultMode ?? empty.defaultMode,
   };
-  return from;
 }
 
 function isColour(value: unknown): value is string {
@@ -136,7 +137,16 @@ export function ThemeCustomizeView() {
   const [notice, setNotice] = useState<string | null>(null);
   const [openSection, setOpenSection] = useState<SectionName>("tokens");
   const [contrastSeen, setContrastSeen] = useState(false);
-  const formRef = useRef<ThemeSettingsInput | null>(null);
+  // The form as the last SERVER response left it, kept beside the live form so "is this dirty"
+  // is a comparison of two React values rather than a read of a mutable ref during render.
+  // A ref read in a render is a lie the first time a component re-renders without the writer
+  // having run, and "you have unsaved edits" is exactly the claim that must never lie.
+  const [baseline, setBaseline] = useState<string>("");
+
+  const accept = useCallback((next: ThemeSettingsInput) => {
+    setForm(next);
+    setBaseline(JSON.stringify(next));
+  }, []);
 
   const load = useCallback(async () => {
     if (!selectedSite) return;
@@ -145,8 +155,7 @@ export function ThemeCustomizeView() {
     try {
       const next = await fetchThemeSettings(selectedSite.id);
       setView(next);
-      setForm(initialSettings(next));
-      formRef.current = initialSettings(next);
+      accept(initialSettings(next));
       setContrastSeen(false);
     } catch (caught) {
       setError((caught as ApiError).message);
@@ -161,12 +170,7 @@ export function ThemeCustomizeView() {
 
   const setField = useCallback(
     <K extends keyof ThemeSettingsInput>(key: K, value: ThemeSettingsInput[K]) => {
-      setForm((current) => {
-        if (!current) return current;
-        const next = { ...current, [key]: value };
-        formRef.current = next;
-        return next;
-      });
+      setForm((current) => (current ? { ...current, [key]: value } : current));
       setContrastSeen(false);
     },
     [],
@@ -178,9 +182,7 @@ export function ThemeCustomizeView() {
         if (!current) return current;
         const currentSection = { ...(current[name] as Record<string, unknown>) };
         currentSection[key] = value;
-        const next = { ...current, [name]: currentSection } as ThemeSettingsInput;
-        formRef.current = next;
-        return next;
+        return { ...current, [name]: currentSection } as ThemeSettingsInput;
       });
       setContrastSeen(false);
     },
@@ -193,9 +195,7 @@ export function ThemeCustomizeView() {
         if (!current) return current;
         const currentSection = { ...(current[name] as Record<string, unknown>) };
         delete currentSection[key];
-        const next = { ...current, [name]: currentSection } as ThemeSettingsInput;
-        formRef.current = next;
-        return next;
+        return { ...current, [name]: currentSection } as ThemeSettingsInput;
       });
       setContrastSeen(false);
     },
@@ -219,16 +219,14 @@ export function ThemeCustomizeView() {
     // means the theme's own defaults apply, which is what the button says it does.
     const cleared = emptySettings(view.themeKey);
     cleared.defaultMode = form?.defaultMode ?? "system";
-    setForm(cleared);
-    formRef.current = cleared;
+    accept(cleared);
     setContrastSeen(false);
   }, [form, view]);
 
   const discard = useCallback(() => {
     if (!view) return;
     const reset = initialSettings(view);
-    setForm(reset);
-    formRef.current = reset;
+    accept(reset);
     setContrastSeen(false);
     setNotice("Unsaved edits discarded. The editor is back on the last saved draft.");
   }, [view]);
@@ -241,8 +239,7 @@ export function ThemeCustomizeView() {
     try {
       const next = await saveThemeSettings(selectedSite.id, form);
       setView(next);
-      setForm(initialSettings(next));
-      formRef.current = initialSettings(next);
+      accept(initialSettings(next));
       setNotice(
         `Saved as draft revision ${next.draft?.revisionNo ?? "?"}. Visitors still see revision ${
           next.published?.revisionNo ?? "the theme defaults"
@@ -266,8 +263,7 @@ export function ThemeCustomizeView() {
       const acknowledge = view.contrast.length === 0 || contrastSeen;
       const next = await publishThemeSettings(selectedSite.id, acknowledge);
       setView(next);
-      setForm(initialSettings(next));
-      formRef.current = initialSettings(next);
+      accept(initialSettings(next));
       setContrastSeen(false);
       setNotice(`Published revision ${next.published?.revisionNo ?? "?"}. The public site renders with it now.`);
     } catch (caught) {
@@ -338,7 +334,10 @@ export function ThemeCustomizeView() {
   const findings = view.contrast;
   const themeDefaults = (view.defaultTokens ?? {}) as Record<string, unknown>;
   const hasDraft = view.draft !== null;
-  const dirty = formRef.current !== null && JSON.stringify(form) !== JSON.stringify(initialSettings(view));
+  // A comparison of the two React values. Comparing against `initialSettings(view)` instead
+  // would recompute the seed on every render and report "dirty" against a fresh object graph,
+  // which JSON.stringify happens to hide today and key ORDER would expose tomorrow.
+  const dirty = form !== null && JSON.stringify(form) !== baseline;
 
   return (
     <div className="space-y-6" data-theme-customize>
@@ -522,14 +521,12 @@ export function ThemeCustomizeView() {
                         onChange={(key, value) => setSectionValue("tokens", key, value)}
                         onReset={(key) => resetToken("tokens", key)}
                       />
-                    ) : entry.name === "typography" || entry.name === "layout" || entry.name === "branding" ? (
-                      <FlatEditor
-                        section={entry.name}
-                        values={values}
-                        onChange={(key, value) => setSectionValue(entry.name, key, value)}
-                        onRemove={(key) => clearSectionValue(entry.name, key)}
-                      />
                     ) : (
+                      /* Typography, layout, branding and header/footer are all the same
+                          shape — a flat map of named values — so they share one editor. The
+                          four section names are still passed through as data, because the
+                          stored payload is keyed by section and an editor that guessed which
+                          one it was editing is an editor that writes to the wrong one. */
                       <FlatEditor
                         section={entry.name}
                         values={values}
