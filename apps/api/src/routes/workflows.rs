@@ -185,6 +185,19 @@ pub struct StepBody {
     pub kind: String,
     /// Built-in action of a task step.
     pub action: Option<String>,
+    /// The step's inputs, as stored JSON (REQ-004 slice 3, criterion 2).
+    ///
+    /// This is the half of "clicking the node opens that step's inputs and output" that
+    /// lives on the server, and it is the half that cannot be derived in the client: the
+    /// node on the canvas carries the *authored* parameters, which is what the inspector
+    /// edits, while this is what the engine was actually handed — a run from a node, a
+    /// retry, or an edit that was never saved all leave the two different, and the one an
+    /// operator debugging a run needs is this one.
+    ///
+    /// Sent whenever the step has them, so "no inputs" reads as a missing key rather than
+    /// as a `null` a client has to distinguish from an empty object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
     /// `pending`, `running`, `waiting`, `succeeded`, `failed` or `cancelled`.
     pub status: String,
     /// The graph node this step came from, when the rule was started from a graph.
@@ -237,6 +250,7 @@ impl StepBody {
             name: step.name.clone(),
             kind: step.kind.clone(),
             action: step.action.clone(),
+            params: Some(step.params.clone()),
             status: step.status.clone(),
             node_id: step.node_id.clone(),
             skip_reason: step.skip_reason.clone(),
@@ -1032,5 +1046,86 @@ mod tests {
         assert_eq!(rendered["status"], "completed");
         assert_eq!(rendered["steps"][0]["name"], "prepare");
         assert_eq!(rendered["steps"][0]["attempts"], 1);
+    }
+
+    /// One stored step, for the tests below.
+    fn step_row(step_no: i32, status: &str, params: serde_json::Value) -> WorkflowStep {
+        WorkflowStep {
+            skip_reason: None,
+            node_id: Some(format!("node-{step_no}")),
+            branch: None,
+            approval_id: None,
+            id: Uuid::nil(),
+            execution_id: Uuid::nil(),
+            step_no,
+            name: format!("step-{step_no}"),
+            kind: "task".to_owned(),
+            action: Some("noop".to_owned()),
+            params,
+            on_error: "inherit".to_owned(),
+            timeout_ms: 30_000,
+            status: status.to_owned(),
+            attempts: 1,
+            max_attempts: 1,
+            available_at: OffsetDateTime::UNIX_EPOCH,
+            started_at: Some(OffsetDateTime::UNIX_EPOCH),
+            finished_at: Some(OffsetDateTime::UNIX_EPOCH),
+            output: Some(serde_json::json!({ "value": step_no })),
+            error: None,
+            ignored: false,
+        }
+    }
+
+    #[test]
+    fn a_step_sends_its_inputs_and_its_output() {
+        // REQ-004 slice 3, criterion 2: "clicking the node opens that step's inputs and
+        // output". The client half renders a panel; this test is the half that has to be
+        // true for the panel to have anything to render.
+        //
+        // The assertion is on the SERIALISED body, not on the struct. A field that is set on
+        // `StepBody` and dropped by a `skip_serializing_if` that always fires is a field the
+        // client never sees, and a struct-level assertion would call that a pass — the same
+        // shape of gap as the `node_id` one this criterion already paid for once.
+        let body = StepBody::build(&step_row(
+            2,
+            "succeeded",
+            serde_json::json!({ "url": "https://example.test/hook", "retries": 3 }),
+        ));
+        let rendered = serde_json::to_value(&body).expect("a step serialises");
+
+        assert_eq!(rendered["params"]["url"], "https://example.test/hook");
+        assert_eq!(rendered["params"]["retries"], 3);
+        assert_eq!(rendered["output"]["value"], 2);
+    }
+
+    #[test]
+    fn an_empty_input_object_is_still_sent() {
+        // The distinction the client's `describePayload` turns on: a step whose inputs are
+        // `{}` RAN and took nothing, while a step whose inputs are missing was never told
+        // anything. Omitting an empty object would collapse those two into one, and the
+        // panel would claim the second about the first.
+        let body = StepBody::build(&step_row(1, "succeeded", serde_json::json!({})));
+        let rendered = serde_json::to_value(&body).expect("a step serialises");
+        assert!(
+            rendered.get("params").is_some(),
+            "an empty input object is still an input object, not an absent key"
+        );
+        assert!(rendered["params"].is_object());
+    }
+
+    #[test]
+    fn a_step_that_produced_nothing_sends_a_null_output_rather_than_a_fake_one() {
+        // The other half: a `pending` step has no output and says so. Inventing an empty
+        // object here would let the panel report "the step ran and returned nothing" for a
+        // step that has not run at all.
+        let mut step = step_row(1, "pending", serde_json::json!({}));
+        step.output = None;
+        step.finished_at = None;
+        let rendered = serde_json::to_value(StepBody::build(&step)).expect("a step serialises");
+        assert!(rendered["output"].is_null());
+        // `error` is sent unconditionally, so a step with no failure reads as a null rather
+        // than as an absent key. The client must not have to tell those apart, and the
+        // trace panel renders `error` only when it is a string.
+        assert!(rendered["error"].is_null());
     }
 }
