@@ -1907,3 +1907,123 @@ export type SeoOverview = {
   broken_links: SeoBrokenLink[];
   robots_warnings: string[];
 };
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 2) — the header policy
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Whether the CSP is enforced or only reported.
+ *
+ * The two are mutually exclusive on the wire: `report_only` sends
+ * `Content-Security-Policy-Report-Only` and sends no enforcing header at all, because sending
+ * both applies the policy while claiming to only report it.
+ */
+export type CspMode = "report_only" | "enforce";
+
+/**
+ * One CSP directive row.
+ *
+ * `values` is a **list**, not a string: a source with a space in it is refused by the server,
+ * and a form that joined them into one field would only discover that on save. Splitting here
+ * is what lets the directive field and the source field be edited apart.
+ */
+export type CspDirective = {
+  directive: string;
+  values: string[];
+};
+
+/** HSTS as stored. `max_age_seconds: null` means the header is not sent at all. */
+export type HstsPolicy = {
+  max_age_seconds: number | null;
+  include_subdomains: boolean;
+  preload: boolean;
+};
+
+/**
+ * One rendered header line.
+ *
+ * `value: null` is **not** an omission — it is "configured off", and the screen renders it as a
+ * row with a strike rather than hiding it. A header an operator turned off and cannot see is a
+ * header they will not know is off. `rendered` is produced by the same function the response
+ * middleware applies, which is what makes the preview a preview.
+ */
+export type HeaderLine = {
+  name: string;
+  value: string | null;
+};
+
+/** The policy as `GET /api/v1/security/headers` returns it. */
+export type HeaderPolicyDocument = {
+  csp_mode: CspMode;
+  csp: CspDirective[];
+  hsts: HstsPolicy;
+  content_type_options: boolean;
+  referrer_policy: string | null;
+  permissions_policy: string[];
+  /** The exact lines a response carries right now. */
+  rendered: HeaderLine[];
+  /** `false` means nobody has saved a policy yet and the baseline is showing. */
+  saved: boolean;
+  updated_by: string | null;
+  updated_at: string | null;
+};
+
+/** The save request. `expected_document` is the compare-and-swap key. */
+export type HeaderPolicySave = {
+  csp_mode: CspMode;
+  csp: CspDirective[];
+  hsts_max_age_seconds: number | null;
+  hsts_include_subdomains: boolean;
+  hsts_preload: boolean;
+  content_type_options: boolean;
+  referrer_policy: string | null;
+  permissions_policy: string[];
+  expected_document?: unknown;
+};
+
+/** The save's answer: the stored policy, flattened, plus the history row it wrote. */
+export type HeaderPolicySaved = HeaderPolicyDocument & { change_id: number | null };
+
+/** The directives this build recognises, in render order — the form's own dropdown. */
+export const CSP_DIRECTIVE_NAMES = [
+  "default-src",
+  "base-uri",
+  "object-src",
+  "frame-ancestors",
+  "script-src",
+  "script-src-elem",
+  "script-src-attr",
+  "style-src",
+  "img-src",
+  "font-src",
+  "connect-src",
+  "form-action",
+  "frame-src",
+  "media-src",
+  "worker-src",
+  "manifest-src",
+  "upgrade-insecure-requests",
+  "block-all-mixed-content",
+  "require-trusted-types-for",
+] as const;
+
+/** The `Referrer-Policy` values browsers implement. An empty choice sends no header. */
+export const REFERRER_POLICIES = [
+  "no-referrer",
+  "no-referrer-when-downgrade",
+  "origin",
+  "origin-when-cross-origin",
+  "same-origin",
+  "strict-origin",
+  "strict-origin-when-cross-origin",
+  "unsafe-url",
+] as const;
+
+/**
+ * The `max-age` below which a browser ignores the whole HSTS header (~6 months).
+ *
+ * Kept beside the form because it is the difference between "a shorter policy" and "a policy
+ * the browser silently drops", and an operator setting 3600 deserves to be told before saving.
+ */
+export const MIN_HSTS_MAX_AGE = 15_768_000;
