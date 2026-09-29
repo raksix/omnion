@@ -5951,3 +5951,51 @@ migrate on its own branch.
 which is why the slice is still open. Then the scoped QA pass with the w5 stack (`QA_STACK=w5 QA_API_PORT=18084
 QA_ADMIN_PORT=3104 QA_WEB_PORT=3204`), which this tick could not run: it needs a browser and the box is at
 load 30+.
+
+## Tick 32 — wave 5 · REQ-017 slice 3, the panel
+
+**What.** The UI half of slice 3, in five commits: `07464d7` the client and its types, `0c37234` the
+Changes tab with its checkbox column, `2332e37` the promotion dialog, `61c8d1c` the Promotions tab and
+the tab strip, `5c8870d` the browser claims, `ab32a41` the REQ's own record. `pnpm typecheck` green;
+`cargo test -p omnion-environment --quiet` 50/50.
+
+**Three decisions that are the slice, in one place.**
+
+1. **The deploy key is read, not assumed.** The dialog asks `GET /api/v1/iam/effective-permissions` —
+   the route deliberately left unguarded because it answers *"what may I do here"* — and looks for
+   `deployment.deploy` in the answer. That is the same resolver the route guard, the role screens and
+   the simulator use, so the button and the guard cannot drift. A panel that rendered "Approve and
+   deploy" for everyone would produce a `403` toast on the one click that writes to production.
+2. **The typed-confirmation threshold belongs to the server.** Above 25 items the operator types the
+   environment's name, and *which* branch is taken is `promotion.requires_typed_confirmation` rather
+   than a count compared against a constant in the panel. That branch is the safety one: a panel-side
+   copy would drift the first time the server moved it, and the drift would be a gate quietly not
+   asking people to be careful.
+3. **A bulk action names its own scope.** `Promote selection (1)` after one checkbox, `Promote all 7`
+   with none — and select-all only ever reaches the rows the filter left visible. A selection is also
+   dropped when the re-read change set no longer holds it, because a checkbox the table cannot show is
+   one the operator cannot uncheck and the promotion would freeze a row that is not on screen.
+
+**Proof.** `pnpm typecheck` → 2/2 packages green. `cargo test -p omnion-environment --quiet` → **50
+passed, 0 failed**. `cargo test -p omnion-api --lib` was started and is still compiling the API
+dependency tree under load 17; it is not claimed as green here.
+
+**The gate did not run, and that is what keeps slice 3 open.** A sibling writer held the QA slot for
+the whole tick (holder pid 3490157, alive at the end), `/dev/shm` sat at 94% and load at 17. Starting
+a browser pass into that would have fought the same resources and produced a red that said nothing
+about the code. So `runEnvironmentsDepth` grew four claims — the selection names its scope, the
+dialog leads with a count, requesting writes a `promotions` row read back from the database, and the
+Promotions tab survives a full navigation — and **not one of them has executed**. A screen nobody has
+opened is not a screen that works, and the REQ's walkthrough box stays unticked for that reason alone.
+
+**Two things the fixture got wrong before the pass could, both found by reading the schema.** A page
+has no `title` column — the title lives on its `page_revisions` row — so the seed writes both, and a
+`pages.title` insert would have failed on its first statement and been reported as a broken promotion
+screen. And the `promotions` delete in the cleanup is wrapped: against a database that predates
+migration 0161 an unguarded delete aborts in the *cleanup*, throwing away the steps already collected
+and reporting red for a missing table rather than for anything the screen did.
+
+**Next.** Run the pass on the w5 stack (`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104
+QA_WEB_PORT=3204`) as the first thing the slot frees, and require the four new claims plus the six
+existing ones. Slice 4 is then `noindex` on staging hosts, the header environment chip and the
+`promotion.*` webhook delivery.
