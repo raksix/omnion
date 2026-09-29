@@ -684,10 +684,14 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
     record_binding_health(pool, &source, submission).await;
 
     let spam = SpamVerdict::evaluate(&submission.payload);
+    // The first touch is looked up by the MAPPED address (`mapped`, not `payload`): the lead
+    // row is written with the mapped value, so keying the lookup on the raw payload's `email`
+    // compared two different names and found nothing.
     let attribution = merge_attribution(
         pool,
         &source,
-        submission,
+        submission.organization_id,
+        &mapped,
         &Attribution::from_payload(&submission.payload),
     )
     .await?;
@@ -1168,27 +1172,37 @@ pub async fn fetch_candidates(
 /// Keyed on the dedupe key rather than on a cookie or a fingerprint: a returning visitor who
 /// submits twice *is* the same lead by definition, and a fingerprint cookie is both a privacy
 /// problem and a value a bot can clear.
+///
+/// **The key is the MAPPED address, not `payload["email"]`.** This read the raw payload's
+/// `email` key, which is one mapping away from the value the lead row is actually written
+/// with — so every source whose form calls the field anything else (`e_mail`, `contact_email`,
+/// `eposta`, `your_email`) silently kept no first touch at all, and a second submission
+/// overwrote the campaign that first brought the visitor in. The unit tests could not see
+/// it: they all map `email` from a key called `email`, so the two names coincided, and the
+/// merge test drove `merge_first_touch` directly with hand-built `Attribution` values.
+///
+/// `dedupe::dedupe_key` is the right key for the same reason it is the right key for the
+/// duplicate queue: it is the one function that already answers "which stored lead is this
+/// the same person as", and answering that question a second time in a second place is how
+/// the two answers drift apart.
 async fn merge_attribution(
     pool: &PgPool,
     source: &IntakeSource,
-    submission: &Submission,
+    organization_id: Uuid,
+    mapped: &MappedValues,
     later: &Attribution,
 ) -> Result<Attribution> {
-    let Some(key) = submission
-        .payload
-        .get("email")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| dedupe::normalize_email(Some(value)))
-    else {
+    let Some(key) = dedupe::dedupe_key(mapped) else {
         return Ok(later.clone());
     };
     let row: Option<StoredAttribution> = sqlx::query_as(
         "select utm_source, utm_medium, utm_campaign, utm_term, utm_content, click_id, \
                 referrer_host, landing_path, source_path from crm_leads \
-         where organization_id = $1 and source_id = $2 and lower(email) = $3 \
+         where organization_id = $1 and source_id = $2 \
+           and (lower(email) = $3 or lower(coalesce(phone, '')) = $3) \
          order by received_at asc limit 1",
     )
-    .bind(submission.organization_id)
+    .bind(organization_id)
     .bind(source.id)
     .bind(&key)
     .fetch_optional(pool)
