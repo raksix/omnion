@@ -44,10 +44,26 @@ the preview endpoint and none may be refused.** An offered candidate is a promis
 the assertion that stops the two halves of slice 3 drifting into a feature worse than none — a
 menu full of paths that preview as errors teaches a person to ignore the menu.
 
-**The browser pass has still not run.** `runGraphCanvasDepth` remains unwalked. This tick the
-QA slot was *free* and the box was not: load average peaked at 178 with nine writers' cargo
-target directories filling /dev/shm to 100% and 0 GiB available, which is the real reason
-rather than the queue. No gesture acceptance box is ticked.
+**The browser pass ran, and found a bug in the harness before it reached the canvas.** The
+slot came free around 13:51, so the pass was launched — and `run.sh` failed with
+`Script not found: /mnt/apopic/omnion-w10/target/debug/omnion-api`. It honours `CARGO_TARGET_DIR`
+for the *build* but starts pm2 from `QA_API_BIN`, which defaults to `$ROOT/target/debug/…`; a
+writer building out of tree has to pass both.
+
+Then three consecutive passes died on `migration 19 was previously applied but is missing in
+the resolved migrations`, a sentence that names a migration and so sends you auditing 41 SQL
+files that are all fine. The cause was `pm2 restart`, which **keeps the environment a process
+was first started with**: an earlier attempt had left a process pointing at the main writer's
+`omnion_qa` while every later pass reset `omnion_qa_w10`, and each restart faithfully
+reconnected to the database nobody had reset. `run.sh` now does `delete` + `start` for all
+three processes (`203bc77`) — the ports, the CSRF secret and the binary path are inherited the
+same way, and each has changed between passes at least once.
+
+**With that fixed the pass ran for real** — 750 clicks across 47 pages — and then the browser
+died at `runPalette` with `Target page, context or browser has been closed`, the box-wide tab
+death with ten chromes on the machine. It never reached the graph-canvas routes, so
+`runGraphCanvasDepth` remains unwalked and **no gesture acceptance box is ticked**. The 47 pages
+it did reach are evidence the harness works; they are not evidence about the canvas.
 
 **Next.** Run the walkthrough when the box has room. Then slice 3's last owed item: the
 type-aware half of connects (`connection_type_mismatch`), which belongs to REQ-088's ports.
