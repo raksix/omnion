@@ -78,12 +78,42 @@ export type LeadEvent = {
   created_at: string;
 };
 
-/** The lead detail: the row, the payload as submitted and the trail. */
+/**
+ * One step of the documented flow, as the server computed it.
+ *
+ * The stepper does not decide these states in the browser: the server knows the row *and*
+ * which modules this deployment has, and a client that worked it out itself would be the
+ * second place the two can disagree.
+ */
+export type LeadStep = {
+  key: "lead" | "opportunity" | "quotation" | "customer";
+  state: "done" | "current" | "pending" | "blocked";
+  note: string;
+};
+
+/** The lead detail: the row, the payload as submitted, the trail and the plan. */
 export type LeadDetail = {
   lead: Lead;
   payload: Record<string, unknown>;
   payload_bytes: number;
   timeline: LeadEvent[];
+  steps: LeadStep[];
+};
+
+/** What a conversion produced — and what it could not, which is a field not an error. */
+export type LeadConversion = {
+  lead: Lead;
+  contact_id: string;
+  contact_created: boolean;
+  deal_id: string | null;
+  deal_skipped: string | null;
+};
+
+/** Which of the documented flow's modules this deployment actually has. */
+export type LeadFlow = {
+  crm: boolean;
+  sales: boolean;
+  commerce: boolean;
 };
 
 /** One page of the inbox, with the counters from the same read. */
@@ -239,6 +269,25 @@ export function markLeadResponded(id: string): Promise<Lead> {
     method: "POST",
     body: JSON.stringify({}),
   });
+}
+
+/**
+ * Turn a lead into a contact and an opportunity.
+ *
+ * Pressing it twice is safe by construction — the store reuses the contact the dedupe pass
+ * already linked and never makes a second one — so this carries no idempotency key of its
+ * own, for the same reason `markLeadResponded` does not.
+ */
+export function convertLead(id: string): Promise<LeadConversion> {
+  return request<LeadConversion>(`/api/v1/crm/leads/${encodeURIComponent(id)}/convert`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** What this deployment can do with the documented flow, so the stepper can say so. */
+export function fetchLeadFlow(): Promise<LeadFlow> {
+  return request<LeadFlow>("/api/v1/crm/leads/flow");
 }
 
 /** Refuse a lead, keeping the row and the reason the API demands. */

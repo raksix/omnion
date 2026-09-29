@@ -15,17 +15,20 @@
  * * **Right — the work.** `Mark responded` (idempotent on the first instant, so a double click
  *   cannot rewrite the measurement an SLA report rests on), `Reject` with a required reason,
  *   and the match panel with the key the dedupe passed actually matched on.
- * * **The conversion stepper is honest about what exists.** Contact and deal conversion are
- *   slice 3 (`crm.leads.convert` does not exist yet), so the stepper draws the four documented
- *   steps and marks the two that are not built as "not available yet" *with the permission that
- *   will do it* — instead of drawing a button that answers a 404. A dead button is the one
- *   thing a panel must not ship.
+ * * **The conversion stepper reports what the server knows.** `Convert` is a real call to
+ *   `crm.leads.convert` and the four documented steps come back *computed* from the lead row
+ *   and from which modules this deployment actually has — so "the sales module is not
+ *   installed here" and "nobody pressed the button yet" are different sentences, each with
+ *   its own note. The previous build hard-coded four strings saying the buttons did not
+ *   exist; a panel that says "waiting" for a module that will never arrive is a bug report
+ *   against a working platform, and a dead button is the one thing a panel must not ship.
  */
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
+  ArrowRight,
   Ban,
   Check,
   FileWarning,
@@ -50,6 +53,7 @@ import {
   slaState,
 } from "@/lib/crm-intake";
 import {
+  convertLead,
   deleteLead,
   fetchLead,
   markLeadResponded,
@@ -57,7 +61,9 @@ import {
   rejectLead,
   patchLead,
   type Lead,
+  type LeadConversion,
   type LeadDetail as LeadDetailBody,
+  type LeadStep,
 } from "@/lib/crm-intake-api";
 
 type Draft = {
@@ -98,6 +104,10 @@ export function LeadDetail() {
   const [showRaw, setShowRaw] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
+  // What the last `Convert` actually produced, kept apart from `notice` because the
+  // interesting half is the `deal_skipped` sentence — "the CRM module is not installed" is
+  // information the operator needs after the toast has gone.
+  const [conversion, setConversion] = useState<LeadConversion | null>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -122,6 +132,36 @@ export function LeadDetail() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * Convert, and reload.
+   *
+   * It reloads rather than patching the row in place, and the reason is that the step plan
+   * *changes* — the opportunity becomes done and the quotation becomes reachable — so a
+   * local merge of the returned lead would leave the stepper showing the pre-conversion
+   * state next to a post-conversion lead. A stale stepper is worse than a re-read.
+   */
+  const convert = async () => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const answer = await convertLead(id);
+      setConversion(answer);
+      setNotice(
+        answer.deal_skipped
+          ? "The contact is ready. The opportunity is not."
+          : "The lead is now a contact and an opportunity.",
+      );
+      await load();
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError ? caught.message : "The lead could not be converted.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const run = async (action: () => Promise<Lead>, message: string) => {
     setBusy(true);
@@ -606,8 +646,13 @@ export function LeadDetail() {
               Conversion
             </h3>
             <ol data-conversion-stepper className="flex flex-col gap-2.5 px-4 py-3 text-[12.5px]">
-              {CONVERSION_STEPS.map((step) => (
-                <li key={step.key} data-step={step.key} className="flex items-start gap-2.5">
+              {detail.steps.map((step, index) => (
+                <li
+                  key={step.key}
+                  data-step={step.key}
+                  data-state={step.state}
+                  className="flex items-start gap-2.5"
+                >
                   <span
                     className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
                       step.state === "done"
@@ -618,15 +663,46 @@ export function LeadDetail() {
                     }`}
                     aria-hidden
                   >
-                    {step.state === "done" ? "✓" : step.order}
+                    {step.state === "done" ? "✓" : index + 1}
                   </span>
                   <span className="flex flex-col">
-                    <span className="font-medium">{step.label}</span>
+                    <span className="font-medium">{STEP_LABEL[step.key]}</span>
                     <span className="text-[11.5px] text-muted">{step.note}</span>
                   </span>
                 </li>
               ))}
             </ol>
+            {conversion ? (
+              <p
+                data-conversion-result
+                className="mx-4 mb-3 rounded-lg border border-line bg-quiet-soft px-3 py-2 text-[11.5px] text-muted"
+              >
+                {conversion.deal_skipped
+                  ? `Contact ready. ${conversion.deal_skipped}.`
+                  : `Contact and opportunity ready${
+                      conversion.contact_created ? " (contact created)" : " (existing contact reused)"
+                    }.`}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap gap-2 border-t border-line px-4 py-3">
+              <button
+                type="button"
+                data-lead-convert
+                data-qa-guard="crm-intake-depth"
+                disabled={busy || lead.deal_id !== null}
+                onClick={() => void convert()}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-accent bg-accent-soft px-3 py-1.5 text-[12.5px] text-accent-strong disabled:opacity-50"
+              >
+                <ArrowRight className="size-3.5" aria-hidden />
+                {lead.deal_id ? "Opportunity created" : "Convert"}
+              </button>
+              {lead.deal_id ? (
+                <span className="inline-flex items-center gap-1.5 self-center text-[11.5px] text-muted">
+                  <Check className="size-3.5" aria-hidden />
+                  Deal linked
+                </span>
+              ) : null}
+            </div>
           </div>
 
           <div className="rounded-xl border border-line bg-surface">
@@ -706,28 +782,10 @@ export function LeadDetail() {
   );
 }
 
-/** The four documented steps and what this build can honestly claim about each. */
-const CONVERSION_STEPS: { key: string; order: number; label: string; note: string; state: "done" | "current" | "pending" }[] = [
-  { key: "lead", order: 1, label: "Lead", note: "This submission. Arrived through its intake source.", state: "done" },
-  {
-    key: "opportunity",
-    order: 2,
-    label: "Opportunity",
-    note: "Contact and deal conversion land in slice 3 — crm.leads.convert is not built yet, so there is no button that would answer a 404.",
-    state: "current",
-  },
-  {
-    key: "quotation",
-    order: 3,
-    label: "Quotation",
-    note: "Opens with the product interest pre-filled once the sales module (REQ-052) is on this branch.",
-    state: "pending",
-  },
-  {
-    key: "customer",
-    order: 4,
-    label: "Customer",
-    note: "Runs through the commerce path (REQ-008) when commerce is installed and the quote is accepted.",
-    state: "pending",
-  },
-];
+/** The four documented steps, in order. The *state* of each comes from the server. */
+const STEP_LABEL: Record<LeadStep["key"], string> = {
+  lead: "Lead",
+  opportunity: "Opportunity",
+  quotation: "Quotation",
+  customer: "Customer",
+};
