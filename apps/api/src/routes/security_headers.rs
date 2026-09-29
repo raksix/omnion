@@ -210,7 +210,11 @@ pub async fn put(
     // carries the directive *names* and the mode — never the values, because a CSP value is
     // still configuration somebody considers sensitive and an event travels further than the
     // panel does.
-    bus::emit(
+    //
+    // A failure here is logged, not surfaced: the policy has already been stored and the audit
+    // entry below is the authoritative record, so answering 500 would tell the operator their
+    // edit was lost when it is in the database and on the next response.
+    if let Err(error) = bus::emit(
         state.db().pool(),
         NewEvent::new("security.headers.updated")
             .organization(session.user.organization_id)
@@ -220,7 +224,10 @@ pub async fn put(
                 "directives": policy.csp.iter().map(|row| row.directive.clone()).collect::<Vec<_>>(),
             })),
     )
-    .await;
+    .await
+    {
+        tracing::warn!(error = %error, "the header policy was saved but the event was not recorded");
+    }
 
     record_audit(
         state.db().pool(),
