@@ -513,17 +513,53 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
         return Err(CrmIntakeError::RateLimited);
     }
 
-    // One submission, one lead: a retried delivery finds the row the first one wrote.
-    if let Some(submission_id) = submission.submission_id.as_deref() {
-        if let Some(existing) = find_lead_by_submission(pool, source.id, submission_id).await? {
-            return Ok(Captured {
-                spam: SpamVerdict::default(),
-                attribution: Attribution::default(),
-                verdict: Verdict::Unique,
-                lead: existing,
-            });
-        }
-    }
+    // **One submission, one lead — enforced by the claim, not by this read.**
+    //
+    // The line this replaces was `find_lead_by_submission(...)` returning early. It looked
+    // like the same thing and was not: a read followed by an unguarded insert has no lock and
+    // nothing to collide with, so two deliveries of the same `content.form.submitted` arriving
+    // together both read "not found" and both write a lead. The platform's events are
+    // at-least-once by contract, and nothing about the second lead is an *error* — it is a
+    // well-formed row with its own dedupe verdict, which is why no gate in this crate ever
+    // went red over it.
+    //
+    // The claim is taken here, before the work, and completed at every return below. Taken
+    // *before* rather than in the same transaction as the insert on purpose: a claim released
+    // by a failed capture is re-claimable, so a burst of retries collides again on exactly the
+    // submissions that are already failing. A claim that dies open is recoverable; a claim
+    // that frees itself is not.
+    let claim = match submission.submission_id.as_deref() {
+        Some(submission_id) => match crate::claims::take(pool, source.id, submission_id).await? {
+            crate::claims::Claimed::Owned { claimed_at } => Some(claimed_at),
+            crate::claims::Claimed::Taken { lead_id } => {
+                // The winner either finished already — answer with its lead — or is still
+                // writing it. `None` is a real answer and not a failure: the lead exists or is
+                // about to, and a delivery that spins until it appears has re-introduced the
+                // load the claim was taken to shed. One reference is owed to a caller that
+                // sent an idempotency key, so an open claim falls back to the earlier read —
+                // which is safe precisely because it can only add work, never remove it.
+                let reference = match lead_id {
+                    Some(id) => find_lead(pool, submission.organization_id, id).await?,
+                    None => find_lead_by_submission(pool, source.id, submission_id).await?,
+                };
+                return match reference {
+                    Some(lead) => Ok(Captured {
+                        spam: SpamVerdict::default(),
+                        attribution: Attribution::default(),
+                        verdict: Verdict::Unique,
+                        lead,
+                    }),
+                    None => Err(CrmIntakeError::invalid(format!(
+                        "submission \"{submission_id}\" is already being captured; \
+                         retry with the same key once that attempt finishes"
+                    ))),
+                };
+            }
+        },
+        // No key: every attempt is its own lead, which is the honest reading of a form post a
+        // browser may resend. See `apps/api`'s `idempotency_key`.
+        None => None,
+    };
 
     let lines = source.mapping_lines();
     let mapped = mapping::apply(&lines, &submission.payload)?;
@@ -574,6 +610,11 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
             Some("a submission was rejected: the mapping produced no contactable lead"),
         )
         .await?;
+        // A rejected submission is still *this* submission's one lead, so the claim completes
+        // on this path too. Leaving it open would make a redelivery of a rejected submission
+        // answer "already being captured" for ever, and the operator's own re-submit test on a
+        // broken form is exactly the case that would hit it.
+        finish_claim(pool, submission, &source, claim, lead.id).await;
         return Ok(Captured {
             lead,
             verdict: Verdict::Unique,
@@ -602,6 +643,7 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
         )
         .await?;
         record_source_outcome(pool, source.id, true, Some("spam heuristics fired")).await?;
+        finish_claim(pool, submission, &source, claim, lead.id).await;
         return Ok(Captured {
             lead,
             verdict: Verdict::Unique,
@@ -727,12 +769,44 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
     );
 
     record_source_outcome(pool, source.id, true, None).await?;
+    finish_claim(pool, submission, &source, claim, lead.id).await;
     Ok(Captured {
         lead,
         verdict,
         spam,
         attribution,
     })
+}
+
+/// Point the submission's claim at the lead this capture wrote.
+///
+/// A no-op when there is no claim, which is the `submission_id: None` path — every attempt its
+/// own lead, and there is nothing to collide with. A failure here is **logged, not propagated**:
+/// the lead is already stored and the caller is owed its `202`, so unwinding here would answer
+/// `500` for a submission that was captured. The cost of losing the completion is the honest
+/// one: the claim stays open, the sweeper takes it over after `CLAIM_STALE_AFTER`, and the
+/// redelivery finds the same lead rather than writing a second one.
+async fn finish_claim(
+    pool: &PgPool,
+    submission: &Submission,
+    source: &IntakeSource,
+    claim: Option<time::OffsetDateTime>,
+    lead_id: Uuid,
+) {
+    let (Some(claimed_at), Some(submission_id)) = (claim, submission.submission_id.as_deref())
+    else {
+        return;
+    };
+    if let Err(error) =
+        crate::claims::complete(pool, source.id, submission_id, claimed_at, lead_id).await
+    {
+        tracing::warn!(
+            lead_id = %lead_id,
+            source_id = %source.id,
+            error = %error,
+            "the lead was captured but its submission claim was not completed"
+        );
+    }
 }
 
 /// A stored attribution, read back as a row.

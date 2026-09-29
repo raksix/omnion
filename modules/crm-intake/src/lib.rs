@@ -36,6 +36,7 @@ pub mod assignment;
 pub mod assignment_store;
 pub mod autoresponder;
 pub mod autoresponder_store;
+pub mod claims;
 pub mod convert;
 pub mod convert_store;
 pub mod dedupe;
@@ -49,6 +50,10 @@ pub mod vocabulary;
 pub use assignment::{
     AssignmentInput, AssignmentOutcome, AssignmentRule, BusinessHours, SlaPolicy, SlaState, due_at,
     next_position, renumber, simulate, validate_policy, validate_rule,
+};
+pub use claims::{
+    CLAIM_STALE_AFTER, Claimed, MAX_SUBMISSION_ID, complete as complete_claim, lead_of as claim_lead,
+    take as take_claim, take_over_stale,
 };
 pub use assignment_store::{
     Breach, NewPolicy, NewRule, claim_assignment, create_policy, create_rule, delete_policy,
