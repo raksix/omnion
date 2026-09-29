@@ -27,6 +27,7 @@ pub mod sanitize;
 pub mod seo;
 pub mod seo_csv;
 pub mod templates;
+pub mod themes;
 pub mod translations;
 pub mod validation;
 
@@ -74,6 +75,14 @@ pub use pages::{
     create_page, current_draft, delete_page, find_page, find_page_by_slug, find_revision,
     latest_revision, list_pages, list_revisions, publish_page, restore_revision, unpublish_page,
     update_page,
+};
+// The theme bounds are deliberately NOT re-exported here, for the same reason
+// `MAX_NAME_LENGTH` is not: `patterns` and `seo_csv` already export one with the same name
+// and a different meaning. A caller that wants the theme's bound asks `themes::MAX_NAME_LENGTH`.
+pub use themes::{
+    Activation, ActivationChange, ActivationRequest, DEFAULT_THEME_KEY, GalleryEntry,
+    GalleryView, ManifestShape, SOURCES, Theme, activate, active_theme_key, describe, find_theme,
+    gallery, gallery_for_site, manifest_shape, read_activation, restore_previous, sync_bundled,
 };
 pub use patterns::{
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate,

@@ -69,6 +69,7 @@
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
+pub mod themes;
 pub mod ai;
 pub mod analytics;
 pub mod auth;
@@ -1100,6 +1101,18 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "content.pages.update"));
     let featured_candidates =
         get(featured_media::list_candidates).layer(guards::require(&state, "media.read"));
+    // The theme gallery (REQ-062 slice 1). Two read permissions and one write, and the
+    // split follows the question each one answers rather than the verb: the gallery is a
+    // listing (`themes.read`), the single theme is the renderer's own lookup, and activation
+    // is the only thing on this surface that changes what a signed-out visitor sees — so it
+    // carries its own key and cannot be reached by a `themes.read` account.
+    let themes_gallery =
+        get(themes::list_gallery).layer(guards::require(&state, "themes.read"));
+    let theme_read = get(themes::get_theme).layer(guards::require(&state, "themes.read"));
+    let theme_activate =
+        post(themes::activate_theme).layer(guards::require(&state, "themes.activate"));
+    let theme_rollback =
+        post(themes::rollback_theme).layer(guards::require(&state, "themes.activate"));
     let seo_redirect_create =
         post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
     let seo_redirect_write = put(seo::update_redirect)
@@ -1821,6 +1834,10 @@ pub fn router(state: AppState) -> Router {
             media_version_download,
         )
         .route("/public/pages/{slug}", public_pages)
+        .route("/themes", themes_gallery)
+        .route("/themes/{key}", theme_read)
+        .route("/sites/{site_id}/theme", theme_activate)
+        .route("/sites/{site_id}/theme/rollback", theme_rollback)
         .route("/public/media/{id}", public_media)
         // The share token route: unauthenticated by nature, because the token is the
         // credential. It is a *static* `shared` segment, so it never collides with the

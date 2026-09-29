@@ -255,6 +255,19 @@ catalogue! {
     "A member started a visitor session.",
     [("member_id", Uuid, req), ("site_id", Uuid, req)];
 
+    // ---- Themes ------------------------------------------------------------------------------
+    // Both rows are `Live`: an activation writes the row inside the request, so a subscriber
+    // to a cache invalidation hears about a theme switch from the switch itself rather than
+    // from a poll. `previous_theme_key` is `opt` and not `req` because the first activation of
+    // a site has nothing to replace — and a required field an emitter cannot fill is a promise
+    // the platform cannot keep, which is worse than a field a consumer must null-check.
+    "themes.theme.activated", "content", Live,
+    "A site activated a theme.",
+    [ ( "site_id", Uuid, req ), ( "theme_key", String, req ), ( "previous_theme_key", String, opt ) ] ;
+    "themes.theme.rolled_back", "content", Live,
+    "The theme a site was on before its last activation was restored.",
+    [ ( "site_id", Uuid, req ), ( "theme_key", String, req ), ( "previous_theme_key", String, opt ) ] ;
+
     // ---- Media ---------------------------------------------------------------------------------
     // The upload fact is `media.created`, not `media.uploaded`. The registry is written from
     // what the code emits rather than from what the request imagined: renaming the row to

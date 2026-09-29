@@ -146,6 +146,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
     // address on it, so "somebody may look at the list" must not imply "somebody may re-add the
     // people who left". An operator who can import a CSV can undo an unsubscribe in one action,
     // and that is a moderation power, not a reporting one.
+    // Themes (REQ-062). Three keys because the surface has three different powers: seeing the
+    // gallery, reading one manifest (what the renderer's preview frame does), and changing
+    // which theme a site renders with. The last one is deliberately not implied by the first:
+    // a theme switch changes every page a signed-out visitor sees, and an account that may
+    // only LOOK at the gallery is a very common setup.
+    PermissionDef {
+        key: "themes.read",
+        category: "content",
+        description: "Read the theme gallery and a theme manifest",
+    },
+    PermissionDef {
+        key: "themes.activate",
+        category: "content",
+        description: "Activate or roll back the theme of a site",
+    },
     PermissionDef {
         key: "newsletter.read",
         category: "content",

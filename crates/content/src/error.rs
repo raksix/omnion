@@ -170,6 +170,12 @@ pub enum ContentError {
     /// purpose: a redirect for a site that was deleted is a caller bug, not a missing resource.
     #[error("no such site")]
     SiteNotFound,
+    /// No live theme carries this key for this organization (REQ-062 slice 1).
+    #[error("no installed theme has the key '{0}'")]
+    ThemeNotFound(String),
+    /// The site has no activation row, so there is nothing to roll back to (REQ-062 slice 1).
+    #[error("this site has no theme activation to roll back from")]
+    RollbackUnavailable,
     /// No comment carries this identifier, or it belongs to another site (REQ-064 slice 4a).
     #[error("no such comment")]
     CommentNotFound,
@@ -324,6 +330,8 @@ impl ContentError {
             Self::VerificationNotRequired => "verification_not_required",
             Self::WeakPassword(_) => "weak_password",
             Self::SiteNotFound => "site_not_found",
+            Self::ThemeNotFound(_) => "theme_not_found",
+            Self::RollbackUnavailable => "theme_rollback_unavailable",
         }
     }
 }
