@@ -624,6 +624,67 @@ impl Default for AiHubConfig {
     }
 }
 
+/// The secret a CSRF token is derived from (REQ-012, slice 2).
+///
+/// The token itself is `HMAC(this, session id)`, so this is the one value that decides whether a
+/// browser may change something. Two consequences shape the struct:
+///
+/// * **It is not in the database.** A secret in a row lands in every backup and every replica; an
+///   environment variable is what a deployment already knows how to keep out of both.
+/// * **It is write-only.** `Debug` renders `<redacted>` and never the bytes, exactly like the
+///   SMTP password above — the log line at boot says "a secret is configured", not what it is.
+///
+/// `is_usable` is the question that matters at runtime: with no secret the platform must **refuse
+/// cookie-authenticated mutations**, not skip the check. Failing open here would turn a missing
+/// configuration into a silent loss of a control nobody would notice was gone.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CsrfSecret {
+    /// The raw key material, if one was configured.
+    secret: Option<String>,
+}
+
+impl CsrfSecret {
+    /// Build from a configured value; a blank string counts as unset.
+    #[must_use]
+    pub fn new(secret: Option<String>) -> Self {
+        Self {
+            secret: secret
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+        }
+    }
+
+    /// The key material, when one is configured.
+    #[must_use]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        self.secret.as_ref().map(String::as_bytes)
+    }
+
+    /// `true` when tokens can be derived at all.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.secret.is_some()
+    }
+}
+
+/// Render the CSRF settings without the secret.
+impl std::fmt::Debug for CsrfSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CsrfSecret")
+            .field(
+                "secret",
+                &if self.is_usable() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .finish()
+    }
+}
+
+
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -653,6 +714,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
+    /// The secret CSRF tokens are derived from (REQ-012, slice 2).
+    pub csrf: CsrfSecret,
     /// Logging.
     pub log: LogConfig,
 }
@@ -865,6 +928,12 @@ impl Config {
             timeout_ms: read_positive(&read, "OMNION_SMTP_TIMEOUT_MS", DEFAULT_SMTP_TIMEOUT_MS)?,
         };
 
+        // The CSRF secret is the one piece of configuration the platform refuses to invent: a
+        // deployment that sets none still boots, and every cookie-authenticated mutation then
+        // answers 403 rather than skipping the check. Failing open would turn a missing key into
+        // a silent loss of a control nobody would notice.
+        let csrf = CsrfSecret::new(read("OMNION_CSRF_SECRET"));
+
         let config = Self {
             env,
             http: HttpConfig { host, port },
@@ -879,6 +948,7 @@ impl Config {
             ai_hub,
             retention,
             mail,
+            csrf,
             log,
         };
         config.validate()?;
@@ -919,6 +989,9 @@ impl Default for Config {
             ai_hub: AiHubConfig::default(),
             retention: RetentionConfig::default(),
             mail: MailConfig::default(),
+            // No secret by default, which is the honest default: a default key would be a key
+            // every deployment shares, and a shared CSRF secret is no CSRF secret.
+            csrf: CsrfSecret::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
     }
@@ -1244,6 +1317,7 @@ mod tests {
             ("OMNION_MAIL_FROM", "platform@example.com"),
             ("OMNION_SMTP_USERNAME", "omnion"),
             ("OMNION_SMTP_PASSWORD", "secret"),
+            ("OMNION_CSRF_SECRET", "secret"),
             ("OMNION_SMTP_TIMEOUT_MS", "1500"),
         ])
         .expect("the automation settings are valid");
@@ -1320,6 +1394,44 @@ mod tests {
         // The whole configuration renders safely too (it derives Debug through this field).
         let whole = format!("{:?}", config);
         assert!(!whole.contains("hunter2"), "{whole}");
+    }
+
+    #[test]
+    fn the_csrf_secret_is_read_and_never_rendered() {
+        let config = config_from(&[("OMNION_CSRF_SECRET", "s3cret-key-material")])
+            .expect("a CSRF secret is a valid setting");
+        assert!(config.csrf.is_usable());
+        assert_eq!(
+            config.csrf.as_bytes(),
+            Some(b"s3cret-key-material".as_slice())
+        );
+
+        let rendered = format!("{:?}", config.csrf);
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("s3cret-key-material"), "{rendered}");
+        let whole = format!("{:?}", config);
+        assert!(
+            !whole.contains("s3cret-key-material"),
+            "the whole configuration derives Debug through this field: {whole}"
+        );
+    }
+
+    #[test]
+    fn a_blank_csrf_secret_counts_as_unset_rather_than_as_an_empty_key() {
+        // An empty string is a value a compose file produces when a variable is declared and
+        // left blank. Signing with an empty key would make every deployment's token identical.
+        let config = config_from(&[("OMNION_CSRF_SECRET", "   ")])
+            .expect("a blank secret is not a broken configuration");
+        assert!(!config.csrf.is_usable());
+        assert_eq!(config.csrf.as_bytes(), None);
+    }
+
+    #[test]
+    fn a_deployment_without_a_csrf_secret_still_boots() {
+        // Failing to boot would make the secret a hard deployment requirement; the honest
+        // answer is that the platform starts and refuses cookie-authenticated mutations.
+        let config = config_from(&[]).expect("the platform boots without a CSRF secret");
+        assert!(!config.csrf.is_usable());
     }
 
     #[test]

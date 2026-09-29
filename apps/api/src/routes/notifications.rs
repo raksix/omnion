@@ -1147,7 +1147,10 @@ mod tests {
         // as a third state. `with_read=off` is the reader who asked for the inbox; a client
         // that never mentioned `with_read` asked for everything, and the two are not the same
         // question.
-        assert_eq!(parse("with_read=off").expect("valid").with_read, Some(false));
+        assert_eq!(
+            parse("with_read=off").expect("valid").with_read,
+            Some(false)
+        );
         assert_eq!(parse("with_read=1").expect("valid").with_read, Some(true));
     }
 

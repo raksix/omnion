@@ -3518,3 +3518,146 @@ override** and tick the screen boxes for slices 1–3 of REQ-016 together, then 
 then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
 the same reason). If the slot is still held, name the holder and its ports in the log rather
 than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
+
+## 2026-09-29 — omnion-build tick 57 · REQ-012 slice 1, and a screen that says "I don't know"
+
+**What.** Started REQ-012, the security centre — the first not-done REQ in wave 1. The whole
+slice turns on one rule, and it is the only screen in the panel where a plausible default is
+a lie: **a check that could not verify something must not report `pass`.** So the rule is
+written into the design rather than left to each check's judgement —
+
+* a check is a pure function of an `Environment` it is handed, so it cannot look anything up
+  and cannot conclude anything from an empty result set;
+* a probe that could not read answers `Probe::Unknown`, and `unknown` is one of the four states
+  rather than a null the panel has to guess at;
+* the overview renders **every** registered check including one that has never run, so a
+  missing row can never read as "nothing to report here".
+
+The vocabulary (four states, four sources, five severities, four finding statuses) is
+duplicated in `0054_security_posture.sql`, which cannot import Rust. A test reads that
+migration and fails if a word exists in one list and not the other, so the two can drift only
+visibly — a red test rather than a filter that silently returns nothing.
+
+**Two asymmetries worth naming, because both were the wrong answer at first.**
+
+*A missing backup is `fail`; a missing dependency scan is `unknown`.* They look like the same
+case and they are not: "there is no backup" is a fact we can state without having read
+anything, while "we have never run a scan" is a fact about us. Collapsing them would let a
+platform with no backups read as merely unverified. The first version of the test asserted
+"unknown for everything with an empty world" and it caught this — the test was wrong, the
+asymmetry was the design, so the test now states the full expected map instead of a blanket
+rule, which means changing either default is a failure that names the check that moved.
+
+*The score weights `unknown` at 40, not 0 and not 100.* Zero punishes the platform for what
+it does not know, which is how a number stops being trusted; 100 is the over-claim the crate
+exists to avoid. The middle says "a question", which is what it is.
+
+**Also shipped.** The API behind three separate powers — `security.read` sees, `security.scan`
+re-runs and ingests, `security.manage` dismisses. `scan` is deliberately *below* `manage`:
+re-running the checks changes no configuration, while an ignore is a decision somebody will be
+asked to justify later, and granting both lets an account that can only look also dismiss what
+it saw. An uploaded report carrying a key shaped like a credential is refused **whole**,
+because this table is read by people and exported to CSV — a token in a description would move
+a secret from a CI log onto a screen designed to be shared.
+
+**Proof.**
+
+- `cargo test -p omnion-security -p omnion-permissions --lib` → **39 + 62 passed, 0 failed**
+- `cargo build -p omnion-api` → clean
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `60b45d9` (crate), `b2d82aa` (API + permissions), `7210ca3` (panel), `4208a7e` (QA)
+
+**Not done, and not claimed. No browser pass.** The single QA slot is held by a live w10 pass
+(holder pid 2521941, cwd `/mnt/apopic/omnion-w10`, still writing screenshots at the time of
+writing) — this time the blocker is named with its holder and its ports rather than written off
+as "the slot is held". `runSecurityDepth` is written and wired in; it is unrun, so the boxes
+naming a screen stay unticked. It asserts the one thing a fresh QA database makes falsifiable:
+with no MFA rows, no backup history and no header policy, the screen must say "Not checked
+yet" rather than "Verified".
+
+**Then, in the same tick, slice 1's last item: the CSV export.** An export is the one screen
+output that *leaves* the platform, so `crates/security/src/csv.rs` is written as though every
+row will be pasted into a ticket, an email and an auditor's spreadsheet. Three decisions, and
+one of them is the actual security fix:
+
+* **The export is the filter, not the page.** It ignores the page size on purpose. An operator
+  who filters to "critical", exports 50 of 300 rows and hands that to an auditor has produced
+  a document that reads as a complete list and is not one. A 50k-row cap applies instead, and
+  its refusal names the count and says "narrow the filter".
+* **A cell starting with `=`, `+`, `-` or `@` is prefixed with a tab.** Correctly quoting
+  `"=1+1"` does not help: a findings title can be a hostile package name, and a findings export
+  is exactly the document a person opens in a spreadsheet. This is the CSV injection the
+  security-export literature is actually about, and it is the reason this module is hand-written
+  rather than delegated to a helper nobody can check.
+* **The evidence blob is not exported.** Evidence is the raw report entry and this file leaves
+  the building. The ingest already refuses a document carrying something shaped like a
+  credential, but "the ingest checked" is not a reason to put the raw blob in a spreadsheet.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **51 passed** (39 + 12 CSV)
+- `cargo build -p omnion-api` → clean; `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `2585d72` (the CSV), `0d5a72e` (the endpoint and the button), `ab157fd` (this record)
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with **no `QA_STACK` override** and
+tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
+referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
+real to report, which is why those two rows are the most useful thing this tick left behind.
+
+## Tick 58 — REQ-012 slice 2, the header policy and the CSRF token
+
+**What.** `crates/security/src/headers.rs` (the policy, its rendering and every reason it is
+refused), `csrf.rs` (the derived double-submit token), `header_store.rs` (the singleton row, a
+compare-and-swap save, and the history), `0135_security_headers.sql`, `CsrfSecret` in
+`crates/core/src/config.rs`, the two middlewares in `apps/api/src/headers_middleware.rs`, and
+`GET`/`PUT /security/headers` behind `security.read` / `security.manage`.
+
+**The decisions that are the slice, not its furniture.**
+
+* **One rendering, three consumers.** `HeaderPolicy::render` produces the header lines that go
+  on the wire, the `rendered` column the panel previews, and what the posture checks read. A
+  policy summarised in one place and assembled in another is how an operator ends up with
+  "I configured it and nothing changed".
+* **Report-only sends the report header and nothing else.** Sending both would apply a policy
+  while the screen says it is only reporting it. The test asserts neither mode emits the other
+  mode's name.
+* **The installed layer holds a shared cell, not a snapshot.** The first draft snapshotted the
+  policy when the router was built, which meant a save changed the database and no response
+  until the next restart. `RwLock<Arc<Policy>>` — one pointer clone per request, and `reload`
+  after a successful save.
+* **Refuse, never skip, when the secret is missing.** A deployment with no `OMNION_CSRF_SECRET`
+  boots and then refuses cookie-authenticated mutations. Failing open would turn a missing key
+  into a silent loss of a control, which is the worst outcome a control has.
+* **Header policy is a singleton, not per-tenant.** One process serves every response, so a
+  per-tenant CSP would let one tenant weaken the policy everybody's requests are answered with.
+* **The audit row and the setting are one transaction.** The first draft ran them as two
+  queries — the update commits, the insert fails on a dropped connection, and the edit happened
+  with nothing recording it.
+
+**Two defects from tick 57, found because this tick finally ran `--lib`.**
+
+* `cargo test -p omnion-api --lib` had been **red since slice 1** and only `cargo build` had
+  ever been run against it. A test called `to_string()` on `ApiError`, which implements no
+  `Display`. It does now — the code and the message, never the `details` blob.
+* A test fixture had a **credential mask written into the source** instead of a secret: the
+  file literally held the redaction placeholder where an `sk-` value was meant, so the
+  credential detector was being asserted against a Unicode marker and passing for the wrong
+  reason. Fixed at byte level; `git diff --stat` is the check that catches that class of edit.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **100 passed** (51 + 46 for headers and CSRF, + 3 store)
+- `cargo test -p omnion-api --lib` → **208 passed** (was 0 compiling)
+- `cargo test -p omnion-core --lib` → **37 passed** (34 + 3 for the secret)
+- `cargo build -p omnion-api` → clean
+- Commits: `163a4f8`, `b9e2ae2`, `f2f8007`, `1ad077e`, `6e7b920`, `4747b9f`
+
+**Still open, and named rather than written off.** The `/security/headers` **screen** does not
+exist yet, and neither slice 1 nor slice 2 has a browser pass: the single QA slot was held by a
+live w10 pass for this whole tick (holder 2521941, cwd `/mnt/apopic/omnion-w10`). A pass that
+starts while this tree is half-written would build half of it, so the pass was deliberately
+stopped and the slice committed instead. **Next tick:** if the slot is free, run
+`bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
+then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
+visited and clicked.
