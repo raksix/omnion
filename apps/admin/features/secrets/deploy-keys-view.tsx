@@ -307,11 +307,7 @@ export function DeployKeysView() {
       )}
 
       {minted ? (
-        <MintedDialog
-          minted={minted}
-          header={state?.header ?? "x-omnion-deployment-key"}
-          onClose={() => setMinted(null)}
-        />
+        <MintedDialog minted={minted} onClose={() => setMinted(null)} />
       ) : null}
 
       {minting ? (
@@ -446,11 +442,9 @@ function KeyRow({
 /** The one-time value panel. Same rule as the gateway keys (REQ-040): it exists exactly once. */
 function MintedDialog({
   minted,
-  header,
   onClose,
 }: {
   minted: CreatedDeploymentKey;
-  header: string;
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
@@ -497,7 +491,7 @@ function MintedDialog({
         </p>
         <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12.5px]">
           <dt className="text-muted">Header</dt>
-          <dd className="font-mono">{header}</dd>
+          <dd className="font-mono">{minted.header}</dd>
           <dt className="text-muted">Environment</dt>
           <dd>{minted.environment}</dd>
           <dt className="text-muted">Scopes</dt>
@@ -584,8 +578,11 @@ function MintDialog({
         environment,
         scopes,
         // The form works in whole days; the API wants an instant, so the end of that day.
-        expiresAt: new Date(`${expiresAt}T23:59:59Z`).toISOString(),
-        allowedIps: allowedIps.trim() || null,
+        // The field names are the API's, not the form's: the create body is `deny_unknown_fields`,
+        // so a camelCase `expiresAt` is a 422 with no field named — this is a bug the panel had,
+        // not a naming preference.
+        expires_at: new Date(`${expiresAt}T23:59:59Z`).toISOString(),
+        allowed_ips: allowedIps.trim() || null,
       });
       await onMinted(created);
     } catch (cause) {
@@ -876,7 +873,7 @@ function UseLogDialog({ entry, onClose }: { entry: DeploymentKey; onClose: () =>
     let live = true;
     fetchDeploymentKeyUses(entry.id)
       .then((answer) => {
-        if (live) setUses(answer.uses);
+        if (live) setUses(answer);
       })
       .catch((cause) => {
         if (live) {
