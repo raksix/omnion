@@ -174,6 +174,8 @@ async fn open_harness() -> Option<(AppState, Db)> {
         }
     };
 
+    reclaim_scratch_databases(maintenance.pool()).await;
+
     let database = format!("omnion_env_{}", Uuid::new_v4().simple());
     if let Err(err) = sqlx::query(&format!("create database \"{database}\""))
         .execute(maintenance.pool())
@@ -201,6 +203,36 @@ async fn open_harness() -> Option<(AppState, Db)> {
         test_storage(),
     );
     Some((state, db))
+}
+
+/// Reclaim scratch databases left behind by an earlier run.
+///
+/// A `Drop` guard would be the obvious answer and it does not work here: the harness cell is a
+/// `OnceCell`, so its value — and anything hanging off it — is never dropped, and the process
+/// exits before any destructor the test harness owns runs. Sweeping at the *start* is what
+/// actually reclaims, and it is safe precisely because this run's database does not exist yet.
+///
+/// The sweep only touches names this suite mints (`omnion_env_`), so it cannot reach the shared
+/// QA database or anything else living on the server. Without it every killed run leaves a
+/// 105-table database behind, and after a dozen ticks they are why the box runs out of disk for
+/// the builds rather than for the data.
+async fn reclaim_scratch_databases(pool: &sqlx::PgPool) {
+    let stale: Vec<String> = sqlx::query_scalar(
+        "select datname from pg_database where datname like 'omnion_env\\_%' escape '\\'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for name in stale {
+        // A database another live suite is using refuses the drop; that refusal is the answer,
+        // not a failure worth printing.
+        let dropped = sqlx::query(&format!("drop database if exists \"{name}\""))
+            .execute(pool)
+            .await;
+        if dropped.is_ok() {
+            eprintln!("reclaimed a stale scratch database: {name}");
+        }
+    }
 }
 
 /// Replace the database name in a PostgreSQL connection string.
@@ -319,7 +351,43 @@ struct Caller {
     csrf: String,
 }
 
+/// Sign in, once per address, for the whole run.
+///
+/// The caching is not an optimisation — it is the reason this suite passes at all. Sign-in is
+/// rate-limited (`sign_in`: 10 requests per 300 seconds, which is the shipped default), the
+/// counter lives in Redis and Redis is shared by every writer on the box, and this suite creates
+/// a fresh account for each of its 25 walks. Signing in per walk therefore spends the whole
+/// shared budget on the first few tests, and every later one fails at `login body: … rate_limited`
+/// for a reason that has nothing to do with environments.
+///
+/// Sessions outlive a suite run, so one sign-in per account is both cheaper and closer to how a
+/// browser behaves. The address is part of the key, so two walks that happen to share an address
+/// still get the right session rather than each other's.
+static CALLERS: tokio::sync::OnceCell<
+    std::sync::Mutex<std::collections::HashMap<String, Caller>>,
+> = tokio::sync::OnceCell::const_new();
+
 async fn login(state: &AppState, email: &str) -> Caller {
+    let cache = CALLERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cached = cache
+        .lock()
+        .expect("the caller cache is not poisoned")
+        .get(email)
+        .cloned();
+    if let Some(caller) = cached {
+        return caller;
+    }
+
+    let caller = login_uncached(state, email).await;
+    cache
+        .lock()
+        .expect("the caller cache is not poisoned")
+        .insert(email.to_owned(), caller.clone());
+    caller
+}
+
+/// The sign-in itself, with no cache in the way.
+async fn login_uncached(state: &AppState, email: &str) -> Caller {
     let response = call(
         state,
         request(
