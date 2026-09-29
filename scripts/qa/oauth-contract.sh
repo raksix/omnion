@@ -26,6 +26,11 @@ set -euo pipefail
 API_PORT="${QA_API_PORT:-18089}"
 BASE="http://127.0.0.1:${API_PORT}"
 DB="${QA_DB:-omnion_qa_w10}"
+# The fixture owner scripts/qa/seed-w10.sh creates. Signing in as somebody else fails the
+# security policy after a run of failures and locks the address out, and the recovery is a
+# table edit — so the probe owns its identity rather than borrowing a real account.
+EMAIL="${QA_OWNER_EMAIL:-qa-owner@omnion.test}"
+PASSWORD="${QA_OWNER_PASSWORD:-OmnionQa-Passw0rd-2026!}"
 JAR="$(mktemp -d)/cookies.txt"
 FIXTURE_PORT="${OAUTH_FIXTURE_PORT:-18099}"
 PROVIDER_PID=""
@@ -184,7 +189,7 @@ PY
 # ---------------------------------------------------------------------------------------------
 
 login() {
-  local base="${1:-$BASE}" email="${2:-raksix@fermag.com.tr}" password="${3:-Fe277353}"
+  local base="${1:-$BASE}" email="${2:-$EMAIL}" password="${3:-$PASSWORD}"
   # One invocation: curl only stores a cookie when `-c` is on the same call that received the
   # set-cookie, and a jar written by a later call stays empty — which then answers
   # `organization_required` on every scoped route and looks exactly like an authz bug.
@@ -213,10 +218,28 @@ body_of() { sed '$d' <<<"$1"; }
 echo "== REQ-087 slice 3 · the OAuth contract probe =="
 echo "   api ${BASE} · provider 127.0.0.1:${FIXTURE_PORT} · database ${DB}"
 
+# The stack's database is dropped by reset-db.sh, so the fixture owner is re-created here
+# rather than assumed — a probe that seeds itself is re-runnable, and one that assumes a seed
+# is only ever green the first time. `seed-w10.sh` is idempotent (the onboarding calls answer
+# "already exists" and the binding update is unconditional), so running it when the stack is
+# already seeded is a no-op rather than a failure. Its *output* is suppressed but its *exit
+# code* is not: a seed that fails is a stack that is not there, and every later assertion
+# would be measuring a connection refused.
+if ! API="$BASE" QA_DB="$DB" bash "$(dirname "${BASH_SOURCE[0]}")/seed-w10.sh" >/dev/null 2>&1; then
+  echo "could not seed the QA stack at ${BASE} (is the API up on :${API_PORT}?)" >&2
+  exit 1
+fi
+
 start_provider
-login
-bad "the session" "login failed against ${BASE}" && exit 1
-ok "signed in"
+# The owner is seeded above; the login that matters is the probe's own session, and a failure
+# here is reported as a note rather than aborting — the rest of the probe is about refusals
+# that a signed-in session is not needed for, and a stack that is merely not up should say so
+# once instead of hiding seven downstream failures behind a bad exit code.
+if ! login; then
+  bad "the session" "login failed against ${BASE}; is the API up and seeded?"
+else
+  ok "signed in"
+fi
 
 # The credential type's endpoints point at the fixture. The registry is code, so a fixture
 # provider means a fixture *type* — which is why this probe writes one row into the registry
