@@ -1160,7 +1160,9 @@ export type NodePackage = {
   version: string;
   source: string;
   checksum: string;
-  permissions: unknown[];
+  permissions: string[];
+  /** The *namespaced* node keys the package installed (`package.node`, 0055). */
+  node_keys: string[];
   enabled: boolean;
   installed_at: string;
 };
@@ -1168,6 +1170,34 @@ export type NodePackage = {
 export type NodePackagePage = {
   packages: NodePackage[];
   total: number;
+};
+/** One validator finding, as an install refusal reports it. */
+export type PackageFinding = {
+  code: string;
+  subject: string;
+  message: string;
+};
+/** The answer to an install: the row, the checksum the server computed, and what moved. */
+export type NodePackageInstall = NodePackage & {
+  checksum: string;
+  node_keys: string[];
+  /** Nodes the previous install had and this one no longer ships. */
+  replaced_node_keys: string[];
+  enabled: boolean;
+};
+/** The answer to an enable/disable. */
+export type NodePackageToggle = {
+  package: NodePackage;
+  node_keys: string[];
+  message: string;
+};
+/** The answer to a removal: what it broke, named. */
+export type NodePackageRemoval = {
+  key: string;
+  removed: boolean;
+  node_keys: string[];
+  affected_workflows: { workflow_id: string; workflow_name: string; node_keys: string[] }[];
+  message: string;
 };
 /** The body of a create. Secrets ride in `secrets[]`, never in `settings`. */
 export type NewCredential = {

@@ -3163,6 +3163,195 @@ async function runCredentialDepth(page, report) {
 }
 
 /**
+ * The node-package pass (REQ-087, slice 4).
+ *
+ * Drives `/modules/installed` through the whole lifecycle against a real package: it installs
+ * the scaffold the SDK itself writes, refuses a broken variant and reads the findings back
+ * from the screen, disables and re-enables, then removes and confirms the ledger is empty
+ * again.
+ *
+ * The refusal is the interesting half. An install that validates is one assertion; an install
+ * that is *refused with every finding rendered* is the criterion the REQ states ("a package
+ * failing the SDK validator is refused with the findings and nothing reaches the ledger"), and
+ * the second half — nothing reached the ledger — is checked by reading the list rather than by
+ * trusting the screen's own wording.
+ */
+async function runNodePackagesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "node-packages-depth", action: "node-packages", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/modules/installed`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  note({
+    step: "list",
+    rows: await page.locator("[data-package-row]").count(),
+    emptyState: (await page.locator("[data-testid=packages-empty]").count()) > 0,
+  });
+  await shot(page, "page-modules-installed");
+
+  // The manifest the SDK scaffolds. Written here rather than read from disk so the pass does
+  // not depend on a cargo build having produced the CLI.
+  const manifest = {
+    key: "qa-fixture",
+    version: "0.1.0",
+    name: "QA fixture package",
+    description: "Installed by the walkthrough to exercise the ledger.",
+    docs_url: "https://example.com/docs/qa-fixture",
+    source: "local",
+    permissions: ["network", "credentials", "sandbox"],
+    nodes: [
+      {
+        key: "echo",
+        version: "0.1.0",
+        label: "Fixture echo",
+        description: "Returns its input unchanged.",
+        category: "helper",
+        icon: "MessageSquare",
+        docs_url: "https://example.com/docs/qa-fixture/echo",
+        inputs: [
+          { name: "main", kind: "main", accepts: ["text", "json"], open: false },
+        ],
+        outputs: [
+          { name: "main", kind: "main", accepts: ["text", "json"], open: true },
+        ],
+        params: [
+          {
+            name: "text",
+            type: "string",
+            label: "Text",
+            required: true,
+            ui: "textarea",
+            placeholder: "Anything",
+          },
+        ],
+        capabilities: ["execute"],
+        sandbox: "required",
+        default_max_attempts: 3,
+      },
+    ],
+    credentials: [
+      {
+        key: "api_key",
+        kind: "api_key",
+        label: "API key",
+        description: "A single API key.",
+        icon: "KeyRound",
+        docs_url: "https://example.com/docs/qa-fixture/api-key",
+        fields: [
+          {
+            name: "api_key",
+            label: "API key",
+            type: "secret",
+            required: true,
+            never_log: true,
+          },
+        ],
+        test_timeout_seconds: 5,
+      },
+    ],
+  };
+
+  // 1. A package the validator refuses, and every finding rendered.
+  const broken = structuredClone(manifest);
+  broken.permissions = ["network"];
+  broken.nodes[0].credential_types = ["oauth2"];
+  await page
+    .locator("[data-testid=package-manifest]")
+    .fill(JSON.stringify(broken, null, 2))
+    .catch(() => {});
+  await page.locator("[data-testid=package-install]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const renderedFindings = await page
+    .locator("[data-testid=package-findings] li")
+    .count()
+    .catch(() => 0);
+  note({ step: "refused", findingsRendered: renderedFindings, expectsTwo: true });
+  await shot(page, "page-modules-installed-refused");
+
+  // Nothing reached the ledger: read the API, not the screen's own claim.
+  steps.refusedReachedLedger = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
+    const body = await response.json().catch(() => ({}));
+    return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
+  });
+
+  // 2. The same package, valid, installs — and the node key is namespaced.
+  await page.locator("[data-testid=package-install-clear]").click({ timeout: 5000 }).catch(() => {});
+  await page
+    .locator("[data-testid=package-manifest]")
+    .fill(JSON.stringify(manifest, null, 2))
+    .catch(() => {});
+  await page.locator("[data-testid=package-install]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const row = page.locator('[data-package-key="qa-fixture"]');
+  steps.installedRowPresent = (await row.count()) > 0;
+  steps.namespacedNodeKey = (await row.locator("td").nth(1).innerText().catch(() => "")) .includes(
+    "qa-fixture.echo",
+  );
+  note({ step: "install", rowPresent: steps.installedRowPresent, namespaced: steps.namespacedNodeKey });
+  await shot(page, "page-modules-installed-installed");
+
+  // 3. A downgrade is refused by name.
+  steps.downgradeRefused = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/node-packages", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        manifest: { key: "qa-fixture", version: "0.0.1", name: "x", docs_url: "https://x" },
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    return { status: response.status, code: body?.error?.code ?? null };
+  });
+
+  // 4. Disable, then re-enable: the ledger keeps the row and the state chip changes.
+  await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.disabledStateRendered = (await page
+    .locator('[data-package-key="qa-fixture"] [data-testid=package-state]')
+    .innerText()
+    .catch(() => "")) .includes("disabled");
+  steps.ledgerRowSurvivedDisable = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
+    const body = await response.json().catch(() => ({}));
+    return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
+  });
+  await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  note({
+    step: "toggle",
+    disabledRendered: steps.disabledStateRendered,
+    rowSurvived: steps.ledgerRowSurvivedDisable,
+  });
+
+  // 5. Remove: the confirmation names what it disables, and the ledger ends empty.
+  await page.locator('[data-testid=package-remove]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.removeDialogNamedItsNodes = (await page
+    .locator("[data-testid=package-remove-dialog]")
+    .innerText()
+    .catch(() => "")) .includes("qa-fixture.echo");
+  await shot(page, "page-modules-installed-remove");
+  await page.locator("[data-testid=package-remove-confirm]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.removedFromLedger = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
+    const body = await response.json().catch(() => ({}));
+    return !(body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
+  });
+  note({ step: "remove", dialogNamedNodes: steps.removeDialogNamedItsNodes, gone: steps.removedFromLedger });
+
+  log(`node packages: ${JSON.stringify(steps)}`);
+  return steps;
+}
+
+/**
  * The role-depth pass (REQ-006, slice 1).
  *
  * Drives the real lifecycle through the panel: a custom role is created from the list, a matrix
@@ -4861,6 +5050,10 @@ async function main() {
     { path: "/workflows/credentials", name: "workflow-credentials" },
     { path: "/workflows/credentials/new", name: "workflow-credentials-new" },
     { path: "/workflows/credentials/new?type=api_key", name: "workflow-credentials-new-typed" },
+    // The installer ledger (REQ-087, slice 4). Walked as a screen *and* driven by
+    // `runNodePackagesDepth` below, which installs a real fixture package, refuses a broken
+    // one, disables, re-enables and removes it — so the screen is never merely loaded.
+    { path: "/modules/installed", name: "modules-installed" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -4998,6 +5191,12 @@ async function main() {
   // re-sent on a PATCH is refused by name, prove a test reports a result rather than a pass,
   // and prove the delete guard both refuses when it should and allows when it should.
   report.credentials = await runDepthPass("credentials", () => runCredentialDepth(page, report));
+  // The node-package lifecycle (REQ-087, slice 4): install a real fixture, refuse a broken
+  // one, toggle, remove. Isolated like the other depth passes so a failure in one does not
+  // cost the rest of the run its report.
+  report.nodePackages = await runDepthPass("node-packages", () =>
+    runNodePackagesDepth(page, report),
+  );
   log(`credentials: ${JSON.stringify(report.credentials)}`);
 
   report.iamRoles = await runIamRolesDepth(page, report);

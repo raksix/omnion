@@ -66,7 +66,10 @@ import type {
   CredentialUsage,
   NewCredential,
   NodePackage,
+  NodePackageInstall,
   NodePackagePage,
+  NodePackageRemoval,
+  NodePackageToggle,
   PortKindCatalogue,
   RegistryLint,
   NotificationOutbox,
@@ -4206,16 +4209,34 @@ export async function replaceCredentialSecret(
 export async function fetchNodePackages(): Promise<NodePackagePage> {
   return request<NodePackagePage>("/api/v1/node-packages");
 }
+/**
+ * Install a package from its manifest.
+ *
+ * The body is the manifest, not a summary of it: the server validates what it is given and
+ * computes the checksum itself, so there is no `checksum` field here to send and no way for a
+ * client to talk the ledger into a checksum that does not match the package.
+ */
+export async function installNodePackage(manifest: unknown): Promise<NodePackageInstall> {
+  return request<NodePackageInstall>("/api/v1/node-packages", {
+    method: "POST",
+    body: JSON.stringify({ manifest }),
+  });
+}
 /** Enable or disable a package. Disabling never touches a workflow. */
-export async function setNodePackageEnabled(key: string, enabled: boolean): Promise<NodePackage> {
-  return request<NodePackage>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
+export async function setNodePackageEnabled(
+  key: string,
+  enabled: boolean,
+): Promise<NodePackageToggle> {
+  return request<NodePackageToggle>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
     method: "PATCH",
     body: JSON.stringify({ enabled }),
   });
 }
-/** Remove a package; the ledger row stays, marked removed. */
-export async function removeNodePackage(key: string): Promise<void> {
-  await request<null>(`/api/v1/node-packages/${encodeURIComponent(key)}`, { method: "DELETE" });
+/** Remove a package; the ledger row stays, marked removed, and the dependents come back. */
+export async function removeNodePackage(key: string): Promise<NodePackageRemoval> {
+  return request<NodePackageRemoval>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
+    method: "DELETE",
+  });
 }
 /**
  * The caller's own channel configuration (REQ-021, slice 2).
