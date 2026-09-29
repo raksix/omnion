@@ -7209,3 +7209,64 @@ already were.
 **Next.** The CRM pass alone, once load is under ~40. It is the only thing REQ-051 owes, and the two
 wizard defects above cost four earlier passes their sign-in, which is likely why this one looked
 impossible for a week.
+
+## 2026-09-29 · wave 4 · REQ-054 slice 1 closed on the routes and the screens
+
+**What.** Recovered the slice a dead tick left half-written, then made it run. The
+uncommitted tree was 3,863 lines across the API route, the three admin screens and a
+1,047-line integration suite; the module crate and the migration were already in. Four
+product defects and four test defects came out of the first run.
+
+**Proof.**
+- `cargo build -p omnion-api` — 0, 7m13s from a cold target
+- `cargo test -p omnion-module-accounting --lib` — 18/18
+- `cargo test -p omnion-api --lib` — 281/281 (this is also what proves migration 0167 is wired)
+- `pnpm turbo run typecheck --force` — 2/2 (admin + web)
+- the accounting integration suite — **12/12, run one test at a time**
+
+**The four that could not run at all.** Every one of them was invisible to the compiler
+and to the lib tests, and each failed only on the path a person actually takes.
+
+1. `patch_account` and `patch_tax_rate` emitted the tenant predicate FIRST and appended
+   the assignments after it: `update … set active = active where organization_id = $1 and
+   id = $2, name = $3 returning id`. The no-field patch is the only statement that parses,
+   so the crate compiled and every rename and every deactivate answered **500**. Both are
+   now one `COALESCE` statement — a NULL bind leaves the stored value alone, and there is
+   no hand-numbered placeholder left to drift.
+2. `list_entries` numbered its own filters `$1..$3` after the builder had already given
+   `$1` to the organization id, so the source filter compared `source_kind` against a
+   uuid. Renumbering by hand is the same mistake in the other direction: `QueryBuilder`
+   renumbers binds itself, and a literal `$2` in pushed SQL is a dollar-quoted token —
+   `syntax error at or near "$2"`. The filters are pushed only when present, which is the
+   shape the sales module already uses.
+3. The line count was aliased `line_count` and read as `lines`. `row.get` is a RUNTIME
+   lookup, so this is a request-time 500 on the list and nowhere else.
+4. `deactivate_account` refused to close a seeded account while its own comment said the
+   opposite. The guard belongs to deletion, and there is no delete route.
+
+**The four in the tests.** Each failed for a reason unrelated to the rule it was written to
+prove, which is the reason they are written down rather than quietly fixed. The "both sides"
+case passed two ordinary one-sided lines through the AMOUNT arguments where it meant one
+line with two sides — it was asserting that a valid entry was a defect. The cycle test asked
+for code `1000`, which migration 0167's own seed owns, so it died on a name collision. The
+list assertion printed no body, which is why a `syntax error at or near "$2"` took three runs
+to name itself. And the refused-line field was asserted as `amounts` when the module
+deliberately names the exact cell (`debit`/`credit`) so the grid can highlight it.
+
+**Two environment facts that cost time and will cost it again.** The test database is
+selected by `OMNION_DATABASE_URL`, not `DATABASE_URL`; exporting the latter silently
+leaves the suite on the default database, where it fails at `migrations must apply:
+VersionMissing(19)` and reads like a broken migration. And the whole suite in one run
+**hangs**: the twelve walks serialise on one `tokio::sync::Mutex`, all five pool
+connections sit idle, and the process parks in `futex_do_wait`. Under load 10–20 with eight
+writers on the box that is contention, not a result — every walk passes alone in 4–14s.
+
+**Commits.** `13791b6` the two statements that could not run, `2e31e3c` routes + twelve
+walks, `7c73c71` the three screens and the walk, `14df24e` the REQ written down honestly.
+Merge `df6886e` (origin/main, 6 commits, all `crates/backup`; BUILD-LOG resolved by splicing
+both append-only bodies and proving the result by non-blank line MULTISET against both
+parents — 6355 lines, 0 lost from either).
+
+**Next.** REQ-054 slice 2: invoices, the sales handoff and the PDF. The unticked boxes it
+owns are the first ones anybody can look at — run `scripts/qa/target-guard.sh` and only
+then the scoped pass, because no screen in this REQ has been seen in a browser yet.
