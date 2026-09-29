@@ -6262,3 +6262,61 @@ is that a `check` constraint and a Rust constant are written twice with nothing 
 **Next, in order.** (1) the admin screen `/commerce/storefront` with its walkthrough route — the
 one screen slice 1a still owes, and the reason acceptance 16 cannot close without it; (2) slice
 1b's catalogue, gated on REQ-008 arriving, not on this branch being ready.
+
+## Wave 4b / w8 tick 29 — REQ-118 slice 1a closes its screen, and the gate proved itself again
+
+**What shipped.** The `/commerce/storefront` screen (REQ-118 slice 1a) plus the walkthrough
+route and a depth pass, in `05760c0`. The merge of `origin/main` (`9a60a9b`) came first — one
+commit behind, and the BUILD-LOG conflict was an independent append-only union, verified by
+**multiset** (`Counter(merged) - Counter(side)` empty on both sides, not a line count) because a
+count passes on a duplicated block in a file this heavy in repeated prose.
+
+**Why the screen is the rest of the slice rather than an extra.** Acceptance 16 is *"admin
+storefront settings persist per site and the client honours them"* — and until this tick the
+"client" was a migration, a store and an API. The screen renders **the vocabulary the server
+published** (`/commerce/storefront/vocabulary`) rather than its own copy of the closed lists,
+so a `<select>` cannot offer a value the migration's `check` refuses, and the number inputs
+carry `min`/`max` from the same source. Field errors land under the control the server named in
+`details.field`. A site with no saved row is announced as unconfigured instead of being silently
+filled with defaults — otherwise "who set page size to 24" has no answer, and `configured:false`
+is the flag that makes it answerable.
+
+**A real defect the linter caught on the first write.** The number input component was named
+`Number`, which shadows the global inside the module: `Number.parseInt` resolved to the
+component and every call was a type error. Renamed to `NumberField`. Worth naming because the
+file had four call sites and all four failed at once — a shadowed global is a *class* error, not
+a typo, and it would have been a confusing one to read in a diff.
+
+**Proof.**
+
+    cargo test -p omnion-module-ecommerce --lib        → 19 passed, 0 failed
+    cargo clippy -p omnion-module-ecommerce --all-targets → 0 warnings
+    cargo build -p omnion-api                          → clean (10 pre-existing warnings)
+    pnpm typecheck (apps/admin)                        → exit 0
+    node --check scripts/qa/walkthrough.cjs            → clean
+    bash scripts/qa/run-storefront-settings.sh         → 6/6, and PROVEN TO FAIL at 5/6
+
+The proven-to-fail run deleted the `where exists` tenancy guard from the write: the
+cross-organization assertion fails and **the five tenancy-free assertions stay green**, which is
+what shows the gate names its defect rather than its neighbourhood. Restored by `md5sum`, tree
+clean, gate green again. Note the six `cargo test --test storefront_settings` failures under a
+bare `cargo test` are the harness's documented shape, not a regression: those tests read
+`DATABASE_URL`, which the shell gate supplies.
+
+**Also checked rather than assumed** — the route shape. `/vocabulary` is declared **before**
+`/{site_id}` in `storefront_surface`, because axum ranks static segments ahead of parameters
+but the explicit ordering puts the intent in the file. This branch has already been bitten by a
+parameter route swallowing a static one (the notifications `400`s in tick 50), so the ordering
+was verified by reading rather than by assuming the matcher.
+
+**Not done, stated rather than implied.** The browser pass did **not** run: `qa-slot.sh` is held
+by a live sibling (`bash scripts/qa/qa-slot.sh`, cwd `/mnt/apopic/omnion-w3`), load ~10 and ~5.4 G
+available. `runStorefrontDepth` is written, wired into the route inventory *and* dispatched, and
+`node --check` confirms the harness parses — but it has never run against a browser, so no line
+here claims the screen was observed. Slice 1a therefore stays `in-progress`, and acceptance 16
+stays unticked: a screen that typechecks is not a screen that was walked.
+
+**Next, in order.** (1) `QA_STACK=w8 QA_API_PORT=18087 QA_ADMIN_PORT=3107 QA_WEB_PORT=3207 bash
+scripts/qa/run.sh` when the slot clears — the store/save round trip, the refusal that names its
+field, and the unconfigured banner are all asserted by a pass that has not executed.
+(2) slice 1b's catalogue, gated on REQ-008 arriving, not on this branch being ready.
