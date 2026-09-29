@@ -48,6 +48,7 @@ export const SALES_NAV = [
   { href: "/sales/approvals", label: "Approvals", shortcut: "a" },
   { href: "/sales/catalog", label: "Catalog", shortcut: "c" },
   { href: "/sales/pricelists", label: "Price lists", shortcut: "p" },
+  { href: "/sales/reports", label: "Reports", shortcut: "r" },
   { href: "/sales/settings", label: "Settings", shortcut: "s" },
 ] as const;
 
@@ -66,6 +67,7 @@ const SHORTCUTS: Shortcut[] = [
   { keys: "g then a", what: "Go to the approvals" },
   { keys: "g then c", what: "Go to the catalog" },
   { keys: "g then p", what: "Go to the price lists" },
+  { keys: "g then r", what: "Go to the reports" },
   { keys: "?", what: "Show or hide this sheet" },
   { keys: "Esc", what: "Close the sheet, or leave the field" },
 ];

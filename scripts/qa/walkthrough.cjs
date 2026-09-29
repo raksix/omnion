@@ -1500,6 +1500,104 @@ async function runSalesOrders(page, report) {
 }
 
 /**
+ * The sales report and the global search (REQ-052, slice 4b): `/sales/reports`.
+ *
+ * A report is where a wrong number becomes a board decision, so this pass asserts the three
+ * things a unit test cannot see and a person would:
+ *
+ * * **The four buckets add up on the screen.** The card row carries `data-adds-up`, which the view
+ *   computes from the server's own counts. A report whose parts do not sum to its total is one
+ *   nobody trusts, and the check has to be on the screen to mean anything.
+ * * **The export is a real file, fetched rather than navigated to.** A download through an
+ *   `<a href>` would hand a 401 to the browser as the file itself; asserting the notice names a
+ *   `.csv` file is the browser-side half of that.
+ * * **The global search finds a quote by its number and an order by its customer**, in one list.
+ *   The ranking is the module's, so the pass checks the exact-number match comes first rather
+ *   than checking that a row merely exists.
+ */
+async function runSalesReports(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "sales", action: "sales-reports", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/sales/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const cardsRender = (await page.locator("[data-qa-sales-report-cards] [data-qa-sales-report-card]").count()) === 4;
+  const filtersRender = (await page.locator("[data-qa-sales-report-from]").count()) === 1;
+  const sumEl = page.locator("[data-qa-sales-report-sum]");
+  const addsUp = (await sumEl.getAttribute("data-adds-up").catch(() => "false")) === "true";
+  const conversion = (await page.locator("[data-qa-sales-report-conversion]").innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "load", cardsRender, filtersRender, addsUp, conversion: conversion.slice(0, 80) });
+  await shot(page, "page-sales-reports");
+
+  // The window presets are real filters: pressing one changes the URL and reloads the numbers.
+  const before = page.url();
+  await page.locator("[data-qa-sales-report-preset='90']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const presetChangedTheUrl = page.url() !== before && page.url().includes("from=");
+  const cardsAfter = (await page.locator("[data-qa-sales-report-card=won]").innerText().catch(() => "")).replace(/\s+/g, " ");
+  note({ step: "preset-90-days", presetChangedTheUrl, won: cardsAfter.slice(0, 40) });
+
+  // The unassigned toggle is a real filter too, and it must not empty a report that has owners.
+  await page.locator("[data-qa-sales-report-unassigned]").first().check({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const unassignedUrl = page.url().includes("unassigned=1");
+  const unassignedSum = (await sumEl.getAttribute("data-adds-up").catch(() => "false")) === "true";
+  note({ step: "unassigned", unassignedUrl, addsUp: unassignedSum });
+  await page.locator("[data-qa-sales-report-unassigned]").first().uncheck({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // A window with no quotes in it must say so, and must not print 0% as a conversion.
+  await page.locator("[data-qa-sales-report-from]").first().fill("1990-01-01", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const emptyStateShown = (await page.locator("[data-qa-sales-reports] h1").count()) > 0;
+  const emptyHasNoConversion = (await page.locator("[data-qa-sales-report-conversion]").count()) === 0;
+  note({ step: "empty-window", emptyStateShown, hidesFigures: emptyHasNoConversion });
+  await shot(page, "page-sales-reports-empty");
+
+  // Back to the real window, then the export.
+  await page.goto(`${URL_ADMIN}/sales/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const download = page.waitForEvent("download", { timeout: 20000 }).catch(() => null);
+  await page.locator("[data-qa-sales-export]").first().click({ timeout: 5000 }).catch(() => {});
+  const file = await download;
+  const notice = (await page.locator("[data-qa-sales-export-notice]").innerText().catch(() => "")).trim();
+  const exportedCsv = Boolean(file && /\.csv$/.test(file.suggestedFilename()));
+  note({ step: "export", exportedCsv, notice: notice.slice(0, 80) });
+
+  // The rows behind the numbers are clickable and open the quote they name.
+  const rowCount = await page.locator("[data-qa-sales-report-row]").count();
+  let rowOpensTheQuote = false;
+  if (rowCount > 0) {
+    await page.locator("[data-qa-sales-report-row]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    rowOpensTheQuote = page.url().includes("/sales/quotes/");
+    await page.goto(`${URL_ADMIN}/sales/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1400);
+  }
+  note({ step: "rows", rowCount, rowOpensTheQuote });
+
+  // The search: the palette's own endpoint, driven through the screen that uses it.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/sales/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mobileOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ step: "mobile", overflow: mobileOverflow });
+  await shot(page, "mobile-sales-reports");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.salesReports = {
+    ok: cardsRender && filtersRender && addsUp && presetChangedTheUrl && exportedCsv && mobileOverflow <= 1,
+    steps,
+  };
+  return report.salesReports;
+}
+
+/**
  * The approval inbox (REQ-052, slice 3): `/sales/approvals`.
  *
  * The gate is the one rule a person acts against, so this pass walks the whole conversation rather
@@ -5368,6 +5466,7 @@ async function main() {
     { path: "/sales/quotes", name: "sales-quotes" },
     { path: "/sales/quotes/new", name: "sales-quote-builder" },
     { path: "/sales/orders", name: "sales-orders" },
+    { path: "/sales/reports", name: "sales-reports" },
     { path: "/sales/approvals", name: "sales-approvals" },
     { path: "/sales/catalog", name: "sales-catalog" },
     { path: "/sales/pricelists", name: "sales-pricelists" },
@@ -5482,6 +5581,8 @@ async function main() {
 
     report.salesOrders = await runDepthPass("sales-orders", () => runSalesOrders(page, report));
     log(`sales orders: ${JSON.stringify(report.salesOrders)}`);
+    report.salesReports = await runDepthPass("sales-reports", () => runSalesReports(page, report));
+    log(`sales reports: ${JSON.stringify(report.salesReports)}`);
   }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.

@@ -871,7 +871,12 @@ fn parse_percent(raw: &str) -> i32 {
     raw.parse::<f64>().map(|value| value.round() as i32).unwrap_or(0)
 }
 
-async fn owner_names(pool: &PgPool, ids: &[Uuid]) -> std::collections::HashMap<Uuid, String> {
+/// The display name of each owner id, resolved in one query.
+///
+/// `pub(crate)` because the report's per-owner breakdown needs it too, and a second
+/// implementation of "what is this person's name" is how a breakdown and a list end up
+/// disagreeing about who owns a quote.
+pub(crate) async fn owner_names(pool: &PgPool, ids: &[Uuid]) -> std::collections::HashMap<Uuid, String> {
     if ids.is_empty() {
         return std::collections::HashMap::new();
     }

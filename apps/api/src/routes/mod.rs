@@ -120,6 +120,7 @@ pub mod readyz;
 pub mod sales;
 pub mod sales_approvals;
 pub mod sales_orders;
+pub mod sales_reports;
 pub mod sales_quotes;
 pub mod scim;
 pub mod search;
@@ -1228,6 +1229,30 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "sales.orders.confirm"));
 
+    // The report and the search (docs/requests/REQ-052, slice 4b). Both are **reads**, and both
+    // are on keys that only read: a report is a picture of what already happened, and asking for
+    // one commits nobody to anything.
+    //
+    // The export is deliberately on the *same* key as the summary rather than a key of its own. An
+    // export readable by somebody who cannot see the table is not a smaller copy of it — it is a
+    // way around the permission, landing in a downloads folder with no screen on it to explain
+    // what it is.
+    let sales_reports_read = Router::new()
+        .route("/sales/reports/summary", get(sales_reports::report_summary))
+        .route("/sales/reports/export", get(sales_reports::report_export))
+        .route_layer(guards::require(&state, "sales.reports.read"));
+    // **Any one of** the two read keys, and the one place the platform needs an "or" guard. The
+    // palette is on every screen, so a person whose job is deliveries and not quoting must still
+    // find their order by typing a customer's name. Requiring both keys would make the search
+    // silently absent for half the sales desk — a feature that vanishes with no message, which is
+    // worse than a feature that is not there.
+    let sales_search = Router::new()
+        .route("/sales/search", get(sales_reports::search))
+        .route_layer(guards::require_any(
+            &state,
+            &["sales.quotes.read", "sales.orders.read"],
+        ));
+
     let sales_approvals_read = Router::new()
         .route("/sales/approvals", get(sales_approvals::list_approvals))
         .route("/sales/approvals/{id}", get(sales_approvals::get_approval))
@@ -1274,6 +1299,8 @@ pub fn router(state: AppState) -> Router {
         .merge(sales_orders_read)
         .merge(sales_orders_create)
         .merge(sales_orders_confirm)
+        .merge(sales_reports_read)
+        .merge(sales_search)
         .merge(sales_approvals_ask)
         .merge(sales_approvals_send)
         .merge(sales_products_manage)

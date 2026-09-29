@@ -17,6 +17,8 @@
 //!   sent afterwards.
 //! * [`orders`] — the other half of the chain: quote → order → confirm (which holds stock) →
 //!   invoice draft, with the status history that says how the document got where it is.
+//! * [`reports`] — the answer a desk is judged on: what was won and lost, per owner and per
+//!   period, the same rows as a CSV, and one ranked search over every document it wrote.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature the platform can carry behind the
 //! `sales.*` permission family, not infrastructure the core depends on. It talks to PostgreSQL
@@ -32,6 +34,7 @@ pub mod model;
 pub mod money;
 pub mod orders;
 pub mod quotes;
+pub mod reports;
 pub mod store;
 
 pub use error::{Result, SalesError};
@@ -44,6 +47,9 @@ pub use approvals::{
 pub use quotes::{
     NewQuote, NewQuoteLine, PublicQuote, QuoteDetail, QuoteLineView, QuotePatch, QuoteQuery,
     QuoteTotalsView, QuoteView,
+};
+pub use reports::{
+    GlobalSearchResults, OwnerRow, ReportRow, ReportTotals, ReportQuery, SalesReport, SearchHit,
 };
 pub use orders::{
     CancelOrder, HistoryEntry, InvoiceHandoffView, NewOrder, NewOrderLine, OrderDetail, OrderLineView,
