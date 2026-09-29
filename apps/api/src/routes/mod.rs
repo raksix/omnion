@@ -80,6 +80,7 @@ pub mod cdn_purge;
 pub mod commands;
 pub mod content;
 pub mod environments;
+pub mod promotions;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -1065,6 +1066,24 @@ pub fn router(state: AppState) -> Router {
     let environment_changes = get(environments::list_changes)
         .layer(guards::require(&state, "deployment.read"));
 
+    // Promotions (REQ-017 slice 3). Reading a promotion is `deployment.read`; *requesting* one
+    // and withdrawing it is `deployment.preview`, because a request records an intent and changes
+    // nothing — an account that fills a staging copy must be able to say "this is ready" without
+    // being able to push it. Approving is `deployment.deploy`: the only route in this request that
+    // writes to production.
+    let environment_promotions = get(promotions::list_promotions)
+        .layer(guards::require(&state, "deployment.read"))
+        .merge(
+            post(promotions::request_promotion)
+                .layer(guards::require(&state, "deployment.preview")),
+        );
+    let promotion_one = get(promotions::get_promotion)
+        .layer(guards::require(&state, "deployment.read"));
+    let promotion_approve = post(promotions::approve_promotion)
+        .layer(guards::require(&state, "deployment.deploy"));
+    let promotion_cancel = post(promotions::cancel_promotion)
+        .layer(guards::require(&state, "deployment.preview"));
+
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
@@ -1724,6 +1743,10 @@ pub fn router(state: AppState) -> Router {
         .route("/environments/{id}/clone", environment_one_clone)
         .route("/environments/{id}/clone-jobs", environment_jobs)
         .route("/environments/{id}/changes", environment_changes)
+        .route("/environments/{id}/promotions", environment_promotions)
+        .route("/promotions/{id}", promotion_one)
+        .route("/promotions/{id}/approve", promotion_approve)
+        .route("/promotions/{id}/cancel", promotion_cancel)
         .route(
             "/environments/{id}/clone-jobs/{job_id}/cancel",
             environment_job_cancel,

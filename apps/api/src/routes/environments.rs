@@ -818,7 +818,7 @@ async fn environment_body(
 /// the environment surface is organization-scoped end to end — there is no "all organizations"
 /// listing of somebody's staging copies, because a staging environment is a tenant's own content
 /// and a platform operator has no business guessing which tenant's staging to show.
-fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError> {
+pub fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError> {
     current.user.organization_id.ok_or_else(|| {
         ApiError::forbidden(
             "organization_required",
@@ -884,7 +884,8 @@ impl From<EnvironmentError> for ApiError {
             | EnvironmentError::NotStaging { .. }
             | EnvironmentError::Archived { .. }
             | EnvironmentError::CloneAlreadyRunning { .. }
-            | EnvironmentError::PromotionNotPending { .. } => {
+            | EnvironmentError::PromotionNotPending { .. }
+            | EnvironmentError::PromotionAlreadyRunning { .. } => {
                 Self::new(StatusCode::CONFLICT, error.code(), Self::message_of(&error))
             }
             EnvironmentError::PromotionConflict { ref items } => {
