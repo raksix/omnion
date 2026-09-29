@@ -8907,11 +8907,47 @@ note({
   // executed the prefix the author asked to skip is exactly what this has to rule out.
   {
     // Start from the *second* action of a live graph, so there is a prefix to skip.
-    // The *second* node in draw order, so there is a prefix to skip. A run from the first
-    // node is a whole run and would prove nothing about skipping.
+    // "Second in draw order" is the wrong question to ask a canvas. A rule is born from
+    // `Graph::starter` as `[trigger, end]`, so the second card is always the END node — and
+    // an end node is the one node that cannot start a run, correctly and by design ("the end
+    // of the graph has nothing after it to run"). The probe therefore read a stated refusal
+    // where the criterion wanted a run, and `canStart: "false"` says nothing about whether
+    // skipping works.
+    //
+    // The control lives in the INSPECTOR, so it only exists for the node that is selected:
+    // asking the whole page which nodes can start asks a question about a panel that renders
+    // one. The search is therefore what a user does — select each card, read its own answer —
+    // and the first node that says it can start and is not the trigger (a run from the top is
+    // a whole run and proves nothing about a prefix being skipped) wins. The scan is recorded
+    // so "no node on this graph can start" is a finding with evidence behind it rather than
+    // a null.
     const cards = page.locator("[data-node-id]");
     const cardCount = await cards.count();
-    if (cardCount > 1) {
+    const cardOrder = await page
+      .evaluate(() =>
+        Array.from(document.querySelectorAll("[data-node-id]")).map((card) => ({
+          id: card.getAttribute("data-node-id"),
+          type: card.getAttribute("data-node-type"),
+        })),
+      )
+      .catch(() => []);
+    const scan = [];
+    let chosenId = null;
+    for (const card of cardOrder) {
+      await page.locator(`[data-node-id="${card.id}"]`).first().click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(450);
+      const canStartHere = await page
+        .locator("[data-run-from-here]")
+        .first()
+        .getAttribute("data-can-start")
+        .catch(() => null);
+      scan.push({ id: card.id, type: card.type, canStart: canStartHere });
+      if (canStartHere === "true" && card.type !== "trigger") {
+        chosenId = card.id;
+        break;
+      }
+    }
+    if (!chosenId && cardCount > 1) {
       await cards.nth(1).click({ timeout: 8000 }).catch(() => {});
       await page.waitForTimeout(600);
     }
@@ -9004,6 +9040,10 @@ note({
       controlFound: controlCount > 0,
       cardsOnCanvas: cardCount,
       canStart,
+      // Which node each card answered for, so a `canStart: "false"` can be told apart from
+      // "the control never rendered for the node the criterion is about".
+      scan,
+      chosenId,
       // A disabled control must say why. A greyed button with no reason is a dead
       // button wearing a disabled attribute.
       disabledReason: disabledReason ? disabledReason.slice(0, 160) : null,
