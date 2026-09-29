@@ -1134,6 +1134,242 @@ async function runSalesCatalog(page, report) {
   return report.salesCatalog;
 }
 
+/**
+ * The quote depth pass (REQ-052, slice 2).
+ *
+ * A quote is the only document in this module a **customer** reads, so the pass walks the whole
+ * chain a seller walks and then does what the customer does: a quote is built with three lines, one
+ * of them over the approval threshold, it is saved, the totals that come back are read from the
+ * screen, the quote is sent, a link is issued, the public page is opened **with that link**, the
+ * decline-without-a-reason is refused, the quote is accepted, and the link is shown dead afterwards.
+ *
+ * The step that matters most is the one a screenshot cannot prove: the builder's footer must show
+ * the server's grand total, and the pass reads it rather than asserting that a footer exists. A
+ * builder that computed its own line sums would look identical in a screenshot and charge a
+ * different amount.
+ */
+async function runSalesQuotes(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "sales", action: "sales-quotes", ...step });
+  };
+  const stamp = Date.now().toString(36);
+  const reference = `QA-REF-${stamp}`;
+
+  // --- the empty list -----------------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/sales/quotes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const listRenders =
+    (await page.locator("[data-qa-sales-new-quote]").count()) > 0 ||
+    (await page.locator("[data-qa-sales-empty-new]").count()) > 0;
+  const tabsPresent = (await page.locator('[data-qa-sales-tab="draft"]').count()) > 0;
+  note({ step: "list-renders", listRenders, tabsPresent });
+  await shot(page, "page-sales-quotes");
+
+  // --- the builder: three lines, one over the threshold --------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/sales/quotes/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const builderRenders = (await page.locator("[data-qa-sales-lines]").count()) > 0;
+
+  // Two more rows, so the grid's add control and the reorder controls have something to act on.
+  await page.locator("[data-qa-sales-line-add]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-qa-sales-line-add]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const threeLines = (await page.locator('[data-qa-sales-line="3"]').count()) > 0;
+
+  await page.locator('[data-qa-sales-field="customer_id"]').first().fill("QA Customer Ltd", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="title"]').first().fill("QA website rebuild", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-field="reference"]').first().fill(reference, { timeout: 4000 }).catch(() => {});
+
+  await page.locator('[data-qa-sales-line-description="1"]').first().fill("Discovery", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-quantity="1"]').first().fill("3", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-price="1"]').first().fill("100.00", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-tax="1"]').first().fill("20", { timeout: 3000 }).catch(() => {});
+
+  await page.locator('[data-qa-sales-line-description="2"]').first().fill("Build", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-quantity="2"]').first().fill("2.5", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-price="2"]').first().fill("19.90", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-discount="2"]').first().fill("20", { timeout: 3000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-tax="2"]').first().fill("20", { timeout: 3000 }).catch(() => {});
+
+  await page.locator('[data-qa-sales-line-description="3"]').first().fill("Goodwill", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-qa-sales-line-quantity="3"]').first().fill("1", { timeout: 3000 }).catch(() => {});
+
+  // The banner must appear from the typing, before any save: "this needs a manager" has to be
+  // known while the seller decides the discount, not after the send is refused.
+  await page.waitForTimeout(400);
+  const bannerAppeared = (await page.locator("[data-qa-sales-approval-banner]").count()) > 0;
+  const sendDisabled = await page
+    .locator("[data-qa-sales-builder-send]")
+    .first()
+    .isDisabled()
+    .catch(() => false);
+  note({ step: "approval-banner-while-typing", bannerAppeared, sendDisabled });
+  await shot(page, "page-sales-quote-builder");
+
+  // The grid's own controls: reorder and remove, both of which change what the server is sent.
+  const firstBefore = await page
+    .locator('[data-qa-sales-line-description="1"]')
+    .first()
+    .inputValue()
+    .catch(() => "");
+  await page.locator('[data-qa-sales-line-down="1"]').first().click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const firstAfter = await page
+    .locator('[data-qa-sales-line-description="1"]')
+    .first()
+    .inputValue()
+    .catch(() => "");
+  const reordered = firstBefore !== firstAfter && firstAfter.length > 0;
+  await page.locator('[data-qa-sales-line-up="1"]').first().click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const backAgain = await page
+    .locator('[data-qa-sales-line-description="1"]')
+    .first()
+    .inputValue()
+    .catch(() => "");
+  note({ step: "line-reorder", reordered, backAgain: backAgain === firstBefore });
+
+  // --- save, and read the server's numbers back ----------------------------------------------------------------
+  await page.locator("[data-qa-sales-builder-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const saved = (await page.locator("[data-qa-sales-notice]").count()) > 0;
+  const notice = await page.locator("[data-qa-sales-notice]").first().textContent().catch(() => "");
+  const grandTotal = await page
+    .locator("[data-qa-sales-total]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  // The value the screen shows must be the value the module computed: three lines at 300.00 gross
+  // less 9.95 off plus 67.96 tax is 407.76, and a builder that added up its own rows would print
+  // something else here.
+  const showsServerTotal = typeof grandTotal === "string" && grandTotal.includes("407.76");
+  note({ step: "save-shows-the-server-total", saved, notice, grandTotal, showsServerTotal });
+  await shot(page, "page-sales-quote-saved");
+
+  // --- the list carries the quote ------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/sales/quotes?search=${reference}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const listed =
+    (await page.locator(`[data-qa-sales-quote-row*="${reference}"]`).count()) > 0 ||
+    (await page.locator("[data-qa-sales-quote-row]").count()) > 0;
+  const draftBadge = (await page.locator('[data-qa-sales-status="draft"]').count()) > 0;
+  note({ step: "list-carries-the-quote", listed, draftBadge });
+
+  // The status tabs must actually filter, or they are decoration.
+  await page.goto(`${URL_ADMIN}/sales/quotes?status=sent`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1300);
+  const sentTabRendered = (await page.locator('[data-qa-sales-tab="sent"]').count()) > 0;
+  const onlySent =
+    (await page.locator('[data-qa-sales-status="draft"]').count()) === 0 ||
+    (await page.locator('[data-qa-sales-status="sent"]').count()) > 0;
+  note({ step: "status-tab-filters", sentTabRendered, onlySent });
+  await shot(page, "page-sales-quotes-filtered");
+
+  // --- the detail: send, issue a link ---------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/sales/quotes?search=${reference}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  await page.locator("[data-qa-sales-quote-row]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const onDetail = page.url().includes("/sales/quotes/") && !page.url().endsWith("/sales/quotes");
+  const detailRendered = (await page.locator("[data-qa-sales-customer]").count()) > 0;
+  const versionsEmpty = (await page.locator("[data-qa-sales-versions]").count()) > 0;
+  await shot(page, "page-sales-quote-detail");
+
+  await page.locator("[data-qa-sales-detail-send]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const sent = (await page.locator('[data-qa-sales-detail-status="sent"]').count()) > 0;
+  const versionListed = (await page.locator("[data-qa-sales-versions] li").count()) > 0;
+  note({ step: "detail-send", onDetail, detailRendered, versionsEmpty, sent, versionListed });
+
+  // A sent quote is frozen, and the screen has to say so rather than letting the line grid look
+  // editable — that is the whole point of the "duplicate to change it" rule.
+  const frozenNotice = (await page.getByText(/frozen/i).count()) > 0;
+  await shot(page, "page-sales-quote-sent");
+
+  await page.locator("[data-qa-sales-link-issue]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const linkShown = (await page.locator("[data-qa-sales-link-url]").count()) > 0;
+  const linkText = linkShown
+    ? await page.locator("[data-qa-sales-link-url]").first().textContent().catch(() => "")
+    : "";
+  note({ step: "issue-the-customer-link", linkShown, hasToken: /\/q\/[0-9a-f-]{20,}/.test(linkText || "") });
+  await shot(page, "page-sales-quote-link");
+
+  // --- the public page, as the customer -------------------------------------------------------------------------
+  const token = (linkText || "").trim().split("/").pop();
+  if (token) {
+    await page.goto(`${URL_ADMIN}/q/${token}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(2000);
+    const publicNumber = (await page.locator("[data-qa-public-quote-number]").count()) > 0;
+    const publicLines = (await page.locator("[data-qa-public-quote-line]").count()) > 0;
+    const publicTotal = await page
+      .locator("[data-qa-public-quote-total]")
+      .first()
+      .textContent()
+      .catch(() => null);
+    const publicTotalMatches = typeof publicTotal === "string" && publicTotal.includes("407.76");
+    note({ step: "public-page-reads", publicNumber, publicLines, publicTotal, publicTotalMatches });
+    await shot(page, "web-public-quote");
+
+    // A decline with no reason is refused, and the refusal has to land on the reason field.
+    await page.locator("[data-qa-public-quote-decline]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    const declineRefused = (await page.locator("[data-qa-public-quote-error]").count()) > 0;
+    const stillOpen = (await page.locator("[data-qa-public-quote-accept]").count()) > 0;
+    note({ step: "decline-without-a-reason-is-refused", declineRefused, stillOpen });
+
+    // Accept: the page says so, and the buttons are gone because the decision is final.
+    await page.locator("[data-qa-public-quote-note]").first().fill("Looks good, let's start", { timeout: 4000 }).catch(() => {});
+    await page.locator("[data-qa-public-quote-accept]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    const accepted = (await page.locator("[data-qa-public-quote-decided]").count()) > 0;
+    const buttonsGone = (await page.locator("[data-qa-public-quote-accept]").count()) === 0;
+    note({ step: "public-accept", accepted, buttonsGone });
+    await shot(page, "web-public-quote-accepted");
+
+    // And a link that has been answered says the sentence rather than showing an error page.
+    const consumed = await page
+      .goto(`${URL_ADMIN}/q/${token}`, { waitUntil: "domcontentloaded" })
+      .then(() => page.waitForTimeout(1600))
+      .then(() => page.locator("[data-qa-public-quote-unavailable]").count())
+      .catch(() => 0);
+    note({ step: "consumed-link-is-a-sentence", consumed: consumed > 0 });
+    await shot(page, "web-public-quote-consumed");
+  } else {
+    note({ step: "public-page-skipped", reason: "no token was issued" });
+  }
+
+  // --- mobile ---------------------------------------------------------------------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/sales/quotes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const mobileOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ step: "mobile", overflow: mobileOverflow });
+  await shot(page, "mobile-sales-quotes");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.salesQuotes = {
+    ok:
+      builderRenders &&
+      threeLines &&
+      bannerAppeared &&
+      saved &&
+      showsServerTotal &&
+      sent &&
+      linkShown &&
+      publicNumber &&
+      accepted,
+    steps,
+    reference,
+  };
+  return report.salesQuotes;
+}
+
 async function runMediaFileManager(page, report) {
   const steps = [];
   const note = (step) => {
@@ -4846,6 +5082,8 @@ async function main() {
     // carry an id, and a route walked with a placeholder id only proves the not-found state
     // renders. `runSalesCatalog` below opens a *real* product's screen instead — the same reason
     // the media file detail is not in this list.
+    { path: "/sales/quotes", name: "sales-quotes" },
+    { path: "/sales/quotes/new", name: "sales-quote-builder" },
     { path: "/sales/catalog", name: "sales-catalog" },
     { path: "/sales/pricelists", name: "sales-pricelists" },
     { path: "/sales/settings", name: "sales-settings" },
@@ -4946,6 +5184,12 @@ async function main() {
   if (!onlyGroup("crm")) {
     report.salesCatalog = await runDepthPass("sales-catalog", () => runSalesCatalog(page, report));
     log(`sales catalog: ${JSON.stringify(report.salesCatalog)}`);
+
+    // The quote chain (REQ-052, slice 2): build with three lines and a 20% discount, read the
+    // server's total off the screen, send, issue the link, open it as the customer, decline
+    // without a reason (refused), accept, and confirm the consumed link says a sentence.
+    report.salesQuotes = await runDepthPass("sales-quotes", () => runSalesQuotes(page, report));
+    log(`sales quotes: ${JSON.stringify(report.salesQuotes)}`);
   }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.

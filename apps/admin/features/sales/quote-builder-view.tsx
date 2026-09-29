@@ -687,6 +687,7 @@ export function QuoteBuilderView({ quoteId }: { quoteId?: string }) {
               label="Total"
               value={totals ? formatMoney(totals.grand_total, detail?.quote.currency ?? "TRY") : "—"}
               strong
+              qa="sales-total"
             />
             <p className="pt-1 text-[11.5px] text-muted">
               {totals
@@ -700,11 +701,34 @@ export function QuoteBuilderView({ quoteId }: { quoteId?: string }) {
   );
 }
 
-function Row({ label, value, strong }: { label: string; value: string; strong?: boolean }) {
+/**
+ * One totals row.
+ *
+ * `qa` marks the grand total for the walkthrough, and only that row: the pass reads the number the
+ * screen printed rather than asserting that a footer exists, because "the totals block renders" is
+ * exactly the claim that a builder computing its own sums would pass while charging a different
+ * amount.
+ */
+function Row({
+  label,
+  value,
+  strong,
+  qa,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+  qa?: string;
+}) {
   return (
     <div className="flex items-center justify-between">
       <dt className={strong ? "font-medium" : "text-muted"}>{label}</dt>
-      <dd className={strong ? "font-semibold tabular-nums" : "tabular-nums"}>{value}</dd>
+      <dd
+        data-qa-sales-total={qa}
+        className={strong ? "font-semibold tabular-nums" : "tabular-nums"}
+      >
+        {value}
+      </dd>
     </div>
   );
 }
