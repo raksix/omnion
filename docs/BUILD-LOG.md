@@ -1,3 +1,76 @@
+## omnion-w10 · REQ-087 slice 3 (API half) — four endpoints, and a key that never matched
+
+The slice's algebra and persistence landed in the last two ticks. This tick is the half that
+talks to a provider, and the interesting part is not the endpoints — it is that **the flow
+could not have worked at all**, and every symptom pointed somewhere else.
+
+**`state_key` derived an HMAC key through an encryption primitive.** `SecretBox::encrypt`
+produces a fresh random nonce per call, which is exactly right for sealing a PKCE verifier and
+catastrophically wrong for an HMAC key: `build_state` and `verify_state` were handed different
+key bytes, so *every* callback failed as `credential_oauth_state`. The error names CSRF. The
+person reading it — me, at 01:00, with six red tests — goes looking for an attack. It is a key
+that never matched. The fix is a plain keyed hash of the raw installation material, and the
+lesson is narrower than "be careful with crypto": **a nonce is a property of the mode, not of
+the primitive.** A function named `encrypt` called where a `hash` was meant is the kind of
+mistake that reads as correct at every call site.
+
+**The state did not carry a tenant, and the callback cannot supply one.** A provider redirects
+a browser, not a session, so the handler has to learn which organization to scope its lookup to
+from the `state` itself. The payload named only the credential, which leaves two workarounds —
+guess a tenant, or query without a scope — and both are the failure the state exists to
+prevent. So the organization went into the *signed* bytes and `verify_state` now returns a
+`VerifiedState` pair rather than a bare id, which is what makes "scope it to a tenant I chose"
+unrepresentable. A payload without the dot is a state from a build that predates the field, and
+it is refused rather than parsed with a guess.
+
+**A guard on the wrong side of a boundary refused every refresh.** The first version of the
+refresh caller checked `TokenRequest::carries_secret` and refused to send. A refresh request
+*always* carries a refresh token, so the guard refused 100% of refreshes in the product. Six
+tests failed at once, which is the only reason I looked: a rule that refuses everything is
+not a rule, and it read as a careful safety check. `carries_secret` belongs to the transport,
+which is where the body must never be logged.
+
+**A matcher that knew the OAuth vocabulary but not the HTTP one.** `refusal_is_about_the_credential`
+listed `invalid_grant` and friends. A provider answering a bare `401 Unauthorized` — which is
+most of them for a revoked token — was classified as a transport hiccup, so the credential
+never degraded and the reader never saw the amber chip.
+
+| Piece | What the obvious version does | What shipped |
+|---|---|---|
+| state payload | `credential:issued:nonce` | `organization.credential:issued:nonce`, signed |
+| state key | `encrypt(installation_secret)` — a nonce per call | keyed hash of the raw material |
+| refresh refusal | timeout behind a peer is a failure | `Busy` — a retry, answered `202` |
+| `needs_reauth` | any refresh error degrades the row | only a refusal the provider issued |
+| state refusals | one sentence | five, one per situation, one code |
+| token store | a local scheme so the test passes | `secret_store_unavailable`, reported as a failure |
+
+The refresh caller's four-way answer is the slice's real content and the reason for the table:
+`Fresh` (not due), `Refreshed` (a new set), `Busy` (a peer holds the single-flight lock — a
+retry), `Reauth` (the provider refused the token). Reading `Busy` as a failure marks a working
+credential `needs_reauth` — six nodes finish together, one refreshes, five time out behind the
+lock, and five amber chips appear over a green connection. The probe's herd test asserts the
+provider was called *once*; the six callers' outcomes are whatever the lock says they are.
+
+A second test bug worth naming: the herd test's fixture had one answer, so the five losers
+reported "the fixture ran out" instead of `Busy`, and the test was measuring its own fixture.
+`Fixture::unlimited` exists because of that, and the assertion that matters is the provider's
+call count, not the outcomes.
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | **132 passed** (was 110) |
+| `cargo test -p omnion-api --lib` | **225 passed** |
+| `pnpm typecheck` | 2 successful, 0 errors |
+| `git status` | clean |
+
+Commits `e2a7e17`, `faeb737`, `3e91777`, `7317cfb`, `77c60fb` pushed to `wave10`.
+
+**Next.** Run `scripts/qa/oauth-contract.sh` against the w10 stack — the loopback provider and
+the probe exist but have not yet been driven over a real socket, and a test that has never run
+is a test that has never been wrong. Then REQ-087 slice 4 (the package ledger's install/remove
+and the SDK's scaffold/validate/pack). Slice 3 itself closes when REQ-125 gives the token
+somewhere to live and REQ-086 slice 2 gives `needs_reauth` a canvas to disable nodes on.
+
 ## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
 
 build media: retention policies, the run log, the hold, and the reference repair

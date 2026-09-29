@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** in-progress (slice 3, `7edd4fa` + `f2a4b97`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slices 1–3, `c3ec2d0`…`77c60fb`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -175,8 +175,26 @@ back to untested), `workflows.graph.saved` (usage refresh).
       guard degrades, it does not edit somebody's automation. **The last clause outstanding** is
       "disables the dependent nodes", which needs the canvas (REQ-086 slice 2) to have somewhere
       to disable them.*
-- [ ] OAuth start → callback stores a token set, shows the connected identity, and rejects a tampered `state` with `credential_oauth_state`.
-- [ ] A refresh failure lands as `needs_reauth`, emits its event, and disables the affected nodes on the canvas.
+- [~] OAuth start → callback stores a token set, shows the connected identity, and rejects a tampered `state` with `credential_oauth_state`.
+      *Proven: `POST /credentials/{id}/oauth/start` returns an authorization URL, a PKCE
+      challenge and the redirect URI; the callback refuses a tampered state, a foreign state
+      and an expired one with three *different* sentences under one code; the fixture provider
+      proves PKCE is derived `S256` and that a code is single-use. **The last clause is
+      blocked on REQ-125**, not on this slice: the provider issues a token and
+      `write_token_payload` refuses with `secret_store_unavailable` rather than inventing a
+      local scheme, so the "stores a token set" and "connected identity" halves cannot be
+      asserted until the encrypted store exists. The callback reports that refusal to the
+      reader as a *failure*, not as a connection.*
+- [~] A refresh failure lands as `needs_reauth`, emits its event, and disables the affected nodes on the canvas.
+      *Proven except the last clause. `refresh_or_use` returns four answers and the route
+      maps them: `fresh`/`expired` (200/409), `refreshed` (200), `busy` (**202**, not an
+      error — a peer holding the single-flight lock is a retry, and six concurrent callers
+      produce one exchange), and `needs_reauth`/`unavailable` (502). Only a refusal the
+      provider actually issued degrades the row: a 503 leaves it alone, because sending a
+      reader to re-authorize for the provider's bad minute is worse than a stale token. The
+      event `workflows.credential.needs_reauth` carries `credential_key`, which is what the
+      canvas needs to disable the nodes. **"Disables the affected nodes" waits on REQ-086
+      slice 2** — the canvas has nowhere to disable them.*
 - [ ] The usage view matches a manual count of fixture workflows and node keys referencing a credential.
 - [ ] Installing a third-party node package adds its nodes to the registry and palette without a restart; removal disables them and flags dependent workflows.
 - [ ] A package failing the SDK validator is refused with the findings and nothing reaches the ledger.
@@ -225,7 +243,9 @@ match the tested state, usage data is real.
    inventing a scheme — and the referenced-delete refusal, which needs a fixture graph and
    arrives with the canvas.*
 3. **OAuth and health** — start/callback, single-flight refresh, reauth state, canvas integration. Done: a fixture provider round-trips tokens and a forced refresh failure degrades correctly.
-   *Shipped so far (`7edd4fa`, `f2a4b97`): the flow's own algebra and its persistence.*
+   *Shipped (`7edd4fa`, `f2a4b97`, `e2a7e17`, `faeb737`, `3e91777`, `7317cfb`, `77c60fb`): the
+   flow's algebra, its persistence, the transport seam, the refresh caller, the four endpoints
+   and the contract probe.*
    `crates/workflows/src/oauth.rs` — the signed `state` (HMAC-SHA256 over a
    `credential:issued:nonce` payload, ten-minute window, four *distinct* refusals so a client
    can tell a CSRF attempt from a person who was slow), PKCE derived `S256` and verified before
@@ -239,9 +259,34 @@ match the tested state, usage data is real.
    bearer value), and `claim_flow` as one `update … where status = 'pending'` so the database
    decides who spent it rather than the application's timing. `release_flow` exists so a
    provider timeout does not strand a flow in `completing` forever.
-   35 new tests; `cargo test -p omnion-workflows --lib` 75 → 110.
-   **Still open on this slice:** the four endpoints, the fixture provider, the refresh
-   *caller* that uses `RefreshLock`, and `needs_reauth` reaching the canvas.
+   `crates/workflows/src/oauth_client.rs` — the `OAuthClient` trait, so the `ok: true`
+   branch of the test hook is reachable over a socket rather than asserted, and
+   `token_set_from_status`, so the code exchange and the refresh cannot disagree about what a
+   provider's answer means. `oauth_refresh.rs` — the caller, whose four-way answer
+   (`Fresh`/`Refreshed`/`Busy`/`Reauth`) is the slice's real content: `Busy` is a retry, and a
+   version that reads a lock timeout as a refusal marks a working credential `needs_reauth`.
+   `apps/api/src/routes/credential_oauth.rs` — the four endpoints, with the callback
+   unauthenticated by necessity and authenticated by the signed state.
+   `scripts/qa/oauth-contract.sh` — a loopback provider and the probe that drives it.
+
+   **One design change the callback forced.** The state's payload named only the credential,
+   and the callback has no session to scope its lookup with — so the organization went into
+   the *signed* bytes, and `verify_state` now returns a pair. A state minted for tenant A can
+   no longer be replayed into tenant B even by an attacker who edits the query string.
+
+   **One bug the tests caught that would have shipped silently.** `state_key` derived its HMAC
+   key through `SecretBox::encrypt`, which produces a fresh random nonce per call, so signing
+   and verifying used *different keys* and every callback failed as `credential_oauth_state` —
+   a sentence about CSRF for what is really a key that never matched. The key is now a plain
+   keyed hash of the raw installation material.
+
+   `cargo test -p omnion-workflows --lib` 110 → **132**; `cargo test -p omnion-api --lib`
+   **225 passed**; `pnpm typecheck` 0 errors.
+
+   **Still open on this slice:** storing the token set (REQ-125 — the callback reports that
+   refusal as a *failure* rather than as a connection), and `needs_reauth` reaching the canvas
+   (REQ-086 slice 2 — the event carries `credential_key`, and the canvas has nowhere to
+   disable nodes yet).
 4. **Node packages and SDK** — ledger, install/remove via REQ-044, scaffold/validate/pack CLI, fixtures. Done: a fixture package installs, appears in the palette, and removal degrades instead of breaking.
 
 ### Risks / notes
