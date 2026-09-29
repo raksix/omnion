@@ -202,6 +202,8 @@ pub struct AgentView {
     pub deadline_seconds: i32,
     /// Token ceiling.
     pub token_budget: i64,
+    /// The 30-day roll-up, so the table's cell is one request rather than one per row.
+    pub telemetry: Option<AgentTelemetryView>,
     /// Tool allow-list.
     pub tools: Vec<String>,
     /// How many of those park the run.
@@ -222,8 +224,15 @@ pub struct AgentView {
 
 impl AgentView {
     /// Describe one row.
+    ///
+    /// `telemetry` is `None` by default because the *detail* screen has no use for a 30-day
+    /// roll-up, and a builder that always computed one would make every read of an agent cost
+    /// a second query. The list route fills it in from the bulk roll-up it already fetched —
+    /// one query for the whole table rather than one per row, which on a 200-agent tenant is
+    /// the difference between an instant screen and an eleven-second one.
     fn build(agent: &Agent) -> Self {
         Self {
+            telemetry: None,
             id: agent.id,
             organization_id: agent.organization_id,
             site_id: agent.site_id,
@@ -310,6 +319,86 @@ impl RunView {
     }
 }
 
+/// One run's recomputed telemetry, as the run detail's header renders it.
+#[derive(Debug, Serialize)]
+pub struct RunTelemetryView {
+    /// Steps that finished.
+    pub completed_steps: i64,
+    /// Steps that failed.
+    pub failed_steps: i64,
+    /// Tool calls attempted.
+    pub tool_calls: i64,
+    /// Prompt tokens, summed from the completed steps.
+    pub prompt_tokens: i32,
+    /// Completion tokens, summed from the completed steps.
+    pub completion_tokens: i32,
+    /// Cost in millionths, summed from the completed steps.
+    pub cost_micros: i64,
+    /// Wall-clock milliseconds from the first step to the last.
+    pub duration_ms: i64,
+    /// Total tokens, so the panel does not add the two halves in eight places.
+    pub total_tokens: i64,
+}
+
+impl RunTelemetryView {
+    /// Describe one run's recomputed numbers.
+    fn build(telemetry: &omnion_ai_hub::telemetry::RunTelemetry) -> Self {
+        Self {
+            completed_steps: telemetry.completed_steps,
+            failed_steps: telemetry.failed_steps,
+            tool_calls: telemetry.tool_calls,
+            prompt_tokens: telemetry.prompt_tokens,
+            completion_tokens: telemetry.completion_tokens,
+            cost_micros: telemetry.cost_micros,
+            duration_ms: telemetry.duration_ms,
+            total_tokens: i64::from(telemetry.prompt_tokens) + i64::from(telemetry.completion_tokens),
+        }
+    }
+}
+
+/// One agent's 30-day roll-up, as the agents table's cell renders it.
+#[derive(Debug, Serialize)]
+pub struct AgentTelemetryView {
+    /// Finished runs in the window.
+    pub runs: i64,
+    /// Of those, the ones that produced an answer.
+    pub completed: i64,
+    /// Of those, the ones a person stopped.
+    pub cancelled: i64,
+    /// Of those, the ones that failed.
+    pub failed: i64,
+    /// Total tokens in the window.
+    pub total_tokens: i64,
+    /// Cost in millionths in the window.
+    pub cost_micros: i64,
+    /// Steps in the window.
+    pub steps: i64,
+    /// Completed as a percentage of finished runs, or `None` when nothing has finished.
+    ///
+    /// `None` is the honest answer for a brand-new agent and `0%` is a claim about a division
+    /// that never happened, so the panel renders an em dash rather than a number here.
+    pub success_rate: Option<f64>,
+    /// When the window starts, so the column header is not the only statement of it.
+    pub since: time::OffsetDateTime,
+}
+
+impl AgentTelemetryView {
+    /// Describe one agent's roll-up.
+    fn build(telemetry: &omnion_ai_hub::telemetry::AgentTelemetry, since: time::OffsetDateTime) -> Self {
+        Self {
+            runs: telemetry.runs,
+            completed: telemetry.completed,
+            cancelled: telemetry.cancelled,
+            failed: telemetry.failed,
+            total_tokens: telemetry.total_tokens(),
+            cost_micros: telemetry.cost_micros,
+            steps: telemetry.steps,
+            success_rate: telemetry.success_rate(),
+            since,
+        }
+    }
+}
+
 /// One step, as the trace accordion renders it.
 ///
 /// `arguments` is the **redacted** form the store wrote, not a re-read of the tool call: a
@@ -384,6 +473,14 @@ pub struct RunDetail {
     /// The run.
     #[serde(flatten)]
     pub run: RunView,
+    /// What the run actually did, recomputed from its step rows.
+    ///
+    /// A separate block rather than more columns on the run view, because the run's columns are
+    /// the *stored* totals and this is the *recomputed* one — and the acceptance criterion is
+    /// that they agree. Shipping them side by side turns that criterion from a test into
+    /// something an operator can check by eye on the screen, and a drift shows up as two
+    /// different numbers in the same header instead of as a wrong number.
+    pub telemetry: RunTelemetryView,
     /// The trace.
     pub steps: Vec<StepView>,
     /// What the run was told to read.
@@ -499,7 +596,74 @@ pub async fn list_agents_route(
     let organization = resolve_organization(&current, scope_query.organization_id)?;
 
     let agents = list_agents(state.db().pool(), organization).await?;
-    Ok(Json(agents.iter().map(AgentView::build).collect()))
+    // One roll-up query for the whole table. The `left join` inside it keeps an agent with no
+    // runs in the result with zeroes, so a brand-new agent renders an em dash rather than
+    // disappearing from its own table.
+    let since = omnion_ai_hub::telemetry::window_start(omnion_ai_hub::telemetry::ROLLUP_DAYS);
+    let rollup =
+        omnion_ai_hub::telemetry::agents_telemetry(state.db().pool(), organization, since).await?;
+    Ok(Json(
+        agents
+            .iter()
+            .map(|agent| {
+                let mut view = AgentView::build(agent);
+                view.telemetry = rollup.get(&agent.id).map(|row| AgentTelemetryView::build(row, since));
+                view
+            })
+            .collect(),
+    ))
+}
+
+/// `GET /api/v1/ai/agents/{id}/telemetry` — one agent's roll-up, on its own.
+///
+/// The list already carries the number, so this route exists for the *detail* screen and for
+/// anything that wants the roll-up without the whole agent list — a workflow node asking "is
+/// this agent worth calling", or an operator who has just changed the step cap and wants the
+/// rate to move without waiting for a page refresh. It is `ai.agents.read` and answers 404 for
+/// another tenant's agent, like every other agent route.
+pub async fn agent_telemetry_route(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope_query): Query<OrgQuery>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AgentTelemetryView>, ApiError> {
+    let organization = resolve_organization(&current, scope_query.organization_id)?;
+    // The agent has to exist *and* belong to this tenant. A roll-up for an agent that is not
+    // there is a 404 rather than a set of zeroes, because zeroes for a deleted agent read as
+    // "it has never run" on a screen that also lists deleted agents' history.
+    run_store::get_agent(state.db().pool(), organization, id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "agent.not_found", "no such agent"))?;
+    let since = omnion_ai_hub::telemetry::window_start(omnion_ai_hub::telemetry::ROLLUP_DAYS);
+    let telemetry =
+        omnion_ai_hub::telemetry::agent_telemetry(state.db().pool(), organization, id).await?;
+    Ok(Json(AgentTelemetryView::build(&telemetry, since)))
+}
+
+/// `GET /api/v1/ai/telemetry/tools` — how often each tool was called in the window.
+///
+/// Tenant-wide rather than per agent, because the question it answers is "what is this
+/// installation actually spending its tool calls on", and answering it per agent would make
+/// the caller fan out over the agent list to get one table.
+pub async fn tool_usage_route(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope_query): Query<OrgQuery>,
+) -> Result<Json<ToolUsageView>, ApiError> {
+    let organization = resolve_organization(&current, scope_query.organization_id)?;
+    let since = omnion_ai_hub::telemetry::window_start(omnion_ai_hub::telemetry::ROLLUP_DAYS);
+    let usage =
+        omnion_ai_hub::telemetry::tool_usage(state.db().pool(), organization, since).await?;
+    Ok(Json(ToolUsageView { since, tools: usage }))
+}
+
+/// The tool-usage table, as the API hands it over.
+#[derive(Debug, Serialize)]
+pub struct ToolUsageView {
+    /// When the window starts, so the client does not have to guess its own.
+    pub since: time::OffsetDateTime,
+    /// Call counts by tool key, in a stable order.
+    pub tools: std::collections::BTreeMap<String, i64>,
 }
 
 /// `POST /api/v1/ai/agents` — create one.
@@ -885,8 +1049,13 @@ pub async fn get_run_route(
         .map(|file| (file.id, file.bytes()))
         .collect();
     let resolution = agent_workspace::resolve(&inputs, &present);
+    // Recomputed from the step rows rather than read off the run's own columns, so the panel's
+    // numbers and the store's columns are two independent reads of the same fact and a drift
+    // between them is visible instead of being asserted (REQ-099 slice 4).
+    let telemetry = omnion_ai_hub::telemetry::run_telemetry(state.db().pool(), run.id).await?;
     Ok(Json(RunDetail {
         run: RunView::build(&run),
+        telemetry: RunTelemetryView::build(&telemetry),
         steps: steps.iter().map(StepView::build).collect(),
         // In the order the sheet named them, not "resolved first": the goal quotes them in that
         // order and a trace that silently reorders them is a trace the reader has to re-derive.
@@ -1146,6 +1315,10 @@ fn event_name(event: &omnion_ai_hub::agent::AgentEvent) -> &'static str {
         AgentEvent::AwaitingApproval { .. } => "awaiting_approval",
         AgentEvent::Done { .. } => "loop_done",
         AgentEvent::Error { .. } => "error",
+        // A guardrail is not an error: the run may be perfectly healthy and a rule may still
+        // have fired. Publishing it as `error` would make the trace's error badge appear on a
+        // run that succeeded, and an operator would go looking for a break that is not there.
+        AgentEvent::Guardrail { .. } => "guardrail",
     }
 }
 

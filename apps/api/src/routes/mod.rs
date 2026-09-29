@@ -812,6 +812,14 @@ pub fn router(state: AppState) -> Router {
         );
     let ai_agent_runs =
         post(ai_agents::start_run).layer(guards::require(&state, "ai.agents.run"));
+    // The telemetry reads (REQ-099 slice 4). Both are `ai.agents.read` rather than a new key:
+    // they read the runs and steps an `ai.agents.read` caller can already list, so a separate
+    // permission would be a key an operator has to remember for a sum of columns they can add
+    // up themselves.
+    let ai_agent_telemetry = get(ai_agents::agent_telemetry_route)
+        .layer(guards::require(&state, "ai.agents.read"));
+    let ai_tool_usage =
+        get(ai_agents::tool_usage_route).layer(guards::require(&state, "ai.agents.read"));
     // The skills registry (REQ-099, slice 3). Read and write are separate keys for the same
     // reason agents have: writing a skill means writing text that lands in every prompt an
     // attached agent sends, which is a different act from reading a list of them.
@@ -1578,6 +1586,13 @@ pub fn router(state: AppState) -> Router {
         // are the only GET/POST pair here that share a path prefix, so they are registered in
         // order rather than merged: `axum` matches a literal segment before a capture, and
         // `/ai/runs/{id}` would otherwise swallow `/ai/runs/{id}/events`.
+        // Telemetry (REQ-099 slice 4). Two reads, both `ai.agents.read`: the roll-up for one
+        // agent and the tenant-wide tool usage. The per-agent route is registered *before*
+        // `/ai/agents/{id}`'s siblings are consulted because axum matches a literal segment
+        // before a capture, so `/ai/agents/{id}/telemetry` cannot be reached by any other
+        // shape.
+        .route("/ai/agents/{id}/telemetry", ai_agent_telemetry)
+        .route("/ai/telemetry/tools", ai_tool_usage)
         .route("/ai/agents", ai_agents)
         .route("/ai/agents/{id}", ai_agent)
         .route("/ai/agents/{id}/runs", ai_agent_runs)

@@ -5453,6 +5453,56 @@ export type AiAgent = {
   enabled: boolean;
   created_at: string;
   updated_at: string;
+  /**
+   * The 30-day roll-up, present on the list and absent on the detail.
+   *
+   * Optional on purpose: the list route fills it from one bulk query, the detail route does not
+   * compute it, and a type that demanded it would make the second one lie. The cell renders an
+   * em dash for `null` rather than a zero, because "no runs yet" and "zero percent" are
+   * different facts.
+   */
+  telemetry?: AiAgentTelemetry | null;
+};
+
+/**
+ * One agent's 30-day roll-up.
+ *
+ * The denominator is **finished** runs, and `cancelled` is published beside it rather than
+ * folded in: a person pressing stop stopped the run, and counting that against the agent's
+ * reliability is the definition of a metric that gets gamed by impatience. A reader who wants
+ * the other denominator subtracts `cancelled` from `runs`.
+ */
+export type AiAgentTelemetry = {
+  /** Finished runs in the window. */
+  runs: number;
+  /** Of those, the ones that produced an answer. */
+  completed: number;
+  /** Of those, the ones a person stopped. */
+  cancelled: number;
+  /** Of those, the ones that failed. */
+  failed: number;
+  /** Total tokens in the window. */
+  total_tokens: number;
+  /** Cost in millionths in the window. */
+  cost_micros: number;
+  /** Steps in the window. */
+  steps: number;
+  /**
+   * Completed as a percentage of finished runs, or `null` when nothing has finished.
+   *
+   * `null` is the honest answer for a brand-new agent: `0%` is a claim about a division that
+   * never happened, and a cell reading "0%" on an agent nobody has run yet is a defect.
+   */
+  success_rate: number | null;
+  /** When the window starts, so the client does not have to guess its own. */
+  since: string;
+};
+
+/** How often each tool was called in the window, tenant-wide. */
+export type AiToolUsage = {
+  since: string;
+  /** Call counts by tool key. */
+  tools: Record<string, number>;
 };
 
 /** One run as the history list renders it. */
@@ -5506,7 +5556,50 @@ export type AiRunInput = {
 };
 
 /** One run with its trace and its named inputs — the run detail screen's whole payload. */
-export type AiRunDetail = AiRun & { steps: AiRunStep[]; inputs: AiRunInput[] };
+/**
+ * One run's recomputed telemetry, as the run detail's header renders it.
+ *
+ * A separate block rather than more columns on `AiRun` because the run's own columns are the
+ * *stored* totals and this is the *recomputed* one. Shipping both side by side turns "telemetry
+ * equals the underlying rows" from a test into something an operator can check by eye: a drift
+ * shows up as two different numbers in the same header instead of as one wrong number.
+ */
+export type AiRunTelemetry = {
+  completed_steps: number;
+  failed_steps: number;
+  tool_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+  duration_ms: number;
+  total_tokens: number;
+};
+
+export type AiRunDetail = AiRun & {
+  steps: AiRunStep[];
+  inputs: AiRunInput[];
+  telemetry: AiRunTelemetry;
+};
+
+/**
+ * One agent's 30-day roll-up, on its own.
+ *
+ * The list already carries this number, so the call exists for the detail screen and for
+ * anything that wants the roll-up without the whole agent list.
+ */
+export function fetchAiAgentTelemetry(
+  agentId: string,
+  organizationId?: string | null,
+): Promise<AiAgentTelemetry> {
+  return request<AiAgentTelemetry>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/telemetry${agentScopeParams(organizationId)}`,
+  );
+}
+
+/** How often each tool was called in the window, tenant-wide. */
+export function fetchAiToolUsage(organizationId?: string | null): Promise<AiToolUsage> {
+  return request<AiToolUsage>(`/api/v1/ai/telemetry/tools${agentScopeParams(organizationId)}`);
+}
 
 /** The organization selector the agent and run routes accept. */
 function agentScopeParams(organizationId?: string | null): string {
