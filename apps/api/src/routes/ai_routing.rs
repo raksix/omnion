@@ -446,7 +446,12 @@ pub async fn preview_routing(
     // An explicit `provider/model` is resolved through the real router so the preview answers
     // with the same pair a live request would get — including a refusal when the name does not
     // exist, which is exactly the thing an operator wants to know before shipping the pin.
-    let explicit = match body.requested.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    let requested = body
+        .requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let explicit = match requested {
         Some(requested) => Some(omnion_ai_hub::resolve(state.db().pool(), Some(requested)).await?.model),
         None => None,
     };
@@ -455,6 +460,11 @@ pub async fn preview_routing(
         &maps,
         &ResolveRequest {
             explicit: explicit.as_ref(),
+            // The dry run has to preview the decision a **live** request would take, so it
+            // records the operator's own spelling too. Without it the preview of a pin reads
+            // the bare model key, resolves it against the installation default, and reports
+            // that — a preview that disagrees with production is worse than no preview.
+            explicit_identifier: requested,
             feature: body.feature.as_deref(),
             task: body.task.as_deref(),
             requires: body.requires.clone(),

@@ -310,6 +310,7 @@ async fn record_for(
         &maps,
         &omnion_ai_hub::ResolveRequest {
             explicit: None,
+            explicit_identifier: None,
             feature: None,
             task: Some(task),
             requires: requirements.clone(),

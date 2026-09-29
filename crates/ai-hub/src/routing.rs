@@ -288,6 +288,20 @@ pub struct ResolveRequest<'a> {
     /// "chosen" really is usable. The API layer resolves it through `router::resolve` and hands
     /// the row in.
     pub explicit: Option<&'a AiModel>,
+    /// The identifier the caller actually sent, when it sent one.
+    ///
+    /// This is what the walk records, and it is **not** derivable from `explicit`. The row knows
+    /// its own `model_key`, but a key is ambiguous the moment two providers serve the same model
+    /// name — which is the normal shape of a failover pair, since both are configured with the
+    /// same upstream model. The first draft rebuilt the identifier from the key, so a request
+    /// pinning `Standby/mock-small` recorded `mock-small`, the read-back split found no provider
+    /// called it, fell through to a bare-key lookup, and answered with **Preferred** — the dead
+    /// one. The operator's pin silently addressed a different machine, and the walk said
+    /// "chosen" while doing it.
+    ///
+    /// `None` when the request named nothing; the walk then never takes the explicit branch, so
+    /// this is only consulted when `explicit` is `Some`.
+    pub explicit_identifier: Option<&'a str>,
     /// The feature whose pin may answer (checked before the task map).
     pub feature: Option<&'a str>,
     /// The task whose candidate list may answer.
@@ -353,7 +367,7 @@ pub fn decide(maps: &RoutingMaps, request: &ResolveRequest<'_>) -> Decision {
     // 1. An explicit pin wins over everything. It is the caller naming a model on purpose, so
     //    the only thing that can refuse it is a capability the model does not claim.
     if let Some(model) = request.explicit {
-        return decide_explicit(model, &requirements);
+        return decide_explicit(model, request.explicit_identifier, &requirements);
     }
 
     // 2. A feature pin, then 3. a task map — both walked from the most specific scope outwards,
@@ -422,8 +436,25 @@ pub fn decide(maps: &RoutingMaps, request: &ResolveRequest<'_>) -> Decision {
 /// cannot be capability-checked: the flags live on the model, not on the identifier. Passing the
 /// identifier through unchecked would produce a walk that says "chosen" for a model the router
 /// would refuse two lines later, which is the one thing the walk exists to prevent.
-fn decide_explicit(model: &AiModel, requirements: &[String]) -> Decision {
-    let model_id = model.model_key.clone();
+fn decide_explicit(
+    model: &AiModel,
+    identifier: Option<&str>,
+    requirements: &[String],
+) -> Decision {
+    // The walk identifier is the string the caller sent, because that is the only form that
+    // survives a round trip through `load_pair` when two providers serve the same model key —
+    // the shape of every failover pair. A bare `model_key` reads as "any provider serving this
+    // name", and the read-back answers with the default one.
+    //
+    // A caller who sent a *bare* key still gets the bare key recorded, because that is what they
+    // asked for and what the panel will echo back into the field. The ambiguity is real in both
+    // directions; pretending the walk can invent a provider the caller never named would make the
+    // log a work of fiction.
+    let model_id = identifier
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&model.model_key)
+        .to_owned();
     let mut walk: Vec<WalkEntry> = Vec::new();
 
     for requirement in requirements {
@@ -807,6 +838,7 @@ mod tests {
     fn request<'a>(task: &'a str, feature: Option<&'a str>, scope: Scope) -> ResolveRequest<'a> {
         ResolveRequest {
             explicit: None,
+            explicit_identifier: None,
             feature,
             task: Some(task),
             requires: Vec::new(),
@@ -1088,6 +1120,36 @@ mod tests {
         let decision = decide(&maps, &asked);
         assert_eq!(decision.rule, "explicit");
         assert_eq!(decision.model.expect("answers").model_id, "typed-model");
+    }
+
+    /// The walk records **the identifier the caller sent**, not the model's own key. A failover
+    /// pair is configured with the same upstream model on both providers, so the key alone names
+    /// two rows; the walk has to carry the disambiguating prefix or the read-back resolves it
+    /// against whichever provider the installation made default — which is, in the shape that
+    /// matters, the one that is down.
+    #[test]
+    fn an_explicit_pin_records_the_identifier_the_caller_typed() {
+        let scope = Scope::Installation;
+        let mut maps = maps_with_routes(scope, "cheap", vec![], None);
+        let standby = model("mock-small", true, false, None);
+
+        let mut asked = request("cheap", None, scope);
+        asked.explicit = Some(&standby);
+
+        // Without an identifier the walk can only say `mock-small` — true, and not enough.
+        assert_eq!(
+            decide(&maps, &asked).model.expect("answers").model_id,
+            "mock-small"
+        );
+
+        // With the caller's own spelling, the prefix survives the round trip.
+        asked.explicit_identifier = Some("Standby/mock-small");
+        assert_eq!(
+            decide(&maps, &asked).model.expect("answers").model_id,
+            "Standby/mock-small",
+            "the provider the caller named must survive into the walk, or the pin can be \
+             answered by a different provider serving the same model name"
+        );
     }
 
     #[test]
