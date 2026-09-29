@@ -20,6 +20,7 @@ import {
   fetchIamProvisioningTokens,
   fetchOrganizations,
   revokeIamProvisioningToken,
+  rotateIamProvisioningToken,
   type IamProvisioningToken,
   type IamSyncLogEntry,
 } from "@/lib/api";
@@ -32,6 +33,41 @@ const OUTCOME_STYLES: Record<string, string> = {
   skipped: "border-line bg-panel text-muted",
   failed: "border-danger/40 bg-danger-soft text-caution",
 };
+
+/**
+ * The one word that describes what a token will do on the next request.
+ *
+ * Four states, not two. Before expiry and rotation existed, "revoked or live" was the whole
+ * vocabulary, and the two that are new are the two an operator acts on differently: an **expired**
+ * token still looks live in a list of prefixes until a connector starts failing, and a **rotated**
+ * one is not dead by anyone's decision — it was replaced, and the replacement is the live row
+ * directly above it. Calling both "revoked" would be true and useless.
+ *
+ * The order matters: a rotated token is *also* revoked, and a token can be rotated and then
+ * expired. The first match wins, so the state shown is the one that happened last and is the
+ * reason the token no longer works.
+ */
+function tokenStateChip(token: IamProvisioningToken) {
+  const chip = (label: string, style: string) => (
+    <span
+      data-token-state={label}
+      className={`rounded-full border px-2 py-0.5 text-[11px] ${style}`}
+    >
+      {label}
+    </span>
+  );
+
+  if (token.rotated) return chip("rotated", "border-sky-500/40 bg-sky-500/10 text-sky-700");
+  if (token.revoked_at) return chip("revoked", "border-line bg-panel text-muted");
+  if (token.expired) return chip("expired", "border-amber-500/40 bg-amber-500/10 text-amber-800");
+  if (!token.expires_at) {
+    // A token with no expiry is the one this screen should never let an operator create quietly,
+    // so it says so even though it is the rare case. Silently rendering it as "live" would hide
+    // the only token on the list that can never be rotated into safety.
+    return chip("no expiry", "border-amber-500/40 bg-amber-500/10 text-amber-800");
+  }
+  return chip("live", "border-emerald-500/40 bg-emerald-500/10 text-emerald-700");
+}
 
 /** `/settings/iam/provisioning`. */
 export function ProvisioningView() {
@@ -46,6 +82,10 @@ export function ProvisioningView() {
   const [name, setName] = useState("");
   const [secret, setSecret] = useState<string | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null);
+  const [confirmRotate, setConfirmRotate] = useState<string | null>(null);
+  const [ttlDays, setTtlDays] = useState("90");
+  /** The rotation that produced the secret on screen, so the banner names what replaced what. */
+  const [replacedPrefix, setReplacedPrefix] = useState<string | null>(null);
 
   // A platform account (the first-run owner) names the organization it provisions into; an
   // account with its own organization never sees the picker.
@@ -99,14 +139,56 @@ export function ProvisioningView() {
     setError(null);
     setNotice(null);
     setSecret(null);
+    setReplacedPrefix(null);
+    // The lifetime is a real field rather than a constant the server picks, because "this token
+    // never expires" is a decision somebody should have to make on purpose. A blank means the
+    // server default; the number is validated here so a typo never reaches the API as a zero.
+    const parsed = ttlDays.trim() === "" ? undefined : Number(ttlDays);
+    if (parsed !== undefined && (!Number.isInteger(parsed) || parsed < 1 || parsed > 365)) {
+      setBusy(false);
+      setError("A token must live between 1 and 365 days.");
+      return;
+    }
     try {
-      const issued = await createIamProvisioningToken({ name: name.trim(), organizationId: activeOrg });
+      const issued = await createIamProvisioningToken({
+        name: name.trim(),
+        organizationId: activeOrg,
+        expiresInDays: parsed,
+      });
       setSecret(issued.secret);
       setNotice(`Token ${issued.token.prefix} minted. Copy the secret now — it is shown once.`);
       setName("");
       await load(activeOrg);
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "The token could not be minted.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Replace a token with a fresh one.
+   *
+   * The confirmation names the consequence rather than the action, because "Rotate" and "Revoke"
+   * are two words for the same visible outcome — the old secret stops working — and only one of
+   * them hands back something to paste into the directory. Saying so before the click is the
+   * difference between a rotation and a connector that is mysteriously failing at 3 a.m.
+   */
+  const rotate = async (token: IamProvisioningToken) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await rotateIamProvisioningToken(token.id);
+      setSecret(result.secret);
+      setReplacedPrefix(result.replaced.prefix);
+      setNotice(
+        `Token ${result.replaced.prefix} was replaced by ${result.token.prefix}. The old secret is refused from now on.`,
+      );
+      setConfirmRotate(null);
+      await load(activeOrg);
+    } catch (cause) {
+      setError(cause instanceof ApiError ? cause.message : "The token could not be rotated.");
     } finally {
       setBusy(false);
     }
@@ -189,6 +271,22 @@ export function ProvisioningView() {
               className="h-8 rounded-lg border border-line bg-surface px-2 text-[12.5px] text-ink outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
             />
           </label>
+          <label className="flex w-32 flex-col gap-1">
+            <span className="text-[11.5px] text-muted">Expires in (days)</span>
+            <input
+              value={ttlDays}
+              data-token-ttl
+              inputMode="numeric"
+              onChange={(event) => setTtlDays(event.target.value)}
+              placeholder="90"
+              aria-describedby="token-ttl-help"
+              className="h-8 rounded-lg border border-line bg-surface px-2 text-[12.5px] text-ink outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+            />
+            <span id="token-ttl-help" className="sr-only">
+              Blank uses the ninety-day default. A provisioning token never outlives its lifetime
+              unless somebody chooses to mint a longer one.
+            </span>
+          </label>
           <button
             type="submit"
             data-token-mint
@@ -206,7 +304,9 @@ export function ProvisioningView() {
             className="flex flex-col gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3"
           >
             <span className="text-[11.5px] font-medium text-amber-800">
-              Copy this secret now — it is stored only as a hash and cannot be shown again.
+              {replacedPrefix
+                ? `This is the new secret. Token ${replacedPrefix} is already refused — paste this one into the directory.`
+                : "Copy this secret now — it is stored only as a hash and cannot be shown again."}
             </span>
             <code className="break-all font-mono text-[12px] text-ink">{secret}</code>
           </div>
@@ -276,13 +376,21 @@ export function ProvisioningView() {
                   <th className="px-3 py-2">Prefix</th>
                   <th className="px-3 py-2">Created</th>
                   <th className="px-3 py-2">Last used</th>
+                  <th className="px-3 py-2">Expires</th>
                   <th className="px-3 py-2">State</th>
                   <th className="px-3 py-2" />
                 </tr>
               </thead>
               <tbody>
                 {tokens.map((token) => (
-                  <tr key={token.id} data-token-row data-token-revoked={token.revoked_at ? "true" : "false"} className="border-b border-line/60 last:border-0">
+                  <tr
+                    key={token.id}
+                    data-token-row
+                    data-token-revoked={token.revoked_at ? "true" : "false"}
+                    data-token-expired={token.expired ? "true" : "false"}
+                    data-token-rotated={token.rotated ? "true" : "false"}
+                    className="border-b border-line/60 last:border-0"
+                  >
                     <td className="px-3 py-2 text-ink">{token.name || "—"}</td>
                     <td className="px-3 py-2 font-mono text-[11.5px] text-muted">{token.prefix}…</td>
                     <td className="px-3 py-2 text-muted">
@@ -291,16 +399,11 @@ export function ProvisioningView() {
                     <td className="px-3 py-2 text-muted">
                       {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : "never"}
                     </td>
+                    <td className="px-3 py-2 text-muted">
+                      {token.expires_at ? new Date(token.expires_at).toLocaleDateString() : "no expiry"}
+                    </td>
                     <td className="px-3 py-2">
-                      {token.revoked_at ? (
-                        <span className="rounded-full border border-line bg-panel px-2 py-0.5 text-[11px] text-muted">
-                          revoked
-                        </span>
-                      ) : (
-                        <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-700">
-                          live
-                        </span>
-                      )}
+                      {tokenStateChip(token)}
                     </td>
                     <td className="px-3 py-2">
                       {token.revoked_at ? null : confirmRevoke === token.id ? (
@@ -322,17 +425,51 @@ export function ProvisioningView() {
                             Cancel
                           </button>
                         </span>
+                      ) : confirmRotate === token.id ? (
+                        // The confirmation states the consequence, because "Rotate" and "Revoke"
+                        // look identical from the outside — the old secret dies either way, and only
+                        // one of them hands back something to paste.
+                        <span className="flex items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            data-token-rotate-confirm
+                            onClick={() => void rotate(token)}
+                            className="rounded-lg border border-accent/40 bg-accent/10 px-2 py-1 text-[11.5px] text-ink"
+                          >
+                            Replace it
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmRotate(null)}
+                            className="rounded-lg border border-line px-2 py-1 text-[11.5px] text-muted"
+                          >
+                            Cancel
+                          </button>
+                        </span>
                       ) : (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          data-token-revoke
-                          onClick={() => setConfirmRevoke(token.id)}
-                          className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-caution transition hover:bg-panel"
-                        >
-                          <Trash2 className="size-3.5" aria-hidden />
-                          Revoke
-                        </button>
+                        <span className="flex items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            data-token-rotate
+                            onClick={() => setConfirmRotate(token.id)}
+                            className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-ink transition hover:bg-panel"
+                          >
+                            <RefreshCw className="size-3.5" aria-hidden />
+                            Rotate
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            data-token-revoke
+                            onClick={() => setConfirmRevoke(token.id)}
+                            className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-caution transition hover:bg-panel"
+                          >
+                            <Trash2 className="size-3.5" aria-hidden />
+                            Revoke
+                          </button>
+                        </span>
                       )}
                     </td>
                   </tr>

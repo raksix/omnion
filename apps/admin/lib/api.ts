@@ -3502,6 +3502,17 @@ export type IamProvisioningToken = {
   last_used_at: string | null;
   revoked_at: string | null;
   created_at: string;
+  /** When the token stops being accepted; null only for tokens minted before expiry existed. */
+  expires_at: string | null;
+  /** Set when a newer token replaced this one. */
+  rotated_at: string | null;
+  /**
+   * Computed by the API, not by the client. A panel that compares timestamps in the browser
+   * disagrees with the server by the viewer's timezone and its clock, and an expired token that
+   * still reads as live is the one thing this screen must never show.
+   */
+  expired: boolean;
+  rotated: boolean;
 };
 
 /** One line of the SCIM sync log. */
@@ -3530,14 +3541,32 @@ export function fetchIamProvisioningTokens(
 export function createIamProvisioningToken(input: {
   name?: string;
   organizationId?: string | null;
+  /** Lifetime in days; omitted means the server's default rather than "never expires". */
+  expiresInDays?: number;
 }): Promise<{ token: IamProvisioningToken; secret: string }> {
   return request("/api/v1/iam/provisioning/tokens", {
     method: "POST",
     body: JSON.stringify({
       name: input.name ?? "",
       ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+      ...(input.expiresInDays !== undefined ? { expires_in_days: input.expiresInDays } : {}),
     }),
   });
+}
+
+/**
+ * Rotate a token: the old secret stops working and a new one is returned, shown once.
+ *
+ * `replaced` is re-read from the database rather than echoing the pre-rotation row, so the panel
+ * can render "replaced by" without contradicting the list it refreshes into.
+ */
+export function rotateIamProvisioningToken(id: string): Promise<{
+  rotated: boolean;
+  replaced: IamProvisioningToken;
+  token: IamProvisioningToken;
+  secret: string;
+}> {
+  return request(`/api/v1/iam/provisioning/tokens/${id}`, { method: "POST" });
 }
 
 /** Revoke a token. */

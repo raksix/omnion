@@ -6161,6 +6161,48 @@ async function runIamProvisioningDepth(page, report) {
   note({ step: "sync-log", logRows, createdRows, deactivatedRows, firstDetail: firstDetail.slice(0, 120) });
   await shot(page, "page-iam-provisioning-log");
 
+  // ---- Rotate, and prove the old secret is refused (REQ-065, slice 4 part 4) ----------------
+  // Rotation is the operation the acceptance criterion is actually about, and it is the only one
+  // of the three that *hands back a new secret*: revoke and rotate look identical from the
+  // outside — the old secret dies — so without this step the walk would pass against a screen
+  // that can kill a connector and leave nothing to paste in.
+  await page.locator("[data-token-rotate]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-token-rotate-confirm]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-token-secret]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const rotatedSecret = (await page
+    .locator("[data-token-secret] code")
+    .first()
+    .innerText()
+    .catch(() => ""))
+    .trim();
+
+  const rotation = await page.evaluate(async ({ oldToken, newToken }) => {
+    const call = async (token) => {
+      const response = await fetch("/api/v1/scim/v2/Users", {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      });
+      return { status: response.status };
+    };
+    return {
+      oldStatus: (await call(oldToken)).status,
+      newStatus: (await call(newToken)).status,
+    };
+  }, { oldToken: secret, newToken: rotatedSecret });
+
+  const rotatedRows = await page.locator('[data-token-row][data-token-rotated="true"]').count();
+  const expiryColumn = await page.locator('[data-token-row] td:nth-child(5)').first().innerText().catch(() => "");
+  note({
+    step: "rotated",
+    newSecretShown: rotatedSecret.startsWith("omsc_") && rotatedSecret !== secret,
+    oldStatus: rotation.oldStatus,
+    newStatus: rotation.newStatus,
+    rotatedRows,
+    expiryColumn: expiryColumn.trim().slice(0, 40),
+  });
+  await shot(page, "page-iam-provisioning-rotated");
+
   // ---- Revoke, and prove the token is refused afterwards -----------------------------------
   // The list is newest-first, so the token this pass minted is the first row.
   await page.locator("[data-token-revoke]").first().click({ timeout: 4000 }).catch(() => {});
