@@ -4438,3 +4438,57 @@ level first. `retryRefusesASentRow` is not written at all.
 
 **Next.** Drive the nest to a genuine third level so `fourthLevelRefused` is a screen fact, write
 `retryRefusesASentRow`, then a full `bash scripts/qa/run.sh` on the w2 stack to close slice 1.
+
+## 2026-09-29 · REQ-064 slice 1, the last check — and the migration that was quietly killing every suite
+
+**What.** The menus pass is **14/14 with `missing: []`** and zero console errors. Closing it took
+a merge, five harness corrections and one migration fix, and the useful part is that the store
+was never wrong about anything the checklist complained about.
+
+**The refused fourth level, which had been unprovable for four ticks.** The pass pressed *Nest
+under the row above* on a row it had already nested, so the second press had nothing to do and
+the tree stayed two deep. The depth probe then parented its new row on the deepest row — depth
+two — which is a legal third level the store accepted, so `fourthLevelRefused` read `false`
+beside a `200` and the depth rule was reported broken by a check that had never once asked about
+a fourth level. The editor's own affordance for going deeper is *Add a child under `<row>`*;
+driving that, and reading the child row out of the parent's child **list** rather than its own
+row, gets the tree to *deepest branch 3 of 3*. The refusal is then real: **400 `menu_too_deep`**,
+*"menu items nest at most 3 levels deep; \"QA fourth\" reaches 4"*, stored tree untouched.
+
+**A check that could never be written.** `retryRefusesASentRow` sat in the menus checklist but
+was produced by the **notifications** pass, which drives a different screen and does not run
+under `--only=menus` — so it was permanently "missing", reading like a screen that does not work.
+The queue has its own retry and its own refusal, and the pass drives that now: a `pending` entry
+must not be requeued (`404 publishing_entry_not_found`, row still `pending`).
+
+**Two more of the same class, both green for the wrong reason.** `nestedUnderSecond` asked a row
+whether it had a child by matching the parent's own `<li>` and taking its first row — it always
+found one, so the nest was never actually proven. And `treeRendered` counted a **collapsed**
+branch's child as a row the editor had lost; branches are opened first, then `renderedRows 4 ==
+savedItems 4`.
+
+**And the one that was not the harness at all.** Merging main brought
+`0052_webhook_delivery_ops.sql` onto a branch already holding `0052_cms_menus_publishing.sql`.
+Migration numbers are a shared namespace, not per branch, so the duplicate is a
+`VersionMismatch(38)` that killed **all 14** menu tests before an assertion ran — printed as SKIP
+with a result line, which reads exactly like "PostgreSQL is unreachable". Renumbered to **0124**,
+past main's high-water mark.
+
+**Proof.**
+
+- `node scripts/qa/walkthrough.cjs --only=menus` (private w2 stack) → **`MENUS_MISSING=none`**,
+  `MENUS_CONSOLE_ERRORS=0`, `NET_FAILURES=3` — and all three are refusals the pass provokes on
+  purpose: the too-deep write (400), the contested location (409) and the queue retry (404)
+- `cargo test -p omnion-api --test cms_menus` → **14/14** against real PostgreSQL
+- `cargo test -p omnion-content` → **118**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `c2b8fd8`, `1c1893e`, `74dfe85`, `7301d57`, `aba4920`, `738bef3`, `064526a`, `461b188`
+
+**Not done, and not claimed.** Slice 1 is not closed: acceptance 4's *full-pass* half and the
+wave-wide mobile check (criterion 13) still need a whole `run.sh` on the w2 stack, and the queue
+screen's retry button has been exercised through the API rather than clicked. Next.
+
+**Next.** Run the full `bash scripts/qa/run.sh` on the private stack
+(`QA_STACK=w2 QA_API_PORT=18081 QA_ADMIN_PORT=3101 QA_WEB_PORT=3201`) to take the whole pass —
+including 390 px — and close slice 1 if it is green. Then slice 2: **forms** (`0113`-renumbered,
+builder + public render + inbox).
