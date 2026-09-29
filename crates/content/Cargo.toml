@@ -15,3 +15,11 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 time.workspace = true
+tokio.workspace = true
+
+# Argon2id password hashing for visitor accounts (REQ-064, slice 4c). The dependency is on the
+# identity crate rather than on `argon2` directly, deliberately: the point of reusing it is that
+# a member's credential costs exactly what a user's costs, and duplicating the PHC plumbing here
+# is how the two drift into different parameters. Identity does not depend on content, so this
+# is not a cycle.
+omnion-identity = { path = "../identity" }

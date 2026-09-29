@@ -206,6 +206,44 @@ pub enum ContentError {
     /// No issue carries this archive slug, or it belongs to another site.
     #[error("no such newsletter issue")]
     IssueNotFound,
+
+    // -----------------------------------------------------------------------------------------
+    // Memberships (REQ-064, slice 4c)
+    // -----------------------------------------------------------------------------------------
+
+    /// A member field is not usable (blank, too long, an unknown role, an unknown state).
+    #[error("invalid member: {0}")]
+    InvalidMember(String),
+    /// No member carries this identifier, or it belongs to another site.
+    #[error("no such member")]
+    MemberNotFound,
+    /// The address already has an account on this site.
+    ///
+    /// Deliberately a 409 and not a 404, on a *public* route. The tension is real and it is
+    /// resolved in favour of the visitor here rather than in favour of concealment: this error
+    /// is only ever returned by the **panel**'s "add a member" action, never by the public
+    /// signup. The public signup answers 202 with the same body whether the address was new,
+    /// already known or just re-invited, so it discloses nothing; the panel is a signed-in
+    /// operator who needs to be told the add did not work and why.
+    #[error("{0} already has an account on this site")]
+    MemberEmailTaken(String),
+    /// A sign-in was refused.
+    ///
+    /// One error for four refusals — unknown address, wrong password, not yet verified, and
+    /// blocked — because the two that matter to an attacker are indistinguishable to a
+    /// visitor, and a sign-in form that answers "this address is not verified yet" hands out
+    /// the membership of every address on the site.
+    #[error("that e-mail and password do not match an account here")]
+    InvalidCredentials,
+    /// The member's own site has not verification on, so no link was ever sent.
+    ///
+    /// The panel's "send verification" button reaching this means the site's own policy
+    /// contradicts the button, which is a configuration mistake the operator has to see.
+    #[error("this site does not require verification — turn it on in membership settings first")]
+    VerificationNotRequired,
+    /// The password is too short to be stored.
+    #[error("password: {0}")]
+    WeakPassword(String),
 }
 
 /// Result alias used across the content crate.
@@ -269,6 +307,12 @@ impl ContentError {
             Self::SubscriberAlreadyConfirmed(_) => "subscriber_already_confirmed",
             Self::InvalidToken => "invalid_token",
             Self::IssueNotFound => "newsletter_issue_not_found",
+            Self::InvalidMember(_) => "invalid_member",
+            Self::MemberNotFound => "member_not_found",
+            Self::MemberEmailTaken(_) => "member_email_taken",
+            Self::InvalidCredentials => "invalid_credentials",
+            Self::VerificationNotRequired => "verification_not_required",
+            Self::WeakPassword(_) => "weak_password",
             Self::SiteNotFound => "site_not_found",
         }
     }

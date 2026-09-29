@@ -14,6 +14,7 @@ pub mod comments;
 pub mod error;
 pub mod forms;
 pub mod menus;
+pub mod members;
 pub mod model;
 pub mod newsletter;
 pub mod page_comments;
