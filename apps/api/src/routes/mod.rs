@@ -1243,6 +1243,12 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/owners",
             get(crm_intake::owners).layer(guards::require(&state, "crm.leads.read")),
         )
+        // The bulk hand-over. `crm.leads.assign`, because a batch of twenty hand-overs is
+        // twenty hand-overs and no more powerful than the one it replaces.
+        .route(
+            "/crm/leads/bulk-assign",
+            post(crm_intake::bulk_assign).layer(guards::require(&state, "crm.leads.assign")),
+        )
         .route(
             "/crm/leads/retention/sweep",
             post(crm_intake::retention_sweep).layer(guards::require(&state, "crm.leads.manage")),

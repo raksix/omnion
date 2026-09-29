@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# CRM intake — hand assignment, against a real database.
+# CRM intake — hand assignment and the batch that hands twenty over at once, against a real
+# database.
 #
 #   QA_DB=omnion_qa_w8_assign bash scripts/qa/run-crm-assign.sh
 #
@@ -42,4 +43,4 @@ done
 
 # One organization per test, for the reason the other gates say it: cargo runs a binary's tests
 # concurrently, so a shared fixture means each test deletes the others' rows mid-run.
-cargo test -p omnion-module-crm-intake --test crm_assign -- --nocapture
+cargo test -p omnion-module-crm-intake --test crm_assign --test crm_bulk -- --nocapture

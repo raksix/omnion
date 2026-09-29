@@ -13,6 +13,7 @@
 //! * **A refusal is still a row.** [`capture`] writes the spam and rejected rows *through the
 //!   same insert* as an accepted one, so the inbox can show what was discarded.
 
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgQueryResult;
 use sqlx::PgPool;
 use sqlx::{Postgres, QueryBuilder};
@@ -26,7 +27,7 @@ use crate::model::{
     contactable, Attribution, IntakeSource, Lead, LeadEvent, LeadMetrics, LeadOwner,
     NewIntakeSource, SpamVerdict,
 };
-use crate::vocabulary::{is_status, MAX_PAGE, MAX_PAYLOAD_BYTES};
+use crate::vocabulary::{is_status, MAX_BULK_IDS, MAX_PAGE, MAX_PAYLOAD_BYTES};
 
 pub const SOURCE_COLUMNS: &str = "id, organization_id, site_id, name, kind, form_key, \
      endpoint_key_hash, endpoint_key_hint, mapping, required_targets, consent_required, \
@@ -1250,6 +1251,132 @@ pub async fn list_owners(pool: &PgPool, organization_id: Uuid) -> Result<Vec<Lea
             status,
         })
         .collect())
+}
+
+/// What one bulk call actually did, per lead.
+///
+/// The inbox's bulk bar acts on twenty rows and reports one sentence, and "Assigned 18 of 20"
+/// without saying *which* two leaves the operator unable to tell a refusal from a selection
+/// that never got ticked. So the answer is per id, and the panel renders the failures rather
+/// than the successes' absence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkAssignOutcome {
+    /// The lead the action was about.
+    pub id: Uuid,
+    /// Whether it landed.
+    pub done: bool,
+    /// Why not, in the caller's words. `None` on success.
+    pub reason: Option<String>,
+}
+
+/// What a whole bulk call did.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BulkAssignReport {
+    /// Per lead, in the order they were named.
+    pub results: Vec<BulkAssignOutcome>,
+}
+
+impl BulkAssignReport {
+    /// How many landed.
+    #[must_use]
+    pub fn applied(&self) -> usize {
+        self.results.iter().filter(|row| row.done).count()
+    }
+
+    /// How many were refused, and why they were not.
+    #[must_use]
+    pub fn refused(&self) -> usize {
+        self.results.len() - self.applied()
+    }
+
+    /// One sentence an operator can paste into a ticket.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let refused = self.refused();
+        if refused == 0 {
+            return format!("{} leads now have their new owner.", self.applied());
+        }
+        let mut reasons: Vec<(String, usize)> = Vec::new();
+        for row in self.results.iter().filter(|row| !row.done) {
+            let reason = row.reason.clone().unwrap_or_else(|| "unknown".to_string());
+            match reasons.iter_mut().find(|(text, _)| *text == reason) {
+                Some((_, count)) => *count += 1,
+                None => reasons.push((reason, 1)),
+            }
+        }
+        let detail = reasons
+            .iter()
+            .map(|(text, count)| format!("{count} x {text}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("{} of {} leads were assigned. {detail}", self.applied(), self.results.len())
+    }
+}
+
+/// Hand a batch of leads to one person, or back to the queue.
+///
+/// **Each lead is its own transaction, on purpose.** `assign_owner` is a transaction because a
+/// lead's owner change and its trail line must be together; it is not a transaction because it
+/// has to be *atomic with the rest of the batch*, and making it so would be worse than the
+/// alternative: one row the operator lacks `crm.leads.read` for, or one lead somebody filed as
+/// spam, would roll back nineteen legitimate hand-overs and report a failure for work that had
+/// already happened. A batch is a sequence of decisions that happen to be requested together,
+/// and the report says which of them landed.
+///
+/// The refusals are therefore *per row* rather than one exception for the call: a verdict is
+/// refused with its status in the message (see `assign_owner`), and that message is what the
+/// inbox shows on the row that stayed put.
+pub async fn bulk_assign_owner(
+    pool: &PgPool,
+    organization_id: Uuid,
+    ids: &[Uuid],
+    owner: Option<Uuid>,
+    reason: &str,
+    actor_user_id: Option<Uuid>,
+) -> Result<BulkAssignReport> {
+    // The cap is here and not only in the handler, for the reason every vocabulary constant
+    // in this crate exists: a value the route refuses and the store accepts reads as "nothing
+    // happened" from whichever caller forgot the check. Two hundred is a page of the inbox,
+    // and a batch larger than that is a filter the operator forgot to apply.
+    if ids.len() > MAX_BULK_IDS {
+        return Err(CrmIntakeError::invalid(format!(
+            "{} leads is more than one bulk action takes ({MAX_BULK_IDS}) — narrow the filter first",
+            ids.len()
+        )));
+    }
+    if ids.is_empty() {
+        return Err(CrmIntakeError::invalid(
+            "no leads were named — a bulk action with nothing selected does nothing and says so",
+        ));
+    }
+
+    let mut report = BulkAssignReport::default();
+    for id in ids {
+        let outcome = match assign_owner(pool, organization_id, *id, owner, reason, actor_user_id)
+            .await
+        {
+            Ok(Some(_)) => BulkAssignOutcome {
+                id: *id,
+                done: true,
+                reason: None,
+            },
+            // A lead of another organization is not a row, and the batch says so rather than
+            // pretending the caller asked for something that does not exist — `404` for one
+            // id in a list of twenty is not an error the operator can act on.
+            Ok(None) => BulkAssignOutcome {
+                id: *id,
+                done: false,
+                reason: Some("no such lead in this organization".to_string()),
+            },
+            Err(error) => BulkAssignOutcome {
+                id: *id,
+                done: false,
+                reason: Some(error.to_string()),
+            },
+        };
+        report.results.push(outcome);
+    }
+    Ok(report)
 }
 
 /// One lead of an organization, or `None`.

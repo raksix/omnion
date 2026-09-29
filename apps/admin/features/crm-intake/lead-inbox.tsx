@@ -23,7 +23,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { RefreshCw, Search, TriangleAlert, UserPlus } from "lucide-react";
+import { Check, Loader2, RefreshCw, Search, TriangleAlert, UserPlus, UserRoundCheck } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -43,9 +43,11 @@ import {
   slaState,
 } from "@/lib/crm-intake";
 import {
+  bulkAssignLeads,
   fetchIntakeSources,
   fetchLeads,
   fetchLeadOwners,
+  type BulkAssignReport,
   type IntakeSource,
   type Lead,
   type LeadInbox,
@@ -78,6 +80,16 @@ export function LeadInbox() {
   // The roster behind the owner column. Read once, and its absence is invisible to the table:
   // a lead whose owner cannot be named still has to appear, with the short id the trail uses.
   const [owners, setOwners] = useState<LeadOwner[]>([]);
+  // The bulk hand-over. Selection is a set of ids, the owner is one value and the reason is
+  // one sentence shared by the whole batch — because twenty rows moved for twenty different
+  // reasons is a trail nobody can read afterwards.
+  const [selected, setSelected] = useState<string[]>([]);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkOwner, setBulkOwner] = useState("");
+  const [bulkReason, setBulkReason] = useState("");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkReport, setBulkReport] = useState<BulkAssignReport | null>(null);
+  const [bulkError, setBulkError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -99,6 +111,9 @@ export function LeadInbox() {
           append && previous ? { ...page, leads: [...previous.leads, ...page.leads] } : page,
         );
         setCursor(page.next_before);
+        // A filter change re-reads the page, and a selection of twenty ids that are no longer
+        // on it is a bulk press about rows the operator cannot see.
+        if (!append) setSelected([]);
       } catch (caught) {
         setError(caught instanceof ApiError ? caught.message : "The inbox could not be read.");
       } finally {
@@ -143,6 +158,35 @@ export function LeadInbox() {
       cancelled = true;
     };
   }, []);
+
+  const toggleSelected = (id: string) => {
+    setSelected((previous) =>
+      previous.includes(id) ? previous.filter((row) => row !== id) : [...previous, id],
+    );
+  };
+
+  const runBulk = async () => {
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      const report = await bulkAssignLeads(
+        selected,
+        bulkOwner === "" ? null : bulkOwner,
+        bulkReason.trim(),
+      );
+      setBulkReport(report);
+      setBulkOpen(false);
+      setBulkReason("");
+      // The rows that moved now have an owner, so the table has to be re-read: leaving the
+      // old owner in the column next to a toast that says otherwise is how an operator stops
+      // believing the screen.
+      await load(false);
+    } catch (caught) {
+      setBulkError(caught instanceof ApiError ? caught.message : "The batch could not be handed over.");
+    } finally {
+      setBulkBusy(false);
+    }
+  };
 
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(params?.toString() ?? "");
@@ -368,9 +412,159 @@ export function LeadInbox() {
             />
           )
         ) : (
-          <LeadTable leads={leads} ownersById={ownersById} />
+          <LeadTable
+            leads={leads}
+            ownersById={ownersById}
+            selected={selected}
+            onToggle={toggleSelected}
+            onToggleAll={() =>
+              setSelected((previous) =>
+                previous.length === leads.length ? [] : leads.map((lead) => lead.id),
+              )
+            }
+            allSelected={leads.length > 0 && selected.length === leads.length}
+          />
         )}
       </div>
+
+      {/* The bulk hand-over. It appears only when something is selected, because a permanent
+          bar above a table of twenty leads is a control nobody reads. The reason is required
+          and there is exactly one, because twenty rows moved for twenty different reasons is
+          a trail nobody can read afterwards. */}
+      {selected.length > 0 ? (
+        <div
+          data-lead-bulk
+          className="sticky bottom-0 z-20 flex flex-col gap-2 rounded-xl border border-line bg-canvas/95 px-3 py-2.5 backdrop-blur"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[12.5px] font-medium" data-lead-bulk-count>
+              {selected.length} selected
+            </span>
+            {!bulkOpen ? (
+              <button
+                type="button"
+                data-lead-bulk-open
+                onClick={() => {
+                  setBulkReport(null);
+                  setBulkError(null);
+                  setBulkOpen(true);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-accent bg-accent-soft px-3 py-1.5 text-[12.5px] text-accent-strong"
+              >
+                <UserRoundCheck className="size-3.5" aria-hidden />
+                Hand them over
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                setSelected([]);
+                setBulkOpen(false);
+              }}
+              className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-muted"
+            >
+              Clear
+            </button>
+          </div>
+
+          {bulkOpen ? (
+            <div data-lead-bulk-panel className="flex flex-col gap-2 rounded-lg border border-line bg-surface p-2.5">
+              <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+                <span className="font-medium">New owner</span>
+                <select
+                  data-lead-bulk-owner
+                  value={bulkOwner}
+                  onChange={(event) => setBulkOwner(event.target.value)}
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] text-ink"
+                >
+                  <option value="">Unassigned queue</option>
+                  {owners.map((owner) => (
+                    <option key={owner.id} value={owner.id} data-bulk-owner-option={owner.id}>
+                      {owner.label} · {owner.open_leads} open
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+                <span className="font-medium">Why (one reason for the whole batch)</span>
+                <input
+                  data-lead-bulk-reason
+                  value={bulkReason}
+                  onChange={(event) => setBulkReason(event.target.value)}
+                  placeholder="On call this week"
+                  className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] text-ink"
+                />
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  data-lead-bulk-save
+                  disabled={bulkBusy || bulkReason.trim() === ""}
+                  onClick={() => void runBulk()}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-accent bg-accent-soft px-3 py-1.5 text-[12.5px] text-accent-strong disabled:opacity-50"
+                >
+                  {bulkBusy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : <Check className="size-3.5" aria-hidden />}
+                  Hand over {selected.length}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkOpen(false)}
+                  className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-muted"
+                >
+                  Cancel
+                </button>
+                <span className="text-[11.5px] text-muted">
+                  Each lead is decided on its own: a row filed as spam stays put and says why,
+                  and the rest still move.
+                </span>
+              </div>
+              {bulkReason.trim() === "" ? (
+                <p className="text-[11.5px] text-muted">
+                  A reason is required — a lead that changed hands with no explanation cannot be
+                  explained to the person who had it.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {bulkError ? (
+            <p role="alert" data-lead-bulk-error className="text-[11.5px] text-caution">
+              {bulkError}
+            </p>
+          ) : null}
+
+          {bulkReport ? (
+            /* The report is the answer, and it names the refusals. "20 assigned" against
+               nineteen real hand-overs is the failure this whole shape exists to prevent. */
+            <div data-lead-bulk-report className="flex flex-col gap-1.5 text-[11.5px]">
+              <p
+                className={
+                  bulkReport.refused > 0
+                    ? "text-caution"
+                    : "text-positive"
+                }
+              >
+                {bulkReport.summary}
+              </p>
+              {bulkReport.refused > 0 ? (
+                <ul data-lead-bulk-refusals className="flex flex-col gap-0.5 text-muted">
+                  {bulkReport.results
+                    .filter((row) => !row.done)
+                    .map((row) => (
+                      <li key={row.id} data-bulk-refusal={row.id}>
+                        {leads.find((lead) => lead.id === row.id)
+                          ? contactLabel(leads.find((lead) => lead.id === row.id) as Lead)
+                          : row.id.slice(0, 8)}
+                        {" — "}
+                        {row.reason}
+                      </li>
+                    ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {cursor ? (
         <div className="flex justify-center">
@@ -432,15 +626,33 @@ function Counter({
 function LeadTable({
   leads,
   ownersById,
+  selected,
+  onToggle,
+  onToggleAll,
+  allSelected,
 }: {
   leads: Lead[];
   ownersById: Map<string, string>;
+  selected: string[];
+  onToggle: (id: string) => void;
+  onToggleAll: () => void;
+  allSelected: boolean;
 }) {
   return (
     <div className="overflow-x-auto">
       <table data-lead-table className="w-full border-collapse text-left text-[13px]">
         <thead>
           <tr className="border-b border-line text-[11.5px] text-muted">
+            <th scope="col" className="w-8 px-3 py-2.5">
+              <input
+                type="checkbox"
+                data-lead-select-all
+                aria-label="Select every lead on this page"
+                checked={allSelected}
+                onChange={onToggleAll}
+                className="size-3.5 accent-[var(--color-accent)]"
+              />
+            </th>
             <th scope="col" className="px-3 py-2.5 font-medium">Received</th>
             <th scope="col" className="px-3 py-2.5 font-medium">Contact</th>
             <th scope="col" className="px-3 py-2.5 font-medium">Product</th>
@@ -459,6 +671,16 @@ function LeadTable({
                 data-lead-row={lead.id}
                 className="border-b border-line/60 transition last:border-0 hover:bg-quiet-soft"
               >
+                <td className="px-3 py-2.5">
+                  <input
+                    type="checkbox"
+                    data-lead-select={lead.id}
+                    aria-label={`Select the lead from ${contactLabel(lead)}`}
+                    checked={selected.includes(lead.id)}
+                    onChange={() => onToggle(lead.id)}
+                    className="size-3.5 accent-[var(--color-accent)]"
+                  />
+                </td>
                 <td className="px-3 py-2.5 text-muted tabular-nums" title={new Date(lead.received_at).toLocaleString()}>
                   {relativeInstant(lead.received_at)}
                 </td>

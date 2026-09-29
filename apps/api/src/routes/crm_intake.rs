@@ -1395,6 +1395,120 @@ pub async fn convert(
     }))
 }
 
+/// The body of a bulk hand-over.
+#[derive(Debug, Deserialize)]
+pub struct BulkAssignBody {
+    /// The leads, in the order the panel listed them.
+    pub ids: Vec<Uuid>,
+    /// The new owner, or `null` for the unassigned queue.
+    ///
+    /// An `Option<Option<Uuid>>` for the same reason the single-lead route uses one: `Some`
+    /// with nothing inside is "put them all back", and a *missing* field is a caller that
+    /// forgot, which must not empty twenty queues in one press.
+    pub owner_user_id: Option<Option<uuid::Uuid>>,
+    /// The one reason every row in the batch carries.
+    pub reason: String,
+}
+
+/// `POST /api/v1/crm/leads/bulk-assign` — hand a batch to one person in one press.
+///
+/// The REQ promises "bulk: assign, reassign, mark responded, mark spam, reject" on the inbox.
+/// This is the first of those, and it is the one the *previous* two slices made impossible:
+/// the hand-over asked for one owner and one reason and one lead, so routing a morning's
+/// twenty leads to whoever is on call was twenty presses and twenty reasons.
+///
+/// The answer is a **report, not a count**, and that is the whole design. Each lead is its own
+/// transaction (`store::bulk_assign_owner`), so one spam row or one id from another tenant
+/// cannot roll back nineteen hand-overs that already happened; the report says which of them
+/// landed and what the rest said. An endpoint that answered `204` here would leave an operator
+/// believing twenty leads moved while two silently stayed put.
+pub async fn bulk_assign(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Json(body): Json<BulkAssignBody>,
+) -> Result<Json<BulkAssignBodyOut>, ApiError> {
+    let organization_id = organization_of(&session)?;
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(ApiError::bad_request(
+            "reason_required",
+            "an assignment says why \u2014 twenty leads that moved hands with no explanation \
+             cannot be explained to twenty people who had them",
+        ));
+    }
+    let Some(owner) = body.owner_user_id else {
+        return Err(ApiError::bad_request(
+            "owner_required",
+            "say who the leads go to, or send them to \"unassigned\" explicitly",
+        ));
+    };
+
+    let report = store::bulk_assign_owner(
+        state.db().pool(),
+        organization_id,
+        &body.ids,
+        owner,
+        reason,
+        Some(session.user.id),
+    )
+    .await
+    .map_err(map_store)?;
+
+    audit(
+        state.db().pool(),
+        session.user.id,
+        organization_id,
+        "crm.lead.assigned",
+        body.ids.first().copied().unwrap_or(uuid::Uuid::nil()),
+        json!({
+            "owner_user_id": owner.map(|o| o.to_string()),
+            "reason": reason,
+            "bulk": body.ids.len(),
+            "applied": report.applied(),
+        }),
+    )
+    .await;
+
+    Ok(Json(BulkAssignBodyOut {
+        applied: report.applied(),
+        refused: report.refused(),
+        summary: report.summary(),
+        results: report
+            .results
+            .into_iter()
+            .map(|row| BulkAssignRow {
+                id: row.id,
+                done: row.done,
+                reason: row.reason,
+            })
+            .collect(),
+    }))
+}
+
+/// One lead's answer inside a bulk call.
+#[derive(Debug, Serialize)]
+pub struct BulkAssignRow {
+    /// The lead.
+    pub id: Uuid,
+    /// Whether it moved.
+    pub done: bool,
+    /// Why not, when it did not.
+    pub reason: Option<String>,
+}
+
+/// The whole bulk call's answer.
+#[derive(Debug, Serialize)]
+pub struct BulkAssignBodyOut {
+    /// How many moved.
+    pub applied: usize,
+    /// How many did not, and are named in `results`.
+    pub refused: usize,
+    /// One sentence to show the operator.
+    pub summary: String,
+    /// Per lead, in the order they were named.
+    pub results: Vec<BulkAssignRow>,
+}
+
 /// `GET /api/v1/crm/leads/owners` — who a lead can be handed to, and what they already hold.
 ///
 /// The hand-over screen used to ask for a uuid in a free-text box. That is the identifier of

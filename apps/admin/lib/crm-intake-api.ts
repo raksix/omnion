@@ -303,6 +303,45 @@ export function convertLead(id: string): Promise<LeadConversion> {
   });
 }
 
+/** One lead's answer inside a bulk hand-over. */
+export type BulkAssignRow = {
+  id: string;
+  done: boolean;
+  reason: string | null;
+};
+
+/**
+ * The whole bulk call's answer.
+ *
+ * `results` is the reason this is a report and not a number: the batch is twenty independent
+ * decisions that happen to be requested together, so one spam row cannot roll back the other
+ * nineteen — and an operator told only "20 assigned" would believe twenty leads moved while
+ * two stayed put. The panel lists the refusals by name.
+ */
+export type BulkAssignReport = {
+  applied: number;
+  refused: number;
+  summary: string;
+  results: BulkAssignRow[];
+};
+
+/**
+ * Hand a batch of leads to one person, or back to the queue.
+ *
+ * `ownerUserId` is `null` for the queue and a user id for a person — the two are *sent*, never
+ * omitted, for the reason the single-lead call types it that way.
+ */
+export function bulkAssignLeads(
+  ids: string[],
+  ownerUserId: string | null,
+  reason: string,
+): Promise<BulkAssignReport> {
+  return request<BulkAssignReport>("/api/v1/crm/leads/bulk-assign", {
+    method: "POST",
+    body: JSON.stringify({ ids, owner_user_id: ownerUserId, reason }),
+  });
+}
+
 /** One person a lead can be handed to, with the load they already hold. */
 export type LeadOwner = {
   id: string;
