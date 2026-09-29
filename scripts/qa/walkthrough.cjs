@@ -9256,7 +9256,7 @@ note({
       deleteKeyRefused: afterDeleteKey === afterAddAttempt,
       draftWhileLocked: draftOpenLocked(draftWhileLocked),
       edgesBefore: beforeEdges,
-      edgesAfter,
+      edgesAfter: afterEdges,
       edgesUnchanged: beforeEdges === afterEdges,
       undoRefused: beforeVersion === afterVersion,
       versionBefore: beforeVersion,
