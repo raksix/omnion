@@ -308,6 +308,10 @@ pub struct NewSubmission {
     pub source_path: Option<String>,
 }
 
+/// The rate limit's window, in seconds. The store counts against a moving hour and therefore
+/// reports its wait in the same unit, so the two halves of the same number live next to each other.
+const HOUR_SECONDS: i64 = 3_600;
+
 /// The outcome of a public submission.
 ///
 /// `stored` is false for every refusal — that is the whole point: a submission that trips the
@@ -324,6 +328,14 @@ pub struct SubmissionOutcome {
     pub honeypot_fired: bool,
     /// The heuristic score the submission earned.
     pub spam_score: i32,
+    /// Seconds until this sender may submit to this form again, when the hourly limit refused.
+    ///
+    /// The rate limit is a *load* decision, not a spam verdict, so it is the one refusal a
+    /// sender is told about. It has to carry a real number: "you are limited" with no wait
+    /// attached is the shape that teaches a client to hammer, and the shape that tells somebody
+    /// who lost an enquiry that retrying now is worth it. `None` on every other refusal, so the
+    /// absence of the field means "no wait applies" rather than "we did not bother".
+    pub retry_after_seconds: Option<i64>,
 }
 
 impl SubmissionOutcome {
@@ -336,6 +348,7 @@ impl SubmissionOutcome {
             errors: BTreeMap::new(),
             honeypot_fired: false,
             spam_score: 0,
+            retry_after_seconds: None,
         }
     }
 
@@ -343,6 +356,16 @@ impl SubmissionOutcome {
     #[must_use]
     pub fn stored(&self) -> bool {
         self.submission.is_some()
+    }
+
+    /// The wait a throttled sender should be given, in whole seconds and never below one.
+    ///
+    /// Only a positive wait is reported, so the absence of the field means "no wait applies"
+    /// rather than "we did not bother to work it out" — and the caller can pass the result
+    /// straight to `ApiError::with_retry_after`, which takes an `i64` and refuses a zero.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<i64> {
+        self.retry_after_seconds.filter(|seconds| *seconds > 0)
     }
 }
 
@@ -1086,6 +1109,7 @@ pub async fn submit_public(
         errors: BTreeMap::new(),
         honeypot_fired: false,
         spam_score: 0,
+        retry_after_seconds: None,
     };
 
     // 1. The honeypot. An invisible input a human never sees: anything in it came from a script.
@@ -1100,8 +1124,15 @@ pub async fn submit_public(
     //    a flood of invalid submissions is throttled too — otherwise the limiter protects the
     //    database from nothing at all.
     if let Some(sender) = incoming.ip_hash.as_deref() {
-        let sent: i64 = sqlx::query_scalar(
-            "select count(*) from cms_form_submissions \
+        // Count AND the age of the oldest row in ONE query, because two queries race: between a
+        // `count(*)` and a separate `min(created_at)`, a concurrent submission lands and the
+        // count that justified the refusal is already stale. An aggregate always returns exactly
+        // one row, so the count is never an `Option` — but `min(created_at)` is NULL for a sender
+        // with nothing in the window, and that NULL is a value to carry, not a missing row.
+        let (sent, oldest_age_seconds): (i64, Option<i64>) = sqlx::query_as(
+            "select count(*)::bigint, \
+                    extract(epoch from (now() - min(created_at)))::bigint \
+             from cms_form_submissions \
              where form_id = $1 and ip_hash = $2 and created_at > now() - interval '1 hour'",
         )
         .bind(form.id)
@@ -1109,6 +1140,15 @@ pub async fn submit_public(
         .fetch_one(pool)
         .await?;
         if sent >= i64::from(form.rate_limit_per_hour) {
+            // The window is a MOVING hour, so the wait is what is LEFT of it: the oldest row in
+            // the window is the first one to fall out, and an hour minus its age is the first
+            // instant a retry could be allowed. Measured from that row rather than answered as a
+            // flat hour, because the flat answer is wrong in both directions — too long, so
+            // somebody who just lost an enquiry sits idle past the moment it could have been
+            // sent, and too short for a client that obeys it literally and is refused again
+            // with the same number. A sender with no rows has an age of zero, which only reaches
+            // here when the limit is set to zero, where an hour is the honest answer.
+            outcome.retry_after_seconds = Some((HOUR_SECONDS - oldest_age_seconds.unwrap_or(0)).max(1));
             outcome.refused = Some("form_rate_limited");
             return Ok(outcome);
         }
