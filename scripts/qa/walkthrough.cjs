@@ -652,7 +652,31 @@ async function ensureSignedIn(page, report) {
   await pass.fill(CREDS.password).catch(() => {});
   await shot(page, "10-login-filled");
   const clicked = await primaryClick(page);
-  await page.waitForTimeout(1200);
+  // The sign-in navigates only *after* the API answers: the page awaits `signIn(...)` and only
+  // then calls `router.replace("/")`. A fixed sleep therefore races the round-trip, and the race
+  // is lost on a cold dev compile where the login POST alone takes seconds — the pass reads the
+  // URL while it is still `/login` and reports "could not sign in" for a login that succeeded.
+  // Wait for the state that means signed in, and say which side of it we came out on.
+  const signedIn = await page
+    .waitForFunction(
+      () => !location.pathname.includes("/login") || !!document.querySelector('nav[aria-label="Sections"]'),
+      null,
+      { timeout: 45000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  if (!signedIn) {
+    // Record *why* before giving up: an API error is rendered on the form, and a pass that says
+    // "could not sign in" without that text has thrown away the only diagnostic it will get.
+    const shown = await page
+      .locator('[role="alert"], [data-error], p.text-red-600, .text-red-600')
+      .first()
+      .innerText()
+      .catch(() => "");
+    report.steps.push({ action: "login", clicked, url: page.url(), error: shown.trim() || "no navigation after 45s" });
+    return false;
+  }
+  await page.waitForTimeout(400);
   report.steps.push({ action: "login", clicked, url: page.url() });
   return !/\/login/.test(page.url());
 }
