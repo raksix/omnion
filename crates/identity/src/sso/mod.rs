@@ -35,6 +35,7 @@ pub mod provisioning;
 pub mod role_rule_store;
 pub mod role_rules;
 pub mod saml;
+pub mod sync_runs;
 
 pub use attributes::{
     AttributeMap, AttributeMapping, MapProblem, Projection, TargetField, Transform,
