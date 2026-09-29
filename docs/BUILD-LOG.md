@@ -4595,3 +4595,66 @@ free, and the API binary runs from the new home: `healthz 200`, migrations clean
 full mount, which is also why that directory was eating the disk. Cleared it; `/login` now
 answers in 160ms instead of 3.6s and renders a real email+password form. Re-running the scoped
 pass.
+
+## 2026-09-29 · Wave 5 · tick 21 — the scoped pass was scoped in name only
+
+Eight ticks deferred the browser gate; this tick ran it — and the first thing it revealed was
+that the *gate itself* had never once been scoped, on any branch, for any writer.
+
+**The defect.** `inScope` was meant to answer "does this route match the scope?", and it read
+
+```js
+const inScope = (name) => !ONLY || name.split(",").some((w) => w.trim() && name.includes(w.trim()));
+```
+
+`name.split(",")` — the **route name** was split on commas, not the scope. With no comma in a
+route name that is a one-element array holding the name itself, so the predicate degenerated to
+`name.includes(name)`, which is true for every route, for every scope, forever. `QA_ONLY=cdn`
+walked all 46 routes. The summary stamped `scope: "cdn"`, the report header said *"Scoped pass"*,
+the screenshots were real — and the claim was false in every one of those artifacts. This is the
+third instance of the same failure this branch has produced, and the most dangerous of the three:
+a `{"fatal": ...}` summary filed as a clean report is *absence* of evidence read as evidence, a
+scope matching nothing filed as zero findings is the same thing one level up, and this is
+**misdescription** — real evidence, correctly gathered, under a label that says it is less than
+it is. A reader of the next tick's artifacts would believe CDN had been covered when the pass had
+in fact been covering everything and naming a part.
+
+**Why it survived seven ticks of scrutiny.** I checked the guard four ways before finding it:
+`--only` in `process.argv`, `QA_ONLY` in the live process's `/proc/<pid>/environ`, the guard's
+byte offset relative to the `log()` line it guards, and `md5sum` of the file against
+`git show HEAD:`. All four confirmed the code was *present*. None of them asked what it *did* —
+and the answer was in the variable name. The fix took ten seconds once the predicate was
+re-executed instead of read; the reading took twenty minutes.
+
+**The fix, and the witness that keeps it fixed.** `ONLY.split(",")` now, plus two guards so a
+mis-scoped run can never again file itself as a targeted result: the pass logs what it resolved
+(`scope: "cdn,events,webhooks" keeps 10 of 46 routes`), and it **refuses to start** when the
+scope matches a core route (`overview`/`pages`/`media`/`sites`), which is exactly the shape of
+the bug that just cost this tick. A narrowing control needs a witness in the product, not in the
+diff. Proof: `scope: "cdn,events,webhooks" keeps 10 of 46 routes` followed by the ten routes it
+kept — `cdn-overview`, `cdn-rules`, `cdn-settings`, `cdn-purges`, `cdn-purge-console`, `events`,
+`events-catalogue`, `webhooks`, `webhooks-new`, and the ten-route count matches the route table
+exactly. `1aa8930`.
+
+**What the pass proved, and what it could not.** The in-scope routes all walked and screens
+rendered (`cdn-rules → 29 elements`, `cdn-settings → 40`, `webhooks → 34`,
+`webhooks-new → 40`). Two observations, neither of them closed:
+
+1. `cdn-purges → 0 elements` — the purge history screen rendered *nothing* on a cold mount,
+   while its sibling routes rendered 29–40 elements. The API answers (`/healthz` 200, the purge
+   runner is polling), so this is either a first-paint defect or a tab that was already dying.
+2. `iam roles depth` recorded `chrome-error://chromewebdata/` — the signature of a **dead tab**,
+   which seven writers on one 32 GB host produce routinely (70 Chrome processes, 8 concurrent
+   passes, load 10-15, MemAvailable down to 8 GB with 1 GB free). That is this box's contention,
+   not this branch, and per the standing rule it is logged and not charged to a REQ.
+
+**So the CDN gate is not green, and REQ-011 is not closed.** The two unticked boxes stand. The
+honest position after this tick is narrower and better-founded than before it: the harness
+defect is fixed and proven, the CDN and events/webhooks screens are reachable and render, and the
+one number that would have told me the pass was mis-scoped is now printed by the pass itself.
+Next: re-run the pass alone (`QA_SLOTS=1`, and only after the sibling writers' passes clear) and
+read `cdn-purges` specifically — a 0-element screen next to three healthy siblings is either a
+real first-paint defect worth fixing or the tab dying, and the difference is one clean run.
+
+**Gates.** `cargo test -p omnion-cdn` **110/110**. `pnpm typecheck` **5 packages, 0 errors**.
+`node --check scripts/qa/walkthrough.cjs` clean. Browser gate: **red — not closed.**

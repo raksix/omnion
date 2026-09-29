@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; `origin/main` merged in `928249f`; browser gate still pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; `origin/main` merged in `928249f`; browser gate **red** as of tick 21 — the harness's own `--only` scope matched every route (`1aa8930`), and the re-run showed `cdn-purges` rendering 0 elements against three healthy sibling routes) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -201,6 +201,13 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
 - [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
 - [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
 - [ ] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.
+  _Not ticked, and the tick-21 pass is the reason to be careful here. The pass that would have measured this walked
+  `/cdn/purges` and found **0 elements** on a cold mount while `cdn-rules`, `cdn-settings` and `webhooks` rendered
+  29, 40 and 40 in the same run — and that same pass was under a scope that had silently matched all 46 routes
+  (`1aa8930`), so its numbers were gathered under a label that was wrong. The views do carry the states in code
+  (`EmptyState` in all five, `LoadingTable` in four, a field-level error in all five), but code presence is not the
+  acceptance line and the count match has never been measured on screen. It stays unticked until a clean, correctly
+  scoped pass reports both._
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
 
 ### QA plan
