@@ -25,7 +25,7 @@ use crate::client::{ChatMessage, ChatOutcome, ChatRequest, ChatUsage};
 use crate::error::{AiHubError, Result};
 
 /// One decoded piece of a provider's answer, whatever the vendor sent.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamPiece {
     /// A piece of the answer, when this frame carried one.
     pub content: Option<String>,
@@ -33,13 +33,63 @@ pub struct StreamPiece {
     pub finish_reason: Option<String>,
     /// Token counts, when the provider reported them in this frame.
     pub usage: Option<ChatUsage>,
+    /// One piece of a tool call, when this frame carried part of one.
+    ///
+    /// A streamed tool call is *not* one frame: OpenAI sends the name and the id in the first
+    /// delta and the argument JSON in a string fragment that may itself be split across frames,
+    /// and providers interleave calls by index. The piece therefore carries only what this frame
+    /// added, and [`crate::client::ToolCallAssembler`] merges pieces into whole calls.
+    pub tool_call: Option<ToolCallPiece>,
+}
+
+impl Default for StreamPiece {
+    fn default() -> Self {
+        Self {
+            content: None,
+            finish_reason: None,
+            usage: None,
+            tool_call: None,
+        }
+    }
 }
 
 impl StreamPiece {
     /// `true` when the piece carries nothing a subscriber can see.
+    ///
+    /// A tool-call piece is not empty: the run has to know the model wants a tool even though
+    /// there is no text to stream.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.content.is_none() && self.finish_reason.is_none() && self.usage.is_none()
+        self.content.is_none()
+            && self.finish_reason.is_none()
+            && self.usage.is_none()
+            && self.tool_call.is_none()
+    }
+}
+
+/// One fragment of a tool call, as one stream frame carried it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ToolCallPiece {
+    /// Position in the turn's call list, which is how interleaved calls are told apart.
+    pub index: u32,
+    /// The provider's handle, when this frame carried it.
+    pub id: Option<String>,
+    /// The tool name, when this frame carried it.
+    pub name: Option<String>,
+    /// A fragment of the argument JSON, when this frame carried one.
+    pub arguments_fragment: Option<String>,
+}
+
+impl ToolCallPiece {
+    /// A fragment carrying only arguments, the common case after the first frame.
+    #[must_use]
+    pub fn arguments(index: u32, fragment: impl Into<String>) -> Self {
+        Self {
+            index,
+            id: None,
+            name: None,
+            arguments_fragment: Some(fragment.into()),
+        }
     }
 }
 
@@ -186,7 +236,7 @@ impl ProtocolAdapter for OpenAiCompatible {
     fn build_chat(&self, request: &ChatRequest, stream: bool) -> Value {
         let mut body = json!({
             "model": request.model,
-            "messages": request.messages,
+            "messages": request.messages.iter().map(openai_message).collect::<Vec<_>>(),
             "stream": stream,
         });
         if stream {
@@ -202,6 +252,28 @@ impl ProtocolAdapter for OpenAiCompatible {
         }
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = json!(max_tokens);
+        }
+        if !request.tools.is_empty() {
+            body["tools"] = json!(request
+                .tools
+                .iter()
+                .map(|tool| json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": if tool.parameters.is_null() {
+                            json!({ "type": "object", "properties": {} })
+                        } else {
+                            tool.parameters.clone()
+                        },
+                    }
+                }))
+                .collect::<Vec<_>>());
+            // Without this the model may answer in prose instead of calling anything, and a
+            // tool-capable model that skips the flag is the single most common cause of "the
+            // agent never used its tools".
+            body["tool_choice"] = json!("auto");
         }
         body
     }
@@ -224,6 +296,7 @@ impl ProtocolAdapter for OpenAiCompatible {
             content,
             finish_reason,
             usage,
+            tool_calls: read_openai_tool_calls(choice.pointer("/message/tool_calls")),
         })
     }
 
@@ -250,6 +323,76 @@ impl ProtocolAdapter for OpenAiCompatible {
     fn decoder(&self) -> Box<dyn StreamDecoder> {
         Box::new(OpenAiStream { done: false })
     }
+}
+
+/// One OpenAI message, in the shape the chat endpoint accepts.
+///
+/// A tool result is a `role: "tool"` message that quotes the call it answers, and the tool
+/// message *must* come immediately after the assistant turn that asked for it — a model
+/// rejects the whole request if the pairing is broken, so a dropped result is a broken request
+/// rather than a missing fact.
+fn openai_message(message: &crate::client::ChatMessage) -> Value {
+    use crate::client::ChatRole;
+
+    match message.role {
+        ChatRole::Tool => json!({
+            "role": "tool",
+            "tool_call_id": message.call_id(),
+            "content": message.content,
+        }),
+        ChatRole::Assistant if !message.tool_calls.is_empty() => json!({
+            "role": "assistant",
+            "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
+            "tool_calls": message
+                .tool_calls
+                .iter()
+                .map(|call| json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": { "name": call.name, "arguments": call.arguments.to_string() },
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ChatRole::Assistant if message.content.is_empty() => {
+            // An assistant turn that was only a tool call has no text; sending an empty string
+            // is legal, but some providers prefer null. Either is accepted, null is tidier.
+            json!({ "role": "assistant", "content": Value::Null })
+        }
+        _ => json!({ "role": message.role.as_str(), "content": message.content }),
+    }
+}
+
+/// Tool calls as the OpenAI chat endpoint reports them.
+fn read_openai_tool_calls(value: Option<&Value>) -> Vec<crate::client::ChatToolCall> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let function = entry.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            let arguments = match function.get("arguments") {
+                // Providers send the arguments as a JSON *string*, and a small number of them
+                // send an object. Both are read; anything that is not parseable becomes an
+                // empty object so the tool's own validator refuses it with a message instead
+                // of the transport reporting a parse error nobody can act on.
+                Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
+                Some(object) if object.is_object() => object.clone(),
+                _ => json!({}),
+            };
+            Some(crate::client::ChatToolCall {
+                id: entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: name.to_owned(),
+                arguments,
+            })
+        })
+        .collect()
 }
 
 /// Decoder of an OpenAI-compatible stream.
@@ -282,6 +425,24 @@ impl StreamDecoder for OpenAiStream {
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 piece.finish_reason = Some(reason.to_owned());
             }
+            piece.tool_call = choice
+                .pointer("/delta/tool_calls")
+                .and_then(|calls| calls.as_array().and_then(|calls| calls.first()))
+                .and_then(|call| {
+                    let function = call.get("function")?;
+                    let fragment = function.get("arguments").and_then(Value::as_str);
+                    let id = call.get("id").and_then(Value::as_str);
+                    let name = function.get("name").and_then(Value::as_str);
+                    if id.is_none() && name.is_none() && fragment.is_none() {
+                        return None;
+                    }
+                    Some(ToolCallPiece {
+                        index: call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        id: id.map(str::to_owned),
+                        name: name.map(str::to_owned),
+                        arguments_fragment: fragment.map(str::to_owned),
+                    })
+                });
         }
         if let Some(usage) = value.get("usage") {
             piece.usage = serde_json::from_value::<ChatUsage>(usage.clone()).ok();
@@ -348,23 +509,76 @@ impl ProtocolAdapter for AnthropicMessages {
             .filter(|message| message.role == crate::client::ChatRole::System)
             .map(|message| message.content.as_str())
             .collect();
-        let messages: Vec<Value> = request
+
+        // The messages protocol keeps instructions outside the conversation and content as a
+        // *list of blocks*. A turn that asked for tools and the turn that answers it are
+        // different turns with different roles — an assistant turn holding `tool_use` blocks
+        // and a user turn holding `tool_result` blocks. Merging them into one turn is the
+        // mistake this shape exists to prevent: the provider sees a result with no call.
+        //
+        // So the blocks are collected with the role they belong to, and a role change flushes.
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut block_role = String::new();
+        let mut messages: Vec<Value> = Vec::new();
+        let mut flush = |blocks: &mut Vec<Value>, role: &mut String, messages: &mut Vec<Value>| {
+            if !blocks.is_empty() {
+                messages.push(json!({ "role": role, "content": blocks }));
+                blocks.clear();
+            }
+        };
+        for message in request
             .messages
             .iter()
             .filter(|message| message.role != crate::client::ChatRole::System)
-            .map(|message| {
-                json!({
-                    // The messages protocol has no `system` role: it carries instructions
-                    // outside the conversation, and only user/assistant turn inside it.
-                    "role": if message.role == crate::client::ChatRole::Assistant {
+        {
+            use crate::client::ChatRole;
+            match message.role {
+                ChatRole::Tool => {
+                    if block_role != "user" {
+                        flush(&mut blocks, &mut block_role, &mut messages);
+                        block_role = "user".to_owned();
+                    }
+                    blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": message.call_id(),
+                        "content": message.content,
+                        // A failed tool is a fact the model must reason about, not a transport
+                        // error: without this flag Anthropic hands the result back as a success
+                        // and the model retries the same failing call forever.
+                        "is_error": false,
+                    }));
+                }
+                ChatRole::Assistant if !message.tool_calls.is_empty() => {
+                    if block_role != "assistant" {
+                        flush(&mut blocks, &mut block_role, &mut messages);
+                        block_role = "assistant".to_owned();
+                    }
+                    // One assistant turn can ask for several tools, and the messages protocol
+                    // wants each as its own `tool_use` block on that turn.
+                    for call in &message.tool_calls {
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": call.arguments,
+                        }));
+                    }
+                }
+                _ => {
+                    flush(&mut blocks, &mut block_role, &mut messages);
+                    let role = if message.role == ChatRole::Assistant {
                         "assistant"
                     } else {
                         "user"
-                    },
-                    "content": message.content,
-                })
-            })
-            .collect();
+                    };
+                    messages.push(json!({
+                        "role": role,
+                        "content": [{ "type": "text", "text": message.content }],
+                    }));
+                }
+            }
+        }
+        flush(&mut blocks, &mut block_role, &mut messages);
 
         // The protocol requires an answer budget, so a caller that set none gets the one the
         // platform uses everywhere else rather than an unanswerable request.
@@ -379,6 +593,21 @@ impl ProtocolAdapter for AnthropicMessages {
         }
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
+        }
+        if !request.tools.is_empty() {
+            body["tools"] = json!(request
+                .tools
+                .iter()
+                .map(|tool| json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": if tool.parameters.is_null() {
+                        json!({ "type": "object", "properties": {} })
+                    } else {
+                        tool.parameters.clone()
+                    },
+                }))
+                .collect::<Vec<_>>());
         }
         body
     }
@@ -408,6 +637,7 @@ impl ProtocolAdapter for AnthropicMessages {
             content,
             finish_reason,
             usage,
+            tool_calls: read_anthropic_tool_calls(value.get("content")),
         })
     }
 
@@ -443,15 +673,43 @@ fn read_anthropic_usage(value: &Value) -> Option<ChatUsage> {
     })
 }
 
+/// Tool calls as the messages protocol reports them: `tool_use` blocks inside `content`.
+fn read_anthropic_tool_calls(value: Option<&Value>) -> Vec<crate::client::ChatToolCall> {
+    let Some(blocks) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| {
+            Some(crate::client::ChatToolCall {
+                id: block.get("id").and_then(Value::as_str)?.to_owned(),
+                name: block.get("name").and_then(Value::as_str)?.to_owned(),
+                arguments: block
+                    .get("input")
+                    .filter(|input| input.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect()
+}
+
 /// Decoder of the messages protocol's typed stream events.
 ///
 /// Usage arrives in two different events — the input count in `message_start`, the output count
 /// in `message_delta` — so the decoder holds both and emits the pair when the second arrives.
+/// A tool call arrives in three more (`content_block_start` names it, `input_json_delta` carries
+/// the arguments a piece at a time, `content_block_stop` closes it), and the block index the
+/// provider uses is not the position in the call list, so it is carried through as the piece's
+/// index — interleaved text and tool blocks then sort the same way the provider wrote them.
 #[derive(Default)]
 struct AnthropicStream {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     done: bool,
+    block_index: u32,
 }
 
 impl StreamDecoder for AnthropicStream {
@@ -482,6 +740,21 @@ impl StreamDecoder for AnthropicStream {
                     self.prompt_tokens = usage.get("input_tokens").and_then(Value::as_u64);
                 }
             }
+            "content_block_start" => {
+                self.block_index = value
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as u32;
+                let block = value.get("content_block").cloned().unwrap_or(Value::Null);
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    piece.tool_call = Some(ToolCallPiece {
+                        index: self.block_index,
+                        id: block.get("id").and_then(Value::as_str).map(str::to_owned),
+                        name: block.get("name").and_then(Value::as_str).map(str::to_owned),
+                        arguments_fragment: None,
+                    });
+                }
+            }
             "content_block_delta" => {
                 if let Some(text) = value
                     .pointer("/delta/text")
@@ -489,6 +762,10 @@ impl StreamDecoder for AnthropicStream {
                     .filter(|text| !text.is_empty())
                 {
                     piece.content = Some(text.to_owned());
+                }
+                if let Some(fragment) = value.pointer("/delta/partial_json").and_then(Value::as_str)
+                {
+                    piece.tool_call = Some(ToolCallPiece::arguments(self.block_index, fragment));
                 }
             }
             "message_delta" => {
@@ -513,7 +790,7 @@ impl StreamDecoder for AnthropicStream {
                 }
             }
             "message_stop" => self.done = true,
-            // `ping` and `content_block_start` carry nothing a subscriber sees.
+            // `ping` and `content_block_stop` carry nothing a subscriber sees.
             _ => {}
         }
 
@@ -575,21 +852,61 @@ impl ProtocolAdapter for GoogleGemini {
             .filter(|message| message.role == crate::client::ChatRole::System)
             .map(|message| message.content.as_str())
             .collect();
-        let contents: Vec<Value> = request
+
+        // A tool result is a `user` turn holding a `functionResponse` part that names the call
+        // it answers, and the model turn that asked for it holds a `functionCall` part. Both
+        // are parts rather than roles, so a turn is a list of parts — but they are still
+        // *separate turns with different roles*. Merging a `functionResponse` into the same
+        // turn as the `functionCall` that asked for it produces a request the provider refuses.
+        let mut parts: Vec<Value> = Vec::new();
+        let mut part_role = String::new();
+        let mut contents: Vec<Value> = Vec::new();
+        let mut flush = |parts: &mut Vec<Value>, role: &mut String, contents: &mut Vec<Value>| {
+            if !parts.is_empty() {
+                contents.push(json!({ "role": role, "parts": parts }));
+                parts.clear();
+            }
+        };
+        for message in request
             .messages
             .iter()
             .filter(|message| message.role != crate::client::ChatRole::System)
-            .map(|message| {
-                json!({
-                    "role": if message.role == crate::client::ChatRole::Assistant {
-                        "model"
-                    } else {
-                        "user"
-                    },
-                    "parts": [{ "text": message.content }],
-                })
-            })
-            .collect();
+        {
+            use crate::client::ChatRole;
+            match message.role {
+                ChatRole::Tool => {
+                    if part_role != "user" {
+                        flush(&mut parts, &mut part_role, &mut contents);
+                        part_role = "user".to_owned();
+                    }
+                    parts.push(json!({
+                        "functionResponse": {
+                            "name": message.tool_name(),
+                            "response": { "result": message.content },
+                        }
+                    }));
+                }
+                ChatRole::Assistant if !message.tool_calls.is_empty() => {
+                    if part_role != "model" {
+                        flush(&mut parts, &mut part_role, &mut contents);
+                        part_role = "model".to_owned();
+                    }
+                    for call in &message.tool_calls {
+                        parts.push(json!({
+                            "functionCall": { "name": call.name, "args": call.arguments }
+                        }));
+                    }
+                }
+                _ => {
+                    flush(&mut parts, &mut part_role, &mut contents);
+                    contents.push(json!({
+                        "role": if message.role == ChatRole::Assistant { "model" } else { "user" },
+                        "parts": [{ "text": message.content }],
+                    }));
+                }
+            }
+        }
+        flush(&mut parts, &mut part_role, &mut contents);
 
         let mut body = json!({ "contents": contents });
         if !system.is_empty() {
@@ -604,6 +921,25 @@ impl ProtocolAdapter for GoogleGemini {
         }
         if !generation.as_object().is_none_or(serde_json::Map::is_empty) {
             body["generationConfig"] = generation;
+        }
+        if !request.tools.is_empty() {
+            // Gemini names a tool in the declaration and refers to it by name only — there is
+            // no call id anywhere in the protocol, so the platform mints one from the name and
+            // the index rather than asking a provider for a handle it does not have.
+            body["tools"] = json!([{ "functionDeclarations": request
+                .tools
+                .iter()
+                .map(|tool| json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": if tool.parameters.is_null() {
+                        json!({ "type": "object", "properties": {} })
+                    } else {
+                        tool.parameters.clone()
+                    },
+                }))
+                .collect::<Vec<_>>() }]);
+            body["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
         }
         // The streaming operation is chosen by the path, not by a field in the body, so nothing
         // is added here for it.
@@ -632,6 +968,7 @@ impl ProtocolAdapter for GoogleGemini {
             content,
             finish_reason,
             usage: value.get("usageMetadata").and_then(read_gemini_usage),
+            tool_calls: read_gemini_tool_calls(candidate.pointer("/content/parts")),
         })
     }
 
@@ -673,6 +1010,39 @@ fn read_gemini_usage(value: &Value) -> Option<ChatUsage> {
             .and_then(Value::as_u64)
             .or_else(|| prompt.zip(completion).map(|(a, b)| a + b)),
     })
+}
+
+/// Tool calls as `generateContent` reports them: `functionCall` parts.
+///
+/// The protocol has no call id at all, so one is minted from the tool's name. Two calls to the
+/// same tool in one turn would then share a handle, which is why the position is part of the id:
+/// the answer a call needs is matched by id, and two identical handles would make the model's
+/// own result pairing ambiguous.
+fn read_gemini_tool_calls(value: Option<&Value>) -> Vec<crate::client::ChatToolCall> {
+    let Some(parts) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    parts
+        .iter()
+        .filter_map(|part| {
+            let call = part.get("functionCall")?;
+            let name = call.get("name").and_then(Value::as_str)?;
+            let position = parts
+                .iter()
+                .position(|earlier| earlier.get("functionCall").is_some())
+                .unwrap_or(0);
+            Some(crate::client::ChatToolCall {
+                id: format!("gemini:{name}:{position}"),
+                name: name.to_owned(),
+                arguments: call
+                    .get("args")
+                    .filter(|args| args.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect()
 }
 
 /// Decoder of a `streamGenerateContent` body: the same `candidates` shape, chunk by chunk.
@@ -719,6 +1089,24 @@ impl StreamDecoder for GeminiStream {
                 piece.finish_reason = Some(reason.to_owned());
                 self.done = true;
             }
+            // A chunked stream sends a function call whole in one chunk, so the piece carries
+            // the complete arguments as one fragment and the assembler parses it as-is.
+            piece.tool_call = candidate
+                .pointer("/content/parts")
+                .and_then(|parts| parts.as_array().and_then(|parts| parts.first()))
+                .and_then(|part| {
+                    let call = part.get("functionCall")?;
+                    let name = call.get("name").and_then(Value::as_str)?;
+                    let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                    Some(ToolCallPiece {
+                        index: 0,
+                        // No id in this protocol, so the platform mints a stable one from the
+                        // name: the same call in the same turn always answers the same handle.
+                        id: Some(format!("gemini:{name}")),
+                        name: Some(name.to_owned()),
+                        arguments_fragment: Some(arguments.to_string()),
+                    })
+                });
         }
         if let Some(usage) = value.get("usageMetadata").and_then(read_gemini_usage) {
             piece.usage = Some(usage);
@@ -781,7 +1169,7 @@ pub fn role_name(protocol: &str, role: &ChatMessage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ChatRole, ProviderTarget};
+    use crate::client::{ChatRole, ProviderTarget, ToolSpec};
     use uuid::Uuid;
 
     fn request(messages: Vec<ChatMessage>) -> ChatRequest {
@@ -790,7 +1178,22 @@ mod tests {
             messages,
             temperature: Some(0.3),
             max_tokens: Some(64),
+            tools: Vec::new(),
         }
+    }
+
+    /// A request that offers one tool, for the declarations under test.
+    fn request_with_tool(messages: Vec<ChatMessage>) -> ChatRequest {
+        let tool = ToolSpec::new(
+            "page.search",
+            "Search the pages.",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"],
+            }),
+        );
+        ChatRequest::new("mock-model", messages).with_tools(vec![tool])
     }
 
     fn target() -> ProviderTarget {
@@ -904,6 +1307,9 @@ mod tests {
                 ChatMessage {
                     role: ChatRole::Assistant,
                     content: "hello".to_owned(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: Vec::new(),
                 },
             ]),
             false,
@@ -922,6 +1328,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 temperature: None,
                 max_tokens: None,
+                tools: Vec::new(),
             },
             true,
         );
@@ -938,6 +1345,9 @@ mod tests {
                 ChatMessage {
                     role: ChatRole::Assistant,
                     content: "hello".to_owned(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: Vec::new(),
                 },
             ]),
             false,
@@ -1152,7 +1562,10 @@ mod tests {
         let assistant = ChatMessage {
             role: ChatRole::Assistant,
             content: "hello".to_owned(),
-        };
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: Vec::new(),
+                };
         assert_eq!(role_name("openai_compatible", &user), "user");
         assert_eq!(role_name("openai_compatible", &assistant), "assistant");
         assert_eq!(role_name("anthropic_messages", &assistant), "assistant");
@@ -1169,5 +1582,340 @@ mod tests {
             target.endpoint(&adapter_for(&target.protocol).chat_path("gemini-x", false)),
             "https://api.example.com/v1/models/gemini-x:generateContent"
         );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Tool declarations: all three protocols
+    // -------------------------------------------------------------------------------------
+
+    #[test]
+    fn no_tools_means_no_declarations_in_any_protocol() {
+        // An empty `tools` array is not the same as no field: several providers answer one
+        // with a 400, so the adapters have to omit the key entirely.
+        for protocol in ["openai_compatible", "anthropic_messages", "google_gemini"] {
+            let body = adapter_for(protocol)
+                .build_chat(&request(vec![ChatMessage::user("hi")]), false);
+            assert!(
+                body.get("tools").is_none() && body.get("toolConfig").is_none(),
+                "{protocol} sent a tools field for a request with no tools"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_declares_functions_and_asks_for_one() {
+        let body = adapter_for("openai_compatible")
+            .build_chat(&request_with_tool(vec![ChatMessage::user("find it")]), false);
+
+        let tools = body["tools"].as_array().expect("a tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "page.search");
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "q");
+        // Without the flag a tool-capable model is free to answer in prose and never call.
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn anthropic_declares_input_schemas() {
+        let body = adapter_for("anthropic_messages")
+            .build_chat(&request_with_tool(vec![ChatMessage::user("find it")]), false);
+
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], "page.search");
+        // The messages protocol spells a tool's schema `input_schema`, not `parameters`.
+        assert_eq!(tool["input_schema"]["properties"]["q"]["type"], "string");
+    }
+
+    #[test]
+    fn gemini_wraps_declarations_and_sets_the_calling_mode() {
+        let body = adapter_for("google_gemini")
+            .build_chat(&request_with_tool(vec![ChatMessage::user("find it")]), false);
+
+        let declarations = body["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("declarations");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0]["name"], "page.search");
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Tool results travel back with the pairing that makes them legal
+    // -------------------------------------------------------------------------------------
+
+    fn conversation_after_a_call(id: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("what is the weather in Istanbul?"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: vec![crate::client::ChatToolCall {
+                    id: id.to_owned(),
+                    name: "weather.lookup".to_owned(),
+                    arguments: serde_json::json!({ "city": "Istanbul" }),
+                }],
+            },
+            ChatMessage::tool_result(id, "weather.lookup", "18C and clear"),
+        ]
+    }
+
+    #[test]
+    fn openai_pairs_a_result_with_the_assistant_turn_that_asked_for_it() {
+        let body = adapter_for("openai_compatible")
+            .build_chat(&ChatRequest::new("mock-model", conversation_after_a_call("call_1")), false);
+
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3);
+        // The assistant turn must carry the call, or the result below is unmatched.
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Istanbul\"}"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn anthropic_pairs_a_result_as_a_tool_result_block() {
+        let body = adapter_for("anthropic_messages")
+            .build_chat(&ChatRequest::new("mock-model", conversation_after_a_call("toolu_1")), false);
+
+        let messages = body["messages"].as_array().expect("messages");
+        // The messages protocol has no `tool` role: the call rides on an assistant turn as a
+        // `tool_use` block and the result on a user turn as a `tool_result` block.
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][0]["id"], "toolu_1");
+        assert_eq!(messages[1]["content"][0]["input"]["city"], "Istanbul");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn gemini_pairs_a_result_as_a_function_response() {
+        let body = adapter_for("google_gemini")
+            .build_chat(&ChatRequest::new("mock-model", conversation_after_a_call("g1")), false);
+
+        let contents = body["contents"].as_array().expect("contents");
+        let call = &contents[1]["parts"][0]["functionCall"];
+        assert_eq!(call["name"], "weather.lookup");
+        assert_eq!(call["args"]["city"], "Istanbul");
+        let response = &contents[2]["parts"][0]["functionResponse"];
+        assert_eq!(response["name"], "weather.lookup");
+        assert_eq!(response["response"]["result"], "18C and clear");
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Reading a provider's tool calls back
+    // -------------------------------------------------------------------------------------
+
+    #[test]
+    fn openai_reads_tool_calls_out_of_a_non_streamed_answer() {
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_9",
+                        "type": "function",
+                        "function": { "name": "page.search", "arguments": "{\"q\":\"x\"}" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 4 },
+        });
+        let answer = adapter_for("openai_compatible").parse_answer(&value).expect("an answer");
+
+        assert_eq!(answer.tool_calls.len(), 1);
+        assert_eq!(answer.tool_calls[0].id, "call_9");
+        assert_eq!(answer.tool_calls[0].name, "page.search");
+        assert_eq!(answer.tool_calls[0].arguments["q"], "x");
+        // The reason string says "tool_calls" and the turn is *not* final.
+        assert!(!answer.is_final());
+    }
+
+    #[test]
+    fn a_malformed_argument_blob_becomes_an_empty_object_rather_than_failing_the_turn() {
+        // A model that emits half a JSON object is ordinary. The tool's own validator then
+        // refuses it with a message the model can read and correct.
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c",
+                        "function": { "name": "page.search", "arguments": "{\"q\":" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }]
+        });
+        let answer = adapter_for("openai_compatible").parse_answer(&value).expect("an answer");
+
+        assert_eq!(answer.tool_calls[0].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_turn_with_tool_calls_and_no_text_is_still_a_turn() {
+        // The regression this guards: "no text" was treated as "nothing arrived", which ended
+        // a run on step one, before the first tool had run.
+        let value = serde_json::json!({
+            "choices": [{
+                "message": { "tool_calls": [{
+                    "id": "c",
+                    "function": { "name": "page.search", "arguments": "{}" },
+                }]},
+                "finish_reason": "tool_calls",
+            }]
+        });
+        let answer = adapter_for("openai_compatible").parse_answer(&value).expect("an answer");
+
+        assert!(answer.content.is_empty());
+        assert_eq!(answer.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_reads_tool_use_blocks() {
+        let value = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "one moment" },
+                { "type": "tool_use", "id": "toolu_7", "name": "page.search", "input": { "q": "x" } },
+            ],
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 8, "output_tokens": 3 },
+        });
+        let answer = adapter_for("anthropic_messages")
+            .parse_answer(&value)
+            .expect("an answer");
+
+        assert_eq!(answer.content, "one moment");
+        assert_eq!(answer.tool_calls.len(), 1);
+        assert_eq!(answer.tool_calls[0].id, "toolu_7");
+        assert!(!answer.is_final());
+    }
+
+    #[test]
+    fn gemini_reads_function_call_parts() {
+        let value = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "page.search", "args": { "q": "x" } } }
+                ]},
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2 },
+        });
+        let answer = adapter_for("google_gemini").parse_answer(&value).expect("an answer");
+
+        assert_eq!(answer.tool_calls.len(), 1);
+        // Gemini issues no call id, so the platform mints one — and it has to be unique per
+        // call, because a result is matched to its call by id.
+        assert_eq!(answer.tool_calls[0].id, "gemini:page.search:0");
+        assert!(!answer.is_final());
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Streamed tool calls
+    // -------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_streamed_tool_call_arrives_in_pieces_an_index_and_all() {
+        let mut decoder = adapter_for("openai_compatible").decoder();
+
+        let first = decoder
+            .decode(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"page.search","arguments":""}}]}}]}"#)
+            .expect("decodes");
+        let piece = first.tool_call.expect("a tool-call piece");
+        assert_eq!(piece.index, 0);
+        assert_eq!(piece.id.as_deref(), Some("call_1"));
+        assert_eq!(piece.name.as_deref(), Some("page.search"));
+
+        // The argument JSON is split mid-token, which is the ordinary case.
+        let second = decoder
+            .decode(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]}}]}"#)
+            .expect("decodes");
+        assert_eq!(
+            second.tool_call.expect("a piece").arguments_fragment.as_deref(),
+            Some("{\"q\":")
+        );
+
+        let third = decoder
+            .decode(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}"#)
+            .expect("decodes");
+        assert_eq!(
+            third.tool_call.expect("a piece").arguments_fragment.as_deref(),
+            Some("\"x\"}")
+        );
+
+        // Text still decodes alongside it.
+        let text = decoder
+            .decode(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            .expect("decodes");
+        assert_eq!(text.content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn an_interleaved_pair_of_calls_keeps_its_own_arguments() {
+        let mut assembler = crate::client::ToolCallAssembler::default();
+        let mut decoder = adapter_for("openai_compatible").decoder();
+        for frame in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"one","arguments":"{\"x\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"two","arguments":"{\"y\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}"#,
+        ] {
+            if let Some(piece) = decoder.decode(frame).expect("decodes").tool_call {
+                assert!(assembler.push(piece), "the assembler must accept a fragment");
+            }
+        }
+        let calls = assembler.finish(|position| position as u32);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "one");
+        assert_eq!(calls[0].arguments["x"], 1);
+        assert_eq!(calls[1].name, "two");
+        assert_eq!(calls[1].arguments["y"], 2);
+    }
+
+    #[test]
+    fn anthropic_carries_the_block_index_into_the_argument_fragments() {
+        let mut decoder = adapter_for("anthropic_messages").decoder();
+        let start = decoder
+            .decode(r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_3","name":"page.search"}}"#)
+            .expect("decodes");
+        let piece = start.tool_call.expect("a piece");
+        assert_eq!(piece.index, 3);
+        assert_eq!(piece.id.as_deref(), Some("toolu_3"));
+
+        // The fragment has to land on the same index, or it lands on another call.
+        let delta = decoder
+            .decode(r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#)
+            .expect("decodes");
+        assert_eq!(delta.tool_call.expect("a piece").index, 3);
+    }
+
+    #[test]
+    fn the_assembler_refuses_a_call_whose_arguments_never_stop_growing() {
+        let mut assembler = crate::client::ToolCallAssembler::default();
+        let chunk = "x".repeat(1024 * 1024);
+        let mut accepted = 0;
+        for _ in 0..8 {
+            let piece = ToolCallPiece {
+                index: 0,
+                id: Some("c".to_owned()),
+                name: Some("t".to_owned()),
+                arguments_fragment: Some(chunk.clone()),
+            };
+            if !assembler.push(piece) {
+                break;
+            }
+            accepted += 1;
+        }
+        assert!(accepted < 8, "an unbounded argument buffer must be refused");
     }
 }

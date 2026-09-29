@@ -1554,6 +1554,9 @@ pub async fn chat(
         messages.push(ChatMessage {
             role,
             content: message.content,
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
         });
     }
 
@@ -1659,6 +1662,10 @@ pub async fn chat(
         messages,
         temperature: body.temperature,
         max_tokens: body.max_tokens,
+        // The chat endpoint is a conversation, not an agent: a run is what offers tools, and
+        // offering them here would let a caller reach a tool the route never checked a
+        // permission for.
+        tools: Vec::new(),
     };
     // The request shape is checked before the stream opens, so a bad one answers 400.
     omnion_ai_hub::validate_request(&request)?;

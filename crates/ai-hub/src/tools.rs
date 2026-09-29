@@ -51,6 +51,16 @@ pub trait Tool: Send + Sync {
     /// The permission a caller must hold for this tool to run.
     fn permission(&self) -> &str;
 
+    /// The JSON Schema of this tool's arguments, as the model is told.
+    ///
+    /// Defaults to "no arguments", which is the honest answer for a tool that takes none —
+    /// but a tool that *does* take arguments and inherits this is told to call it with an
+    /// empty object, and the model then invents a query the tool never receives. Anything with
+    /// arguments overrides it.
+    fn schema(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
     /// Run the tool.
     ///
     /// Returns the *summary* that goes into the transcript. Implementations that return more
@@ -100,6 +110,7 @@ pub struct FnTool<F> {
     key: String,
     description: String,
     permission: String,
+    schema: Value,
     body: F,
 }
 
@@ -107,7 +118,7 @@ impl<F> FnTool<F>
 where
     F: Fn(&Value) -> ToolOutcome + Send + Sync,
 {
-    /// Describe a synchronous tool.
+    /// Describe a synchronous tool that takes no arguments.
     pub fn new(
         key: impl Into<String>,
         description: impl Into<String>,
@@ -118,8 +129,20 @@ where
             key: key.into(),
             description: description.into(),
             permission: permission.into(),
+            schema: serde_json::json!({ "type": "object", "properties": {} }),
             body,
         }
+    }
+
+    /// The same tool, with the arguments it takes declared to the model.
+    ///
+    /// Declaring them is not optional politeness: a model told a tool takes no arguments calls
+    /// it with an empty object, and the tool then runs on a missing value instead of on the
+    /// one the model meant.
+    #[must_use]
+    pub fn with_schema(mut self, schema: Value) -> Self {
+        self.schema = schema;
+        self
     }
 }
 
@@ -230,6 +253,8 @@ pub struct ToolSummary {
     pub description: String,
     /// The permission a caller needs.
     pub permission: String,
+    /// The JSON Schema of the arguments, as the model is told.
+    pub schema: Value,
 }
 
 /// The registry: every implemented tool, by key.
@@ -318,6 +343,7 @@ impl ToolRegistry {
                 key: tool.key().to_owned(),
                 description: tool.description().to_owned(),
                 permission: tool.permission().to_owned(),
+                schema: tool.schema(),
             })
             .collect();
         entries.sort_by(|left, right| left.key.cmp(&right.key));

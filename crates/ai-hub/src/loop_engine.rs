@@ -52,6 +52,26 @@ pub struct RequestedCall {
     /// The arguments, as JSON.
     #[serde(default)]
     pub arguments: Value,
+    /// The provider's handle for this call.
+    ///
+    /// Carried through the whole loop because the result has to be paired with the call: a
+    /// provider that gets a result quoting an id it never issued refuses the entire next
+    /// request. A scripted model that names no call gets the loop's own handle, so the
+    /// transcript is always well-formed whatever produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl RequestedCall {
+    /// A call with no provider handle, the shape a scripted model produces.
+    #[must_use]
+    pub fn new(tool: &str, arguments: Value) -> Self {
+        Self {
+            tool: tool.to_owned(),
+            arguments,
+            id: None,
+        }
+    }
 }
 
 impl From<RequestedCall> for ToolCall {
@@ -104,20 +124,35 @@ impl ModelAnswer {
 /// `Model` takes a step number rather than being constructed once.
 pub trait Model: Send + Sync {
     /// Ask the model for the next answer.
-    fn complete(
-        &self,
+    ///
+    /// The lifetime is named rather than elided because the returned future borrows both `self`
+    /// and the conversation: with `'_` each borrow got its own lifetime and the future could
+    /// not be built at all, which is the trait's only real constraint.
+    fn complete<'a>(
+        &'a self,
         step_no: u32,
-        messages: &[Message],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + '_>>;
+        messages: &'a [Message],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + 'a>>;
 }
 
 /// One message of the conversation the loop builds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
-    /// `system`, `user` or `tool`.
+    /// `system`, `user`, `assistant` or `tool`.
     pub role: String,
     /// The text.
     pub content: String,
+    /// On an `assistant` turn that asked for tools: the calls, in order. The turn has to travel
+    /// back to the provider before the results do, or every protocol rejects the pairing — a
+    /// tool result quoting an id the provider never received is a 400, not a missing fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<RequestedCall>,
+    /// On a `tool` turn: which call this answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// On a `tool` turn: which tool ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl Message {
@@ -127,6 +162,9 @@ impl Message {
         Self {
             role: "system".to_owned(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 
@@ -136,6 +174,9 @@ impl Message {
         Self {
             role: "user".to_owned(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 
@@ -144,11 +185,17 @@ impl Message {
     /// A tool result is *always* wrapped, including one this platform's own tools produced. The
     /// cost of wrapping our own output is a few tokens; the cost of not wrapping it is that the
     /// one place a payload with an embedded fence gets through is the tool we wrote.
+    ///
+    /// The call id travels with it: the next turn quotes the id the provider issued, and a
+    /// result that cannot be matched to its call makes the provider reject the whole request.
     #[must_use]
-    pub fn tool_result(tool: &str, summary: &str) -> Self {
+    pub fn tool_result(call_id: &str, tool: &str, summary: &str) -> Self {
         Self {
             role: "tool".to_owned(),
             content: delimit_untrusted(tool, summary),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.to_owned()),
+            name: Some(tool.to_owned()),
         }
     }
 }
@@ -300,6 +347,9 @@ pub async fn run(
     // the count; this is what decides *whether* a call counts as repeated when a run resumes
     // from a step the machine never saw.
     let mut recent: VecDeque<String> = VecDeque::new();
+    // Calls handed out for this run, so a scripted model's unnamed call still gets a stable
+    // handle and the assistant turn and its results pair up on every protocol.
+    let mut call_handles = 0_u32;
 
     loop {
         if let StopCondition::Stop(reason) = machine.should_continue() {
@@ -372,13 +422,36 @@ pub async fn run(
             return finish(machine, StopReason::FinalAnswer, final_text, sink).await;
         }
 
+        // Every call gets a handle before anything runs, so the assistant turn recorded here
+        // and the results recorded below quote the same ids. A provider that receives a result
+        // without the matching call refuses the whole request.
+        let calls = answer
+            .calls
+            .into_iter()
+            .map(|requested| {
+                let id = requested.id.clone().unwrap_or_else(|| {
+                    let handle = format!("call_{step_no}_{call_handles}");
+                    call_handles += 1;
+                    handle
+                });
+                RequestedCall {
+                    id: Some(id),
+                    ..requested
+                }
+            })
+            .collect::<Vec<_>>();
+
         history.push(Message {
             role: "assistant".to_owned(),
             content: answer.text.clone(),
+            tool_calls: calls.clone(),
+            tool_call_id: None,
+            name: None,
         });
 
         // -- tool calls, one step each
-        for requested in answer.calls {
+        for requested in calls {
+            let call_id = requested.id.clone().unwrap_or_default();
             // The guard is checked *before* execution: three identical calls in a row is the
             // failure mode that costs money, and the third one is the one that must not run.
             let call = ToolCall::from(requested);
@@ -438,7 +511,7 @@ pub async fn run(
                         persisted,
                     )
                     .await;
-                    history.push(Message::tool_result(&tool, &summary));
+                    history.push(Message::tool_result(&call_id, &tool, &summary));
                     // A failed tool does not end the run: the model reads why and retries or
                     // answers. That is the difference between "the tool broke" and "the agent
                     // stopped", and only one of them is a bug report.
@@ -455,7 +528,7 @@ pub async fn run(
                         persisted,
                     )
                     .await;
-                    history.push(Message::tool_result(&tool, reason.code()));
+                    history.push(Message::tool_result(&call_id, &tool, reason.code()));
                 }
                 Execution::Parked { tool, arguments } => {
                     publish(
@@ -572,8 +645,8 @@ impl ScriptedModel {
 }
 
 impl Model for ScriptedModel {
-    fn complete(
-        &self,
+    fn complete<'a>(
+        &'a self,
         _step_no: u32,
         _messages: &[Message],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + '_>>
@@ -665,10 +738,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_call_runs_the_tool_and_the_second_step_answers() {
         let model = ScriptedModel::new(vec![
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({ "q": "x" }),
-            }]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "q": "x" }))]),
             ModelAnswer::text("found three pages"),
         ]);
         let (sink, events) = collect().await;
@@ -696,22 +766,10 @@ mod tests {
         // A model that only ever asks for tools: nothing ends the run but the cap, so the count
         // of provider calls *is* the measurement of the cap.
         let model = ScriptedModel::new(vec![
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({ "n": 1 }),
-            }]),
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({ "n": 2 }),
-            }]),
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({ "n": 3 }),
-            }]),
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({ "n": 4 }),
-            }]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "n": 1 }))]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "n": 2 }))]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "n": 3 }))]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "n": 4 }))]),
         ]);
         let (sink, _events) = collect().await;
         let outcome = run(
@@ -738,10 +796,7 @@ mod tests {
     #[tokio::test]
     async fn three_identical_tool_calls_end_the_run_as_loop_detected() {
         let same = || {
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({ "q": "same" }),
-            }])
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "q": "same" }))])
         };
         let model = ScriptedModel::new(vec![same(), same(), same(), same(), same()]);
         let (sink, events) = collect().await;
@@ -772,10 +827,7 @@ mod tests {
     #[tokio::test]
     async fn a_denied_tool_is_refused_and_the_model_is_told_why_instead_of_being_hung_up_on() {
         let model = ScriptedModel::new(vec![
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({}),
-            }]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({}))]),
             ModelAnswer::text("I cannot do that."),
         ]);
         let (sink, events) = collect().await;
@@ -796,10 +848,7 @@ mod tests {
     #[tokio::test]
     async fn an_approval_gated_tool_parks_the_run_and_stops_calling_the_model() {
         let model = ScriptedModel::new(vec![
-            ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({}),
-            }]),
+            ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({}))]),
             ModelAnswer::text("should never be reached"),
         ]);
         let (sink, events) = collect().await;
@@ -831,11 +880,11 @@ mod tests {
     async fn a_provider_failure_fails_the_run_with_the_bridges_code() {
         struct Broken;
         impl Model for Broken {
-            fn complete(
-                &self,
+            fn complete<'a>(
+                &'a self,
                 _step_no: u32,
-                _messages: &[Message],
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + '_>>
+                _messages: &'a [Message],
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + 'a>>
             {
                 Box::pin(async {
                     Err(ModelError::new("upstream", "the provider did not answer"))
@@ -866,10 +915,7 @@ mod tests {
         // One step asks for the tool, the next answers. The recorder answers both, so the only
         // thing that ends this run is the tool call in the first answer.
         let model: Arc<dyn Model> = Arc::new(StepChained {
-            first: std::sync::Mutex::new(Some(ModelAnswer::calling(vec![RequestedCall {
-                tool: "page.search".into(),
-                arguments: serde_json::json!({}),
-            }]))),
+            first: std::sync::Mutex::new(Some(ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({}))]))),
             recorder: Arc::clone(&recorder),
         });
         let tools = ToolRegistry::new(vec![Arc::new(FnTool::new(
@@ -921,11 +967,11 @@ mod tests {
         recorder: Arc<Recorder>,
     }
     impl Model for StepChained {
-        fn complete(
-            &self,
+        fn complete<'a>(
+            &'a self,
             _step_no: u32,
-            messages: &[Message],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + '_>>
+            messages: &'a [Message],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ModelAnswer, ModelError>> + Send + 'a>>
         {
             let first = self
                 .first

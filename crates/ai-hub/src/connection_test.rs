@@ -236,6 +236,7 @@ pub async fn run_test(provider: &Provider, known: &[String]) -> TestReport {
             messages: vec![ChatMessage::user("ping")],
             temperature: None,
             max_tokens: Some(8),
+            tools: Vec::new(),
         };
         match chat(&target, &request).await {
             Ok(_) => {

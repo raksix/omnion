@@ -27,6 +27,7 @@ pub mod health_store;
 pub mod loop_engine;
 pub mod model;
 pub mod protocol;
+pub mod provider_model;
 pub mod resolve_path;
 pub mod router;
 pub mod routing;
@@ -45,8 +46,8 @@ pub use catalog::{
     task_refusal_reason, validate_feature, validate_price, validate_requirement, validate_task,
 };
 pub use client::{
-    ChatEvent, ChatMessage, ChatOutcome, ChatRequest, ChatRole, ChatUsage, ProviderTarget, chat,
-    list_remote_models, stream_chat, validate_request,
+    ChatEvent, ChatMessage, ChatOutcome, ChatRequest, ChatRole, ChatToolCall, ChatUsage,
+    ProviderTarget, ToolSpec, chat, list_remote_models, stream_chat, validate_request,
 };
 pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
 pub use error::{AiHubError, Result};
@@ -71,6 +72,7 @@ pub use model::{
     validate_token_limits,
 };
 pub use protocol::{ProtocolAdapter, ProtocolInfo, StreamPiece, adapter_for, protocol_infos};
+pub use provider_model::{ProviderModel, SharedModel};
 pub use resolve_path::{Resolved, resolve_and_record};
 pub use router::{ResolvedModel, model_id, resolve, resolve_for};
 pub use routing::{

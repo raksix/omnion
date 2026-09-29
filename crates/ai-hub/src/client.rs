@@ -15,11 +15,12 @@
 //! without the usage block, and providers that report a failure *inside* an otherwise `200`
 //! stream.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -85,6 +86,8 @@ pub enum ChatRole {
     User,
     /// What the model answered earlier in the same conversation.
     Assistant,
+    /// The result of a tool the model asked for.
+    Tool,
 }
 
 impl ChatRole {
@@ -95,6 +98,10 @@ impl ChatRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            // No protocol takes a `tool` role on a request message: OpenAI spells the result as
+            // `role: "tool"`, the other two carry it as a content block. The name is here for
+            // logs and for the round trip through `parse`, not for a body we hand a provider.
+            Self::Tool => "tool",
         }
     }
 
@@ -104,20 +111,65 @@ impl ChatRole {
             "system" => Ok(Self::System),
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
+            "tool" => Ok(Self::Tool),
             other => Err(AiHubError::InvalidChatRequest(format!(
-                "unknown message role \"{other}\" (system, user, assistant)"
+                "unknown message role \"{other}\" (system, user, assistant, tool)"
             ))),
         }
     }
 }
 
+/// One tool the model may call, in the platform's own shape.
+///
+/// Every adapter translates this into its own spelling; a caller never writes a vendor's tool
+/// JSON. `parameters` is a JSON Schema object — the same schema the tool's arguments are
+/// validated against before anything runs, so what the model is told and what the tool checks
+/// are the same document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    /// Key the call will carry.
+    pub name: String,
+    /// What the tool does, in one line.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema of the arguments.
+    #[serde(default)]
+    pub parameters: Value,
+}
+
+impl ToolSpec {
+    /// A tool with a description and an argument schema.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
 /// One message of a chat request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Who said it.
     pub role: ChatRole,
     /// What was said.
     pub content: String,
+    /// Set on a [`ChatRole::Tool`] message: the call this result answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Set on a [`ChatRole::Tool`] message: which tool ran. Two protocols need it and neither can
+    /// be served from the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Set on a [`ChatRole::Assistant`] message: the tool calls the model made in that turn.
+    ///
+    /// The turn has to travel back to the provider with its calls attached, because the results
+    /// that follow quote the call ids — and a result whose call is missing from the
+    /// conversation is a rejected request, not a model that lost the thread.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
 }
 
 impl ChatMessage {
@@ -127,6 +179,9 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -136,8 +191,65 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
         }
     }
+
+    /// An assistant message from an earlier turn.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// The result of one tool call, handed back to the model.
+    #[must_use]
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+            name: Some(tool.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// The id this message answers, for the protocols that need one.
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        self.tool_call_id.as_deref().unwrap_or_default()
+    }
+
+    /// The tool this message reports on, for the protocols that need the name.
+    #[must_use]
+    pub fn tool_name(&self) -> &str {
+        self.name.as_deref().unwrap_or_default()
+    }
+}
+
+/// One tool call a model asked for, as the wire reported it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatToolCall {
+    /// The provider's handle for this call; the matching result has to quote it.
+    pub id: String,
+    /// Which tool to run.
+    pub name: String,
+    /// The arguments, parsed. A provider that sends malformed JSON yields an empty object, and
+    /// the tool's own validator refuses it with `bad_arguments` — a broken argument blob from a
+    /// model is an expected outcome, not a transport error.
+    #[serde(default)]
+    pub arguments: Value,
 }
 
 /// One chat exchange, addressed to a model.
@@ -151,6 +263,30 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     /// Answer budget in tokens, when the caller sets one.
     pub max_tokens: Option<u32>,
+    /// Tools the model may call. Empty means a plain conversation: the adapters then omit the
+    /// field entirely rather than sending an empty list, which some providers answer with a 400.
+    pub tools: Vec<ToolSpec>,
+}
+
+impl ChatRequest {
+    /// A plain request to one model, with no tools offered.
+    #[must_use]
+    pub fn new(model: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            model: model.into(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: Vec::new(),
+        }
+    }
+
+    /// The same request with a tool list attached.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = tools;
+        self
+    }
 }
 
 /// Token counts a provider reported.
@@ -165,7 +301,7 @@ pub struct ChatUsage {
 }
 
 /// A finished answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatOutcome {
     /// The answer text.
     pub content: String,
@@ -173,6 +309,33 @@ pub struct ChatOutcome {
     pub finish_reason: Option<String>,
     /// Token counts, when the provider reported them.
     pub usage: Option<ChatUsage>,
+    /// Tool calls the model asked for. A non-empty list means this turn is *not* the answer:
+    /// the results have to go back to the model before it can finish.
+    pub tool_calls: Vec<ChatToolCall>,
+}
+
+impl ChatOutcome {
+    /// A plain answer: text, no tool calls, nothing claimed about tokens.
+    #[must_use]
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            finish_reason: None,
+            usage: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Whether the provider considered this turn finished.
+    ///
+    /// Providers disagree on what "finished" means — OpenAI says `stop` for a final answer and
+    /// `tool_calls` when it wants tools, Anthropic says `end_turn` and `tool_use` — so the
+    /// check is on the *absence* of tool calls. A turn that asked for tools is never final,
+    /// whatever the reason string says.
+    #[must_use]
+    pub fn is_final(&self) -> bool {
+        self.tool_calls.is_empty()
+    }
 }
 
 /// What the client pushes while an answer streams in.
@@ -218,10 +381,28 @@ pub fn validate_request(request: &ChatRequest) -> Result<()> {
     if request
         .messages
         .iter()
-        .any(|message| message.content.trim().is_empty())
+        // An assistant turn that was *only* a tool call carries its meaning in
+        // `tool_calls`, and its text is legitimately empty — every protocol accepts that
+        // (OpenAI wants `content: null`). Refusing it here would make a tool-using turn the
+        // one request the platform rejects itself, which is how a run that works looks broken.
+        .any(|message| {
+            message.content.trim().is_empty()
+                && !(message.role == ChatRole::Assistant && !message.tool_calls.is_empty())
+        })
     {
         return Err(AiHubError::InvalidChatRequest(
             "chat messages may not be empty".to_owned(),
+        ));
+    }
+    // A tool result has to answer a call, or the provider has nothing to pair it with and
+    // refuses the whole request. Checking it here names the problem before it costs a call.
+    if request
+        .messages
+        .iter()
+        .any(|message| message.role == ChatRole::Tool && message.call_id().is_empty())
+    {
+        return Err(AiHubError::InvalidChatRequest(
+            "a tool result must quote the call it answers".to_owned(),
         ));
     }
     if let Some(temperature) = request.temperature
@@ -325,7 +506,12 @@ pub async fn stream_chat(
         content: String::new(),
         finish_reason: None,
         usage: None,
+        tool_calls: Vec::new(),
     };
+    // Tool calls are merged as they stream, keyed by the index the provider used, and only
+    // turned into whole calls once the stream ends — a call's arguments are not valid JSON
+    // until the last fragment has arrived.
+    let mut calls = ToolCallAssembler::default();
 
     while let Some(chunk) = response
         .chunk()
@@ -333,9 +519,10 @@ pub async fn stream_chat(
         .map_err(|error| AiHubError::Stream(error.to_string()))?
     {
         for piece in parser.push(&String::from_utf8_lossy(&chunk)) {
-            if let Err(error) = absorb(piece?, &mut outcome, &events).await {
+            if let Err(error) = absorb(piece?, &mut outcome, &mut calls, &events).await {
                 if error.to_string() == STREAM_ABANDONED {
                     // The caller stopped listening: the answer in hand is still the answer.
+                    outcome.tool_calls = calls.finish(|position| position as u32);
                     return Ok(outcome);
                 }
                 return Err(error);
@@ -345,7 +532,7 @@ pub async fn stream_chat(
 
     let mut abandoned = false;
     for piece in parser.finish() {
-        if let Err(error) = absorb(piece?, &mut outcome, &events).await {
+        if let Err(error) = absorb(piece?, &mut outcome, &mut calls, &events).await {
             if error.to_string() == STREAM_ABANDONED {
                 abandoned = true;
             } else {
@@ -353,11 +540,14 @@ pub async fn stream_chat(
             }
         }
     }
+    outcome.tool_calls = calls.finish(|position| position as u32);
     if abandoned {
         return Ok(outcome);
     }
 
-    if outcome.content.is_empty() && outcome.finish_reason.is_none() {
+    // A turn that only asked for tools carries no text and, on some providers, no finish reason
+    // either — it is a perfectly good turn. Only a turn with *nothing* in it is malformed.
+    if outcome.content.is_empty() && outcome.finish_reason.is_none() && outcome.tool_calls.is_empty() {
         return Err(AiHubError::Malformed(
             "the provider streamed no answer and no finish reason".to_owned(),
         ));
@@ -459,6 +649,7 @@ fn trimmed(body: &str) -> String {
 async fn absorb(
     piece: StreamPiece,
     outcome: &mut ChatOutcome,
+    calls: &mut ToolCallAssembler,
     events: &mpsc::Sender<ChatEvent>,
 ) -> Result<()> {
     if let Some(text) = piece.content {
@@ -474,6 +665,13 @@ async fn absorb(
             return Err(AiHubError::Stream(STREAM_ABANDONED.to_owned()));
         }
     }
+    if let Some(piece) = piece.tool_call
+        && !calls.push(piece)
+    {
+        return Err(AiHubError::Stream(
+            "the provider streamed more tool-call bytes than the platform accepts".to_owned(),
+        ));
+    }
     if piece.finish_reason.is_some() {
         outcome.finish_reason = piece.finish_reason;
     }
@@ -482,6 +680,91 @@ async fn absorb(
     }
 
     Ok(())
+}
+
+/// Collects the tool calls of one streamed turn out of the fragments the provider sent.
+///
+/// A streamed tool call is not one frame. OpenAI sends the id and the name in the first delta
+/// and the argument JSON a few characters at a time, Anthropic splits the same thing across
+/// `content_block_start` and a run of `input_json_delta`s, and both interleave two calls in one
+/// turn by index. The fragments are therefore keyed by index and the arguments are
+/// *concatenated* — never parsed per fragment, because a JSON object is routinely split
+/// mid-token (`{"city":"Is` + `tanbul"}` is the ordinary case, not a broken provider).
+#[derive(Debug, Default)]
+pub(crate) struct ToolCallAssembler {
+    /// The calls found so far, in the order their ids first appeared.
+    calls: Vec<ChatToolCall>,
+    /// Argument bytes per call index, still incomplete.
+    fragments: BTreeMap<u32, String>,
+}
+
+impl ToolCallAssembler {
+    /// Merge one fragment. Returns `false` when a call's arguments outgrow the answer limit,
+    /// which is a provider that never stops sending rather than one that is slow.
+    pub(crate) fn push(&mut self, piece: crate::protocol::ToolCallPiece) -> bool {
+        if let Some(fragment) = &piece.arguments_fragment {
+            let buffer = self.fragments.entry(piece.index).or_default();
+            buffer.push_str(fragment);
+            if buffer.len() > MAX_ANSWER_BYTES {
+                return false;
+            }
+        }
+
+        match (&piece.id, &piece.name) {
+            (Some(id), name) => {
+                if let Some(position) = self.calls.iter().position(|call| &call.id == id) {
+                    // The same id arriving twice is a provider repeating itself, not a second
+                    // call: the name is refreshed and the argument buffer keeps accumulating.
+                    if let Some(name) = name
+                        && !name.is_empty()
+                    {
+                        self.calls[position].name.clone_from(name);
+                    }
+                } else {
+                    self.calls.push(ChatToolCall {
+                        id: id.clone(),
+                        name: name.clone().unwrap_or_default(),
+                        arguments: Value::Null,
+                    });
+                }
+            }
+            (None, Some(name)) => {
+                // A protocol that names no id at all (Gemini) still identifies its call by name.
+                if let Some(call) = self.calls.iter_mut().find(|call| call.name.is_empty()) {
+                    call.name.clone_from(name);
+                }
+            }
+            (None, None) => {}
+        }
+
+        true
+    }
+
+    /// The finished calls, with their arguments parsed.
+    ///
+    /// A call whose arguments never became parseable JSON yields an empty object rather than
+    /// being dropped: the tool's own validator then refuses it with a message the model can
+    /// read and correct, which is a better outcome than a turn that silently lost a tool call.
+    #[must_use]
+    pub(crate) fn finish(self, fallback_index: impl Fn(usize) -> u32) -> Vec<ChatToolCall> {
+        self.calls
+            .into_iter()
+            .enumerate()
+            .map(|(position, mut call)| {
+                let raw = self
+                    .fragments
+                    .get(&fallback_index(position))
+                    .or_else(|| self.fragments.values().next())
+                    .cloned()
+                    .unwrap_or_default();
+                call.arguments = serde_json::from_str(&raw)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                call
+            })
+            .collect()
+    }
 }
 
 /// Marker error a closed subscriber channel produces; it ends the stream without a failure.
@@ -640,6 +923,7 @@ mod tests {
             messages: vec![ChatMessage::user("hello")],
             temperature: None,
             max_tokens: None,
+            tools: Vec::new(),
         };
         assert!(validate_request(&request).is_ok());
 
