@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod destination;
 pub mod error;
 pub mod media;
@@ -41,6 +42,10 @@ pub mod restore;
 pub mod store;
 pub mod sweep;
 
+pub use apply::{
+    ArchiveFacts, MAX_MEDIA_OBJECTS, MAX_SELECTED_PARTS, PlanError, PlanRefusal, RestorePlan,
+    RestoreRequest, build_plan,
+};
 pub use destination::{
     DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
     storage_prefix,
