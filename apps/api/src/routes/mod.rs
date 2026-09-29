@@ -1106,6 +1106,12 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "seo.manage"))
         .merge(delete(seo::delete_redirect).layer(guards::require(&state, "seo.manage")));
     let seo_redirect_test = post(seo::test_redirect).layer(guards::require(&state, "seo.read"));
+    // The import writes rules, so it carries `seo.manage` like every other write on this surface
+    // — a *read* guard would have let any account that may look at the rules paste a file into
+    // the table. The export is the read it is: a caller who may see the rules may take them away.
+    let seo_redirect_import =
+        post(seo::import_redirects).layer(guards::require(&state, "seo.manage"));
+    let seo_redirect_export = get(seo::export_redirects).layer(guards::require(&state, "seo.read"));
     let seo_settings_write = put(seo::put_settings).layer(guards::require(&state, "seo.manage"));
     let seo_sitemap_regenerate =
         post(seo::regenerate_sitemap).layer(guards::require(&state, "seo.manage"));
@@ -1638,6 +1644,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/seo/settings", seo_overview)
         .route("/seo/redirects", seo_redirect_create)
+        // Before `/seo/redirects/{id}`: axum's matchit would otherwise read "import" as a
+        // redirect id and hand the CSV to a handler that expects a UUID, which fails as a 400
+        // with a message about the path instead of about the file.
+        .route("/seo/redirects/import", seo_redirect_import)
+        .route("/seo/redirects/export", seo_redirect_export)
         .route("/seo/redirects/{id}", seo_redirect_write)
         .route("/seo/redirects/{id}/test", seo_redirect_test)
         .route("/sites/{site_id}/seo/settings", seo_settings_write)

@@ -559,6 +559,189 @@ pub struct TestPathIn {
     pub path: String,
 }
 
+/// A file of redirect rules, as text.
+///
+/// The CSV travels as a JSON string rather than as `multipart/form-data` on purpose: the panel
+/// pastes or drops a file, and a `.txt` body with a JSON envelope is the one shape that survives
+/// a proxy, a `curl` and a browser alike. The alternative — a multipart upload — is three parsers
+/// and a temporary-file rule for a document that is, by construction, a few kilobytes of text.
+#[derive(Debug, Deserialize)]
+pub struct RedirectImportIn {
+    /// Site the rules belong to.
+    pub site_id: Uuid,
+    /// The CSV itself.
+    pub csv: String,
+    /// Read the file and report what it holds **without writing anything**.
+    ///
+    /// This is the default a panel uses: a 400-row file is something an owner wants to read
+    /// before they commit it, and the report is exactly what the parse already produces. The
+    /// write is a second, explicit press.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+/// A row the importer refused, in the report.
+#[derive(Debug, Serialize)]
+pub struct RedirectRejectionBody {
+    /// 1-based line in the uploaded file, or 0 for a refusal about the file as a whole.
+    pub line: usize,
+    /// The row as it was read.
+    pub row: String,
+    /// Why it was refused.
+    pub reason: String,
+}
+
+/// The answer to an import: what would happen, or what happened.
+#[derive(Debug, Serialize)]
+pub struct RedirectImportBody {
+    /// `true` when the file had nothing refused.
+    pub clean: bool,
+    /// Rows written — 0 for a dry run, and 0 for a refused file.
+    pub imported: usize,
+    /// Rows that will be written, or would be on a dry run.
+    pub accepted: usize,
+    /// One sentence for the panel to show.
+    pub summary: String,
+    /// The refusals, in file order.
+    pub rejected: Vec<RedirectRejectionBody>,
+}
+
+/// `POST /api/v1/seo/redirects/import` — read a CSV of rules, and (unless it is a dry run)
+/// write the whole file or nothing.
+///
+/// The all-or-nothing contract is the reason this is one endpoint and not a per-row loop: an
+/// owner who pastes 400 rows and reads "imported 397, 3 failed" reasonably concludes the other
+/// 397 were saved. A refused file writes nothing and says which line stopped it, so the fix is
+/// to edit the file rather than to audit a table nobody meant to change.
+pub async fn import_redirects(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Json(input): Json<RedirectImportIn>,
+) -> Result<(StatusCode, Json<RedirectImportBody>), ApiError> {
+    let site = site_in_scope(&state, &current, input.site_id).await?;
+    let store = SeoStore::new(state.db().pool().clone());
+
+    let plan = omnion_content::seo_csv::parse_redirect_csv(&input.csv)?;
+
+    // A file that closes a circle with a rule ALREADY stored is the same loop the per-row check
+    // would have caught had the rows arrived in the other order, and it is invisible to the
+    // parser because it has no database to ask. So the plan is checked against both.
+    if let Some(reason) = omnion_content::seo_csv::refuse_circular_plan_with(
+        &store.redirect_pairs(site.id).await?,
+        &plan.accepted,
+    ) {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(RedirectImportBody {
+                clean: false,
+                imported: 0,
+                accepted: plan.accepted.len(),
+                summary: reason,
+                rejected: plan.rejected.iter().map(rejection_body).collect(),
+            }),
+        ));
+    }
+
+    if !plan.is_clean() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(RedirectImportBody {
+                clean: false,
+                imported: 0,
+                accepted: plan.accepted.len(),
+                summary: format!("nothing was imported — {}", plan.summary()),
+                rejected: plan.rejected.iter().map(rejection_body).collect(),
+            }),
+        ));
+    }
+
+    if input.dry_run.unwrap_or(false) {
+        return Ok((
+            StatusCode::OK,
+            Json(RedirectImportBody {
+                clean: true,
+                imported: 0,
+                accepted: plan.accepted.len(),
+                summary: format!("{} — nothing was written (dry run)", plan.summary()),
+                rejected: Vec::new(),
+            }),
+        ));
+    }
+
+    let written = store
+        .import_redirects(site.id, &plan.accepted, Some(current.user.id))
+        .await?;
+    record(
+        &state,
+        &current,
+        site.organization_id,
+        "seo.redirect.import",
+        site.id,
+        json!({ "rows": written.len(), "site_id": site.id }),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RedirectImportBody {
+            clean: true,
+            imported: written.len(),
+            accepted: plan.accepted.len(),
+            summary: format!("imported {} redirect rule(s)", written.len()),
+            rejected: Vec::new(),
+        }),
+    ))
+}
+
+/// `GET /api/v1/seo/redirects/export?site_id=` — the site's rules as a CSV file.
+///
+/// Served as a download rather than as JSON because the caller wants a file, and the header is
+/// the whole difference between "save this" and "here is a string".
+pub async fn export_redirects(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(query): Query<RedirectExportQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let store = SeoStore::new(state.db().pool().clone());
+    let csv = store.export_redirects(site.id).await?;
+    record(
+        &state,
+        &current,
+        site.organization_id,
+        "seo.redirect.export",
+        site.id,
+        json!({ "site_id": site.id }),
+    )
+    .await?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"redirects.csv\"",
+            ),
+        ],
+        csv,
+    ))
+}
+
+/// Which site's rules to export.
+#[derive(Debug, Deserialize)]
+pub struct RedirectExportQuery {
+    /// Site the rules belong to.
+    pub site_id: Uuid,
+}
+
+fn rejection_body(rejection: &omnion_content::seo_csv::CsvRejection) -> RedirectRejectionBody {
+    RedirectRejectionBody {
+        line: rejection.line,
+        row: rejection.row.clone(),
+        reason: rejection.reason.clone(),
+    }
+}
+
 /// `PUT /api/v1/sites/{site_id}/seo/settings` — write the site's settings.
 pub async fn put_settings(
     State(state): State<AppState>,
