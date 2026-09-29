@@ -16,6 +16,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use omnion_audit::NewAuditEntry;
+use omnion_cdn::invalidation;
 use omnion_cdn::purge::{
     self, NewPurge, PurgeFilter, PurgeInputError, PurgeItemRow, PurgeKind, PurgeStatus, MAX_TARGETS,
 };
@@ -162,6 +163,23 @@ pub struct PurgeDetailResponse {
     pub purge: PurgeBody,
     /// Its items, in listing order.
     pub items: Vec<PurgeItemBody>,
+    /// What asked for this purge, when the platform did (REQ-011, slice 3).
+    ///
+    /// `None` for a manual purge, and that `None` is the answer: the drawer shows "an
+    /// operator asked for this" against a row that has a person, and names the event
+    /// against one that does not. A field that is always null is a field the panel learns
+    /// to ignore, and a purge the platform raised would then be indistinguishable from a
+    /// purge a person pressed the button for — in the one column an operator reads first.
+    pub source: Option<PurgeSourceBody>,
+}
+
+/// The event behind an automatic purge.
+#[derive(Debug, Serialize)]
+pub struct PurgeSourceBody {
+    /// The bus event's id.
+    pub event_id: i64,
+    /// The event's name (`page.published`, `media.version_created`, …).
+    pub trigger: String,
 }
 
 /// Response of `GET /api/v1/cdn/purges`.
@@ -281,11 +299,30 @@ pub async fn get_purge(
     Path(id): Path<Uuid>,
 ) -> Result<Json<PurgeDetailResponse>, ApiError> {
     let row = purge_in_scope(&state, &current, id).await?;
-    let items = purge::items_of(state.db().pool(), id).await?;
-    Ok(Json(PurgeDetailResponse {
+    Ok(Json(detail_of(state.db().pool(), row).await?))
+}
+
+/// A purge, its items and its provenance — the body two routes return.
+///
+/// One function, because the two answers have to be *the same* answer. A retry that returned
+/// the purge without the source would make the drawer's "automatic · `page.published`" line
+/// vanish the moment an operator retried a failed automatic purge, and the panel would read
+/// the disappearance as "this one is a manual purge now" — which is exactly backwards.
+async fn detail_of(pool: &sqlx::PgPool, row: purge::PurgeRow) -> Result<PurgeDetailResponse, ApiError> {
+    let items = purge::items_of(pool, row.id).await?;
+    // One source per purge by construction (the table's key is `purge_id`), so the first
+    // row is the whole answer. A drain that could write two would mean one publication
+    // produced two purges, which is a different bug and would show up as two purges.
+    let source = invalidation::sources_of(pool, row.id)
+        .await?
+        .into_iter()
+        .next()
+        .map(|(event_id, trigger)| PurgeSourceBody { event_id, trigger });
+    Ok(PurgeDetailResponse {
         purge: PurgeBody::build(&row),
         items: items.iter().map(PurgeItemBody::build).collect(),
-    }))
+        source,
+    })
 }
 
 /// `POST /api/v1/cdn/purges` — the purge console's submit.
@@ -397,17 +434,16 @@ pub async fn retry_purge(
     )
     .await?;
 
-    let items = purge::items_of(state.db().pool(), id).await?;
-    Ok(Json(PurgeDetailResponse {
-        purge: PurgeBody::build(&purge::find(state.db().pool(), id)
-            .await?
-            .ok_or_else(|| ApiError::new(
+    let row = purge::find(state.db().pool(), id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
                 axum::http::StatusCode::NOT_FOUND,
                 "purge_not_found",
                 "no cache purge with that id exists",
-            ))?),
-        items: items.iter().map(PurgeItemBody::build).collect(),
-    }))
+            )
+        })?;
+    Ok(Json(detail_of(state.db().pool(), row).await?))
 }
 
 /// `GET /api/v1/cdn/adapters` — the shipped catalogue and the fields each one needs.

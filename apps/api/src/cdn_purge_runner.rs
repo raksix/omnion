@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
+use omnion_cdn::invalidation;
 use omnion_cdn::purge::{self, PurgeItemRow, PurgeKind};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -43,6 +44,15 @@ use crate::state::AppState;
 /// items not claimed here are the next tick's work.
 const CLAIM_BATCH: i64 = 200;
 
+/// How many events one invalidation pass reads.
+///
+/// Half the claim batch, for a reason that is about the *shape* of the work rather than
+/// its size: a drain turns one event into one purge, and a purge is a row plus a row per
+/// target. A pass that read 200 events and queued 200 purges would write 200 history rows
+/// in one transaction while the claim batches the resulting items 200 at a time — the two
+/// numbers answer different questions and there is no reason to make them the same one.
+const EVENT_BATCH: i64 = 100;
+
 /// Start the purge worker; the handle is kept by the binary and ends with the process.
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
@@ -54,6 +64,20 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tracing::info!(poll_ms, "the CDN purge worker started");
 
     tokio::spawn(async move {
+        // The invalidation cursor is pointed at the head of the bus before the first walk,
+        // for the same reason the search indexer does it: a fresh installation watches
+        // forward, and an existing one does not replay every publication it has ever
+        // recorded into a burst of purges at a provider that is doing nothing wrong.
+        match invalidation::seed_cursor(state.db().pool()).await {
+            Ok(Some(cursor)) => {
+                tracing::info!(cursor, "the CDN invalidation cursor seeded to the end of the bus");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "the CDN invalidation cursor could not be seeded");
+            }
+        }
+
         let mut ticks = tokio::time::interval(StdDuration::from_millis(poll_ms));
         // A slow tick must not become a burst of catch-up ticks: the rows are still
         // queued, so the next tick drains the same set again and the history shows two
@@ -64,11 +88,39 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
 
         loop {
             ticks.tick().await;
+            // The order of the two passes is the whole point of this tick, and it is not
+            // arbitrary. Automatic invalidation (REQ-011 slice 3) walks the events recorded
+            // since the last one and queues what is stale; the drain above then claims
+            // whatever is due. Running the walk first means a publication recorded a second
+            // ago is queued *and* claimed in the same pass, which is what the request's
+            // "page published -> purge -> new version live" diagram asks for. Running the
+            // drain first would still deliver the purge, one tick later — and on a tick
+            // measured in seconds that is a visitor seeing the old page for no reason.
+            if let Err(error) = invalidate(&state).await {
+                tracing::warn!(error = %error, "the CDN invalidation pass failed");
+            }
             if let Err(error) = tick(&state).await {
                 tracing::warn!(error = %error, "the CDN purge tick failed");
             }
         }
     })
+}
+
+/// Walk the event bus above the invalidation cursor and queue what it says is stale.
+pub async fn invalidate(state: &AppState) -> Result<(), omnion_cdn::CdnError> {
+    let pool = state.db().pool();
+    let report = invalidation::drain(pool, EVENT_BATCH).await?;
+    if report.is_idle() {
+        return Ok(());
+    }
+    tracing::debug!(
+        read = report.read,
+        queued = report.queued,
+        skipped = report.skipped,
+        cursor = report.cursor,
+        "cdn: the automatic invalidation pass"
+    );
+    Ok(())
 }
 
 /// One pass: claim, dispatch, record.
