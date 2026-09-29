@@ -128,17 +128,70 @@ fn test_storage() -> omnion_storage::Storage {
 /// without the token — a test that skipped that would be testing a router no browser ever uses.
 const CSRF_SECRET: &str = "environment-suite-csrf-key-material";
 
+/// Open a throwaway database with every migration applied, plus its router.
+///
+/// The database is **per run**, and that is the whole point of this function. The suite used to
+/// connect straight to whatever `OMNION_DATABASE_URL` named and drop its fixtures in alongside
+/// whatever else lived there — which on this box is a *shared* database, because every writer runs
+/// its QA pass against one. The visible symptom arrived in another tool: the walkthrough seeds one
+/// owner account at boot, the API's `bootstrap_first_admin` creates it only while `users` is
+/// empty, and this suite's 54 accounts meant the seed was skipped — so the browser pass died at
+/// `could not sign in after wizard` and filed it as a product failure. A suite that steals the
+/// account its own acceptance gate signs in with does not merely make a mess; it removes the gate,
+/// and the removal is invisible from inside the suite.
+///
+/// One database for the whole run, not one per test: applying 105 migrations 25 times would cost
+/// minutes per suite, and the walks do not collide with each other anyway — every fixture names
+/// its own organization, site, key and account with a random suffix, which is the same discipline
+/// the walks already rely on. This is the pattern `event_retention.rs`, `events.rs` and
+/// `onboarding.rs` already use, which is why this suite is the odd one out and now is not.
+static HARNESS: tokio::sync::OnceCell<Option<(AppState, Db)>> = tokio::sync::OnceCell::const_new();
+
 async fn live_state() -> Option<(AppState, Db)> {
+    let shared = HARNESS
+        .get_or_init(|| Box::pin(open_harness()))
+        .await;
+    // Cloned, not shared: `AppState` is cheap to clone and the walks each get their own handle,
+    // while the *database* underneath is the one thing they must share.
+    shared.as_ref().map(|(state, db)| (state.clone(), db.clone()))
+}
+
+/// Create the database, apply the migrations and build the router. `None` means "skip".
+async fn open_harness() -> Option<(AppState, Db)> {
     let mut config = Config::from_env().ok()?;
     config.csrf = omnion_core::config::CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
-    let db = match Db::connect(&config.database).await {
+
+    let maintenance = match Db::connect(&omnion_core::config::DatabaseConfig {
+        url: swap_database(&config.database.url, "postgres"),
+        max_connections: 1,
+    })
+    .await
+    {
         Ok(db) => db,
         Err(err) => {
             eprintln!("SKIP: PostgreSQL is not reachable ({err})");
             return None;
         }
     };
+
+    let database = format!("omnion_env_{}", Uuid::new_v4().simple());
+    if let Err(err) = sqlx::query(&format!("create database \"{database}\""))
+        .execute(maintenance.pool())
+        .await
+    {
+        eprintln!("SKIP: the temporary database could not be created ({err})");
+        return None;
+    }
+    eprintln!("scratch database: {database}");
+
+    let db = Db::connect(&omnion_core::config::DatabaseConfig {
+        url: swap_database(&config.database.url, &database),
+        max_connections: 8,
+    })
+    .await
+    .expect("the fresh database must connect");
     db.migrate().await.expect("migrations must apply");
+
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -148,6 +201,22 @@ async fn live_state() -> Option<(AppState, Db)> {
         test_storage(),
     );
     Some((state, db))
+}
+
+/// Replace the database name in a PostgreSQL connection string.
+fn swap_database(url: &str, database: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let prefix = base
+        .rsplit_once('/')
+        .expect("the URL must contain a database path")
+        .0;
+    match query {
+        Some(query) => format!("{prefix}/{database}?{query}"),
+        None => format!("{prefix}/{database}"),
+    }
 }
 
 async fn create_organization_row(db: &Db, suffix: &str) -> Uuid {
