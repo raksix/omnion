@@ -434,6 +434,25 @@ impl From<ContentError> for ApiError {
                 "publishing_entry_not_found",
                 "no such publishing entry",
             ),
+            // Forms (REQ-064 slice 2). The two statuses here are load-bearing and both were
+            // wrong when the mapping was missing: without an arm, every ContentError fell
+            // through to 400, so "no such form" answered "your request was malformed" and the
+            // panel showed a validation error on a form that had been deleted. A missing row is
+            // 404 and a taken key is 409 — the same two answers `MenuNotFound` gives, for the
+            // same reason.
+            ContentError::FormNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "form_not_found", "no such form")
+            }
+            ContentError::FormKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "form_key_taken",
+                format!("this site already has a form with the key {key:?}"),
+            ),
+            ContentError::SubmissionNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "submission_not_found",
+                "no such submission in this form",
+            ),
             ContentError::InvalidLocation(message) => {
                 Self::bad_request("invalid_location", message)
             }

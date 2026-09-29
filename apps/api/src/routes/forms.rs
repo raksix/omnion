@@ -229,6 +229,7 @@ pub struct FormBody {
     /// How long a submission is kept.
     pub retention_days: i32,
     /// Field count — the list card's number.
+    pub field_count: usize,
     /// Unread submissions — the inbox badge.
     pub unread_count: i64,
     /// Spam submissions counted, never silently dropped.
