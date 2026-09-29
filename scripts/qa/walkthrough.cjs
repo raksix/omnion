@@ -6668,22 +6668,22 @@ async function runWorkflowBuilderDepth(page, report) {
   // highlights nothing is invisible in a screenshot and would otherwise pass every other gate.
   await page.keyboard.press("Control+a");
   await page.waitForTimeout(600);
-  const selectedAfterSelectAll = await page.locator("[data-node-id]").evaluateAll((cards) =>
-    cards.filter((card) => {
-      const style = card.getAttribute("style") ?? "";
-      return style.includes("outline: 2px") || style.includes("outline:2px");
-    }).length,
-  );
+  // `[data-node-selected]` is the product's own answer. The previous probe grepped the inline
+  // style for the substring "outline", which React writes as `outline: none` on EVERY card —
+  // so "3 of 3 selected" and "stillSelected: 3 after Escape" were the same reading of a
+  // probe that could not tell a selected card from an unselected one. A probe that cannot go
+  // red is not a gate; this one can.
+  const countSelected = () =>
+    page.locator("[data-node-selected='true']").count();
+  const selectedAfterSelectAll = await countSelected();
   note({ step: "select-all", total: await page.locator("[data-node-id]").count(), selected: selectedAfterSelectAll });
   await shot(page, "page-workflow-builder-select-all");
 
   // Escape clears it again, so the next gesture starts from a known state.
   await page.keyboard.press("Escape");
   await page.waitForTimeout(400);
-  const afterEscape = await page.locator("[data-node-id]").evaluateAll((cards) =>
-    cards.filter((card) => (card.getAttribute("style") ?? "").includes("outline")).length,
-  );
-  note({ step: "escape-clears", stillSelected: afterEscape });
+  const afterEscape = await countSelected();
+  note({ step: "escape-clears", stillSelected: afterEscape, cleared: afterEscape === 0 });
 
   // Shift+click adds a second node to the selection. Two cards drawn as selected is the
   // whole point: a Shift+click that *replaces* the selection is a bug no count can hide.
@@ -6699,10 +6699,10 @@ async function runWorkflowBuilderDepth(page, report) {
       .click({ timeout: 5000, modifiers: ["Shift"] })
       .catch(() => {});
     await page.waitForTimeout(500);
-    const multiSelected = await page.locator("[data-node-id]").evaluateAll((cards) =>
-      cards.filter((card) => (card.getAttribute("style") ?? "").includes("outline")).length,
-    );
-    note({ step: "shift-click-multi", expected: 2, selected: multiSelected });
+    const multiSelected = await countSelected();
+    // Two, not three: the plain click selected one, the Shift+click added the second. A
+    // count of 3 means the second click replaced the first or the first survived Escape.
+    note({ step: "shift-click-multi", expected: 2, selected: multiSelected, ok: multiSelected === 2 });
     await shot(page, "page-workflow-builder-multi");
     await page.keyboard.press("Escape");
     await page.waitForTimeout(300);
@@ -6854,12 +6854,31 @@ note({
 // The edge delete: select an edge, Del, and the server's edge count falls. An edge whose
   // deletion the canvas shows but the graph keeps is a ghost edge that comes back on reload.
   const edgesBefore = (await readGraph())?.edge_count ?? 0;
-  const edgeHit = await page
-    .locator("[data-edge] path")
-    .first()
-    .click({ timeout: 5000, force: true })
-    .then(() => true)
-    .catch(() => false);
+  // The click has to land ON the curve. `locator.click()` aims at the element's bounding
+  // box, and a bezier's box is the rectangle *around* the arc — its centre is empty canvas.
+  // So the click fell on the desk, the canvas handler cleared the selection, and the pass
+  // reported "no edge could be selected": a probe defect read as a product defect. The point
+  // is taken from `getPointAtLength` (the midpoint of the stroke itself) and mapped to screen
+  // through `getScreenCTM`, which is the only transform that accounts for the viewport's
+  // pan, zoom and the node layer's CSS transform.
+  const edgeScreenPoint = await page
+    .evaluate(() => {
+      const hit = document.querySelector("[data-edge] path");
+      if (!hit || typeof hit.getPointAtLength !== "function") return null;
+      const ctm = hit.getScreenCTM();
+      if (!ctm) return null;
+      const mid = hit.getPointAtLength(hit.getTotalLength() / 2);
+      const screen = mid.matrixTransform(ctm);
+      return { x: screen.x, y: screen.y };
+    })
+    .catch(() => null);
+  let edgeHit = false;
+  if (edgeScreenPoint) {
+    await page.mouse.move(edgeScreenPoint.x, edgeScreenPoint.y).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    await page.mouse.up().catch(() => {});
+    edgeHit = true;
+  }
   await page.waitForTimeout(500);
   const edgeSelected = (await page.locator("[data-edge-selected='true']").count()) > 0;
   if (edgeSelected) {
@@ -6867,15 +6886,37 @@ note({
     await page.waitForTimeout(1200);
     const afterEdgeDelete = await page.locator("[data-edge]").count();
     const edgesAfter = (await readGraph())?.edge_count ?? 0;
-    note({ step: "edge-delete", hit: edgeHit, edgesBefore, after: edgesAfter, canvas: afterEdgeDelete });
+    const selectionReadout = await page
+      .locator("[data-builder-selection]")
+      .first()
+      .innerText()
+      .catch(() => null);
+    note({
+      step: "edge-delete",
+      hit: edgeHit,
+      edgesBefore,
+      after: edgesAfter,
+      canvas: afterEdgeDelete,
+      // The server is the authority: a canvas that hides the line while the graph keeps it is
+      // a ghost edge that returns on reload, and the count is what says so.
+      removed: edgesAfter < edgesBefore,
+      readout: selectionReadout,
+    });
     await shot(page, "page-workflow-builder-edge-deleted");
     // Undo puts it back: the history has to know about edge deletes too.
     await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
     await page.keyboard.press("Control+z");
     await page.waitForTimeout(1200);
-    note({ step: "edge-delete-undo", edgesRestored: (await readGraph())?.edge_count ?? 0 });
+    const edgesRestored = (await readGraph())?.edge_count ?? 0;
+    note({ step: "edge-delete-undo", edgesRestored, restored: edgesRestored === edgesBefore });
   } else {
-    note({ step: "edge-delete", hit: edgeHit, selected: false, reason: "no edge could be selected" });
+    note({
+      step: "edge-delete",
+      hit: edgeHit,
+      selected: false,
+      point: edgeScreenPoint,
+      reason: edgeScreenPoint ? "the click missed the curve" : "no edge could be measured",
+    });
   }
 
   // ---- Cleanup: this pass owns the rule it made --------------------------------------------
