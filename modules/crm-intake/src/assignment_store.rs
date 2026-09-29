@@ -570,8 +570,12 @@ pub async fn policy_for_source(
 ) -> Result<Option<SlaPolicy>> {
     ensure_defaults(pool, organization_id).await?;
     if let Some(id) = source_id {
+        // Qualified at the *query*, not in the constant — see `POLICY_COLUMNS_SCALAR`.
         let query = format!(
-            "select p.{POLICY_COLUMNS_SCALAR} from crm_sla_policies p \
+            "select p.id, p.organization_id, p.name, p.first_response_minutes, \
+             p.business_hours_only, p.reminder_minutes, p.escalate_to_user_id, \
+             p.business_hours, p.active, p.created_at, p.updated_at \
+             from crm_sla_policies p \
              join crm_intake_sources s on s.sla_policy_id = p.id \
              where s.organization_id = $1 and s.id = $2 and p.active"
         );
@@ -594,9 +598,35 @@ pub async fn policy_for_source(
         .await?)
 }
 
-const POLICY_COLUMNS_SCALAR: &str = "p.id, p.organization_id, p.name, p.first_response_minutes, \
-     p.business_hours_only, p.reminder_minutes, p.escalate_to_user_id, p.business_hours, \
-     p.active, p.created_at, p.updated_at";
+/// The policy columns for the *joined* query, which must qualify every name.
+///
+/// **A real defect, found by the entry-point gate, and the shape is worth stating plainly:
+/// this constant carried its own `p.` prefixes while the query that used it wrote
+/// `select p.{POLICY_COLUMNS_SCALAR}`.** The expansion was `select p.p.id, p.p.organization_id, …`
+/// and PostgreSQL refused it with `invalid reference to FROM-clause entry for table "p"` on
+/// every execution — the error names a table alias, which is why a reader chasing a "policy
+/// problem" reads past it.
+///
+/// Two things kept it invisible for twenty-four ticks, and both are the same lesson as the
+/// missing caller it sat behind:
+///
+///   * **No production caller.** The arm is only reached when a source names a policy, and
+///     nothing named a policy — because the *column* it joined on did not exist either
+///     (`0163`). Two independent defects stacked in the same function, and either one alone
+///     would have hidden the other: fixing the column would have turned a `42703` into a
+///     `42P01`, which reads like a different bug entirely.
+///   * **The tests never reached it.** `policy_for_source` is exercised with a `source_id` of
+///     `None` and with organizations that have one policy, so both take the fallback arm and
+///     the joined query is never built.
+///
+/// The constant is now unprefixed, like `POLICY_COLUMNS` and `RULE_COLUMNS` beside it, and the
+/// query writes `select {POLICY_COLUMNS_SCALAR} … from crm_sla_policies p` — so every name
+/// has to be qualified at the query, which is the only place that knows the alias. A
+/// constant that carries its own prefix *and* is used behind a prefix can only be correct by
+/// accident, and this one was correct in neither arrangement.
+const POLICY_COLUMNS_SCALAR: &str = "id, organization_id, name, first_response_minutes, \
+     business_hours_only, reminder_minutes, escalate_to_user_id, business_hours, \
+     active, created_at, updated_at";
 
 /// One breached lead, ready to escalate. The read is bounded and ordered so the worker is
 /// reproducible: given the same database and the same `now`, it escalates the same leads in
