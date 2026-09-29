@@ -4836,3 +4836,14 @@ created through the form, the test's "it did not count a hit" line, a relative p
 the rule absent from SQL, a blocking robots.txt saved *with* its warning, the regenerated XML
 previewed and its count matching what is in storage, the internal-link scan, and the delete
 confirmation naming the path. Then slice 4 — comments, newsletter, memberships, media reuse.
+
+**The browser pass did not run in this tick, and the reason is a queue, not a failure.** The
+`QA_STACK=w2` pass was started and took its place in the global QA-slot queue
+(`QA_SLOTS=1`, `QA_SLOT_WAIT=3600`) about twenty minutes in. It is still waiting: another writer's
+pass holds the single slot, and when that pass ended another writer claimed the freed place within
+one poll interval. With six writers on one box this is a scheduling outcome, and the honest
+statement is that **every browser-side claim about this slice is currently untested** — the
+`runSeoDepth` pass is written and queued, not passed. What IS proved is the whole server half:
+7/7 integration walks against real PostgreSQL, 154 content unit tests, the migration gate, and a
+clean `pnpm typecheck`. The next tick starts with `node scripts/qa/walkthrough.cjs --only=seo` and
+must not treat this tick as closing the slice.
