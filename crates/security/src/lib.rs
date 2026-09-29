@@ -27,6 +27,10 @@ pub mod csv;
 pub mod error;
 pub mod header_store;
 pub mod headers;
+pub mod limiter;
+pub mod limiter_redis;
+pub mod limiter_store;
+pub mod lockout;
 pub mod model;
 pub mod posture;
 pub mod store;
@@ -42,6 +46,22 @@ pub use headers::{
     CSP_DIRECTIVES, CspDirective, CspMode, HeaderLine, HeaderPolicy, HstsPolicy, PostureFacts,
     REFERRER_POLICIES, csp_header_name, is_effective_hsts,
 };
+pub use limiter::{
+    ClientId, MAX_BURST, MAX_LIMIT, MAX_WINDOW_SECONDS, RatePolicy, RequestFacts, Verdict,
+    decide, merge_with_defaults, parse_document as parse_rate_limits, scope_of, scope_options,
+    to_document as rate_limits_to_document,
+};
+pub use lockout::{
+    LockoutPolicy, LockoutState, LockedAccount, MAX_ATTEMPTS, MAX_LOCKOUT_MINUTES,
+    MAX_WINDOW_SECONDS as MAX_FAILURE_WINDOW_SECONDS, MIN_ATTEMPTS, MIN_LOCKOUT_MINUTES,
+    MIN_WINDOW_SECONDS as MIN_FAILURE_WINDOW_SECONDS, document as lockout_to_document,
+    evaluate as evaluate_lockout, parse_document as parse_lockout,
+};
+pub use limiter_store::{
+    StoredDocuments, failures_in_window, load_documents, load_lockout, load_rate_limits,
+    locked_accounts, locked_count, save_lockout, save_rate_limits, unlock_account,
+};
+pub use limiter_redis::{Counted, enforce, forget, peek, retention_for};
 pub use model::{
     BuiltFinding, CheckResult, Finding, FindingPage, FindingQuery, NewCheckResult, NewFinding,
     SeverityCount, StatusChange, fingerprint_of, is_slug,
@@ -56,6 +76,7 @@ pub use store::{
     stale_dependency_count, upsert_finding,
 };
 pub use vocabulary::{
-    FINDING_STATUSES, MAX_BULK_IDS, MAX_PAGE, SEVERITIES, SOURCES, STATE_WHEN_UNEVALUATED, STATES,
-    is_finding_status, is_severity, is_source, is_state, severity_rank,
+    FINDING_STATUSES, MAX_BULK_IDS, MAX_PAGE, RATE_SCOPES, SEVERITIES, SOURCES,
+    STATE_WHEN_UNEVALUATED, STATES, is_finding_status, is_severity, is_source, is_state,
+    severity_rank,
 };
