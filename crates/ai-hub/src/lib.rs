@@ -23,6 +23,7 @@ pub mod cost;
 pub mod decision_store;
 pub mod error;
 pub mod failover;
+pub mod guardrails;
 pub mod health;
 pub mod health_store;
 pub mod loop_engine;
