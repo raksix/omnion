@@ -92,8 +92,19 @@ step "API on :$API_PORT (database omnion_qa)"
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-if [ ! -x target/debug/omnion-api ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+#
+# **The target directory is `$CARGO_TARGET_DIR` when it is set, never a hardcoded
+# `target/debug`.** The box is loaded enough that the parallel writers all point cargo at
+# `/dev/shm/<writer>-target` (a 32 GB tmpfs), and this script read the hardcoded path in three
+# places — the staleness check, the `cargo build` and the `pm2 start`. The result was the worst
+# kind of harness bug: `cargo build` compiled the current tree into the tmpfs, the staleness
+# check compared migration times against a *different*, three-hours-older binary in
+# `target/debug`, and pm2 started that one. The pass then reported a router panic from code that
+# no longer existed in the tree, and "the API did not answer" was the honest summary of a harness
+# testing the wrong build. One variable, used three times, is the whole fix.
+API_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/omnion-api"
+if [ ! -x "$API_BIN" ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
   cargo build -p omnion-api
 fi
@@ -104,7 +115,7 @@ else
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
-    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+    pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
