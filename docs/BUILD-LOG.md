@@ -4055,3 +4055,68 @@ to make the passes take turns is simply not in effect for any of the six writers
 box runs as many browsers at once as there are loops. The one-line fix belongs in `run.sh`
 itself — default `QA_SLOTS` inside the script — and `run.sh` is shared tooling, so it is
 reported here rather than edited from a writer branch.
+
+## Wave 5 · tick 17 · REQ-011: main merged in, and four merges that only look resolvable
+
+**What.** Merged `origin/main` (REQ-021 notifications, events catalogue, media fixes) into
+`wave5`, and paid for it with the most stubborn conflict set this branch has had: **eleven
+files**, all of them additive, all of them cut *inside statements*.
+
+**Proof.**
+- `cargo build -p omnion-api` → **exit 0**, `Finished dev profile in 5m 04s` (2 warnings,
+  both pre-existing in main's `notifications_admin.rs`).
+- `pnpm typecheck` → **2 successful, 0 errors** (admin re-checked after the merge, web cached).
+- `cargo test -p omnion-cdn --quiet` → **94 passed / 0 failed**.
+- `cargo test -p omnion-api --test cdn_purge -- --test-threads=1` against `omnion_w5_dev`
+  → **17 passed / 0 failed** (154.87s), including
+  `a_successful_drain_leaves_the_purge_succeeded_with_every_item_done` and
+  `a_provider_refusal_lands_in_the_drawer_with_its_message_and_is_retryable`.
+- `node --check scripts/qa/walkthrough.cjs` → clean, with both `runCdn*` and the
+  notifications passes in the inventory.
+- `ls database/migrations | sed 's/_.*//' | sort | uniq -d` → empty. main's `0051` and
+  wave5's `0054` do not collide.
+
+**The merge, and what it cost.** Both branches appended a section at the same anchor, so git
+produced hunks that started *inside* a function. Three resolvers were written before one was
+right, and the failures are the lesson:
+
+1. **A hunk-level union is not a merge.** Taking both sides of a hunk produced
+   `updateCdnRule(` immediately followed by main's `fetchNotificationPreferences` — text that
+   parses as neither. The unit of a correct union is a whole added region, not a hunk.
+2. **Anchoring on the preceding *line* is a guess.** The line before main's block was often the
+   `await page.route(` of a multi-line call, so the block landed *inside* our call and
+   `walkthrough.cjs` stopped parsing. Two resolvers died here before the third switched to
+   mapping base-line indices through the base→ours opcodes.
+3. **A duplicate-definition sweep deletes the body, not just the second copy.** Removing the
+   repeated `fn row_is_mine` left three signatures and one body, which is an *unclosed
+   delimiter* rather than a duplicate symbol — a strictly worse state, and one the compiler
+   reports with a line number pointing at the wrong thing.
+
+**A `use` list reflow is a merge conflict in disguise.** Wave5's rustfmt had rewrapped
+`use omnion_notifications::{…}`; main had added four names to the same list. difflib read
+main's entire Preferences section as a *replacement* of that base range, so the union kept
+every test that exercised `PutPreferencesBody` and dropped the definitions. The signature of
+this class is a file that references a type it no longer defines — and the compiler finds it
+in one pass where a merge resolver cannot.
+
+**The compiler is the only safe judge of a merge.** Ten errors, in four files, all of them
+"defined twice" or "cannot find value": the duplicated `pub mod media_duplicates;` (ours
+deleted base's line, main kept it), the three helper duplicates, main's four sub-router
+`let` bindings whose `.merge()` call sites had survived without them, and a vestigial
+`params.with_read.unwrap_or(true)` on a field that is a plain `bool` with a serde default.
+None of these are visible to a line-multiset check, which reported 0 missing on all seven
+spliced files.
+
+**Browser gate: deferred again, fourth tick in a row, and this time the box said why.**
+Pre-flight one minute before the pass: `MemAvailable` **4G** against a `>8G` precondition,
+load **23.8**, **40** Chrome processes, `/mnt/apopic` at 96% with 2.6G free. The slot is
+currently held by a live pass, and a pass started into that is a pass that dies on
+`Page crashed` and reports nothing. **Slice 2 is therefore still not closed**, and this entry
+does not claim otherwise. The gate is queued for the next tick that finds `MemAvailable > 8G`
+and fewer than ~20 Chrome processes.
+
+**Commits.** `698f249` (the merge, resolved file by file against the base).
+
+**Next.** Run the browser pass as the first action of the next tick, and on a green gate
+close slice 2 and start slice 3 — the six trigger events mapped through the rule set into one
+enqueued purge, gated by the `auto_purge` toggles the settings screen already stores.

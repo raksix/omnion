@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slice 2 built, `69ba2c7`; browser gate pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slice 2 built, `69ba2c7`; main merged `698f249`; browser gate still pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
