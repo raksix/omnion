@@ -7433,6 +7433,127 @@ note({
     });
   }
 
+  // ---- Two tabs: the second save loses, and the first tab keeps its copy --------------------
+  // The `conflict` step above PUTs a stale version through a raw `fetch`, which proves the
+  // *server* refuses it. That is half the criterion: the request says the UI must offer
+  // Reload "while keeping the local copy visible instead of overwriting silently", and a raw
+  // fetch never touches the toolbar, so the half that matters was unmeasured.
+  //
+  // So: open a second real page on the same rule, save a real edit there (the version
+  // advances), then make an edit in this tab and let its own autosave run. The autosave
+  // quotes the version this tab loaded, the server is one ahead, and the answer is a 409 that
+  // the toolbar has to render. Three things are then read: the save state says conflict, the
+  // Reload button is there, and the local node is still on the canvas — a client that
+  // silently reloads on conflict has thrown away the author's work, which is the one thing
+  // this criterion exists to forbid.
+  const tabTwo = await page.context().newPage();
+  try {
+    await tabTwo
+      .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await tabTwo.waitForSelector("[data-builder-palette]", { timeout: 20000 }).catch(() => {});
+    await tabTwo.waitForTimeout(1000);
+
+    // Tab two saves a real edit, so the stored version moves under this tab.
+    //
+    // A *rename* rather than an added node, and that is not a detail: `replace_graph` derives
+    // the step list in the same statement, so a graph that does not validate never reaches
+    // the version check — the PUT would be refused for a reason that has nothing to do with
+    // concurrency, and this probe would be reading a different failure than the one it names.
+    const tabTwoSave = await tabTwo.evaluate(async (id) => {
+      const current = await (
+        await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+      ).json();
+      const graph = structuredClone(current.graph);
+      const target = graph.nodes.find((node) => node.id !== "node-tab-two");
+      if (target) target.label = `Renamed by the second tab ${Date.now().toString(36)}`;
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ graph, graph_version: current.graph_version }),
+      });
+      return {
+        status: response.status,
+        before: current.graph_version,
+        after: (await response.json().catch(() => null))?.graph_version ?? null,
+      };
+    }, workflowId);
+
+    // Tab one edits and lets its own debounced autosave fire. The palette click is the same
+    // route the acceptance pass uses, so the save is armed by a gesture a user could make.
+    await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.locator("[data-palette-node='transform']").first().click({ timeout: 8000 }).catch(() => {});
+    let conflictState = "";
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      conflictState =
+        (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+      if (conflictState === "conflict" || conflictState === "saved" || conflictState === "error") break;
+      await page.waitForTimeout(400);
+    }
+    const localNodesKept = await page.locator("[data-node-id]").count();
+    const reloadOffered = (await page.locator("[data-save-reload]").count()) > 0;
+    // The second exit has to exist *and* work. Before this tick the server's message said
+    // "reload to see their change, or keep editing to overwrite it" while the client quoted
+    // its stale version forever, so the only way to save was to discard the author's work —
+    // a button that was missing was less bad than a button that was a dead end.
+    const keepMineOffered = (await page.locator("[data-save-keep-mine]").count()) > 0;
+    let afterKeepMine = { state: "", version: null, nodeGone: null };
+    if (conflictState === "conflict" && keepMineOffered) {
+      await page.locator("[data-save-keep-mine]").first().click({ timeout: 8000 }).catch(() => {});
+      let keptState = "";
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        keptState =
+          (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+        if (keptState === "saved" || keptState === "error" || keptState === "conflict") break;
+        await page.waitForTimeout(400);
+      }
+      const stored = await readGraph();
+      afterKeepMine = {
+        state: keptState,
+        version: stored?.graph_version ?? null,
+        // The overwrite is only an overwrite if the version actually moved past the one the
+        // second editor took; a banner that clears without a write has changed nothing.
+        nodeGone: stored?.node_count ?? null,
+      };
+    }
+    const conflictText = (await page.locator("[data-save-state='conflict']").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    note({
+      step: "two-tab-conflict",
+      tabTwoStatus: tabTwoSave.status,
+      versionBefore: tabTwoSave.before,
+      versionAfter: tabTwoSave.after,
+      state: conflictState,
+      // The whole criterion in three readings: the save was refused, Reload is offered, and
+      // the author's own nodes are still on the canvas.
+      refused: conflictState === "conflict",
+      reloadOffered,
+      localNodesKept,
+      // The banner has to name the version — that is what lets a client offer a real Reload
+      // instead of a shrug.
+      namesVersion: /version/i.test(conflictText),
+      text: conflictText.slice(0, 160),
+    });
+    if (conflictState === "conflict") {
+      note({
+        step: "two-tab-keep-mine",
+        offered: keepMineOffered,
+        stateAfter: afterKeepMine.state,
+        // Saved on top of the other editor's version, not refused again: this is the reading
+        // that would have caught the dead end, because every save quoting a stale version
+        // comes back as a second `conflict`.
+        resolved: afterKeepMine.state === "saved",
+        versionAfter: afterKeepMine.version,
+        nodes: afterKeepMine.nodeGone,
+      });
+      await shot(page, "page-workflow-builder-keep-mine");
+    }
+  } finally {
+    await tabTwo.close().catch(() => {});
+  }
+
   // ---- Cleanup: this pass owns the rule it made --------------------------------------------
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);
