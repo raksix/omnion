@@ -442,16 +442,25 @@ pub async fn set_override(
     }
 
     let row: (Uuid,) = sqlx::query_as(
+        // `scope_key` is **not** in the column list, for the same reason
+        // `replace_task_map` leaves it out: it is a `generated always as (...)` column, and
+        // PostgreSQL refuses any INSERT that names it ("cannot insert a non-DEFAULT value into
+        // column scope_key"). The database derives the scope from the two ids.
+        //
+        // It is still *referenced* below, in `on conflict`. That is the asymmetry worth knowing:
+        // a generated column may be read by an index, a constraint or a conflict target, but it
+        // may not be *written*. The sibling fix (44b85c9) corrected the route INSERT and missed
+        // this one, so a feature pin answered 500 "internal_error" while the route map beside it
+        // worked — the two writes live in the same file and disagree about the same column.
         "insert into ai_feature_overrides \
-         (scope_key, organization_id, site_id, feature, model_id, updated_by) \
-         values ($1, $2, $3, $4, $5, $6) \
+         (organization_id, site_id, feature, model_id, updated_by) \
+         values ($1, $2, $3, $4, $5) \
          on conflict (scope_key, feature) do update \
          set model_id = excluded.model_id, \
              updated_by = excluded.updated_by, \
              updated_at = now() \
          returning id",
     )
-    .bind(scope.key())
     .bind(column_organization)
     .bind(column_site)
     .bind(feature)
